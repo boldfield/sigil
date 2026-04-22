@@ -104,6 +104,37 @@ via `libSystem.dylib` which re-exports `_Unwind_*` from libunwind, so
 no extra flag is needed there. The macOS arm of the `cfg` remains
 unchanged.
 
+## [Task 16] e2e test lives in `compiler/tests/e2e.rs`, not a separate `sigil-tests` crate
+
+**Commit:** (pending — next commit)
+
+**Plan text:** Task 16 describes the test location as
+`tests/e2e/hello.rs` and the acceptance command as
+`cargo test -p sigil-tests --test e2e hello`.
+
+**What was done instead:** The e2e test is placed at
+`compiler/tests/e2e.rs` with `#[test] fn hello()`. The acceptance
+command becomes `cargo test -p sigil-compiler --test e2e hello`.
+`cargo test --workspace` (what CI actually runs) is unchanged.
+
+**Why:** Putting the integration test in the same crate that produces
+the `sigil` binary lets us use `env!("CARGO_BIN_EXE_sigil")` — a
+compile-time Cargo facility — to find the compiler binary at test
+runtime. The alternative (separate `sigil-tests` workspace member)
+requires either a nested `cargo run`/`cargo build` invocation from
+inside the test, which fights the outer cargo's target-directory
+lock, or an `escargot`-style helper crate — an extra dependency the
+plan's dependency allow-list does not include.
+`sigil-runtime` is added as a dev-dependency of `sigil-compiler` so
+that `cargo test -p sigil-compiler` builds `libsigil_runtime.a` into
+`target/debug/` where `link.rs` looks for it.
+
+**Forward implications:** Future integration tests (arithmetic,
+conditionals, closures in Plans A2/A3) follow the same placement
+convention. If a future need genuinely requires a separate test
+crate (e.g., a spec-validator harness), it can be added alongside
+without moving this one.
+
 ## Format
 
 Format:
