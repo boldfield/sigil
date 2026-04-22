@@ -1,0 +1,103 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs on the same ref — keeps CI from stacking when
+# pushes land in quick succession.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  SOURCE_DATE_EPOCH: "0"
+  TZ: UTC
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Boehm GC (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgc-dev pkg-config
+
+      - name: install Boehm GC (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install bdw-gc pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/opt/bdw-gc/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+
+      # Rust toolchain pinned via rust-toolchain.toml; no explicit install.
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cache Homebrew bottles
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew/downloads
+          key: ${{ runner.os }}-brew-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: no-HashMap grep check
+        shell: bash
+        run: |
+          # Plan A1 §0.3: compiler crate must not use HashMap/HashSet.
+          # Tests modules are allowed an explicit #[allow]; the grep below is
+          # coarse and keeps the rule mechanical.
+          set -euo pipefail
+          if grep -REn 'HashMap|HashSet' compiler/src/ \
+               --include='*.rs' \
+               --exclude-dir='errors' \
+             | grep -v -E '//.*HashMap|//.*HashSet'; then
+            echo "compiler/src/ contains HashMap/HashSet references — see clippy.toml rules." >&2
+            exit 1
+          fi
+          echo "no-HashMap grep: OK"
+
+      - name: interior-pointer check
+        run: ./scripts/check-no-interior-pointers.sh
+
+      - name: commit-message format
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: ./scripts/check-commit-messages.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+
+      - name: reproducibility
+        run: ./scripts/reproducibility.sh
+
+      - name: smoke
+        run: ./scripts/smoke.sh
