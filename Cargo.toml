@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["compiler", "runtime"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.95.0"
+license = "MIT"
+
+[workspace.dependencies]
+cranelift = "=0.131.0"
+cranelift-module = "=0.131.0"
+cranelift-object = "=0.131.0"
+target-lexicon = "=0.13.5"
+include_dir = "=0.7.4"
+object = "=0.39.1"
+insta = "=1.47.2"
+
+[profile.release]
+lto = false
+codegen-units = 1

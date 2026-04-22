@@ -1,0 +1,21 @@
+[package]
+name = "sigil-compiler"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+
+[[bin]]
+name = "sigil"
+path = "src/main.rs"
+
+[dependencies]
+cranelift = { workspace = true }
+cranelift-module = { workspace = true }
+cranelift-object = { workspace = true }
+target-lexicon = { workspace = true }
+include_dir = { workspace = true }
+object = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

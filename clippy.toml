@@ -1,0 +1,12 @@
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "Use BTreeMap or explicitly sorted iteration in compiler/." },
+    { path = "std::collections::HashSet", reason = "Use BTreeSet or explicitly sorted iteration in compiler/." },
+    { path = "hashbrown::HashMap", reason = "Use BTreeMap in compiler/." },
+    { path = "hashbrown::HashSet", reason = "Use BTreeSet in compiler/." },
+]
+disallowed-methods = [
+    { path = "core::result::Result::unwrap", reason = "Route errors through CompilerError." },
+    { path = "core::option::Option::unwrap", reason = "Route None through CompilerError." },
+    { path = "core::result::Result::expect", reason = "Route errors through CompilerError." },
+    { path = "core::option::Option::expect", reason = "Route None through CompilerError." },
+]
