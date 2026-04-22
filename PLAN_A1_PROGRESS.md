@@ -121,16 +121,16 @@ Status values: `todo`, `in-progress`, `done`.
   - commits: [2a17e83]
   - notes: Compiler recognises IO.println as a runtime intrinsic; flagged TODO(plan-b) for generalisation in Plan B Stage 6.
 - Task 16 — end-to-end test
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [8592bde]
+  - notes: Test placed at compiler/tests/e2e.rs rather than a separate sigil-tests crate; see DEVIATIONS.
 - Task 17 — reproducibility.sh
-  - status: todo
-  - commits: []
+  - status: done
+  - commits: [b83d8bb]
   - notes:
 - Task 18 — smoke.sh
-  - status: todo
-  - commits: []
+  - status: done
+  - commits: [21893e9]
   - notes:
 - Task 19 — prompt bank (3 entries)
   - status: done

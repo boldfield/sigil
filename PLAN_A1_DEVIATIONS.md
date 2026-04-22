@@ -106,7 +106,7 @@ unchanged.
 
 ## [Task 16] e2e test lives in `compiler/tests/e2e.rs`, not a separate `sigil-tests` crate
 
-**Commit:** (pending — next commit)
+**Commit:** 8592bde
 
 **Plan text:** Task 16 describes the test location as
 `tests/e2e/hello.rs` and the acceptance command as
