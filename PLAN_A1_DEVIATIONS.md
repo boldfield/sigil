@@ -39,6 +39,71 @@ future need for a raw-bytes overload (e.g. for zero-copy output of
 static data) would be added as a second function (`sigil_println_raw`)
 rather than re-shaping this one.
 
+## [Tasks 3–15] Single multi-task commit for the Stage 1 compiler front-to-back
+
+**Commit:** (pending — next commit)
+
+**Plan text:** The plan's Commit discipline section says "Every commit's
+message begins with `[Task <N>]` ..." and "Multiple tasks may share a
+commit only if genuinely atomic; prefer splitting." The natural reading
+is one commit per task.
+
+**What was done instead:** Tasks 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+15 are landed in a single commit tagged `[DEVIATION Tasks 3-15]`.
+Specifically: the compiler CLI + `stdlib_embed` + AST types + the
+elaborate / color / cps / closure-convert / monomorphize stubs (Task 3);
+the lexer (Task 4); the parser (Task 5); name resolution (Task 6); the
+type checker (Task 7); ANF elaboration (Task 8); Cranelift codegen with
+stackmap emission (Task 12); the link driver (Task 13);
+`examples/hello.sigil` (Task 14); and `std/io.sigil` (Task 15).
+
+**Why:** The work was developed in a single session against a hot
+compiler/runtime design loop — the lexer, parser, typecheck, and
+codegen were written in tandem because each required the others'
+shape to settle before any of them could be finalised. Retroactively
+splitting the working tree into twelve per-task commits would require
+either (a) fabricating per-task stub states that never actually existed
+on disk, or (b) reverting each file to a stub, committing, then
+restoring the implementation — both of which produce a fictitious
+history without improving bisectability, because the code does not
+build in intermediate states (Task 3's `lib.rs` declares modules;
+stubs for lexer/parser/etc. are needed before Task 4+ can replace them,
+and the codegen test only passes once the full pipeline is in place).
+The honest representation is one atomic multi-task commit.
+
+**Forward implications:** Future tasks (16 e2e test, 17 reproducibility,
+18 smoke) are separately committed per the plan's one-task-one-commit
+rule. No future plan (A2/A3/B/C) should use this as a precedent — the
+"developed as one session" justification only applies when a tightly
+coupled vertical slice is landed for the first time.
+
+## [Task 13] link.rs adds `-lgcc_s` on Linux for `_Unwind_*` symbols
+
+**Commit:** (pending — same commit as Tasks 3–15)
+
+**Plan text:** Task 13 enumerates the Linux linker flags as
+`-lgc -Wl,--build-id=none`.
+
+**What was done instead:** `-lgcc_s` is also passed on Linux. The
+Rust staticlib (`libsigil_runtime.a`) pulls in `panic_unwind`, which
+references `_Unwind_Resume`, `_Unwind_RaiseException`, etc. `cc` does
+not autolink libgcc's unwind shim when driving `ld` directly for a
+non-Rust entry object, so the link fails with undefined-symbol errors.
+Adding `-lgcc_s` resolves all of them.
+
+**Why:** The alternative is setting `panic = "abort"` on
+`[profile.release]` and `[profile.dev]` in the workspace `Cargo.toml`.
+That would also drop the unwinding dependency, but changes the
+runtime's behaviour on internal panics (abort vs unwind) and is a
+broader workspace-config change than touching the link driver. The
+`-lgcc_s` approach keeps the fix localised to Task 13's surface and
+preserves the default Rust panic semantics for the runtime crate.
+
+**Forward implications:** macOS has the same class of issue but links
+via `libSystem.dylib` which re-exports `_Unwind_*` from libunwind, so
+no extra flag is needed there. The macOS arm of the `cfg` remains
+unchanged.
+
 ## Format
 
 Format:
