@@ -1,11 +1,51 @@
 #!/usr/bin/env bash
-# reproducibility.sh — plan A1 Stage 0 stub, populated in Stage 1 task 17.
+# reproducibility.sh — plan A1 Stage 1 task 17.
 #
-# Stage 0: succeed silently so the CI workflow can reference the file
-# before the hello-world vertical slice exists. Stage 1 task 17 replaces
-# this with a compile-twice sha256sum comparison over examples/hello.sigil.
+# Compiles examples/hello.sigil twice on the same host and asserts the
+# two output binaries are byte-identical (sha256sum). Reproducibility
+# is per-host: we make no claim about cross-host binary identity.
+#
+# Cargo is expected on PATH. The script works from any cwd because it
+# resolves the repo root from its own location.
 
 set -euo pipefail
 
-echo "reproducibility: stage-0 stub (populated in Stage 1 task 17)"
-exit 0
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
+cd "${repo_root}"
+
+# Build release binaries (compiler + runtime staticlib).
+cargo build --release --workspace --quiet
+
+sigil_bin="${repo_root}/target/release/sigil"
+source_path="${repo_root}/examples/hello.sigil"
+
+if [[ ! -x "${sigil_bin}" ]]; then
+    echo "reproducibility: sigil binary not found at ${sigil_bin}" >&2
+    exit 1
+fi
+if [[ ! -f "${source_path}" ]]; then
+    echo "reproducibility: ${source_path} missing" >&2
+    exit 1
+fi
+
+tmpdir="$(mktemp -d -t sigil-repro.XXXXXX)"
+trap 'rm -rf "${tmpdir}"' EXIT
+
+out_a="${tmpdir}/hello_a"
+out_b="${tmpdir}/hello_b"
+
+"${sigil_bin}" "${source_path}" -o "${out_a}"
+"${sigil_bin}" "${source_path}" -o "${out_b}"
+
+hash_a="$(sha256sum "${out_a}" | awk '{print $1}')"
+hash_b="$(sha256sum "${out_b}" | awk '{print $1}')"
+
+if [[ "${hash_a}" != "${hash_b}" ]]; then
+    echo "reproducibility: FAIL — same-host builds produced different binaries" >&2
+    echo "  ${out_a}: ${hash_a}" >&2
+    echo "  ${out_b}: ${hash_b}" >&2
+    exit 1
+fi
+
+echo "reproducibility: OK (sha256=${hash_a})"
