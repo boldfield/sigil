@@ -69,57 +69,57 @@ Status values: `todo`, `in-progress`, `done`.
   - commits: [1efcda7]
   - notes: counters + stackmap from task 0.10/0.11 already landed.
 - Task 3 — compiler crate CLI + stub modules
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Landed together with Tasks 4-15 as a multi-task commit; see DEVIATIONS.
 - Task 4 — lexer
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Multi-task commit (see DEVIATIONS).
 - Task 5 — parser
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Multi-task commit (see DEVIATIONS).
 - Task 6 — name resolution
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Multi-task commit (see DEVIATIONS).
 - Task 7 — type checker
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Multi-task commit (see DEVIATIONS).
 - Task 8 — elaboration to ANF
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Multi-task commit (see DEVIATIONS).
 - Task 9 — color inference stub
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Stub landed with the multi-task commit; real inference is Plan B.
 - Task 10 — CPS transform stub
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Near-identity stub landed with multi-task commit; IO special-case flagged TODO(plan-b). Real CPS transform is Plan B Stage 6.
 - Task 11 — closure conversion
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Stub — every fn becomes a top-level code block with empty closure record. Real captures handled in Plan A2+.
 - Task 12 — Cranelift codegen (with safepoints + headers)
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Multi-task commit (see DEVIATIONS); stackmap section populated at every call site.
 - Task 13 — linker driver
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Multi-task commit. See DEVIATIONS for the Linux -lgcc_s addition.
 - Task 14 — examples/hello.sigil
-  - status: todo
-  - commits: []
+  - status: done
+  - commits: [2a17e83]
   - notes:
 - Task 15 — std/io.sigil
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [2a17e83]
+  - notes: Compiler recognises IO.println as a runtime intrinsic; flagged TODO(plan-b) for generalisation in Plan B Stage 6.
 - Task 16 — end-to-end test
   - status: todo
   - commits: []

@@ -41,7 +41,7 @@ rather than re-shaping this one.
 
 ## [Tasks 3–15] Single multi-task commit for the Stage 1 compiler front-to-back
 
-**Commit:** (pending — next commit)
+**Commit:** 2a17e83
 
 **Plan text:** The plan's Commit discipline section says "Every commit's
 message begins with `[Task <N>]` ..." and "Multiple tasks may share a
@@ -79,7 +79,7 @@ coupled vertical slice is landed for the first time.
 
 ## [Task 13] link.rs adds `-lgcc_s` on Linux for `_Unwind_*` symbols
 
-**Commit:** (pending — same commit as Tasks 3–15)
+**Commit:** 2a17e83
 
 **Plan text:** Task 13 enumerates the Linux linker flags as
 `-lgc -Wl,--build-id=none`.
