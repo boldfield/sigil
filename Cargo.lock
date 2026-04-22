@@ -598,6 +598,7 @@ dependencies = [
  "include_dir",
  "insta",
  "object",
+ "sigil-runtime",
  "target-lexicon",
 ]
 

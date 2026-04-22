@@ -23,3 +23,7 @@ object = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+# Dev-dep on the runtime so `cargo test -p sigil-compiler` builds
+# `target/debug/libsigil_runtime.a`, which `link.rs` links against
+# during the end-to-end hello-world test.
+sigil-runtime = { path = "../runtime" }
