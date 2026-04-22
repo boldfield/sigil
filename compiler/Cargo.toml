@@ -5,6 +5,10 @@ edition = { workspace = true }
 rust-version = { workspace = true }
 license = { workspace = true }
 
+[lib]
+name = "sigil_compiler"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sigil"
 path = "src/main.rs"
