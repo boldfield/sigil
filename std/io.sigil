@@ -1,0 +1,11 @@
+// sigil: 0.1
+//
+// Standard IO effect. For Stage 1 the compiler recognises IO.println as a
+// runtime intrinsic and lowers it to a direct `sigil_println` call. Plan B
+// Stage 6 must generalise this path: remove the intrinsic special-case in
+// compiler/src/codegen.rs, implement general effect-handler dispatch, and
+// route `perform IO.println` through a proper handler frame.
+
+effect IO {
+  println: (String) -> Unit,
+}

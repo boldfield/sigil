@@ -1,19 +1,61 @@
 use std::io::Write;
-use std::process::ExitCode;
+use std::path::Path;
+use std::process::{Command, ExitCode, Stdio};
 
+use sigil_compiler::cli::{self, CompileArgs};
 use sigil_compiler::errors::catalog;
+use sigil_compiler::pipeline;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.as_slice() {
-        [cmd, code] if cmd == "explain" => explain(code),
-        _ => {
-            // Compile mode and the full flag surface (-o, --human-errors, etc.)
-            // are wired in Stage 1 task 3. For now report cleanly so nothing
-            // upstream mistakes this stub for the real compiler.
-            eprintln!("sigil: compile pipeline not yet wired; Stage 1 task 3 pending.");
-            eprintln!("usage: sigil explain <code>");
+    match cli::parse(&args) {
+        cli::Command::Compile(cargs) => compile(cargs),
+        cli::Command::PrintRuntimeStats(cargs) => print_runtime_stats(cargs),
+        cli::Command::Explain(code) => explain(&code),
+        cli::Command::Usage => {
+            eprintln!("{}", cli::USAGE);
             ExitCode::from(2)
+        }
+        cli::Command::UsageError(msg) => {
+            eprintln!("sigil: {msg}");
+            eprintln!();
+            eprintln!("{}", cli::USAGE);
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn compile(cargs: CompileArgs) -> ExitCode {
+    match pipeline::compile(&cargs.input, &cargs.output, cargs.error_format) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(1),
+    }
+}
+
+fn print_runtime_stats(cargs: CompileArgs) -> ExitCode {
+    let compile_status = compile(CompileArgs { ..cargs.clone() });
+    if compile_status != ExitCode::SUCCESS {
+        return compile_status;
+    }
+    // Run the compiled program. Exit status mirrors the inner program; the
+    // counters dump goes to stderr via `sigil_counter_print_all`. For Stage
+    // 1 we invoke the program then read `/proc/self/...` — actually the
+    // counters are process-local to the child. We run the child with
+    // SIGIL_PRINT_STATS=1; the runtime checks this env var on startup and
+    // registers an atexit hook that calls sigil_counter_print_all. Stage 1
+    // wires the atexit via a small inline shim in the runtime module.
+    let prog = Path::new(&cargs.output);
+    let mut cmd = Command::new(prog);
+    cmd.env("SIGIL_PRINT_STATS", "1");
+    cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    match cmd.status() {
+        Ok(s) => match s.code() {
+            Some(c) => ExitCode::from(c as u8),
+            None => ExitCode::from(1),
+        },
+        Err(e) => {
+            eprintln!("sigil: cannot run compiled binary: {e}");
+            ExitCode::from(1)
         }
     }
 }
@@ -38,3 +80,6 @@ fn explain(code: &str) -> ExitCode {
         }
     }
 }
+
+// Make CompileArgs cloneable for print-runtime-stats reuse.
+// (Defined in cli.rs — this is a small forward-compat helper.)
