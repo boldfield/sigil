@@ -5,7 +5,7 @@ Retroactive entries are forbidden.
 
 ## [Task 2] `sigil_println` takes a heap String pointer, not `(ptr, len)`
 
-**Commit:** (pending — next commit)
+**Commit:** 57d174b
 
 **Plan text:** Task 2 describes `runtime/src/io.rs:
 sigil_println(ptr: *const u8, len: usize)` — two parameters, raw bytes
