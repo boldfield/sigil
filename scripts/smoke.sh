@@ -1,11 +1,38 @@
 #!/usr/bin/env bash
-# smoke.sh — plan A1 Stage 0 stub, populated in Stage 1 task 18.
+# smoke.sh — plan A1 Stage 1 task 18.
 #
-# Stage 0: succeed silently so the CI workflow can reference the file
-# before the hello-world vertical slice exists. Stage 1 task 18 replaces
-# this with a real build + run of examples/hello.sigil.
+# Builds the sigil compiler, compiles examples/hello.sigil, runs the
+# produced binary, and asserts stdout is exactly "hello, world" and
+# exit status is zero. Later plans extend this with additional
+# examples.
+#
+# Cargo is expected on PATH. Works from any cwd.
 
 set -euo pipefail
 
-echo "smoke: stage-0 stub (populated in Stage 1 task 18)"
-exit 0
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
+cd "${repo_root}"
+
+cargo build --release --workspace --quiet
+
+sigil_bin="${repo_root}/target/release/sigil"
+source_path="${repo_root}/examples/hello.sigil"
+
+tmpdir="$(mktemp -d -t sigil-smoke.XXXXXX)"
+trap 'rm -rf "${tmpdir}"' EXIT
+out_path="${tmpdir}/hello"
+
+"${sigil_bin}" "${source_path}" -o "${out_path}"
+
+actual="$("${out_path}")"
+expected="hello, world"
+
+if [[ "${actual}" != "${expected}" ]]; then
+    echo "smoke: FAIL — stdout mismatch" >&2
+    echo "  expected: ${expected}" >&2
+    echo "  actual:   ${actual}" >&2
+    exit 1
+fi
+
+echo "smoke: OK (hello-world printed as expected)"
