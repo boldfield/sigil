@@ -187,19 +187,32 @@ impl Tc {
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
-        // Per-function environment: start from the global `fn_env` so
-        // the body can reference sibling and own-recursive top-level
-        // functions (plan A2 task 30), then extend with params. Lets
-        // and lambda captures push further during `check_block`.
-        self.env = self.fn_env.clone();
+        // Fresh per-function local env: holds only parameters and
+        // `let` bindings. Top-level function signatures live in
+        // `self.fn_env`, consulted as a fallback during Ident
+        // resolution (see `check_expr`/`Expr::Ident`). Keeping the
+        // two maps separate avoids two bugs that arose when fn_env
+        // was merged into env at fn entry:
+        //
+        //   1. Debug-assert in `env_insert` tripped on `let foo: Int
+        //      = ...` inside a function whose top-level namesake
+        //      is also `foo` — because `foo` was already in `env`
+        //      via the fn_env seeding. Release builds silently
+        //      overwrote, leaving fn_env's entry inconsistent with
+        //      the local binding.
+        //   2. Capture analysis treated every top-level fn name as
+        //      an outer free variable, so closure conversion would
+        //      allocate spurious env fields for statically-resolvable
+        //      top-level symbols.
+        //
+        // Reported on PR #6 review; fix preserves local-first lookup
+        // semantics (params/lets shadow top-level fns of the same
+        // name within their scope) while keeping fn_env out of the
+        // insert-collision and capture-analysis paths.
+        self.env.clear();
         for p in &f.params {
             if let Some(ty) = ty_from_type_expr(&p.ty) {
-                // Params may shadow global fn names inside this function's
-                // scope. The shadowing is deliberate and local-first
-                // lookup makes `fn fib(fib: Int) -> Int { fib + 1 }` refer
-                // to the parameter, not the enclosing function. That's
-                // unusual but not wrong; resolve.rs does not intervene.
-                self.env.insert(p.name.clone(), ty);
+                self.env_insert(p.name.clone(), ty);
             }
         }
         if f.name == "main" {
@@ -351,17 +364,31 @@ impl Tc {
                 self.string_literals.push((span.clone(), s.clone()));
                 Some(Ty::String)
             }
-            Expr::Ident(name, span) => match self.env.get(name).cloned() {
-                Some(ty) => Some(ty),
-                None => {
-                    self.push_error(
-                        "E0046",
-                        span.clone(),
-                        format!("unknown identifier `{name}`"),
-                    );
-                    None
+            Expr::Ident(name, span) => {
+                // Local env first (params + lets + lambda captures
+                // stitched in during `check_lambda`), then fall
+                // through to the global fn_env for top-level
+                // function references. Keeping the two maps separate
+                // lets `let foo: Int = ...` locally shadow a
+                // top-level `fn foo() -> ...` without `env_insert`'s
+                // debug-assert tripping (see PR #6 review).
+                match self
+                    .env
+                    .get(name)
+                    .or_else(|| self.fn_env.get(name))
+                    .cloned()
+                {
+                    Some(ty) => Some(ty),
+                    None => {
+                        self.push_error(
+                            "E0046",
+                            span.clone(),
+                            format!("unknown identifier `{name}`"),
+                        );
+                        None
+                    }
                 }
-            },
+            }
             Expr::Call { callee, args, span } => self.check_call(callee, args, span.clone(), row),
             Expr::Perform(p) => {
                 self.check_perform(p, row);
@@ -1564,6 +1591,46 @@ mod tests {
         assert!(
             captures.is_empty(),
             "lambda with no free vars should have no captures, got {captures:?}"
+        );
+    }
+
+    #[test]
+    fn lambda_does_not_capture_top_level_fn() {
+        // A lambda body references a top-level fn (`inc`). Top-level
+        // fn names must resolve through `fn_env`, not be treated as
+        // free variables — otherwise Task 31's closure conversion
+        // would allocate a spurious env field for a statically-
+        // resolvable symbol. Pinned here after PR #6 review found
+        // the capture-over-fn-names bug.
+        let src = "fn inc(x: Int) -> Int ![] { x + 1 }\n\
+                   fn main() -> Int ![] { (fn (y: Int) -> Int ![] => inc(y))(1) }\n";
+        let (toks, _) = crate::lexer::lex("t.sigil", src);
+        let (prog, _) = crate::parser::parse("t.sigil", &toks);
+        let (rp, _) = crate::resolve::resolve(prog);
+        let (checked, errs) = typecheck(rp.program);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+        assert_eq!(checked.lambda_captures.len(), 1, "one lambda");
+        let (_, captures) = &checked.lambda_captures[0];
+        assert!(
+            !captures.iter().any(|n| n == "inc"),
+            "top-level fn `inc` must not appear in captures, got {captures:?}"
+        );
+    }
+
+    #[test]
+    fn let_shadowing_top_level_fn_typechecks() {
+        // A function whose body `let`-binds a name that matches a
+        // top-level fn must typecheck clean in both debug and
+        // release. Pre-fix: the fn_env-seeding made the `let`
+        // collide with the top-level fn's entry in the local env,
+        // tripping `env_insert`'s debug-assert in debug builds and
+        // silently overwriting in release. PR #6 review found this.
+        let src = "fn foo() -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { let foo: Int = 3; foo }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "let shadowing a top-level fn name should typecheck clean, got: {errs:?}"
         );
     }
 
