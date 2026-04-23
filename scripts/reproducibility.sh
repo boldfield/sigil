@@ -32,8 +32,16 @@ fi
 tmpdir="$(mktemp -d -t sigil-repro.XXXXXX)"
 trap 'rm -rf "${tmpdir}"' EXIT
 
-out_a="${tmpdir}/hello_a"
-out_b="${tmpdir}/hello_b"
+# On macOS the ad-hoc code signature's Identifier is derived from the
+# output filename, so two compiles to different filenames produce
+# byte-different binaries even though the compilation is reproducible.
+# Compile twice to the *same* filename (in per-run subdirectories) so
+# filename-derived metadata is identical across the two binaries.
+dir_a="${tmpdir}/a"
+dir_b="${tmpdir}/b"
+mkdir -p "${dir_a}" "${dir_b}"
+out_a="${dir_a}/hello"
+out_b="${dir_b}/hello"
 
 "${sigil_bin}" "${source_path}" -o "${out_a}"
 "${sigil_bin}" "${source_path}" -o "${out_b}"
