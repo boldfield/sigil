@@ -677,8 +677,6 @@ impl<'a> Lowerer<'a> {
         scrutinee: &crate::ast::Expr,
         arms: &[crate::ast::MatchArm],
     ) -> Value {
-        use crate::ast::Pattern;
-
         let s = self.lower_expr(scrutinee);
         let s_ty = self.builder.func.dfg.value_type(s);
 
@@ -696,44 +694,23 @@ impl<'a> Lowerer<'a> {
         // unreachable trap below.
         let mut chain_terminated = false;
         for arm in arms.iter() {
-            match &arm.pattern {
-                Pattern::Wildcard(_) => {
+            match pattern_as_immediate(&arm.pattern) {
+                None => {
+                    // Wildcard arm: unconditional jump to the continue
+                    // block. Typecheck accepts trailing arms after a
+                    // wildcard but they're dead; break out of the
+                    // chain unconditionally.
                     let v = self.lower_expr(&arm.body);
                     self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
                     chain_terminated = true;
-                    // No arms should follow a wildcard in well-typed
-                    // programs (typecheck accepts them but they're
-                    // dead); break out of the chain unconditionally.
                     break;
                 }
-                Pattern::IntLit(n, _) => {
-                    let lit = self.builder.ins().iconst(s_ty, *n);
-                    let eq = self.builder.ins().icmp(IntCC::Equal, s, lit);
-                    let body = self.builder.create_block();
-                    let next = self.builder.create_block();
-                    self.builder.ins().brif(eq, body, &[], next, &[]);
-                    self.builder.switch_to_block(body);
-                    self.builder.seal_block(body);
-                    let v = self.lower_expr(&arm.body);
-                    self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
-                    self.builder.switch_to_block(next);
-                    self.builder.seal_block(next);
-                }
-                Pattern::BoolLit(b, _) => {
-                    let lit = self.builder.ins().iconst(s_ty, if *b { 1 } else { 0 });
-                    let eq = self.builder.ins().icmp(IntCC::Equal, s, lit);
-                    let body = self.builder.create_block();
-                    let next = self.builder.create_block();
-                    self.builder.ins().brif(eq, body, &[], next, &[]);
-                    self.builder.switch_to_block(body);
-                    self.builder.seal_block(body);
-                    let v = self.lower_expr(&arm.body);
-                    self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
-                    self.builder.switch_to_block(next);
-                    self.builder.seal_block(next);
-                }
-                Pattern::CharLit(c, _) => {
-                    let lit = self.builder.ins().iconst(s_ty, *c as i64);
+                Some(imm) => {
+                    // Literal arm: compare scrutinee to the pattern's
+                    // immediate value; on equality enter the body and
+                    // jump to `cont`, otherwise fall through to the
+                    // next arm.
+                    let lit = self.builder.ins().iconst(s_ty, imm);
                     let eq = self.builder.ins().icmp(IntCC::Equal, s, lit);
                     let body = self.builder.create_block();
                     let next = self.builder.create_block();
@@ -812,6 +789,29 @@ impl<'a> Lowerer<'a> {
 /// runtime has a richer trap catalogue.
 const TRAP_ARITH_ABORT: u8 = 0x40;
 const TRAP_NONEXHAUSTIVE_MATCH: u8 = 0x41;
+
+/// Reduce a pattern to the `i64` immediate that codegen needs to
+/// compare the scrutinee against. Returns `None` for `Wildcard` — the
+/// lowerer treats that as an unconditional branch target. This helper
+/// unifies the compare-and-branch logic for `IntLit` / `BoolLit` /
+/// `CharLit` patterns, which otherwise differ only in the immediate's
+/// source.
+///
+/// Plan A3 will introduce constructor patterns (sum types); when that
+/// lands the return type must change — `Option<i64>` no longer spans
+/// the full pattern space. The lowerer's callers will need a richer
+/// classification (tag-then-compare for sum-type tags, structural
+/// match for records). Until then, this helper is a faithful Stage-2
+/// surface.
+fn pattern_as_immediate(p: &crate::ast::Pattern) -> Option<i64> {
+    use crate::ast::Pattern;
+    match p {
+        Pattern::IntLit(n, _) => Some(*n),
+        Pattern::BoolLit(b, _) => Some(i64::from(*b)),
+        Pattern::CharLit(c, _) => Some(*c as i64),
+        Pattern::Wildcard(_) => None,
+    }
+}
 
 /// Best-effort PC-offset approximation for Stage 1's placeholder stackmap.
 /// Cranelift's real stack-map API ships in Plan B; the number here is a

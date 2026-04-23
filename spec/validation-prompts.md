@@ -60,3 +60,46 @@ second
 ```
 
 **Oracle (exit):** `0`
+
+## P05 — parity check via mod and if/else
+
+**Prompt:** Write a Sigil program that assigns the integer `14` to a
+variable `n`, uses the `%` operator and `==` to check whether `n` is
+even (i.e. `n % 2 == 0`), prints `even` on a single line if it is and
+`odd` otherwise via `perform IO.println`, then returns `0` as the
+process exit status.
+
+**Oracle (stdout):**
+```
+even
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises Stage-2 features — the `%` operator, the
+`==` comparison on `Int`, a `let` binding of type `Bool`, and
+`if`/`else` as an expression whose branches unify to `String`. The
+prompt deliberately hard-codes `n = 14` so the oracle is
+deterministic; generalising to runtime-varied input arrives with Plan
+B's effect handlers.
+
+## P07 — safe divide with explicit divisor check
+
+**Prompt:** Write a Sigil program that assigns `n = 42` and `d = 0`,
+then computes a value `q`: when `d == 0`, `q` should be `-1`;
+otherwise `q` should be `n / d`. The program must not trigger the
+runtime's division-by-zero trap. Return `q` as the process exit
+status (no stdout output).
+
+**Oracle (stdout):** *(empty)*
+
+**Oracle (exit):** `255`
+
+**Oracle (notes):** Unix exit codes are unsigned 8-bit, so `-1`
+surfaces as `255` to a calling shell. The prompt tests the Stage-2
+"explicit guard around `/`" pattern: without the guard the runtime
+trap (E0401) fires and the process exits with status `2`. A correct
+program threads a `Bool` through `if`/`else` to select between `-1`
+and `n / d`, dodging the trap entirely. Plan B replaces this pattern
+with a `Raise[ArithError]` effect the caller can handle; until then,
+`if` guards are the only tool.

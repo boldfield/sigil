@@ -1,0 +1,22 @@
+// examples/arith.sigil
+//
+// Stage 2 arithmetic example (plan A2 task 26): demonstrates `+`, `-`,
+// `*`, `/`, `%`, integer comparison, unary negation, and `if`/`else`.
+// Computes the process exit code from a small formula.
+//
+// Invariant: running this program exits with status 26.
+//   n = 42
+//   half = n / 2            = 21
+//   rem = n % 10            = 2
+//   boosted = half + rem + 3 = 26
+//   n is even, so the `if` selects `boosted` over `-boosted`.
+
+fn main() -> Int ![] {
+  let n: Int = 42;
+  let half: Int = n / 2;
+  let rem: Int = n % 10;
+  let boosted: Int = half + rem + 3;
+  let is_even: Bool = n % 2 == 0;
+  let result: Int = if is_even { boosted } else { -boosted };
+  result
+}

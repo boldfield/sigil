@@ -66,18 +66,18 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
   - commits: [d4d0682]
   - notes: Two new runtime modules: `runtime/src/arith.rs` (`sigil_panic_arith_error` → writes `sigil: arithmetic error: <reason>` to stderr then `std::process::exit(2)`; `sigil_int_to_string` → allocates via `sigil_string_new`; `sigil_checked_add`/`sub`/`mul` returning `#[repr(C)] CheckedInt { value: i64, overflowed: bool }`) and `runtime/src/byte.rs` (`sigil_byte_from_int_checked` returning `#[repr(C)] ByteFromInt { value: u8, in_range: bool }`; `sigil_byte_to_int`, `sigil_byte_add`, `sigil_byte_sub` wrapping). `libc::exit(2)` in the plan's spec → `std::process::exit(2)` in the implementation (runtime has no `libc` dep; `std::process::exit` is equivalent — delegates to `exit(3)` on Unix, flushes stdout/stderr, runs `atexit` handlers, so the counter-dump atexit still fires). Byte primitives are shipped but not yet called from codegen — language-level exposure arrives with Stage 3's user-fn calls (Task 29) and Plan A3's sum types (for `Option[Byte]`). New catalog entry **E0401** ("runtime arithmetic abort") with long-form text explaining the v1-only surface and Plan B's `Raise[ArithError]` successor. 14 new runtime tests (6 arith + 8 byte); 37 total runtime lib tests all green locally. `sigil_panic_arith_error` itself has no unit test because it exits the process — exercised via the Task 24 `div_by_zero_traps`/`mod_by_zero_traps` e2e tests.
     - **Test-concurrency fix** landed with this task: `runtime/src/test_support.rs` exposes a crate-level `Mutex` guard that serialises every GC-allocating test. Rationale is in the module doc and reproduced here: Boehm is built with POSIX thread support but Rust test threads are not auto-registered (`std::thread::spawn` is not `GC_pthread_create`), so Boehm's mark phase can miss pointers on unregistered stacks, collect live objects, and reuse the slots from concurrent allocations. Pre-existing `gc::tests::alloc_empty_string` had been passing by luck (low GC pressure); adding the new arith tests tipped the pressure over the threshold and the test became flaky (~30% failure rate under parallel `cargo test`). The mutex makes every GC-touching runtime test take turns, which dodges the race at ~1ms/test cost. Proper thread registration (`GC_allow_register_threads` + `GC_register_my_thread`) is deferred to Plan B when the precise-GC rewrite happens.
-- Task 26 — examples/factorial.sigil + arith.sigil + div_by_zero.sigil + e2e tests
-  - status: todo
+- Task 26 — examples/arith.sigil + examples/div_by_zero.sigil + e2e tests + PR #2 deferrals
+  - status: done-pending-ci
+  - commits: [(pending)]
+  - notes: (scope revised post PR #3 review at designs commit `8e75c43`) Factorial deferred to Stage 3 (Task 33's `fibonacci.sigil` absorbs the recursive-oracle role). Ships `examples/arith.sigil` (mixed arithmetic + `if`/`else`; invariant exit 26) and `examples/div_by_zero.sigil` (test-only trap trigger — exits 2 with the `sigil: arithmetic error: division by zero` banner). Two new file-based e2e tests (`arith_example_exits_26`, `div_by_zero_example_traps`) replace the Task 24 inline `arith_integer_ops` / `div_by_zero_traps` coverage. PR #2 deferrals picked up: `sigil_binary() -> PathBuf` helper wraps `env!("CARGO_BIN_EXE_sigil")` + `ensure_runtime_staticlib` behind a `std::sync::Once`; every e2e test (including the pre-existing `hello` and `stackmap_section_parses_v0_placeholder`) migrated to the helper. `compile_file_and_run` + `compile_and_run` (inline-source wrapper) share the same staticlib-aware path. QUESTIONS.md `[PLAN-A2] factorial-in-Stage-2` resolved as option (a) with full reviewer rationale. Drive-by dedup: the three identical literal-pattern branches in `lower_match` collapsed through a `pattern_as_immediate(&Pattern) -> Option<i64>` helper (~40 lines of duplication removed).
+- Task 27 — Stage 2 has no Stage-2-specific perf floor
+  - status: done
   - commits: []
-  - notes:
-- Task 27 — Performance floor: factorial(10) in <100ms end-to-end on both hosts
-  - status: todo
-  - commits: []
-  - notes:
-- Task 28 — Seed prompt bank P04–P07
-  - status: todo
-  - commits: []
-  - notes:
+  - notes: (scope revised post PR #3 review at designs commit `8e75c43`) The original `factorial(10) < 100ms` perf floor is dropped because Stage 2 has no non-trivial recursive program to benchmark (factorial moved to Stage 3). For Stage 2, verification shrinks to "`cargo test --workspace` completes within CI job limits on both hosts" — covered by every PR's CI run on both hosts. The v1 perf floor lives in **Task 34** as `fib(20) == 6765` in <50ms. No code change required for Task 27 at the Stage-2 cut.
+- Task 28 — Seed prompt bank (P05 + P07 only; P04 + P06 deferred to Task 35)
+  - status: done-pending-ci
+  - commits: [(pending)]
+  - notes: (scope revised post PR #3 review at designs commit `8e75c43`) Added P05 (parity check via `%` and `if`/`else`) and P07 (safe divide with explicit divisor check) to `spec/validation-prompts.md`. P07 notes that Unix exit-code truncation converts `-1` to `255`. Prompts can't be validated against a real spec until Plan C — authored as scaffolding. P04 (sum-to-n via recursion) and P06 (multiplication table via nested recursion) require user function calls and move to Stage 3's Task 35 alongside P08-P10.
 
 ## Stage 3 — Multi-arg functions, recursion, closures, lambdas
 
@@ -105,7 +105,7 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
   - status: todo
   - commits: []
   - notes:
-- Task 35 — Seed prompt bank P08–P10
+- Task 35 — Seed prompt bank P04, P06, P08–P10 (P04+P06 moved from Task 28)
   - status: todo
   - commits: []
-  - notes:
+  - notes: (scope revised post PR #3 review at designs commit `8e75c43`) Task 35 now ships five prompts, not three: P04 and P06 moved here from Task 28 because they require recursive user function calls (only available after Task 29). P08-P10 unchanged.
