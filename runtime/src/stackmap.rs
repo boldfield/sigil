@@ -90,8 +90,7 @@ pub fn parse_section(bytes: &[u8]) -> Result<ParsedSection, ParseError> {
         return Err(ParseError::UnknownVersion(version));
     }
     let count = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-    let expected =
-        STACKMAP_HEADER_SIZE.saturating_add(count.saturating_mul(STACKMAP_RECORD_SIZE));
+    let expected = STACKMAP_HEADER_SIZE.saturating_add(count.saturating_mul(STACKMAP_RECORD_SIZE));
     if bytes.len() < expected {
         return Err(ParseError::TruncatedRecords);
     }
