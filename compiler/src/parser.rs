@@ -21,7 +21,7 @@
 //! the same compile invocation.
 
 use crate::ast::*;
-use crate::errors::{catalog::ErrorCode, CompilerError, Severity, Span};
+use crate::errors::{self, CompilerError, Severity, Span};
 use crate::lexer::{Token, TokenKind};
 
 pub fn parse(file: &str, tokens: &[Token]) -> (Program, Vec<CompilerError>) {
@@ -72,12 +72,12 @@ impl<'a> Parser<'a> {
     }
 
     fn err(&mut self, span: Span, message: impl Into<String>) {
-        let code = match ErrorCode::new("E0010") {
-            Some(c) => c,
-            None => panic!("catalog is missing E0010"),
-        };
-        self.errors
-            .push(CompilerError::new(Severity::Error, code, span, message));
+        self.errors.push(CompilerError::new(
+            Severity::Error,
+            errors::code("E0010"),
+            span,
+            message,
+        ));
     }
 
     fn expect(&mut self, kind: &TokenKind, what: &str) -> Option<Token> {
@@ -151,13 +151,9 @@ impl<'a> Parser<'a> {
         }
         // v1 restricts user imports to std.*.
         if path.first().map(String::as_str) != Some("std") {
-            let code = match ErrorCode::new("E0031") {
-                Some(c) => c,
-                None => panic!("catalog is missing E0031"),
-            };
             self.errors.push(CompilerError::new(
                 Severity::Error,
-                code,
+                errors::code("E0031"),
                 start.clone(),
                 format!(
                     "user-code imports are not supported in v1 (saw `{}`)",
@@ -393,7 +389,7 @@ impl<'a> Parser<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use crate::lexer::lex;

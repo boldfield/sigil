@@ -12,7 +12,7 @@
 //! Unknown characters produce `E0010` at the position of the offending byte.
 //! Every token carries a `Span` back to the source.
 
-use crate::errors::{self, CompilerError, ErrorCode, Severity, Span};
+use crate::errors::{self, CompilerError, Severity, Span};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TokenKind {
@@ -152,24 +152,15 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
         // Unknown character.
         let span = Span::new(file, start_line, start_col, start_line, start_col + 1);
         cursor.advance();
-        let code = errors::catalog::ErrorCode::new("E0010").unwrap_or_else(|| panic_code("E0010"));
         errors.push(CompilerError::new(
             Severity::Error,
-            code,
+            errors::code("E0010"),
             span,
             format!("unexpected character `{c}`"),
         ));
     }
 
     (tokens, errors)
-}
-
-fn panic_code(code: &str) -> ErrorCode {
-    // Catalog-entry absence for a compiler-owned string is a build-time
-    // invariant (the catalog seed is checked into the tree). We panic
-    // here rather than propagate a `CompilerError` because this path
-    // cannot happen with a well-formed catalog.
-    panic!("catalog is missing entry for {code}");
 }
 
 struct Cursor<'a> {
@@ -291,11 +282,9 @@ impl<'a> Cursor<'a> {
         loop {
             if self.at_eof() {
                 let span = Span::new(self.file, start_line, start_col, self.line, self.col);
-                let code =
-                    errors::catalog::ErrorCode::new("E0010").unwrap_or_else(|| panic_code("E0010"));
                 return Err(CompilerError::new(
                     Severity::Error,
-                    code,
+                    errors::code("E0010"),
                     span,
                     "unterminated string literal",
                 ));
@@ -318,11 +307,9 @@ impl<'a> Cursor<'a> {
                         let span =
                             Span::new(self.file, self.line, self.col, self.line, self.col + 1);
                         self.advance();
-                        let code = errors::catalog::ErrorCode::new("E0010")
-                            .unwrap_or_else(|| panic_code("E0010"));
                         return Err(CompilerError::new(
                             Severity::Error,
-                            code,
+                            errors::code("E0010"),
                             span,
                             format!("unknown string escape `\\{other}`"),
                         ));
@@ -342,7 +329,7 @@ impl<'a> Cursor<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
 

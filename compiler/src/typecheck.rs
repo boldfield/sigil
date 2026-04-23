@@ -14,7 +14,7 @@
 //! as possible.
 
 use crate::ast::*;
-use crate::errors::{catalog::ErrorCode, CompilerError, Severity, Span};
+use crate::errors::{self, CompilerError, Severity, Span};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
@@ -72,12 +72,12 @@ struct Tc {
 
 impl Tc {
     fn push_error(&mut self, code: &'static str, span: Span, msg: impl Into<String>) {
-        let c = match ErrorCode::new(code) {
-            Some(c) => c,
-            None => panic!("catalog is missing {code}"),
-        };
-        self.errors
-            .push(CompilerError::new(Severity::Error, c, span, msg));
+        self.errors.push(CompilerError::new(
+            Severity::Error,
+            errors::code(code),
+            span,
+            msg,
+        ));
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
@@ -214,7 +214,7 @@ fn type_matches(expected: &TypeExpr, actual: Ty) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use crate::{lexer::lex, parser::parse, resolve::resolve};

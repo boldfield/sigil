@@ -6,7 +6,7 @@
 //! `NodeId`-based symbol table is populated in later plans.
 
 use crate::ast::*;
-use crate::errors::{catalog::ErrorCode, CompilerError, Severity, Span};
+use crate::errors::{CompilerError, Severity, Span};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
@@ -31,13 +31,9 @@ pub fn resolve(program: Program) -> (ResolvedProgram, Vec<CompilerError>) {
 }
 
 fn push_redef(errors: &mut Vec<CompilerError>, span: Span, name: &str) {
-    let code = match ErrorCode::new("E0020") {
-        Some(c) => c,
-        None => panic!("catalog is missing E0020"),
-    };
     errors.push(CompilerError::new(
         Severity::Error,
-        code,
+        crate::errors::code("E0020"),
         span,
         format!("redefinition of `{name}` — Sigil forbids shadowing"),
     ));
@@ -57,7 +53,7 @@ fn resolve_block(b: &Block, scope: &mut BTreeSet<String>, errors: &mut Vec<Compi
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use crate::{lexer::lex, parser::parse};
