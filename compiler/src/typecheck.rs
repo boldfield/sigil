@@ -277,6 +277,24 @@ impl Tc {
                 self.check_perform(p, row);
                 Some(Ty::Unit)
             }
+            // Stage-2 expression shapes — parser accepts them (task 21)
+            // so they round-trip through the AST, but typechecker rules
+            // land in task 22. Until then, reject with E0043 so any
+            // program that happens to exercise them produces a
+            // user-facing error rather than slipping through.
+            Expr::BoolLit(_, _)
+            | Expr::CharLit(_, _)
+            | Expr::Binary { .. }
+            | Expr::Unary { .. }
+            | Expr::If { .. }
+            | Expr::Match { .. } => {
+                self.push_error(
+                    "E0043",
+                    e.span(),
+                    "Stage-2 expression shapes are parsed but not yet typed (plan A2 task 22)",
+                );
+                None
+            }
         }
     }
 }

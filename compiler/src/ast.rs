@@ -74,6 +74,8 @@ pub struct LetStmt {
 pub enum Expr {
     IntLit(i64, Span),
     StringLit(String, Span),
+    BoolLit(bool, Span),
+    CharLit(char, Span),
     Ident(String, Span),
     Call {
         callee: Box<Expr>,
@@ -81,6 +83,78 @@ pub enum Expr {
         span: Span,
     },
     Perform(PerformExpr),
+    // Stage 2 additions (plan A2 task 21).
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        span: Span,
+    },
+    Unary {
+        op: UnOp,
+        operand: Box<Expr>,
+        span: Span,
+    },
+    If {
+        cond: Box<Expr>,
+        then_block: Box<Block>,
+        else_block: Box<Block>,
+        span: Span,
+    },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    NotEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
+    And,
+    Or,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    Neg,
+    Not,
+}
+
+#[derive(Clone, Debug)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Expr,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum Pattern {
+    IntLit(i64, Span),
+    BoolLit(bool, Span),
+    CharLit(char, Span),
+    Wildcard(Span),
+}
+
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::IntLit(_, s)
+            | Pattern::BoolLit(_, s)
+            | Pattern::CharLit(_, s)
+            | Pattern::Wildcard(s) => s.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -96,8 +170,14 @@ impl Expr {
         match self {
             Expr::IntLit(_, s)
             | Expr::StringLit(_, s)
+            | Expr::BoolLit(_, s)
+            | Expr::CharLit(_, s)
             | Expr::Ident(_, s)
-            | Expr::Call { span: s, .. } => s.clone(),
+            | Expr::Call { span: s, .. }
+            | Expr::Binary { span: s, .. }
+            | Expr::Unary { span: s, .. }
+            | Expr::If { span: s, .. }
+            | Expr::Match { span: s, .. } => s.clone(),
             Expr::Perform(p) => p.span.clone(),
         }
     }
