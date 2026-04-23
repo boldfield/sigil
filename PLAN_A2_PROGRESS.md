@@ -43,11 +43,11 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
 
 - Task 20 — Extend lexer (booleans, if/else, match, operators, char literals)
   - status: done
-  - commits: [(pending)]
+  - commits: [b838a9c]
   - notes: Added keywords `true false if else match`; tokens `Plus Minus Star Slash Percent EqEq NotEq Lt Gt LtEq GtEq AndAnd OrOr FatArrow CharLit`; char-literal lexer with `\n \t \r \\ \'` escapes. Two-char lookahead wins over single (arrow vs minus, eqeq/fatarrow vs eq, etc.). 15 lexer unit tests pass (9 new).
 - Task 21 — Extend parser (arith/cmp with precedence, if, match, unary, constant-fold `-<lit>`)
   - status: done
-  - commits: [(pending)]
+  - commits: [964a83c]
   - notes: Pratt-style precedence climbing in `parse_expr_prec`. AST gains `BoolLit`, `CharLit`, `Binary`, `Unary`, `If`, `Match`, `MatchArm`, `BinOp`, `UnOp`, `Pattern`. `-<int-literal>` folds to `IntLit(-n)` at parse time. Parenthesized exprs supported. Typecheck emits E0043 "Stage-2 not yet typed" for the new variants (task 22 replaces with real rules). 15 parser unit tests pass (12 new).
 - Task 22 — Extend typechecker (Bool, Char, Byte; binop typing; if unification; match exhaustiveness)
   - status: todo
