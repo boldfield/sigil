@@ -35,9 +35,9 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
   - commits: [(pending)]
   - notes: DEVIATION logged. `compiler/build.rs` invokes `cargo build -p sigil-runtime` when `target/<profile>/libsigil_runtime.a` is missing; `SIGIL_SKIP_RUNTIME_STATICLIB_BUILD=1` opt-out available. Separate CI job `cold-checkout-test` runs `rm -rf target && cargo test --workspace` twice in succession on both hosts (slow; ~10m Linux, ~15m macOS). Approach documented in `runtime/README.md#cold-checkout-build-ordering`. Cold path cannot be validated on the pod (would OOM); CI is the authoritative acceptance gate.
 - Task 1.5.6 — `debug_assert!` on typecheck env insertion (no-shadowing invariant)
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [(pending)]
+  - notes: Extracted a `Tc::env_insert(name, ty)` helper that asserts `prev.is_none()` in debug builds. Both insertion sites (params in `check_fn`, let bindings in `check_block`) use the helper. All 14 typecheck tests still green.
 
 ## Stage 2 — Arithmetic, booleans, conditionals
 

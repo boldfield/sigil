@@ -87,6 +87,25 @@ impl Tc {
         ));
     }
 
+    /// Insert a binding into the current function's environment.
+    /// `resolve.rs` is responsible for rejecting shadowing and duplicate
+    /// bindings before typecheck runs, so a `None` return from the
+    /// underlying `BTreeMap::insert` is an invariant here. Asserting it
+    /// in debug builds makes any future caller that invokes `typecheck`
+    /// on an un-resolved AST (fuzzer harness, IDE integration,
+    /// experimental pipeline) fail loudly instead of silently preferring
+    /// the last insertion. No behaviour change in release builds.
+    fn env_insert(&mut self, name: String, ty: Ty) {
+        let prev = self.env.insert(name.clone(), ty);
+        debug_assert!(
+            prev.is_none(),
+            "typecheck env shadowing should have been caught by resolve.rs for '{name}'"
+        );
+        // `prev` is intentionally discarded in release builds; the debug
+        // assertion above is the entire contract.
+        let _ = prev;
+    }
+
     fn check_fn(&mut self, f: &FnDecl) {
         // Fresh environment per function. Sigil has no closures in Plan A1
         // (closure conversion is a no-op stub), so lexical scopes do not
@@ -94,7 +113,7 @@ impl Tc {
         self.env.clear();
         for p in &f.params {
             if let Some(ty) = ty_from_type_expr(&p.ty) {
-                self.env.insert(p.name.clone(), ty);
+                self.env_insert(p.name.clone(), ty);
             }
         }
         if f.name == "main" {
@@ -161,7 +180,7 @@ impl Tc {
                     // type mismatch in the initializer doesn't cascade into
                     // spurious E0044/E0046 at downstream sites.
                     if let Some(ty) = ty_from_type_expr(&l.ty) {
-                        self.env.insert(l.name.clone(), ty);
+                        self.env_insert(l.name.clone(), ty);
                     }
                 }
             }
