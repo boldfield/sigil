@@ -80,8 +80,23 @@ jobs:
       # memory lower than a single `cargo build --workspace`, which is
       # load-bearing on memory-constrained hosts where Cranelift's heavy
       # dependency tree co-compiles with the compiler crate.
+      #
+      # `rm` the cached staticlibs before the build: `cargo build -p
+      # sigil-runtime` can otherwise skip rebuilding the `.a` when the
+      # cached `target/` dir's per-unit fingerprints say it is fresh
+      # but a pod-verify step earlier in the job has updated some
+      # adjacent fingerprints (rlib / test-profile) such that cargo
+      # declines to re-emit the staticlib. Dropping the `.a` forces an
+      # unambiguous rebuild into the current source's symbol set. See
+      # Plan A2 task 24+25 commit history for the concrete
+      # manifestation: `sigil_panic_arith_error` was added to
+      # `runtime/src/arith.rs` on a cached-target CI run and the
+      # subsequent e2e link step reported `undefined reference` until
+      # this workaround landed.
       - name: build runtime
-        run: cargo build -p sigil-runtime
+        run: |
+          rm -f target/debug/libsigil_runtime.a target/release/libsigil_runtime.a
+          cargo build -p sigil-runtime
 
       - name: build compiler
         run: cargo build -p sigil-compiler

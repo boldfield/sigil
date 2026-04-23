@@ -248,11 +248,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // Plan A2: static null-terminated C strings for the arith-error
     // reasons. `sigil_panic_arith_error` consumes them as `*const
     // c_char`. The trailing `\0` is included in the data payload.
-    let div_zero_msg_id =
-        declare_cstring(&mut module, "sigil_arith_msg_div_zero", b"division by zero")?;
+    //
+    // Symbol names describe the content for the linker's symbol table;
+    // Mach-O section names (third arg) are capped at 16 chars and use
+    // abbreviated forms. Keep the two independent.
+    let div_zero_msg_id = declare_cstring(
+        &mut module,
+        "sigil_arith_msg_div_zero",
+        "_sigil_amsg_dz",
+        b"division by zero",
+    )?;
     let mod_zero_msg_id = declare_cstring(
         &mut module,
         "sigil_arith_msg_mod_zero",
+        "_sigil_amsg_mz",
         b"remainder by zero",
     )?;
 
@@ -387,23 +396,34 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 /// `declare_data_in_func` it and derive a `symbol_value` pointer at
 /// codegen time. The terminating `\0` is appended here; callers pass
 /// the raw bytes.
+///
+/// `symbol_name` identifies the data in the object's symbol table and
+/// can be as long as the linker allows (hundreds of chars). `section`
+/// names the output section containing the bytes; Mach-O caps section
+/// names at **16 characters** (including the NUL), so the two must be
+/// provided separately rather than sharing a name. ELF accepts either.
 fn declare_cstring(
     module: &mut ObjectModule,
-    name: &str,
+    symbol_name: &str,
+    section: &str,
     bytes: &[u8],
 ) -> Result<cranelift_module::DataId, String> {
+    debug_assert!(
+        section.len() < 16,
+        "Mach-O section name `{section}` exceeds the 16-char limit"
+    );
     let id = module
-        .declare_data(name, Linkage::Local, false, false)
-        .map_err(|e| format!("declare {name}: {e}"))?;
+        .declare_data(symbol_name, Linkage::Local, false, false)
+        .map_err(|e| format!("declare {symbol_name}: {e}"))?;
     let mut payload = Vec::with_capacity(bytes.len() + 1);
     payload.extend_from_slice(bytes);
     payload.push(0);
     let mut data = DataDescription::new();
     data.define(payload.into_boxed_slice());
-    data.set_segment_section(".rodata", name);
+    data.set_segment_section(".rodata", section);
     module
         .define_data(id, &data)
-        .map_err(|e| format!("define {name}: {e}"))?;
+        .map_err(|e| format!("define {symbol_name}: {e}"))?;
     Ok(id)
 }
 
