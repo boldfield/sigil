@@ -121,3 +121,45 @@ jobs:
 
       - name: smoke
         run: ./scripts/smoke.sh
+
+  # Cold-checkout acceptance for Plan A2 task 1.5.5:
+  # `rm -rf target && cargo test --workspace` must pass twice in
+  # succession on both hosts. Separate from `build-test` because that
+  # job caches `target/` and so cannot itself verify cold behaviour.
+  # Slow (~10 min Linux, up to ~15 min macOS); acceptable as the price
+  # of proving the invariant.
+  cold-checkout-test:
+    name: cold-checkout test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Boehm GC + lld (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgc-dev pkg-config lld clang
+
+      - name: install Boehm GC (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install bdw-gc pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/opt/bdw-gc/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+
+      # No actions/cache — the whole point of this job is to verify
+      # that a true cold `cargo test --workspace` succeeds.
+
+      - name: cold run 1 of 2
+        run: |
+          rm -rf target
+          cargo test --workspace --no-fail-fast
+
+      - name: cold run 2 of 2
+        run: |
+          rm -rf target
+          cargo test --workspace --no-fail-fast

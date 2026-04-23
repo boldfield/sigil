@@ -255,6 +255,39 @@ do not make an arbitrarily small ceiling work: the `cargo test
 binary (which links Cranelift and codegen), and on the Talos pod this
 alone exceeded ~12 GiB at j=1.
 
+## Cold-checkout build ordering
+
+Plan A2 task 1.5.5 — the runtime ships a **staticlib** (`libsigil_runtime.a`)
+which the compiler's linker driver links into every compiled Sigil program.
+Cargo does not automatically produce the staticlib artifact when
+`sigil-runtime` is pulled in as a plain dev-dep of `sigil-compiler`, because
+the dev-dep only consumes the rlib. On a cold `cargo test --workspace`
+this could leave the e2e test binary trying to link without the staticlib
+present.
+
+**Fix:** `compiler/build.rs` checks for `target/<profile>/libsigil_runtime.a`
+during sigil-compiler's build. If missing, it invokes
+`cargo build -p sigil-runtime` synchronously. Cargo 1.74+ handles nested
+invocations via the jobserver, so the pattern is safe on our 1.95.0 pin.
+
+**Opt-out:** set `SIGIL_SKIP_RUNTIME_STATICLIB_BUILD=1` in the environment
+if the staticlib is produced by another mechanism (custom build systems,
+IDE background indexers that don't want recursive cargo). The compiler's
+`build.rs` will skip the staticlib build and trust the caller; a missing
+staticlib will surface as a linker error at test / production-compile time.
+
+**CI acceptance check:** the `.github/workflows/ci.yml` file defines a
+`cold-checkout-test` job separate from the main `build-test` matrix. It
+runs `rm -rf target && cargo test --workspace` twice in succession (the
+plan's acceptance criterion) on both supported hosts. The main
+`build-test` job uses `actions/cache@v4` on `target/` so it cannot itself
+prove the cold-checkout invariant; keeping the cold verification in its
+own job lets the warm-path cache still work.
+
+See `PLAN_A2_DEVIATIONS.md` ([Task 1.5.5]) for why this shell-out is used
+instead of an artifact dependency (`cargo-features = ["bindeps"]` is
+unstable as of Rust 1.95.0) or CI restructure alone.
+
 ## macOS prerequisites
 
 - `brew install bdw-gc pkg-config` — the runtime crate's `build.rs`
