@@ -288,6 +288,37 @@ pub const CATALOG: &[ErrorEntry] = &[
                       match n {\n  0 => \"zero\",\n  _ => \"other\",\n}  // Int exhaustive: wildcard covers the rest",
     },
     ErrorEntry {
+        code: "E0068",
+        short: "cannot apply a non-function value",
+        long: "A call-site expression `callee(args...)` requires the callee \
+               to have a function type. Plan A2 function types are built \
+               from `fn` declarations (top-level or lambdas) and have the \
+               shape `(param_tys) -> ret_ty ![effects]`. Applying a \
+               non-function value — an `Int`, `Bool`, `String`, or any \
+               other primitive — is a type error.\n\n\
+               Common causes: a typo in the callee name that resolved to a \
+               user variable; a parenthesised expression whose result \
+               happens to be a primitive; or a lambda-bound name that \
+               was later shadowed by a `let` of a non-function type.",
+        fix_example: "fn inc(x: Int) -> Int ![] { x + 1 }\n\
+                      fn main() -> Int ![] { inc(41) }",
+    },
+    ErrorEntry {
+        code: "E0069",
+        short: "lambda body type does not match declared return type",
+        long: "A lambda expression `fn (params) -> R ![E] => body` requires \
+               `typeof(body)` to match the declared return type `R`. The \
+               checker does not infer a lambda's return type; it verifies \
+               the programmer's annotation. Adjust either the annotation or \
+               the body so the two agree.\n\n\
+               The check fires in-place when the lambda is type-checked — \
+               before the lambda is assigned or passed as an argument. A \
+               separate diagnostic (E0044) handles the case where the \
+               lambda's overall function type is passed to a callee whose \
+               parameter expects a different function type.",
+        fix_example: "let inc = fn (x: Int) -> Int ![] => x + 1;  // body is Int, matches",
+    },
+    ErrorEntry {
         code: "E0401",
         short: "runtime arithmetic abort",
         long: "A division or modulo operation was performed with a zero \

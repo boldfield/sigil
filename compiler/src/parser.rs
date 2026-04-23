@@ -532,6 +532,17 @@ impl<'a> Parser<'a> {
     /// dispatches on `TokenKind::Fn`; no `fn_decl`/`lambda`
     /// disambiguation is needed because `parse_fn_decl` only runs
     /// from `parse_program`, not from expression-position parsing.
+    ///
+    /// # Body precedence note
+    ///
+    /// The body is parsed via `parse_expr`, which recurses all the
+    /// way down to `postfix`. That means `fn () -> Int ![] => 1()`
+    /// parses as `Lambda { body: Call(IntLit 1, []) }`, *not*
+    /// `Call(Lambda { body: IntLit 1 }, [])`. Callers who want the
+    /// latter parse must parenthesise the lambda. This mirrors the
+    /// ML/Haskell convention — the lambda body extends as far to the
+    /// right as possible. The `lambda_body_swallows_postfix` test
+    /// pins the behaviour so a future precedence tweak is deliberate.
     fn parse_lambda_expr(&mut self) -> Option<Expr> {
         let start = self.peek().span.clone();
         self.expect(&TokenKind::Fn, "`fn`")?;
@@ -911,23 +922,28 @@ mod tests {
 
     #[test]
     fn multi_arg_fn_decl_parses() {
-        let src = "fn sum3(a: Int, b: Int, c: Int) -> Int ![] { 0 }\n\
+        // Mix types across params to exercise `parse_type()` re-entry
+        // between commas. Per PR #5 reviewer follow-up.
+        let src = "fn mix(a: Int, b: String, c: Bool) -> Int ![] { 0 }\n\
                    fn main() -> Int ![] { 0 }\n";
         let (toks, _) = lex("t.sigil", src);
         let (prog, errs) = parse("t.sigil", &toks);
         assert!(errs.is_empty(), "parse errs: {errs:?}");
-        let sum3 = prog
+        let mix = prog
             .items
             .iter()
             .find_map(|i| match i {
-                Item::Fn(f) if f.name == "sum3" => Some(f),
+                Item::Fn(f) if f.name == "mix" => Some(f),
                 _ => None,
             })
-            .expect("sum3 not parsed");
-        assert_eq!(sum3.params.len(), 3);
-        assert_eq!(sum3.params[0].name, "a");
-        assert_eq!(sum3.params[1].name, "b");
-        assert_eq!(sum3.params[2].name, "c");
+            .expect("mix not parsed");
+        assert_eq!(mix.params.len(), 3);
+        assert_eq!(mix.params[0].name, "a");
+        assert_eq!(mix.params[1].name, "b");
+        assert_eq!(mix.params[2].name, "c");
+        assert!(matches!(&mix.params[0].ty, TypeExpr::Named(n, _) if n == "Int"));
+        assert!(matches!(&mix.params[1].ty, TypeExpr::Named(n, _) if n == "String"));
+        assert!(matches!(&mix.params[2].ty, TypeExpr::Named(n, _) if n == "Bool"));
     }
 
     #[test]
@@ -1106,5 +1122,89 @@ mod tests {
             }
             other => panic!("expected Call on Lambda, got {other:?}"),
         }
+    }
+
+    // ===== Plan A2 Task 30 — reviewer follow-ups on parser surface ======
+
+    #[test]
+    fn lambda_body_swallows_postfix() {
+        // `parse_lambda_expr`'s body is `parse_expr`, which recurses
+        // down to postfix; that means `fn () -> Int ![] => 1()`
+        // parses as `Lambda { body: Call(IntLit 1, []) }`, **not**
+        // `Call(Lambda { body: IntLit 1 }, [])`. Callers who want the
+        // other parse must parenthesise the lambda. This matches ML
+        // and Haskell conventions — pinned here so a future grammar
+        // tweak to lambda-body precedence is a deliberate decision.
+        let e = parse_tail_expr("fn () -> Int ![] => 1()");
+        match e {
+            Expr::Lambda { body, .. } => match *body {
+                Expr::Call { callee, args, .. } => {
+                    assert!(args.is_empty());
+                    assert!(matches!(*callee, Expr::IntLit(1, _)));
+                }
+                other => panic!("body should be Call, got {other:?}"),
+            },
+            other => panic!("outer should be Lambda, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lambda_in_call_arg_parses() {
+        // `f(fn () -> Int ![] => 1)` — lambda as a call argument.
+        // Should compose via `parse_postfix`'s arg-list calling
+        // `parse_expr`.
+        let e = parse_tail_expr("f(fn () -> Int ![] => 1)");
+        match e {
+            Expr::Call { callee, args, .. } => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Expr::Lambda { .. }));
+                assert!(matches!(*callee, Expr::Ident(ref n, _) if n == "f"));
+            }
+            other => panic!("expected Call with Lambda arg, got {other:?}"),
+        }
+    }
+
+    fn parse_errs(src: &str) -> Vec<CompilerError> {
+        let (toks, _) = lex("t.sigil", src);
+        let (_prog, errs) = parse("t.sigil", &toks);
+        errs
+    }
+
+    #[test]
+    fn lambda_missing_arrow_errors() {
+        // `fn () Int ![] => 0` — missing `->` before return type.
+        let errs = parse_errs("fn main() -> Int ![] { fn () Int ![] => 0 }\n");
+        assert!(
+            !errs.is_empty(),
+            "missing `->` in lambda should parse-error"
+        );
+    }
+
+    #[test]
+    fn lambda_missing_bang_errors() {
+        // `fn () -> Int [] => 0` — missing `!` before the effect row.
+        let errs = parse_errs("fn main() -> Int ![] { fn () -> Int [] => 0 }\n");
+        assert!(
+            !errs.is_empty(),
+            "missing `!` before effect row should parse-error"
+        );
+    }
+
+    #[test]
+    fn lambda_missing_fat_arrow_errors() {
+        // `fn () -> Int ![] 0` — missing `=>` between the effect row
+        // and the body.
+        let errs = parse_errs("fn main() -> Int ![] { fn () -> Int ![] 0 }\n");
+        assert!(
+            !errs.is_empty(),
+            "missing `=>` before lambda body should parse-error"
+        );
+    }
+
+    #[test]
+    fn lambda_missing_body_errors() {
+        // `fn () -> Int ![] =>` — no body after `=>`.
+        let errs = parse_errs("fn main() -> Int ![] { fn () -> Int ![] => }\n");
+        assert!(!errs.is_empty(), "missing lambda body should parse-error");
     }
 }
