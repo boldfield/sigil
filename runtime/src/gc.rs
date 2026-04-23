@@ -16,7 +16,7 @@
 use std::ffi::c_void;
 use std::sync::Once;
 
-use crate::counters::{self, CounterId};
+use crate::counters::{self, sigil_counter_print_all, CounterId};
 use crate::header::{self, Header};
 
 // Direct Boehm FFI — we do not depend on a Rust wrapper crate. These are
@@ -31,6 +31,18 @@ extern "C" {
     fn GC_malloc_atomic(size: usize) -> *mut c_void;
 }
 
+// `atexit` from the C runtime. Used by `sigil --print-runtime-stats` to
+// dump counters when the compiled program exits. We avoid depending on
+// the `libc` crate (not in the plan's dependency allow-list) and declare
+// the signature directly.
+extern "C" {
+    fn atexit(cb: extern "C" fn()) -> i32;
+}
+
+extern "C" fn counter_atexit_cb() {
+    sigil_counter_print_all();
+}
+
 static GC_INIT: Once = Once::new();
 
 /// Initialise Boehm GC. Safe to call multiple times from any number of
@@ -38,6 +50,11 @@ static GC_INIT: Once = Once::new();
 /// `Once` until init completes. The generated `main` shim calls this
 /// exactly once before transferring control to user code; tests also call
 /// it (serialised by `Once`).
+///
+/// Also honours `SIGIL_PRINT_STATS=1`: when set on entry, an `atexit`
+/// hook is installed that prints every runtime counter to stderr at
+/// process exit. `sigil --print-runtime-stats <input>` sets this env
+/// var on the child process it spawns.
 #[no_mangle]
 pub extern "C" fn sigil_gc_init() {
     GC_INIT.call_once(|| {
@@ -45,6 +62,15 @@ pub extern "C" fn sigil_gc_init() {
         // under concurrent entry, so Boehm's non-reentrant init runs on a
         // single thread.
         unsafe { GC_init() };
+
+        // Wire the counter dump exactly once — doing it inside the Once
+        // guarantees atexit sees exactly one registration per process.
+        if std::env::var_os("SIGIL_PRINT_STATS").is_some() {
+            // SAFETY: atexit only requires the callback pointer to be
+            // valid for the lifetime of the process; `counter_atexit_cb`
+            // is a static function with no captured state.
+            unsafe { atexit(counter_atexit_cb) };
+        }
     });
 }
 
