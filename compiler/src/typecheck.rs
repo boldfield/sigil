@@ -15,6 +15,7 @@
 
 use crate::ast::*;
 use crate::errors::{self, CompilerError, Severity, Span};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
@@ -35,6 +36,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     let mut tc = Tc {
         errors: Vec::new(),
         string_literals: Vec::new(),
+        env: BTreeMap::new(),
     };
     // Validate main: for Stage 1 there must be exactly one fn named "main".
     for item in &program.items {
@@ -68,6 +70,11 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
 struct Tc {
     errors: Vec<CompilerError>,
     string_literals: Vec<(Span, String)>,
+    /// Type environment for the currently-checked function. Populated with
+    /// parameters on entry to `check_fn` and extended by `let` bindings as
+    /// each statement is checked. Cleared between functions. A BTreeMap
+    /// keeps iteration order stable (the catalog-integrity discipline).
+    env: BTreeMap<String, Ty>,
 }
 
 impl Tc {
@@ -81,6 +88,15 @@ impl Tc {
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
+        // Fresh environment per function. Sigil has no closures in Plan A1
+        // (closure conversion is a no-op stub), so lexical scopes do not
+        // nest across function boundaries.
+        self.env.clear();
+        for p in &f.params {
+            if let Some(ty) = ty_from_type_expr(&p.ty) {
+                self.env.insert(p.name.clone(), ty);
+            }
+        }
         if f.name == "main" {
             // Main's signature is fixed in Plan A1: `() -> Int ![IO]` or `() -> Int ![]`.
             // Anything else — wrong return type, any parameters, or an effect row
@@ -138,6 +154,14 @@ impl Tc {
                                 ),
                             );
                         }
+                    }
+                    // Extend the environment with the declared type, so
+                    // subsequent statements can resolve references. We use
+                    // the declaration rather than the inferred type so a
+                    // type mismatch in the initializer doesn't cascade into
+                    // spurious E0044/E0046 at downstream sites.
+                    if let Some(ty) = ty_from_type_expr(&l.ty) {
+                        self.env.insert(l.name.clone(), ty);
                     }
                 }
             }
@@ -211,7 +235,17 @@ impl Tc {
                 self.string_literals.push((span.clone(), s.clone()));
                 Some(Ty::String)
             }
-            Expr::Ident(_, _) => Some(Ty::Unit),
+            Expr::Ident(name, span) => match self.env.get(name).copied() {
+                Some(ty) => Some(ty),
+                None => {
+                    self.push_error(
+                        "E0046",
+                        span.clone(),
+                        format!("unknown identifier `{name}`"),
+                    );
+                    None
+                }
+            },
             Expr::Call { .. } => {
                 self.push_error(
                     "E0043",
@@ -237,6 +271,21 @@ fn type_is(t: &TypeExpr, name: &str) -> bool {
 fn type_name(t: &TypeExpr) -> &str {
     match t {
         TypeExpr::Named(n, _) => n.as_str(),
+    }
+}
+
+/// Lift a surface `TypeExpr` into the checker's `Ty` lattice. Unknown
+/// type names return `None`; Plan A1's surface only names `Int`,
+/// `String`, and `Unit`, so any other name is a no-op here (the checker
+/// elsewhere emits a diagnostic for the surrounding declaration).
+fn ty_from_type_expr(t: &TypeExpr) -> Option<Ty> {
+    match t {
+        TypeExpr::Named(n, _) => match n.as_str() {
+            "Int" => Some(Ty::Int),
+            "String" => Some(Ty::String),
+            "Unit" => Some(Ty::Unit),
+            _ => None,
+        },
     }
 }
 
@@ -337,6 +386,39 @@ mod tests {
         let src = "fn main() -> Int ![] { let x: String = 42; 0 }\n";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0045"), "expected E0045, got: {errs:?}");
+    }
+
+    #[test]
+    fn unknown_ident_is_e0046() {
+        // `ghost` is never bound; referencing it should emit E0046 with a
+        // span pointing at the reference.
+        let src = "fn main() -> Int ![] { let x: Int = ghost; 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0046"), "expected E0046, got: {errs:?}");
+        let e = errs.iter().find(|e| e.code.as_str() == "E0046").unwrap();
+        assert!(e.message.contains("ghost"), "message lacks ident: {e:?}");
+        // Span should point at the identifier (line 1, column > 0).
+        assert!(e.span.line >= 1, "span missing: {e:?}");
+    }
+
+    #[test]
+    fn bound_ident_resolves_to_its_type() {
+        // `greeting` is declared String and passed to IO.println (which needs
+        // String). If the env lookup works, this typechecks clean; if it
+        // returned Unit as the pre-fix placeholder did, E0044 would fire.
+        let src = "fn main() -> Int ![IO] {\n  let greeting: String = \"hello\";\n  perform IO.println(greeting);\n  0\n}\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
+    }
+
+    #[test]
+    fn bound_ident_wrong_type_is_e0044() {
+        // Before Fix 3, this typechecked clean because Ident returned
+        // Ty::Unit silently. After Fix 3, the Int binding leaks into
+        // IO.println's arg-type check as Int, which is E0044.
+        let src = "fn main() -> Int ![IO] {\n  let x: Int = 1;\n  perform IO.println(x);\n  0\n}\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
     }
 
     #[test]
