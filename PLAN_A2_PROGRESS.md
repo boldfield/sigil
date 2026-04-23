@@ -42,9 +42,9 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
 ## Stage 2 — Arithmetic, booleans, conditionals
 
 - Task 20 — Extend lexer (booleans, if/else, match, operators, char literals)
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [(pending)]
+  - notes: Added keywords `true false if else match`; tokens `Plus Minus Star Slash Percent EqEq NotEq Lt Gt LtEq GtEq AndAnd OrOr FatArrow CharLit`; char-literal lexer with `\n \t \r \\ \'` escapes. Two-char lookahead wins over single (arrow vs minus, eqeq/fatarrow vs eq, etc.). 15 lexer unit tests pass (9 new).
 - Task 21 — Extend parser (arith/cmp with precedence, if, match, unary, constant-fold `-<lit>`)
   - status: todo
   - commits: []
