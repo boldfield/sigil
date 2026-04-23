@@ -9,7 +9,7 @@
 // `CompilerError`. Test-module code is exempted per plan task 0.2.
 #![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Workspace root — `compiler/tests/` is two levels deep.
@@ -20,10 +20,67 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Cargo builds `sigil-runtime` as an rlib when it's pulled in as a
+/// dev-dep of `sigil-compiler`, but `link.rs` links user programs
+/// against the **staticlib** (`libsigil_runtime.a`) which may not be
+/// present on a cold `cargo test --workspace`. Check here; if missing,
+/// invoke `cargo build -p sigil-runtime` at the matching profile.
+///
+/// Safe at test-run time: the outer cargo has finished its build phase
+/// and released the per-build-unit locks, so the nested cargo acquires
+/// its own locks without deadlock. (Earlier revisions of this plan
+/// attempted the same rebuild from `compiler/build.rs`; that deadlocked
+/// on a cold `cargo test --workspace` because the outer cargo still
+/// held locks during build-script execution. See PLAN_A2_DEVIATIONS.md
+/// [Task 1.5.5] for the detailed history.)
+fn ensure_runtime_staticlib(root: &Path, sigil_bin: &Path) {
+    // Detect the profile from the `sigil` binary's path
+    // (`target/<profile>/sigil`). Default to debug if nothing recognizable
+    // is found.
+    let profile = sigil_bin
+        .ancestors()
+        .find_map(|a| match a.file_name().and_then(|s| s.to_str()) {
+            Some("debug") => Some("debug"),
+            Some("release") => Some("release"),
+            _ => None,
+        })
+        .unwrap_or("debug");
+
+    let staticlib = root.join("target").join(profile).join("libsigil_runtime.a");
+    if staticlib.exists() {
+        return;
+    }
+
+    // Invoke cargo to materialise the staticlib. `CARGO` is set in the
+    // env by cargo for child processes; fall back to the PATH name if
+    // unset (e.g. when running the test binary directly from disk).
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut cmd = Command::new(cargo);
+    cmd.arg("build").arg("-p").arg("sigil-runtime");
+    if profile == "release" {
+        cmd.arg("--release");
+    }
+    cmd.current_dir(root);
+
+    let status = cmd
+        .status()
+        .expect("failed to invoke cargo for sigil-runtime staticlib build");
+    assert!(
+        status.success(),
+        "sigil-runtime staticlib build failed (exit {status})"
+    );
+    assert!(
+        staticlib.exists(),
+        "staticlib {} not produced after `cargo build -p sigil-runtime`",
+        staticlib.display()
+    );
+}
+
 #[test]
 fn hello() {
     let root = workspace_root();
     let sigil_bin = PathBuf::from(env!("CARGO_BIN_EXE_sigil"));
+    ensure_runtime_staticlib(&root, &sigil_bin);
     let source = root.join("examples/hello.sigil");
     let out_path = std::env::temp_dir().join(format!("sigil_e2e_hello_{}", std::process::id(),));
 

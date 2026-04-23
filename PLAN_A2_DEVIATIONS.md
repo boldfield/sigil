@@ -3,9 +3,54 @@
 Each deviation from the plan is logged here *before* the implementing commit.
 Retroactive entries are forbidden.
 
+## [Task 1.5.5 — revision] Move staticlib materialisation out of build.rs into the e2e test itself
+
+**Commit:** (pending revision)
+
+**Plan text:** Same as the earlier 1.5.5 entry below (plan offers option-a
+build.rs / option-b CI restructure; neither fits stable cleanly).
+
+**What was done instead (revised):** `compiler/build.rs` is now a no-op
+apart from `cargo:rerun-if-changed` hints. The staticlib-materialisation
+logic lives in `compiler/tests/e2e.rs::ensure_runtime_staticlib`, called
+at the top of the `hello` test. It detects the test's profile from
+`env!("CARGO_BIN_EXE_sigil")`'s path and invokes `cargo build -p sigil-runtime`
+(with `--release` if applicable) at test-run time.
+
+**Why (revised):** The original build.rs approach (previous
+`f0a6212`) deadlocked under `cargo test --workspace` on a cold target
+directory. Observed CI behaviour on PR #2's first run: the
+`cold-checkout test` jobs hung on "cold run 1 of 2" for 47+ minutes
+on both Linux and macOS, long past the expected ~15-20 min for a
+full Cranelift cold build. The outer cargo holds per-build-unit
+locks while `compiler/build.rs` runs as part of sigil-compiler's
+build; the nested `cargo build -p sigil-runtime` then blocks
+trying to acquire a compatible lock. Cargo's jobserver handles some
+nested invocations, but not this particular build-unit overlap on
+our 1.95.0 pin.
+
+The test-run-time approach avoids the deadlock cleanly: once the
+outer cargo finishes its build phase and starts executing tests, it
+has released the build-unit locks, so a nested cargo invocation
+acquires its own locks fresh. Parallel test execution is not a risk
+either — cargo serialises concurrent builds at the target-dir level,
+so even if two tests called `ensure_runtime_staticlib` at once, one
+would wait briefly for the other rather than deadlocking.
+
+**Forward implications:** The `SIGIL_SKIP_RUNTIME_STATICLIB_BUILD`
+escape hatch introduced in the previous revision is *no longer in
+the code* — build.rs no longer does anything it needs to skip. If a
+future out-of-tree caller needs to suppress the e2e-test-time
+rebuild (e.g. pre-building the staticlib in a custom harness), the
+cleanest escape is for the caller to place
+`target/<profile>/libsigil_runtime.a` before invoking `cargo test`;
+`ensure_runtime_staticlib` short-circuits when the staticlib is
+already present. The env var is removed from `runtime/README.md`
+along with this change.
+
 ## [Task 1.5.5] `compiler/build.rs` invokes cargo to materialise the runtime staticlib; cold-checkout verification lives in a dedicated CI job
 
-**Commit:** f0a6212
+**Commit:** f0a6212 (superseded by revision above; entry preserved for history)
 
 **Plan text:** "Fix by adding a `build.rs` to `compiler/` that declares an
 explicit artifact dependency on `runtime`, or by restructuring CI's test

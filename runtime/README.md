@@ -265,16 +265,16 @@ the dev-dep only consumes the rlib. On a cold `cargo test --workspace`
 this could leave the e2e test binary trying to link without the staticlib
 present.
 
-**Fix:** `compiler/build.rs` checks for `target/<profile>/libsigil_runtime.a`
-during sigil-compiler's build. If missing, it invokes
-`cargo build -p sigil-runtime` synchronously. Cargo 1.74+ handles nested
-invocations via the jobserver, so the pattern is safe on our 1.95.0 pin.
-
-**Opt-out:** set `SIGIL_SKIP_RUNTIME_STATICLIB_BUILD=1` in the environment
-if the staticlib is produced by another mechanism (custom build systems,
-IDE background indexers that don't want recursive cargo). The compiler's
-`build.rs` will skip the staticlib build and trust the caller; a missing
-staticlib will surface as a linker error at test / production-compile time.
+**Fix:** the e2e test (`compiler/tests/e2e.rs`) checks for
+`target/<profile>/libsigil_runtime.a` at its entry point and, if missing,
+invokes `cargo build -p sigil-runtime` before the test proceeds. This runs
+at test-*run* time, after the outer cargo has completed its build phase
+and released its per-build-unit locks — so the nested cargo invocation
+acquires its own locks cleanly without deadlock. An earlier version of
+this fix put the rebuild in `compiler/build.rs`; that deadlocked under
+`cargo test --workspace` because the outer cargo held build-unit locks
+during build-script execution. See `PLAN_A2_DEVIATIONS.md` [Task 1.5.5]
+for the full history.
 
 **CI acceptance check:** the `.github/workflows/ci.yml` file defines a
 `cold-checkout-test` job separate from the main `build-test` matrix. It
@@ -283,10 +283,6 @@ plan's acceptance criterion) on both supported hosts. The main
 `build-test` job uses `actions/cache@v4` on `target/` so it cannot itself
 prove the cold-checkout invariant; keeping the cold verification in its
 own job lets the warm-path cache still work.
-
-See `PLAN_A2_DEVIATIONS.md` ([Task 1.5.5]) for why this shell-out is used
-instead of an artifact dependency (`cargo-features = ["bindeps"]` is
-unstable as of Rust 1.95.0) or CI restructure alone.
 
 ## macOS prerequisites
 

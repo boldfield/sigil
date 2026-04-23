@@ -32,8 +32,8 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
   - notes: Script wraps fmt + check + per-crate clippy + runtime lib tests + interior-pointer check + discipline greps. Greps for unwrap/expect/panic are advisory (clippy -D warnings is the authority); false positives inside test modules are expected. CI invokes the script as a new step before the existing build/test matrix.
 - Task 1.5.5 — Fix cold-target e2e staticlib ordering
   - status: done-pending-ci
-  - commits: [f0a6212]
-  - notes: DEVIATION logged. `compiler/build.rs` invokes `cargo build -p sigil-runtime` when `target/<profile>/libsigil_runtime.a` is missing; `SIGIL_SKIP_RUNTIME_STATICLIB_BUILD=1` opt-out available. Separate CI job `cold-checkout-test` runs `rm -rf target && cargo test --workspace` twice in succession on both hosts (slow; ~10m Linux, ~15m macOS). Approach documented in `runtime/README.md#cold-checkout-build-ordering`. Cold path cannot be validated on the pod (would OOM); CI is the authoritative acceptance gate.
+  - commits: [f0a6212, (pending revision)]
+  - notes: DEVIATION logged (original and revision). First revision (`f0a6212`) put the rebuild in `compiler/build.rs`; deadlocked under `cargo test --workspace` cold (PR #2 first CI run sat on "cold run 1 of 2" for 47+ minutes on both hosts before being cancelled). Second revision moves the rebuild into `compiler/tests/e2e.rs::ensure_runtime_staticlib`, called at the top of the `hello` test. Runs at test-run time after outer cargo releases its locks; no deadlock. `SIGIL_SKIP_RUNTIME_STATICLIB_BUILD` env var is gone (no longer needed — callers that pre-build the staticlib short-circuit via the existence check). `cold-checkout-test` CI job unchanged.
 - Task 1.5.6 — `debug_assert!` on typecheck env insertion (no-shadowing invariant)
   - status: done
   - commits: [00739d3]
