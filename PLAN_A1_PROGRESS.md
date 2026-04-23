@@ -208,3 +208,87 @@ on the laptop and the user has reviewed the A1 hand-off. The plan's
 execution-notes memory guidance once real peak-RSS numbers are observable
 on macOS. The current prose is the plan's *prescription*, not a
 *verified* recipe — it has now been falsified on Linux at j=1.
+
+## Execution status — 2026-04-22 (laptop verification session)
+
+Verification pass on `aarch64-apple-darwin` (macOS 26.2, Apple ld-1230.1,
+Rust 1.95.0 per `rust-toolchain.toml`). All A1 acceptance commands green.
+
+**What changed during verification (logged in `PLAN_A1_DEVIATIONS.md`):**
+
+- `[Task 13]` macOS reproducibility — `-Wl,-no_uuid` replaced with
+  `-Wl,-reproducible`. Modern dyld rejects binaries lacking LC_UUID
+  (`missing LC_UUID load command`, SIGABRT at load). `-reproducible`
+  yields a stable content-hash UUID, which is what the plan actually
+  wanted for reproducibility.
+- `[Task 2, Task 13]` libgc discovery — `runtime/build.rs` and
+  `compiler/src/link.rs` now shell out to `pkg-config --libs bdw-gc`
+  and emit any reported `-L<dir>` before `-lgc`. Homebrew puts
+  `libgc.dylib` under `/opt/homebrew/opt/bdw-gc/lib` which isn't on
+  the default linker search path; Ubuntu apt does put it there, so the
+  Linux build was never affected. Falls back to the bare `-lgc` if
+  pkg-config isn't available.
+
+**Non-deviation fixes that surfaced during verification (within
+existing tasks' spec):**
+
+- `[Task 5]` parser infinite loop: `parse_program`'s error-recovery
+  path returned to the top of the loop at the same token on a stray
+  top-level `}`. Added a forward-progress guarantee — if recovery
+  left position unchanged, advance one token. Without this, the new
+  `two_syntax_errors_in_one_run` test allocated errors unbounded
+  until OOM (~12 GiB RSS in 60 s on the laptop).
+- `[Task 0.10]` completed the `--print-runtime-stats` plumbing: the
+  runtime's `sigil_gc_init` now honours `SIGIL_PRINT_STATS=1` and
+  registers an `atexit` hook that calls `sigil_counter_print_all`.
+  Previously the env-var was set by the compiler CLI but nothing on
+  the runtime side consumed it. The acceptance criterion
+  (`BOEHM_ALLOC_COUNT` nonzero, `ARENA_ESCAPE_COUNT` zero) required
+  this.
+- `scripts/reproducibility.sh` now compiles both runs to the *same*
+  output filename in per-run subdirectories. macOS `ld` embeds the
+  output filename into the ad-hoc code signature's `Identifier`
+  string, so comparing binaries built to `hello_a` vs `hello_b`
+  produced a deterministic-but-filename-dependent diff in the code
+  signature region.
+
+**Verified acceptance commands (all green on macOS):**
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --no-deps --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace --no-fail-fast` — 43 / 43 pass
+  (compiler lib 26, compiler e2e 1, runtime 16, plus doc-test containers).
+- `scripts/smoke.sh` — `hello, world` printed, exit 0.
+- `scripts/reproducibility.sh` — two same-host release builds produce
+  byte-identical binaries (SHA256 matches).
+- `scripts/check-no-interior-pointers.sh` — clean on `runtime/src`.
+- `sigil --print-runtime-stats examples/hello.sigil -o /tmp/hello_stats`
+  prints `SIGIL_COUNTER_BOEHM_ALLOC_COUNT=1`,
+  `SIGIL_COUNTER_BOEHM_ALLOC_BYTES=32`,
+  `SIGIL_COUNTER_ARENA_ESCAPE_COUNT=0` (and all arena / handler /
+  trampoline / CPS / native-call slots = 0, as expected for Stage 1).
+- `__SIGIL,__stackmaps` section present on the linked `hello_stats`
+  binary: 36 bytes, header count = 4 safepoint records (matches the
+  four `call`/`call_indirect` sites Cranelift emits for `hello.sigil`).
+  Parsed format: `u32 count` + `count × (u32 pc_offset, u16 live, u16 pad)`.
+
+**Observed peak RSS on the laptop** (`/usr/bin/time -l`, default
+parallelism):
+
+| command                               | peak RSS |
+|---------------------------------------|----------|
+| `cargo build -p sigil-runtime`        | ~140 MB  |
+| `cargo build -p sigil-compiler`       | ~930 MB  |
+| `cargo test  --workspace`             | ~2.9 GB  |
+
+`runtime/README.md#memory-constrained-builds` now leads with these
+numbers instead of the old "4–6 GB" prescription.
+
+**Linux host status.** Not re-verified in this session. CI
+(`ubuntu-24.04` runner) is the reference for Linux greenness; any
+regression on that matrix is what will surface regressions, not the
+abandoned Talos pod.
+
+**Next (gated on human review).** Per "Do not grade your own work":
+Plan A2 remains queued; no A2 work starts until a human verifies this
+output and queues it.

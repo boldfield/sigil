@@ -125,8 +125,29 @@ specialisation) is data-driven.
 ## Memory-constrained builds
 
 Peak memory during a workspace build is driven by the compiler crate's
-Cranelift dependency tree. The defaults below keep the peak in the
-4–6 GB range on Linux, survivable on 8–12 GB headless pods.
+Cranelift dependency tree. The table below is the first set of observed
+peak-RSS numbers (from `/usr/bin/time -l`) on one host; earlier guidance
+that 8–12 GB was sufficient was falsified on Talos-Linux headless pods.
+
+### Observed peaks
+
+Measured on `aarch64-apple-darwin` (Apple M-series laptop, 2026-04-22).
+Commands run via `/usr/bin/time -l` with `CARGO_BUILD_JOBS` unset
+(default parallelism = physical core count).
+
+| Command                              | peak RSS  |
+|--------------------------------------|-----------|
+| `cargo build -p sigil-runtime`       | ~140 MB   |
+| `cargo build -p sigil-compiler`      | ~930 MB   |
+| `cargo test  --workspace`            | ~2.9 GB   |
+
+For `x86_64-unknown-linux-gnu` on a memory-constrained Talos pod
+(~8–12 GiB allotment, `CARGO_BUILD_JOBS=1`, lld, `CARGO_INCREMENTAL=0`,
+the profile settings below), `cargo test -p sigil-compiler --no-fail-fast`
+OOM-killed the pod — once taking the underlying k8s node with it. Plan A1
+verification on constrained Linux is therefore out of scope; CI runners
+(GitHub-hosted) have enough headroom and the laptop is the reference
+environment for completion criteria.
 
 ### Workspace profile settings (committed in `Cargo.toml`)
 
@@ -194,5 +215,20 @@ For clippy, prefer `cargo clippy --no-deps` over `cargo clippy` — the
 `--no-deps` flag skips re-analysing dependency crates, cutting memory
 significantly without losing coverage of our own code.
 
-If an OOM is reported during a build, the fix is build ordering +
-`CARGO_BUILD_JOBS=2`, not raising the memory ceiling.
+If an OOM is reported during a build, try per-crate ordering and
+`CARGO_BUILD_JOBS=1` first — they materially cut peak memory. But they
+do not make an arbitrarily small ceiling work: the `cargo test
+-p sigil-compiler` step needs enough headroom to compile the test
+binary (which links Cranelift and codegen), and on the Talos pod this
+alone exceeded ~12 GiB at j=1.
+
+## macOS prerequisites
+
+- `brew install bdw-gc pkg-config` — the runtime crate's `build.rs`
+  consults `pkg-config --libs bdw-gc` to find libgc's search path.
+  Without this, `cargo build -p sigil-runtime --tests` and
+  `sigil <input> -o <output>` both fail at link time with
+  `ld: library 'gc' not found`.
+- `export PKG_CONFIG_PATH="$(brew --prefix)/opt/bdw-gc/lib/pkgconfig:$PKG_CONFIG_PATH"`
+  before the first `cargo` invocation in a shell. CI handles this
+  automatically in `.github/workflows/ci.yml`.
