@@ -54,7 +54,7 @@ Status values: `todo`, `in-progress`, `done`.
     the arena / handler-walk / trampoline / CPS slots.
 - Task 0.11 — safepoint metadata infrastructure
   - status: done-with-caveat
-  - commits: [1efcda7, <TBD-fix-2>]
+  - commits: [1efcda7, d3e9966]
   - notes: The compiler-side `StackMapBuilder` was not landed alongside
     task 12 as the original entry claimed — it ships here as Fix 2 of
     the post-A1 review pass. Plan A1's section format is **v0

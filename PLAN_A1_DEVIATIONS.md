@@ -206,7 +206,7 @@ without moving this one.
 
 ## [Task 0.11] Stackmap section is v0 placeholder; StackMapBuilder lands post-review
 
-**Commit:** <TBD-fix-2>
+**Commit:** d3e9966
 
 **Plan text:** Task 0.11 specifies safepoint-metadata infrastructure:
 a `StackMapBuilder` type in the compiler crate that accumulates one
