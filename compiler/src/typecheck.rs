@@ -351,6 +351,13 @@ impl Tc {
                 arms,
                 span,
             } => self.check_match(scrutinee, arms, span.clone(), row),
+            // `Expr::Block` is introduced by elaboration (plan A2 task
+            // 23); the surface parser never produces it, so this arm is
+            // a structural fallback for exhaustiveness only. Typecheck
+            // is not re-run after elaborate in Plan A2's pipeline, so
+            // the body of this arm is defensive rather than reached in
+            // practice.
+            Expr::Block(b) => self.check_block(b, row),
         }
     }
 

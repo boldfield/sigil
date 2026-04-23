@@ -106,6 +106,15 @@ pub enum Expr {
         arms: Vec<MatchArm>,
         span: Span,
     },
+    /// Block-as-expression, introduced by elaboration (plan A2 task 23)
+    /// when desugaring `if/else` whose branches contain statements into
+    /// `match` arm bodies. The surface parser does not accept this form
+    /// as a primary — user-authored match arm bodies are `Expr`, not
+    /// `Block`. Elaborate may wrap a `Block` with multiple statements
+    /// into `Expr::Block(block)` so the resulting `MatchArm` body can
+    /// carry a statement sequence without changing `MatchArm::body`'s
+    /// type.
+    Block(Box<Block>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +188,7 @@ impl Expr {
             | Expr::If { span: s, .. }
             | Expr::Match { span: s, .. } => s.clone(),
             Expr::Perform(p) => p.span.clone(),
+            Expr::Block(b) => b.span.clone(),
         }
     }
 }
