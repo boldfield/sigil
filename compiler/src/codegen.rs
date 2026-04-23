@@ -34,8 +34,9 @@ use cranelift::codegen::isa;
 use cranelift::codegen::settings;
 use cranelift::prelude::*;
 use cranelift_module::{default_libcall_names, DataDescription, Linkage, Module};
+use cranelift_object::object::write::SectionKind;
+use cranelift_object::object::BinaryFormat;
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use object::write::SectionKind;
 use target_lexicon::Triple;
 
 use crate::closure_convert::ClosureConvertedProgram;
@@ -250,7 +251,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         section_bytes.extend_from_slice(&0u16.to_le_bytes()); // live_count = 0
         section_bytes.extend_from_slice(&0u16.to_le_bytes()); // pad
     }
-    let is_macho = matches!(product.object.format(), object::BinaryFormat::MachO);
+    let is_macho = matches!(product.object.format(), BinaryFormat::MachO);
     let (segment_bytes, section_name): (&[u8], &[u8]) = if is_macho {
         (b"__SIGIL", b"__stackmaps")
     } else {
