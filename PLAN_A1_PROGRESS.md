@@ -53,9 +53,19 @@ Status values: `todo`, `in-progress`, `done`.
     `sigil_gc_init` (honours SIGIL_PRINT_STATS=1). Plan B will populate
     the arena / handler-walk / trampoline / CPS slots.
 - Task 0.11 — safepoint metadata infrastructure
-  - status: done
-  - commits: [1efcda7]
-  - notes: Compiler-side StackMapBuilder ships with task 12.
+  - status: done-with-caveat
+  - commits: [1efcda7, <TBD-fix-2>]
+  - notes: The compiler-side `StackMapBuilder` was not landed alongside
+    task 12 as the original entry claimed — it ships here as Fix 2 of
+    the post-A1 review pass. Plan A1's section format is **v0
+    (placeholder)**: `pc_offset` is a Cranelift `Inst` handle rather
+    than a real post-regalloc code offset, and `live_count` is always
+    0. A versioned header (`"SGST"` magic + `version = 0` + per-record
+    `STACKMAP_FLAG_PLACEHOLDER`) lets a Plan B v1 reader detect the
+    placeholders and bail / resynthesise from relocations. See
+    `PLAN_A1_DEVIATIONS.md` (`[DEVIATION Task 0.11]`) for rationale
+    and the v0 → v1 upgrade plan. Real PC offsets + live-value lists
+    ship with Plan B's Cranelift safepoint integration.
 - Task 0.12 — no-interior-pointers CI check
   - status: done
   - commits: [95abc87]
