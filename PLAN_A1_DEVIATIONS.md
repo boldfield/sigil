@@ -106,7 +106,7 @@ unchanged.
 
 ## [Task 13] macOS reproducibility uses `-Wl,-reproducible`, not `-Wl,-no_uuid`
 
-**Commit:** (pending)
+**Commit:** 51655e7
 
 **Plan text:** Task 13 says macOS links with `-lgc -Wl,-no_uuid`.
 
@@ -135,7 +135,7 @@ future ld, we re-evaluate. No effect on Linux (where `--build-id=none`
 
 ## [Task 2, Task 13] libgc discovery via `pkg-config` on macOS (build.rs + link.rs)
 
-**Commit:** (pending)
+**Commit:** 51655e7
 
 **Plan text:** Task 2 says `runtime/` links against the chosen Boehm GC crate
 with install instructions per host. Task 13 enumerates the Linux linker flags
@@ -211,7 +211,7 @@ Format:
 ```
 ## [Task <N>] short description
 
-**Commit:** (pending) or <hash>
+**Commit:** 51655e7 or <hash>
 
 **Plan text:** (verbatim or precisely paraphrased)
 

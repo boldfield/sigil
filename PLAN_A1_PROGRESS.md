@@ -47,8 +47,11 @@ Status values: `todo`, `in-progress`, `done`.
   - notes:
 - Task 0.10 — runtime instrumentation counters
   - status: done
-  - commits: [1efcda7]
-  - notes: Plan B will populate the arena / handler-walk / trampoline / CPS slots.
+  - commits: [1efcda7, efdbb9b]
+  - notes: 1efcda7 declared the counter slots + sigil_counter_print_all
+    FFI. efdbb9b wires `sigil --print-runtime-stats`'s atexit hook in
+    `sigil_gc_init` (honours SIGIL_PRINT_STATS=1). Plan B will populate
+    the arena / handler-walk / trampoline / CPS slots.
 - Task 0.11 — safepoint metadata infrastructure
   - status: done
   - commits: [1efcda7]
@@ -80,8 +83,10 @@ Status values: `todo`, `in-progress`, `done`.
   - notes: Multi-task commit (see DEVIATIONS).
 - Task 5 — parser
   - status: done
-  - commits: [2a17e83]
-  - notes: Multi-task commit (see DEVIATIONS).
+  - commits: [2a17e83, d12ad52]
+  - notes: Multi-task commit (see DEVIATIONS). d12ad52 adds the
+    forward-progress guarantee in parse_program (prevents OOM on stray
+    top-level `}`).
 - Task 6 — name resolution
   - status: done
   - commits: [2a17e83]
@@ -128,8 +133,10 @@ Status values: `todo`, `in-progress`, `done`.
   - notes: Test placed at compiler/tests/e2e.rs rather than a separate sigil-tests crate; see DEVIATIONS.
 - Task 17 — reproducibility.sh
   - status: done
-  - commits: [b83d8bb]
-  - notes:
+  - commits: [b83d8bb, 3895a1c]
+  - notes: 3895a1c compiles both runs to the same filename in per-run
+    subdirectories so macOS's ad-hoc code signature Identifier (derived
+    from output filename) matches across runs.
 - Task 18 — smoke.sh
   - status: done
   - commits: [21893e9]
