@@ -108,6 +108,7 @@ impl<'a> Parser<'a> {
     fn parse_program(&mut self) -> Vec<Item> {
         let mut items = Vec::new();
         while !self.at_eof() {
+            let saved_pos = self.pos;
             match self.peek().kind {
                 TokenKind::Import => match self.parse_import() {
                     Some(i) => items.push(Item::Import(i)),
@@ -122,6 +123,14 @@ impl<'a> Parser<'a> {
                     self.err(span, "expected `import` or `fn` at top level");
                     self.synchronise_to_semi_or_brace();
                 }
+            }
+            // Forward-progress guarantee. synchronise_to_semi_or_brace
+            // stops *at* a `}` without consuming it (correct inside a
+            // block), so a stray `}` at top level would re-enter this
+            // loop at the same position and accumulate errors forever.
+            // Force an advance if recovery left us stuck.
+            if self.pos == saved_pos {
+                self.advance();
             }
         }
         items
