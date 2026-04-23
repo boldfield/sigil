@@ -229,6 +229,7 @@ mod tests {
 
     #[test]
     fn alloc_and_read_string() {
+        let _guard = crate::test_support::gc_test_lock();
         sigil_gc_init();
         let before_count = counters::read(CounterId::BoehmAllocCount);
         let src = b"hi";
@@ -252,6 +253,7 @@ mod tests {
 
     #[test]
     fn alloc_empty_string() {
+        let _guard = crate::test_support::gc_test_lock();
         sigil_gc_init();
         let obj = unsafe { sigil_string_new(std::ptr::null(), 0) };
         assert!(!obj.is_null());

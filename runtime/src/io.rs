@@ -46,6 +46,7 @@ mod tests {
 
     #[test]
     fn println_does_not_panic() {
+        let _guard = crate::test_support::gc_test_lock();
         // We can't easily capture stdout from within the test without
         // reopening the file descriptor. This test ensures the happy path
         // runs end-to-end without aborting.

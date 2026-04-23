@@ -1,8 +1,27 @@
-//! End-to-end test — plan A1 Stage 1 task 16.
+//! End-to-end tests — plan A1 Stage 1 task 16, extended in plan A2
+//! task 24.
 //!
-//! Compiles `examples/hello.sigil` with the `sigil` binary, runs the
-//! resulting program, and asserts stdout == "hello, world\n" with
-//! exit code 0. Runs green on both supported hosts.
+//! Original (Stage 1): compiles `examples/hello.sigil` with the `sigil`
+//! binary, runs the resulting program, and asserts stdout == "hello,
+//! world\n" with exit code 0.
+//!
+//! Plan A2 additions (Stage 2):
+//!
+//! - `arith_integer_ops` — compiles a program exercising `+ - * /` and
+//!   asserts the exit code matches the expected arithmetic result.
+//! - `if_else_produces_value` — verifies `if/else` with a Bool
+//!   condition lowers correctly (desugared via elaborate to a `match`,
+//!   lowered in codegen to `brif` blocks).
+//! - `match_primitive_with_wildcard` — exercises the codegen-`match`
+//!   chain with IntLit patterns + a wildcard arm.
+//! - `div_by_zero_traps` — asserts the runtime trap prints `sigil:
+//!   arithmetic error: division by zero` to stderr and exits with
+//!   status 2.
+//!
+//! All Stage-2 programs are small (a dozen lines) and inlined in the
+//! test source rather than added to `examples/`; Task 26 introduces
+//! `examples/factorial.sigil` / `arith.sigil` / `div_by_zero.sigil` as
+//! the "real" examples.
 
 // `expect`/`unwrap`/`panic!` are fine in tests; the workspace clippy
 // rule bans them in compiler source so user-facing errors route through
@@ -186,4 +205,144 @@ fn stackmap_section_parses_v0_placeholder() {
     }
 
     let _ = std::fs::remove_file(&obj_path);
+}
+
+/// Compile the given Sigil source to a temp binary and run it.
+/// Returns `(stdout, stderr, exit_code)` from the child process. The
+/// temp files are cleaned up before returning.
+///
+/// Panics on compile failure; the caller should pre-validate the
+/// program is expected to compile. For programs expected to *run* and
+/// exit with a non-zero code (e.g. the div-by-zero trap), check
+/// `exit_code` against the expected sentinel.
+fn compile_and_run(source: &str, test_name: &str) -> (String, String, i32) {
+    let root = workspace_root();
+    let sigil_bin = PathBuf::from(env!("CARGO_BIN_EXE_sigil"));
+    ensure_runtime_staticlib(&root, &sigil_bin);
+
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_{}_{}.sigil",
+        test_name,
+        std::process::id()
+    ));
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
+    std::fs::write(&src_path, source).expect("write source");
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to invoke sigil compiler");
+    assert!(
+        compile.status.success(),
+        "compile failed for {test_name}: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("failed to execute compiled binary");
+
+    // Use exit code 0..=255 as per Unix; fallback to -1 on signal.
+    let code = run.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+
+    (stdout, stderr, code)
+}
+
+/// Plan A2 task 24 — `iadd`/`isub`/`imul`/`sdiv` codegen.
+///
+/// `(10 + 20 * 2) / 2 = 25`. The program returns the result as the
+/// process exit status; Unix masks to the low 8 bits, so the test
+/// asserts `25 & 0xff == 25`.
+#[test]
+fn arith_integer_ops() {
+    let source = "fn main() -> Int ![] {\n\
+                    let n: Int = (10 + 20 * 2) / 2;\n\
+                    n\n\
+                  }\n";
+    let (_stdout, _stderr, code) = compile_and_run(source, "arith");
+    assert_eq!(code, 25, "arith exit code");
+}
+
+/// Plan A2 task 24 — `if`/`else` lowering. Elaborate desugars the
+/// `if` into a `match`-on-`Bool`; codegen emits compare + `brif` to
+/// two arm bodies joining at a continue block.
+#[test]
+fn if_else_produces_value() {
+    let source = "fn main() -> Int ![] {\n\
+                    let n: Int = 5;\n\
+                    let r: Int = if n > 0 { n * 2 } else { -n };\n\
+                    r\n\
+                  }\n";
+    let (_stdout, _stderr, code) = compile_and_run(source, "if_else");
+    assert_eq!(code, 10, "n=5 → n*2 = 10");
+}
+
+/// Plan A2 task 24 — `match` chain with IntLit patterns and a
+/// wildcard. Codegen emits a compare + `brif` per literal pattern, a
+/// wildcard jump for the final arm, and a continue block that
+/// produces the arm's body value.
+#[test]
+fn match_primitive_with_wildcard() {
+    let source = "fn main() -> Int ![] {\n\
+                    let n: Int = 2;\n\
+                    let r: Int = match n {\n\
+                      0 => 100,\n\
+                      1 => 50,\n\
+                      _ => 17,\n\
+                    };\n\
+                    r\n\
+                  }\n";
+    let (_stdout, _stderr, code) = compile_and_run(source, "match");
+    assert_eq!(code, 17, "n=2 hits wildcard → 17");
+}
+
+/// Plan A2 task 24 + task 25 — division by zero traps via
+/// `sigil_panic_arith_error`. Exit code is 2; stderr contains the
+/// runtime's arith-error banner.
+#[test]
+fn div_by_zero_traps() {
+    let source = "fn main() -> Int ![] {\n\
+                    let a: Int = 10;\n\
+                    let b: Int = 0;\n\
+                    let q: Int = a / b;\n\
+                    q\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "div_by_zero");
+    assert_eq!(code, 2, "div-by-zero exits with 2");
+    assert!(
+        stderr.contains("division by zero"),
+        "stderr missing arith-error banner: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("sigil: arithmetic error"),
+        "stderr missing `sigil: arithmetic error` prefix: {stderr:?}"
+    );
+}
+
+/// Plan A2 task 24 + task 25 — modulo by zero takes the same trap
+/// path with a different reason string.
+#[test]
+fn mod_by_zero_traps() {
+    let source = "fn main() -> Int ![] {\n\
+                    let a: Int = 10;\n\
+                    let b: Int = 0;\n\
+                    let r: Int = a % b;\n\
+                    r\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "mod_by_zero");
+    assert_eq!(code, 2, "mod-by-zero exits with 2");
+    assert!(
+        stderr.contains("remainder by zero"),
+        "stderr missing mod-zero banner: {stderr:?}"
+    );
 }

@@ -287,6 +287,25 @@ pub const CATALOG: &[ErrorEntry] = &[
         fix_example: "match b {\n  true => 1,\n  false => 0,\n}        // Bool exhaustive: both values covered\n\n\
                       match n {\n  0 => \"zero\",\n  _ => \"other\",\n}  // Int exhaustive: wildcard covers the rest",
     },
+    ErrorEntry {
+        code: "E0401",
+        short: "runtime arithmetic abort",
+        long: "A division or modulo operation was performed with a zero \
+               divisor, or another runtime arithmetic trap fired. The \
+               runtime prints `sigil: arithmetic error: <reason>` to stderr \
+               and exits with status 2. This is a **v1-only** surface: Plan \
+               B replaces it with a `Raise[ArithError]` effect that the \
+               language can catch with a handler. Until then, dividing by \
+               zero (or modulo by zero) terminates the process.\n\n\
+               Avoid the trap by guarding with an `if` that checks the \
+               divisor before the division.\n\n\
+               `E0401` is a **runtime** code — unlike `E00xx` (compile-time \
+               diagnostics), it is emitted by the runtime library when the \
+               compiled program traps, not by the compiler. Its presence in \
+               this catalog lets `sigil explain E0401` describe the \
+               condition without needing a separate runtime catalog.",
+        fix_example: "let q: Int = if d == 0 { 0 } else { n / d };",
+    },
 ];
 
 #[cfg(test)]
