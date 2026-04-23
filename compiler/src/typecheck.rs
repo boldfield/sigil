@@ -358,6 +358,20 @@ impl Tc {
             // the body of this arm is defensive rather than reached in
             // practice.
             Expr::Block(b) => self.check_block(b, row),
+            // Lambda expressions parse in Task 29 but don't gain
+            // function-type machinery (`Ty::Fn`, application-site
+            // unification, capture analysis) until Task 30. Reject
+            // with E0043 meanwhile so any Stage-3 program that
+            // reaches typecheck fails with a useful diagnostic rather
+            // than slipping through and crashing downstream.
+            Expr::Lambda { span, .. } => {
+                self.push_error(
+                    "E0043",
+                    span.clone(),
+                    "lambda expressions are Stage-3 (plan A2 task 30 adds function-type typing)",
+                );
+                None
+            }
         }
     }
 
