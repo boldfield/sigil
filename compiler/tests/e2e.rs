@@ -4,6 +4,11 @@
 //! resulting program, and asserts stdout == "hello, world\n" with
 //! exit code 0. Runs green on both supported hosts.
 
+// `expect`/`unwrap` are fine in tests; the workspace clippy rule bans
+// them in compiler source so user-facing errors route through
+// `CompilerError`. Test-module code is exempted per plan task 0.2.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -20,10 +25,7 @@ fn hello() {
     let root = workspace_root();
     let sigil_bin = PathBuf::from(env!("CARGO_BIN_EXE_sigil"));
     let source = root.join("examples/hello.sigil");
-    let out_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_hello_{}",
-        std::process::id(),
-    ));
+    let out_path = std::env::temp_dir().join(format!("sigil_e2e_hello_{}", std::process::id(),));
 
     // Invoke the compiler from the workspace root so the linker can
     // find target/<profile>/libsigil_runtime.a via its relative-path

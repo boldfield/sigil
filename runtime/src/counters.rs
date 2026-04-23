@@ -118,9 +118,18 @@ mod tests {
     #[test]
     fn counter_names_match_enum_order() {
         assert_eq!(NAMES.len(), COUNTER_SLOTS);
-        assert_eq!(NAMES[CounterId::BoehmAllocCount as usize], "SIGIL_COUNTER_BOEHM_ALLOC_COUNT");
-        assert_eq!(NAMES[CounterId::ArenaEscapeCount as usize], "SIGIL_COUNTER_ARENA_ESCAPE_COUNT");
-        assert_eq!(NAMES[CounterId::NativeCallCount as usize], "SIGIL_COUNTER_NATIVE_CALL_COUNT");
+        assert_eq!(
+            NAMES[CounterId::BoehmAllocCount as usize],
+            "SIGIL_COUNTER_BOEHM_ALLOC_COUNT"
+        );
+        assert_eq!(
+            NAMES[CounterId::ArenaEscapeCount as usize],
+            "SIGIL_COUNTER_ARENA_ESCAPE_COUNT"
+        );
+        assert_eq!(
+            NAMES[CounterId::NativeCallCount as usize],
+            "SIGIL_COUNTER_NATIVE_CALL_COUNT"
+        );
     }
 
     #[test]

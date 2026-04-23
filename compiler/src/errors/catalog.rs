@@ -113,11 +113,19 @@ mod tests {
         let mut codes: Vec<&str> = CATALOG.iter().map(|e| e.code).collect();
         codes.sort();
         codes.dedup();
-        assert_eq!(codes.len(), CATALOG.len(), "duplicate error codes in CATALOG");
+        assert_eq!(
+            codes.len(),
+            CATALOG.len(),
+            "duplicate error codes in CATALOG"
+        );
         for e in CATALOG {
             assert!(!e.short.is_empty(), "{} has empty short", e.code);
             assert!(!e.long.is_empty(), "{} has empty long", e.code);
-            assert!(!e.fix_example.is_empty(), "{} has empty fix_example", e.code);
+            assert!(
+                !e.fix_example.is_empty(),
+                "{} has empty fix_example",
+                e.code
+            );
             assert!(e.code.starts_with('E'), "{} is not an E-code", e.code);
         }
     }

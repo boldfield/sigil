@@ -16,7 +16,7 @@ pub struct Program {
 #[derive(Clone, Debug)]
 pub enum Item {
     Import(ImportDecl),
-    Fn(FnDecl),
+    Fn(Box<FnDecl>),
 }
 
 #[derive(Clone, Debug)]

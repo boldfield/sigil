@@ -141,7 +141,10 @@ mod tests {
 
     #[test]
     fn explain_path() {
-        assert_eq!(parse_argv(&["explain", "E0010"]), Command::Explain("E0010".into()));
+        assert_eq!(
+            parse_argv(&["explain", "E0010"]),
+            Command::Explain("E0010".into())
+        );
         assert_eq!(
             parse_argv(&["explain"]),
             Command::UsageError("explain: missing <code> argument".into()),

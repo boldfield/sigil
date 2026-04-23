@@ -82,7 +82,9 @@ mod tests {
     fn redefinition_is_e0020() {
         let src = "fn main() -> Int ![] { let x: Int = 1; let x: Int = 2; 0 }\n";
         let errs = pipeline(src);
-        assert!(errs.iter().any(|e| e.code.as_str() == "E0020"),
-            "expected E0020 redef error, got: {errs:?}");
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0020"),
+            "expected E0020 redef error, got: {errs:?}"
+        );
     }
 }

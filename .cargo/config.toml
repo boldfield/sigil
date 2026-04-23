@@ -1,0 +1,11 @@
+# Per-environment build behavior. Memory-constrained hosts set
+# CARGO_BUILD_JOBS via env; CI sets it to the runner's core count.
+# No static jobs cap here to avoid pinning CI.
+
+# Linux: prefer lld linker (half the memory of ld.bfd). Requires
+# lld installed on the host. CI installs it; headless pods should
+# too (see runtime/README.md). If lld is unavailable, comment out
+# this block.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

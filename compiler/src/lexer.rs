@@ -93,7 +93,7 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
 
         if c.is_ascii_digit() {
             let lit = cursor.take_while(|ch| ch.is_ascii_digit());
-            let n = lit.parse::<i64>().unwrap_or_else(|_| 0);
+            let n = lit.parse::<i64>().unwrap_or(0);
             tokens.push(Token {
                 kind: TokenKind::IntLit(n),
                 span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
@@ -152,8 +152,7 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
         // Unknown character.
         let span = Span::new(file, start_line, start_col, start_line, start_col + 1);
         cursor.advance();
-        let code = errors::catalog::ErrorCode::new("E0010")
-            .unwrap_or_else(|| panic_code("E0010"));
+        let code = errors::catalog::ErrorCode::new("E0010").unwrap_or_else(|| panic_code("E0010"));
         errors.push(CompilerError::new(
             Severity::Error,
             code,
@@ -292,7 +291,8 @@ impl<'a> Cursor<'a> {
         loop {
             if self.at_eof() {
                 let span = Span::new(self.file, start_line, start_col, self.line, self.col);
-                let code = errors::catalog::ErrorCode::new("E0010").unwrap_or_else(|| panic_code("E0010"));
+                let code =
+                    errors::catalog::ErrorCode::new("E0010").unwrap_or_else(|| panic_code("E0010"));
                 return Err(CompilerError::new(
                     Severity::Error,
                     code,
@@ -318,8 +318,8 @@ impl<'a> Cursor<'a> {
                         let span =
                             Span::new(self.file, self.line, self.col, self.line, self.col + 1);
                         self.advance();
-                        let code =
-                            errors::catalog::ErrorCode::new("E0010").unwrap_or_else(|| panic_code("E0010"));
+                        let code = errors::catalog::ErrorCode::new("E0010")
+                            .unwrap_or_else(|| panic_code("E0010"));
                         return Err(CompilerError::new(
                             Severity::Error,
                             code,

@@ -74,7 +74,12 @@ pub struct CompilerError {
 }
 
 impl CompilerError {
-    pub fn new(severity: Severity, code: ErrorCode, span: Span, message: impl Into<String>) -> Self {
+    pub fn new(
+        severity: Severity,
+        code: ErrorCode,
+        span: Span,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             severity,
             code,
@@ -232,12 +237,8 @@ mod tests {
 
     #[test]
     fn human_emit_shape() {
-        let err = CompilerError::error(
-            code("E0010"),
-            Span::new("f.sigil", 2, 3, 2, 4),
-            "oops",
-        )
-        .with_hint("try something");
+        let err = CompilerError::error(code("E0010"), Span::new("f.sigil", 2, 3, 2, 4), "oops")
+            .with_hint("try something");
         let mut buf = Vec::new();
         let mut em = DiagnosticEmitter::new(&mut buf, ErrorFormat::Human);
         em.emit(&err).expect("emit");

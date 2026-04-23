@@ -65,9 +65,11 @@ Status values: `todo`, `in-progress`, `done`.
   - commits: [1248bc7]
   - notes: Landed with Stage 0 task 0.1; workspace scaffolding is the same commit.
 - Task 2 — runtime crate (value, header, gc, io, arena, counters)
-  - status: in-progress
-  - commits: [1efcda7]
-  - notes: counters + stackmap from task 0.10/0.11 already landed.
+  - status: done
+  - commits: [1efcda7, 57d174b]
+  - notes: counters + stackmap from task 0.10/0.11 landed in 1efcda7; value,
+    header, gc, io, arena landed in 57d174b. See PLAN_A1_DEVIATIONS.md for
+    the `sigil_println` signature deviation.
 - Task 3 — compiler crate CLI + stub modules
   - status: done
   - commits: [2a17e83]
@@ -136,3 +138,73 @@ Status values: `todo`, `in-progress`, `done`.
   - status: done
   - commits: [670f41d]
   - notes: Seeded alongside Stage 0 task 0.9 since content is identical.
+
+## Execution status — 2026-04-23 (development moved off headless pod)
+
+All Plan A1 task-level work is landed (Stage 0 + Stage 1, tasks 0.1 through
+19). Plan A1 *completion criteria* are **not yet verified** on either host.
+Remaining verification is moving to the user's local macOS laptop
+(`aarch64-apple-darwin`); the headless Talos pod (`x86_64-unknown-linux-gnu`,
+~8–12 GiB) has been abandoned as a build/test environment for sigil.
+
+**What's landed in this hand-off commit (on top of `e634fe0`):**
+
+- `Cargo.toml`: `[profile.dev]` block (debug=1, incremental=false,
+  codegen-units=256) + `[profile.release]` filled to spec (debug=0,
+  codegen-units=16, lto=false). Completes the profile-settings portion of
+  Task 0.1 that the earlier commits had not fully set.
+- `.cargo/config.toml` (new): Linux target pins the lld linker via
+  `clang -fuse-ld=lld` to cut link-time memory roughly in half.
+- `.github/workflows/ci.yml`: installs `lld clang` on Linux; splits the
+  build into `cargo build -p sigil-runtime` → `cargo build -p sigil-compiler`
+  → `cargo test --workspace --no-fail-fast`; clippy uses `--no-deps`;
+  `CARGO_INCREMENTAL=0` set in env.
+- `runtime/README.md`: adds the "Memory-constrained builds" section required
+  by the Plan A1 completion criterion at plan lines 296–301 (profile
+  settings, lld requirement, env var recommendations, build ordering,
+  clippy --no-deps guidance).
+- Compiler + runtime source: fmt / clippy polish only (rustfmt line
+  reflows; `Item::Fn` payload boxed to shrink enum variant size;
+  `unwrap_or_else(|_| 0)` → `unwrap_or(0)`). No behaviour change.
+
+**Why the pod was abandoned.** Even with every memory guard the plan
+prescribes — per-crate build ordering, `CARGO_BUILD_JOBS=1`, lld, the
+profile settings above, `CARGO_INCREMENTAL=0` — the command
+
+```shell
+CARGO_BUILD_JOBS=1 cargo test -p sigil-compiler --no-fail-fast
+```
+
+OOM-killed the Talos pod. This *contradicts* the claim in the plan's
+execution notes and in `runtime/README.md#memory-constrained-builds` that
+"the fix is build ordering + `CARGO_BUILD_JOBS=2`, not raising the memory
+ceiling." The ceiling matters: compiling the sigil-compiler test binary
+(Cranelift + codegen tests linked into a single test executable)
+measurably exceeds what an ~8–12 GiB pod can carry at j=1. Prior sessions
+also OOM'd on `cargo build --workspace`; a previous session once took the
+whole Talos node down.
+
+**What remains for Plan A1 completion (to be done on the laptop):**
+
+- `cargo test --workspace` green on `x86_64-unknown-linux-gnu` (CI) *and*
+  `aarch64-apple-darwin` (laptop). Pod runs are out.
+- `scripts/smoke.sh` compiling and running `hello.sigil` on both hosts.
+- `scripts/reproducibility.sh` asserting byte-identical hello-world
+  binaries across two same-host runs on both hosts.
+- Verify the runtime counter assertion:
+  `sigil --print-runtime-stats examples/hello.sigil -o /tmp/hello && /tmp/hello`
+  prints nonzero `SIGIL_COUNTER_BOEHM_ALLOC_COUNT` and zero
+  `SIGIL_COUNTER_ARENA_ESCAPE_COUNT`.
+- Confirm the `.sigil_stackmaps` / `__SIGIL,__stackmaps` section is
+  non-empty and parseable on emitted objects.
+- `scripts/check-no-interior-pointers.sh` passes in CI on Linux.
+
+**Gate for Plan A2.** No Plan A2 work starts until the above are green
+on the laptop and the user has reviewed the A1 hand-off. The plan's
+"do not grade your own work" rule still applies.
+
+**Open follow-up (for the laptop session):** revise
+`runtime/README.md#memory-constrained-builds` and the plan's Task 0.1 /
+execution-notes memory guidance once real peak-RSS numbers are observable
+on macOS. The current prose is the plan's *prescription*, not a
+*verified* recipe — it has now been falsified on Linux at j=1.

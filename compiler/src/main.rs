@@ -47,7 +47,9 @@ fn print_runtime_stats(cargs: CompileArgs) -> ExitCode {
     let prog = Path::new(&cargs.output);
     let mut cmd = Command::new(prog);
     cmd.env("SIGIL_PRINT_STATS", "1");
-    cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
     match cmd.status() {
         Ok(s) => match s.code() {
             Some(c) => ExitCode::from(c as u8),

@@ -43,7 +43,10 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             Item::Import(_) => {}
         }
     }
-    let has_main = program.items.iter().any(|i| matches!(i, Item::Fn(f) if f.name == "main"));
+    let has_main = program
+        .items
+        .iter()
+        .any(|i| matches!(i, Item::Fn(f) if f.name == "main"));
     if !has_main {
         let span = Span::synthetic(&program.file);
         tc.push_error(
@@ -73,12 +76,8 @@ impl Tc {
             Some(c) => c,
             None => panic!("catalog is missing {code}"),
         };
-        self.errors.push(CompilerError::new(
-            Severity::Error,
-            c,
-            span,
-            msg,
-        ));
+        self.errors
+            .push(CompilerError::new(Severity::Error, c, span, msg));
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
@@ -141,7 +140,10 @@ impl Tc {
                 self.push_error(
                     "E0001",
                     p.span.clone(),
-                    format!("`IO.println` takes exactly one String argument (got {})", p.args.len()),
+                    format!(
+                        "`IO.println` takes exactly one String argument (got {})",
+                        p.args.len()
+                    ),
                 );
                 return;
             }

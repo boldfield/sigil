@@ -55,10 +55,7 @@ pub const STACKMAP_RECORD_SIZE: usize = 8;
 /// Compile `cc` to an object file at `out_path`. Returns `Ok(())` on
 /// success. Stage 1 compilation is deterministic given identical input on
 /// the same host.
-pub fn emit_object(
-    cc: &ClosureConvertedProgram,
-    out_path: &Path,
-) -> Result<(), String> {
+pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), String> {
     // Plan A1 Stage 1 stops at the hello-world shape. Validate that shape
     // up front so codegen can assume it.
     let checked: &CheckedProgram = &cc.cps.colored.mono.anf.checked;
@@ -74,8 +71,8 @@ pub fn emit_object(
         .map_err(|e| format!("cranelift flag is_pic: {e}"))?;
     // Deterministic register allocation is not a flag; regalloc2 is
     // deterministic under the same input.
-    let isa_builder = isa::lookup(triple.clone())
-        .map_err(|e| format!("cranelift isa for {triple}: {e}"))?;
+    let isa_builder =
+        isa::lookup(triple.clone()).map_err(|e| format!("cranelift isa for {triple}: {e}"))?;
     let isa = isa_builder
         .finish(settings::Flags::new(flag_builder))
         .map_err(|e| format!("cranelift isa finish: {e}"))?;
@@ -87,7 +84,11 @@ pub fn emit_object(
 
     // Declare runtime symbols we'll call.
     let gc_init = module
-        .declare_function("sigil_gc_init", Linkage::Import, &Signature::new(isa_call_conv(&module)))
+        .declare_function(
+            "sigil_gc_init",
+            Linkage::Import,
+            &Signature::new(isa_call_conv(&module)),
+        )
         .map_err(|e| format!("declare sigil_gc_init: {e}"))?;
 
     let mut string_new_sig = Signature::new(isa_call_conv(&module));
@@ -241,7 +242,8 @@ pub fn emit_object(
     let mut product = module.finish();
 
     // Write a minimal stackmap: u32 count, then count * (pc_offset: u32, live: u16, pad: u16).
-    let mut section_bytes = Vec::with_capacity(4 + stackmap_pc_offsets.len() * STACKMAP_RECORD_SIZE);
+    let mut section_bytes =
+        Vec::with_capacity(4 + stackmap_pc_offsets.len() * STACKMAP_RECORD_SIZE);
     section_bytes.extend_from_slice(&(stackmap_pc_offsets.len() as u32).to_le_bytes());
     for off in &stackmap_pc_offsets {
         section_bytes.extend_from_slice(&off.to_le_bytes());
@@ -265,11 +267,8 @@ pub fn emit_object(
         section.set_data(section_bytes, 8);
     }
 
-    let bytes = product
-        .emit()
-        .map_err(|e| format!("object emit: {e}"))?;
-    std::fs::write(out_path, bytes)
-        .map_err(|e| format!("write {}: {}", out_path.display(), e))?;
+    let bytes = product.emit().map_err(|e| format!("object emit: {e}"))?;
+    std::fs::write(out_path, bytes).map_err(|e| format!("write {}: {}", out_path.display(), e))?;
     Ok(())
 }
 

@@ -76,12 +76,8 @@ impl<'a> Parser<'a> {
             Some(c) => c,
             None => panic!("catalog is missing E0010"),
         };
-        self.errors.push(CompilerError::new(
-            Severity::Error,
-            code,
-            span,
-            message,
-        ));
+        self.errors
+            .push(CompilerError::new(Severity::Error, code, span, message));
     }
 
     fn expect(&mut self, kind: &TokenKind, what: &str) -> Option<Token> {
@@ -118,7 +114,7 @@ impl<'a> Parser<'a> {
                     None => self.synchronise_to_semi_or_brace(),
                 },
                 TokenKind::Fn => match self.parse_fn_decl() {
-                    Some(f) => items.push(Item::Fn(f)),
+                    Some(f) => items.push(Item::Fn(Box::new(f))),
                     None => self.synchronise_to_semi_or_brace(),
                 },
                 _ => {
@@ -154,7 +150,10 @@ impl<'a> Parser<'a> {
                 Severity::Error,
                 code,
                 start.clone(),
-                format!("user-code imports are not supported in v1 (saw `{}`)", path.join(".")),
+                format!(
+                    "user-code imports are not supported in v1 (saw `{}`)",
+                    path.join(".")
+                ),
             ));
         }
         Some(ImportDecl { path, span: start })
@@ -398,11 +397,15 @@ mod tests {
         let (prog, errs) = parse("hello.sigil", &toks);
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(prog.items.len(), 2);
-        let Item::Fn(ref f) = prog.items[1] else { panic!() };
+        let Item::Fn(ref f) = prog.items[1] else {
+            panic!()
+        };
         assert_eq!(f.name, "main");
         assert_eq!(f.effects, vec!["IO".to_string()]);
         assert_eq!(f.body.stmts.len(), 1);
-        let Some(Expr::IntLit(0, _)) = f.body.tail else { panic!() };
+        let Some(Expr::IntLit(0, _)) = f.body.tail else {
+            panic!()
+        };
     }
 
     #[test]
@@ -422,6 +425,9 @@ mod tests {
         // no `!` before `{` which triggers a parser E0010.
         let (_prog, parse_errs) = parse("x.sigil", &toks);
         let total = lex_errs.len() + parse_errs.len();
-        assert!(total >= 2, "expected >=2 errors, got {lex_errs:?} + {parse_errs:?}");
+        assert!(
+            total >= 2,
+            "expected >=2 errors, got {lex_errs:?} + {parse_errs:?}"
+        );
     }
 }

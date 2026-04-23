@@ -121,3 +121,78 @@ prints the counters to stderr at exit, one `NAME=value` per line.
 v1 itself does not make decisions from these counters; they exist so v2
 optimisation work (precise GC tuning, arena sizing, handler-dispatch
 specialisation) is data-driven.
+
+## Memory-constrained builds
+
+Peak memory during a workspace build is driven by the compiler crate's
+Cranelift dependency tree. The defaults below keep the peak in the
+4–6 GB range on Linux, survivable on 8–12 GB headless pods.
+
+### Workspace profile settings (committed in `Cargo.toml`)
+
+```toml
+[profile.dev]
+debug = 1              # line tables only; full DWARF blows up link memory
+incremental = false    # incremental caches bloat memory and occasionally corrupt
+codegen-units = 256    # many small units → smaller per-unit peak memory
+
+[profile.release]
+debug = 0
+codegen-units = 16     # balances optimisation quality with link-time memory
+lto = false            # LTO is a v2+ consideration
+```
+
+These apply to every builder (local dev machine, CI, headless pod) without
+environment variables.
+
+### `.cargo/config.toml` — Linux lld requirement
+
+`.cargo/config.toml` at the workspace root pins the Linux target to the
+lld linker via `clang`:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+```
+
+lld uses roughly half the memory of ld.bfd at link time. Install on
+hosts:
+
+- **Linux (Debian/Ubuntu):** `sudo apt-get install -y lld clang`
+- **macOS:** no action — Apple's ld is used; this block is Linux-only.
+
+If lld is genuinely unavailable on a host, comment out the Linux target
+block (not delete — the next contributor will want it back).
+
+### Recommended environment variables
+
+For constrained hosts (headless pods, small CI runners):
+
+- `CARGO_BUILD_JOBS=2` — caps rustc parallelism. This is the single
+  biggest lever for peak memory. CI runners with more cores can raise
+  or omit this.
+- `CARGO_INCREMENTAL=0` — redundant with the profile setting above but
+  explicit in CI.
+
+### Build ordering on constrained hosts
+
+Do not run `cargo build --workspace`, `cargo check --workspace`, or
+`cargo clippy --all-targets` as a single invocation on memory-constrained
+hosts. These co-compile multiple large crates in parallel and can spike
+peak memory past 10 GB (Cranelift's dependency tree is the main driver).
+
+Use the per-crate ordering (what CI does):
+
+```shell
+cargo build -p sigil-runtime
+cargo build -p sigil-compiler
+cargo test  --workspace --no-fail-fast
+```
+
+For clippy, prefer `cargo clippy --no-deps` over `cargo clippy` — the
+`--no-deps` flag skips re-analysing dependency crates, cutting memory
+significantly without losing coverage of our own code.
+
+If an OOM is reported during a build, the fix is build ordering +
+`CARGO_BUILD_JOBS=2`, not raising the memory ceiling.

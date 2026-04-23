@@ -53,7 +53,10 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("cc exited {}: stdout={stdout} stderr={stderr}", output.status));
+        return Err(format!(
+            "cc exited {}: stdout={stdout} stderr={stderr}",
+            output.status
+        ));
     }
     Ok(())
 }
@@ -62,14 +65,19 @@ fn locate_runtime_lib() -> Option<PathBuf> {
     // `cargo build` places libsigil_runtime.a under target/<profile>/.
     // We walk a few candidate profile directories in preference order.
     for profile in &["release", "debug"] {
-        let p = PathBuf::from("target").join(profile).join("libsigil_runtime.a");
+        let p = PathBuf::from("target")
+            .join(profile)
+            .join("libsigil_runtime.a");
         if p.exists() {
             return Some(p);
         }
     }
     // CARGO_MANIFEST_DIR fallback if invoked from a subdir.
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        let base = Path::new(&manifest).parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let base = Path::new(&manifest)
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
         for profile in &["release", "debug"] {
             let p = base.join("target").join(profile).join("libsigil_runtime.a");
             if p.exists() {

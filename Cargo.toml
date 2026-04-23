@@ -16,6 +16,12 @@ include_dir = "=0.7.4"
 object = "=0.39.1"
 insta = "=1.47.2"
 
+[profile.dev]
+debug = 1              # line tables only; avoids full-DWARF link-time memory blowup
+incremental = false    # incremental caches bloat memory and occasionally corrupt
+codegen-units = 256    # many small units → smaller per-unit peak memory
+
 [profile.release]
-lto = false
-codegen-units = 1
+debug = 0
+codegen-units = 16     # balance between optimization quality and link memory
+lto = false            # LTO is a v2+ consideration; off for now

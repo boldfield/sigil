@@ -52,7 +52,10 @@ pub fn compile(input: &str, output: &str, format: ErrorFormat) -> Result<usize, 
     // Early exit on any errors before we try codegen — invariants downstream
     // (e.g. "main exists", "IO.println arg is a String") are only valid on
     // clean type-checks.
-    if all_errs.iter().any(|e| matches!(e.severity, crate::errors::Severity::Error)) {
+    if all_errs
+        .iter()
+        .any(|e| matches!(e.severity, crate::errors::Severity::Error))
+    {
         emit_errors(&all_errs, format);
         return Err(all_errs.len());
     }
