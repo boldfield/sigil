@@ -50,9 +50,9 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
   - commits: [964a83c]
   - notes: Pratt-style precedence climbing in `parse_expr_prec`. AST gains `BoolLit`, `CharLit`, `Binary`, `Unary`, `If`, `Match`, `MatchArm`, `BinOp`, `UnOp`, `Pattern`. `-<int-literal>` folds to `IntLit(-n)` at parse time. Parenthesized exprs supported. Typecheck emits E0043 "Stage-2 not yet typed" for the new variants (task 22 replaces with real rules). 15 parser unit tests pass (12 new).
 - Task 22 — Extend typechecker (Bool, Char, Byte; binop typing; if unification; match exhaustiveness)
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done-pending-ci
+  - commits: [(pending)]
+  - notes: Added `Bool`, `Char`, `Byte` to `Ty`; wired `ty_from_type_expr`/`type_matches` for the new names. New catalog entries E0060 (binop operand type), E0061 (unary operand type), E0062 (if-cond not Bool), E0063 (if-branch disunion), E0064 (pattern/scrutinee mismatch), E0065 (match-arm disunion), E0066 (non-exhaustive match). `check_block` now returns `Option<Ty>` so `if` branch unification can see block types. Exhaustiveness is coarse and documented in the E0066 catalog entry: wildcard → exhaustive; Bool without wildcard → exhaustive iff both `true` and `false` appear; other primitives require wildcard. `< > <= >=` are Int→Int→Bool only; PLAN-A2 QUESTIONS.md entry documents the Byte-ordering discrepancy with the plan's Byte feature paragraph (resolved by implementor as strict form; reviewer may override). 25 new typecheck tests (39 total in the module, 88 total compiler lib tests, all green locally).
 - Task 23 — Extend elaboration (if → match on Bool; arith flattened into ANF)
   - status: todo
   - commits: []
