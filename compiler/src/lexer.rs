@@ -93,11 +93,30 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
 
         if c.is_ascii_digit() {
             let lit = cursor.take_while(|ch| ch.is_ascii_digit());
-            let n = lit.parse::<i64>().unwrap_or(0);
-            tokens.push(Token {
-                kind: TokenKind::IntLit(n),
-                span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
-            });
+            let span = Span::new(file, start_line, start_col, cursor.line, cursor.col);
+            match lit.parse::<i64>() {
+                Ok(n) => tokens.push(Token {
+                    kind: TokenKind::IntLit(n),
+                    span,
+                }),
+                Err(_) => {
+                    // Preserve forward progress for subsequent tokens: we
+                    // still emit a token slot (with value 0) so downstream
+                    // parser positions do not shift, then attach the
+                    // positioned E0050. The zero never reaches codegen —
+                    // compile aborts after the errors sweep.
+                    errors.push(CompilerError::new(
+                        Severity::Error,
+                        errors::code("E0050"),
+                        span.clone(),
+                        format!("integer literal `{lit}` is out of range for `Int` (i64)"),
+                    ));
+                    tokens.push(Token {
+                        kind: TokenKind::IntLit(0),
+                        span,
+                    });
+                }
+            }
             continue;
         }
 
@@ -385,5 +404,30 @@ mod tests {
         assert_eq!(errs[0].code.as_str(), "E0010");
         assert!(kinds(&toks).contains(&TokenKind::Ident("a".into())));
         assert!(kinds(&toks).contains(&TokenKind::Ident("b".into())));
+    }
+
+    #[test]
+    fn integer_literal_overflow_is_e0050() {
+        // 20 nines exceeds i64::MAX (9_223_372_036_854_775_807, 19 digits).
+        // Pre-fix this silently lexed to IntLit(0).
+        let src = "99999999999999999999";
+        let (_toks, errs) = lex("x.sigil", src);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code.as_str(), "E0050");
+        // Span should span the literal's 20 bytes on line 1.
+        assert_eq!(errs[0].span.line, 1);
+        assert_eq!(errs[0].span.column, 1);
+        assert_eq!(errs[0].span.end_column, 21);
+    }
+
+    #[test]
+    fn integer_literal_at_i64_max_does_not_error() {
+        let src = "9223372036854775807";
+        let (toks, errs) = lex("x.sigil", src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        match &toks[0].kind {
+            TokenKind::IntLit(n) => assert_eq!(*n, i64::MAX),
+            other => panic!("expected int lit, got {other:?}"),
+        }
     }
 }

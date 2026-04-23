@@ -172,6 +172,17 @@ pub const CATALOG: &[ErrorEntry] = &[
                identifier, or add the missing binding before use.",
         fix_example: "let count: Int = 1;\nlet total: Int = count;  // count is now in scope",
     },
+    ErrorEntry {
+        code: "E0050",
+        short: "integer literal out of range",
+        long: "An integer literal exceeds the range representable by the Plan A1 \
+               `Int` type, which is a signed 64-bit two's-complement integer \
+               (range -2^63 .. 2^63-1). Literals that do not fit must be expressed \
+               differently — split across arithmetic, stored as a bignum once v2 \
+               introduces one, or encoded as a `String` if the value is a textual \
+               constant rather than a number used in arithmetic.",
+        fix_example: "let n: Int = 9223372036854775807;  // i64::MAX, fits",
+    },
 ];
 
 #[cfg(test)]
