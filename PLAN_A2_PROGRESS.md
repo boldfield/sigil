@@ -83,7 +83,7 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
 
 - Task 29 — Extend parser (multi-arg decls, call exprs with args, lambda syntax)
   - status: done-pending-ci
-  - commits: [(pending)]
+  - commits: [036e3ab]
   - notes: Multi-arg function declarations (`fn_decl` with `param_list?`) and function-call expressions (`postfix := primary ('(' arg_list? ')')*`) were already admissible under Plan A1's grammar — Task 29 only introduces `lambda_expr := 'fn' '(' param_list? ')' '->' type '!' '[' effect_list ']' '=>' expr` as a new primary form. New AST variant `Expr::Lambda { params, return_type, effects, body, span }` (body is a single `Expr`, unlike top-level `FnDecl`'s `Block`). Parser dispatches on `TokenKind::Fn` at primary position; disambiguation from `parse_fn_decl` is unnecessary because top-level fn-decls only fire from `parse_program`. Downstream passes handle the new variant defensively: typecheck emits `E0043` until Task 30's function-type machinery lands; elaborate recurses into the body but hoisting across a lambda boundary is deferred to Task 31's closure conversion; codegen's `lower_expr` arm `unreachable!`s (typecheck rejection keeps it from firing on well-formed programs); `type_of_expr` predicts `pointer_ty` for lambdas (heap-allocated closure at Task 32). 10 new parser unit tests (25 total parser tests, all green): multi-arg decl, trailing-comma-tolerated, call-with-args, no-args, chained calls, lambdas (no-params, one-param, two-params-with-effect, nested/curried, paren-then-call).
 - Task 30 — Extend typechecker (function types, application unification, capture analysis)
   - status: todo
