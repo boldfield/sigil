@@ -1,27 +1,33 @@
 //! End-to-end tests — plan A1 Stage 1 task 16, extended in plan A2
-//! task 24.
+//! tasks 24 and 26.
 //!
-//! Original (Stage 1): compiles `examples/hello.sigil` with the `sigil`
-//! binary, runs the resulting program, and asserts stdout == "hello,
-//! world\n" with exit code 0.
+//! Stage 1 task 16: compiles `examples/hello.sigil` with the `sigil`
+//! binary, runs the resulting program, and asserts
+//! `stdout == "hello, world\n"` with exit code 0.
 //!
-//! Plan A2 additions (Stage 2):
+//! Stage 1 task 0.11: compiles `examples/hello.sigil` to an object
+//! file and asserts the stackmap section round-trips through the
+//! runtime's parser with the v0 placeholder invariants.
 //!
-//! - `arith_integer_ops` — compiles a program exercising `+ - * /` and
-//!   asserts the exit code matches the expected arithmetic result.
-//! - `if_else_produces_value` — verifies `if/else` with a Bool
-//!   condition lowers correctly (desugared via elaborate to a `match`,
-//!   lowered in codegen to `brif` blocks).
-//! - `match_primitive_with_wildcard` — exercises the codegen-`match`
-//!   chain with IntLit patterns + a wildcard arm.
-//! - `div_by_zero_traps` — asserts the runtime trap prints `sigil:
-//!   arithmetic error: division by zero` to stderr and exits with
-//!   status 2.
+//! Plan A2 task 24: codegen extensions for Stage-2 arithmetic,
+//! `if`/`else`, `match`, and the divide-by-zero trap. Exercised via
+//! the `if_else_produces_value`, `match_primitive_with_wildcard`, and
+//! `mod_by_zero_traps` tests (inline-source programs — cheaper to
+//! maintain than dedicated example files, and orthogonal to the
+//! canonical Task-26 examples).
 //!
-//! All Stage-2 programs are small (a dozen lines) and inlined in the
-//! test source rather than added to `examples/`; Task 26 introduces
-//! `examples/factorial.sigil` / `arith.sigil` / `div_by_zero.sigil` as
-//! the "real" examples.
+//! Plan A2 task 26: `examples/arith.sigil` and
+//! `examples/div_by_zero.sigil` ship as canonical user-facing examples
+//! of Stage-2 arithmetic. Two e2e tests (`arith_example_exits_26`,
+//! `div_by_zero_example_traps`) compile and run those files from disk.
+//!
+//! Every test that invokes the `sigil` binary goes through
+//! [`sigil_binary`]. The helper wraps `env!("CARGO_BIN_EXE_sigil")`
+//! plus [`ensure_runtime_staticlib`] behind a `std::sync::Once` so
+//! multiple concurrent e2e tests cannot race on the nested
+//! `cargo build -p sigil-runtime` invocation, and so a test author
+//! cannot forget to ensure the staticlib exists before invoking the
+//! compiler.
 
 // `expect`/`unwrap`/`panic!` are fine in tests; the workspace clippy
 // rule bans them in compiler source so user-facing errors route through
@@ -30,6 +36,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Once;
 
 /// Workspace root — `compiler/tests/` is two levels deep.
 fn workspace_root() -> PathBuf {
@@ -37,6 +44,32 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("compiler/ has a parent (workspace root)")
         .to_path_buf()
+}
+
+/// Returns the path to the compiled `sigil` binary and — on the first
+/// call — ensures `libsigil_runtime.a` is present under
+/// `target/<profile>/` so `link.rs` can find it.
+///
+/// Every e2e test that invokes the compiler must route through this
+/// helper. A test author who writes
+/// `Command::new(env!("CARGO_BIN_EXE_sigil"))` directly bypasses the
+/// staticlib check and risks a link-time failure on cold CI runs; the
+/// helper makes the omission syntactically impossible.
+///
+/// The inner `Once` guard is the reviewer-requested (PR #2)
+/// serialisation of the nested `cargo build -p sigil-runtime` call:
+/// without it, two concurrent e2e tests can both observe
+/// `staticlib.exists() == false` and both spawn a cargo subprocess,
+/// doubling cold-CI wall time. Cargo's target-dir lock prevents
+/// deadlock but not the wasted work. Plan A2 task 26 pick-up from
+/// PR #2 review.
+fn sigil_binary() -> PathBuf {
+    static INIT: Once = Once::new();
+    let sigil_bin = PathBuf::from(env!("CARGO_BIN_EXE_sigil"));
+    INIT.call_once(|| {
+        ensure_runtime_staticlib(&workspace_root(), &sigil_bin);
+    });
+    sigil_bin
 }
 
 /// Cargo builds `sigil-runtime` as an rlib when it's pulled in as a
@@ -52,6 +85,9 @@ fn workspace_root() -> PathBuf {
 /// on a cold `cargo test --workspace` because the outer cargo still
 /// held locks during build-script execution. See PLAN_A2_DEVIATIONS.md
 /// [Task 1.5.5] for the detailed history.)
+///
+/// Only called from [`sigil_binary`]'s `Once` init; parallel callers
+/// wait on `Once::call_once` and no subprocess race occurs.
 fn ensure_runtime_staticlib(root: &Path, sigil_bin: &Path) {
     // Detect the profile from the `sigil` binary's path
     // (`target/<profile>/sigil`). Default to debug if nothing recognizable
@@ -95,54 +131,77 @@ fn ensure_runtime_staticlib(root: &Path, sigil_bin: &Path) {
     );
 }
 
-#[test]
-fn hello() {
+/// Compile a Sigil source file to a temp binary and run it. Returns
+/// `(stdout, stderr, exit_code)` from the child process. Temp output
+/// files are cleaned up before returning. `source_path` is passed
+/// through to the compiler as-is; the caller is responsible for
+/// producing a valid `.sigil` file on disk.
+///
+/// Panics on compile failure; callers that expect compilation to fail
+/// should instead drive the compiler by hand.
+fn compile_file_and_run(source_path: &Path, test_name: &str) -> (String, String, i32) {
     let root = workspace_root();
-    let sigil_bin = PathBuf::from(env!("CARGO_BIN_EXE_sigil"));
-    ensure_runtime_staticlib(&root, &sigil_bin);
-    let source = root.join("examples/hello.sigil");
-    let out_path = std::env::temp_dir().join(format!("sigil_e2e_hello_{}", std::process::id(),));
+    let sigil_bin = sigil_binary();
 
-    // Invoke the compiler from the workspace root so the linker can
-    // find target/<profile>/libsigil_runtime.a via its relative-path
-    // lookup.
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
+
     let compile = Command::new(&sigil_bin)
-        .arg(&source)
+        .arg(source_path)
         .arg("-o")
-        .arg(&out_path)
+        .arg(&bin_path)
         .current_dir(&root)
         .output()
         .expect("failed to invoke sigil compiler");
     assert!(
         compile.status.success(),
-        "sigil compilation failed: stdout={} stderr={}",
+        "compile failed for {test_name}: stdout={} stderr={}",
         String::from_utf8_lossy(&compile.stdout),
         String::from_utf8_lossy(&compile.stderr),
     );
 
-    let run = Command::new(&out_path)
+    let run = Command::new(&bin_path)
         .output()
-        .expect("failed to execute compiled hello binary");
-    assert!(
-        run.status.success(),
-        "compiled hello exited with {} stderr={}",
-        run.status,
-        String::from_utf8_lossy(&run.stderr),
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&run.stdout),
-        "hello, world\n",
-        "hello-world stdout mismatch",
-    );
+        .expect("failed to execute compiled binary");
 
-    // Best-effort cleanup; ignore errors.
-    let _ = std::fs::remove_file(&out_path);
+    let code = run.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    let _ = std::fs::remove_file(&bin_path);
+
+    (stdout, stderr, code)
 }
 
-/// Compile hello.sigil and compile-only (no link), then inspect the .o
-/// file's stackmap section bytes and parse them via the runtime's
-/// parser. Asserts the v0 placeholder invariants: magic, version = 0,
-/// every record flagged placeholder, live_count = 0.
+/// Write `source` to a temp `.sigil` file and run
+/// [`compile_file_and_run`] on it. Convenience for tests whose source
+/// is an inline string literal.
+fn compile_and_run(source: &str, test_name: &str) -> (String, String, i32) {
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_{}_{}.sigil",
+        test_name,
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let out = compile_file_and_run(&src_path, test_name);
+    let _ = std::fs::remove_file(&src_path);
+    out
+}
+
+#[test]
+fn hello() {
+    let root = workspace_root();
+    let source = root.join("examples/hello.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "hello");
+    assert_eq!(code, 0, "hello exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello, world\n", "hello-world stdout mismatch");
+}
+
+/// Compile `examples/hello.sigil` (compile-only, no link), then
+/// inspect the `.o` file's stackmap section bytes and parse them via
+/// the runtime's parser. Asserts the v0 placeholder invariants:
+/// magic, version = 0, every record flagged placeholder,
+/// `live_count = 0`.
 #[test]
 fn stackmap_section_parses_v0_placeholder() {
     use sigil_compiler::{
@@ -152,6 +211,12 @@ fn stackmap_section_parses_v0_placeholder() {
     use sigil_runtime::stackmap::{
         parse_section, ParseError, STACKMAP_FLAG_PLACEHOLDER, STACKMAP_VERSION_PLACEHOLDER,
     };
+
+    // The helper does not invoke the compiler binary, but it does read
+    // the staticlib indirectly via link.rs downstream; route through
+    // sigil_binary() anyway so the Once guarantee holds across every
+    // e2e entry point.
+    let _ = sigil_binary();
 
     let root = workspace_root();
     let src = std::fs::read_to_string(root.join("examples/hello.sigil")).expect("read hello.sigil");
@@ -207,75 +272,43 @@ fn stackmap_section_parses_v0_placeholder() {
     let _ = std::fs::remove_file(&obj_path);
 }
 
-/// Compile the given Sigil source to a temp binary and run it.
-/// Returns `(stdout, stderr, exit_code)` from the child process. The
-/// temp files are cleaned up before returning.
-///
-/// Panics on compile failure; the caller should pre-validate the
-/// program is expected to compile. For programs expected to *run* and
-/// exit with a non-zero code (e.g. the div-by-zero trap), check
-/// `exit_code` against the expected sentinel.
-fn compile_and_run(source: &str, test_name: &str) -> (String, String, i32) {
-    let root = workspace_root();
-    let sigil_bin = PathBuf::from(env!("CARGO_BIN_EXE_sigil"));
-    ensure_runtime_staticlib(&root, &sigil_bin);
+// ===== Plan A2 Task 26 — canonical Stage-2 examples =========================
 
-    let src_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_{}_{}.sigil",
-        test_name,
-        std::process::id()
-    ));
-    let bin_path =
-        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
-    std::fs::write(&src_path, source).expect("write source");
-
-    let compile = Command::new(&sigil_bin)
-        .arg(&src_path)
-        .arg("-o")
-        .arg(&bin_path)
-        .current_dir(&root)
-        .output()
-        .expect("failed to invoke sigil compiler");
-    assert!(
-        compile.status.success(),
-        "compile failed for {test_name}: stdout={} stderr={}",
-        String::from_utf8_lossy(&compile.stdout),
-        String::from_utf8_lossy(&compile.stderr),
-    );
-
-    let run = Command::new(&bin_path)
-        .output()
-        .expect("failed to execute compiled binary");
-
-    // Use exit code 0..=255 as per Unix; fallback to -1 on signal.
-    let code = run.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
-
-    let _ = std::fs::remove_file(&src_path);
-    let _ = std::fs::remove_file(&bin_path);
-
-    (stdout, stderr, code)
-}
-
-/// Plan A2 task 24 — `iadd`/`isub`/`imul`/`sdiv` codegen.
-///
-/// `(10 + 20 * 2) / 2 = 25`. The program returns the result as the
-/// process exit status; Unix masks to the low 8 bits, so the test
-/// asserts `25 & 0xff == 25`.
+/// Plan A2 task 26 — compiles and runs `examples/arith.sigil`. The
+/// file's comment documents the invariant: exit code 26.
 #[test]
-fn arith_integer_ops() {
-    let source = "fn main() -> Int ![] {\n\
-                    let n: Int = (10 + 20 * 2) / 2;\n\
-                    n\n\
-                  }\n";
-    let (_stdout, _stderr, code) = compile_and_run(source, "arith");
-    assert_eq!(code, 25, "arith exit code");
+fn arith_example_exits_26() {
+    let root = workspace_root();
+    let source = root.join("examples/arith.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run(&source, "arith_example");
+    assert_eq!(code, 26, "arith.sigil exit code; stderr={stderr:?}");
 }
 
-/// Plan A2 task 24 — `if`/`else` lowering. Elaborate desugars the
-/// `if` into a `match`-on-`Bool`; codegen emits compare + `brif` to
-/// two arm bodies joining at a continue block.
+/// Plan A2 task 26 — compiles and runs `examples/div_by_zero.sigil`.
+/// Verifies the runtime trap: stderr banner and exit status 2.
+#[test]
+fn div_by_zero_example_traps() {
+    let root = workspace_root();
+    let source = root.join("examples/div_by_zero.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run(&source, "div_by_zero_example");
+    assert_eq!(code, 2, "div_by_zero.sigil exits with 2");
+    assert!(
+        stderr.contains("sigil: arithmetic error: division by zero"),
+        "stderr missing arith-error banner: {stderr:?}"
+    );
+}
+
+// ===== Plan A2 Task 24 — Stage-2 codegen additional coverage ================
+//
+// These tests use inline-source programs so the canonical
+// `examples/` directory stays minimal (per plan scope). They exist to
+// pin codegen behaviour for Stage-2 shapes that the Task-26 example
+// files don't exercise: `if`/`else`, `match` with a wildcard, and the
+// modulo-by-zero variant of the arith trap.
+
+/// `if`/`else` lowering. Elaborate desugars the `if` into a
+/// `match`-on-`Bool`; codegen emits compare + `brif` to two arm bodies
+/// joining at a continue block.
 #[test]
 fn if_else_produces_value() {
     let source = "fn main() -> Int ![] {\n\
@@ -287,10 +320,9 @@ fn if_else_produces_value() {
     assert_eq!(code, 10, "n=5 → n*2 = 10");
 }
 
-/// Plan A2 task 24 — `match` chain with IntLit patterns and a
-/// wildcard. Codegen emits a compare + `brif` per literal pattern, a
-/// wildcard jump for the final arm, and a continue block that
-/// produces the arm's body value.
+/// `match` chain with IntLit patterns and a wildcard. Codegen emits a
+/// compare + `brif` per literal pattern, a wildcard jump for the final
+/// arm, and a continue block that produces the arm's body value.
 #[test]
 fn match_primitive_with_wildcard() {
     let source = "fn main() -> Int ![] {\n\
@@ -306,31 +338,10 @@ fn match_primitive_with_wildcard() {
     assert_eq!(code, 17, "n=2 hits wildcard → 17");
 }
 
-/// Plan A2 task 24 + task 25 — division by zero traps via
-/// `sigil_panic_arith_error`. Exit code is 2; stderr contains the
-/// runtime's arith-error banner.
-#[test]
-fn div_by_zero_traps() {
-    let source = "fn main() -> Int ![] {\n\
-                    let a: Int = 10;\n\
-                    let b: Int = 0;\n\
-                    let q: Int = a / b;\n\
-                    q\n\
-                  }\n";
-    let (_stdout, stderr, code) = compile_and_run(source, "div_by_zero");
-    assert_eq!(code, 2, "div-by-zero exits with 2");
-    assert!(
-        stderr.contains("division by zero"),
-        "stderr missing arith-error banner: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("sigil: arithmetic error"),
-        "stderr missing `sigil: arithmetic error` prefix: {stderr:?}"
-    );
-}
-
-/// Plan A2 task 24 + task 25 — modulo by zero takes the same trap
-/// path with a different reason string.
+/// Modulo-by-zero takes the same runtime-trap path as division-by-zero
+/// but with a different reason string. The canonical
+/// `examples/div_by_zero.sigil` covers the `/` path via
+/// [`div_by_zero_example_traps`]; this test covers the `%` path.
 #[test]
 fn mod_by_zero_traps() {
     let source = "fn main() -> Int ![] {\n\

@@ -87,12 +87,15 @@ jobs:
       # but a pod-verify step earlier in the job has updated some
       # adjacent fingerprints (rlib / test-profile) such that cargo
       # declines to re-emit the staticlib. Dropping the `.a` forces an
-      # unambiguous rebuild into the current source's symbol set. See
-      # Plan A2 task 24+25 commit history for the concrete
-      # manifestation: `sigil_panic_arith_error` was added to
-      # `runtime/src/arith.rs` on a cached-target CI run and the
-      # subsequent e2e link step reported `undefined reference` until
-      # this workaround landed.
+      # unambiguous rebuild into the current source's symbol set.
+      #
+      # This `rm -f` line is **load-bearing**: removing it without
+      # swapping the overall cache strategy (e.g. to
+      # `Swatinem/rust-cache@v2`) will re-introduce the
+      # `undefined reference to \`sigil_panic_arith_error\`` failure
+      # that surfaced on PR #3's first CI run. See
+      # `PLAN_A2_DEVIATIONS.md` `[CHORE]` entry for the full rationale
+      # and forward plan.
       - name: build runtime
         run: |
           rm -f target/debug/libsigil_runtime.a target/release/libsigil_runtime.a

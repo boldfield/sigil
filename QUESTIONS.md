@@ -118,14 +118,33 @@ recursion dependency?
   trampoline via a closure built ad-hoc, or unrolled multiplication).
   Contradicts the plan's stated "recursive factorial" wording.
 
-**Status:** open (2026-04-23) — surfaces at Task 26. Current Tasks
-24+25 do not depend on this resolution; `factorial.sigil` is a Task 26
-concern.
+**Status:** resolved (2026-04-23) by reviewer decision on PR #3 and the
+matching plan update at `boldfield/designs` commit `8e75c43`.
 
-**Resolution:** (pending) — implementor defaults to option (a) when Task
-26 arrives unless reviewer decides otherwise before then. The planned
-scope adjustment: Task 26 ships `examples/arith.sigil` +
-`div_by_zero.sigil` only; Task 27's perf floor drops to `arith.sigil`
-run-time; Task 28 ships P05 + P07 only (P04 + P06 wait for Stage 3).
-Task 33's `examples/fibonacci.sigil` (already Stage 3) absorbs the
-recursive-oracle role `factorial.sigil` was meant to play.
+**Resolution:** Option (a) — defer factorial and its perf floor to
+Stage 3; drop the recursion-bearing prompts from Task 28.
+
+The `in-progress/2026-04-21-sigil-core-a2.md` plan was revised in
+parallel with this resolution, so the plan body itself is now
+consistent:
+
+- **Task 26** ships `examples/arith.sigil` + `examples/div_by_zero.sigil`
+  only, plus the PR #2 deferrals (`std::sync::Once` guard around
+  `ensure_runtime_staticlib` and the `fn sigil_binary() -> PathBuf`
+  helper that both existing e2e call sites migrate to).
+- **Task 27** drops its Stage-2 perf floor; verification shrinks to
+  "`cargo test --workspace` completes within CI job limits on both
+  hosts". The v1 perf floor lives in **Task 34** as `fib(20) == 6765`
+  in <50ms.
+- **Task 28** ships **P05** (mod + if/else) and **P07** (safe divide
+  with divisor check) only. P04 (sum-to-n via recursion) and P06
+  (multiplication table via nested recursion) move to **Task 35**
+  in Stage 3.
+- **Task 33**'s `examples/fibonacci.sigil` absorbs the recursive-
+  oracle role `factorial.sigil` was meant to play.
+
+Rationale (from the PR #3 review): Stage 2 is "arithmetic +
+conditionals + match"; Stage 3 is "multi-arg functions + recursion +
+closures". Factorial belongs to the latter. Fibonacci is a better
+benchmark oracle anyway (non-trivial call depth, classic
+branching-recursion pattern, printed oracle is unambiguous).
