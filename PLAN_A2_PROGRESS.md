@@ -16,27 +16,27 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
 
 - Task 1.5.1 — Create `PLAN_A2_PROGRESS.md`
   - status: done
-  - commits: [(pending)]
+  - commits: [a18876e]
   - notes: This file.
 - Task 1.5.2 — Create empty `PLAN_A2_DEVIATIONS.md`
   - status: done
-  - commits: [(pending)]
+  - commits: [a18876e]
   - notes: Landed atomically with 1.5.1 and 1.5.3 (scaffolding is one unit).
 - Task 1.5.3 — Preserve `QUESTIONS.md` across plans with `[PLAN-A2]` prefix convention
   - status: done
-  - commits: [(pending)]
+  - commits: [a18876e]
   - notes: Appended a tagging convention to QUESTIONS.md header; A1 entries are implicitly `[PLAN-A1]`.
 - Task 1.5.4 — `scripts/pod-verify.sh` + README pod-vs-CI section + CI wiring
   - status: done
-  - commits: [(pending)]
+  - commits: [215ef8a]
   - notes: Script wraps fmt + check + per-crate clippy + runtime lib tests + interior-pointer check + discipline greps. Greps for unwrap/expect/panic are advisory (clippy -D warnings is the authority); false positives inside test modules are expected. CI invokes the script as a new step before the existing build/test matrix.
 - Task 1.5.5 — Fix cold-target e2e staticlib ordering
   - status: done-pending-ci
-  - commits: [(pending)]
+  - commits: [f0a6212]
   - notes: DEVIATION logged. `compiler/build.rs` invokes `cargo build -p sigil-runtime` when `target/<profile>/libsigil_runtime.a` is missing; `SIGIL_SKIP_RUNTIME_STATICLIB_BUILD=1` opt-out available. Separate CI job `cold-checkout-test` runs `rm -rf target && cargo test --workspace` twice in succession on both hosts (slow; ~10m Linux, ~15m macOS). Approach documented in `runtime/README.md#cold-checkout-build-ordering`. Cold path cannot be validated on the pod (would OOM); CI is the authoritative acceptance gate.
 - Task 1.5.6 — `debug_assert!` on typecheck env insertion (no-shadowing invariant)
   - status: done
-  - commits: [(pending)]
+  - commits: [00739d3]
   - notes: Extracted a `Tc::env_insert(name, ty)` helper that asserts `prev.is_none()` in debug builds. Both insertion sites (params in `check_fn`, let bindings in `check_block`) use the helper. All 14 typecheck tests still green.
 
 ## Stage 2 — Arithmetic, booleans, conditionals

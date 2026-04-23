@@ -5,7 +5,7 @@ Retroactive entries are forbidden.
 
 ## [Task 1.5.5] `compiler/build.rs` invokes cargo to materialise the runtime staticlib; cold-checkout verification lives in a dedicated CI job
 
-**Commit:** (pending)
+**Commit:** f0a6212
 
 **Plan text:** "Fix by adding a `build.rs` to `compiler/` that declares an
 explicit artifact dependency on `runtime`, or by restructuring CI's test
