@@ -5,7 +5,9 @@
 //! enumerated per-host:
 //!
 //! - Linux: `-Wl,--build-id=none`, `SOURCE_DATE_EPOCH=0` in env.
-//! - macOS: `-Wl,-no_uuid`, path canonicalisation (none needed for Stage 1).
+//! - macOS: `-Wl,-reproducible` (see PLAN_A1_DEVIATIONS.md [Task 13] —
+//!   dyld rejects binaries without LC_UUID; `-reproducible` yields a
+//!   stable content-hash UUID instead of omitting it).
 //! - Both: `TZ=UTC` in the link env.
 //!
 //! The runtime library is located by looking for `libsigil_runtime.a` in
@@ -24,9 +26,19 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
         .ok_or_else(|| "libsigil_runtime.a not found; build the runtime first".to_string())?;
 
     let mut cmd = Command::new("cc");
-    cmd.arg(obj_path)
-        .arg(&runtime)
-        .arg("-lgc")
+    cmd.arg(obj_path).arg(&runtime);
+
+    // On macOS Homebrew installs libgc outside the default linker search
+    // path. Query pkg-config for `-L` entries and pass them through before
+    // `-lgc`. Graceful fallback: if pkg-config is missing or has no entry
+    // for bdw-gc we proceed with the bare `-lgc`, which works on Ubuntu
+    // where apt places libgc on the default path.
+    // See PLAN_A1_DEVIATIONS.md ([Task 2, Task 13]) for the rationale.
+    for search_path in pkg_config_search_paths("bdw-gc") {
+        cmd.arg(format!("-L{search_path}"));
+    }
+
+    cmd.arg("-lgc")
         .arg("-lpthread")
         .arg("-ldl")
         .arg("-lm")
@@ -45,7 +57,7 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     }
 
     #[cfg(target_os = "macos")]
-    cmd.arg("-Wl,-no_uuid");
+    cmd.arg("-Wl,-reproducible");
 
     let output = cmd
         .output()
@@ -59,6 +71,22 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn pkg_config_search_paths(pkg: &str) -> Vec<String> {
+    let output = match Command::new("pkg-config").args(["--libs", pkg]).output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .split_ascii_whitespace()
+        .filter_map(|token| token.strip_prefix("-L").map(str::to_owned))
+        .filter(|path| !path.is_empty())
+        .collect()
 }
 
 fn locate_runtime_lib() -> Option<PathBuf> {

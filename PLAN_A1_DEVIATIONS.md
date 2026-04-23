@@ -104,6 +104,75 @@ via `libSystem.dylib` which re-exports `_Unwind_*` from libunwind, so
 no extra flag is needed there. The macOS arm of the `cfg` remains
 unchanged.
 
+## [Task 13] macOS reproducibility uses `-Wl,-reproducible`, not `-Wl,-no_uuid`
+
+**Commit:** (pending)
+
+**Plan text:** Task 13 says macOS links with `-lgc -Wl,-no_uuid`.
+
+**What was done instead:** macOS links with `-lgc -Wl,-reproducible`.
+`-Wl,-no_uuid` is dropped entirely.
+
+**Why:** Modern macOS (tested here: 26.2, ld-1230.1) rejects binaries that
+lack an `LC_UUID` load command at load time — dyld errors with
+`missing LC_UUID load command`, exit via SIGABRT. The binary `cc` emits
+with `-Wl,-no_uuid` fails to run, which would block every Plan A1
+acceptance criterion on macOS. The plan's intent behind `-no_uuid` was
+reproducibility (UUIDs embed build-time metadata). Apple's linker handles
+that directly with `-reproducible`: "ld creates a reproducible output
+binary by ignoring certain input properties or using alternative
+algorithms" (`man ld`). By default, ld already computes LC_UUID as a
+content hash — `-reproducible` additionally zeros out per-build
+nondeterministic fields (timestamps, path metadata) so the content hash
+is stable across runs. Result: a loadable, valid binary that is still
+byte-identical across two same-host compilations.
+
+**Forward implications:** `scripts/reproducibility.sh` continues to work
+on macOS without special casing; the content-hash UUID is deterministic
+given identical content. If Apple changes `-reproducible` semantics in a
+future ld, we re-evaluate. No effect on Linux (where `--build-id=none`
++ `SOURCE_DATE_EPOCH=0` path is unchanged).
+
+## [Task 2, Task 13] libgc discovery via `pkg-config` on macOS (build.rs + link.rs)
+
+**Commit:** (pending)
+
+**Plan text:** Task 2 says `runtime/` links against the chosen Boehm GC crate
+with install instructions per host. Task 13 enumerates the Linux linker flags
+as `-lgc -Wl,--build-id=none` and macOS as `-lgc -Wl,-no_uuid`. Neither task
+specifies a `-L` search-path flag.
+
+**What was done instead:** Both `runtime/build.rs` and `compiler/src/link.rs`
+now shell out to `pkg-config --libs bdw-gc` and emit every `-L<dir>` flag
+reported, in addition to the bare `-lgc`. If `pkg-config` is not on PATH or
+`bdw-gc.pc` is not discoverable, we fall through with a bare `-lgc` (the
+pre-deviation behaviour), so Ubuntu CI runners — where `libgc-dev` lands
+`libgc` on the system library path — are unaffected.
+
+**Why:** Homebrew installs `libgc.dylib` under
+`/opt/homebrew/Cellar/bdw-gc/<version>/lib/` (Apple Silicon) or
+`/usr/local/Cellar/bdw-gc/<version>/lib/` (Intel). Neither directory is on
+the macOS linker's default search path. Without a `-L` flag, `cc -lgc` fails
+with `ld: library 'gc' not found`, which is exactly what blocked
+`cargo test --workspace` on the laptop. The plan's CI workflow sets
+`PKG_CONFIG_PATH=$(brew --prefix)/opt/bdw-gc/lib/pkgconfig` so `pkg-config
+bdw-gc` already resolves correctly; the bug was that no site actually
+consulted pkg-config, just the plain `-lgc`. Two viable fixes existed: (a)
+add the `pkg-config` crate as a build-dep, (b) shell out to the `pkg-config`
+binary. (b) is chosen because the plan's dependency allow-list enumerates
+`cranelift`, `cranelift-module`, `cranelift-object`, `target-lexicon`, the
+chosen Boehm GC crate, `include_dir`, and `insta` — adding any other crate
+is an enumerated-deviation rule. Shelling to `pkg-config` keeps the
+dependency set unchanged.
+
+**Forward implications:** The runtime's `build.rs` and the compiler's
+`link.rs` now have the same pkg-config query. Plan B's effect runtime is
+likely to add a second link-time library (currently none is planned for B);
+if that happens, the same pattern applies. If cross-compilation is ever
+introduced (explicitly out of scope for v1), the `pkg-config` invocation
+needs to become target-aware (`PKG_CONFIG_ALLOW_CROSS=1` + sysroot
+handling); out-of-scope until then.
+
 ## [Task 16] e2e test lives in `compiler/tests/e2e.rs`, not a separate `sigil-tests` crate
 
 **Commit:** 8592bde
