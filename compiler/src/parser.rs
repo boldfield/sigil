@@ -26,11 +26,20 @@
 //! postfix      := primary ('(' arg_list? ')')*
 //! primary      := int_lit | string_lit | char_lit | bool_lit | ident
 //!               | perform_expr | '(' expr ')' | if_expr | match_expr
+//!               | lambda_expr
 //! if_expr      := 'if' expr block 'else' block
 //! match_expr   := 'match' expr '{' match_arm (',' match_arm)* ','? '}'
 //! match_arm    := pattern '=>' expr
 //! pattern      := '-'? int_lit | bool_lit | char_lit | '_'
 //! perform_expr := 'perform' ident '.' ident '(' arg_list? ')'
+//!
+//! # Stage 3 grammar additions (plan A2 task 29).
+//! lambda_expr  := 'fn' '(' param_list? ')' '->' type '!' '[' effect_list ']' '=>' expr
+//! # (Multi-arg function declarations and function-call expressions
+//! # with arguments were already admissible under the Plan-A1 grammar
+//! # above: `fn_decl` uses `param_list?` and `postfix` accepts
+//! # `'(' arg_list? ')'` chains. Task 29 only introduces `lambda_expr`
+//! # as a new grammar form.)
 //! ```
 //!
 //! `-<integer-literal>` is constant-folded at parse time into a single
@@ -509,11 +518,67 @@ impl<'a> Parser<'a> {
             }
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
+            TokenKind::Fn => self.parse_lambda_expr(),
             _ => {
                 self.err(tok.span.clone(), "expected an expression");
                 None
             }
         }
+    }
+
+    /// Parse a lambda expression of the form
+    /// `fn (x: T, ...) -> U ![E, ...] => body`. Body is a single
+    /// expression, not a block. The surrounding `parse_primary`
+    /// dispatches on `TokenKind::Fn`; no `fn_decl`/`lambda`
+    /// disambiguation is needed because `parse_fn_decl` only runs
+    /// from `parse_program`, not from expression-position parsing.
+    fn parse_lambda_expr(&mut self) -> Option<Expr> {
+        let start = self.peek().span.clone();
+        self.expect(&TokenKind::Fn, "`fn`")?;
+
+        self.expect(&TokenKind::LParen, "`(`")?;
+        let mut params = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
+            let p_start = self.peek().span.clone();
+            let pname = self.parse_ident("lambda parameter name")?;
+            self.expect(&TokenKind::Colon, "`:`")?;
+            let pty = self.parse_type()?;
+            params.push(Param {
+                name: pname,
+                ty: pty,
+                span: p_start,
+            });
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen, "`)`")?;
+        self.expect(&TokenKind::Arrow, "`->` before lambda return type")?;
+        let return_type = self.parse_type()?;
+        self.expect(&TokenKind::Bang, "`!` before lambda effect row")?;
+        self.expect(&TokenKind::LBracket, "`[` opening lambda effect row")?;
+        let mut effects = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBracket | TokenKind::Eof) {
+            let e = self.parse_ident("effect name")?;
+            effects.push(e);
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBracket, "`]` closing lambda effect row")?;
+        self.expect(&TokenKind::FatArrow, "`=>` before lambda body")?;
+        let body = self.parse_expr()?;
+        Some(Expr::Lambda {
+            params,
+            return_type,
+            effects,
+            body: Box::new(body),
+            span: start,
+        })
     }
 
     fn parse_if_expr(&mut self) -> Option<Expr> {
@@ -840,5 +905,206 @@ mod tests {
     fn char_literal_expression() {
         let e = parse_tail_expr("'a'");
         assert!(matches!(e, Expr::CharLit('a', _)));
+    }
+
+    // ===== Plan A2 Task 29 — Stage 3 grammar =======================
+
+    #[test]
+    fn multi_arg_fn_decl_parses() {
+        let src = "fn sum3(a: Int, b: Int, c: Int) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (toks, _) = lex("t.sigil", src);
+        let (prog, errs) = parse("t.sigil", &toks);
+        assert!(errs.is_empty(), "parse errs: {errs:?}");
+        let sum3 = prog
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Fn(f) if f.name == "sum3" => Some(f),
+                _ => None,
+            })
+            .expect("sum3 not parsed");
+        assert_eq!(sum3.params.len(), 3);
+        assert_eq!(sum3.params[0].name, "a");
+        assert_eq!(sum3.params[1].name, "b");
+        assert_eq!(sum3.params[2].name, "c");
+    }
+
+    #[test]
+    fn trailing_comma_in_param_list_is_tolerated() {
+        // The `parse_fn_decl` loop peeks for `Comma` after each
+        // param, advances past it, then loops; if the next token is
+        // `RParen`, the while-condition exits cleanly. Net effect:
+        // trailing commas in parameter lists are accepted. This
+        // mirrors the `arg_list` behaviour in `parse_postfix`.
+        let src = "fn ok(a: Int,) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (toks, _) = lex("t.sigil", src);
+        let (prog, errs) = parse("t.sigil", &toks);
+        assert!(errs.is_empty(), "expected clean parse, got: {errs:?}");
+        let ok = prog
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Fn(f) if f.name == "ok" => Some(f),
+                _ => None,
+            })
+            .expect("ok not parsed");
+        assert_eq!(ok.params.len(), 1);
+    }
+
+    #[test]
+    fn call_expression_with_args_parses() {
+        // The grammar already admits `postfix := primary ('(' arg_list? ')')*`
+        // since Plan A1. Pin the shape: a call with multiple args
+        // produces `Expr::Call { callee: Ident, args: [...] }`.
+        let e = parse_tail_expr("f(1, 2, 3)");
+        match e {
+            Expr::Call { callee, args, .. } => {
+                assert!(matches!(*callee, Expr::Ident(ref n, _) if n == "f"));
+                assert_eq!(args.len(), 3);
+                assert!(matches!(args[0], Expr::IntLit(1, _)));
+                assert!(matches!(args[1], Expr::IntLit(2, _)));
+                assert!(matches!(args[2], Expr::IntLit(3, _)));
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_with_no_args_parses() {
+        let e = parse_tail_expr("f()");
+        match e {
+            Expr::Call { args, .. } => {
+                assert!(args.is_empty());
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chained_calls_parse_left_assoc() {
+        // `f()()` → Call(Call(Ident f, []), [])
+        let e = parse_tail_expr("f()()");
+        match e {
+            Expr::Call { callee, args, .. } => {
+                assert!(args.is_empty());
+                match *callee {
+                    Expr::Call { args: inner, .. } => assert!(inner.is_empty()),
+                    other => panic!("expected inner Call, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lambda_no_params_no_effects() {
+        let e = parse_tail_expr("fn () -> Int ![] => 42");
+        match e {
+            Expr::Lambda {
+                params,
+                return_type,
+                effects,
+                body,
+                ..
+            } => {
+                assert!(params.is_empty());
+                match return_type {
+                    TypeExpr::Named(n, _) => assert_eq!(n, "Int"),
+                }
+                assert!(effects.is_empty());
+                assert!(matches!(*body, Expr::IntLit(42, _)));
+            }
+            other => panic!("expected Lambda, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lambda_one_param() {
+        let e = parse_tail_expr("fn (x: Int) -> Int ![] => x");
+        match e {
+            Expr::Lambda {
+                params,
+                return_type,
+                effects,
+                body,
+                ..
+            } => {
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "x");
+                match &params[0].ty {
+                    TypeExpr::Named(n, _) => assert_eq!(n, "Int"),
+                }
+                match return_type {
+                    TypeExpr::Named(n, _) => assert_eq!(n, "Int"),
+                }
+                assert!(effects.is_empty());
+                match *body {
+                    Expr::Ident(ref n, _) => assert_eq!(n, "x"),
+                    other => panic!("body not Ident, got {other:?}"),
+                }
+            }
+            other => panic!("expected Lambda, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lambda_two_params_with_effect() {
+        let e = parse_tail_expr("fn (a: Int, b: Int) -> Int ![IO] => a + b");
+        match e {
+            Expr::Lambda {
+                params,
+                effects,
+                body,
+                ..
+            } => {
+                assert_eq!(params.len(), 2);
+                assert_eq!(params[0].name, "a");
+                assert_eq!(params[1].name, "b");
+                assert_eq!(effects, vec!["IO".to_string()]);
+                match *body {
+                    Expr::Binary { op, .. } => assert_eq!(op, BinOp::Add),
+                    other => panic!("body not Binary, got {other:?}"),
+                }
+            }
+            other => panic!("expected Lambda, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lambda_body_can_be_another_lambda() {
+        // `fn (x: Int) -> ... => fn (y: Int) -> Int ![] => x + y`.
+        // Nested lambda parsing — currying by hand. Pin the shape so
+        // a future precedence tweak doesn't silently break it.
+        let e = parse_tail_expr("fn (x: Int) -> Int ![] => fn (y: Int) -> Int ![] => x + y");
+        match e {
+            Expr::Lambda { body, .. } => match *body {
+                Expr::Lambda { params, body, .. } => {
+                    assert_eq!(params.len(), 1);
+                    assert_eq!(params[0].name, "y");
+                    assert!(matches!(*body, Expr::Binary { .. }));
+                }
+                other => panic!("inner not Lambda, got {other:?}"),
+            },
+            other => panic!("outer not Lambda, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lambda_applied_immediately_with_parens() {
+        // `(fn (x: Int) -> Int ![] => x + 1)(41)` — parenthesised
+        // lambda as callee, applied to an argument. Exercises the
+        // interaction between `primary := '(' expr ')'` and
+        // `postfix := primary '(' args ')'`.
+        let e = parse_tail_expr("(fn (x: Int) -> Int ![] => x + 1)(41)");
+        match e {
+            Expr::Call { callee, args, .. } => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Expr::IntLit(41, _)));
+                assert!(matches!(*callee, Expr::Lambda { .. }));
+            }
+            other => panic!("expected Call on Lambda, got {other:?}"),
+        }
     }
 }

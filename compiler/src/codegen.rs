@@ -573,6 +573,12 @@ impl<'a> Lowerer<'a> {
                 // typecheck rejects them with E0043 before codegen.
                 unreachable!("codegen: Expr::Call is Stage 3; typecheck should have rejected it")
             }
+            Expr::Lambda { .. } => {
+                // Lambdas parse (plan A2 task 29) but don't reach
+                // codegen until Task 32's closure machinery lands;
+                // typecheck rejects them with E0043 meanwhile.
+                unreachable!("codegen: Expr::Lambda is Stage 3; typecheck should have rejected it")
+            }
         }
     }
 
@@ -780,6 +786,11 @@ impl<'a> Lowerer<'a> {
                 None => types::I8,
             },
             Expr::Call { .. } => types::I64,
+            // Lambda type prediction is a Task-31/32 concern; for PR
+            // 5 typecheck rejects Lambda before we reach this helper.
+            // Pick `pointer_ty` defensively: a closure lowers to a
+            // GC-heap pointer in Task 32.
+            Expr::Lambda { .. } => self.pointer_ty,
         }
     }
 }

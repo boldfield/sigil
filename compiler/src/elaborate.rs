@@ -301,6 +301,49 @@ impl Elaborator {
             // future caller does produce one, treat it defensively:
             // elaborate its contents and return it as-is.
             Expr::Block(b) => (Expr::Block(Box::new(self.elab_block(*b))), Vec::new()),
+
+            // Lambda expressions parse in Task 29 but don't yet
+            // typecheck (Task 30) or reach codegen (Tasks 31/32).
+            // Typecheck rejects them with E0043, which exits the
+            // pipeline before elaborate runs, so in practice this
+            // arm is never hit in Stage 3's first PR. Defensive
+            // handling: elaborate the body in place (no hoisting,
+            // no ANF flattening across a lambda boundary — that
+            // rewriting lands in Task 31's closure conversion).
+            Expr::Lambda {
+                params,
+                return_type,
+                effects,
+                body,
+                span,
+            } => {
+                let (body, hoisted) = self.elab_expr(*body, false);
+                // Hoisted bindings inside a lambda body cannot leak
+                // out of its scope. If elaborate produced any (it
+                // shouldn't in PR 5 since the pre-typecheck rejection
+                // ensures Lambda never reaches elaborate on a well-
+                // formed program), wrap the body in `Expr::Block`.
+                let final_body = if hoisted.is_empty() {
+                    body
+                } else {
+                    let b_span = span.clone();
+                    Expr::Block(Box::new(Block {
+                        stmts: hoisted,
+                        tail: Some(body),
+                        span: b_span,
+                    }))
+                };
+                (
+                    Expr::Lambda {
+                        params,
+                        return_type,
+                        effects,
+                        body: Box::new(final_body),
+                        span,
+                    },
+                    Vec::new(),
+                )
+            }
         }
     }
 

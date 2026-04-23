@@ -115,6 +115,26 @@ pub enum Expr {
     /// carry a statement sequence without changing `MatchArm::body`'s
     /// type.
     Block(Box<Block>),
+    /// Lambda expression `fn (x: T, ...) -> U !E => body`. Surface
+    /// form introduced by plan A2 task 29. Unlike top-level `FnDecl`,
+    /// a lambda's body is a single expression rather than a block —
+    /// the grammar choice that most closely matches canonical
+    /// anonymous-function forms in ML-family languages. Callers that
+    /// want multiple statements inside a lambda can wrap the body in
+    /// a match-arm-style expression once elaboration lands the
+    /// appropriate desugaring.
+    ///
+    /// Typecheck, closure conversion, and codegen for lambdas land in
+    /// plan A2 tasks 30, 31, 32 respectively; the AST variant is
+    /// introduced in Task 29 (parser) so the grammar can ship without
+    /// waiting for the full closure machinery.
+    Lambda {
+        params: Vec<Param>,
+        return_type: TypeExpr,
+        effects: Vec<String>,
+        body: Box<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,7 +206,8 @@ impl Expr {
             | Expr::Binary { span: s, .. }
             | Expr::Unary { span: s, .. }
             | Expr::If { span: s, .. }
-            | Expr::Match { span: s, .. } => s.clone(),
+            | Expr::Match { span: s, .. }
+            | Expr::Lambda { span: s, .. } => s.clone(),
             Expr::Perform(p) => p.span.clone(),
             Expr::Block(b) => b.span.clone(),
         }
