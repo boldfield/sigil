@@ -44,12 +44,30 @@ comparisons on Byte operands.
 - (b) Polymorphic form implied by the Byte-feature paragraph: `< > <= >=`
   accept either (Int, Int) or (Byte, Byte) and return Bool.
 
-**Status:** resolved (2026-04-23) by implementor decision; open to reviewer
-override.
+**Status:** resolved (2026-04-23) by reviewer decision on PR #2.
 
-**Resolution:** Implementor chose (a) for Task 22 — the explicit typing-rule
-list wins, Byte ordering via `byte_to_int` + int compare until a later plan
-generalises. Deviation is not logged (plan bullet about ordering is descriptive
-of capability, not a contradictory typing rule). Reviewer may override at PR
-#2's Task 22 commit; changing to (b) is one additional arm in the
-typechecker's binop handler and one additional test.
+**Resolution:** Choice (a) — strict form: `< > <= >=` is `Int → Int → Bool`
+only. Confirmed by reviewer in the PR #2 top-level review comment dated
+2026-04-23T17:35:29Z. Three reasons:
+
+1. **Normative typing rules outrank descriptive paragraphs when they
+   conflict.** Task 22's typing-rule enumeration is the specification;
+   the Byte-feature paragraph is describing the forward-looking
+   capability surface, not contradicting the formal rules.
+2. **Relaxing to polymorphism for one operator in A2 costs more than doing
+   it once in A3** when sum types land and ad-hoc polymorphism (over
+   `Orderable` or an equivalent constraint) becomes necessary anyway.
+   Adding a one-off `Int | Byte` special case now means re-auditing and
+   refactoring it when the general mechanism arrives.
+3. **`byte_to_int(b1) < byte_to_int(b2)` is a one-line user workaround.**
+   For the handful of Byte-ordering use cases in a Plan-A2-era program,
+   the lift-to-Int pattern is ergonomic enough.
+
+Byte equality (`==` / `!=`) continues to work via the existing
+`T → T → Bool for primitives` rule — this covers the vast majority of
+byte-comparison use cases (delimiter matching in network and binary
+parsing) without needing operator polymorphism.
+
+Implementation in `compiler/src/typecheck.rs` (as landed in Task 22,
+commit `1de46b4`) matches the chosen form; no code change is required by
+this resolution.
