@@ -10,3 +10,6 @@ disallowed-methods = [
     { path = "core::result::Result::expect", reason = "Route errors through CompilerError." },
     { path = "core::option::Option::expect", reason = "Route None through CompilerError." },
 ]
+disallowed-macros = [
+    { path = "std::panic", reason = "Use CompilerError for user-facing paths; use unreachable! only for build-time invariants (e.g. errors::code)." },
+]

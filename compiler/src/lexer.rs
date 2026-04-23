@@ -12,7 +12,7 @@
 //! Unknown characters produce `E0010` at the position of the offending byte.
 //! Every token carries a `Span` back to the source.
 
-use crate::errors::{self, CompilerError, ErrorCode, Severity, Span};
+use crate::errors::{self, CompilerError, Severity, Span};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TokenKind {
@@ -93,11 +93,30 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
 
         if c.is_ascii_digit() {
             let lit = cursor.take_while(|ch| ch.is_ascii_digit());
-            let n = lit.parse::<i64>().unwrap_or(0);
-            tokens.push(Token {
-                kind: TokenKind::IntLit(n),
-                span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
-            });
+            let span = Span::new(file, start_line, start_col, cursor.line, cursor.col);
+            match lit.parse::<i64>() {
+                Ok(n) => tokens.push(Token {
+                    kind: TokenKind::IntLit(n),
+                    span,
+                }),
+                Err(_) => {
+                    // Preserve forward progress for subsequent tokens: we
+                    // still emit a token slot (with value 0) so downstream
+                    // parser positions do not shift, then attach the
+                    // positioned E0050. The zero never reaches codegen —
+                    // compile aborts after the errors sweep.
+                    errors.push(CompilerError::new(
+                        Severity::Error,
+                        errors::code("E0050"),
+                        span.clone(),
+                        format!("integer literal `{lit}` is out of range for `Int` (i64)"),
+                    ));
+                    tokens.push(Token {
+                        kind: TokenKind::IntLit(0),
+                        span,
+                    });
+                }
+            }
             continue;
         }
 
@@ -152,24 +171,15 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
         // Unknown character.
         let span = Span::new(file, start_line, start_col, start_line, start_col + 1);
         cursor.advance();
-        let code = errors::catalog::ErrorCode::new("E0010").unwrap_or_else(|| panic_code("E0010"));
         errors.push(CompilerError::new(
             Severity::Error,
-            code,
+            errors::code("E0010"),
             span,
             format!("unexpected character `{c}`"),
         ));
     }
 
     (tokens, errors)
-}
-
-fn panic_code(code: &str) -> ErrorCode {
-    // Catalog-entry absence for a compiler-owned string is a build-time
-    // invariant (the catalog seed is checked into the tree). We panic
-    // here rather than propagate a `CompilerError` because this path
-    // cannot happen with a well-formed catalog.
-    panic!("catalog is missing entry for {code}");
 }
 
 struct Cursor<'a> {
@@ -291,11 +301,9 @@ impl<'a> Cursor<'a> {
         loop {
             if self.at_eof() {
                 let span = Span::new(self.file, start_line, start_col, self.line, self.col);
-                let code =
-                    errors::catalog::ErrorCode::new("E0010").unwrap_or_else(|| panic_code("E0010"));
                 return Err(CompilerError::new(
                     Severity::Error,
-                    code,
+                    errors::code("E0010"),
                     span,
                     "unterminated string literal",
                 ));
@@ -318,11 +326,9 @@ impl<'a> Cursor<'a> {
                         let span =
                             Span::new(self.file, self.line, self.col, self.line, self.col + 1);
                         self.advance();
-                        let code = errors::catalog::ErrorCode::new("E0010")
-                            .unwrap_or_else(|| panic_code("E0010"));
                         return Err(CompilerError::new(
                             Severity::Error,
-                            code,
+                            errors::code("E0010"),
                             span,
                             format!("unknown string escape `\\{other}`"),
                         ));
@@ -342,7 +348,7 @@ impl<'a> Cursor<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
 
@@ -398,5 +404,30 @@ mod tests {
         assert_eq!(errs[0].code.as_str(), "E0010");
         assert!(kinds(&toks).contains(&TokenKind::Ident("a".into())));
         assert!(kinds(&toks).contains(&TokenKind::Ident("b".into())));
+    }
+
+    #[test]
+    fn integer_literal_overflow_is_e0050() {
+        // 20 nines exceeds i64::MAX (9_223_372_036_854_775_807, 19 digits).
+        // Pre-fix this silently lexed to IntLit(0).
+        let src = "99999999999999999999";
+        let (_toks, errs) = lex("x.sigil", src);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code.as_str(), "E0050");
+        // Span should span the literal's 20 bytes on line 1.
+        assert_eq!(errs[0].span.line, 1);
+        assert_eq!(errs[0].span.column, 1);
+        assert_eq!(errs[0].span.end_column, 21);
+    }
+
+    #[test]
+    fn integer_literal_at_i64_max_does_not_error() {
+        let src = "9223372036854775807";
+        let (toks, errs) = lex("x.sigil", src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        match &toks[0].kind {
+            TokenKind::IntLit(n) => assert_eq!(*n, i64::MAX),
+            other => panic!("expected int lit, got {other:?}"),
+        }
     }
 }

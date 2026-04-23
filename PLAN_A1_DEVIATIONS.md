@@ -204,6 +204,88 @@ convention. If a future need genuinely requires a separate test
 crate (e.g., a spec-validator harness), it can be added alongside
 without moving this one.
 
+## [Task 0.11] Stackmap section is v0 placeholder; StackMapBuilder lands post-review
+
+**Commit:** d3e9966
+
+**Plan text:** Task 0.11 specifies safepoint-metadata infrastructure:
+a `StackMapBuilder` type in the compiler crate that accumulates one
+record per `call` / `call_indirect`, each record carrying a
+post-regalloc PC offset and a live-value list so Plan B's precise GC
+can consume the section without a codegen rewrite. The plan also said:
+"if it seems impossible [to emit proper stackmap metadata in Stage 1],
+log in `QUESTIONS.md` and stop."
+
+**What was done instead:** Four things were papered over in the
+original Task 0.11 landing (`1efcda7`) and its Task 12 multi-task
+follow-up, and are corrected here (Fix 2 of the post-A1 code review):
+
+1. **No real `StackMapBuilder` type existed.** Codegen serialised a
+   `Vec<u32>` of Cranelift `Inst` indices by hand at section-emit
+   time. This commit introduces a real `StackMapBuilder` in
+   `compiler/src/codegen.rs` with `push_placeholder(u32)`,
+   `serialize() -> Vec<u8>`, `len()`, and a `Default` impl. Plan B
+   adds `push(pc_offset, live_values)` + a version bump; the shape is
+   compatible.
+
+2. **`pc_offset` is a placeholder, not a real PC offset.** The
+   original comment acknowledged this only as a code comment; nothing
+   on the v2-reader side could tell the difference. The section now
+   carries a 12-byte header (`"SGST"` magic + `u32 version = 0` +
+   `u32 record_count`) and every record has
+   `STACKMAP_FLAG_PLACEHOLDER` (0x0001) set. A Plan B reader that
+   expects `version = 1` fails fast on v0 instead of consuming
+   placeholder offsets as if they were real.
+
+3. **`live_count = 0` is now an asserted v0 invariant.** The
+   runtime's `parse_section` function validates it. Previously the
+   zero value was a silent encoding choice.
+
+4. **Docs previously over-promised.** `runtime/README.md`'s stackmap
+   section described the **v1** format — complete with a live-value
+   entry layout that isn't emitted — without flagging that the
+   shipped binary carried placeholders. The section is revised to
+   lead with "Plan A1 limitation: placeholder format", document the
+   v0 wire format that is actually emitted, and spell out the v0 → v1
+   upgrade path.
+
+`PLAN_A1_PROGRESS.md`'s Task 0.11 entry is corrected from `done` to
+`done-with-caveat` and the false "Compiler-side StackMapBuilder ships
+with task 12" self-report is replaced with an accurate description
+pointing at this commit.
+
+**Why:** Real post-regalloc PC offsets + live-value lists require
+Cranelift's safepoint API (`FunctionBuilder::use_alias` / stack-slot
+safepoint machinery), which Plan A1's vertical slice did not turn on —
+and v1's Boehm GC is conservative, so it doesn't actually need the
+data. Escalating "impossible in Stage 1" to `QUESTIONS.md` per the
+plan's instructions was the right call at the time; silently shipping
+incorrect metadata under the guise of a correct implementation was
+not. Routing the shipped data through a real `StackMapBuilder` and
+giving the section a version-gated header turns the debt into a
+stable extension point instead of a landmine.
+
+Option (a) from the review prompt (header marker declaring version 0)
+was chosen over (b) (empty entries in v1) and (c) (per-record
+delimiter with placeholder flag). (a) is what version fields are for;
+a Plan B reader already has to dispatch on version, and the placeholder
+flag on each record is a belt-and-braces check that costs 2 bytes per
+record. (b) would lose the call-site count, which confirms codegen
+visited every Cranelift call site. (c) without a version bump would
+still leave old v2 readers guessing.
+
+**Forward implications:** Plan B's codegen replaces
+`StackMapBuilder::push_placeholder(u32)` with a real
+`push(pc_offset: u32, live_values: &[LiveEntry])`, bumps the header's
+version field to `1`, drops `STACKMAP_FLAG_PLACEHOLDER` from emitted
+records, and populates the per-record live-value list. Section-name
+constants, header layout, and `STACKMAP_RECORD_SIZE` stay fixed; only
+the record body grows. Both the compiler's codegen test
+(`stackmap_builder_round_trips_placeholder_records`) and the runtime's
+parser test (`parse_with_records`) become inputs the Plan B work has
+to update synchronously — which is exactly the forcing function the
+review wanted.
+
 ## Format
 
 Format:

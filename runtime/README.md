@@ -75,27 +75,60 @@ v1 codegen emits one safepoint record per Cranelift `call` /
 - **ELF (Linux):** section `.sigil_stackmaps`
 - **Mach-O (macOS):** segment `__SIGIL`, section `__stackmaps`
 
-The binary format is per-host little-endian:
+### Plan A1 limitation (v0 — placeholder format)
+
+**What Plan A1 actually writes is placeholder metadata.** `pc_offset`
+is the Cranelift `Inst` handle of the call site, **not** a post-regalloc
+code offset — real PC offsets require Cranelift's safepoint API, which
+Plan B turns on. Live-value lists are likewise absent: every record has
+`live_count = 0`. This is sufficient to (a) demonstrate that the section
+is populated at every call site the compiler can see, (b) let a v2
+reader detect the placeholders and resynthesise safepoint metadata from
+relocations rather than trusting the offsets, and (c) give us a stable
+extension point via `StackMapBuilder` in `compiler/src/codegen.rs`.
+
+### Binary format (v0, Plan A1)
+
+Per-host little-endian:
 
 ```
-struct Record {
-    u32 pc_offset;        // relative to the function's first byte
-    u16 live_count;       // number of live values at this safepoint
-    u16 _pad;             // reserved, zero
-    Entry entries[live_count];
-}
-
-struct Entry {
-    u32 cl_type;          // Cranelift type encoding (see entries.rs in v2)
-    i32 stack_offset;     // signed offset from the frame pointer
-    u8  gc_pointer;       // 1 = GC-managed pointer, 0 = scalar
-    u8  _pad[3];          // zero
-}
+header  = magic:4 "SGST" | version:4 | record_count:4            // 12 bytes
+record  = pc_offset:4   | live_count:2 | flags:2                 //  8 bytes
 ```
 
-v1 Boehm never reads the section. v2 precise GC reads it directly; no
-codegen rewrite is required at that time. The constants above live in
-`runtime/src/stackmap.rs`.
+Constants (live in `runtime/src/stackmap.rs` and mirrored in
+`compiler/src/codegen.rs`):
+
+| constant                        | value    |
+|---------------------------------|----------|
+| `STACKMAP_MAGIC`                | `"SGST"` |
+| `STACKMAP_VERSION_PLACEHOLDER`  | `0`      |
+| `STACKMAP_HEADER_SIZE`          | `12`     |
+| `STACKMAP_RECORD_SIZE`          | `8`      |
+| `STACKMAP_FLAG_PLACEHOLDER`     | `0x0001` |
+
+**v0 invariants** (asserted in `runtime/src/stackmap.rs::parse_section`
+and `compiler/src/codegen::tests`):
+
+- `live_count == 0` for every record.
+- `flags & STACKMAP_FLAG_PLACEHOLDER == STACKMAP_FLAG_PLACEHOLDER` for
+  every record.
+- `pc_offset` is opaque (Cranelift `Inst` handle); a reader MUST NOT
+  treat it as a real code offset.
+
+### Plan B (v1) upgrade path
+
+Plan B will emit version 1 records populated from Cranelift's
+safepoint API — real post-regalloc `pc_offset` values plus a
+per-record live-value list (Cranelift type tag + stack offset + GC
+pointer bit). The header magic and layout of the header itself stay
+fixed so both versions share one detection codepath. The `flags` field
+in v1 records carries a cleared `STACKMAP_FLAG_PLACEHOLDER` bit plus
+newly-minted bits for per-record metadata (exact set TBD in Plan B's
+design).
+
+v1 Boehm GC never reads this section regardless of version. The
+live-value list is consumed by Plan B's precise-GC mark phase only.
 
 ## Runtime instrumentation counters
 

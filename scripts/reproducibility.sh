@@ -46,8 +46,17 @@ out_b="${dir_b}/hello"
 "${sigil_bin}" "${source_path}" -o "${out_a}"
 "${sigil_bin}" "${source_path}" -o "${out_b}"
 
-hash_a="$(sha256sum "${out_a}" | awk '{print $1}')"
-hash_b="$(sha256sum "${out_b}" | awk '{print $1}')"
+# sha256sum is GNU coreutils (Linux, or macOS w/ Homebrew). shasum -a 256
+# is portable Perl and ships on macOS by default. Prefer sha256sum when
+# present so Linux CI behaviour is unchanged.
+if command -v sha256sum >/dev/null 2>&1; then
+    hash_cmd=(sha256sum)
+else
+    hash_cmd=(shasum -a 256)
+fi
+
+hash_a="$("${hash_cmd[@]}" "${out_a}" | awk '{print $1}')"
+hash_b="$("${hash_cmd[@]}" "${out_b}" | awk '{print $1}')"
 
 if [[ "${hash_a}" != "${hash_b}" ]]; then
     echo "reproducibility: FAIL — same-host builds produced different binaries" >&2

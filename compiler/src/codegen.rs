@@ -14,12 +14,14 @@
 //!   code calls `sigil_string_new(bytes, len)` to materialise a heap
 //!   String (bumping the Boehm counter) and then passes the heap pointer
 //!   to `sigil_println`.
-//! - Safepoint metadata at every call site is written to `.sigil_stackmaps`
-//!   (ELF) / `__SIGIL,__stackmaps` (Mach-O). v1 Boehm ignores the section;
-//!   v2 precise GC consumes it. Stage 1 emits a minimal but parseable
-//!   record: a u32 record count followed by per-record `pc_offset, count=0`
-//!   placeholder entries so the section is demonstrably non-empty and a
-//!   v2 reader can walk it.
+//! - Safepoint metadata at every call site is accumulated through
+//!   `StackMapBuilder` and written to `.sigil_stackmaps` (ELF) /
+//!   `__SIGIL,__stackmaps` (Mach-O). The section carries a versioned
+//!   header so a v2 precise-GC reader can recognise Stage 1's
+//!   placeholder entries and bail / resynthesise from relocations rather
+//!   than consuming them as real safepoint data. See PLAN_A1_DEVIATIONS
+//!   (`[DEVIATION Task 0.11]`) for the rationale and the v0 → v1
+//!   migration plan.
 //! - No interior pointers. Generated code never computes a pointer into
 //!   the middle of a heap object; it calls runtime helpers that work with
 //!   header pointers and extract transient payload views internally.
@@ -34,23 +36,98 @@ use cranelift::codegen::isa;
 use cranelift::codegen::settings;
 use cranelift::prelude::*;
 use cranelift_module::{default_libcall_names, DataDescription, Linkage, Module};
+use cranelift_object::object::write::SectionKind;
+use cranelift_object::object::BinaryFormat;
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use object::write::SectionKind;
 use target_lexicon::Triple;
 
 use crate::closure_convert::ClosureConvertedProgram;
 use crate::typecheck::CheckedProgram;
 
-/// Stable record layout for `.sigil_stackmaps`. Stage 1 writes records
-/// with `live_count = 0`; Plan B fills in real live-value entries.
+/// Stackmap section layout. Plan A1 emits **version 0 (placeholder)**:
 ///
-/// | field       | width |
-/// | ----------- | ----- |
-/// | record_count (whole section preamble) | u32 |
-/// | per-record: pc_offset                  | u32 |
-/// | per-record: live_count                 | u16 |
-/// | per-record: _pad                       | u16 |
+/// ```text
+/// header  = magic:4 "SGST" | version:4 | record_count:4           // 12 bytes
+/// record  = pc_offset:4    | live_count:2 (always 0 in v0) | flags:2   // 8 bytes
+/// ```
+///
+/// `flags` has bit 0 (`STACKMAP_FLAG_PLACEHOLDER`) set in v0 so a v2
+/// reader that only understands version 1 can detect stale placeholder
+/// records on a per-record basis as well as via the version field.
+///
+/// Version 1 (Plan B) will reuse the same header; the record format
+/// gains a live-value list per record and `pc_offset` becomes a real
+/// post-regalloc code offset via Cranelift's safepoint API.
+pub const STACKMAP_MAGIC: &[u8; 4] = b"SGST";
+pub const STACKMAP_VERSION_PLACEHOLDER: u32 = 0;
+pub const STACKMAP_HEADER_SIZE: usize = 12;
 pub const STACKMAP_RECORD_SIZE: usize = 8;
+pub const STACKMAP_FLAG_PLACEHOLDER: u16 = 0x0001;
+
+/// Accumulator for safepoint records emitted during function lowering.
+///
+/// Stage 1 populates each record with an opaque placeholder (the
+/// Cranelift `Inst` handle of the call site, not a real post-regalloc
+/// code offset) and `live_count = 0`. Plan B replaces `push_placeholder`
+/// with a real `push(pc_offset, live_values)` API backed by Cranelift's
+/// safepoint metadata. The section header's version field is bumped at
+/// the same time so existing consumers can distinguish the formats.
+pub struct StackMapBuilder {
+    records: Vec<StackMapRecord>,
+}
+
+struct StackMapRecord {
+    pc_offset_placeholder: u32,
+}
+
+impl StackMapBuilder {
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
+        }
+    }
+
+    /// Record a safepoint call site. Stage 1 stores the Cranelift `Inst`
+    /// handle as the `pc_offset` field — this is a placeholder; the
+    /// `STACKMAP_FLAG_PLACEHOLDER` bit in the record's flags makes that
+    /// status visible to downstream readers.
+    pub fn push_placeholder(&mut self, pc_offset_placeholder: u32) {
+        self.records.push(StackMapRecord {
+            pc_offset_placeholder,
+        });
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Serialise the section body (header + all records). Little-endian
+    /// on the host; the section is not relocated, so endianness of the
+    /// emitter matches endianness of the consumer.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(STACKMAP_HEADER_SIZE + self.records.len() * STACKMAP_RECORD_SIZE);
+        out.extend_from_slice(STACKMAP_MAGIC);
+        out.extend_from_slice(&STACKMAP_VERSION_PLACEHOLDER.to_le_bytes());
+        out.extend_from_slice(&(self.records.len() as u32).to_le_bytes());
+        for r in &self.records {
+            out.extend_from_slice(&r.pc_offset_placeholder.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // live_count = 0 in v0
+            out.extend_from_slice(&STACKMAP_FLAG_PLACEHOLDER.to_le_bytes());
+        }
+        out
+    }
+}
+
+impl Default for StackMapBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Compile `cc` to an object file at `out_path`. Returns `Ok(())` on
 /// success. Stage 1 compilation is deterministic given identical input on
@@ -121,8 +198,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("main", Linkage::Export, &main_sig)
         .map_err(|e| format!("declare main: {e}"))?;
 
-    // Collect safepoint PC offsets for the stackmap section.
-    let mut stackmap_pc_offsets: Vec<u32> = Vec::new();
+    // Accumulate safepoint records. Stage 1 writes placeholder records
+    // (see StackMapBuilder's doc comment).
+    let mut stackmap = StackMapBuilder::new();
 
     // Define string-literal data objects: one DataId per literal, payload
     // is the raw UTF-8 bytes with no header.
@@ -182,10 +260,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let bytes_ptr = builder.ins().symbol_value(pointer_ty, gv);
                     let len_v = builder.ins().iconst(pointer_ty, s.len() as i64);
                     let alloc_call = builder.ins().call(string_new_ref, &[bytes_ptr, len_v]);
-                    stackmap_pc_offsets.push(function_code_offset(&builder, alloc_call));
+                    stackmap.push_placeholder(function_code_offset(&builder, alloc_call));
                     let heap = builder.inst_results(alloc_call)[0];
                     let print_call = builder.ins().call(println_ref, &[heap]);
-                    stackmap_pc_offsets.push(function_code_offset(&builder, print_call));
+                    stackmap.push_placeholder(function_code_offset(&builder, print_call));
                 }
             }
         }
@@ -220,9 +298,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let gc_init_ref = module.declare_func_in_func(gc_init, builder.func);
         let user_main_ref = module.declare_func_in_func(user_main, builder.func);
         let init_call = builder.ins().call(gc_init_ref, &[]);
-        stackmap_pc_offsets.push(function_code_offset(&builder, init_call));
+        stackmap.push_placeholder(function_code_offset(&builder, init_call));
         let um_call = builder.ins().call(user_main_ref, &[]);
-        stackmap_pc_offsets.push(function_code_offset(&builder, um_call));
+        stackmap.push_placeholder(function_code_offset(&builder, um_call));
 
         // user-main returns a tagged Int; untag to i32 via arithmetic
         // right-shift and narrow. Overflow beyond i32 is not observable in
@@ -241,16 +319,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // --- finish and add the stackmap section ----------------------------
     let mut product = module.finish();
 
-    // Write a minimal stackmap: u32 count, then count * (pc_offset: u32, live: u16, pad: u16).
-    let mut section_bytes =
-        Vec::with_capacity(4 + stackmap_pc_offsets.len() * STACKMAP_RECORD_SIZE);
-    section_bytes.extend_from_slice(&(stackmap_pc_offsets.len() as u32).to_le_bytes());
-    for off in &stackmap_pc_offsets {
-        section_bytes.extend_from_slice(&off.to_le_bytes());
-        section_bytes.extend_from_slice(&0u16.to_le_bytes()); // live_count = 0
-        section_bytes.extend_from_slice(&0u16.to_le_bytes()); // pad
-    }
-    let is_macho = matches!(product.object.format(), object::BinaryFormat::MachO);
+    let section_bytes = stackmap.serialize();
+    let is_macho = matches!(product.object.format(), BinaryFormat::MachO);
     let (segment_bytes, section_name): (&[u8], &[u8]) = if is_macho {
         (b"__SIGIL", b"__stackmaps")
     } else {
@@ -291,12 +361,66 @@ fn isa_call_conv(_m: &ObjectModule) -> isa::CallConv {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
 
     #[test]
     fn stackmap_record_size_is_eight() {
         assert_eq!(STACKMAP_RECORD_SIZE, 8);
+    }
+
+    #[test]
+    fn stackmap_header_layout() {
+        // Constants pin the shipped format. Bumping STACKMAP_VERSION_PLACEHOLDER
+        // from 0 should be paired with a corresponding change in
+        // runtime/src/stackmap.rs so both crates agree on what v1 looks like.
+        assert_eq!(STACKMAP_MAGIC, b"SGST");
+        assert_eq!(STACKMAP_VERSION_PLACEHOLDER, 0);
+        assert_eq!(STACKMAP_HEADER_SIZE, 12);
+        assert_eq!(STACKMAP_FLAG_PLACEHOLDER, 0x0001);
+    }
+
+    #[test]
+    fn stackmap_builder_empty_serializes_to_header_only() {
+        let b = StackMapBuilder::new();
+        let bytes = b.serialize();
+        assert_eq!(bytes.len(), STACKMAP_HEADER_SIZE);
+        assert_eq!(&bytes[0..4], STACKMAP_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            STACKMAP_VERSION_PLACEHOLDER,
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            0,
+        );
+    }
+
+    #[test]
+    fn stackmap_builder_round_trips_placeholder_records() {
+        let mut b = StackMapBuilder::new();
+        b.push_placeholder(0x1111_2222);
+        b.push_placeholder(0x3333_4444);
+        let bytes = b.serialize();
+        assert_eq!(b.len(), 2);
+        assert_eq!(bytes.len(), STACKMAP_HEADER_SIZE + 2 * STACKMAP_RECORD_SIZE,);
+        // Record 0.
+        let r0 = STACKMAP_HEADER_SIZE;
+        assert_eq!(
+            u32::from_le_bytes([bytes[r0], bytes[r0 + 1], bytes[r0 + 2], bytes[r0 + 3]]),
+            0x1111_2222,
+        );
+        assert_eq!(u16::from_le_bytes([bytes[r0 + 4], bytes[r0 + 5]]), 0);
+        assert_eq!(
+            u16::from_le_bytes([bytes[r0 + 6], bytes[r0 + 7]]),
+            STACKMAP_FLAG_PLACEHOLDER,
+        );
+        // Record 1.
+        let r1 = STACKMAP_HEADER_SIZE + STACKMAP_RECORD_SIZE;
+        assert_eq!(
+            u32::from_le_bytes([bytes[r1], bytes[r1 + 1], bytes[r1 + 2], bytes[r1 + 3]]),
+            0x3333_4444,
+        );
     }
 }
