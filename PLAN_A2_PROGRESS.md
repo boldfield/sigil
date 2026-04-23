@@ -32,7 +32,7 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
   - notes: Script wraps fmt + check + per-crate clippy + runtime lib tests + interior-pointer check + discipline greps. Greps for unwrap/expect/panic are advisory (clippy -D warnings is the authority); false positives inside test modules are expected. CI invokes the script as a new step before the existing build/test matrix.
 - Task 1.5.5 — Fix cold-target e2e staticlib ordering
   - status: done-pending-ci
-  - commits: [f0a6212, (pending revision)]
+  - commits: [f0a6212, db3ae5e]
   - notes: DEVIATION logged (original and revision). First revision (`f0a6212`) put the rebuild in `compiler/build.rs`; deadlocked under `cargo test --workspace` cold (PR #2 first CI run sat on "cold run 1 of 2" for 47+ minutes on both hosts before being cancelled). Second revision moves the rebuild into `compiler/tests/e2e.rs::ensure_runtime_staticlib`, called at the top of the `hello` test. Runs at test-run time after outer cargo releases its locks; no deadlock. `SIGIL_SKIP_RUNTIME_STATICLIB_BUILD` env var is gone (no longer needed — callers that pre-build the staticlib short-circuit via the existence check). `cold-checkout-test` CI job unchanged.
 - Task 1.5.6 — `debug_assert!` on typecheck env insertion (no-shadowing invariant)
   - status: done

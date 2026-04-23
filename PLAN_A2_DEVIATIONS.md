@@ -5,7 +5,7 @@ Retroactive entries are forbidden.
 
 ## [Task 1.5.5 — revision] Move staticlib materialisation out of build.rs into the e2e test itself
 
-**Commit:** (pending revision)
+**Commit:** db3ae5e
 
 **Plan text:** Same as the earlier 1.5.5 entry below (plan offers option-a
 build.rs / option-b CI restructure; neither fits stable cleanly).
