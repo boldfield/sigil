@@ -1,13 +1,14 @@
-//! Hand-rolled lexer for the Stage-1 subset of Sigil.
+//! Hand-rolled lexer for the Stage-1 + Stage-2 subset of Sigil.
 //!
-//! Stage-1 tokens:
-//! - Keywords: `fn`, `let`, `perform`, `import`, `return`.
-//! - Identifiers (alpha or `_` followed by alnum / `_`).
-//! - Integer literals (decimal digits, no sign at the token layer).
-//! - String literals (double-quoted, with `\"`, `\\`, `\n` escapes).
-//! - Punctuation: `{ } ( ) ; , : . !` and operator `->`.
-//! - Comments: `// line`, `/* block */` (no nesting).
-//! - Version pragma: a leading `// sigil: X.Y` comment is recognised.
+//! Stage-1 tokens: keywords `fn`, `let`, `perform`, `import`, `return`;
+//! identifiers; integer literals; string literals; punctuation
+//! `{ } ( ) ; , : . !`; operator `->`; comments; version pragma.
+//!
+//! Stage-2 additions (plan A2 task 20):
+//! - Keywords: `true`, `false`, `if`, `else`, `match`.
+//! - Operators: `+ - * / % == != < > <= >= && || ! =>`. The lexer does
+//!   not distinguish unary from binary `-`; the parser does.
+//! - Character literals: `'x'`, with `\n`, `\t`, `\r`, `\\`, `\'` escapes.
 //!
 //! Unknown characters produce `E0010` at the position of the offending byte.
 //! Every token carries a `Span` back to the source.
@@ -22,11 +23,17 @@ pub enum TokenKind {
     Perform,
     Import,
     Return,
+    True,
+    False,
+    If,
+    Else,
+    Match,
 
     // atoms
     Ident(String),
     IntLit(i64),
     StringLit(String),
+    CharLit(char),
 
     // punctuation
     LBrace,
@@ -42,6 +49,24 @@ pub enum TokenKind {
     LBracket,
     RBracket,
     Eq,
+    // Stage-2 operators. Ordering matters for two-char lookahead:
+    // longest-match wins, so `==` is recognised before bare `=`, `=>`
+    // before `=`, `!=` before `!`, etc.
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    EqEq,
+    NotEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
+    AndAnd,
+    OrOr,
+    FatArrow,
+
     Eof,
 }
 
@@ -82,6 +107,11 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
                 "perform" => TokenKind::Perform,
                 "import" => TokenKind::Import,
                 "return" => TokenKind::Return,
+                "true" => TokenKind::True,
+                "false" => TokenKind::False,
+                "if" => TokenKind::If,
+                "else" => TokenKind::Else,
+                "match" => TokenKind::Match,
                 _ => TokenKind::Ident(ident),
             };
             tokens.push(Token {
@@ -133,12 +163,90 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
             continue;
         }
 
-        // Punctuation.
+        if c == '\'' {
+            match cursor.take_char_lit() {
+                Ok(ch) => {
+                    tokens.push(Token {
+                        kind: TokenKind::CharLit(ch),
+                        span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
+                    });
+                }
+                Err(e) => errors.push(e),
+            }
+            continue;
+        }
+
+        // Two-char operator lookahead first (longest match wins). The
+        // ordering below matters: `==` must be recognised before `=`,
+        // `->` before `-`, etc.
         if c == '-' && cursor.peek_at(1) == Some('>') {
             cursor.advance();
             cursor.advance();
             tokens.push(Token {
                 kind: TokenKind::Arrow,
+                span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
+            });
+            continue;
+        }
+        if c == '=' && cursor.peek_at(1) == Some('=') {
+            cursor.advance();
+            cursor.advance();
+            tokens.push(Token {
+                kind: TokenKind::EqEq,
+                span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
+            });
+            continue;
+        }
+        if c == '=' && cursor.peek_at(1) == Some('>') {
+            cursor.advance();
+            cursor.advance();
+            tokens.push(Token {
+                kind: TokenKind::FatArrow,
+                span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
+            });
+            continue;
+        }
+        if c == '!' && cursor.peek_at(1) == Some('=') {
+            cursor.advance();
+            cursor.advance();
+            tokens.push(Token {
+                kind: TokenKind::NotEq,
+                span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
+            });
+            continue;
+        }
+        if c == '<' && cursor.peek_at(1) == Some('=') {
+            cursor.advance();
+            cursor.advance();
+            tokens.push(Token {
+                kind: TokenKind::LtEq,
+                span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
+            });
+            continue;
+        }
+        if c == '>' && cursor.peek_at(1) == Some('=') {
+            cursor.advance();
+            cursor.advance();
+            tokens.push(Token {
+                kind: TokenKind::GtEq,
+                span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
+            });
+            continue;
+        }
+        if c == '&' && cursor.peek_at(1) == Some('&') {
+            cursor.advance();
+            cursor.advance();
+            tokens.push(Token {
+                kind: TokenKind::AndAnd,
+                span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
+            });
+            continue;
+        }
+        if c == '|' && cursor.peek_at(1) == Some('|') {
+            cursor.advance();
+            cursor.advance();
+            tokens.push(Token {
+                kind: TokenKind::OrOr,
                 span: Span::new(file, start_line, start_col, cursor.line, cursor.col),
             });
             continue;
@@ -157,6 +265,13 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
             '[' => Some(TokenKind::LBracket),
             ']' => Some(TokenKind::RBracket),
             '=' => Some(TokenKind::Eq),
+            '+' => Some(TokenKind::Plus),
+            '-' => Some(TokenKind::Minus),
+            '*' => Some(TokenKind::Star),
+            '/' => Some(TokenKind::Slash),
+            '%' => Some(TokenKind::Percent),
+            '<' => Some(TokenKind::Lt),
+            '>' => Some(TokenKind::Gt),
             _ => None,
         };
         if let Some(kind) = single {
@@ -345,6 +460,86 @@ impl<'a> Cursor<'a> {
     fn cur_span(&self, width: u32) -> Span {
         Span::new(self.file, self.line, self.col, self.line, self.col + width)
     }
+
+    /// Consume a single-quoted character literal: one character or one
+    /// recognised escape sequence. Escapes supported: `\n \t \r \\ \'`.
+    /// Anything else (including empty `''`, multi-char, or unknown
+    /// escape) produces an `E0010` with a span pointing at the offending
+    /// bytes. Returns the closing quote position on success so the outer
+    /// loop can keep advancing.
+    fn take_char_lit(&mut self) -> Result<char, CompilerError> {
+        let start_line = self.line;
+        let start_col = self.col;
+        // Consume the opening quote.
+        self.advance();
+        if self.at_eof() {
+            let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+            return Err(CompilerError::new(
+                Severity::Error,
+                errors::code("E0010"),
+                span,
+                "unterminated character literal",
+            ));
+        }
+        let ch = self.peek();
+        let value = if ch == '\\' {
+            // Escape sequence.
+            self.advance();
+            if self.at_eof() {
+                let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+                return Err(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0010"),
+                    span,
+                    "unterminated character escape",
+                ));
+            }
+            let esc = self.peek();
+            self.advance();
+            match esc {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '\\' => '\\',
+                '\'' => '\'',
+                other => {
+                    let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+                    return Err(CompilerError::new(
+                        Severity::Error,
+                        errors::code("E0010"),
+                        span,
+                        format!("unknown character escape `\\{other}`"),
+                    ));
+                }
+            }
+        } else if ch == '\'' {
+            // Empty `''` — not a valid literal.
+            let span = Span::new(self.file, start_line, start_col, self.line, self.col + 1);
+            self.advance();
+            return Err(CompilerError::new(
+                Severity::Error,
+                errors::code("E0010"),
+                span,
+                "empty character literal",
+            ));
+        } else {
+            self.advance();
+            ch
+        };
+        // Require the closing quote. Multi-char literals like `'ab'` are
+        // rejected here.
+        if self.at_eof() || self.peek() != '\'' {
+            let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+            return Err(CompilerError::new(
+                Severity::Error,
+                errors::code("E0010"),
+                span,
+                "expected closing `'` in character literal",
+            ));
+        }
+        self.advance();
+        Ok(value)
+    }
 }
 
 #[cfg(test)]
@@ -429,5 +624,92 @@ mod tests {
             TokenKind::IntLit(n) => assert_eq!(*n, i64::MAX),
             other => panic!("expected int lit, got {other:?}"),
         }
+    }
+
+    // Plan A2 task 20 — Stage-2 token coverage.
+
+    #[test]
+    fn stage2_keywords_lex_as_keywords() {
+        let (toks, errs) = lex("x.sigil", "true false if else match");
+        assert!(errs.is_empty(), "{errs:?}");
+        use TokenKind::*;
+        let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
+        assert!(ks.starts_with(&[True, False, If, Else, Match]));
+    }
+
+    #[test]
+    fn arithmetic_and_comparison_operators_lex() {
+        // Order matters: lookahead must pick `==` over `=`, `=>` over `=`,
+        // `!=` over `!`, `<=` over `<`, `>=` over `>`, `&&`/`||`, and so on.
+        let (toks, errs) = lex("x.sigil", "+ - * / % == != < > <= >= && || ! => =");
+        assert!(errs.is_empty(), "{errs:?}");
+        use TokenKind::*;
+        let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
+        let expected = [
+            Plus, Minus, Star, Slash, Percent, EqEq, NotEq, Lt, Gt, LtEq, GtEq, AndAnd, OrOr, Bang,
+            FatArrow, Eq, Eof,
+        ];
+        assert_eq!(ks, expected, "operator sequence mismatch");
+    }
+
+    #[test]
+    fn arrow_still_lexes_as_single_token() {
+        // `->` regression: after adding bare `-` as Minus, the Arrow
+        // lookahead must still win.
+        let (toks, errs) = lex("x.sigil", "fn f() -> Int ![] { 0 }");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Arrow)));
+        assert!(!toks.iter().any(|t| matches!(t.kind, TokenKind::Minus)));
+    }
+
+    #[test]
+    fn char_literal_basic() {
+        let (toks, errs) = lex("x.sigil", "'a'");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(toks[0].kind, TokenKind::CharLit('a')));
+    }
+
+    #[test]
+    fn char_literal_escapes() {
+        let (toks, errs) = lex("x.sigil", r"'\n' '\t' '\r' '\\' '\''");
+        assert!(errs.is_empty(), "{errs:?}");
+        let chars: Vec<char> = toks
+            .iter()
+            .filter_map(|t| match t.kind {
+                TokenKind::CharLit(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chars, vec!['\n', '\t', '\r', '\\', '\'']);
+    }
+
+    #[test]
+    fn empty_char_literal_is_e0010() {
+        let (_toks, errs) = lex("x.sigil", "''");
+        assert!(!errs.is_empty());
+        assert_eq!(errs[0].code.as_str(), "E0010");
+    }
+
+    #[test]
+    fn unterminated_char_literal_is_e0010() {
+        let (_toks, errs) = lex("x.sigil", "'a");
+        assert!(!errs.is_empty());
+        assert_eq!(errs[0].code.as_str(), "E0010");
+    }
+
+    #[test]
+    fn unknown_char_escape_is_e0010() {
+        let (_toks, errs) = lex("x.sigil", r"'\q'");
+        assert!(!errs.is_empty());
+        assert_eq!(errs[0].code.as_str(), "E0010");
+    }
+
+    #[test]
+    fn multi_char_literal_is_e0010() {
+        // `'ab'` — two chars between the quotes; closing quote missing
+        // at the expected position.
+        let (_toks, errs) = lex("x.sigil", "'ab'");
+        assert!(!errs.is_empty());
+        assert_eq!(errs[0].code.as_str(), "E0010");
     }
 }

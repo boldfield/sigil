@@ -51,7 +51,36 @@ Default compiler error output is JSON Lines on stderr, one event per line:
 `--human-errors` switches to human-readable text. `sigil explain <code>`
 prints the long-form explanation and canonical fix for any diagnostic code.
 
+## Local verification on memory-constrained hosts
+
+Plan A1 established that `cargo test --workspace` and `cargo build --release`
+OOM on memory-constrained hosts (the reference case is a headless Talos
+Linux pod, ~8–12 GiB). On such hosts, do not run the workspace test
+suite locally — use `scripts/pod-verify.sh` for local verification
+instead:
+
+```shell
+./scripts/pod-verify.sh
+```
+
+The script wraps the pod-safe subset: `cargo check --workspace`,
+`cargo fmt --check`, per-crate `cargo clippy`, `cargo test -p sigil-runtime
+--lib`, `scripts/check-no-interior-pointers.sh`, and the discipline greps.
+It explicitly does *not* run `cargo test --workspace`,
+`cargo build --release`, `scripts/reproducibility.sh`, or
+`scripts/smoke.sh` — those are CI's responsibility.
+
+**CI is authoritative** for the full test suite and for multi-host
+verification. A task is not considered complete until CI is green on
+both `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`; local
+pod-verify green is a necessary but not sufficient signal.
+
+On large-memory development machines (the reference case is an
+aarch64-apple-darwin laptop with ≥16 GiB), `cargo test --workspace`
+works fine — see the quickstart above.
+
 ## Status
 
-Plan A1 (current): Stage 0 scaffolding + Stage 1 hello-world vertical slice.
-Plans A2, A3, B, C follow once each checkpoint is reviewed.
+Plan A1: Stage 0 scaffolding + Stage 1 hello-world vertical slice — done.
+Plan A2 (current): arithmetic, conditionals, closures (Stages 2–3).
+Plans A3, B, C follow once each checkpoint is reviewed.

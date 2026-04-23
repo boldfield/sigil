@@ -255,6 +255,35 @@ do not make an arbitrarily small ceiling work: the `cargo test
 binary (which links Cranelift and codegen), and on the Talos pod this
 alone exceeded ~12 GiB at j=1.
 
+## Cold-checkout build ordering
+
+Plan A2 task 1.5.5 — the runtime ships a **staticlib** (`libsigil_runtime.a`)
+which the compiler's linker driver links into every compiled Sigil program.
+Cargo does not automatically produce the staticlib artifact when
+`sigil-runtime` is pulled in as a plain dev-dep of `sigil-compiler`, because
+the dev-dep only consumes the rlib. On a cold `cargo test --workspace`
+this could leave the e2e test binary trying to link without the staticlib
+present.
+
+**Fix:** the e2e test (`compiler/tests/e2e.rs`) checks for
+`target/<profile>/libsigil_runtime.a` at its entry point and, if missing,
+invokes `cargo build -p sigil-runtime` before the test proceeds. This runs
+at test-*run* time, after the outer cargo has completed its build phase
+and released its per-build-unit locks — so the nested cargo invocation
+acquires its own locks cleanly without deadlock. An earlier version of
+this fix put the rebuild in `compiler/build.rs`; that deadlocked under
+`cargo test --workspace` because the outer cargo held build-unit locks
+during build-script execution. See `PLAN_A2_DEVIATIONS.md` [Task 1.5.5]
+for the full history.
+
+**CI acceptance check:** the `.github/workflows/ci.yml` file defines a
+`cold-checkout-test` job separate from the main `build-test` matrix. It
+runs `rm -rf target && cargo test --workspace` twice in succession (the
+plan's acceptance criterion) on both supported hosts. The main
+`build-test` job uses `actions/cache@v4` on `target/` so it cannot itself
+prove the cold-checkout invariant; keeping the cold verification in its
+own job lets the warm-path cache still work.
+
 ## macOS prerequisites
 
 - `brew install bdw-gc pkg-config` — the runtime crate's `build.rs`

@@ -183,6 +183,110 @@ pub const CATALOG: &[ErrorEntry] = &[
                constant rather than a number used in arithmetic.",
         fix_example: "let n: Int = 9223372036854775807;  // i64::MAX, fits",
     },
+    ErrorEntry {
+        code: "E0060",
+        short: "binary operator operand type mismatch",
+        long: "A binary operator was applied to an operand of the wrong type. \
+               Sigil's binary operators are monomorphic in Plan A2:\n\n\
+               - `+ - * / %` require both operands to be `Int` and return `Int`.\n\
+               - `< > <= >=` require both operands to be `Int` and return `Bool`.\n\
+               - `&& ||` require both operands to be `Bool` and return `Bool`.\n\
+               - `== !=` require both operands to have the same primitive type \
+                 (`Int`, `Bool`, `Char`, `Byte`, `String`, or `Unit`) and return \
+                 `Bool`.\n\n\
+               Sigil performs no implicit conversions between types. If you need \
+               to compare a `Byte` and an `Int` numerically, convert the `Byte` \
+               first using `byte_to_int`. There is no `String`-to-`Int` parse in \
+               Plan A2.",
+        fix_example: "let n: Int = 1 + 2;            // Int + Int\n\
+                      let b: Bool = 3 < 4;           // Int < Int\n\
+                      let p: Bool = true && false;   // Bool && Bool\n\
+                      let e: Bool = 1 == 1;          // primitive == primitive (same type)",
+    },
+    ErrorEntry {
+        code: "E0061",
+        short: "unary operator operand type mismatch",
+        long: "A prefix unary operator was applied to an operand of the wrong type. \
+               `-` (negation) requires an `Int` operand and returns `Int`; `!` \
+               (logical not) requires a `Bool` operand and returns `Bool`. Sigil \
+               performs no implicit conversions.\n\n\
+               Integer-literal negation is constant-folded at parse time: `-3` is \
+               tokenised as `Minus Int(3)` then folded to `IntLit(-3)` in the \
+               parser, so a literal negation never reaches the typechecker as a \
+               `Unary`. A `Unary::Neg` therefore always wraps a non-literal \
+               expression whose type is checked here.",
+        fix_example: "let n: Int = -x;    // x must be Int\n\
+                      let b: Bool = !p;   // p must be Bool",
+    },
+    ErrorEntry {
+        code: "E0062",
+        short: "`if` condition is not `Bool`",
+        long: "The condition expression of an `if/else` form must have type \
+               `Bool`. Plan A2 does not coerce `Int` or other types to `Bool` — \
+               an `if` condition must be produced by a comparison (`< > == !=`), \
+               a boolean literal (`true`/`false`), or an identifier bound to a \
+               `Bool` value.\n\n\
+               Elaboration (Task 23) desugars `if/else` into a `match` on `Bool`, \
+               so the `Bool` constraint here is structural: no `Bool`, no \
+               desugaring path.",
+        fix_example: "if n == 0 { \"zero\" } else { \"nonzero\" }  // n == 0 is Bool",
+    },
+    ErrorEntry {
+        code: "E0063",
+        short: "`if` branches have incompatible types",
+        long: "The `then` and `else` branches of an `if/else` form must have the \
+               same type; `if/else` is an expression and its type is the common \
+               branch type. Sigil performs no branch-level type widening in Plan \
+               A2 — `Int` and `String` are disjoint and no `if/else` produces \
+               either one based on the condition. Refactor to two separate \
+               statements, or make both branches produce the same type.",
+        fix_example: "let s: String = if ok { \"yes\" } else { \"no\" };",
+    },
+    ErrorEntry {
+        code: "E0064",
+        short: "match pattern type does not match scrutinee",
+        long: "Each pattern in a `match` form must describe a value of the \
+               scrutinee's type. Plan A2 patterns are literal patterns \
+               (integer, boolean, character) and the wildcard pattern `_`. A \
+               literal pattern is only valid against a scrutinee of the \
+               matching primitive type: `IntLit` against `Int`, `BoolLit` \
+               against `Bool`, `CharLit` against `Char`. Wildcard `_` matches \
+               any scrutinee type.\n\n\
+               `Byte` has no literal pattern form in Plan A2, so matches on a \
+               `Byte` scrutinee must be wildcard-only in the current surface.",
+        fix_example: "match n {\n  0 => \"zero\",\n  _ => \"other\",\n}  // scrutinee: Int, patterns: IntLit + wildcard",
+    },
+    ErrorEntry {
+        code: "E0065",
+        short: "match arms have incompatible types",
+        long: "All arms of a `match` expression must produce the same type; the \
+               `match` form is an expression and its type is the common arm \
+               type. The first arm's body type is taken as the expected type for \
+               the remaining arms, and any arm whose body type does not match \
+               produces E0065. Refactor arms to produce a common type.",
+        fix_example: "let name: String = match n {\n  0 => \"zero\",\n  _ => \"other\",\n};",
+    },
+    ErrorEntry {
+        code: "E0066",
+        short: "non-exhaustive match",
+        long: "A `match` expression must cover every possible value of its \
+               scrutinee. Plan A2 exhaustiveness is structural and deliberately \
+               coarse:\n\n\
+               - `Bool`: exhaustive iff both `true` and `false` are covered, or \
+                 a wildcard `_` arm is present.\n\
+               - `Int`, `Char`, `String`, `Byte`: exhaustive iff a wildcard `_` \
+                 arm is present (these scrutinees have infinite or effectively- \
+                 infinite value domains in Plan A2's surface syntax).\n\
+               - `Unit`: exhaustive iff the arm list is non-empty (only one \
+                 `Unit` value exists), though in practice patterns here are \
+                 wildcards.\n\n\
+               An empty arm list is always non-exhaustive. Plan A3 introduces \
+               sum types and refines this check; Plan A2's rule is intentionally \
+               simple so `match` on primitives is usable without the full \
+               decision-procedure machinery.",
+        fix_example: "match b {\n  true => 1,\n  false => 0,\n}        // Bool exhaustive: both values covered\n\n\
+                      match n {\n  0 => \"zero\",\n  _ => \"other\",\n}  // Int exhaustive: wildcard covers the rest",
+    },
 ];
 
 #[cfg(test)]
