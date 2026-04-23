@@ -101,6 +101,77 @@ pub const CATALOG: &[ErrorEntry] = &[
                exists.",
         fix_example: "import std.io",
     },
+    ErrorEntry {
+        code: "E0040",
+        short: "program has no `fn main`",
+        long: "Every Sigil program is a standalone executable and must declare a \
+               function named `main`. Plan A1 fixes its signature as either \
+               `fn main() -> Int ![IO]` (when the body performs any IO effect) or \
+               `fn main() -> Int ![]` (pure). `main` takes no parameters and the \
+               `Int` it returns becomes the process exit status.",
+        fix_example: "fn main() -> Int ![IO] {\n  perform IO.println(\"hello\");\n  0\n}",
+    },
+    ErrorEntry {
+        code: "E0041",
+        short: "`fn main` has the wrong signature",
+        long: "`main` must be declared `fn main() -> Int ![IO]` (when the body \
+               performs IO) or `fn main() -> Int ![]` (pure). Other return types, \
+               parameter lists, or effect rows are rejected in Plan A1 so the \
+               runtime's C-callable `main` shim can always rely on an `Int` exit \
+               status.",
+        fix_example: "fn main() -> Int ![IO] {\n  perform IO.println(\"hi\");\n  0\n}",
+    },
+    ErrorEntry {
+        code: "E0042",
+        short: "effect used but not declared in the enclosing function's row",
+        long: "Every `perform E.op(..)` call site requires the effect `E` to appear \
+               in the enclosing function's `![..]` effect row. Effect rows are the \
+               static contract that makes handler dispatch sound; silently widening \
+               a function's effect row at the call site would defeat the point. \
+               Either add the missing effect to the function's row, or factor the \
+               perform into a helper function that declares it.",
+        fix_example: "fn main() -> Int ![IO] {\n  perform IO.println(\"hi\");\n  0\n}",
+    },
+    ErrorEntry {
+        code: "E0043",
+        short: "wrong argument count at call site",
+        long: "A call supplied a different number of arguments than the callee \
+               declares. Sigil has no variadics and no default parameters in Plan \
+               A1; each call site must match the declared arity exactly. For \
+               `perform IO.println(..)` in Plan A1 the declared arity is one.",
+        fix_example: "perform IO.println(\"one String argument\");",
+    },
+    ErrorEntry {
+        code: "E0044",
+        short: "argument type mismatch at call site",
+        long: "A call passed an argument whose type does not match the callee's \
+               declared parameter type. Sigil performs no implicit conversions in \
+               Plan A1 — `Int`, `String`, and `Unit` are disjoint and the checker \
+               will not coerce between them. Adjust the argument to match the \
+               declared type.",
+        fix_example: "perform IO.println(\"hi\");  // String is required",
+    },
+    ErrorEntry {
+        code: "E0045",
+        short: "let-binding declared type does not match initializer",
+        long: "A `let <name>: <DeclaredType> = <expr>;` form requires \
+               `typeof(<expr>)` to equal `<DeclaredType>`. Plan A1 does not infer \
+               binding types when they are declared, and does not coerce between \
+               `Int`, `String`, and `Unit`. Either change the declared type to \
+               match the initializer, or change the initializer to produce the \
+               declared type.",
+        fix_example: "let greeting: String = \"hello\";",
+    },
+    ErrorEntry {
+        code: "E0046",
+        short: "unknown identifier",
+        long: "An identifier was referenced that resolves to no binding in scope. \
+               Plan A1 does not introduce user-bound locals through shadowing; every \
+               binding must be declared via `let` (or appear as a function \
+               parameter) earlier in the same block. Check for a typo in the \
+               identifier, or add the missing binding before use.",
+        fix_example: "let count: Int = 1;\nlet total: Int = count;  // count is now in scope",
+    },
 ];
 
 #[cfg(test)]

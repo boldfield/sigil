@@ -50,9 +50,9 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     if !has_main {
         let span = Span::synthetic(&program.file);
         tc.push_error(
-            "E0001",
+            "E0040",
             span,
-            "program has no `fn main`; every Sigil program needs `fn main() -> Int ![IO]`",
+            "program has no `fn main`; every Sigil program needs `fn main() -> Int ![IO]` or `fn main() -> Int ![]`",
         );
     }
 
@@ -82,15 +82,34 @@ impl Tc {
 
     fn check_fn(&mut self, f: &FnDecl) {
         if f.name == "main" {
-            // Return type must be Int.
+            // Main's signature is fixed in Plan A1: `() -> Int ![IO]` or `() -> Int ![]`.
+            // Anything else — wrong return type, any parameters, or an effect row
+            // containing anything other than IO — is E0041.
             if !type_is(&f.return_type, "Int") {
                 self.push_error(
-                    "E0001",
+                    "E0041",
                     f.span.clone(),
-                    "`main` must return `Int` in Plan A1",
+                    "`fn main` must return `Int` (expected `fn main() -> Int ![IO]` or `fn main() -> Int ![]`)",
                 );
             }
-            // Stage 1 allows [] or [IO] — both are valid.
+            if !f.params.is_empty() {
+                self.push_error(
+                    "E0041",
+                    f.span.clone(),
+                    "`fn main` takes no parameters in Plan A1 (expected `fn main() -> Int ![IO]`)",
+                );
+            }
+            for effect in &f.effects {
+                if effect != "IO" {
+                    self.push_error(
+                        "E0041",
+                        f.span.clone(),
+                        format!(
+                            "`fn main`'s effect row may only contain `IO` in Plan A1 (saw `{effect}`)",
+                        ),
+                    );
+                }
+            }
         }
         self.check_block(&f.body, &f.effects);
     }
@@ -109,9 +128,14 @@ impl Tc {
                     if let Some(got_ty) = got {
                         if !type_matches(&l.ty, got_ty) {
                             self.push_error(
-                                "E0001",
+                                "E0045",
                                 l.span.clone(),
-                                format!("let binding `{}` has declared type mismatch", l.name),
+                                format!(
+                                    "let binding `{}` has declared type `{}` but initializer has type `{:?}`",
+                                    l.name,
+                                    type_name(&l.ty),
+                                    got_ty,
+                                ),
                             );
                         }
                     }
@@ -126,7 +150,7 @@ impl Tc {
     fn check_perform(&mut self, p: &PerformExpr, row: &[String]) {
         if !row.iter().any(|e| e == &p.effect) {
             self.push_error(
-                "E0001",
+                "E0042",
                 p.span.clone(),
                 format!(
                     "`perform {}.{}` requires `{}` in the enclosing function's effect row",
@@ -138,7 +162,7 @@ impl Tc {
         if p.effect == "IO" && p.op == "println" {
             if p.args.len() != 1 {
                 self.push_error(
-                    "E0001",
+                    "E0043",
                     p.span.clone(),
                     format!(
                         "`IO.println` takes exactly one String argument (got {})",
@@ -151,7 +175,7 @@ impl Tc {
                 Some(Ty::String) => {}
                 Some(other) => {
                     self.push_error(
-                        "E0001",
+                        "E0044",
                         p.span.clone(),
                         format!("`IO.println` requires a `String` argument; got `{other:?}`"),
                     );
@@ -159,8 +183,13 @@ impl Tc {
                 None => {}
             }
         } else if p.effect == "IO" {
+            // Plan A1 only recognises IO.println. Other IO ops arrive with
+            // Plan B's effect-handler dispatch. Reuse E0042 — the user-facing
+            // message is about an effect-surface shape the checker does not
+            // know how to dispatch, which is the same category as "effect not
+            // in row".
             self.push_error(
-                "E0001",
+                "E0042",
                 p.span.clone(),
                 format!("`IO.{}` is not a Plan A1 operation", p.op),
             );
@@ -168,7 +197,7 @@ impl Tc {
             // Non-IO perform sites arrive in later plans; Stage 1 treats
             // them as unknown and recovers.
             self.push_error(
-                "E0001",
+                "E0042",
                 p.span.clone(),
                 format!("`perform {}.{}` is not a Plan A1 operation", p.effect, p.op),
             );
@@ -185,7 +214,7 @@ impl Tc {
             Expr::Ident(_, _) => Some(Ty::Unit),
             Expr::Call { .. } => {
                 self.push_error(
-                    "E0001",
+                    "E0043",
                     e.span(),
                     "function calls are Stage-2+; Plan A1 supports only `perform IO.println`",
                 );
@@ -202,6 +231,12 @@ impl Tc {
 fn type_is(t: &TypeExpr, name: &str) -> bool {
     match t {
         TypeExpr::Named(n, _) => n == name,
+    }
+}
+
+fn type_name(t: &TypeExpr) -> &str {
+    match t {
+        TypeExpr::Named(n, _) => n.as_str(),
     }
 }
 
@@ -231,6 +266,10 @@ mod tests {
         all
     }
 
+    fn has_code(errs: &[CompilerError], code: &str) -> bool {
+        errs.iter().any(|e| e.code.as_str() == code)
+    }
+
     #[test]
     fn hello_world_typechecks() {
         let src = "import std.io\nfn main() -> Int ![IO] { perform IO.println(\"hi\"); 0 }\n";
@@ -238,16 +277,88 @@ mod tests {
     }
 
     #[test]
-    fn perform_without_io_in_row_errors() {
+    fn perform_without_io_in_row_is_e0042() {
         let src = "fn main() -> Int ![] { perform IO.println(\"hi\"); 0 }\n";
         let errs = pipeline(src);
-        assert!(!errs.is_empty());
+        assert!(has_code(&errs, "E0042"), "expected E0042, got: {errs:?}");
     }
 
     #[test]
-    fn perform_non_io_effect_errors() {
+    fn perform_non_io_effect_is_e0042() {
         let src = "fn main() -> Int ![Foo] { perform Foo.bar(\"x\"); 0 }\n";
         let errs = pipeline(src);
-        assert!(!errs.is_empty());
+        assert!(has_code(&errs, "E0042"), "expected E0042, got: {errs:?}");
+    }
+
+    #[test]
+    fn no_main_is_e0040() {
+        let src = "fn not_main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0040"), "expected E0040, got: {errs:?}");
+    }
+
+    #[test]
+    fn main_wrong_return_type_is_e0041() {
+        let src = "fn main() -> String ![] { \"x\" }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0041"), "expected E0041, got: {errs:?}");
+    }
+
+    #[test]
+    fn main_with_params_is_e0041() {
+        let src = "fn main(x: Int) -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0041"), "expected E0041, got: {errs:?}");
+    }
+
+    #[test]
+    fn main_with_non_io_effect_is_e0041() {
+        let src = "fn main() -> Int ![Foo] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0041"), "expected E0041, got: {errs:?}");
+    }
+
+    #[test]
+    fn io_println_arg_count_is_e0043() {
+        let src = "fn main() -> Int ![IO] { perform IO.println(); 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0043"), "expected E0043, got: {errs:?}");
+    }
+
+    #[test]
+    fn io_println_arg_type_is_e0044() {
+        let src = "fn main() -> Int ![IO] { perform IO.println(42); 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
+    }
+
+    #[test]
+    fn let_type_mismatch_is_e0045() {
+        let src = "fn main() -> Int ![] { let x: String = 42; 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0045"), "expected E0045, got: {errs:?}");
+    }
+
+    #[test]
+    fn no_user_facing_error_uses_e0001() {
+        // Every user-reachable diagnostic from typecheck must carry an
+        // E0040+ code. Negative-coverage sweep across the cases the
+        // checker actually flags.
+        let programs = [
+            "fn not_main() -> Int ![] { 0 }\n",
+            "fn main() -> String ![] { \"x\" }\n",
+            "fn main(x: Int) -> Int ![] { 0 }\n",
+            "fn main() -> Int ![] { perform IO.println(\"hi\"); 0 }\n",
+            "fn main() -> Int ![IO] { perform IO.println(); 0 }\n",
+            "fn main() -> Int ![IO] { perform IO.println(42); 0 }\n",
+            "fn main() -> Int ![] { let x: String = 42; 0 }\n",
+        ];
+        for src in programs {
+            let errs = pipeline(src);
+            assert!(
+                !errs.iter().any(|e| e.code.as_str() == "E0001"),
+                "program surfaced E0001 (internal-only): src={src:?} errs={errs:?}",
+            );
+        }
     }
 }
