@@ -67,6 +67,14 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all -- --check
 
+      # Run the pod-safe verification script. It is a superset of fmt +
+      # per-crate clippy + workspace check + runtime lib tests + the
+      # discipline greps; its purpose in CI is to keep the pod-safe
+      # path continuously exercised on both hosts (per Plan A2 task
+      # 1.5.4). It does not replace the full build/test matrix below.
+      - name: pod-verify (pod-safe subset)
+        run: ./scripts/pod-verify.sh
+
       # Build the runtime crate first, then the compiler crate, then run
       # tests. Splitting the build into per-crate invocations keeps peak
       # memory lower than a single `cargo build --workspace`, which is

@@ -27,9 +27,9 @@ is not `done` until CI is green on both `x86_64-unknown-linux-gnu` and
   - commits: [(pending)]
   - notes: Appended a tagging convention to QUESTIONS.md header; A1 entries are implicitly `[PLAN-A1]`.
 - Task 1.5.4 — `scripts/pod-verify.sh` + README pod-vs-CI section + CI wiring
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done
+  - commits: [(pending)]
+  - notes: Script wraps fmt + check + per-crate clippy + runtime lib tests + interior-pointer check + discipline greps. Greps for unwrap/expect/panic are advisory (clippy -D warnings is the authority); false positives inside test modules are expected. CI invokes the script as a new step before the existing build/test matrix.
 - Task 1.5.5 — Fix cold-target e2e staticlib ordering
   - status: todo
   - commits: []
