@@ -188,6 +188,49 @@ fn compile_and_run(source: &str, test_name: &str) -> (String, String, i32) {
     out
 }
 
+/// Like [`compile_file_and_run`] but also returns the wall-clock
+/// duration of the child process's `exec(2)`-to-exit run. The
+/// compile step is NOT measured; only the compiled-program run is
+/// timed. Used by plan A2 task 34's performance-floor test.
+fn compile_file_and_run_timed(
+    source_path: &Path,
+    test_name: &str,
+) -> (String, String, i32, std::time::Duration) {
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
+
+    let compile = Command::new(&sigil_bin)
+        .arg(source_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to invoke sigil compiler");
+    assert!(
+        compile.status.success(),
+        "compile failed for {test_name}: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    let start = std::time::Instant::now();
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("failed to execute compiled binary");
+    let elapsed = start.elapsed();
+
+    let code = run.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    let _ = std::fs::remove_file(&bin_path);
+
+    (stdout, stderr, code, elapsed)
+}
+
 #[test]
 fn hello() {
     let root = workspace_root();
@@ -325,6 +368,34 @@ fn higher_order_example_exits_130() {
     let source = root.join("examples/higher_order.sigil");
     let (_stdout, stderr, code) = compile_file_and_run(&source, "higher_order_example");
     assert_eq!(code, 130, "higher_order.sigil exit code; stderr={stderr:?}");
+}
+
+// ===== Plan A2 Task 34 — performance-floor example ==========================
+
+/// Plan A2 task 34 — compiles and runs `examples/fib_perf.sigil`. The
+/// file's comment documents the invariants: stdout `"6765\n"`, exit
+/// `0`, and end-to-end wall-clock of the compiled binary under 50ms
+/// on both hosts (`x86_64-unknown-linux-gnu` + `aarch64-apple-darwin`).
+///
+/// Exercises the `int_to_string` builtin wired in this task plus the
+/// pre-existing `IO.println` + recursive-fn paths. The performance
+/// bound is a normative acceptance criterion from the plan; if this
+/// test flakes on CI the remediation is a DEVIATION entry, not a
+/// silent relaxation.
+#[test]
+fn fib_perf_example_prints_6765_under_50ms() {
+    let root = workspace_root();
+    let source = root.join("examples/fib_perf.sigil");
+    let (stdout, stderr, code, elapsed) = compile_file_and_run_timed(&source, "fib_perf_example");
+    assert_eq!(code, 0, "fib_perf.sigil exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "6765\n",
+        "fib_perf.sigil stdout must be exactly \"6765\\n\""
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(50),
+        "fib_perf.sigil wall-clock {elapsed:?} exceeds the 50ms plan-A2 floor",
+    );
 }
 
 // ===== Plan A2 Task 24 — Stage-2 codegen additional coverage ================

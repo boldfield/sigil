@@ -1,0 +1,42 @@
+// examples/fib_perf.sigil
+//
+// Plan A2 Task 34: performance floor example. `fib(20) = 6765` exceeds
+// the 0..255 exit-code ceiling Task 33's fibonacci.sigil relied on, so
+// this example prints the result via `perform IO.println` after
+// converting it to a String via the `int_to_string` builtin (seeded in
+// the typechecker's `fn_env` and dispatched by codegen to the runtime
+// symbol `sigil_int_to_string`).
+//
+// Invariant: running this program writes exactly `6765\n` to stdout
+// and exits with status 0. The e2e test asserts this AND that the
+// end-to-end wall-clock from `exec(2)` to process exit is under 50ms
+// on both CI hosts (x86_64-unknown-linux-gnu, aarch64-apple-darwin).
+//
+// Exercises:
+//   - Task 32 closure-calling-convention direct-call for a self-
+//     referential top-level fn (null closure_ptr).
+//   - Task 34 builtin-call lowering: codegen evaluates the arg and
+//     direct-calls `sigil_int_to_string`; the runtime allocates a
+//     fresh Boehm-managed String on the heap and returns its header
+//     pointer, which is then passed straight into `sigil_println`.
+//
+// Naive doubly-recursive fib is deliberate — the performance floor
+// verifies that even an unoptimised recursive program is fast enough
+// to stay under the plan's bound. A tighter iterative form arrives
+// with Plan B's effect handlers (which give us mutable-cell-style
+// patterns the Plan A2 language can't express).
+
+import std.io
+
+fn fib(n: Int) -> Int ![] {
+  match n {
+    0 => 0,
+    1 => 1,
+    _ => fib(n - 1) + fib(n - 2),
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(int_to_string(fib(20)));
+  0
+}
