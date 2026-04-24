@@ -294,11 +294,20 @@ impl Converter {
                 span,
             } => {
                 let scrutinee = Box::new(self.rewrite_expr(*scrutinee, locals, captures));
-                let arms = arms
+                let arms: Vec<MatchArm> = arms
                     .into_iter()
-                    .map(|a| MatchArm {
-                        body: self.rewrite_expr(a.body, locals, captures),
-                        ..a
+                    .map(|a| {
+                        // Plan A3 task 39: Pattern::Var bindings (top-
+                        // level or nested inside Ctor/Tuple patterns)
+                        // are arm-local. Extend `locals` for this arm's
+                        // body rewrite so capture-vs-local detection
+                        // treats them correctly.
+                        let mut arm_locals = locals.clone();
+                        crate::typecheck::pattern_bindings(&a.pattern, &mut arm_locals);
+                        MatchArm {
+                            body: self.rewrite_expr(a.body, &arm_locals, captures),
+                            ..a
+                        }
                     })
                     .collect();
                 Expr::Match {

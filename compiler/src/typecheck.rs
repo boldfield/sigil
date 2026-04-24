@@ -1875,6 +1875,44 @@ fn ctor_witness_string(variant: &Variant) -> String {
 /// the outer set expanded to include the outer lambda's params — a
 /// nested lambda captures not only the enclosing lambda's outer
 /// scope but also the enclosing lambda's params.
+/// Recursively collect every `Pattern::Var` binding name from a
+/// pattern (Plan A3 task 39). Nullary-ctor promotion is NOT applied
+/// here — this helper is used by capture analysis and closure
+/// conversion's local-tracking path where a promoted nullary variant
+/// is indistinguishable from a fresh binding at the syntactic layer
+/// (both are Pattern::Var). Treating every `Var` as a binding is
+/// safe: the over-approximation adds an unused entry to `locals`
+/// that simply fails to match any later capture.
+pub(crate) fn pattern_bindings(p: &Pattern, out: &mut std::collections::BTreeSet<String>) {
+    match p {
+        Pattern::Wildcard(_)
+        | Pattern::IntLit(_, _)
+        | Pattern::BoolLit(_, _)
+        | Pattern::CharLit(_, _) => {}
+        Pattern::Var(name, _) => {
+            out.insert(name.clone());
+        }
+        Pattern::Tuple(pats, _) => {
+            for sub in pats {
+                pattern_bindings(sub, out);
+            }
+        }
+        Pattern::Ctor { fields, .. } => match fields {
+            CtorPatternFields::Unit => {}
+            CtorPatternFields::Positional(ps) => {
+                for sub in ps {
+                    pattern_bindings(sub, out);
+                }
+            }
+            CtorPatternFields::Record(fs) => {
+                for f in fs {
+                    pattern_bindings(&f.pattern, out);
+                }
+            }
+        },
+    }
+}
+
 fn collect_free_vars(
     e: &Expr,
     outer_names: &std::collections::BTreeSet<String>,
@@ -1927,7 +1965,15 @@ fn collect_free_vars(
             } => {
                 walk(scrutinee, outer_names, param_names, locals, captures);
                 for arm in arms {
+                    // Plan A3 task 39: pattern `Pattern::Var(name)` —
+                    // including names nested inside `Ctor`/`Tuple`
+                    // sub-patterns — introduces a local binding for
+                    // the arm body. Snapshot `locals`, add the arm's
+                    // bindings, walk the body, then restore.
+                    let saved = locals.clone();
+                    pattern_bindings(&arm.pattern, locals);
                     walk(&arm.body, outer_names, param_names, locals, captures);
+                    *locals = saved;
                 }
             }
             Expr::Block(b) => {
@@ -3352,5 +3398,60 @@ mod tests {
             "witness format wrong: {}",
             e120.message
         );
+    }
+
+    // ===== Plan A3 Task 39 — capture analysis respects pattern bindings =====
+
+    #[test]
+    fn pattern_bindings_collects_all_var_names_from_nested_patterns() {
+        use crate::ast::{CtorPatternField, CtorPatternFields, Pattern};
+        let span = Span::synthetic("x");
+        // `Cons(h, Cons(mid, Nil))` — two Var bindings: `h`, `mid`.
+        let pat = Pattern::Ctor {
+            name: "Cons".to_string(),
+            fields: CtorPatternFields::Positional(vec![
+                Pattern::Var("h".to_string(), span.clone()),
+                Pattern::Ctor {
+                    name: "Cons".to_string(),
+                    fields: CtorPatternFields::Positional(vec![
+                        Pattern::Var("mid".to_string(), span.clone()),
+                        Pattern::Ctor {
+                            name: "Nil".to_string(),
+                            fields: CtorPatternFields::Unit,
+                            span: span.clone(),
+                        },
+                    ]),
+                    span: span.clone(),
+                },
+            ]),
+            span: span.clone(),
+        };
+        let mut bindings = std::collections::BTreeSet::new();
+        pattern_bindings(&pat, &mut bindings);
+        assert_eq!(bindings.len(), 2, "expected h + mid, got {bindings:?}");
+        assert!(bindings.contains("h"));
+        assert!(bindings.contains("mid"));
+        // Record-style Ctor pattern — field-pun and renamed fields.
+        let pat2 = Pattern::Ctor {
+            name: "Point".to_string(),
+            fields: CtorPatternFields::Record(vec![
+                CtorPatternField {
+                    name: "x".to_string(),
+                    pattern: Pattern::Var("x".to_string(), span.clone()),
+                    span: span.clone(),
+                },
+                CtorPatternField {
+                    name: "y".to_string(),
+                    pattern: Pattern::Var("why".to_string(), span.clone()),
+                    span: span.clone(),
+                },
+            ]),
+            span,
+        };
+        let mut bindings2 = std::collections::BTreeSet::new();
+        pattern_bindings(&pat2, &mut bindings2);
+        assert_eq!(bindings2.len(), 2);
+        assert!(bindings2.contains("x"));
+        assert!(bindings2.contains("why"));
     }
 }
