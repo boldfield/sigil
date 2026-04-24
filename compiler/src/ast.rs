@@ -17,6 +17,18 @@ pub struct Program {
 pub enum Item {
     Import(ImportDecl),
     Fn(Box<FnDecl>),
+    /// User-defined nominal type declaration — plan A3 task 37.
+    ///
+    /// Surface forms:
+    /// - `type Name = | Ctor | Ctor(T1, T2) | Ctor { f: T, ... }` — sum type.
+    /// - `type Name = { f: T, ... }` — single-constructor shorthand,
+    ///   desugars to one named variant `Name { ... }`.
+    ///
+    /// The typechecker (task 38) treats these nominally: a sum type
+    /// with name `N` is distinct from any other type of the same shape
+    /// but a different name. Codegen (task 41) bakes a per-program
+    /// type tag (0x10+) into each allocation site.
+    Type(Box<TypeDecl>),
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +58,44 @@ pub struct Param {
 #[derive(Clone, Debug)]
 pub enum TypeExpr {
     Named(String, Span),
+}
+
+/// Plan A3 task 37 — user-defined nominal type declaration.
+#[derive(Clone, Debug)]
+pub struct TypeDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub variants: Vec<Variant>,
+    pub span: Span,
+}
+
+/// A single constructor (variant) in a `type` declaration.
+#[derive(Clone, Debug)]
+pub struct Variant {
+    pub name: String,
+    pub name_span: Span,
+    pub fields: VariantFields,
+    pub span: Span,
+}
+
+/// Three shapes a variant's payload may take.
+#[derive(Clone, Debug)]
+pub enum VariantFields {
+    /// `| None` — no payload.
+    Unit,
+    /// `| Some(Int)` / `| Pair(Int, Int)` — positional fields.
+    Positional(Vec<TypeExpr>),
+    /// `| Point { x: Int, y: Int }` — named fields. Also the shape used
+    /// by the single-constructor record shorthand `type Name = { ... }`.
+    Record(Vec<RecordFieldDecl>),
+}
+
+/// A named field inside a variant's record payload.
+#[derive(Clone, Debug)]
+pub struct RecordFieldDecl {
+    pub name: String,
+    pub ty: TypeExpr,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +251,26 @@ pub enum Expr {
         kind: EnvSlotKind,
         span: Span,
     },
+    /// Plan A3 task 37 — record-style constructor application:
+    /// `Ctor { f: v, ... }`. Distinct from positional constructor
+    /// application `Ctor(v, ...)` which parses as an `Expr::Call` on
+    /// an `Expr::Ident` callee and is disambiguated by the
+    /// typechecker (task 38) against the registered type symbol
+    /// table. A `RecordLit` is only produced for identifier + `{`
+    /// in expression position.
+    RecordLit {
+        name: String,
+        fields: Vec<RecordFieldLit>,
+        span: Span,
+    },
+}
+
+/// A `field: value` pair in a record literal `Ctor { f: v, ... }`.
+#[derive(Clone, Debug)]
+pub struct RecordFieldLit {
+    pub name: String,
+    pub value: Expr,
+    pub span: Span,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,6 +309,56 @@ pub enum Pattern {
     BoolLit(bool, Span),
     CharLit(char, Span),
     Wildcard(Span),
+    /// Plan A3 task 37 — fresh variable binding in a pattern.
+    ///
+    /// `match x { y => y + 1 }` binds `y` to the scrutinee value
+    /// inside the arm body. The parser emits `Pattern::Var` for
+    /// any bare identifier in pattern position that is not `_`.
+    /// The typechecker (task 38) may reinterpret a `Pattern::Var`
+    /// as a nullary constructor pattern when the bare name matches
+    /// a registered constructor for the scrutinee's type — that
+    /// resolution is delayed so the parser does not need a symbol
+    /// table.
+    Var(String, Span),
+    /// Plan A3 task 37 — tuple pattern `(pat, pat, ...)`.
+    Tuple(Vec<Pattern>, Span),
+    /// Plan A3 task 37 — constructor pattern:
+    /// - Unit: `None`
+    /// - Positional: `Some(n)` / `Pair(a, b)`
+    /// - Record: `Point { x, y }` (field-pun: each name binds a
+    ///   fresh variable with the same name) or
+    ///   `Point { x: px, y }` (rename: `px` binds).
+    ///
+    /// Unit-shape constructors (no fields, no parentheses) never
+    /// reach this variant from the parser — the parser emits
+    /// `Pattern::Var(name)` for a bare identifier, and the
+    /// typechecker promotes it to a nullary `Ctor` when the name
+    /// resolves to a constructor.
+    Ctor {
+        name: String,
+        fields: CtorPatternFields,
+        span: Span,
+    },
+}
+
+/// Plan A3 task 37 — the three possible payload shapes of a
+/// constructor pattern, mirroring `VariantFields`.
+#[derive(Clone, Debug)]
+pub enum CtorPatternFields {
+    Unit,
+    Positional(Vec<Pattern>),
+    Record(Vec<CtorPatternField>),
+}
+
+/// A named field inside a record constructor pattern.
+/// `Point { x, y }` field-puns `x` and `y` as fresh binders of
+/// the same name. `Point { x: px }` renames field `x` to binding
+/// `px`.
+#[derive(Clone, Debug)]
+pub struct CtorPatternField {
+    pub name: String,
+    pub pattern: Pattern,
+    pub span: Span,
 }
 
 impl Pattern {
@@ -247,7 +367,10 @@ impl Pattern {
             Pattern::IntLit(_, s)
             | Pattern::BoolLit(_, s)
             | Pattern::CharLit(_, s)
-            | Pattern::Wildcard(s) => s.clone(),
+            | Pattern::Wildcard(s)
+            | Pattern::Var(_, s)
+            | Pattern::Tuple(_, s)
+            | Pattern::Ctor { span: s, .. } => s.clone(),
         }
     }
 }
@@ -275,7 +398,8 @@ impl Expr {
             | Expr::Match { span: s, .. }
             | Expr::Lambda { span: s, .. }
             | Expr::ClosureRecord { span: s, .. }
-            | Expr::ClosureEnvLoad { span: s, .. } => s.clone(),
+            | Expr::ClosureEnvLoad { span: s, .. }
+            | Expr::RecordLit { span: s, .. } => s.clone(),
             Expr::Perform(p) => p.span.clone(),
             Expr::Block(b) => b.span.clone(),
         }

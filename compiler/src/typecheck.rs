@@ -122,6 +122,14 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         match item {
             Item::Fn(f) => tc.check_fn(f),
             Item::Import(_) => {}
+            // Plan A3: user-defined types are registered in a pre-pass
+            // (task 38 fleshes out the nominal-types symbol table).
+            // For task 37 (parser) the arm is empty — AST variants
+            // arrive first so the parser can ship without waiting for
+            // the full typechecker. A temporary E0001 will fire from
+            // downstream passes if a `type` decl is actually reached
+            // in a compiled program before task 38 lands.
+            Item::Type(_) => {}
         }
     }
     let has_main = program
@@ -508,6 +516,23 @@ impl Tc {
             // strictly before closure conversion.
             Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
                 unreachable!("typecheck: closure-conversion nodes should not appear pre-CC")
+            }
+            // Plan A3 task 37: record literal `Ctor { f: v, ... }`.
+            // Task 38 replaces this stub with real nominal-type
+            // resolution (look up `name` in the registered types,
+            // check field names and value types, return the sum
+            // type). For task 37, any program using this syntax is
+            // rejected with a temporary diagnostic so the pipeline
+            // does not silently accept un-typechecked record data.
+            Expr::RecordLit { name, span, .. } => {
+                self.push_error(
+                    "E0001",
+                    span.clone(),
+                    format!(
+                        "record literal `{name} {{ .. }}` requires Plan A3 task 38's nominal-type checker; not yet implemented"
+                    ),
+                );
+                None
             }
         }
     }
@@ -992,6 +1017,15 @@ fn pattern_ty(p: &Pattern) -> Option<Ty> {
         Pattern::BoolLit(_, _) => Some(Ty::Bool),
         Pattern::CharLit(_, _) => Some(Ty::Char),
         Pattern::Wildcard(_) => None,
+        // Plan A3 task 37: new pattern variants. A `Var` / `Tuple` /
+        // `Ctor` pattern's type is not a simple scalar — it depends
+        // on the nominal type of the scrutinee, which task 38's
+        // nominal-types symbol table resolves. Returning `None`
+        // here keeps the coarse pattern-vs-scrutinee check (which
+        // uses this function) in sync with the "wildcard matches
+        // any type" case; task 38 will replace this coarse check
+        // with a structural one that uses the symbol table.
+        Pattern::Var(_, _) | Pattern::Tuple(..) | Pattern::Ctor { .. } => None,
     }
 }
 
@@ -1120,6 +1154,15 @@ fn collect_free_vars(
             // before closure conversion. These nodes never appear here.
             Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
                 unreachable!("collect_free_vars: closure-conversion nodes should not appear pre-CC")
+            }
+            // Plan A3 task 37: record literal. Each field value is a
+            // potential capture source. The name of the constructor
+            // is not itself a captureable identifier (it resolves to
+            // the registered type, not a binding).
+            Expr::RecordLit { fields, .. } => {
+                for f in fields {
+                    walk(&f.value, outer_names, param_names, locals, captures);
+                }
             }
         }
     }

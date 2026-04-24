@@ -40,6 +40,27 @@
 //! # above: `fn_decl` uses `param_list?` and `postfix` accepts
 //! # `'(' arg_list? ')'` chains. Task 29 only introduces `lambda_expr`
 //! # as a new grammar form.)
+//!
+//! # Stage 4 grammar additions (plan A3 task 37).
+//! program   := (import | fn_decl | type_decl)*
+//! type_decl := 'type' ident '=' ('|' variant)+
+//!           | 'type' ident '=' '{' record_fields '}'    # single-ctor shorthand
+//! variant   := ident ('(' type (',' type)* ','? ')')?
+//!           | ident '{' record_fields '}'
+//! record_fields := (ident ':' type) (',' (ident ':' type))* ','?
+//! primary   := ... | ident '{' record_field_lit (',' record_field_lit)* ','? '}'
+//!   # (record literal; disabled in if-cond / match-scrutinee positions to avoid
+//!   # ambiguity with the block that follows. Parens `(Ctor { .. })` re-enable.)
+//! record_field_lit := ident ':' expr
+//! pattern   := literal | bool_lit | char_lit | '_' | ident      # Var or nullary Ctor
+//!           | ident '(' pattern (',' pattern)* ','? ')'         # positional Ctor
+//!           | ident '{' pattern_field (',' pattern_field)* ','? '}'  # record Ctor
+//!           | '(' pattern (',' pattern)* ','? ')'               # tuple (or paren)
+//! pattern_field := ident             # field-pun: binds same name
+//!               | ident ':' pattern  # rename
+//! # Plan A3 explicitly rejects pattern guards, or-patterns, and as-bindings
+//! # with E0110 at the parser level. See the error catalog entry for the
+//! # rationale: these forms are anti-ergonomic under fight-the-priors.
 //! ```
 //!
 //! `-<integer-literal>` is constant-folded at parse time into a single
@@ -59,6 +80,7 @@ pub fn parse(file: &str, tokens: &[Token]) -> (Program, Vec<CompilerError>) {
         toks: tokens,
         pos: 0,
         errors: Vec::new(),
+        no_record_lits: false,
     };
     let items = p.parse_program();
     (
@@ -76,6 +98,13 @@ struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
     errors: Vec<CompilerError>,
+    /// Plan A3 task 37 — disables recognition of `Ident { ... }` as a
+    /// record literal inside `if` conditions and `match` scrutinees,
+    /// where the immediately-following `{` would otherwise be ambiguous
+    /// with the block that starts the arm / branch. Parenthesised
+    /// sub-expressions restore the default (record literals allowed),
+    /// so `if (Foo { x: 1 }).some_bool_field { .. }` still parses.
+    no_record_lits: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -134,6 +163,29 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Plan A3 task 37 — recover from a malformed match arm by skipping
+    /// tokens until either a `=>` (end of the attempted arm's LHS),
+    /// a `,` (end of the arm), or a `}` (end of the match). Leaves the
+    /// parser positioned AT the terminator, not past it, so the outer
+    /// arm loop can decide how to continue.
+    fn recover_to_arm_terminator(&mut self) {
+        while !self.at_eof() {
+            match self.peek().kind {
+                TokenKind::FatArrow => {
+                    // Consume through the `=>` and the following body
+                    // expression so the caller can test for `,` / `}`.
+                    self.advance();
+                    let _ = self.parse_expr();
+                    return;
+                }
+                TokenKind::Comma | TokenKind::RBrace => return,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
     fn parse_program(&mut self) -> Vec<Item> {
         let mut items = Vec::new();
         while !self.at_eof() {
@@ -147,9 +199,13 @@ impl<'a> Parser<'a> {
                     Some(f) => items.push(Item::Fn(Box::new(f))),
                     None => self.synchronise_to_semi_or_brace(),
                 },
+                TokenKind::Type => match self.parse_type_decl() {
+                    Some(t) => items.push(Item::Type(Box::new(t))),
+                    None => self.synchronise_to_semi_or_brace(),
+                },
                 _ => {
                     let span = self.peek().span.clone();
-                    self.err(span, "expected `import` or `fn` at top level");
+                    self.err(span, "expected `import`, `fn`, or `type` at top level");
                     self.synchronise_to_semi_or_brace();
                 }
             }
@@ -275,6 +331,154 @@ impl<'a> Parser<'a> {
         };
         self.advance();
         Some(TypeExpr::Named(n, tok.span))
+    }
+
+    /// Plan A3 task 37 — parse a top-level `type` declaration.
+    ///
+    /// Grammar:
+    /// ```text
+    /// type Name = | Ctor | Ctor(T1, T2) | Ctor { f: T, ... }
+    /// type Name = { f: T, ... }   # single-ctor record shorthand
+    /// ```
+    ///
+    /// The record-shorthand form desugars to a single `Variant` whose
+    /// name equals the type name and whose fields are the listed record
+    /// fields. The sum form requires at least one leading `|` and at
+    /// least one variant.
+    fn parse_type_decl(&mut self) -> Option<TypeDecl> {
+        let start = self.peek().span.clone();
+        self.expect(&TokenKind::Type, "`type`")?;
+        let name_tok = self.peek().clone();
+        let name = match name_tok.kind {
+            TokenKind::Ident(ref n) => {
+                self.advance();
+                n.clone()
+            }
+            _ => {
+                self.err(name_tok.span.clone(), "expected type name after `type`");
+                return None;
+            }
+        };
+        let name_span = name_tok.span;
+        self.expect(&TokenKind::Eq, "`=`")?;
+
+        // Single-constructor record shorthand `type Name = { f: T, ... }`.
+        if matches!(self.peek().kind, TokenKind::LBrace) {
+            self.advance();
+            let fields = self.parse_record_field_decls()?;
+            self.expect(&TokenKind::RBrace, "`}` closing record fields")?;
+            let variant = Variant {
+                name: name.clone(),
+                name_span: name_span.clone(),
+                fields: VariantFields::Record(fields),
+                span: name_span.clone(),
+            };
+            return Some(TypeDecl {
+                name,
+                name_span,
+                variants: vec![variant],
+                span: start,
+            });
+        }
+
+        // Sum form: `= | Ctor | Ctor(T, ...) | Ctor { ... } ...`.
+        let mut variants = Vec::new();
+        while matches!(self.peek().kind, TokenKind::Pipe) {
+            self.advance();
+            let variant = self.parse_variant()?;
+            variants.push(variant);
+        }
+        if variants.is_empty() {
+            let span = self.peek().span.clone();
+            self.err(
+                span,
+                "expected at least one `| Ctor` variant after `=`, or `{` for record shorthand",
+            );
+            return None;
+        }
+        Some(TypeDecl {
+            name,
+            name_span,
+            variants,
+            span: start,
+        })
+    }
+
+    /// Parse one constructor in a sum-type decl:
+    /// `Ctor`, `Ctor(T1, T2)`, or `Ctor { f: T, ... }`.
+    fn parse_variant(&mut self) -> Option<Variant> {
+        let name_tok = self.peek().clone();
+        let (name, name_span) = match name_tok.kind {
+            TokenKind::Ident(ref n) => {
+                self.advance();
+                (n.clone(), name_tok.span.clone())
+            }
+            _ => {
+                self.err(name_tok.span.clone(), "expected constructor name");
+                return None;
+            }
+        };
+        let span = name_span.clone();
+        let fields = match self.peek().kind {
+            TokenKind::LParen => {
+                self.advance();
+                let mut tys = Vec::new();
+                while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
+                    tys.push(self.parse_type()?);
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen, "`)` closing positional fields")?;
+                VariantFields::Positional(tys)
+            }
+            TokenKind::LBrace => {
+                self.advance();
+                let fields = self.parse_record_field_decls()?;
+                self.expect(&TokenKind::RBrace, "`}` closing record fields")?;
+                VariantFields::Record(fields)
+            }
+            _ => VariantFields::Unit,
+        };
+        Some(Variant {
+            name,
+            name_span,
+            fields,
+            span,
+        })
+    }
+
+    /// Parse `ident ':' type (',' ident ':' type)* ','?` inside `{ ... }`.
+    fn parse_record_field_decls(&mut self) -> Option<Vec<RecordFieldDecl>> {
+        let mut fields = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            let tok = self.peek().clone();
+            let fname = match tok.kind {
+                TokenKind::Ident(ref n) => {
+                    self.advance();
+                    n.clone()
+                }
+                _ => {
+                    self.err(tok.span.clone(), "expected field name");
+                    return None;
+                }
+            };
+            self.expect(&TokenKind::Colon, "`:` in record field declaration")?;
+            let fty = self.parse_type()?;
+            fields.push(RecordFieldDecl {
+                name: fname,
+                ty: fty,
+                span: tok.span,
+            });
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Some(fields)
     }
 
     fn parse_block(&mut self) -> Option<Block> {
@@ -462,6 +666,12 @@ impl<'a> Parser<'a> {
         while matches!(self.peek().kind, TokenKind::LParen) {
             let call_start = expr.span();
             self.advance();
+            // Plan A3 task 37: call-argument parsing is a fresh
+            // expression context — `if cond_fn(Foo { x: 1 }) { ... }`
+            // should parse the record literal normally. Save/restore
+            // `no_record_lits` around the argument list.
+            let saved = self.no_record_lits;
+            self.no_record_lits = false;
             let mut args = Vec::new();
             while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
                 args.push(self.parse_expr()?);
@@ -471,6 +681,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
+            self.no_record_lits = saved;
             self.expect(&TokenKind::RParen, "`)`")?;
             expr = Expr::Call {
                 callee: Box::new(expr),
@@ -505,14 +716,31 @@ impl<'a> Parser<'a> {
                 Some(Expr::BoolLit(false, tok.span))
             }
             TokenKind::Ident(ref n) => {
+                let name = n.clone();
+                let name_span = tok.span.clone();
                 self.advance();
-                Some(Expr::Ident(n.clone(), tok.span))
+                // Plan A3 task 37: record literal `Ctor { f: v, ... }`.
+                // Disabled in if-cond / match-scrutinee positions
+                // (`no_record_lits`) to avoid ambiguity with the block
+                // that follows; parens reset the flag. Note the check
+                // is `LBrace` not a broader "compound follow" — a
+                // lambda body after `=>` also uses `parse_expr` but the
+                // `=>` token is already consumed, so the lambda arm
+                // does not enter this path under the wrong flag state.
+                if !self.no_record_lits && matches!(self.peek().kind, TokenKind::LBrace) {
+                    return self.parse_record_lit(name, name_span);
+                }
+                Some(Expr::Ident(name, name_span))
             }
             TokenKind::Perform => self.parse_perform_expr().map(Expr::Perform),
             TokenKind::LParen => {
                 // Parenthesized expression for precedence override.
+                // Record literals are always re-enabled inside `(...)`.
                 self.advance();
+                let saved = self.no_record_lits;
+                self.no_record_lits = false;
                 let inner = self.parse_expr()?;
+                self.no_record_lits = saved;
                 self.expect(&TokenKind::RParen, "`)` closing parenthesized expression")?;
                 Some(inner)
             }
@@ -595,7 +823,14 @@ impl<'a> Parser<'a> {
     fn parse_if_expr(&mut self) -> Option<Expr> {
         let start = self.peek().span.clone();
         self.expect(&TokenKind::If, "`if`")?;
+        // Plan A3 task 37: disable record-literal recognition inside the
+        // condition so `if Foo { ... } else { ... }` parses as an `if`
+        // with an Ident cond and a block body, not an `if` with a
+        // record-literal cond. Parens restore the default.
+        let saved = self.no_record_lits;
+        self.no_record_lits = true;
         let cond = self.parse_expr()?;
+        self.no_record_lits = saved;
         let then_block = self.parse_block()?;
         self.expect(
             &TokenKind::Else,
@@ -613,12 +848,69 @@ impl<'a> Parser<'a> {
     fn parse_match_expr(&mut self) -> Option<Expr> {
         let start = self.peek().span.clone();
         self.expect(&TokenKind::Match, "`match`")?;
+        // Plan A3 task 37: same reasoning as parse_if_expr — disable
+        // record-literal recognition while parsing the scrutinee so
+        // `match Foo { a => ... }` is the arm form, not a record lit.
+        let saved = self.no_record_lits;
+        self.no_record_lits = true;
         let scrutinee = self.parse_expr()?;
+        self.no_record_lits = saved;
         self.expect(&TokenKind::LBrace, "`{` opening match arms")?;
         let mut arms = Vec::new();
         while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
             let arm_start = self.peek().span.clone();
             let pattern = self.parse_pattern()?;
+            // Plan A3 task 37: reject or-patterns / guards / as-bindings
+            // immediately after the first pattern of an arm. The
+            // patterns themselves parse cleanly, so the ambiguous
+            // tokens only surface here (where `=>` is expected).
+            // Fire E0110 for each, then recover by consuming until
+            // the next `=>` / `,` / `}`.
+            match self.peek().kind {
+                TokenKind::Pipe => {
+                    let span = self.peek().span.clone();
+                    self.errors.push(CompilerError::new(
+                        Severity::Error,
+                        errors::code("E0110"),
+                        span,
+                        "or-patterns `p1 | p2` are not supported in v1; write each variant as a separate `match` arm",
+                    ));
+                    self.recover_to_arm_terminator();
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        self.advance();
+                    }
+                    continue;
+                }
+                TokenKind::If => {
+                    let span = self.peek().span.clone();
+                    self.errors.push(CompilerError::new(
+                        Severity::Error,
+                        errors::code("E0110"),
+                        span,
+                        "pattern guards `pat if cond` are not supported in v1; move the condition into the arm body",
+                    ));
+                    self.recover_to_arm_terminator();
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        self.advance();
+                    }
+                    continue;
+                }
+                TokenKind::Ident(ref n) if n == "as" => {
+                    let span = self.peek().span.clone();
+                    self.errors.push(CompilerError::new(
+                        Severity::Error,
+                        errors::code("E0110"),
+                        span,
+                        "as-bindings `pat as name` are not supported in v1; introduce bindings via constructor / tuple patterns",
+                    ));
+                    self.recover_to_arm_terminator();
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        self.advance();
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             self.expect(&TokenKind::FatArrow, "`=>`")?;
             let body = self.parse_expr()?;
             arms.push(MatchArm {
@@ -653,6 +945,52 @@ impl<'a> Parser<'a> {
             self.err(next.span, "expected integer literal after `-` in pattern");
             return None;
         }
+        // Plan A3 task 37: `|` / `as` / `if` in pattern position are
+        // explicitly rejected with E0110 — or-patterns, as-bindings,
+        // and guards are deliberate restrictions under fight-the-
+        // priors (see the E0110 catalog entry). We reject at the
+        // pattern entry point so any syntactic misstep in any pattern
+        // position gets a clear message; if we recovered and parsed
+        // the LHS first, the error would appear in a surprising
+        // position.
+        match tok.kind {
+            TokenKind::Pipe => {
+                self.errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0110"),
+                    tok.span.clone(),
+                    "or-patterns `p1 | p2` are not supported in v1; write each variant as a separate `match` arm",
+                ));
+                self.advance();
+                return None;
+            }
+            TokenKind::If => {
+                self.errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0110"),
+                    tok.span.clone(),
+                    "pattern guards `pat if cond` are not supported in v1; move the condition into the arm body",
+                ));
+                self.advance();
+                return None;
+            }
+            // `as` is a contextual keyword — currently always parses as
+            // an `Ident("as")` token since it is not in the keyword
+            // table. We catch it specifically before falling through
+            // to the Ident arm so the diagnostic is E0110, not a
+            // generic "expected pattern".
+            TokenKind::Ident(ref n) if n == "as" => {
+                self.errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0110"),
+                    tok.span.clone(),
+                    "as-bindings `pat as name` are not supported in v1; introduce bindings via constructor / tuple patterns instead",
+                ));
+                self.advance();
+                return None;
+            }
+            _ => {}
+        }
         match tok.kind {
             TokenKind::IntLit(n) => {
                 self.advance();
@@ -674,11 +1012,170 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(Pattern::Wildcard(tok.span))
             }
+            TokenKind::Ident(ref n) => {
+                let name = n.clone();
+                let name_span = tok.span.clone();
+                self.advance();
+                // Constructor pattern with positional fields: `Ctor(pat, ...)`.
+                if matches!(self.peek().kind, TokenKind::LParen) {
+                    self.advance();
+                    let mut inner = Vec::new();
+                    while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
+                        inner.push(self.parse_pattern()?);
+                        if matches!(self.peek().kind, TokenKind::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RParen, "`)` closing constructor pattern")?;
+                    return Some(Pattern::Ctor {
+                        name,
+                        fields: CtorPatternFields::Positional(inner),
+                        span: name_span,
+                    });
+                }
+                // Constructor pattern with record fields: `Ctor { f, f: p, ... }`.
+                if matches!(self.peek().kind, TokenKind::LBrace) {
+                    self.advance();
+                    let fields = self.parse_ctor_pattern_record_fields()?;
+                    self.expect(&TokenKind::RBrace, "`}` closing record pattern")?;
+                    return Some(Pattern::Ctor {
+                        name,
+                        fields: CtorPatternFields::Record(fields),
+                        span: name_span,
+                    });
+                }
+                // Bare identifier: `Pattern::Var`. Task 38's typechecker
+                // may reinterpret this as a nullary `Ctor` if the name
+                // resolves to a constructor for the scrutinee's type.
+                Some(Pattern::Var(name, name_span))
+            }
+            TokenKind::LParen => {
+                // `(pat)` is a parenthesised pattern (returns inner);
+                // `(pat, pat, ...)` is a tuple pattern.
+                self.advance();
+                let mut pats = Vec::new();
+                let mut saw_comma = false;
+                while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
+                    pats.push(self.parse_pattern()?);
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        saw_comma = true;
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen, "`)` closing pattern group")?;
+                // clippy::disallowed-methods forbids `Option::unwrap`.
+                // We know `pats.len() == 1` here, but destructure
+                // defensively so the lint passes.
+                if pats.len() == 1 && !saw_comma {
+                    let mut it = pats.into_iter();
+                    match it.next() {
+                        Some(p) => Some(p),
+                        None => unreachable!(
+                            "parse_pattern: pats.len() == 1 contradicts iter().next() == None"
+                        ),
+                    }
+                } else {
+                    Some(Pattern::Tuple(pats, tok.span))
+                }
+            }
             _ => {
-                self.err(tok.span.clone(), "expected pattern (literal or `_`)");
+                self.err(
+                    tok.span.clone(),
+                    "expected pattern (literal, `_`, identifier, constructor, or tuple)",
+                );
                 None
             }
         }
+    }
+
+    /// Parse the body of a record-shaped constructor pattern:
+    /// `{ f, f: p, g: q, ... }`. Field-pun `f` is equivalent to
+    /// `f: f` (binds a fresh variable with the same name as the field).
+    fn parse_ctor_pattern_record_fields(&mut self) -> Option<Vec<CtorPatternField>> {
+        let mut fields = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            let tok = self.peek().clone();
+            let fname = match tok.kind {
+                TokenKind::Ident(ref n) => {
+                    self.advance();
+                    n.clone()
+                }
+                _ => {
+                    self.err(tok.span.clone(), "expected field name in record pattern");
+                    return None;
+                }
+            };
+            let pattern = if matches!(self.peek().kind, TokenKind::Colon) {
+                self.advance();
+                self.parse_pattern()?
+            } else {
+                // Field-pun: binds a variable of the same name.
+                Pattern::Var(fname.clone(), tok.span.clone())
+            };
+            fields.push(CtorPatternField {
+                name: fname,
+                pattern,
+                span: tok.span,
+            });
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Some(fields)
+    }
+
+    /// Plan A3 task 37 — parse a record literal `Ctor { f: v, ... }`.
+    /// Invoked from `parse_primary` after having already consumed the
+    /// `Ctor` identifier and verified the following `{`. Allows
+    /// trailing comma in the field list.
+    fn parse_record_lit(&mut self, name: String, name_span: Span) -> Option<Expr> {
+        self.expect(&TokenKind::LBrace, "`{` opening record literal")?;
+        let mut fields = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            let tok = self.peek().clone();
+            let fname = match tok.kind {
+                TokenKind::Ident(ref n) => {
+                    self.advance();
+                    n.clone()
+                }
+                _ => {
+                    self.err(tok.span.clone(), "expected field name in record literal");
+                    return None;
+                }
+            };
+            self.expect(&TokenKind::Colon, "`:` between field name and value")?;
+            // Record literals inside record literals are unambiguous
+            // — the `no_record_lits` flag only matters at if-cond /
+            // match-scrutinee positions. We explicitly restore the
+            // default (allow) for nested field values so an `if`-cond
+            // containing a record literal via `(...)` still works.
+            let saved = self.no_record_lits;
+            self.no_record_lits = false;
+            let value = self.parse_expr()?;
+            self.no_record_lits = saved;
+            fields.push(RecordFieldLit {
+                name: fname,
+                value,
+                span: tok.span,
+            });
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}` closing record literal")?;
+        Some(Expr::RecordLit {
+            name,
+            fields,
+            span: name_span,
+        })
     }
 }
 
@@ -1206,5 +1703,316 @@ mod tests {
         // `fn () -> Int ![] =>` — no body after `=>`.
         let errs = parse_errs("fn main() -> Int ![] { fn () -> Int ![] => }\n");
         assert!(!errs.is_empty(), "missing lambda body should parse-error");
+    }
+
+    // ===== Plan A3 Task 37 — Stage 4 grammar ============================
+
+    fn parse_ok(src: &str) -> Program {
+        let (toks, lex_errs) = lex("t.sigil", src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parse("t.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+        prog
+    }
+
+    fn parse_tail_pattern(src: &str) -> Pattern {
+        // Wraps `src` as the pattern of a single-arm match. Easier than
+        // standing up a full program for pattern experiments.
+        let full = format!("fn main() -> Int ![] {{ match 0 {{ {src} => 0 }} }}");
+        let prog = parse_ok(&full);
+        let Item::Fn(ref f) = prog.items[0] else {
+            panic!("expected fn decl")
+        };
+        let Expr::Match { ref arms, .. } = f.body.tail.clone().expect("tail expr") else {
+            panic!("expected match expr")
+        };
+        arms[0].pattern.clone()
+    }
+
+    #[test]
+    fn type_decl_unit_and_positional_variants() {
+        // The canonical Option shape. Two variants: one unit, one
+        // positional with a single Int.
+        let prog = parse_ok("type Option = | None | Some(Int)\nfn main() -> Int ![] { 0 }\n");
+        let Item::Type(ref t) = prog.items[0] else {
+            panic!("expected type decl, got {:?}", prog.items[0])
+        };
+        assert_eq!(t.name, "Option");
+        assert_eq!(t.variants.len(), 2);
+        assert_eq!(t.variants[0].name, "None");
+        assert!(matches!(t.variants[0].fields, VariantFields::Unit));
+        assert_eq!(t.variants[1].name, "Some");
+        match &t.variants[1].fields {
+            VariantFields::Positional(tys) => {
+                assert_eq!(tys.len(), 1);
+                assert!(matches!(&tys[0], TypeExpr::Named(n, _) if n == "Int"));
+            }
+            other => panic!("expected Positional, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_decl_record_variant() {
+        // A sum with a single record-shaped variant.
+        let prog = parse_ok(
+            "type Shape = | Circle { radius: Int } | Rect { w: Int, h: Int }\n\
+             fn main() -> Int ![] { 0 }\n",
+        );
+        let Item::Type(ref t) = prog.items[0] else {
+            panic!()
+        };
+        assert_eq!(t.variants.len(), 2);
+        match &t.variants[0].fields {
+            VariantFields::Record(fields) => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].name, "radius");
+            }
+            other => panic!("expected Record, got {other:?}"),
+        }
+        match &t.variants[1].fields {
+            VariantFields::Record(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name, "w");
+                assert_eq!(fields[1].name, "h");
+            }
+            other => panic!("expected Record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_decl_single_ctor_record_shorthand() {
+        // `type Name = { fields }` desugars to one variant named Name.
+        let prog = parse_ok("type Point = { x: Int, y: Int }\nfn main() -> Int ![] { 0 }\n");
+        let Item::Type(ref t) = prog.items[0] else {
+            panic!()
+        };
+        assert_eq!(t.name, "Point");
+        assert_eq!(t.variants.len(), 1);
+        assert_eq!(t.variants[0].name, "Point");
+        match &t.variants[0].fields {
+            VariantFields::Record(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name, "x");
+                assert_eq!(fields[1].name, "y");
+            }
+            other => panic!("expected Record shorthand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_decl_trailing_comma_in_fields() {
+        // Trailing commas tolerated in both positional and record fields.
+        let prog = parse_ok(
+            "type Pair = | P(Int, Int,)\n\
+             type Loc = { line: Int, col: Int, }\n\
+             fn main() -> Int ![] { 0 }\n",
+        );
+        assert_eq!(
+            prog.items
+                .iter()
+                .filter(|i| matches!(i, Item::Type(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn type_decl_without_variants_errors() {
+        // `type Empty =` alone is a parse error — need either `| Ctor` or `{ .. }`.
+        let errs = parse_errs("type Empty =\nfn main() -> Int ![] { 0 }\n");
+        assert!(!errs.is_empty(), "empty type decl should parse-error");
+    }
+
+    #[test]
+    fn record_literal_basic() {
+        // `Point { x: 1, y: 2 }` in a let RHS. Unambiguous — no if/match around.
+        let prog = parse_ok(
+            "type Point = { x: Int, y: Int }\n\
+             fn main() -> Int ![] { let p: Point = Point { x: 1, y: 2 }; 0 }\n",
+        );
+        let Item::Fn(ref f) = prog.items[1] else {
+            panic!()
+        };
+        let Stmt::Let(ref l) = f.body.stmts[0] else {
+            panic!()
+        };
+        match &l.value {
+            Expr::RecordLit { name, fields, .. } => {
+                assert_eq!(name, "Point");
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name, "x");
+                assert_eq!(fields[1].name, "y");
+            }
+            other => panic!("expected RecordLit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_literal_disabled_in_if_cond() {
+        // `if Foo { ... } else { ... }` — the `{` starts the then-block,
+        // not a record literal. The cond resolves to `Ident("Foo")`
+        // (which typecheck will later reject if it isn't a Bool —
+        // but the parser must accept this shape).
+        let prog = parse_ok("fn main() -> Int ![] { if Foo { 1 } else { 2 } }\n");
+        let Item::Fn(ref f) = prog.items[0] else {
+            panic!()
+        };
+        match f.body.tail.as_ref().expect("tail expr") {
+            Expr::If { cond, .. } => match cond.as_ref() {
+                Expr::Ident(n, _) => assert_eq!(n, "Foo"),
+                other => panic!("cond should be Ident, got {other:?}"),
+            },
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_literal_disabled_in_match_scrutinee() {
+        // Same reasoning as if-cond: `match Foo { ... }` — scrutinee
+        // is `Ident("Foo")`.
+        let prog = parse_ok("fn main() -> Int ![] { match Foo { _ => 0 } }\n");
+        let Item::Fn(ref f) = prog.items[0] else {
+            panic!()
+        };
+        match f.body.tail.as_ref().expect("tail expr") {
+            Expr::Match { scrutinee, .. } => match scrutinee.as_ref() {
+                Expr::Ident(n, _) => assert_eq!(n, "Foo"),
+                other => panic!("scrutinee should be Ident, got {other:?}"),
+            },
+            other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_literal_in_parens_inside_if_cond() {
+        // `if (Foo { x: 1 }).flag { ... }` — the record lit is
+        // inside parens, so `no_record_lits` resets and the lit
+        // parses. We can't directly probe a field access (no field
+        // access syntax in A3), so test the shape with a call that
+        // carries the record lit as an arg instead.
+        let prog = parse_ok(
+            "type Foo = { x: Int }\n\
+             fn is_ok(f: Foo) -> Bool ![] { true }\n\
+             fn main() -> Int ![] { if is_ok(Foo { x: 1 }) { 1 } else { 2 } }\n",
+        );
+        let Item::Fn(ref main_fn) = prog.items[2] else {
+            panic!()
+        };
+        match main_fn.body.tail.as_ref().expect("tail") {
+            Expr::If { cond, .. } => match cond.as_ref() {
+                Expr::Call { args, .. } => match &args[0] {
+                    Expr::RecordLit { name, .. } => assert_eq!(name, "Foo"),
+                    other => panic!("expected RecordLit arg, got {other:?}"),
+                },
+                other => panic!("expected Call cond, got {other:?}"),
+            },
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pattern_var_binds_identifier() {
+        // A bare identifier in pattern position becomes `Pattern::Var`.
+        let p = parse_tail_pattern("x");
+        assert!(matches!(p, Pattern::Var(ref n, _) if n == "x"));
+    }
+
+    #[test]
+    fn pattern_positional_ctor() {
+        // `Some(n)` — positional constructor pattern with a var inside.
+        let p = parse_tail_pattern("Some(n)");
+        match p {
+            Pattern::Ctor { name, fields, .. } => {
+                assert_eq!(name, "Some");
+                match fields {
+                    CtorPatternFields::Positional(inner) => {
+                        assert_eq!(inner.len(), 1);
+                        assert!(matches!(inner[0], Pattern::Var(ref n, _) if n == "n"));
+                    }
+                    other => panic!("expected Positional, got {other:?}"),
+                }
+            }
+            other => panic!("expected Ctor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pattern_record_ctor_with_pun_and_rename() {
+        // `Point { x, y: py }` — x puns, y renames to py.
+        let p = parse_tail_pattern("Point { x, y: py }");
+        match p {
+            Pattern::Ctor { name, fields, .. } => {
+                assert_eq!(name, "Point");
+                match fields {
+                    CtorPatternFields::Record(rf) => {
+                        assert_eq!(rf.len(), 2);
+                        assert_eq!(rf[0].name, "x");
+                        assert!(matches!(rf[0].pattern, Pattern::Var(ref n, _) if n == "x"));
+                        assert_eq!(rf[1].name, "y");
+                        assert!(matches!(rf[1].pattern, Pattern::Var(ref n, _) if n == "py"));
+                    }
+                    other => panic!("expected Record, got {other:?}"),
+                }
+            }
+            other => panic!("expected Ctor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pattern_tuple() {
+        let p = parse_tail_pattern("(a, b)");
+        match p {
+            Pattern::Tuple(pats, _) => {
+                assert_eq!(pats.len(), 2);
+                assert!(matches!(pats[0], Pattern::Var(ref n, _) if n == "a"));
+                assert!(matches!(pats[1], Pattern::Var(ref n, _) if n == "b"));
+            }
+            other => panic!("expected Tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pattern_parenthesised_single_is_inner() {
+        // `(a)` is a parenthesised pattern, not a 1-tuple.
+        let p = parse_tail_pattern("(a)");
+        assert!(matches!(p, Pattern::Var(ref n, _) if n == "a"));
+    }
+
+    #[test]
+    fn pattern_or_pattern_is_e0110() {
+        // `Foo | Bar => ...` — or-pattern rejected at parse time.
+        let errs = parse_errs("fn main() -> Int ![] { match 0 { Foo | Bar => 0 } }\n");
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0110"),
+            "expected E0110 for or-pattern, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pattern_guard_is_e0110() {
+        // `Some(n) if n > 0 => ...` — guard rejected at parse time.
+        let errs = parse_errs("fn main() -> Int ![] { match 0 { Some(n) if n > 0 => 0 } }\n");
+        // Guards land at the arm-body parser entry after the first
+        // pattern, not at the pattern itself — we can still see E0110
+        // because `if` in any pattern position errors. (The second
+        // pattern slot — after `|` — is what actually triggers; here
+        // the grammar gets confused by `if` showing up where a `=>` is
+        // expected, but E0110 still fires from a nested parse_pattern.)
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0110"),
+            "expected E0110 for pattern guard, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pattern_as_binding_is_e0110() {
+        // `Pair(a, b) as whole => ...` — as-binding rejected. `as` is
+        // an Ident token, but our parse_pattern catches it
+        // specifically.
+        let errs = parse_errs("fn main() -> Int ![] { match 0 { x as whole => 0 } }\n");
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0110"),
+            "expected E0110 for as-binding, got: {errs:?}"
+        );
     }
 }

@@ -36,9 +36,9 @@ is complete but whose CI run has not yet reported green.
   - commits: [HEAD]
   - notes: Added `TokenKind::Type` keyword and `TokenKind::Pipe` single-char token. `||` lookahead still wins for `OrOr`. 4 new lexer unit tests pin the new tokens, the `||` regression, and a full `type Option = | None | Some(Int)` skeleton.
 - Task 37 — Extend parser: type decls + record literal + constructor/variable/tuple patterns
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: Added AST variants (`Item::Type`, `Expr::RecordLit`, `Pattern::Var/Tuple/Ctor`, `TypeDecl`, `Variant`, `VariantFields`, `RecordFieldDecl`, `RecordFieldLit`, `CtorPatternFields`, `CtorPatternField`); parser extensions (`parse_type_decl` for sum + single-ctor record shorthand; extended `parse_pattern` for Var/positional-Ctor/record-Ctor/tuple; record-literal recognition gated by new `no_record_lits` flag disabled in `if` cond / `match` scrutinee). E0110 rejects or-patterns / guards / as-bindings at the match-arm parser (post-pattern-parse — a valid first pattern followed by `|`/`if`/`as` is the user-visible failure mode). New catalog entry E0110 with full long-form explanation. Downstream passes (typecheck / elaborate / closure_convert / codegen) gained stubs: `Item::Type` is a no-op (task 38 flesh-out), `Expr::RecordLit` emits a temporary E0001 in typecheck and is passed through in elaborate/closure_convert (task 38+41 replace), `Pattern::Var/Tuple/Ctor` return `None` in `pattern_ty` and hit `unreachable!` in codegen's `pattern_as_immediate` (task 41 rewrites the lowerer). 24 new parser tests; 48 parser tests pass. Pod-verify green.
 - Task 38 — Extend typechecker: nominal sum types + record field access + pattern matching with Maranget exhaustiveness
   - status: todo
   - commits: []

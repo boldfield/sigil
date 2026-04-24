@@ -319,6 +319,43 @@ pub const CATALOG: &[ErrorEntry] = &[
         fix_example: "let inc = fn (x: Int) -> Int ![] => x + 1;  // body is Int, matches",
     },
     ErrorEntry {
+        code: "E0110",
+        short: "pattern form not supported in v1",
+        long: "Plan A3 pattern matching deliberately excludes three ergonomic \
+               extensions that other ML/Rust-family languages include:\n\n\
+               - **Or-patterns** `p1 | p2 => body`. Write each variant as a \
+                 separate arm. Rationale: or-patterns obscure which names \
+                 bind where and make exhaustiveness errors harder to read; \
+                 explicit arms keep the match intent obvious.\n\
+               - **Pattern guards** `pat if cond => body`. Move the \
+                 condition into the arm body (an `if`) or into an explicit \
+                 nested match. Rationale: guards turn exhaustiveness checks \
+                 from trivial into a decidable-but-subtle problem, and they \
+                 hide flow control behind seemingly-declarative syntax.\n\
+               - **As-bindings** `pat as name`. Destructure via constructor \
+                 / tuple patterns that already name the pieces you want. \
+                 Rationale: as-bindings introduce a second, redundant \
+                 binding path that makes reading a match arm harder.\n\n\
+               These are all \"fight-the-priors\" decisions: the extensions \
+               are popular but they consistently degrade the code they \
+               appear in. A3 patterns are literal, wildcard `_`, fresh \
+               variable, constructor `Ctor(..)` / `Ctor { .. }`, and tuple \
+               `(pat, pat)`. That surface handles the full set of data \
+               shapes Plan A3 introduces.\n\n\
+               If a v1 program reaches a point where an or-pattern or guard \
+               would be the right tool, the answer is to restructure the \
+               match into multiple arms or to use a nested `match` / `if` \
+               in the arm body — the cost is a few extra lines; the \
+               benefit is that the pattern shape fully determines which \
+               names bind and which arm runs.",
+        fix_example: "// Or-pattern — instead of `Red | Green => ...`:\n\
+                      match c {\n  Red => handle_primary(),\n  Green => handle_primary(),\n  Blue => handle_blue(),\n}\n\n\
+                      // Guard — instead of `Some(n) if n > 0 => ...`:\n\
+                      match o {\n  Some(n) => if n > 0 { positive() } else { non_positive() },\n  None => default(),\n}\n\n\
+                      // As-binding — instead of `Pair(a, b) as whole => ...`:\n\
+                      match p {\n  Pair(a, b) => use_parts(a, b),  // reference `a`, `b` directly\n}",
+    },
+    ErrorEntry {
         code: "E0401",
         short: "runtime arithmetic abort",
         long: "A division or modulo operation was performed with a zero \

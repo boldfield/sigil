@@ -771,6 +771,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 ..
             } => self.lower_closure_record(code_fn_name, env_exprs, env_slot_kinds),
             Expr::ClosureEnvLoad { index, kind, .. } => self.lower_closure_env_load(*index, *kind),
+            // Plan A3 task 41 replaces this stub with record-literal
+            // allocation (heap, user type-tag, fields written per the
+            // registered layout). For task 37 (parser), this arm is an
+            // `unreachable!` because no well-typed Plan A3 program can
+            // reach codegen with a `RecordLit` until task 38's nominal-
+            // types symbol table lands — the typechecker will reject
+            // any program using the new surface syntax until then.
+            Expr::RecordLit { name, .. } => {
+                unreachable!(
+                    "codegen: Expr::RecordLit `{name}` requires Plan A3 task 41's record-allocation lowering; unreachable pre-task-41"
+                )
+            }
         }
     }
 
@@ -1145,7 +1157,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::IntLit(..) => types::I64,
             Expr::BoolLit(..) | Expr::Perform(_) => types::I8,
             Expr::CharLit(..) => types::I32,
-            Expr::StringLit(..) => self.pointer_ty,
+            Expr::StringLit(..) | Expr::RecordLit { .. } => self.pointer_ty,
             Expr::Ident(name, _) => {
                 let v = *self
                     .env
@@ -1234,6 +1246,18 @@ fn pattern_as_immediate(p: &crate::ast::Pattern) -> Option<i64> {
         Pattern::BoolLit(b, _) => Some(i64::from(*b)),
         Pattern::CharLit(c, _) => Some(*c as i64),
         Pattern::Wildcard(_) => None,
+        // Plan A3 task 37: Var / Tuple / Ctor patterns land in task
+        // 41's codegen rewrite, which replaces this primitive
+        // "pattern as scalar" predicate with a full decision-tree
+        // lowerer. Until then, no program that reaches codegen
+        // carries these patterns (task 38 will either typecheck-
+        // reject or, once 41 lands, lower them via a dedicated
+        // path that does not consult `pattern_as_immediate`).
+        Pattern::Var(..) | Pattern::Tuple(..) | Pattern::Ctor { .. } => {
+            unreachable!(
+                "codegen: Pattern::{{Var,Tuple,Ctor}} reaches pattern_as_immediate pre-task-41"
+            )
+        }
     }
 }
 

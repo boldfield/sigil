@@ -42,7 +42,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::{Block, EnvSlotKind, Expr, FnDecl, Item, LetStmt, MatchArm, PerformExpr, Stmt};
+use crate::ast::{
+    Block, EnvSlotKind, Expr, FnDecl, Item, LetStmt, MatchArm, PerformExpr, RecordFieldLit, Stmt,
+};
 use crate::cps::CpsProgram;
 use crate::errors::Span;
 use crate::typecheck::Ty;
@@ -102,7 +104,7 @@ pub fn convert(mut cps: CpsProgram) -> ClosureConvertedProgram {
     let mut new_items: Vec<Item> = Vec::with_capacity(original_items.len());
     for item in original_items {
         match item {
-            Item::Import(_) => new_items.push(item),
+            Item::Import(_) | Item::Type(_) => new_items.push(item),
             Item::Fn(mut f) => {
                 let param_names: BTreeSet<String> =
                     f.params.iter().map(|p| p.name.clone()).collect();
@@ -377,6 +379,25 @@ impl Converter {
             }
             Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
                 unreachable!("closure_convert: input AST contains post-CC nodes (pass run twice?)")
+            }
+            // Plan A3 task 37: record literal. Captures in the field
+            // values must be rewritten just like any other expression
+            // position — a record literal can close over locals or
+            // outer captures.
+            Expr::RecordLit { name, fields, span } => {
+                let rewritten_fields = fields
+                    .into_iter()
+                    .map(|f| RecordFieldLit {
+                        name: f.name,
+                        value: self.rewrite_expr(f.value, locals, captures),
+                        span: f.span,
+                    })
+                    .collect();
+                Expr::RecordLit {
+                    name,
+                    fields: rewritten_fields,
+                    span,
+                }
             }
         }
     }
