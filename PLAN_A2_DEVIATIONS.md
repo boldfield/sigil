@@ -67,6 +67,17 @@ typechecker support for fn-typed lets and params) must:
 4. Extend the e2e test suite with indirect-call tests once fn-typed let
    bindings parse.
 
+**Tests that pin this scope:** the five closure e2e tests added in this
+PR in `compiler/tests/e2e.rs` bound what `done-pending-ci` meant for
+Task 32 — if Plan A3's indirect-call lowering breaks any of them,
+something in the direct-call path has regressed:
+
+- `direct_call_top_level_fn` — `inc(41) -> 42` (Ident-callee direct call).
+- `recursion_via_direct_call` — `fact(5) -> 120` (self-recursive direct call).
+- `iife_no_captures` — `(fn(x)=>x+1)(41) -> 42` (ClosureRecord-callee direct call, empty env).
+- `iife_with_int_capture` — `let x=10; (fn(y)=>x+y)(32) -> 42` (ClosureRecord-callee direct call, single Int env slot).
+- `nested_iife_transitive_capture` — `x=7` threaded through two nested closures to produce `10` (ClosureRecord-callee direct call, transitive capture).
+
 ## [Task 1.5.5 — revision] Move staticlib materialisation out of build.rs into the e2e test itself
 
 **Commit:** db3ae5e
