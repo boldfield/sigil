@@ -90,6 +90,16 @@ pub struct CheckedProgram {
     /// shapes without re-scanning the program. Duplicate declarations
     /// produce E0113 at check time and the first declaration wins here.
     pub types: BTreeMap<String, TypeDecl>,
+    /// Plan A3 task 41.2: scrutinee `Ty` for every `Expr::Match` whose
+    /// scrutinee typechecked, keyed by the match expression's span.
+    /// Codegen reads this map to disambiguate `Pattern::Var(name)`
+    /// between a fresh binding and a nullary-constructor promotion —
+    /// a decision that requires knowing whether the scrutinee has type
+    /// `Ty::User(u)` whose variant registry lists `name` as a Unit
+    /// variant. Absent entries (malformed scrutinee, or a synthetic
+    /// match introduced by elaborate's if→match desugaring) let codegen
+    /// fall back to primitive-scalar dispatch.
+    pub match_scrut_tys: BTreeMap<Span, Ty>,
 }
 
 /// Where a constructor is registered. Indexes a `TypeDecl` in the
@@ -198,6 +208,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         env: BTreeMap::new(),
         types,
         ctors,
+        match_scrut_tys: BTreeMap::new(),
     };
     // E0112 sweep: any TypeExpr in an FnDecl signature that does not
     // resolve to a primitive or registered user type is reported against
@@ -258,6 +269,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             string_literals: tc.string_literals,
             lambda_captures: tc.lambda_captures,
             types: tc.types,
+            match_scrut_tys: tc.match_scrut_tys,
         },
         tc.errors,
     )
@@ -321,6 +333,10 @@ struct Tc {
     /// E0118 at pre-pass time; the first writer wins in the map.
     /// Lookup is O(1) per use-site resolution.
     ctors: BTreeMap<String, CtorInfo>,
+    /// Mirror of `CheckedProgram.match_scrut_tys`, moved into the
+    /// checked program on typecheck completion. `check_match`
+    /// populates an entry when the scrutinee has a known `Ty`.
+    match_scrut_tys: BTreeMap<Span, Ty>,
 }
 
 impl Tc {
@@ -1297,6 +1313,14 @@ impl Tc {
         row: &[String],
     ) -> Option<Ty> {
         let scrut_ty = self.check_expr(scrutinee, row);
+
+        // Record the scrutinee type for codegen's pattern disambiguator
+        // (Plan A3 task 41.2). Only well-typed scrutinees land in the
+        // map; codegen falls back to primitive-scalar dispatch when a
+        // span is absent.
+        if let Some(ref t) = scrut_ty {
+            self.match_scrut_tys.insert(span.clone(), t.clone());
+        }
 
         if arms.is_empty() {
             self.push_error("E0066", span, "`match` must have at least one arm");
@@ -3453,5 +3477,79 @@ mod tests {
         assert_eq!(bindings2.len(), 2);
         assert!(bindings2.contains("x"));
         assert!(bindings2.contains("why"));
+    }
+
+    // ===== Plan A3 Task 41.2 — scrutinee type side-table =====
+
+    #[test]
+    fn match_scrut_tys_records_user_type_for_well_typed_match() {
+        // A well-typed match on a user-defined `Option` must land its
+        // scrutinee's `Ty::User("Option")` in the side-table so codegen
+        // can disambiguate `Pattern::Var` between binding and nullary
+        // ctor promotion.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(n) => n }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        // E0111 is expected (ctor resolution still gated). All other
+        // errors would be real bugs; filter E0111 out when validating.
+        let non_gate: Vec<_> =
+            errs.iter().filter(|e| e.code.as_str() != "E0111").collect();
+        assert!(
+            non_gate.is_empty(),
+            "only E0111 should remain; got: {non_gate:?}"
+        );
+        assert_eq!(
+            cp.match_scrut_tys.len(),
+            1,
+            "exactly one match in the program should appear in the map"
+        );
+        let ty = cp
+            .match_scrut_tys
+            .values()
+            .next()
+            .expect("map has one entry");
+        assert_eq!(*ty, Ty::User("Option".to_string()));
+    }
+
+    #[test]
+    fn match_scrut_tys_records_primitive_scrutinee() {
+        // Primitive-scrutinee matches also land in the map; codegen's
+        // fall-back path handles them but the entry should still be
+        // present for consistency with how check_match runs.
+        let src = "fn f(x: Int) -> Int ![] {\n  \
+                     match x { 0 => 10, _ => 20 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert_eq!(cp.match_scrut_tys.len(), 1);
+        let ty = cp.match_scrut_tys.values().next().expect("one entry");
+        assert_eq!(*ty, Ty::Int);
+    }
+
+    #[test]
+    fn match_scrut_tys_skips_malformed_scrutinee() {
+        // A scrutinee that fails to typecheck has `None` as its Ty;
+        // check_match skips the side-table insertion. Codegen's
+        // fallback path treats the absent entry as "primitive
+        // scalar dispatch" (which is correct because if/match-desugar
+        // is the other producer of absent entries and those are
+        // Bool-only).
+        let src = "fn f() -> Int ![] {\n  \
+                     match undefined_name { _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0046"),
+            "expected E0046 unknown identifier; got: {errs:?}"
+        );
+        assert!(
+            cp.match_scrut_tys.is_empty(),
+            "malformed scrutinee should not be recorded"
+        );
     }
 }

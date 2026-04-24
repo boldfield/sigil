@@ -62,7 +62,7 @@ use sigil_header_constants::{header_word, TAG_CLOSURE};
 use crate::ast::{EnvSlotKind, TypeExpr};
 use crate::closure_convert::ClosureConvertedProgram;
 use crate::errors::Span;
-use crate::typecheck::CheckedProgram;
+use crate::typecheck::{CheckedProgram, Ty};
 
 /// Per-user-function codegen registry. Populated before any body is
 /// defined so direct calls and `ClosureRecord.code_fn_name` lookups can
@@ -485,6 +485,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 user_fns: &user_fns,
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
+                match_scrut_tys: &checked.match_scrut_tys,
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -702,6 +703,15 @@ struct Lowerer<'a, 'b> {
     /// and `Expr::RecordLit` sites in lowering; look-up resolves in
     /// O(log n).
     ctor_index: &'b BTreeMap<String, (String, usize)>,
+
+    /// Plan A3 task 41.2 — per-match scrutinee types keyed by the match
+    /// expression's span. `lower_match` uses this to disambiguate
+    /// `Pattern::Var(name)` between a fresh binding and a nullary-ctor
+    /// promotion. Synthetic matches produced by elaborate's if→match
+    /// desugaring are absent from this map; `lower_match` falls back
+    /// to primitive-scalar dispatch in that case (which is correct
+    /// because if-desugar only emits `Pattern::BoolLit` arms).
+    match_scrut_tys: &'b BTreeMap<Span, Ty>,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -779,8 +789,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.emit_unop(*op, v)
             }
             Expr::Match {
-                scrutinee, arms, ..
-            } => self.lower_match(scrutinee, arms),
+                scrutinee,
+                arms,
+                span,
+            } => self.lower_match(scrutinee, arms, span),
             Expr::Block(b) => self
                 .lower_block(b)
                 .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0)),
@@ -1216,73 +1228,119 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.builder.seal_block(ok);
     }
 
-    /// Lower `match scrutinee { pat => body, ... }` to a linear chain
-    /// of compare-and-branch blocks, terminated by a continue block
-    /// whose single parameter carries the match's result value.
+    /// Lower `match scrutinee { pat => body, ... }` to a per-arm
+    /// decision tree followed by a continue block whose single parameter
+    /// carries the match's result value.
     ///
-    /// Exhaustiveness is enforced at typecheck (E0066); the tail-of-
-    /// the-chain block emits an `unreachable` trap as a safety net.
+    /// Arm strategy:
+    /// - A true catch-all arm (`_` or `Pattern::Var(name)` that is not a
+    ///   nullary-constructor promotion) emits an unconditional jump with
+    ///   the name (if any) bound to the scrutinee value. Any later arms
+    ///   are dead and skipped.
+    /// - Every other arm emits a chain of tests through
+    ///   `emit_pattern_test`: primitive-literal compares, discriminant
+    ///   compares for constructor patterns, and recursive tests for
+    ///   sub-patterns inside a matched constructor (Plan A3 task 41.2).
+    ///   Failed tests fall through to a per-arm `next` block that hosts
+    ///   the subsequent arm's test.
+    ///
+    /// Exhaustiveness is enforced at typecheck (E0066 for primitives,
+    /// E0120 for user types). If the chain runs out of arms without a
+    /// catch-all, `TRAP_NONEXHAUSTIVE_MATCH` is a defensive safety net
+    /// — nested-pattern non-exhaustiveness falls through to this trap
+    /// per the Plan A3 v1 scope.
     fn lower_match(
         &mut self,
         scrutinee: &crate::ast::Expr,
         arms: &[crate::ast::MatchArm],
+        match_span: &Span,
     ) -> Value {
         let s = self.lower_expr(scrutinee);
-        let s_ty = self.builder.func.dfg.value_type(s);
+        let scrut_ty = self.match_scrut_tys.get(match_span).cloned();
 
-        // Predict the result type from the first arm's body by peeking
-        // at its shape. We need the type *before* we emit the arm
-        // bodies because the continue block's single param is created
-        // up front.
-        let result_ty = self.type_of_expr(&arms[0].body);
+        // Predict the result type from the first arm's body. Pattern
+        // bindings introduced by the first arm are added to a preview
+        // map so `type_of_expr` can look up their Cranelift types before
+        // any arm body is actually lowered.
+        let mut preview: BTreeMap<String, Type> = BTreeMap::new();
+        self.predict_pattern_bindings(&arms[0].pattern, scrut_ty.as_ref(), &mut preview);
+        let result_ty = self.type_of_expr(&arms[0].body, &preview);
         let cont = self.builder.create_block();
         self.builder.append_block_param(cont, result_ty);
 
-        // Tracks whether the chain's final fall-through block still
-        // needs a terminator. A wildcard arm jumps to `cont` and sets
-        // this to true; if the loop exits without that, we emit an
-        // unreachable trap below.
         let mut chain_terminated = false;
         for arm in arms.iter() {
-            match pattern_as_immediate(&arm.pattern) {
-                None => {
-                    // Wildcard arm: unconditional jump to the continue
-                    // block. Typecheck accepts trailing arms after a
-                    // wildcard but they're dead; break out of the
-                    // chain unconditionally.
-                    let v = self.lower_expr(&arm.body);
-                    self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
-                    chain_terminated = true;
-                    break;
+            if self.is_catchall_pattern(&arm.pattern, scrut_ty.as_ref()) {
+                // Unconditional arm. If the pattern is a `Pattern::Var`,
+                // bind the name to the scrutinee value over the arm
+                // body; `Pattern::Wildcard` binds nothing.
+                let saved = match &arm.pattern {
+                    crate::ast::Pattern::Var(name, _) => {
+                        let prev = self.env.insert(name.clone(), s);
+                        Some((name.clone(), prev))
+                    }
+                    _ => None,
+                };
+                let v = self.lower_expr(&arm.body);
+                if let Some((name, prev)) = saved {
+                    match prev {
+                        Some(p) => {
+                            self.env.insert(name, p);
+                        }
+                        None => {
+                            self.env.remove(&name);
+                        }
+                    }
                 }
-                Some(imm) => {
-                    // Literal arm: compare scrutinee to the pattern's
-                    // immediate value; on equality enter the body and
-                    // jump to `cont`, otherwise fall through to the
-                    // next arm.
-                    let lit = self.builder.ins().iconst(s_ty, imm);
-                    let eq = self.builder.ins().icmp(IntCC::Equal, s, lit);
-                    let body = self.builder.create_block();
-                    let next = self.builder.create_block();
-                    self.builder.ins().brif(eq, body, &[], next, &[]);
-                    self.builder.switch_to_block(body);
-                    self.builder.seal_block(body);
-                    let v = self.lower_expr(&arm.body);
-                    self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
-                    self.builder.switch_to_block(next);
-                    self.builder.seal_block(next);
+                self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
+                chain_terminated = true;
+                break;
+            }
+
+            // Conditional arm: emit tests, then enter a dedicated body
+            // block. `emit_pattern_test` branches to `next` on any test
+            // failure and leaves the builder positioned in the
+            // "all tests passed" block on success; we jump from there
+            // into `body` with bindings installed.
+            let body = self.builder.create_block();
+            let next = self.builder.create_block();
+            let mut bindings: Vec<(String, Value)> = Vec::new();
+            self.emit_pattern_test(&arm.pattern, s, scrut_ty.as_ref(), next, &mut bindings);
+            self.builder.ins().jump(body, &[]);
+
+            self.builder.switch_to_block(body);
+            self.builder.seal_block(body);
+            // Install bindings, snapshot prior env entries for restore.
+            let saved: Vec<(String, Option<Value>)> = bindings
+                .into_iter()
+                .map(|(name, val)| {
+                    let prev = self.env.insert(name.clone(), val);
+                    (name, prev)
+                })
+                .collect();
+            let v = self.lower_expr(&arm.body);
+            for (name, prev) in saved {
+                match prev {
+                    Some(p) => {
+                        self.env.insert(name, p);
+                    }
+                    None => {
+                        self.env.remove(&name);
+                    }
                 }
             }
+            self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
+
+            self.builder.switch_to_block(next);
+            self.builder.seal_block(next);
         }
 
-        // If the chain exited without a wildcard — which only happens
-        // for a `Bool`-scrutinee match that enumerates both polarities,
-        // or an `Int`/`Char`/`Byte` match whose wildcard was not reached
-        // due to a codegen bug — emit an unreachable trap in the fall-
-        // through block. Typecheck's exhaustiveness rule (E0066)
-        // guarantees every well-typed program either hits a wildcard
-        // or covers both Bool polarities; this trap is a defensive
-        // contract, not a real exit path.
+        // Defensive trap: typecheck's exhaustiveness rules (E0066 for
+        // primitives, E0120 for user types) guarantee every well-typed
+        // program reaches a catch-all or enumerates every variant. Plan
+        // A3 v1 does not extend exhaustiveness into nested constructor
+        // positions, so a mismatched sub-pattern in an otherwise-covered
+        // top-level variant falls through to this trap at runtime.
         if !chain_terminated {
             self.builder
                 .ins()
@@ -1294,11 +1352,268 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.builder.block_params(cont)[0]
     }
 
+    /// Emit tests for `pat` against the SSA value `scrut` (semantic
+    /// type `scrut_ty`). On any test failure, branches to `next`. On
+    /// success, leaves the builder positioned in the "all tests passed"
+    /// block; `bindings` accumulates `(name, Value)` pairs the caller
+    /// must install in `self.env` before lowering the arm body.
+    ///
+    /// Intermediate blocks chain via `brif`; each block is sealed
+    /// immediately after its terminator is emitted so Cranelift's
+    /// `FunctionBuilder` bookkeeping stays consistent.
+    fn emit_pattern_test(
+        &mut self,
+        pat: &crate::ast::Pattern,
+        scrut: Value,
+        scrut_ty: Option<&Ty>,
+        next: Block,
+        bindings: &mut Vec<(String, Value)>,
+    ) {
+        use crate::ast::{CtorPatternFields, Pattern};
+        match pat {
+            Pattern::Wildcard(_) => { /* no test, no binding */ }
+            Pattern::IntLit(n, _) => self.emit_scalar_eq(scrut, types::I64, *n, next),
+            Pattern::BoolLit(b, _) => self.emit_scalar_eq(scrut, types::I8, i64::from(*b), next),
+            Pattern::CharLit(c, _) => self.emit_scalar_eq(scrut, types::I32, *c as i64, next),
+            Pattern::Var(name, _) => {
+                // Nullary-ctor promotion: if the scrutinee is a user
+                // type whose registry lists `name` as a Unit variant,
+                // the pattern is a discriminant check (no binding).
+                if let Some(variant) = self.nullary_ctor_promotion(name, scrut_ty) {
+                    self.emit_discriminant_eq(scrut, variant.discriminant, next);
+                } else {
+                    bindings.push((name.clone(), scrut));
+                }
+            }
+            Pattern::Ctor { name, fields, .. } => {
+                let (type_name, variant_index) =
+                    self.ctor_index.get(name).cloned().unwrap_or_else(|| {
+                        unreachable!("codegen: ctor pattern `{name}` not in ctor_index")
+                    });
+                // Clone the VariantLayout so subsequent calls that take
+                // `&mut self` don't hold an immutable borrow of
+                // `self.type_layouts` across the recursion.
+                let variant = self.type_layouts[&type_name].variants[variant_index].clone();
+                self.emit_discriminant_eq(scrut, variant.discriminant, next);
+                match fields {
+                    CtorPatternFields::Unit => {}
+                    CtorPatternFields::Positional(pats) => {
+                        for (i, sub) in pats.iter().enumerate() {
+                            let field_ty = &variant.field_tys[i];
+                            let field_val = self.load_field_value(scrut, i, field_ty);
+                            self.emit_pattern_test(sub, field_val, Some(field_ty), next, bindings);
+                        }
+                    }
+                    CtorPatternFields::Record(pat_fields) => {
+                        for f in pat_fields {
+                            let idx = variant
+                                .field_names
+                                .iter()
+                                .position(|n| n == &f.name)
+                                .unwrap_or_else(|| {
+                                    unreachable!(
+                                        "codegen: record ctor pattern field `{}` not declared for `{name}`",
+                                        f.name
+                                    )
+                                });
+                            let field_ty = &variant.field_tys[idx];
+                            let field_val = self.load_field_value(scrut, idx, field_ty);
+                            self.emit_pattern_test(
+                                &f.pattern,
+                                field_val,
+                                Some(field_ty),
+                                next,
+                                bindings,
+                            );
+                        }
+                    }
+                }
+            }
+            Pattern::Tuple(_, _) => {
+                unreachable!(
+                    "codegen: Pattern::Tuple reaches lowering (typecheck should reject with E0117)"
+                )
+            }
+        }
+    }
+
+    /// Emit `scrut == imm` at Cranelift type `ty` and split control flow:
+    /// fall through to a freshly-sealed "keep" block on equality, branch
+    /// to `next` otherwise.
+    fn emit_scalar_eq(&mut self, scrut: Value, ty: Type, imm: i64, next: Block) {
+        let lit = self.builder.ins().iconst(ty, imm);
+        let eq = self.builder.ins().icmp(IntCC::Equal, scrut, lit);
+        let keep = self.builder.create_block();
+        self.builder.ins().brif(eq, keep, &[], next, &[]);
+        self.builder.switch_to_block(keep);
+        self.builder.seal_block(keep);
+    }
+
+    /// Load a user-type record's discriminant (payload word 0 at byte
+    /// offset 8 from the object pointer) and branch on equality against
+    /// the expected discriminant.
+    fn emit_discriminant_eq(&mut self, ptr: Value, expected: u8, next: Block) {
+        let disc = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), ptr, 8);
+        let expected_v = self.builder.ins().iconst(types::I64, i64::from(expected));
+        let eq = self.builder.ins().icmp(IntCC::Equal, disc, expected_v);
+        let keep = self.builder.create_block();
+        self.builder.ins().brif(eq, keep, &[], next, &[]);
+        self.builder.switch_to_block(keep);
+        self.builder.seal_block(keep);
+    }
+
+    /// Load a user-type record's field at payload word `index + 1`
+    /// (byte offset `16 + 8*index` from the object pointer). The i64
+    /// word is reduced to the declared field type's Cranelift width for
+    /// sub-word primitives; pointer-typed fields flow through unchanged.
+    fn load_field_value(&mut self, ptr: Value, index: usize, field_ty: &Ty) -> Value {
+        let offset: i32 = 16 + 8 * index as i32;
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), ptr, offset);
+        match field_ty {
+            Ty::Int => raw,
+            Ty::Bool | Ty::Byte | Ty::Unit => self.builder.ins().ireduce(types::I8, raw),
+            Ty::Char => self.builder.ins().ireduce(types::I32, raw),
+            Ty::String | Ty::Fn(_) | Ty::User(_) => raw,
+        }
+    }
+
+    /// Return the `VariantLayout` for `name` if it names a nullary
+    /// (Unit) variant of `scrut_ty`'s declared type. This is the
+    /// promotion rule mirrored at typecheck's `Pattern::Var` arm —
+    /// codegen must agree to avoid binding a name the checker
+    /// already resolved as a ctor reference (and vice versa).
+    fn nullary_ctor_promotion(
+        &self,
+        name: &str,
+        scrut_ty: Option<&Ty>,
+    ) -> Option<crate::layout::VariantLayout> {
+        let Some(Ty::User(type_name)) = scrut_ty else {
+            return None;
+        };
+        let (ctor_type_name, variant_index) = self.ctor_index.get(name)?.clone();
+        if ctor_type_name != *type_name {
+            return None;
+        }
+        let variant = self
+            .type_layouts
+            .get(type_name)?
+            .variants
+            .get(variant_index)?;
+        if variant.field_count() == 0 {
+            Some(variant.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Whether `pat` would accept the scrutinee unconditionally given
+    /// `scrut_ty`. Used by `lower_match` to short-circuit the test
+    /// chain and skip building per-arm body/next blocks for a catch-
+    /// all arm (mirrors the Plan A2 wildcard fast-path).
+    fn is_catchall_pattern(&self, pat: &crate::ast::Pattern, scrut_ty: Option<&Ty>) -> bool {
+        use crate::ast::Pattern;
+        match pat {
+            Pattern::Wildcard(_) => true,
+            Pattern::Var(name, _) => self.nullary_ctor_promotion(name, scrut_ty).is_none(),
+            _ => false,
+        }
+    }
+
+    /// Walk `pat` and fill `out` with every Pattern::Var binding name
+    /// mapped to its Cranelift type, as it would appear in the arm
+    /// body. Mirrors `emit_pattern_test`'s binding logic without
+    /// touching the IR builder.
+    ///
+    /// Nested constructor patterns descend into their fields; record
+    /// patterns resolve to declared-order indices to pick the right
+    /// field type.
+    fn predict_pattern_bindings(
+        &self,
+        pat: &crate::ast::Pattern,
+        scrut_ty: Option<&Ty>,
+        out: &mut BTreeMap<String, Type>,
+    ) {
+        use crate::ast::{CtorPatternFields, Pattern};
+        match pat {
+            Pattern::Wildcard(_)
+            | Pattern::IntLit(..)
+            | Pattern::BoolLit(..)
+            | Pattern::CharLit(..) => {}
+            Pattern::Var(name, _) => {
+                if self.nullary_ctor_promotion(name, scrut_ty).is_some() {
+                    return;
+                }
+                let ty = match scrut_ty {
+                    Some(t) => self.cranelift_ty_of(t),
+                    None => types::I64,
+                };
+                out.insert(name.clone(), ty);
+            }
+            Pattern::Ctor { name, fields, .. } => {
+                let (type_name, variant_index) = match self.ctor_index.get(name).cloned() {
+                    Some(x) => x,
+                    None => return,
+                };
+                let variant = match self
+                    .type_layouts
+                    .get(&type_name)
+                    .and_then(|l| l.variants.get(variant_index))
+                {
+                    Some(v) => v.clone(),
+                    None => return,
+                };
+                match fields {
+                    CtorPatternFields::Unit => {}
+                    CtorPatternFields::Positional(pats) => {
+                        for (i, sub) in pats.iter().enumerate() {
+                            if let Some(field_ty) = variant.field_tys.get(i) {
+                                self.predict_pattern_bindings(sub, Some(field_ty), out);
+                            }
+                        }
+                    }
+                    CtorPatternFields::Record(pat_fields) => {
+                        for f in pat_fields {
+                            if let Some(idx) = variant.field_names.iter().position(|n| n == &f.name)
+                            {
+                                if let Some(field_ty) = variant.field_tys.get(idx) {
+                                    self.predict_pattern_bindings(&f.pattern, Some(field_ty), out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Pattern::Tuple(_, _) => {}
+        }
+    }
+
+    /// Cranelift representation of a semantic `Ty`. Mirrors the store/
+    /// load width choices in `lower_ctor_alloc` and `load_field_value`.
+    fn cranelift_ty_of(&self, ty: &Ty) -> Type {
+        match ty {
+            Ty::Int => types::I64,
+            Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
+            Ty::Char => types::I32,
+            Ty::String | Ty::Fn(_) | Ty::User(_) => self.pointer_ty,
+        }
+    }
+
     /// Structural Cranelift-type predictor. Used by `lower_match` to
     /// size the continue-block parameter before any arm body is
     /// emitted. Agrees with `lower_expr`'s emitted types by
     /// construction.
-    fn type_of_expr(&self, e: &crate::ast::Expr) -> Type {
+    ///
+    /// `preview` overlays the normal env lookup with match-arm-local
+    /// `Pattern::Var` bindings that are not yet installed in `self.env`
+    /// — critical for nested matches whose first arm references a
+    /// binding introduced by an outer match's arm.
+    fn type_of_expr(&self, e: &crate::ast::Expr, preview: &BTreeMap<String, Type>) -> Type {
         use crate::ast::{BinOp, Expr, UnOp};
         match e {
             Expr::IntLit(..) => types::I64,
@@ -1308,6 +1623,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) => {
                 if let Some(v) = self.env.get(name) {
                     self.builder.func.dfg.value_type(*v)
+                } else if let Some(ty) = preview.get(name) {
+                    *ty
                 } else if self.ctor_index.contains_key(name) {
                     // Plan A3 task 41.1: a bare-ident nullary
                     // constructor allocates a heap record — result is
@@ -1325,13 +1642,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 UnOp::Neg => types::I64,
                 UnOp::Not => types::I8,
             },
-            Expr::Match { arms, .. } => self.type_of_expr(&arms[0].body),
+            Expr::Match { arms, span, .. } => {
+                // Propagate the preview down, extending with any pattern
+                // bindings this inner match's first arm introduces so
+                // nested-match result-type prediction sees them.
+                let inner_scrut_ty = self.match_scrut_tys.get(span).cloned();
+                let mut inner_preview = preview.clone();
+                self.predict_pattern_bindings(
+                    &arms[0].pattern,
+                    inner_scrut_ty.as_ref(),
+                    &mut inner_preview,
+                );
+                self.type_of_expr(&arms[0].body, &inner_preview)
+            }
             Expr::If { then_block, .. } => match &then_block.tail {
-                Some(t) => self.type_of_expr(t),
+                Some(t) => self.type_of_expr(t, preview),
                 None => types::I8,
             },
             Expr::Block(b) => match &b.tail {
-                Some(t) => self.type_of_expr(t),
+                Some(t) => self.type_of_expr(t, preview),
                 None => types::I8,
             },
             Expr::Call { callee, .. } => match callee.as_ref() {
@@ -1384,41 +1713,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 /// runtime has a richer trap catalogue.
 const TRAP_ARITH_ABORT: u8 = 0x40;
 const TRAP_NONEXHAUSTIVE_MATCH: u8 = 0x41;
-
-/// Reduce a pattern to the `i64` immediate that codegen needs to
-/// compare the scrutinee against. Returns `None` for `Wildcard` — the
-/// lowerer treats that as an unconditional branch target. This helper
-/// unifies the compare-and-branch logic for `IntLit` / `BoolLit` /
-/// `CharLit` patterns, which otherwise differ only in the immediate's
-/// source.
-///
-/// Plan A3 will introduce constructor patterns (sum types); when that
-/// lands the return type must change — `Option<i64>` no longer spans
-/// the full pattern space. The lowerer's callers will need a richer
-/// classification (tag-then-compare for sum-type tags, structural
-/// match for records). Until then, this helper is a faithful Stage-2
-/// surface.
-fn pattern_as_immediate(p: &crate::ast::Pattern) -> Option<i64> {
-    use crate::ast::Pattern;
-    match p {
-        Pattern::IntLit(n, _) => Some(*n),
-        Pattern::BoolLit(b, _) => Some(i64::from(*b)),
-        Pattern::CharLit(c, _) => Some(*c as i64),
-        Pattern::Wildcard(_) => None,
-        // Plan A3 task 37: Var / Tuple / Ctor patterns land in task
-        // 41's codegen rewrite, which replaces this primitive
-        // "pattern as scalar" predicate with a full decision-tree
-        // lowerer. Until then, no program that reaches codegen
-        // carries these patterns (task 38 will either typecheck-
-        // reject or, once 41 lands, lower them via a dedicated
-        // path that does not consult `pattern_as_immediate`).
-        Pattern::Var(..) | Pattern::Tuple(..) | Pattern::Ctor { .. } => {
-            unreachable!(
-                "codegen: Pattern::{{Var,Tuple,Ctor}} reaches pattern_as_immediate pre-task-41"
-            )
-        }
-    }
-}
 
 /// Best-effort PC-offset approximation for Stage 1's placeholder stackmap.
 /// Cranelift's real stack-map API ships in Plan B; the number here is a
