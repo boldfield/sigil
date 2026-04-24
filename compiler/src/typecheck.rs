@@ -316,12 +316,30 @@ struct Tc {
     /// mutually-recursive user functions typeable without a fix-point
     /// iteration. Plan A2 task 30.
     fn_env: BTreeMap<String, Ty>,
-    /// Type environment for the currently-checked function. Initialised
-    /// from `fn_env` on entry to `check_fn` (so user code can reference
-    /// sibling and own-recursive functions) and extended by parameters
-    /// and `let` bindings as each statement is checked. Reset between
-    /// functions. A `BTreeMap` keeps iteration order stable (the
-    /// catalog-integrity discipline).
+    /// Lexical-scope binding environment for the currently-checked
+    /// function. Holds **only** locally-bound names: parameters, `let`
+    /// bindings, and pattern-bound variables introduced by match arms.
+    /// Top-level fn names live in `fn_env` and are consulted via
+    /// fall-through at `Expr::Ident` resolution — they are deliberately
+    /// absent from `self.env` (PR #6 architectural fix). The rationale
+    /// is twofold:
+    ///
+    /// 1. Let-shadowing a top-level fn name (`let foo: Int = …` when
+    ///    `fn foo` exists) must not trip `env_insert`'s no-shadowing
+    ///    debug-assert.
+    /// 2. `collect_free_vars` takes `outer_names = self.env.keys()` as
+    ///    "names visible from the enclosing lexical scope" — including
+    ///    top-level fn names here would cause the capture analysis to
+    ///    record them as env slots, producing spurious closure fields
+    ///    for what are statically-resolvable top-level symbols.
+    ///
+    /// `check_fn` clears this at entry. Scoped regions (lambda bodies,
+    /// pattern-bound arms) save/restore via `self.env.clone()` +
+    /// reassignment so outer-scope names remain visible within inner
+    /// scopes but inner-scope additions don't leak back out.
+    ///
+    /// A `BTreeMap` keeps iteration order stable — important for the
+    /// catalog-integrity and capture-analysis determinism disciplines.
     env: BTreeMap<String, Ty>,
     /// Nominal user-type registry (Plan A3 task 38). Built by the
     /// top-level pre-pass before any fn body is checked so forward
