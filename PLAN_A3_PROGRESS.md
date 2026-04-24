@@ -32,9 +32,9 @@ is complete but whose CI run has not yet reported green.
 ## Stage 4 — User-defined types and pattern matching
 
 - Task 36 — Extend lexer: `type`, `|`
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: Added `TokenKind::Type` keyword and `TokenKind::Pipe` single-char token. `||` lookahead still wins for `OrOr`. 4 new lexer unit tests pin the new tokens, the `||` regression, and a full `type Option = | None | Some(Int)` skeleton.
 - Task 37 — Extend parser: type decls + record literal + constructor/variable/tuple patterns
   - status: todo
   - commits: []
