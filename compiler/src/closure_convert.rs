@@ -40,7 +40,7 @@
 //! `unreachable!` arms — a belt-and-braces check that they only ever
 //! appear downstream of this pass.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::{Block, EnvSlotKind, Expr, FnDecl, Item, LetStmt, MatchArm, PerformExpr, Stmt};
 use crate::cps::CpsProgram;
@@ -66,11 +66,34 @@ pub fn convert(mut cps: CpsProgram) -> ClosureConvertedProgram {
     let all_captures = std::mem::take(&mut cps.colored.mono.anf.checked.lambda_captures);
     let original_items = std::mem::take(&mut cps.colored.mono.anf.checked.program.items);
 
+    // Pre-scan for user fn names that would collide with `$lambda_N`
+    // AFTER codegen's `$` → `__` mangling. A user fn named
+    // `__lambda_3` mangles to `sigil_user___lambda_3`, the same linker
+    // symbol that a synthetic `$lambda_3` would produce. Cranelift
+    // surfaces such collisions as a duplicate-symbol error at compile
+    // time (not a silent miscompile), but the user-facing diagnostic is
+    // opaque. Collect the reserved `N` values here and skip them in the
+    // counter so `$lambda_N` always maps to a fresh linker symbol. The
+    // `$` character is itself rejected by the lexer, so the reverse
+    // direction (user name collides with a synthetic) is the only
+    // collision worth guarding against.
+    let reserved_counters: BTreeSet<usize> = original_items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Fn(f) => f
+                .name
+                .strip_prefix("__lambda_")
+                .and_then(|rest| rest.parse::<usize>().ok()),
+            _ => None,
+        })
+        .collect();
+
     let mut conv = Converter {
         all_captures,
         counter: 0,
         hoisted: Vec::new(),
-        hoisted_captures: Vec::new(),
+        hoisted_captures: BTreeMap::new(),
+        reserved_counters,
     };
 
     // Rewrite every user fn's body in its own param scope with no enclosing
@@ -108,7 +131,7 @@ pub fn convert(mut cps: CpsProgram) -> ClosureConvertedProgram {
                     .name
                     .strip_prefix("$lambda_")
                     .and_then(|n_str| n_str.parse::<usize>().ok())
-                    .and_then(|n| hoisted_captures.get(n))
+                    .and_then(|n| hoisted_captures.get(&n))
                     .map(|v| v.iter().map(|(s, _)| s.clone()).collect())
                     .unwrap_or_default();
                 Some((f.name.clone(), caps_names))
@@ -126,11 +149,19 @@ struct Converter {
     all_captures: Vec<(Span, Vec<(String, Ty)>)>,
     counter: usize,
     hoisted: Vec<Item>,
-    /// Per-synthetic-lambda capture list in the order lambdas were hoisted.
-    /// `hoisted_captures[N]` is the capture list of `$lambda_N`. Kept here
-    /// so the flat `ClosureConvertedProgram.captures` summary can be
-    /// rebuilt without a post-pass AST walk.
-    hoisted_captures: Vec<Vec<(String, Ty)>>,
+    /// Per-synthetic-lambda capture list, keyed by the counter value
+    /// chosen for `$lambda_<N>`. A `BTreeMap` rather than a `Vec`
+    /// because `allocate_counter` skips values reserved by user-
+    /// defined `__lambda_N` top-level fns, so the index space is
+    /// potentially sparse. The program-level summary built at the end
+    /// of `convert` looks up each synthetic fn's `N` by parsing the
+    /// name and reading this map.
+    hoisted_captures: BTreeMap<usize, Vec<(String, Ty)>>,
+    /// Counter values that mangle to the same linker symbol as a
+    /// user-defined top-level fn (`__lambda_N`). `allocate_counter`
+    /// skips past any value in this set so synthetic names stay unique
+    /// at the symbol-table level.
+    reserved_counters: BTreeSet<usize>,
 }
 
 impl Converter {
@@ -140,6 +171,22 @@ impl Converter {
             .find(|(s, _)| s == span)
             .map(|(_, c)| c.clone())
             .unwrap_or_default()
+    }
+
+    /// Allocate the next synthetic `$lambda_N` counter, skipping any
+    /// value that would mangle to the same linker symbol as a
+    /// user-defined top-level fn named `__lambda_N`. Returns the
+    /// chosen counter; callers build `format!("$lambda_{}", N)` and
+    /// use `counter` as the `hoisted_captures` map key so the program-
+    /// level summary can find the right capture list for each `N`
+    /// without walking the AST.
+    fn allocate_counter(&mut self) -> usize {
+        while self.reserved_counters.contains(&self.counter) {
+            self.counter += 1;
+        }
+        let n = self.counter;
+        self.counter += 1;
+        n
     }
 
     fn rewrite_block(
@@ -277,8 +324,10 @@ impl Converter {
             } => {
                 // Allocate the synthetic name up front so outer lambdas
                 // get lower numbers than the lambdas nested inside them.
-                let fn_name = format!("$lambda_{}", self.counter);
-                self.counter += 1;
+                // `allocate_counter` skips values reserved by
+                // user-defined `__lambda_N` top-level fns.
+                let counter = self.allocate_counter();
+                let fn_name = format!("$lambda_{counter}");
 
                 let caps: Vec<(String, Ty)> = self.capture_at(&span);
 
@@ -317,7 +366,7 @@ impl Converter {
                     span: span.clone(),
                 };
                 self.hoisted.push(Item::Fn(Box::new(synthetic)));
-                self.hoisted_captures.push(caps);
+                self.hoisted_captures.insert(counter, caps);
 
                 Expr::ClosureRecord {
                     code_fn_name: fn_name,
@@ -559,6 +608,90 @@ mod tests {
             },
             other => panic!("expected Call, got {other:?}"),
         }
+    }
+
+    /// Regression test for PR #7 review item 1: a user-defined fn
+    /// named `__lambda_0` mangles to `sigil_user___lambda_0` — the
+    /// same linker symbol a synthetic `$lambda_0` would produce.
+    /// Closure conversion must detect the collision and allocate the
+    /// synthetic name from the next free counter (here, `$lambda_1`
+    /// whose mangled form `sigil_user___lambda_1` doesn't collide).
+    /// The alternative — letting Cranelift surface a duplicate-symbol
+    /// error at compile time — is correct but opaque; this test pins
+    /// the preferred behaviour (skip past reserved counters).
+    #[test]
+    fn user_fn_named_like_synthetic_forces_counter_skip() {
+        let src = "fn __lambda_0() -> Int ![] { 100 }\n\
+                   fn main() -> Int ![] {\n\
+                     (fn (x: Int) -> Int ![] => x + 1)(41)\n\
+                   }\n";
+        let cc = run(src);
+        let names: Vec<&str> = items(&cc)
+            .iter()
+            .filter_map(|it| match it {
+                Item::Fn(f) => Some(f.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        // `__lambda_0` stays as a user fn; the synthetic gets counter
+        // 1, not 0, so `$lambda_1` is the hoisted name.
+        assert!(names.contains(&"__lambda_0"), "user fn lost: {names:?}");
+        assert!(
+            names.contains(&"$lambda_1"),
+            "synthetic should skip reserved 0 and use counter 1: {names:?}"
+        );
+        assert!(
+            !names.contains(&"$lambda_0"),
+            "synthetic must not collide with user `__lambda_0`: {names:?}"
+        );
+
+        // The call site in main references `$lambda_1`.
+        let main = fn_by_name(&cc, "main");
+        let tail = main.body.tail.as_ref().expect("main has a tail");
+        match tail {
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::ClosureRecord { code_fn_name, .. } => {
+                    assert_eq!(code_fn_name, "$lambda_1");
+                }
+                other => panic!("expected ClosureRecord, got {other:?}"),
+            },
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    /// Reserved counters are arbitrary positive integers; a user fn
+    /// named `__lambda_5` reserves `5` but `0..=4` and `6..` remain
+    /// free. This test pins the skip behaviour when the reserved
+    /// counter is above the first synthetic's natural counter.
+    #[test]
+    fn non_zero_reserved_counter_is_skipped() {
+        // Reserve counter 0 with `__lambda_0`; three lambdas should
+        // take `$lambda_1`, `$lambda_2`, `$lambda_3`.
+        let src = "fn __lambda_0() -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] {\n\
+                     let a: Int = (fn (x: Int) -> Int ![] => x)(1);\n\
+                     let b: Int = (fn (x: Int) -> Int ![] => x)(2);\n\
+                     let c: Int = (fn (x: Int) -> Int ![] => x)(3);\n\
+                     a + b + c\n\
+                   }\n";
+        let cc = run(src);
+        let names: std::collections::BTreeSet<&str> = items(&cc)
+            .iter()
+            .filter_map(|it| match it {
+                Item::Fn(f) => Some(f.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["__lambda_0", "main", "$lambda_1", "$lambda_2", "$lambda_3"] {
+            assert!(
+                names.contains(expected),
+                "missing `{expected}` in {names:?}"
+            );
+        }
+        assert!(
+            !names.contains("$lambda_0"),
+            "synthetic must not collide with `__lambda_0`"
+        );
     }
 
     // --- tree-walking helpers ------------------------------------------
