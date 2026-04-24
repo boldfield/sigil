@@ -81,6 +81,11 @@ struct UserFnEntry {
 /// for values of that type. Plan A2's `TypeExpr` grammar is flat
 /// (`Named(String)` only); names outside the v1 primitive set are
 /// rejected by typecheck before codegen sees the program.
+///
+/// Plan A3 task 41: user-defined types (`type Name = ...`) are heap
+/// records addressed by a GC pointer — any name that passes
+/// typecheck's E0112 sweep and isn't a primitive is a registered user
+/// type, represented at the ABI boundary as `pointer_ty`.
 fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
     match te {
         TypeExpr::Named(name, _) => match name.as_str() {
@@ -88,7 +93,7 @@ fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
             "String" => pointer_ty,
             "Bool" | "Byte" | "Unit" => types::I8,
             "Char" => types::I32,
-            other => unreachable!("codegen: unknown named type `{other}`"),
+            _ => pointer_ty,
         },
     }
 }
