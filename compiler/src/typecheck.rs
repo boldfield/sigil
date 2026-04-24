@@ -47,6 +47,12 @@ pub enum Ty {
     /// in a program are primitives, and boxing the fn case keeps the
     /// discriminant + payload fit into a register on 64-bit hosts.
     Fn(Box<FnSig>),
+    /// Nominal user-defined type introduced via `type Name = ...`
+    /// (Plan A3 task 38). Name equality is sufficient — type equality
+    /// is nominal in v1, not structural. The full declaration lives
+    /// in `CheckedProgram.types` keyed by the same name so downstream
+    /// passes (elaborate, codegen) can look up the variant layout.
+    User(String),
 }
 
 /// Structural function signature. Used in `Ty::Fn` and built for
@@ -77,16 +83,48 @@ pub struct CheckedProgram {
     /// in source-order of lambda appearance; the `Ty` for each capture
     /// is the type the name held in the outer scope at lambda-entry.
     pub lambda_captures: Vec<(Span, Vec<(String, Ty)>)>,
+    /// Nominal user-type symbol table (Plan A3 task 38). Keyed by the
+    /// type's declared name; the value is the full parser `TypeDecl` so
+    /// downstream passes (constructor resolution, pattern typing,
+    /// exhaustiveness, codegen layout) can inspect variants and field
+    /// shapes without re-scanning the program. Duplicate declarations
+    /// produce E0113 at check time and the first declaration wins here.
+    pub types: BTreeMap<String, TypeDecl>,
 }
 
 pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
-    // Pre-pass: build a global environment from every top-level
+    // Pre-pass 1 (Plan A3 task 38): build the nominal-type symbol table.
+    // Must precede the fn-env pre-pass so a `fn f(o: Option) -> ...`
+    // declaration can resolve `Option` to `Ty::User("Option")` when
+    // `Option` is declared further down in the file. Duplicate
+    // declarations record E0113 against the second (and subsequent)
+    // offender; the first declaration wins in the symbol table so
+    // downstream passes always see a single canonical variant set.
+    let mut types: BTreeMap<String, TypeDecl> = BTreeMap::new();
+    let mut errors: Vec<CompilerError> = Vec::new();
+    for item in &program.items {
+        if let Item::Type(td) = item {
+            if types.contains_key(&td.name) {
+                errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0113"),
+                    td.name_span.clone(),
+                    format!("duplicate type declaration `{}`", td.name),
+                ));
+            } else {
+                types.insert(td.name.clone(), (**td).clone());
+            }
+        }
+    }
+
+    // Pre-pass 2: build a global environment from every top-level
     // `FnDecl`'s declared signature. This lets recursive and mutually-
     // recursive user functions reference each other by name during
     // `check_fn`'s body walk. Any `FnDecl` whose declared types don't
     // resolve to known `Ty`s is recorded with its best-effort partial
     // signature; the full diagnostic surfaces when the decl's own body
-    // is checked.
+    // is checked (E0112 at the offending `TypeExpr`, E0044 at mismatch
+    // sites with Unit fallback per E0112's documented behavior).
     //
     // Seeded first with language builtins (Plan A2 task 34):
     // `int_to_string(n: Int) -> String` exposes the runtime
@@ -102,9 +140,9 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 params: f
                     .params
                     .iter()
-                    .map(|p| ty_from_type_expr(&p.ty).unwrap_or(Ty::Unit))
+                    .map(|p| ty_from_type_expr(&p.ty, &types).unwrap_or(Ty::Unit))
                     .collect(),
-                ret: ty_from_type_expr(&f.return_type).unwrap_or(Ty::Unit),
+                ret: ty_from_type_expr(&f.return_type, &types).unwrap_or(Ty::Unit),
                 effects: f.effects.clone(),
             };
             fn_env.insert(f.name.clone(), Ty::Fn(Box::new(sig)));
@@ -112,24 +150,51 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     }
 
     let mut tc = Tc {
-        errors: Vec::new(),
+        errors,
         string_literals: Vec::new(),
         lambda_captures: Vec::new(),
         fn_env,
         env: BTreeMap::new(),
+        types,
     };
+    // E0112 sweep: any TypeExpr in an FnDecl signature that does not
+    // resolve to a primitive or registered user type is reported against
+    // the TypeExpr's span. Runs after the types pre-pass so forward
+    // references are fine. The fn_env above already committed Unit as
+    // the fallback for unresolved types; this sweep attaches the real
+    // diagnostic so the user sees why.
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            for p in &f.params {
+                tc.check_type_expr_known(&p.ty);
+            }
+            tc.check_type_expr_known(&f.return_type);
+        }
+    }
     for item in &program.items {
         match item {
             Item::Fn(f) => tc.check_fn(f),
             Item::Import(_) => {}
-            // Plan A3: user-defined types are registered in a pre-pass
-            // (task 38 fleshes out the nominal-types symbol table).
-            // For task 37 (parser) the arm is empty — AST variants
-            // arrive first so the parser can ship without waiting for
-            // the full typechecker. A temporary E0001 will fire from
-            // downstream passes if a `type` decl is actually reached
-            // in a compiled program before task 38 lands.
-            Item::Type(_) => {}
+            // Plan A3 task 38: `Item::Type` declarations are registered
+            // in the pre-pass above. Here we validate that each field
+            // / positional variant's `TypeExpr` resolves.
+            Item::Type(td) => {
+                for v in &td.variants {
+                    match &v.fields {
+                        VariantFields::Unit => {}
+                        VariantFields::Positional(ts) => {
+                            for t in ts {
+                                tc.check_type_expr_known(t);
+                            }
+                        }
+                        VariantFields::Record(fs) => {
+                            for f in fs {
+                                tc.check_type_expr_known(&f.ty);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     let has_main = program
@@ -150,6 +215,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             program,
             string_literals: tc.string_literals,
             lambda_captures: tc.lambda_captures,
+            types: tc.types,
         },
         tc.errors,
     )
@@ -203,6 +269,10 @@ struct Tc {
     /// functions. A `BTreeMap` keeps iteration order stable (the
     /// catalog-integrity discipline).
     env: BTreeMap<String, Ty>,
+    /// Nominal user-type registry (Plan A3 task 38). Built by the
+    /// top-level pre-pass before any fn body is checked so forward
+    /// references resolve. Moved into `CheckedProgram.types` on exit.
+    types: BTreeMap<String, TypeDecl>,
 }
 
 impl Tc {
@@ -213,6 +283,23 @@ impl Tc {
             span,
             msg,
         ));
+    }
+
+    /// Emit E0112 against `t`'s span if the named type is neither a
+    /// Plan A2 primitive nor a registered user type. Idempotent in
+    /// effect: the caller's fallback treats unresolved names as
+    /// `Ty::Unit` so body-level type errors still surface.
+    fn check_type_expr_known(&mut self, t: &TypeExpr) {
+        if ty_from_type_expr(t, &self.types).is_none() {
+            let TypeExpr::Named(n, span) = t;
+            self.push_error(
+                "E0112",
+                span.clone(),
+                format!(
+                    "unknown type `{n}` (expected a primitive or a type declared via `type {n} = ...`)"
+                ),
+            );
+        }
     }
 
     /// Insert a binding into the current function's environment.
@@ -259,7 +346,7 @@ impl Tc {
         // insert-collision and capture-analysis paths.
         self.env.clear();
         for p in &f.params {
-            if let Some(ty) = ty_from_type_expr(&p.ty) {
+            if let Some(ty) = ty_from_type_expr(&p.ty, &self.types) {
                 self.env_insert(p.name.clone(), ty);
             }
         }
@@ -333,7 +420,7 @@ impl Tc {
                     // the declaration rather than the inferred type so a
                     // type mismatch in the initializer doesn't cascade into
                     // spurious E0044/E0046 at downstream sites.
-                    if let Some(ty) = ty_from_type_expr(&l.ty) {
+                    if let Some(ty) = ty_from_type_expr(&l.ty, &self.types) {
                         self.env_insert(l.name.clone(), ty);
                     }
                 }
@@ -766,9 +853,9 @@ impl Tc {
         //     the lambda's own return type even if the body fails.
         let param_tys: Vec<Ty> = params
             .iter()
-            .map(|p| ty_from_type_expr(&p.ty).unwrap_or(Ty::Unit))
+            .map(|p| ty_from_type_expr(&p.ty, &self.types).unwrap_or(Ty::Unit))
             .collect();
-        let ret_ty = ty_from_type_expr(return_type).unwrap_or(Ty::Unit);
+        let ret_ty = ty_from_type_expr(return_type, &self.types).unwrap_or(Ty::Unit);
         let sig = FnSig {
             params: param_tys.clone(),
             ret: ret_ty.clone(),
@@ -931,11 +1018,12 @@ fn type_name(t: &TypeExpr) -> &str {
     }
 }
 
-/// Lift a surface `TypeExpr` into the checker's `Ty` lattice. Unknown
-/// type names return `None`; Plan A2's surface names `Int`, `String`,
-/// `Unit`, `Bool`, `Char`, `Byte`. Any other name is a no-op here (the
-/// checker elsewhere emits a diagnostic for the surrounding declaration).
-fn ty_from_type_expr(t: &TypeExpr) -> Option<Ty> {
+/// Lift a surface `TypeExpr` into the checker's `Ty` lattice. Resolves
+/// Plan A2 primitives first (`Int`, `String`, `Unit`, `Bool`, `Char`,
+/// `Byte`), then Plan A3 user-defined types by consulting the types
+/// registry. Unknown names return `None`; the caller (fn_env pre-pass
+/// or `check_type_expr_known`) handles the fallback/diagnostic split.
+fn ty_from_type_expr(t: &TypeExpr, types: &BTreeMap<String, TypeDecl>) -> Option<Ty> {
     match t {
         TypeExpr::Named(n, _) => match n.as_str() {
             "Int" => Some(Ty::Int),
@@ -944,7 +1032,13 @@ fn ty_from_type_expr(t: &TypeExpr) -> Option<Ty> {
             "Bool" => Some(Ty::Bool),
             "Char" => Some(Ty::Char),
             "Byte" => Some(Ty::Byte),
-            _ => None,
+            other => {
+                if types.contains_key(other) {
+                    Some(Ty::User(other.to_string()))
+                } else {
+                    None
+                }
+            }
         },
     }
 }
@@ -965,6 +1059,8 @@ fn type_matches(expected: &TypeExpr, actual: &Ty) -> bool {
         // expr>;` therefore never matches, so a named left-hand
         // type against a `Ty::Fn` right-hand is a hard mismatch.
         (TypeExpr::Named(_, _), Ty::Fn(_)) => false,
+        // Plan A3 task 38: nominal user-defined types match by name.
+        (TypeExpr::Named(n, _), Ty::User(u)) => n == u,
     }
 }
 
@@ -991,6 +1087,7 @@ fn ty_display(t: &Ty) -> String {
             let effects = sig.effects.join(", ");
             format!("({params}) -> {ret} ![{effects}]")
         }
+        Ty::User(n) => n.clone(),
     }
 }
 
@@ -1222,6 +1319,15 @@ fn is_exhaustive(scrut: &Ty, arms: &[MatchArm]) -> bool {
         // infinite or (for `Fn`) structurally un-enumerable, so a
         // wildcard arm is the only way to reach exhaustiveness.
         Ty::Int | Ty::Char | Ty::String | Ty::Byte | Ty::Fn(_) => false,
+        // Plan A3 task 38.4 replaces this with Maranget's algorithm
+        // that enumerates constructors and emits E0120 with a witness.
+        // Until 38.4 lands, a user-typed scrutinee only reaches this
+        // helper if the arms consist entirely of E0117-rejected
+        // patterns (Var/Tuple/Ctor still return None from pattern_ty
+        // in task 38.1); in that case only a wildcard can make the
+        // match well-formed structurally, so treat User like an
+        // infinite-domain primitive for now.
+        Ty::User(_) => false,
     }
 }
 
@@ -1867,6 +1973,111 @@ mod tests {
         assert!(
             errs.is_empty(),
             "user shadow of int_to_string should typecheck clean; got: {errs:?}"
+        );
+    }
+
+    // ===== Plan A3 Task 38.1 — nominal-type symbol table =====
+
+    fn pipeline_checked(src: &str) -> (CheckedProgram, Vec<CompilerError>) {
+        let (toks, lex_errs) = lex("x.sigil", src);
+        assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
+        let (prog, parse_errs) = parse("x.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse: {parse_errs:?}");
+        let (rp, res_errs) = resolve(prog);
+        assert!(res_errs.is_empty(), "resolve: {res_errs:?}");
+        typecheck(rp.program)
+    }
+
+    #[test]
+    fn type_decl_registers_in_types_table() {
+        // Forward reference — `Option` is declared after use in the
+        // fn signature, but the pre-pass resolves it. No errors.
+        let src = "fn f(o: Option) -> Int ![] { 0 }\n\
+                   type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert!(cp.types.contains_key("Option"));
+        assert_eq!(cp.types["Option"].variants.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_type_declaration_is_e0113() {
+        let src = "type Foo = | A\n\
+                   type Foo = | B\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0113"), "expected E0113, got: {errs:?}");
+    }
+
+    #[test]
+    fn unknown_type_in_fn_param_is_e0112() {
+        let src = "fn f(x: Foo) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0112"), "expected E0112, got: {errs:?}");
+    }
+
+    #[test]
+    fn unknown_type_in_fn_return_is_e0112() {
+        let src = "fn g() -> Bar ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0112"), "expected E0112, got: {errs:?}");
+    }
+
+    #[test]
+    fn unknown_type_in_variant_positional_is_e0112() {
+        // `type T = | X(Missing)` — Missing is undeclared.
+        let src = "type T = | X(Missing)\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0112"), "expected E0112, got: {errs:?}");
+    }
+
+    #[test]
+    fn unknown_type_in_variant_record_is_e0112() {
+        let src = "type P = { x: Missing }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0112"), "expected E0112, got: {errs:?}");
+    }
+
+    #[test]
+    fn user_type_in_let_binding_typechecks_against_param() {
+        // Pass a user-type-valued parameter into a let with the same
+        // declared type. No construction site needed (still E0111
+        // until the flip), but param-carried user values already work.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] { let p: Option = o; 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+    }
+
+    #[test]
+    fn user_type_let_type_mismatch_is_e0045() {
+        // User-typed param bound to a differently-typed let. The
+        // user-type `Option` resolves via the registry; mismatch
+        // against declared `Int` surfaces as E0045 (let-decl vs init).
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] { let n: Int = o; 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0045"), "expected E0045, got: {errs:?}");
+    }
+
+    #[test]
+    fn type_decl_only_emits_no_e0001_surface_errors() {
+        // A lone type decl + empty main must not surface any
+        // user-reachable E0001. Extends the sweep: the Item::Type
+        // arm must not introduce internal-error paths.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0001"),
+            "unexpected E0001: {errs:?}"
         );
     }
 }

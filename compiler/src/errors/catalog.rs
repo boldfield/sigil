@@ -378,6 +378,47 @@ pub const CATALOG: &[ErrorEntry] = &[
                       // record literals in the meantime.",
     },
     ErrorEntry {
+        code: "E0112",
+        short: "unknown type name",
+        long: "A `TypeExpr` referenced a type name that is neither a Plan A2 \
+               primitive (`Int`, `String`, `Unit`, `Bool`, `Char`, `Byte`) nor \
+               a user-defined type declared in the current program via \
+               `type Name = ...`.\n\n\
+               Plan A3 resolves type names in a single pre-pass before any \
+               function body is typechecked; forward references are therefore \
+               fine, but the referenced name must still exist somewhere in \
+               the program. Typos, a missing `type` declaration, and imports \
+               that never landed (imports are Plan A1 stdlib-only in v1) are \
+               the common causes.\n\n\
+               When E0112 fires on a function signature, the checker falls \
+               back to `Unit` for the unresolved type so body-level type \
+               errors still surface on the same compile — downstream \
+               diagnostics may therefore reference `Unit` where the source \
+               said the missing name.",
+        fix_example: "// Declare the type before (or after) using it:\n\
+                      type Option = | None | Some(Int)\n\
+                      fn unwrap_or(o: Option, d: Int) -> Int ![] { d }",
+    },
+    ErrorEntry {
+        code: "E0113",
+        short: "duplicate type declaration",
+        long: "Two `type` declarations in the same program share a name. Plan \
+               A3 registers user types in a single flat namespace keyed by \
+               name; there is no module scoping in v1 and no shadowing of a \
+               prior type declaration. Rename the second declaration or \
+               delete it if it is redundant.\n\n\
+               A duplicate-type diagnostic is distinct from the redefinition \
+               rule for identifiers (E0020): a `type Foo = ...` and a value \
+               binding `let Foo: Int = 1` do not collide (distinct \
+               namespaces), but two `type Foo = ...` lines do.",
+        fix_example: "// Rename or remove one of:\n\
+                      type Option = | None | Some(Int)\n\
+                      type Result = | Ok(Int) | Err(String)   // different name, fine\n\n\
+                      // NOT:\n\
+                      // type Option = | None | Some(Int)\n\
+                      // type Option = | Nope | Yep(Int)  // E0113: duplicate `Option`",
+    },
+    ErrorEntry {
         code: "E0401",
         short: "runtime arithmetic abort",
         long: "A division or modulo operation was performed with a zero \

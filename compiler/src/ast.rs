@@ -141,6 +141,10 @@ pub enum EnvSlotKind {
     Unit,
     String,
     Closure,
+    /// Nominal user-type value (Plan A3). Heap-allocated record with an
+    /// 8-byte header at word 0. GC pointer, same bitmap treatment as
+    /// `String`/`Closure`.
+    User,
 }
 
 impl EnvSlotKind {
@@ -148,7 +152,10 @@ impl EnvSlotKind {
     /// (past the code_ptr word at bit 0) into the closure header's pointer
     /// bitmap iff this returns `true` for slot `k`.
     pub fn is_pointer(self) -> bool {
-        matches!(self, EnvSlotKind::String | EnvSlotKind::Closure)
+        matches!(
+            self,
+            EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User
+        )
     }
 }
 

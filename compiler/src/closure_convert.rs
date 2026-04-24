@@ -412,6 +412,7 @@ fn slot_kind_for_ty(ty: &Ty) -> EnvSlotKind {
         Ty::Unit => EnvSlotKind::Unit,
         Ty::String => EnvSlotKind::String,
         Ty::Fn(_) => EnvSlotKind::Closure,
+        Ty::User(_) => EnvSlotKind::User,
     }
 }
 

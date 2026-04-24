@@ -936,7 +936,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.builder.ins().uextend(types::I64, *raw)
                 }
                 EnvSlotKind::Char => self.builder.ins().uextend(types::I64, *raw),
-                EnvSlotKind::String | EnvSlotKind::Closure => *raw,
+                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => *raw,
             };
             let offset: i32 = 16 + 8 * i as i32;
             self.builder
@@ -962,7 +962,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.ins().ireduce(types::I8, raw)
             }
             EnvSlotKind::Char => self.builder.ins().ireduce(types::I32, raw),
-            EnvSlotKind::String | EnvSlotKind::Closure => {
+            EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
                 if self.pointer_ty == types::I64 {
                     raw
                 } else {
@@ -1212,9 +1212,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 | crate::ast::EnvSlotKind::Byte
                 | crate::ast::EnvSlotKind::Unit => types::I8,
                 crate::ast::EnvSlotKind::Char => types::I32,
-                crate::ast::EnvSlotKind::String | crate::ast::EnvSlotKind::Closure => {
-                    self.pointer_ty
-                }
+                crate::ast::EnvSlotKind::String
+                | crate::ast::EnvSlotKind::Closure
+                | crate::ast::EnvSlotKind::User => self.pointer_ty,
             },
         }
     }
