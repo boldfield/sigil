@@ -6,8 +6,8 @@ authored by large language models — not humans.
 Sigil is under active construction. Plan A2 is complete: the compiler
 handles arithmetic, conditionals, multi-argument functions, recursion,
 closures, and higher-order programs. Plan A3 (sum types + pattern
-matching), Plan B (polymorphism + algebraic effects), and Plan C (stdlib
-+ demos + spec + polish) follow.
+matching), Plan B (polymorphism + algebraic effects), and Plan C (stdlib +
+demos + spec + polish) follow.
 
 ## Why sigil exists
 
