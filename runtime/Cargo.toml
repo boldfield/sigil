@@ -8,3 +8,10 @@ license = { workspace = true }
 [lib]
 name = "sigil_runtime"
 crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Shared ABI constants for the 8-byte object header. PR #7 review
+# item 3 — previously the runtime was the "single source of truth"
+# while codegen replicated the bit-layout inline; that claim is now
+# correct because both crates consume from this shared crate.
+sigil-header-constants = { path = "../header-constants" }

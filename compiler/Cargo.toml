@@ -19,6 +19,11 @@ cranelift-module = { workspace = true }
 cranelift-object = { workspace = true }
 target-lexicon = { workspace = true }
 include_dir = { workspace = true }
+# Shared ABI constants for the 8-byte object header. Codegen emits
+# header immediates inline at each allocation site; this dep replaces
+# the duplicated bit-layout formula that lived in `codegen.rs` as a
+# parallel copy of `runtime::header`. PR #7 review item 3.
+sigil-header-constants = { path = "../header-constants" }
 
 [dev-dependencies]
 insta = { workspace = true }

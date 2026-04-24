@@ -57,17 +57,12 @@ use cranelift_object::object::BinaryFormat;
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use target_lexicon::Triple;
 
+use sigil_header_constants::{header_word, TAG_CLOSURE};
+
 use crate::ast::{EnvSlotKind, TypeExpr};
 use crate::closure_convert::ClosureConvertedProgram;
 use crate::errors::Span;
 use crate::typecheck::CheckedProgram;
-
-/// Header tag (`0x03`) for heap-allocated closure records. The runtime
-/// constant lives in `runtime/src/header.rs`; redefining it here avoids
-/// pulling the runtime crate into the compiler's dependency graph just
-/// for a one-byte constant. Keeping the two in sync is a single-point
-/// edit discipline — both sites document the other.
-const TAG_CLOSURE: u8 = 0x03;
 
 /// Per-user-function codegen registry. Populated before any body is
 /// defined so direct calls and `ClosureRecord.code_fn_name` lookups can
@@ -849,13 +844,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         }
         // Payload word count: 1 (code_ptr) + env_len (one word per slot).
         let count: u8 = 1 + env_len as u8;
-        // Replicate `runtime::header::Header::new(tag, count, bitmap)`
-        // inline — the runtime's `Header` is not a compiler-crate
-        // dependency. If the layout in `runtime/src/header.rs` changes,
-        // this formula must change too. Single-point-of-edit is
-        // enforced by the commit-review checklist.
-        let header: u64 =
-            (TAG_CLOSURE as u64) | (((count as u64) & 0x3F) << 8) | ((bitmap as u64) << 14);
+        // Header word assembled via the shared `sigil-header-constants`
+        // crate so the bit-layout formula is a single-point-of-edit
+        // across the compiler and runtime (PR #7 review item 3).
+        let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
         let payload_bytes: i64 = 8 + 8 * env_len as i64; // code_ptr + env slots
 
         // Lower env_exprs to Cranelift Values in source order; each

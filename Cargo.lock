@@ -560,13 +560,21 @@ dependencies = [
  "cranelift-object",
  "include_dir",
  "insta",
+ "sigil-header-constants",
  "sigil-runtime",
  "target-lexicon",
 ]
 
 [[package]]
+name = "sigil-header-constants"
+version = "0.1.0"
+
+[[package]]
 name = "sigil-runtime"
 version = "0.1.0"
+dependencies = [
+ "sigil-header-constants",
+]
 
 [[package]]
 name = "similar"
