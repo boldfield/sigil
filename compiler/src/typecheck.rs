@@ -2508,6 +2508,27 @@ mod tests {
     }
 
     #[test]
+    fn mutually_recursive_fns_typecheck() {
+        // PR #6 follow-up: pin the pre-pass architecture's mutual-
+        // recursion support. `is_even` calls `is_odd`, which calls
+        // `is_even`. Both signatures must be visible in the fn_env
+        // before either body is checked — the pre-pass enumerates
+        // `Item::Fn`s first, then each body sees every top-level fn
+        // via the fn_env fall-through in `Expr::Ident` resolution.
+        let src = "fn is_even(n: Int) -> Bool ![] {\n\
+                     if n == 0 { true } else { is_odd(n - 1) }\n\
+                   }\n\
+                   fn is_odd(n: Int) -> Bool ![] {\n\
+                     if n == 0 { false } else { is_even(n - 1) }\n\
+                   }\n\
+                   fn main() -> Int ![] {\n\
+                     if is_even(4) { 0 } else { 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+    }
+
+    #[test]
     fn call_wrong_arity_is_e0043() {
         let src = "fn inc(x: Int) -> Int ![] { x + 1 }\n\
                    fn main() -> Int ![] { inc(1, 2) }\n";
