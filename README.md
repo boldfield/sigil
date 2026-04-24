@@ -79,6 +79,14 @@ On large-memory development machines (the reference case is an
 aarch64-apple-darwin laptop with ≥16 GiB), `cargo test --workspace`
 works fine — see the quickstart above.
 
+**Measured peak RSS per workload:** see
+[`docs/memory-profile.md`](docs/memory-profile.md). Short version:
+compiling any single Plan-A2 sigil program peaks at ~63 MiB;
+`cargo test --workspace` peaks at ~1.17 GiB; a parallel
+`cargo build --release` peaks at ~1.56 GiB. The constraint lives in
+the Rust toolchain, not sigil itself. Reproduce with
+`scripts/peak-rss.sh`.
+
 ## Status
 
 Plan A1: Stage 0 scaffolding + Stage 1 hello-world vertical slice — done.
