@@ -450,6 +450,32 @@ pub const CATALOG: &[ErrorEntry] = &[
                       let p: Point = Point { x: 1, y: 2 };  // correct",
     },
     ErrorEntry {
+        code: "E0117",
+        short: "pattern shape does not match scrutinee type",
+        long: "A constructor, tuple, or variable pattern in a `match` arm \
+               names or structures a value that cannot belong to the \
+               scrutinee's type. Plan A3 verifies pattern shape against \
+               the scrutinee's type after Task 38 resolves the scrutinee's \
+               nominal type:\n\n\
+               - A constructor pattern `Ctor(...)` or `Ctor { .. }` matches \
+                 only a scrutinee of the user-defined type that declared \
+                 `Ctor`. Matching `Some(n)` against an `Int` fires E0117.\n\
+               - A tuple pattern `(a, b)` requires a tuple-typed scrutinee. \
+                 Plan A3 v1 has no tuple types in the surface, so every \
+                 tuple pattern fires E0117 against every scrutinee.\n\
+               - Constructor-argument sub-patterns are checked recursively \
+                 against the declared field types; a mismatched sub-pattern \
+                 fires E0117 with the sub-scrutinee position.\n\n\
+               E0064 (Plan A2) handles the literal-pattern-vs-primitive \
+               mismatch case (`0 => ...` against a String scrutinee). \
+               E0117 is the Plan A3 counterpart for the structural pattern \
+               forms introduced in task 37.",
+        fix_example: "type Option = | None | Some(Int)\n\
+                      // match opt { None => 0, Some(n) => n }  // ok\n\
+                      // match n { Some(k) => k, _ => 0 }       // E0117: Some not a ctor of Int\n\
+                      // match opt { (a, b) => a, _ => 0 }     // E0117: no tuple type",
+    },
+    ErrorEntry {
         code: "E0118",
         short: "duplicate constructor name across types",
         long: "Two user-defined types declared variants with the same \

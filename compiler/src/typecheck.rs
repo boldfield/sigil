@@ -1303,29 +1303,41 @@ impl Tc {
             return None;
         }
 
-        // (1) pattern types vs scrutinee
-        if let Some(ref st) = scrut_ty {
-            for arm in arms {
-                if let Some(pt) = pattern_ty(&arm.pattern) {
-                    if pt != *st {
-                        self.push_error(
-                            "E0064",
-                            arm.pattern.span(),
-                            format!(
-                                "pattern type `{}` does not match scrutinee type `{}`",
-                                ty_display(&pt),
-                                ty_display(st),
-                            ),
-                        );
+        // (1) pattern-structure check + arm-body unification. Patterns
+        // introduce bindings (`Pattern::Var(name)` and nested patterns
+        // inside constructor arms) that must scope only over their own
+        // arm body; `check_pattern` gathers them into a list so we can
+        // snapshot/restore the enclosing env correctly.
+        let mut result_ty: Option<Ty> = None;
+        for arm in arms {
+            let mut bindings: Vec<(String, Ty)> = Vec::new();
+            match &scrut_ty {
+                Some(st) => self.check_pattern(&arm.pattern, st, &mut bindings),
+                None => self.check_pattern_shape_only(&arm.pattern, &mut bindings),
+            }
+            // Snapshot the prior binding (if any) for each name the
+            // pattern introduces so we can restore exact state after
+            // the arm body is checked. Pattern::Var names are fresh
+            // per arm (resolve.rs does not track match-arm scopes),
+            // so there is no redefinition concern inside a single arm.
+            let saved: Vec<(String, Option<Ty>)> = bindings
+                .iter()
+                .map(|(name, _)| (name.clone(), self.env.get(name).cloned()))
+                .collect();
+            for (name, ty) in &bindings {
+                self.env.insert(name.clone(), ty.clone());
+            }
+            let body_ty = self.check_expr(&arm.body, row);
+            for (name, prev) in saved {
+                match prev {
+                    Some(ty) => {
+                        self.env.insert(name, ty);
+                    }
+                    None => {
+                        self.env.remove(&name);
                     }
                 }
             }
-        }
-
-        // (2) arm body unification
-        let mut result_ty: Option<Ty> = None;
-        for arm in arms {
-            let body_ty = self.check_expr(&arm.body, row);
             match (&result_ty, &body_ty) {
                 (None, Some(_)) => {
                     result_ty = body_ty;
@@ -1345,7 +1357,10 @@ impl Tc {
             }
         }
 
-        // (3) exhaustiveness
+        // (2) exhaustiveness. Task 38.4 replaces the Plan A2 coarse
+        // check with Maranget's algorithm + counterexample witness for
+        // user types (E0120); until that lands, user-typed scrutinees
+        // are conservatively treated as requiring a wildcard arm.
         if let Some(ref st) = scrut_ty {
             if !is_exhaustive(st, arms) {
                 self.push_error(
@@ -1357,6 +1372,280 @@ impl Tc {
         }
 
         result_ty
+    }
+
+    /// Plan A3 task 38.3 structural pattern typing. Verifies the
+    /// pattern's shape against the scrutinee's type and collects every
+    /// `Pattern::Var` binding (excluding bare-ident nullary-ctor
+    /// promotions) into `bindings` paired with the type the name
+    /// should have inside the arm's body.
+    ///
+    /// Emits E0064 for primitive-literal mismatches (preserving Plan
+    /// A2's code) and E0117 for constructor / tuple / variable shape
+    /// mismatches introduced in Plan A3.
+    fn check_pattern(&mut self, p: &Pattern, scrut_ty: &Ty, bindings: &mut Vec<(String, Ty)>) {
+        match p {
+            Pattern::Wildcard(_) => {}
+            Pattern::IntLit(_, span) => {
+                if scrut_ty != &Ty::Int {
+                    self.push_error(
+                        "E0064",
+                        span.clone(),
+                        format!(
+                            "integer-literal pattern does not match scrutinee type `{}`",
+                            ty_display(scrut_ty)
+                        ),
+                    );
+                }
+            }
+            Pattern::BoolLit(_, span) => {
+                if scrut_ty != &Ty::Bool {
+                    self.push_error(
+                        "E0064",
+                        span.clone(),
+                        format!(
+                            "boolean-literal pattern does not match scrutinee type `{}`",
+                            ty_display(scrut_ty)
+                        ),
+                    );
+                }
+            }
+            Pattern::CharLit(_, span) => {
+                if scrut_ty != &Ty::Char {
+                    self.push_error(
+                        "E0064",
+                        span.clone(),
+                        format!(
+                            "character-literal pattern does not match scrutinee type `{}`",
+                            ty_display(scrut_ty)
+                        ),
+                    );
+                }
+            }
+            Pattern::Var(name, _span) => {
+                // Nullary-ctor promotion: a bare identifier pattern
+                // whose name matches a nullary variant of the
+                // scrutinee's user type is not a binding — it is a
+                // zero-arity constructor pattern. Task 39's elaborate
+                // reads the AST and this binding/non-binding
+                // distinction directly from the recorded bindings
+                // vector (empty for nullary ctors).
+                if let Ty::User(u) = scrut_ty {
+                    if let Some(info) = self.ctors.get(name).cloned() {
+                        if info.type_name == *u {
+                            if let Some(td) = self.types.get(&info.type_name) {
+                                if matches!(
+                                    td.variants[info.variant_index].fields,
+                                    VariantFields::Unit
+                                ) {
+                                    // nullary-ctor pattern, no binding
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                bindings.push((name.clone(), scrut_ty.clone()));
+            }
+            Pattern::Tuple(pats, span) => {
+                // Plan A3 v1 has no tuple types in the surface; a
+                // tuple pattern never matches any scrutinee type. We
+                // still recurse into sub-patterns with the scrutinee
+                // type as a conservative placeholder so any inner
+                // pattern-shape errors still surface, but emit E0117
+                // at the top-level tuple pattern.
+                self.push_error(
+                    "E0117",
+                    span.clone(),
+                    format!(
+                        "tuple pattern does not match scrutinee type `{}` (no tuple types in Plan A3 v1)",
+                        ty_display(scrut_ty)
+                    ),
+                );
+                for sub in pats {
+                    self.check_pattern(sub, scrut_ty, bindings);
+                }
+            }
+            Pattern::Ctor { name, fields, span } => {
+                let Some(info) = self.ctors.get(name).cloned() else {
+                    self.push_error(
+                        "E0114",
+                        span.clone(),
+                        format!("unknown constructor `{name}` in pattern"),
+                    );
+                    // Still walk sub-patterns shape-only so nested
+                    // errors surface.
+                    match fields {
+                        CtorPatternFields::Unit => {}
+                        CtorPatternFields::Positional(ps) => {
+                            for sub in ps {
+                                self.check_pattern_shape_only(sub, bindings);
+                            }
+                        }
+                        CtorPatternFields::Record(fs) => {
+                            for f in fs {
+                                self.check_pattern_shape_only(&f.pattern, bindings);
+                            }
+                        }
+                    }
+                    return;
+                };
+                // Nominal type-match: the ctor's owning type must
+                // equal the scrutinee type.
+                match scrut_ty {
+                    Ty::User(u) if *u == info.type_name => {}
+                    _ => {
+                        self.push_error(
+                            "E0117",
+                            span.clone(),
+                            format!(
+                                "constructor `{name}` is a variant of type `{}`; scrutinee has type `{}`",
+                                info.type_name,
+                                ty_display(scrut_ty)
+                            ),
+                        );
+                    }
+                }
+                let td = match self.types.get(&info.type_name).cloned() {
+                    Some(t) => t,
+                    None => return,
+                };
+                let variant = &td.variants[info.variant_index];
+                match (&variant.fields, fields) {
+                    (VariantFields::Unit, CtorPatternFields::Unit) => {}
+                    (VariantFields::Positional(param_tys), CtorPatternFields::Positional(pats)) => {
+                        if param_tys.len() != pats.len() {
+                            self.push_error(
+                                "E0115",
+                                span.clone(),
+                                format!(
+                                    "constructor `{name}` pattern expects {} positional field{}, got {}",
+                                    param_tys.len(),
+                                    if param_tys.len() == 1 { "" } else { "s" },
+                                    pats.len()
+                                ),
+                            );
+                        }
+                        for (sub, decl_ty) in pats.iter().zip(param_tys.iter()) {
+                            let inner = ty_from_type_expr(decl_ty, &self.types).unwrap_or(Ty::Unit);
+                            self.check_pattern(sub, &inner, bindings);
+                        }
+                    }
+                    (VariantFields::Record(decl_fields), CtorPatternFields::Record(pat_fields)) => {
+                        // Duplicate pattern-field names
+                        let mut seen: BTreeMap<String, Span> = BTreeMap::new();
+                        for f in pat_fields {
+                            if let Some(first) = seen.get(&f.name).cloned() {
+                                self.push_error(
+                                    "E0115",
+                                    f.span.clone(),
+                                    format!(
+                                        "pattern for constructor `{name}` got duplicate field `{}` (first at {}:{})",
+                                        f.name, first.line, first.column
+                                    ),
+                                );
+                            } else {
+                                seen.insert(f.name.clone(), f.span.clone());
+                            }
+                        }
+                        for f in pat_fields {
+                            let Some(decl) = decl_fields.iter().find(|d| d.name == f.name) else {
+                                self.push_error(
+                                    "E0115",
+                                    f.span.clone(),
+                                    format!(
+                                        "pattern for constructor `{name}` of type `{}` has no field `{}`",
+                                        info.type_name, f.name
+                                    ),
+                                );
+                                continue;
+                            };
+                            let inner =
+                                ty_from_type_expr(&decl.ty, &self.types).unwrap_or(Ty::Unit);
+                            self.check_pattern(&f.pattern, &inner, bindings);
+                        }
+                        for d in decl_fields {
+                            if !pat_fields.iter().any(|f| f.name == d.name) {
+                                self.push_error(
+                                    "E0115",
+                                    span.clone(),
+                                    format!(
+                                        "pattern for constructor `{name}` of type `{}` is missing field `{}`",
+                                        info.type_name, d.name
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    // Shape mismatches (Unit vs Positional, etc.) —
+                    // E0115 naming the declared shape.
+                    (VariantFields::Unit, _) => {
+                        self.push_error(
+                            "E0115",
+                            span.clone(),
+                            format!(
+                                "constructor `{name}` of type `{}` is nullary; pattern must be a bare identifier (no parens or braces)",
+                                info.type_name
+                            ),
+                        );
+                    }
+                    (VariantFields::Positional(_), _) => {
+                        self.push_error(
+                            "E0115",
+                            span.clone(),
+                            format!(
+                                "constructor `{name}` of type `{}` has positional fields; pattern must use `{name}(..)` form",
+                                info.type_name
+                            ),
+                        );
+                    }
+                    (VariantFields::Record(_), _) => {
+                        self.push_error(
+                            "E0115",
+                            span.clone(),
+                            format!(
+                                "constructor `{name}` of type `{}` has record fields; pattern must use `{name} {{ .. }}` form",
+                                info.type_name
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shape-only walk used when the scrutinee has unknown type
+    /// (propagated `None` from a prior error). Binds every
+    /// `Pattern::Var` to `Ty::Unit` so the arm body can at least
+    /// reference the names without cascade-NPE-shaped errors.
+    fn check_pattern_shape_only(&mut self, p: &Pattern, bindings: &mut Vec<(String, Ty)>) {
+        match p {
+            Pattern::Wildcard(_)
+            | Pattern::IntLit(_, _)
+            | Pattern::BoolLit(_, _)
+            | Pattern::CharLit(_, _) => {}
+            Pattern::Var(name, _) => {
+                bindings.push((name.clone(), Ty::Unit));
+            }
+            Pattern::Tuple(pats, _) => {
+                for sub in pats {
+                    self.check_pattern_shape_only(sub, bindings);
+                }
+            }
+            Pattern::Ctor { fields, .. } => match fields {
+                CtorPatternFields::Unit => {}
+                CtorPatternFields::Positional(ps) => {
+                    for sub in ps {
+                        self.check_pattern_shape_only(sub, bindings);
+                    }
+                }
+                CtorPatternFields::Record(fs) => {
+                    for f in fs {
+                        self.check_pattern_shape_only(&f.pattern, bindings);
+                    }
+                }
+            },
+        }
     }
 }
 
@@ -1460,26 +1749,6 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::GtEq => ">=",
         BinOp::And => "&&",
         BinOp::Or => "||",
-    }
-}
-
-/// Type of a pattern, for pattern-vs-scrutinee compatibility. Wildcard
-/// returns `None` (it is not a type error against any scrutinee).
-fn pattern_ty(p: &Pattern) -> Option<Ty> {
-    match p {
-        Pattern::IntLit(_, _) => Some(Ty::Int),
-        Pattern::BoolLit(_, _) => Some(Ty::Bool),
-        Pattern::CharLit(_, _) => Some(Ty::Char),
-        Pattern::Wildcard(_) => None,
-        // Plan A3 task 37: new pattern variants. A `Var` / `Tuple` /
-        // `Ctor` pattern's type is not a simple scalar — it depends
-        // on the nominal type of the scrutinee, which task 38's
-        // nominal-types symbol table resolves. Returning `None`
-        // here keeps the coarse pattern-vs-scrutinee check (which
-        // uses this function) in sync with the "wildcard matches
-        // any type" case; task 38 will replace this coarse check
-        // with a structural one that uses the symbol table.
-        Pattern::Var(_, _) | Pattern::Tuple(..) | Pattern::Ctor { .. } => None,
     }
 }
 
@@ -1675,12 +1944,11 @@ fn is_exhaustive(scrut: &Ty, arms: &[MatchArm]) -> bool {
         Ty::Int | Ty::Char | Ty::String | Ty::Byte | Ty::Fn(_) => false,
         // Plan A3 task 38.4 replaces this with Maranget's algorithm
         // that enumerates constructors and emits E0120 with a witness.
-        // Until 38.4 lands, a user-typed scrutinee only reaches this
-        // helper if the arms consist entirely of E0117-rejected
-        // patterns (Var/Tuple/Ctor still return None from pattern_ty
-        // in task 38.1); in that case only a wildcard can make the
-        // match well-formed structurally, so treat User like an
-        // infinite-domain primitive for now.
+        // Until 38.4 lands, a user-typed scrutinee is conservatively
+        // treated as an infinite-domain value: only a wildcard arm can
+        // reach exhaustiveness. Structural ctor-pattern coverage
+        // (`match o { None => .., Some(_) => .. }`) still fires E0066
+        // until 38.4 teaches the checker to enumerate variants.
         Ty::User(_) => false,
     }
 }
@@ -2609,5 +2877,190 @@ mod tests {
                 "program surfaced E0001: src={src:?} errs={errs:?}",
             );
         }
+    }
+
+    // ===== Plan A3 Task 38.3 — structural pattern typing =====
+
+    #[test]
+    fn match_on_option_with_unit_and_positional_ctors_typechecks() {
+        // E0066 still fires (user-type exhaustiveness deferred to
+        // 38.4), so we tolerate it here but check the pattern-shape
+        // check does not surface E0064/E0117 for the ctor arms.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn unwrap(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(n) => n, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e.code.as_str(), "E0064" | "E0117")),
+            "unexpected pattern-shape error: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn match_pattern_var_binds_into_arm_body() {
+        // `Some(n) => n` — `n` binds to Int inside the arm body.
+        // Using `n` against a declared Int return in the match
+        // expression flows cleanly; swapping with a Bool would fire
+        // E0065 (arm body type mismatch) on a different arm.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn unwrap_or(o: Option, d: Int) -> Int ![] {\n  \
+                     match o { None => d, Some(n) => n, _ => d }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        // The arm-body `n` should be typed as Int by the binding,
+        // so neither E0046 (unknown ident) nor E0044/E0065 fires
+        // on it.
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0046"),
+            "arm-scope binding missed: E0046 fired: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn ctor_pattern_against_wrong_user_type_is_e0117() {
+        let src = "type Option = | None | Some(Int)\n\
+                   type Result = | Ok(Int) | Err(String)\n\
+                   fn f(r: Result) -> Int ![] {\n  \
+                     match r { Some(n) => n, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0117"), "expected E0117, got: {errs:?}");
+    }
+
+    #[test]
+    fn ctor_pattern_against_primitive_is_e0117() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] {\n  \
+                     match 0 { Some(n) => n, _ => 0 }\n\
+                   }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0117"), "expected E0117, got: {errs:?}");
+    }
+
+    #[test]
+    fn tuple_pattern_always_fires_e0117_in_a3() {
+        let src = "fn main() -> Int ![] {\n  \
+                     match 0 { (a, b) => a, _ => 0 }\n\
+                   }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0117"), "expected E0117, got: {errs:?}");
+    }
+
+    #[test]
+    fn unit_ctor_with_parens_pattern_is_e0115() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None() => 0, _ => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_pattern_arity_mismatch_is_e0115() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Some(x, y) => x, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_pattern_missing_field_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn f(p: Point) -> Int ![] {\n  \
+                     match p { Point { x } => x, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_pattern_unknown_field_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn f(p: Point) -> Int ![] {\n  \
+                     match p { Point { x, y, z } => x, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn nested_ctor_pattern_sub_type_mismatch_is_e0064() {
+        // `Some(true)` has Int in its positional field; pattern
+        // `Some(BoolLit(true))` mismatches the declared inner Int.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Some(true) => 1, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0064"),
+            "expected E0064 on inner, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn record_ctor_pattern_binds_inner_vars() {
+        // `Point { x, y }` binds `x: Int` and `y: Int`. Using them
+        // as Int in arm body must typecheck clean (beyond the
+        // user-type-exhaustiveness E0066 which 38.4 resolves).
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn f(p: Point) -> Int ![] {\n  \
+                     match p { Point { x, y } => x + y, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0046"),
+            "inner record binding missed: E0046 fired: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0044"),
+            "inner record binding typed wrong: E0044 fired: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pattern_var_binds_primitive_scrutinee() {
+        // `match n { x => x }` on Int scrutinee — `x` binds to Int.
+        // Exhaustive via wildcard-like binding (but E0066 may still
+        // fire because Var on primitives isn't structurally known;
+        // we just check no E0046 for the arm-body use of x).
+        let src = "fn main() -> Int ![] {\n  \
+                     let r: Int = match 5 { x => x };\n  0\n\
+                   }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0046"),
+            "primitive-scrutinee Pattern::Var binding missed: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_ctor_in_explicit_pattern_is_e0114() {
+        // Explicit `Ctor(args)` pattern form whose name isn't
+        // registered fires E0114. (Bare-identifier unknown names are
+        // treated as fresh-variable bindings in pattern position —
+        // the ML-family convention — so they do not fire E0114.)
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Nope(x) => x, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0114"), "expected E0114, got: {errs:?}");
     }
 }
