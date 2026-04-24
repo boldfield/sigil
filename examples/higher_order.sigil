@@ -1,0 +1,46 @@
+// examples/higher_order.sigil
+//
+// Plan A2 Task 33: higher-order-lambda example. Applies a capturing
+// lambda across a fixed run of integers [1..=5], threading each
+// lambda result into a running sum that a recursive user fn walks.
+// Exercises:
+//   - Lambda surface syntax (Task 29).
+//   - Ty::Fn + application-site unification + capture analysis
+//     (Task 30).
+//   - Closure conversion that records each user fn param captured by
+//     an inner lambda into the synthetic closure env (Task 31).
+//   - GC-heap closure allocation + closure-calling-convention ABI
+//     via direct-IIFE dispatch (Task 32).
+//
+// Scope note (Plan A2): `TypeExpr::Fn` is deferred to Plan A3, so a
+// lambda cannot be let-bound, declared as a user fn parameter, or
+// returned from a top-level fn. The "list of ints" the plan's Task 33
+// wording asks for is therefore implicit in a recursive user fn's
+// walk over `n..=0` rather than an explicit list-of-ints value —
+// Plan A2 has no tuples, no arrays, no sum types. The plan text's
+// "simulate a list via nested tuples" aside is aspirational; user
+// tuples require sum-type machinery from Plan A3. This recursive
+// walk is the closest Plan A2 can get to "apply a lambda to a fixed
+// list of ints" while staying inside the shipped language.
+//
+// Invariant: running this program exits with status 130.
+//   weighted_sum(100, 3, 5)
+//     = 100 + (3 + 5) + (3 + 4) + (3 + 3) + (3 + 2) + (3 + 1)
+//     = 100 + 8 + 7 + 6 + 5 + 4
+//     = 130
+//
+// The inline lambda `fn (x: Int) -> Int ![] => delta + x` captures
+// `delta` from `weighted_sum`'s parameter list. Each recursion step
+// allocates a fresh closure record on the GC heap whose single env
+// slot holds the captured `delta`.
+
+fn weighted_sum(base: Int, delta: Int, n: Int) -> Int ![] {
+  match n {
+    0 => base,
+    _ => (fn (x: Int) -> Int ![] => delta + x)(n) + weighted_sum(base, delta, n - 1),
+  }
+}
+
+fn main() -> Int ![] {
+  weighted_sum(100, 3, 5)
+}
