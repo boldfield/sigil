@@ -87,7 +87,15 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // resolve to known `Ty`s is recorded with its best-effort partial
     // signature; the full diagnostic surfaces when the decl's own body
     // is checked.
-    let mut fn_env: BTreeMap<String, Ty> = BTreeMap::new();
+    //
+    // Seeded first with language builtins (Plan A2 task 34):
+    // `int_to_string(n: Int) -> String` exposes the runtime
+    // `sigil_int_to_string` formatter. Seeding before the user-fn loop
+    // means a user `fn int_to_string(...)` declaration simply overwrites
+    // the builtin entry — users can shadow, and codegen's `lower_call`
+    // checks `user_fn_refs` before the builtin branch, so the user's
+    // definition wins end-to-end.
+    let mut fn_env: BTreeMap<String, Ty> = builtin_fn_env();
     for item in &program.items {
         if let Item::Fn(f) = item {
             let sig = FnSig {
@@ -137,6 +145,34 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         },
         tc.errors,
     )
+}
+
+/// Language builtins — functions that appear to user code as ordinary
+/// identifiers whose signatures are seeded into `fn_env` by the
+/// typechecker. Codegen pairs each name with a direct call to the
+/// matching runtime C symbol (see `compiler/src/codegen.rs`
+/// `lower_call` for the dispatch table).
+///
+/// Plan A2 task 34 seeds a single builtin — `int_to_string(n: Int) ->
+/// String` — to close the loop needed for `fib(20)` to print its
+/// result. Additional builtins arrive as the runtime gains language-
+/// surface helpers (Plan B's effect handlers, Plan C's stdlib).
+///
+/// Users can shadow a builtin by declaring their own `fn <name>`: the
+/// user-fn pre-pass overwrites the builtin entry in `fn_env`, and
+/// codegen's `user_fn_refs` resolves first, so the user's definition
+/// wins at both typecheck and call sites.
+fn builtin_fn_env() -> BTreeMap<String, Ty> {
+    let mut m = BTreeMap::new();
+    m.insert(
+        "int_to_string".to_string(),
+        Ty::Fn(Box::new(FnSig {
+            params: vec![Ty::Int],
+            ret: Ty::String,
+            effects: Vec::new(),
+        })),
+    );
+    m
 }
 
 struct Tc {
@@ -1712,6 +1748,75 @@ mod tests {
         assert!(
             !inner_caps.iter().any(|(n, _)| n == "y"),
             "inner lambda's own param `y` should not be a capture"
+        );
+    }
+
+    // ===== Plan A2 task 34 — `int_to_string` builtin =============================
+
+    #[test]
+    fn int_to_string_builtin_typechecks() {
+        // The builtin's signature is seeded in `fn_env` before the
+        // user-fn pre-pass; a call site with a single `Int` arg should
+        // typecheck clean and infer the result type as `String`.
+        let src = "fn main() -> Int ![IO] {\n\
+                     perform IO.println(int_to_string(42));\n\
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+    }
+
+    #[test]
+    fn int_to_string_wrong_arity_is_e0043() {
+        let src = "fn main() -> Int ![IO] {\n\
+                     perform IO.println(int_to_string(1, 2));\n\
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0043"), "expected E0043, got: {errs:?}");
+    }
+
+    #[test]
+    fn int_to_string_wrong_arg_type_is_e0044() {
+        let src = "fn main() -> Int ![IO] {\n\
+                     perform IO.println(int_to_string(\"hi\"));\n\
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
+    }
+
+    #[test]
+    fn int_to_string_is_pure_no_effect_required() {
+        // Builtin has an empty effect row, so it can be called from a
+        // non-IO function. The enclosing effect row need not contain
+        // `IO` to call `int_to_string` itself.
+        let src = "fn stringify(n: Int) -> String ![] {\n\
+                     int_to_string(n)\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "int_to_string should not force an effect row, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_can_shadow_int_to_string_builtin() {
+        // Seeded builtin is overwritten by the user's `fn
+        // int_to_string` in the pre-pass. The user's signature is
+        // what typecheck uses; arg-type checking follows the user's
+        // definition, not the builtin.
+        let src = "fn int_to_string(s: String) -> String ![] { s }\n\
+                   fn main() -> Int ![IO] {\n\
+                     perform IO.println(int_to_string(\"override\"));\n\
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "user shadow of int_to_string should typecheck clean; got: {errs:?}"
         );
     }
 }

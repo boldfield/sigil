@@ -266,6 +266,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_alloc", Linkage::Import, &alloc_sig)
         .map_err(|e| format!("declare sigil_alloc: {e}"))?;
 
+    // Plan A2 task 34: `sigil_int_to_string(n: i64) -> *mut u8`. The
+    // runtime formats `n` as decimal, allocates a fresh String on the
+    // Boehm heap, and returns the 8-byte-aligned header pointer
+    // suitable for `sigil_println` consumption. Seeded into the
+    // typechecker's `fn_env` as the builtin `int_to_string(Int) ->
+    // String !` (see `typecheck::builtin_fn_env`); callers reach it
+    // via `Expr::Call { callee: Ident("int_to_string"), .. }` unless
+    // a user `fn int_to_string` shadows the builtin.
+    let mut int_to_string_sig = Signature::new(isa_call_conv(&module));
+    int_to_string_sig.params.push(AbiParam::new(types::I64)); // n
+    int_to_string_sig.returns.push(AbiParam::new(pointer_ty)); // heap String ptr
+    let int_to_string = module
+        .declare_function("sigil_int_to_string", Linkage::Import, &int_to_string_sig)
+        .map_err(|e| format!("declare sigil_int_to_string: {e}"))?;
+
     // C-callable main: int main(int argc, char **argv). Stage 1 ignores argv.
     let mut main_sig = Signature::new(isa_call_conv(&module));
     main_sig.params.push(AbiParam::new(types::I32));
@@ -398,6 +413,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             let println_ref = module.declare_func_in_func(println, builder.func);
             let panic_arith_ref = module.declare_func_in_func(panic_arith, builder.func);
             let alloc_ref = module.declare_func_in_func(alloc, builder.func);
+            let int_to_string_ref = module.declare_func_in_func(int_to_string, builder.func);
 
             // FuncRefs for every user fn — needed for direct calls
             // (`Expr::Call` with `Ident` callee) and for `func_addr`
@@ -451,6 +467,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 println_ref,
                 panic_arith_ref,
                 alloc_ref,
+                int_to_string_ref,
                 user_fn_refs,
                 user_fns: &user_fns,
             };
@@ -639,6 +656,13 @@ struct Lowerer<'a, 'b> {
     panic_arith_ref: FuncRef,
     alloc_ref: FuncRef,
 
+    /// Runtime ref for `sigil_int_to_string(i64) -> *u8`. Plan A2 task
+    /// 34 wires the language builtin `int_to_string(Int) -> String !`
+    /// to this symbol; `lower_call` dispatches to it when the callee is
+    /// `Ident("int_to_string")` and no user fn of the same name
+    /// shadows it.
+    int_to_string_ref: FuncRef,
+
     /// Per-fn FuncRefs for every user fn (original + synthetic
     /// `$lambda_N`). Used for direct calls and for `func_addr` when
     /// populating a `ClosureRecord`'s `code_ptr` slot.
@@ -768,6 +792,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 all_args.push(null_closure);
                 all_args.extend(arg_vals);
                 let call = self.builder.ins().call(func_ref, &all_args);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            // Plan A2 task 34: language builtin `int_to_string(Int) ->
+            // String !`. Typecheck seeds the signature via
+            // `typecheck::builtin_fn_env`; ordering matters — the
+            // `user_fn_refs` arm above wins if a user defined an
+            // `int_to_string` fn of their own. `sigil_int_to_string`
+            // allocates a fresh Boehm-managed String, so the call is a
+            // safepoint and gets a placeholder stackmap record like
+            // any other heap-touching call.
+            Expr::Ident(name, _) if name == "int_to_string" => {
+                assert_eq!(args.len(), 1, "int_to_string builtin arg count is not 1");
+                let arg_val = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.int_to_string_ref, &[arg_val]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
                 self.builder.inst_results(call)[0]
@@ -1134,6 +1174,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 Expr::Ident(name, _) if self.user_fns.contains_key(name) => {
                     self.user_fns[name].ret_ty
                 }
+                // Plan A2 task 34: the `int_to_string` builtin returns
+                // a Sigil `String`, which is a heap pointer.
+                Expr::Ident(name, _) if name == "int_to_string" => self.pointer_ty,
                 Expr::ClosureRecord { code_fn_name, .. } => self
                     .user_fns
                     .get(code_fn_name)
