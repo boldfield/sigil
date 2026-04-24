@@ -176,13 +176,32 @@ regression.
   Requires reconciling the tagged-Int ABI choice at every user-code
   boundary.
 
-**Status:** open (tracked for Plan A3).
+**Status:** resolved (2026-04-24) by reviewer decision during PR #12
+end-of-A3 cleanup sweep.
 
-**Resolution:** (pending)
+**Resolution:** Choice (a) — lock `main -> Int` as the structural
+contract. Three reasons:
 
-**Forward implications:** Option (c) dovetails with the broader
-tagged-vs-raw Int ABI decision the PR #7 reviewer also called out
-("raw everywhere internally, tag only at the C ABI boundary"). If
-that ABI decision resolves to "no internal tagging", main's tagging
-problem disappears with it. If the tagging stays, (a) or (b) is the
-relevant question.
+1. **The typechecker already enforces it via E0041** ("fn main has
+   wrong signature"), so (a) is effectively the implementation today.
+   This resolution formalizes it rather than reinterpreting it.
+2. **One way to do each thing** (per sigil's "fight the priors" design
+   principle). Admitting multiple `main` return types to accommodate
+   per-type shim logic adds surface area for marginal benefit — a user
+   who wants `main` to return `Unit` can return `0: Int` and drop the
+   value at the shell boundary equally well.
+3. **The broader tagged-vs-raw Int ABI question is decoupled.** Option
+   (c) would have dovetailed with a repo-wide ABI rework; keeping the
+   main-tagging specific to main defers the ABI-wide question to Plan B
+   where it belongs (effect runtime + CPS transform need a definitive
+   ABI decision anyway). Changing main's tagging without touching the
+   rest of the ABI would have been a half-measure.
+
+Implementation already conforms. Added a comment at the tagging site in
+`compiler/src/codegen.rs` (sister commit) citing this resolution and
+E0041 so any future relaxation revises both sites together.
+
+**Forward implications:** Option (c)'s repo-wide "raw everywhere
+internally, tag only at the C ABI boundary" question reopens in Plan B
+alongside effect-runtime ABI decisions. If Plan B resolves it that way,
+main's tagging adjusts as part of the larger change — not independently.
