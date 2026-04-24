@@ -57,8 +57,59 @@ use cranelift_object::object::BinaryFormat;
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use target_lexicon::Triple;
 
+use crate::ast::{EnvSlotKind, TypeExpr};
 use crate::closure_convert::ClosureConvertedProgram;
+use crate::errors::Span;
 use crate::typecheck::CheckedProgram;
+
+/// Header tag (`0x03`) for heap-allocated closure records. The runtime
+/// constant lives in `runtime/src/header.rs`; redefining it here avoids
+/// pulling the runtime crate into the compiler's dependency graph just
+/// for a one-byte constant. Keeping the two in sync is a single-point
+/// edit discipline — both sites document the other.
+const TAG_CLOSURE: u8 = 0x03;
+
+/// Per-user-function codegen registry. Populated before any body is
+/// defined so direct calls and `ClosureRecord.code_fn_name` lookups can
+/// resolve to a `FuncId` regardless of definition order.
+struct UserFnEntry {
+    func_id: cranelift_module::FuncId,
+    signature: Signature,
+    /// Cranelift type of each parameter, including `param_tys[0]` =
+    /// `pointer_ty` for the closure_ptr convention-slot.
+    #[allow(dead_code)]
+    param_tys: Vec<Type>,
+    ret_ty: Type,
+}
+
+/// Map a surface-syntax `TypeExpr` to the Cranelift IR type codegen uses
+/// for values of that type. Plan A2's `TypeExpr` grammar is flat
+/// (`Named(String)` only); names outside the v1 primitive set are
+/// rejected by typecheck before codegen sees the program.
+fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
+    match te {
+        TypeExpr::Named(name, _) => match name.as_str() {
+            "Int" => types::I64,
+            "String" => pointer_ty,
+            "Bool" | "Byte" | "Unit" => types::I8,
+            "Char" => types::I32,
+            other => unreachable!("codegen: unknown named type `{other}`"),
+        },
+    }
+}
+
+/// Mangle a Sigil-level fn name into a linker-legal symbol name.
+/// `main` keeps the historical mangling `sigil_user_main` (the C-main
+/// shim calls this symbol). Other names get a `sigil_user_` prefix with
+/// `$` from synthetic names (`$lambda_N`) rewritten to `__` so the
+/// result is legal on both ELF and Mach-O.
+fn mangle_user_fn(name: &str) -> String {
+    if name == "main" {
+        return "sigil_user_main".to_string();
+    }
+    let sanitized = name.replace('$', "__");
+    format!("sigil_user_{sanitized}")
+}
 
 /// Stackmap section layout. Plan A1 emits **version 0 (placeholder)**:
 ///
@@ -208,12 +259,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_panic_arith_error", Linkage::Import, &panic_arith_sig)
         .map_err(|e| format!("declare sigil_panic_arith_error: {e}"))?;
 
-    // user-main signature: () -> i64 (the tagged Int exit value).
-    let mut user_main_sig = Signature::new(isa_call_conv(&module));
-    user_main_sig.returns.push(AbiParam::new(types::I64));
-    let user_main = module
-        .declare_function("sigil_user_main", Linkage::Local, &user_main_sig)
-        .map_err(|e| format!("declare sigil_user_main: {e}"))?;
+    // Plan A2 task 32: `sigil_alloc(header: u64, payload_bytes: usize)
+    // -> *mut u8`. Heap allocation for closure records (and any future
+    // codegen-level alloc). `payload_bytes` is declared as
+    // `pointer_ty` since the Rust signature uses `usize`.
+    let mut alloc_sig = Signature::new(isa_call_conv(&module));
+    alloc_sig.params.push(AbiParam::new(types::I64)); // header
+    alloc_sig.params.push(AbiParam::new(pointer_ty)); // payload_bytes (usize)
+    alloc_sig.returns.push(AbiParam::new(pointer_ty));
+    let alloc = module
+        .declare_function("sigil_alloc", Linkage::Import, &alloc_sig)
+        .map_err(|e| format!("declare sigil_alloc: {e}"))?;
 
     // C-callable main: int main(int argc, char **argv). Stage 1 ignores argv.
     let mut main_sig = Signature::new(isa_call_conv(&module));
@@ -223,6 +279,59 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     let main = module
         .declare_function("main", Linkage::Export, &main_sig)
         .map_err(|e| format!("declare main: {e}"))?;
+
+    // Pre-declare every user function (original + synthetic $lambda_N from
+    // closure conversion) under the **closure calling convention**:
+    //
+    //   (closure_ptr: *u8, user_arg1: T1, ..., user_argN: TN) -> ret_ty
+    //
+    // closure_ptr is the heap address of the fn's runtime closure record
+    // (or a null pointer for direct calls to top-level fns with no
+    // captured environment). Direct callers in codegen pass null;
+    // `ClosureRecord`-returning callees pass the allocated record's ptr.
+    //
+    // Plan A2 task 32 introduces this ABI for all user fns — including
+    // the top-level `main`. User-main keeps its mangled name
+    // `sigil_user_main` (the C-main shim calls that); its Cranelift
+    // signature gains the closure_ptr param at index 0 (always null from
+    // the shim). Tagging the return value happens inside main's lowering;
+    // other user fns return their raw Cranelift value.
+    let mut user_fns: BTreeMap<String, UserFnEntry> = BTreeMap::new();
+    for item in &checked.program.items {
+        if let crate::ast::Item::Fn(f) = item {
+            let mut sig = Signature::new(isa_call_conv(&module));
+            // arg 0: closure_ptr (always pointer-sized).
+            sig.params.push(AbiParam::new(pointer_ty));
+            let mut param_tys: Vec<Type> = Vec::with_capacity(f.params.len() + 1);
+            param_tys.push(pointer_ty);
+            for p in &f.params {
+                let t = cranelift_ty_for_type_expr(&p.ty, pointer_ty);
+                sig.params.push(AbiParam::new(t));
+                param_tys.push(t);
+            }
+            let ret_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+            sig.returns.push(AbiParam::new(ret_ty));
+
+            let mangled = mangle_user_fn(&f.name);
+            let func_id = module
+                .declare_function(&mangled, Linkage::Local, &sig)
+                .map_err(|e| format!("declare {mangled}: {e}"))?;
+            user_fns.insert(
+                f.name.clone(),
+                UserFnEntry {
+                    func_id,
+                    signature: sig,
+                    param_tys,
+                    ret_ty,
+                },
+            );
+        }
+    }
+
+    let user_main = user_fns
+        .get("main")
+        .map(|uf| uf.func_id)
+        .ok_or_else(|| "codegen requires a `main` function".to_string())?;
 
     // Accumulate safepoint records. Stage 1 writes placeholder records
     // (see StackMapBuilder's doc comment).
@@ -265,74 +374,113 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         b"remainder by zero",
     )?;
 
-    // --- user-main body --------------------------------------------------
+    // --- define every user fn (original + synthetic $lambda_N) ----------
+    //
+    // Each fn gets its own Lowerer instance. The user-fn registry
+    // (`user_fns`) and the per-fn FuncRefs are rebuilt for each
+    // FunctionBuilder because `declare_func_in_func` returns a FuncRef
+    // scoped to the function being defined.
     let mut ctx = module.make_context();
     let mut fb_ctx = FunctionBuilderContext::new();
-    ctx.func.signature = user_main_sig.clone();
-    ctx.func.name = UserFuncName::user(0, user_main.as_u32());
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-        let block = builder.create_block();
-        builder.append_block_params_for_function_params(block);
-        builder.switch_to_block(block);
-        builder.seal_block(block);
-
-        let main_decl = checked
-            .program
-            .items
-            .iter()
-            .find_map(|i| match i {
-                crate::ast::Item::Fn(f) if f.name == "main" => Some(f),
-                _ => None,
-            })
-            .ok_or_else(|| "codegen requires a `main` function".to_string())?;
-
-        // Declare runtime funcs in this function.
-        let string_new_ref = module.declare_func_in_func(string_new, builder.func);
-        let println_ref = module.declare_func_in_func(println, builder.func);
-        let panic_arith_ref = module.declare_func_in_func(panic_arith, builder.func);
-
-        // Pre-declare all string-literal GVs and the arith cstring GVs so
-        // the Lowerer does not need `&mut module` during its walk.
-        let lit_gvs: Vec<GlobalValue> = lit_ids
-            .iter()
-            .map(|id| module.declare_data_in_func(*id, builder.func))
-            .collect();
-        let div_zero_gv = module.declare_data_in_func(div_zero_msg_id, builder.func);
-        let mod_zero_gv = module.declare_data_in_func(mod_zero_msg_id, builder.func);
-
-        let mut lowerer = Lowerer {
-            builder,
-            stackmap: &mut stackmap,
-            env: BTreeMap::new(),
-            pointer_ty,
-            string_lit_lengths: string_literals.iter().map(|(_, s)| s.len()).collect(),
-            lit_gvs,
-            lit_cursor: 0,
-            div_zero_gv,
-            mod_zero_gv,
-            string_new_ref,
-            println_ref,
-            panic_arith_ref,
+    for item in &checked.program.items {
+        let f = match item {
+            crate::ast::Item::Fn(f) => f.as_ref(),
+            _ => continue,
         };
+        let entry = &user_fns[&f.name];
 
-        // Lower main's body. The returned value (if any) is the tail's
-        // i64 value — the caller tags it with `ishl_imm 1` for the
-        // c-`main` shim's untag path.
-        let tail_val = lowerer.lower_block(&main_decl.body);
+        ctx.func.signature = entry.signature.clone();
+        ctx.func.name = UserFuncName::user(0, entry.func_id.as_u32());
+        {
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            builder.seal_block(block);
 
-        let tagged = match tail_val {
-            Some(v) => lowerer.builder.ins().ishl_imm(v, 1),
-            // No tail → unit: return 0 tagged as Int.
-            None => lowerer.builder.ins().iconst(types::I64, 0),
-        };
-        lowerer.builder.ins().return_(&[tagged]);
-        lowerer.builder.finalize();
+            // Runtime FuncRefs for this fn's definition.
+            let string_new_ref = module.declare_func_in_func(string_new, builder.func);
+            let println_ref = module.declare_func_in_func(println, builder.func);
+            let panic_arith_ref = module.declare_func_in_func(panic_arith, builder.func);
+            let alloc_ref = module.declare_func_in_func(alloc, builder.func);
+
+            // FuncRefs for every user fn — needed for direct calls
+            // (`Expr::Call` with `Ident` callee) and for `func_addr`
+            // when a `ClosureRecord` stores the synthetic fn's address.
+            let user_fn_refs: BTreeMap<String, FuncRef> = user_fns
+                .iter()
+                .map(|(name, uf)| {
+                    (
+                        name.clone(),
+                        module.declare_func_in_func(uf.func_id, builder.func),
+                    )
+                })
+                .collect();
+
+            // String-literal GVs + lengths keyed by source span. Closure
+            // conversion can reorder the walk relative to typecheck's
+            // source-order list, so positional cursoring is unsafe once
+            // multiple fns are compiled. Span-keyed linear-search is
+            // O(small) and robust.
+            let lit_gvs: Vec<(Span, GlobalValue, usize)> = string_literals
+                .iter()
+                .enumerate()
+                .map(|(idx, (span, s))| {
+                    let gv = module.declare_data_in_func(lit_ids[idx], builder.func);
+                    (span.clone(), gv, s.len())
+                })
+                .collect();
+            let div_zero_gv = module.declare_data_in_func(div_zero_msg_id, builder.func);
+            let mod_zero_gv = module.declare_data_in_func(mod_zero_msg_id, builder.func);
+
+            // Seed the per-fn env with user params. Block param 0 is the
+            // closure_ptr; user params follow.
+            let block_params: Vec<Value> = builder.block_params(block).to_vec();
+            let closure_ptr = block_params[0];
+            let mut env = BTreeMap::new();
+            for (i, p) in f.params.iter().enumerate() {
+                env.insert(p.name.clone(), block_params[i + 1]);
+            }
+
+            let is_main = f.name == "main";
+            let mut lowerer = Lowerer {
+                builder,
+                stackmap: &mut stackmap,
+                env,
+                pointer_ty,
+                closure_ptr,
+                lit_gvs,
+                div_zero_gv,
+                mod_zero_gv,
+                string_new_ref,
+                println_ref,
+                panic_arith_ref,
+                alloc_ref,
+                user_fn_refs,
+                user_fns: &user_fns,
+            };
+
+            let tail_val = lowerer.lower_block(&f.body);
+
+            // main tags its Int return with `ishl_imm 1` so the C-main
+            // shim can `sshr_imm 1` → i32. Other user fns return their
+            // raw Cranelift value; callers (user code) use it directly.
+            let ret_val = match tail_val {
+                Some(v) if is_main => lowerer.builder.ins().ishl_imm(v, 1),
+                Some(v) => v,
+                // No tail → Unit. Return a zero of the expected Cranelift
+                // type. For main, ret_ty is i64 (tagged); `iconst(I64, 0)`
+                // represents tagged-Int zero.
+                None => lowerer.builder.ins().iconst(entry.ret_ty, 0),
+            };
+            lowerer.builder.ins().return_(&[ret_val]);
+            lowerer.builder.finalize();
+        }
+        module
+            .define_function(entry.func_id, &mut ctx)
+            .map_err(|e| format!("define {}: {e}", f.name))?;
+        module.clear_context(&mut ctx);
     }
-    module
-        .define_function(user_main, &mut ctx)
-        .map_err(|e| format!("define sigil_user_main: {e}"))?;
-    module.clear_context(&mut ctx);
 
     // --- main shim -------------------------------------------------------
     ctx.func.signature = main_sig.clone();
@@ -348,7 +496,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let user_main_ref = module.declare_func_in_func(user_main, builder.func);
         let init_call = builder.ins().call(gc_init_ref, &[]);
         stackmap.push_placeholder(function_code_offset(&builder, init_call));
-        let um_call = builder.ins().call(user_main_ref, &[]);
+        // user-main takes the closure-calling-convention closure_ptr as
+        // arg 0. The shim is not a closure entry point, so it passes a
+        // null pointer; main's body never reads it.
+        let null_closure = builder.ins().iconst(pointer_ty, 0);
+        let um_call = builder.ins().call(user_main_ref, &[null_closure]);
         stackmap.push_placeholder(function_code_offset(&builder, um_call));
 
         // user-main returns a tagged Int; untag to i32 via arithmetic
@@ -462,22 +614,26 @@ fn declare_cstring(
 /// function, at the `return` site. This keeps iadd/isub/imul/sdiv/srem
 /// emissions unadorned and lets Cranelift's peephole optimiser see
 /// arithmetic as plain 64-bit integer math.
-struct Lowerer<'a> {
+struct Lowerer<'a, 'b> {
     builder: FunctionBuilder<'a>,
     stackmap: &'a mut StackMapBuilder,
     env: BTreeMap<String, Value>,
     pointer_ty: Type,
 
-    /// Lengths of each declared string literal, indexed by cursor. Used
-    /// to emit the `sigil_string_new(bytes, len)` call without re-
-    /// walking the program's string-literal list.
-    string_lit_lengths: Vec<usize>,
-    /// Per-function `declare_data_in_func` refs for every string
-    /// literal, in the same order as typecheck emitted them.
-    lit_gvs: Vec<GlobalValue>,
-    /// Monotonic index into `lit_gvs` / `string_lit_lengths`. Bumped
-    /// once per `Expr::StringLit` encountered by the lowerer.
-    lit_cursor: usize,
+    /// Arg-0 of the current fn's entry block: the closure record
+    /// pointer under the closure calling convention (plan A2 task 32).
+    /// Direct callers pass null; `ClosureRecord`-returning callees
+    /// pass the allocated record's header pointer. `ClosureEnvLoad`
+    /// lowers a load against `closure_ptr + 16 + 8 * index` (past the
+    /// 8-byte header and the 8-byte code_ptr word).
+    closure_ptr: Value,
+
+    /// Per-string-literal `(span, GV, byte-length)` tuples declared at
+    /// fn-entry time. Span-keyed so closure-conversion reordering of
+    /// the walk (hoisted `$lambda_N` bodies carry the string literals
+    /// that originally lived inside their lambda expressions) doesn't
+    /// desynchronise the lookup from typecheck's source-order list.
+    lit_gvs: Vec<(Span, GlobalValue, usize)>,
 
     /// `declare_data_in_func` refs for the arith-panic cstrings.
     div_zero_gv: GlobalValue,
@@ -486,9 +642,20 @@ struct Lowerer<'a> {
     string_new_ref: FuncRef,
     println_ref: FuncRef,
     panic_arith_ref: FuncRef,
+    alloc_ref: FuncRef,
+
+    /// Per-fn FuncRefs for every user fn (original + synthetic
+    /// `$lambda_N`). Used for direct calls and for `func_addr` when
+    /// populating a `ClosureRecord`'s `code_ptr` slot.
+    user_fn_refs: BTreeMap<String, FuncRef>,
+
+    /// Shared user-fn registry (FuncId + signature). Immutable over a
+    /// fn's lowering — the Lowerer only reads return types and param
+    /// types to size signature lookups.
+    user_fns: &'b BTreeMap<String, UserFnEntry>,
 }
 
-impl<'a> Lowerer<'a> {
+impl<'a, 'b> Lowerer<'a, 'b> {
     /// Lower a `Block`. Returns the tail expression's value if any,
     /// `None` when the block has no tail (statement-only block, value
     /// is `Unit`).
@@ -537,7 +704,7 @@ impl<'a> Lowerer<'a> {
             Expr::IntLit(n, _) => self.builder.ins().iconst(types::I64, *n),
             Expr::BoolLit(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
             Expr::CharLit(c, _) => self.builder.ins().iconst(types::I32, *c as i64),
-            Expr::StringLit(_, _) => self.lower_string_literal(),
+            Expr::StringLit(_, span) => self.lower_string_literal(span),
             Expr::Ident(name, _) => *self
                 .env
                 .get(name)
@@ -568,16 +735,7 @@ impl<'a> Lowerer<'a> {
                 // Perform returns Unit — represented as `i8 0`.
                 self.builder.ins().iconst(types::I8, 0)
             }
-            Expr::Call { .. } => {
-                // Typecheck (plan A2 task 30) accepts user function
-                // calls and assigns them a result type, but the
-                // closure-calling-convention codegen lands in Task
-                // 32. Hand-crafted programs that exercise `Call`
-                // will trip this `unreachable!` as an intentional
-                // interim state — the user-facing surface says "not
-                // yet compilable, Task 32 pending".
-                unreachable!("codegen: Expr::Call lowering lands in plan A2 task 32")
-            }
+            Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::Lambda { .. } => {
                 // Closure conversion (plan A2 task 31) rewrites every
                 // `Expr::Lambda` into an `Expr::ClosureRecord`; codegen
@@ -587,24 +745,203 @@ impl<'a> Lowerer<'a> {
                     "codegen: Expr::Lambda should have been replaced by ClosureRecord in closure_convert"
                 )
             }
-            // ClosureRecord / ClosureEnvLoad lowering lands in plan A2
-            // task 32; the variants ship in task 31 so closure
-            // conversion can produce them.
-            Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
+            Expr::ClosureRecord {
+                code_fn_name,
+                env_exprs,
+                env_slot_kinds,
+                ..
+            } => self.lower_closure_record(code_fn_name, env_exprs, env_slot_kinds),
+            Expr::ClosureEnvLoad { index, kind, .. } => self.lower_closure_env_load(*index, *kind),
+        }
+    }
+
+    /// Lower `Expr::Call`. Direct-calls the callee when it is an
+    /// `Ident` of a user fn (passing a null closure_ptr) or a
+    /// `ClosureRecord` (passing the allocated record's ptr). Any other
+    /// callee shape would require an indirect call via `call_indirect`
+    /// — which is deferred to Plan A3 when the `TypeExpr::Fn` surface
+    /// syntax lands and fn-typed lets become expressible. See
+    /// `PLAN_A2_DEVIATIONS.md` `[Task 32]` for the rationale.
+    fn lower_call(&mut self, callee: &crate::ast::Expr, args: &[crate::ast::Expr]) -> Value {
+        use crate::ast::Expr;
+        match callee {
+            Expr::Ident(name, _) if self.user_fn_refs.contains_key(name) => {
+                let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let func_ref = self.user_fn_refs[name];
+                let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+                let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 1);
+                all_args.push(null_closure);
+                all_args.extend(arg_vals);
+                let call = self.builder.ins().call(func_ref, &all_args);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::ClosureRecord { code_fn_name, .. } => {
+                // Evaluate the ClosureRecord first (allocates + stores
+                // the closure on the heap) and use its pointer as the
+                // callee's closure_ptr.
+                let closure_value = self.lower_expr(callee);
+                let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let func_ref = *self.user_fn_refs.get(code_fn_name).unwrap_or_else(|| {
+                    unreachable!(
+                        "codegen: closure-record code_fn_name `{code_fn_name}` not registered"
+                    )
+                });
+                let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 1);
+                all_args.push(closure_value);
+                all_args.extend(arg_vals);
+                let call = self.builder.ins().call(func_ref, &all_args);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            _ => {
+                // Indirect calls (callee is a bound local or an
+                // arbitrary expression producing a closure value) land
+                // in Plan A3. Plan A2 cannot reach this arm from a
+                // well-typed program because `TypeExpr::Fn` is deferred
+                // — there is no surface syntax to declare a let or a
+                // param of function type, so every well-typed callee
+                // reduces to `Ident(top_level_fn)` or `ClosureRecord`
+                // at this point.
                 unreachable!(
-                    "codegen: ClosureRecord/ClosureEnvLoad lowering lands in plan A2 task 32"
+                    "codegen: indirect call (callee = {callee:?}) deferred to Plan A3 (TypeExpr::Fn not in A2)"
                 )
             }
         }
     }
 
-    /// Emit a `sigil_string_new(bytes, len)` call for the next pending
-    /// string literal and return the heap-pointer SSA value.
-    fn lower_string_literal(&mut self) -> Value {
-        let idx = self.lit_cursor;
-        self.lit_cursor += 1;
-        let gv = self.lit_gvs[idx];
-        let len = self.string_lit_lengths[idx];
+    /// Allocate a closure record `{header, code_ptr, env[0], ...,
+    /// env[N-1]}` on the GC heap and return its header pointer. See
+    /// `runtime/src/header.rs` for the 8-byte header layout; bit 0 of
+    /// the pointer bitmap is always `0` here (code_ptr is not a GC
+    /// pointer), and bits `1..=N` reflect `env_slot_kinds[k].is_pointer()`.
+    ///
+    /// All env slots are stored as 8-byte words — smaller types
+    /// (`Bool`, `Byte`, `Unit` as `i8`; `Char` as `i32`) are
+    /// zero-extended on store and truncated on load. `String` and
+    /// `Closure` values are already pointer-sized.
+    fn lower_closure_record(
+        &mut self,
+        code_fn_name: &str,
+        env_exprs: &[crate::ast::Expr],
+        env_slot_kinds: &[EnvSlotKind],
+    ) -> Value {
+        assert_eq!(
+            env_exprs.len(),
+            env_slot_kinds.len(),
+            "closure_convert should emit parallel env_exprs / env_slot_kinds"
+        );
+        let env_len = env_exprs.len();
+        assert!(
+            env_len < 31,
+            "closure env >= 31 slots exceeds 6-bit header count field (tag 0xFF descriptor is v2)"
+        );
+
+        // Header bitmap: bit 0 = code_ptr (not a pointer), bit k+1 set
+        // iff env slot k holds a GC-managed pointer.
+        let mut bitmap: u32 = 0;
+        for (i, kind) in env_slot_kinds.iter().enumerate() {
+            if kind.is_pointer() {
+                bitmap |= 1u32 << (i + 1);
+            }
+        }
+        // Payload word count: 1 (code_ptr) + env_len (one word per slot).
+        let count: u8 = 1 + env_len as u8;
+        // Replicate `runtime::header::Header::new(tag, count, bitmap)`
+        // inline — the runtime's `Header` is not a compiler-crate
+        // dependency. If the layout in `runtime/src/header.rs` changes,
+        // this formula must change too. Single-point-of-edit is
+        // enforced by the commit-review checklist.
+        let header: u64 =
+            (TAG_CLOSURE as u64) | (((count as u64) & 0x3F) << 8) | ((bitmap as u64) << 14);
+        let payload_bytes: i64 = 8 + 8 * env_len as i64; // code_ptr + env slots
+
+        // Lower env_exprs to Cranelift Values in source order; each
+        // Value will be extended to i64 before store.
+        let env_vals: Vec<Value> = env_exprs.iter().map(|e| self.lower_expr(e)).collect();
+
+        // Call sigil_alloc(header, payload_bytes) -> *u8.
+        let header_v = self.builder.ins().iconst(types::I64, header as i64);
+        let payload_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
+        let alloc_call = self
+            .builder
+            .ins()
+            .call(self.alloc_ref, &[header_v, payload_v]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, alloc_call));
+        let closure_ptr = self.builder.inst_results(alloc_call)[0];
+
+        // Store code_ptr at offset 8 (past header).
+        let code_fn_ref = *self.user_fn_refs.get(code_fn_name).unwrap_or_else(|| {
+            unreachable!("codegen: ClosureRecord code_fn_name `{code_fn_name}` not registered")
+        });
+        let code_ptr = self.builder.ins().func_addr(self.pointer_ty, code_fn_ref);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), code_ptr, closure_ptr, 8);
+
+        // Store env slots at offset 16 + 8*i, each as an 8-byte word.
+        for (i, (raw, kind)) in env_vals.iter().zip(env_slot_kinds.iter()).enumerate() {
+            let slot_val = match kind {
+                EnvSlotKind::Int => *raw, // i64 already
+                EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
+                    // i8 → i64 (zero-extend; Sigil primitives are
+                    // unsigned in their bit-level storage).
+                    self.builder.ins().uextend(types::I64, *raw)
+                }
+                EnvSlotKind::Char => self.builder.ins().uextend(types::I64, *raw),
+                EnvSlotKind::String | EnvSlotKind::Closure => *raw,
+            };
+            let offset: i32 = 16 + 8 * i as i32;
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), slot_val, closure_ptr, offset);
+        }
+
+        closure_ptr
+    }
+
+    /// Load the `index`-th env slot from the current fn's closure_ptr.
+    /// The load width matches the slot kind; i64 slot words are
+    /// truncated on load for sub-word types.
+    fn lower_closure_env_load(&mut self, index: usize, kind: EnvSlotKind) -> Value {
+        let offset: i32 = 16 + 8 * index as i32;
+        let raw =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), self.closure_ptr, offset);
+        match kind {
+            EnvSlotKind::Int => raw,
+            EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
+                self.builder.ins().ireduce(types::I8, raw)
+            }
+            EnvSlotKind::Char => self.builder.ins().ireduce(types::I32, raw),
+            EnvSlotKind::String | EnvSlotKind::Closure => {
+                if self.pointer_ty == types::I64 {
+                    raw
+                } else {
+                    // Plan A2 targets are 64-bit; the else branch is a
+                    // defensive path for hypothetical 32-bit hosts.
+                    self.builder.ins().ireduce(self.pointer_ty, raw)
+                }
+            }
+        }
+    }
+
+    /// Emit a `sigil_string_new(bytes, len)` call for a string literal
+    /// identified by its source span, returning the heap-pointer SSA
+    /// value.
+    fn lower_string_literal(&mut self, span: &Span) -> Value {
+        let (gv, len) = self
+            .lit_gvs
+            .iter()
+            .find(|(s, _, _)| s == span)
+            .map(|(_, g, l)| (*g, *l))
+            .unwrap_or_else(|| {
+                unreachable!("codegen: string literal at span {span:?} not declared")
+            });
         let bytes_ptr = self.builder.ins().symbol_value(self.pointer_ty, gv);
         let len_v = self.builder.ins().iconst(self.pointer_ty, len as i64);
         let call = self
@@ -801,11 +1138,22 @@ impl<'a> Lowerer<'a> {
                 Some(t) => self.type_of_expr(t),
                 None => types::I8,
             },
-            Expr::Call { .. } => types::I64,
-            // Lambda type prediction is a Task-31/32 concern; for PR
-            // 5 typecheck rejects Lambda before we reach this helper.
-            // Pick `pointer_ty` defensively: a closure lowers to a
-            // GC-heap pointer in Task 32.
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::Ident(name, _) if self.user_fns.contains_key(name) => {
+                    self.user_fns[name].ret_ty
+                }
+                Expr::ClosureRecord { code_fn_name, .. } => self
+                    .user_fns
+                    .get(code_fn_name)
+                    .map(|e| e.ret_ty)
+                    .unwrap_or(types::I64),
+                // Indirect calls don't exist in Plan A2 (see lower_call);
+                // defensively return i64.
+                _ => types::I64,
+            },
+            // Lambda type prediction is a Task-31/32 concern; closure
+            // conversion ensures `Lambda` is always rewritten before
+            // codegen sees it. Kept as a defensive fall-back.
             Expr::Lambda { .. } => self.pointer_ty,
             // Closure records are heap-allocated; a load from the
             // closure env uses the slot's kind to pick its Cranelift

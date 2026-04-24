@@ -21,6 +21,14 @@ pub const TAG_EXTERNAL_DESCRIPTOR: u8 = 0xFF;
 // v1 type tags. Add new tags at the next free slot; never renumber.
 pub const TAG_STRING: u8 = 0x01;
 pub const TAG_INT64: u8 = 0x02;
+/// Closure record layout: `{header, code_ptr, env[0], ..., env[N-1]}`.
+/// Payload word 0 is the code pointer (a static fn address, not a GC
+/// pointer) so bit 0 of the header's pointer bitmap is always 0 for
+/// closures. Subsequent words are env slots; bit `k+1` is set iff
+/// payload word `k+1` (env slot `k`) holds a GC-managed pointer.
+/// Codegen (plan A2 task 32) emits the allocation + stores; this tag
+/// is the shared constant identifying the object kind.
+pub const TAG_CLOSURE: u8 = 0x03;
 
 const COUNT_BITS: u32 = 6;
 const COUNT_SHIFT: u32 = 8;

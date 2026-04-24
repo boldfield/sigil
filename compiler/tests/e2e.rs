@@ -357,3 +357,86 @@ fn mod_by_zero_traps() {
         "stderr missing mod-zero banner: {stderr:?}"
     );
 }
+
+/// Plan A2 task 32: a top-level user fn is direct-called from `main`.
+/// Every user fn takes a closure_ptr as its first Cranelift argument
+/// (always null for direct calls to a top-level fn with no captured
+/// env). Verifies the closure-calling-convention ABI reaches the
+/// callee's entry block and that the user param lives in block_params[1].
+#[test]
+fn direct_call_top_level_fn() {
+    let source = "fn inc(x: Int) -> Int ![] { x + 1 }\n\
+                  fn main() -> Int ![] { inc(41) }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "direct_call_top_level_fn");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(code, 42, "inc(41) -> 42");
+}
+
+/// Plan A2 task 32: recursive direct call. `fact(n)` calls itself with
+/// `n-1` until the base-case match arm fires. This exercises the
+/// calling-convention under a stack of recursive frames and confirms
+/// `user_fn_refs[fact]` resolves correctly inside `fact`'s own body.
+#[test]
+fn recursion_via_direct_call() {
+    let source = "fn fact(n: Int) -> Int ![] {\n\
+                    match n {\n\
+                      0 => 1,\n\
+                      _ => n * fact(n - 1),\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![] { fact(5) }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "recursion_via_direct_call");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(code, 120, "fact(5) = 120");
+}
+
+/// Plan A2 task 32: an IIFE with zero captures. Closure conversion
+/// hoists the lambda into `$lambda_0`, leaving a `ClosureRecord` with
+/// an empty env at the call site. Codegen allocates the record (8-byte
+/// header and one code_ptr word, no env words), then direct-calls the
+/// synthetic fn with the record ptr as closure_ptr. The fn's body
+/// never reads the closure ptr.
+#[test]
+fn iife_no_captures() {
+    let source = "fn main() -> Int ![] {\n\
+                    (fn (x: Int) -> Int ![] => x + 1)(41)\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "iife_no_captures");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(code, 42, "iife returning x+1 applied to 41 -> 42");
+}
+
+/// Plan A2 task 32: an IIFE capturing a single Int. The closure
+/// record's env has one Int slot; inside the synthetic fn body, the
+/// capture is lowered as `ClosureEnvLoad(0, Int)`. The fn adds its
+/// param (block_params[1]) to the env-loaded value.
+#[test]
+fn iife_with_int_capture() {
+    let source = "fn main() -> Int ![] {\n\
+                    let x: Int = 10;\n\
+                    (fn (y: Int) -> Int ![] => x + y)(32)\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "iife_with_int_capture");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(code, 42, "closure captures x=10, applied y=32 -> 42");
+}
+
+/// Plan A2 task 32: nested IIFE with a transitive capture. The inner
+/// lambda captures `x` from the outermost scope; closure conversion
+/// threads the value through the outer closure's env. Outer lambda
+/// has env [Int(x)]; inner lambda's env_exprs in the outer scope
+/// become `ClosureEnvLoad(0, Int, "x")` so the x value flows from
+/// main → outer's env → inner's env, staying live across two frames.
+#[test]
+fn nested_iife_transitive_capture() {
+    let source = "fn main() -> Int ![] {\n\
+                    let x: Int = 7;\n\
+                    ((fn (_p: Int) -> Int ![] => (fn (y: Int) -> Int ![] => x + y)(3))(0))\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "nested_iife_transitive_capture");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(
+        code, 10,
+        "x=7 threaded through outer closure; inner adds y=3 -> 10"
+    );
+}
