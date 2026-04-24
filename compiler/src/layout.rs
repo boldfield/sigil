@@ -35,8 +35,11 @@
 //!
 //! # E0130
 //!
-//! Payload word count is bounded by the header's 6-bit count field
-//! (0..=63). A variant whose `1 + field_count > 63` trips the plan's
+//! Payload word count is bounded by the narrower of two limits: the
+//! header's 6-bit count field (0..=63) and the 32-bit pointer bitmap
+//! (addresses words 0..=31). The bitmap is the real constraint in
+//! v1, so `MAX_PAYLOAD_WORDS` is 33 (1 discriminant word + 32 field
+//! words). A variant whose `1 + field_count > 33` trips the plan's
 //! E0130 diagnostic. Plan A3's prompt bank stays well under the limit;
 //! the check exists to fail loudly rather than silently truncate.
 
@@ -49,9 +52,18 @@ use std::collections::BTreeMap;
 /// `TAG_CLOSURE=0x03`) plus headroom for near-future primitives.
 pub const USER_TAG_START: u8 = 0x10;
 
-/// Maximum allowed payload word count before E0130 fires. The
-/// 6-bit count field maxes at 63.
-pub const MAX_PAYLOAD_WORDS: u8 = 63;
+/// Maximum allowed payload word count before E0130 fires.
+///
+/// The 6-bit count field in the shared `sigil-header-constants` header
+/// maxes at 63, but the pointer bitmap is only 32 bits wide — so a
+/// variant with payload words 33..63 could pass the count check yet
+/// leave its words 33..N unaddressable by the GC bitmap. Tighten to
+/// 33 (1 discriminant word + 32 field words) so E0130 fires at the
+/// real limit. Relaxing back to 63 is a v2 concern that ships with
+/// the external-descriptor path for wide records; until then, any
+/// type needing more than 32 payload fields is a user-visible error
+/// rather than silently losing GC coverage on later fields.
+pub const MAX_PAYLOAD_WORDS: u8 = 33;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeLayout {
@@ -96,7 +108,8 @@ impl VariantLayout {
 }
 
 /// Construct layouts for every user-defined type in `types`. Returns
-/// errors for any type whose payload exceeds 63 words (E0130). The
+/// errors for any type whose payload exceeds the `MAX_PAYLOAD_WORDS`
+/// limit (E0130). The
 /// returned map is keyed by type name and iterates in insertion order
 /// (BTreeMap ordering = alphabetical).
 ///
@@ -204,8 +217,9 @@ pub fn build_ctor_index(
 /// plan's user-facing diagnostics (E0130 etc.).
 #[derive(Clone, Debug)]
 pub enum LayoutError {
-    /// A variant's `1 + field_count` exceeds the header's 6-bit
-    /// payload-word field (63 words). Maps to E0130.
+    /// A variant's `1 + field_count` exceeds `MAX_PAYLOAD_WORDS`
+    /// (the 32-bit pointer bitmap's addressable range: 33 words).
+    /// Maps to E0130.
     PayloadTooLarge {
         type_name: String,
         variant_name: String,
@@ -227,7 +241,8 @@ impl std::fmt::Display for LayoutError {
                 words,
             } => write!(
                 f,
-                "user type `{type_name}` variant `{variant_name}` has {words} payload words (limit 63)"
+                "user type `{type_name}` variant `{variant_name}` has {words} payload words (limit {})",
+                MAX_PAYLOAD_WORDS
             ),
             LayoutError::TooManyTypes {
                 next_tag_attempted,
@@ -408,14 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn payload_over_63_words_is_e0130_shape_error() {
-        // Construct a variant with 63 positional Int fields → 1 + 63 = 64 words.
-        let tys: Vec<&str> = std::iter::repeat_n("Int", 63).collect();
+    fn payload_over_max_words_is_e0130_shape_error() {
+        // Construct a variant whose payload exceeds MAX_PAYLOAD_WORDS
+        // (33 = 1 discriminant + 32 bitmap-addressable fields). 33
+        // positional Int fields → 1 + 33 = 34 words.
+        let tys: Vec<&str> = std::iter::repeat_n("Int", MAX_PAYLOAD_WORDS as usize).collect();
         let mut types = BTreeMap::new();
         types.insert("Big".to_string(), td("Big", vec![pos_variant("Big", tys)]));
         let err = build_layouts(&types).expect_err("expected layout error");
         match err {
-            LayoutError::PayloadTooLarge { words, .. } => assert_eq!(words, 64),
+            LayoutError::PayloadTooLarge { words, .. } => {
+                assert_eq!(words, MAX_PAYLOAD_WORDS as usize + 1);
+            }
             other => {
                 assert!(
                     matches!(other, LayoutError::PayloadTooLarge { .. }),
@@ -423,6 +442,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn payload_at_max_words_layout_succeeds() {
+        // Exactly MAX_PAYLOAD_WORDS - 1 fields (= 32 fields, fitting the
+        // 32-bit bitmap exactly). 1 discriminant + 32 fields = 33 words =
+        // MAX_PAYLOAD_WORDS; should build cleanly.
+        let n_fields = (MAX_PAYLOAD_WORDS as usize) - 1;
+        let tys: Vec<&str> = std::iter::repeat_n("Int", n_fields).collect();
+        let mut types = BTreeMap::new();
+        types.insert(
+            "MaxFit".to_string(),
+            td("MaxFit", vec![pos_variant("MaxFit", tys)]),
+        );
+        let layouts = build_layouts(&types).expect("payload_words at limit should build");
+        assert_eq!(
+            layouts["MaxFit"].variants[0].payload_words as usize,
+            1 + n_fields
+        );
     }
 
     #[test]
