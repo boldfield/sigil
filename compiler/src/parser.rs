@@ -1911,6 +1911,33 @@ mod tests {
     }
 
     #[test]
+    fn record_literal_in_call_arg_of_match_scrutinee() {
+        // `match f(Foo { x: 1 }) { ... }` — the match scrutinee sets
+        // `no_record_lits = true`, but the call's arg list restores
+        // the flag so the record literal parses. Pins the
+        // flag-reset-through-call-arg-list path in the compound
+        // match-scrutinee position (twin of the if-cond case above).
+        let prog = parse_ok(
+            "type Foo = { x: Int }\n\
+             fn tag(f: Foo) -> Int ![] { 1 }\n\
+             fn main() -> Int ![] { match tag(Foo { x: 1 }) { 1 => 10, _ => 20 } }\n",
+        );
+        let Item::Fn(ref main_fn) = prog.items[2] else {
+            panic!()
+        };
+        match main_fn.body.tail.as_ref().expect("tail") {
+            Expr::Match { scrutinee, .. } => match scrutinee.as_ref() {
+                Expr::Call { args, .. } => match &args[0] {
+                    Expr::RecordLit { name, .. } => assert_eq!(name, "Foo"),
+                    other => panic!("expected RecordLit arg, got {other:?}"),
+                },
+                other => panic!("expected Call scrutinee, got {other:?}"),
+            },
+            other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn pattern_var_binds_identifier() {
         // A bare identifier in pattern position becomes `Pattern::Var`.
         let p = parse_tail_pattern("x");

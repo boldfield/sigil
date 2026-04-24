@@ -356,6 +356,28 @@ pub const CATALOG: &[ErrorEntry] = &[
                       match p {\n  Pair(a, b) => use_parts(a, b),  // reference `a`, `b` directly\n}",
     },
     ErrorEntry {
+        code: "E0111",
+        short: "record literal / constructor application pending Plan A3 Task 38",
+        long: "Plan A3 Task 37 parses record literals (`Ctor { field: value, .. }`) \
+               and registers `type` declarations, but the nominal-type checker that \
+               resolves a constructor against its declared type ships in Task 38. \
+               Until Task 38 lands, any well-formed program that uses a record \
+               literal is rejected at typecheck with this staged diagnostic so \
+               later stages (elaborate, codegen) never see un-typechecked record \
+               data.\n\n\
+               This is an \"unimplemented feature\" error, not a user bug: the \
+               surface syntax is correct, but the compiler does not yet know how \
+               to verify that the field names and value types match the \
+               declaration. When Task 38 merges, this code path is removed — \
+               constructor resolution either succeeds or fails with a real \
+               type-mismatch diagnostic (E0120 family for Plan A3).\n\n\
+               If you hit this while working in Plan A3 v1, the workaround is to \
+               avoid record literals until Task 38 is complete. If you hit this \
+               after Task 38 has merged, it is a compiler bug — report it.",
+        fix_example: "// No user-side fix in Plan A3 v1. Wait for Task 38, or avoid\n\
+                      // record literals in the meantime.",
+    },
+    ErrorEntry {
         code: "E0401",
         short: "runtime arithmetic abort",
         long: "A division or modulo operation was performed with a zero \

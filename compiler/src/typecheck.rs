@@ -522,14 +522,17 @@ impl Tc {
             // resolution (look up `name` in the registered types,
             // check field names and value types, return the sum
             // type). For task 37, any program using this syntax is
-            // rejected with a temporary diagnostic so the pipeline
+            // rejected with a staged E0111 diagnostic so the pipeline
             // does not silently accept un-typechecked record data.
+            // E0001 is reserved for compiler-internal contract
+            // violations (see errors/catalog.rs); a user-reachable
+            // "not yet implemented" path must carry its own code.
             Expr::RecordLit { name, span, .. } => {
                 self.push_error(
-                    "E0001",
+                    "E0111",
                     span.clone(),
                     format!(
-                        "record literal `{name} {{ .. }}` requires Plan A3 task 38's nominal-type checker; not yet implemented"
+                        "record literal `{name} {{ .. }}` requires Plan A3 Task 38's nominal-type checker; not yet implemented"
                     ),
                 );
                 None
@@ -1370,6 +1373,10 @@ mod tests {
             "fn main() -> Int ![] { let n: Int = match 0 { 0 => 1, _ => \"x\" }; 0 }\n",
             "fn main() -> Int ![] { let n: Int = match 0 { 0 => 1, 1 => 2 }; 0 }\n",
             "fn main() -> Int ![] { let n: Int = match true { true => 1 }; 0 }\n",
+            // Plan A3 task 37: record literal is a user-reachable surface
+            // form whose typecheck stub lives behind E0111, not E0001.
+            // Review of PR #12 flagged the original E0001 regression here.
+            "type Point = { x: Int, y: Int }\nfn main() -> Int ![] { let p: Int = Point { x: 1, y: 2 }; 0 }\n",
         ];
         for src in programs {
             let errs = pipeline(src);
