@@ -92,6 +92,16 @@ pub struct CheckedProgram {
     pub types: BTreeMap<String, TypeDecl>,
 }
 
+/// Where a constructor is registered. Indexes a `TypeDecl` in the
+/// program's types registry by type name + variant index (Plan A3 task
+/// 38.2). Lookup is O(1) so the checker doesn't rescan every type at
+/// each use site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtorInfo {
+    pub type_name: String,
+    pub variant_index: usize,
+}
+
 pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // Pre-pass 1 (Plan A3 task 38): build the nominal-type symbol table.
     // Must precede the fn-env pre-pass so a `fn f(o: Option) -> ...`
@@ -113,6 +123,37 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 ));
             } else {
                 types.insert(td.name.clone(), (**td).clone());
+            }
+        }
+    }
+
+    // Pre-pass 1b (Plan A3 task 38.2): build the constructor registry.
+    // Constructor names live in a single flat namespace across all
+    // user-defined types in v1; collisions are rejected with E0118 at
+    // the colliding variant's name span. The first declaration wins in
+    // the registry so downstream typing always picks a single canonical
+    // constructor per name.
+    let mut ctors: BTreeMap<String, CtorInfo> = BTreeMap::new();
+    for td in types.values() {
+        for (idx, v) in td.variants.iter().enumerate() {
+            if let Some(existing) = ctors.get(&v.name) {
+                errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0118"),
+                    v.name_span.clone(),
+                    format!(
+                        "constructor `{}` is already defined on type `{}`",
+                        v.name, existing.type_name
+                    ),
+                ));
+            } else {
+                ctors.insert(
+                    v.name.clone(),
+                    CtorInfo {
+                        type_name: td.name.clone(),
+                        variant_index: idx,
+                    },
+                );
             }
         }
     }
@@ -156,6 +197,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         fn_env,
         env: BTreeMap::new(),
         types,
+        ctors,
     };
     // E0112 sweep: any TypeExpr in an FnDecl signature that does not
     // resolve to a primitive or registered user type is reported against
@@ -273,6 +315,12 @@ struct Tc {
     /// top-level pre-pass before any fn body is checked so forward
     /// references resolve. Moved into `CheckedProgram.types` on exit.
     types: BTreeMap<String, TypeDecl>,
+    /// Constructor name -> (owning type name, variant index) index,
+    /// built alongside `types` from every `Item::Type`'s variants
+    /// (Plan A3 task 38.2). Duplicate names across types surface as
+    /// E0118 at pre-pass time; the first writer wins in the map.
+    /// Lookup is O(1) per use-site resolution.
+    ctors: BTreeMap<String, CtorInfo>,
 }
 
 impl Tc {
@@ -300,6 +348,295 @@ impl Tc {
                 ),
             );
         }
+    }
+
+    /// Plan A3 task 38.2 constructor resolution — bare identifier use.
+    ///
+    /// Called from `Expr::Ident` when `name` is a registered constructor.
+    /// A bare identifier can only apply a Unit variant (`None`, etc.);
+    /// positional and record variants require call / record-literal
+    /// syntax and produce E0115 "shape mismatch" from here.
+    ///
+    /// On success, emits the staged E0111 gate and returns
+    /// `Some(Ty::User(...))`. On shape mismatch, emits E0115 and
+    /// returns `None`.
+    fn resolve_ctor_unit_use(&mut self, name: &str, span: &Span) -> Option<Ty> {
+        let info = self.ctors.get(name).cloned()?;
+        let td = self.types.get(&info.type_name)?.clone();
+        let variant = &td.variants[info.variant_index];
+        match &variant.fields {
+            VariantFields::Unit => {
+                self.push_error(
+                    "E0111",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` (of type `{}`) is well-formed but codegen support lands in Plan A3 Task 41",
+                        info.type_name
+                    ),
+                );
+                Some(Ty::User(info.type_name))
+            }
+            VariantFields::Positional(params) => {
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` has {} positional field{}; apply with `{name}(...)` syntax",
+                        info.type_name,
+                        params.len(),
+                        if params.len() == 1 { "" } else { "s" }
+                    ),
+                );
+                None
+            }
+            VariantFields::Record(_) => {
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` has record fields; apply with `{name} {{ .. }}` syntax",
+                        info.type_name
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// Plan A3 task 38.2 constructor resolution — positional call form.
+    ///
+    /// Called from `Expr::Call` when the callee is an `Ident(name)` and
+    /// `name` is a registered constructor. Checks arity and per-argument
+    /// types against the variant's positional field list, emits E0043
+    /// on arity mismatch and E0044 on field-type mismatch (reusing the
+    /// existing call-site diagnostic vocabulary). E0115 fires when the
+    /// variant is Unit or Record.
+    ///
+    /// On success, emits the staged E0111 gate and returns
+    /// `Some(Ty::User(...))`. On shape mismatch, returns `None`.
+    fn resolve_ctor_positional_use(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        span: &Span,
+        row: &[String],
+    ) -> Option<Ty> {
+        let info = self.ctors.get(name).cloned()?;
+        let td = self.types.get(&info.type_name)?.clone();
+        let variant = &td.variants[info.variant_index];
+        // Always type-check each arg so user errors inside args still surface.
+        let arg_tys: Vec<Option<Ty>> = args.iter().map(|a| self.check_expr(a, row)).collect();
+        match &variant.fields {
+            VariantFields::Positional(param_tys) => {
+                let expected_tys: Vec<Option<Ty>> = param_tys
+                    .iter()
+                    .map(|t| ty_from_type_expr(t, &self.types))
+                    .collect();
+                if args.len() != param_tys.len() {
+                    self.push_error(
+                        "E0043",
+                        span.clone(),
+                        format!(
+                            "constructor `{name}` expects {} argument{}, got {}",
+                            param_tys.len(),
+                            if param_tys.len() == 1 { "" } else { "s" },
+                            args.len()
+                        ),
+                    );
+                }
+                for (i, (arg_ty, exp)) in arg_tys.iter().zip(expected_tys.iter()).enumerate() {
+                    match (arg_ty, exp) {
+                        (Some(a), Some(e)) if a != e => {
+                            let arg_span =
+                                args.get(i).map(Expr::span).unwrap_or_else(|| span.clone());
+                            self.push_error(
+                                "E0044",
+                                arg_span,
+                                format!(
+                                    "constructor `{name}` field {i} has type `{}` but argument has type `{}`",
+                                    ty_display(e),
+                                    ty_display(a),
+                                ),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                self.push_error(
+                    "E0111",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` (of type `{}`) is well-formed but codegen support lands in Plan A3 Task 41",
+                        info.type_name
+                    ),
+                );
+                Some(Ty::User(info.type_name))
+            }
+            VariantFields::Unit => {
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` is nullary; apply as a bare identifier (no parens)",
+                        info.type_name
+                    ),
+                );
+                None
+            }
+            VariantFields::Record(_) => {
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` has record fields; apply with `{name} {{ .. }}` syntax",
+                        info.type_name
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// Plan A3 task 38.2 constructor resolution — record literal form.
+    ///
+    /// Called from `Expr::RecordLit`. Checks that each declared field
+    /// is provided exactly once and that each supplied value has the
+    /// declared field type. Emits E0114 on unknown field, E0115 on
+    /// missing / duplicate field or shape mismatch, E0044 on value-type
+    /// mismatch. Evaluates every provided value regardless so errors
+    /// inside field values still surface.
+    ///
+    /// On success, emits the staged E0111 gate and returns
+    /// `Some(Ty::User(...))`. On failure (including unknown ctor
+    /// name), returns `None`.
+    fn resolve_ctor_record_use(
+        &mut self,
+        name: &str,
+        fields: &[RecordFieldLit],
+        span: &Span,
+        row: &[String],
+    ) -> Option<Ty> {
+        let info = match self.ctors.get(name).cloned() {
+            Some(i) => i,
+            None => {
+                // Still evaluate field values so errors inside them surface.
+                for f in fields {
+                    let _ = self.check_expr(&f.value, row);
+                }
+                self.push_error(
+                    "E0114",
+                    span.clone(),
+                    format!(
+                        "unknown constructor `{name}` — no `type` declaration has this variant"
+                    ),
+                );
+                return None;
+            }
+        };
+        let td = self.types.get(&info.type_name)?.clone();
+        let variant = &td.variants[info.variant_index];
+        let declared: Vec<RecordFieldDecl> = match &variant.fields {
+            VariantFields::Record(fs) => fs.clone(),
+            VariantFields::Unit => {
+                for f in fields {
+                    let _ = self.check_expr(&f.value, row);
+                }
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` is nullary; apply as a bare identifier (no braces)",
+                        info.type_name
+                    ),
+                );
+                return None;
+            }
+            VariantFields::Positional(_) => {
+                for f in fields {
+                    let _ = self.check_expr(&f.value, row);
+                }
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` has positional fields; apply with `{name}(...)` syntax",
+                        info.type_name
+                    ),
+                );
+                return None;
+            }
+        };
+        // Check duplicate field names in the literal itself.
+        let mut seen_in_lit: BTreeMap<String, Span> = BTreeMap::new();
+        for f in fields {
+            if let Some(first) = seen_in_lit.get(&f.name).cloned() {
+                self.push_error(
+                    "E0115",
+                    f.span.clone(),
+                    format!(
+                        "constructor `{name}` got duplicate field `{}` (first occurrence at {}:{})",
+                        f.name, first.line, first.column
+                    ),
+                );
+            } else {
+                seen_in_lit.insert(f.name.clone(), f.span.clone());
+            }
+        }
+        // Check each supplied field's value type against the declared
+        // field's type.
+        for f in fields {
+            let v_ty = self.check_expr(&f.value, row);
+            let Some(decl) = declared.iter().find(|d| d.name == f.name) else {
+                self.push_error(
+                    "E0115",
+                    f.span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` has no field `{}`",
+                        info.type_name, f.name
+                    ),
+                );
+                continue;
+            };
+            let Some(exp) = ty_from_type_expr(&decl.ty, &self.types) else {
+                continue;
+            };
+            if let Some(vt) = v_ty {
+                if vt != exp {
+                    self.push_error(
+                        "E0044",
+                        f.value.span(),
+                        format!(
+                            "constructor `{name}` field `{}` has type `{}` but value has type `{}`",
+                            f.name,
+                            ty_display(&exp),
+                            ty_display(&vt),
+                        ),
+                    );
+                }
+            }
+        }
+        // Check that every declared field is supplied.
+        for d in &declared {
+            if !fields.iter().any(|f| f.name == d.name) {
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` is missing field `{}`",
+                        info.type_name, d.name
+                    ),
+                );
+            }
+        }
+        self.push_error(
+            "E0111",
+            span.clone(),
+            format!(
+                "constructor `{name}` (of type `{}`) is well-formed but codegen support lands in Plan A3 Task 41",
+                info.type_name
+            ),
+        );
+        Some(Ty::User(info.type_name))
     }
 
     /// Insert a binding into the current function's environment.
@@ -507,6 +844,14 @@ impl Tc {
                 // lets `let foo: Int = ...` locally shadow a
                 // top-level `fn foo() -> ...` without `env_insert`'s
                 // debug-assert tripping (see PR #6 review).
+                //
+                // Plan A3 task 38.2: if the name isn't bound to a
+                // value or top-level fn, check the ctor registry —
+                // a nullary variant (`None`) surfaces as a bare
+                // identifier. Positional / record variants here
+                // fire E0115 "shape mismatch". Value bindings always
+                // win; a user who writes `let None = ...` keeps the
+                // local in scope for this identifier's span.
                 match self
                     .env
                     .get(name)
@@ -515,16 +860,36 @@ impl Tc {
                 {
                     Some(ty) => Some(ty),
                     None => {
-                        self.push_error(
-                            "E0046",
-                            span.clone(),
-                            format!("unknown identifier `{name}`"),
-                        );
-                        None
+                        if self.ctors.contains_key(name) {
+                            self.resolve_ctor_unit_use(name, span)
+                        } else {
+                            self.push_error(
+                                "E0046",
+                                span.clone(),
+                                format!("unknown identifier `{name}`"),
+                            );
+                            None
+                        }
                     }
                 }
             }
-            Expr::Call { callee, args, span } => self.check_call(callee, args, span.clone(), row),
+            Expr::Call { callee, args, span } => {
+                // Plan A3 task 38.2: intercept Ctor(args...) before
+                // the generic callee-as-function path. An Ident
+                // callee whose name is a registered ctor resolves
+                // as a constructor application; anything else falls
+                // through to `check_call` for the ordinary fn-call
+                // rules (E0046 / E0068 / E0043 / E0044 / E0042).
+                if let Expr::Ident(name, _) = callee.as_ref() {
+                    if self.ctors.contains_key(name)
+                        && !self.env.contains_key(name)
+                        && !self.fn_env.contains_key(name)
+                    {
+                        return self.resolve_ctor_positional_use(name, args, span, row);
+                    }
+                }
+                self.check_call(callee, args, span.clone(), row)
+            }
             Expr::Perform(p) => {
                 self.check_perform(p, row);
                 Some(Ty::Unit)
@@ -604,25 +969,14 @@ impl Tc {
             Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
                 unreachable!("typecheck: closure-conversion nodes should not appear pre-CC")
             }
-            // Plan A3 task 37: record literal `Ctor { f: v, ... }`.
-            // Task 38 replaces this stub with real nominal-type
-            // resolution (look up `name` in the registered types,
-            // check field names and value types, return the sum
-            // type). For task 37, any program using this syntax is
-            // rejected with a staged E0111 diagnostic so the pipeline
-            // does not silently accept un-typechecked record data.
-            // E0001 is reserved for compiler-internal contract
-            // violations (see errors/catalog.rs); a user-reachable
-            // "not yet implemented" path must carry its own code.
-            Expr::RecordLit { name, span, .. } => {
-                self.push_error(
-                    "E0111",
-                    span.clone(),
-                    format!(
-                        "record literal `{name} {{ .. }}` requires Plan A3 Task 38's nominal-type checker; not yet implemented"
-                    ),
-                );
-                None
+            // Plan A3 task 38.2: record literal `Ctor { f: v, ... }`.
+            // Resolves the constructor name in the ctor registry,
+            // checks field names and value types against the declared
+            // record variant, and emits the staged E0111 gate on
+            // success (removed when Task 41 ships codegen). E0114 /
+            // E0115 / E0044 cover the various failure modes.
+            Expr::RecordLit { name, fields, span } => {
+                self.resolve_ctor_record_use(name, fields, span, row)
             }
         }
     }
@@ -2079,5 +2433,181 @@ mod tests {
             !errs.iter().any(|e| e.code.as_str() == "E0001"),
             "unexpected E0001: {errs:?}"
         );
+    }
+
+    // ===== Plan A3 Task 38.2 — constructor resolution =====
+
+    #[test]
+    fn nullary_ctor_bare_ident_fires_e0111_and_resolves_type() {
+        // `None` as an expression is a bare ctor ident. Resolves to
+        // Ty::User("Option"); E0111 gates the compile.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = None; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0111"),
+            "expected E0111 gate, got: {errs:?}"
+        );
+        // Must NOT fire E0046 for `None` — we resolved it to a ctor.
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0046"),
+            "unexpected E0046: {errs:?}"
+        );
+        // Must NOT fire E0045 (let type mismatch) — the ctor's type
+        // matches the declared `Option` lhs.
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0045"),
+            "unexpected E0045: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn positional_ctor_call_fires_e0111_and_resolves_type() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = Some(42); 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0111"), "expected E0111, got: {errs:?}");
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0045"),
+            "unexpected E0045: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn record_ctor_literal_fires_e0111_and_resolves_type() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point { x: 1, y: 2 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0111"), "expected E0111, got: {errs:?}");
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0045"),
+            "unexpected E0045: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_record_ctor_is_e0114() {
+        let src = "fn main() -> Int ![] { let p: Int = Missing { x: 1 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0114"), "expected E0114, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_arity_mismatch_is_e0043() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = Some(1, 2); 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0043"), "expected E0043, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_arg_type_mismatch_is_e0044() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = Some(true); 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_missing_field_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point { x: 1 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_unknown_field_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point { x: 1, y: 2, z: 3 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_duplicate_field_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point { x: 1, x: 2, y: 3 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_field_value_type_mismatch_is_e0044() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point { x: 1, y: true }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
+    }
+
+    #[test]
+    fn nullary_ctor_with_parens_is_e0115() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = None(); 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_as_positional_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point(1, 2); 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_as_record_is_e0115() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = Some { inner: 1 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn duplicate_ctor_name_across_types_is_e0118() {
+        let src = "type Option = | None | Some(Int)\n\
+                   type Maybe = | Nothing | Some(Bool)\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0118"), "expected E0118, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_in_function_arg_typechecks() {
+        // Ctor call used as a function argument whose declared type
+        // matches. Exercises that `Some(42): Option` flows into the
+        // parameter type-check correctly.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn take(o: Option) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { take(Some(42)) }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0111"),
+            "expected E0111 gate, got: {errs:?}"
+        );
+        // No E0044 — Some(42) has type Option, matches the param.
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0044"),
+            "unexpected E0044: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn ctor_resolution_does_not_fire_e0001() {
+        // Sweep-style check: every well-formed ctor use surfaces the
+        // staged E0111 and nothing internal-compiler-error-shaped.
+        let programs = [
+            "type Option = | None | Some(Int)\nfn main() -> Int ![] { let o: Option = None; 0 }\n",
+            "type Option = | None | Some(Int)\nfn main() -> Int ![] { let o: Option = Some(1); 0 }\n",
+            "type Point = { x: Int, y: Int }\nfn main() -> Int ![] { let p: Point = Point { x: 1, y: 2 }; 0 }\n",
+        ];
+        for src in programs {
+            let errs = pipeline_checked(src).1;
+            assert!(
+                !errs.iter().any(|e| e.code.as_str() == "E0001"),
+                "program surfaced E0001: src={src:?} errs={errs:?}",
+            );
+        }
     }
 }

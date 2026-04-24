@@ -357,25 +357,33 @@ pub const CATALOG: &[ErrorEntry] = &[
     },
     ErrorEntry {
         code: "E0111",
-        short: "record literal / constructor application pending Plan A3 Task 38",
-        long: "Plan A3 Task 37 parses record literals (`Ctor { field: value, .. }`) \
-               and registers `type` declarations, but the nominal-type checker that \
-               resolves a constructor against its declared type ships in Task 38. \
-               Until Task 38 lands, any well-formed program that uses a record \
-               literal is rejected at typecheck with this staged diagnostic so \
-               later stages (elaborate, codegen) never see un-typechecked record \
-               data.\n\n\
-               This is an \"unimplemented feature\" error, not a user bug: the \
-               surface syntax is correct, but the compiler does not yet know how \
-               to verify that the field names and value types match the \
-               declaration. When Task 38 merges, this code path is removed — \
-               constructor resolution either succeeds or fails with a real \
-               type-mismatch diagnostic (E0120 family for Plan A3).\n\n\
-               If you hit this while working in Plan A3 v1, the workaround is to \
-               avoid record literals until Task 38 is complete. If you hit this \
-               after Task 38 has merged, it is a compiler bug — report it.",
-        fix_example: "// No user-side fix in Plan A3 v1. Wait for Task 38, or avoid\n\
-                      // record literals in the meantime.",
+        short: "constructor application pending Plan A3 Task 41",
+        long: "Plan A3 Task 38 resolves constructor applications against \
+               registered user-defined types (both positional `Ctor(args)` and \
+               record `Ctor { fields }` forms, plus bare-identifier use for \
+               Unit variants). Task 41 implements the codegen side — heap \
+               allocation with the correct type header, discriminant store, \
+               and field population. Between Task 38's landing and Task 41's \
+               landing, this staged diagnostic fires at every successful \
+               constructor resolution so a well-formed user program stops at \
+               typecheck and never reaches codegen's still-unreachable \
+               allocation path. The diagnostic disappears when Task 41 \
+               flips the gate.\n\n\
+               This is an \"unimplemented feature\" error, not a user bug: \
+               the surface syntax is correct and the constructor's fields \
+               and types agree with the declaration (otherwise E0114 or \
+               E0115 would have surfaced instead). The compiler rejects \
+               the program only because the downstream codegen pipeline \
+               cannot yet produce executable machine code for it.\n\n\
+               Fires at all three construction sites: bare Ident for Unit \
+               variants (`None`), positional Call for Positional variants \
+               (`Some(42)`), and record literal for Record variants \
+               (`Point { x: 1, y: 2 }`). Deconstruction sites (patterns \
+               in a `match`) do not emit E0111 in Task 38 — they only \
+               typecheck into structural information; codegen wires them \
+               up in Task 41's decision-tree lowerer.",
+        fix_example: "// No user-side fix in Plan A3 v1 between Tasks 38 and 41.\n\
+                      // Track PR #12 for the flip-commit that removes this gate.",
     },
     ErrorEntry {
         code: "E0112",
@@ -398,6 +406,66 @@ pub const CATALOG: &[ErrorEntry] = &[
         fix_example: "// Declare the type before (or after) using it:\n\
                       type Option = | None | Some(Int)\n\
                       fn unwrap_or(o: Option, d: Int) -> Int ![] { d }",
+    },
+    ErrorEntry {
+        code: "E0114",
+        short: "unknown constructor",
+        long: "A constructor application referenced a name that does not belong \
+               to any registered user-defined type's variant list. Plan A3 \
+               registers constructor names in a single flat namespace across \
+               all `type` declarations in the program; a missing `type` decl, \
+               a typo in the constructor name, or a constructor defined in a \
+               separate file (imports are Plan A1 stdlib-only) all trip this \
+               diagnostic.\n\n\
+               E0114 fires regardless of how the constructor is applied: \
+               bare identifier (for nullary constructors), `Foo(args)` \
+               positional call, or `Foo { fields }` record form. If the \
+               constructor exists under a different name, or if the call \
+               shape doesn't match the declared shape, E0115 surfaces that \
+               distinct problem.",
+        fix_example: "type Option = | None | Some(Int)\n\
+                      fn f() -> Option ![] { Some(1) }  // Some is a registered ctor\n\n\
+                      // NOT:\n\
+                      // fn g() -> Option ![] { Maybe(1) }  // E0114: Maybe unknown",
+    },
+    ErrorEntry {
+        code: "E0115",
+        short: "constructor application shape mismatch",
+        long: "A constructor application used a form (bare identifier, \
+               positional call, record literal) that does not match the \
+               constructor's declared variant shape. Each variant declares \
+               exactly one shape in its `type` declaration:\n\n\
+               - Unit variants (`| None`) apply as bare identifiers: `None`.\n\
+               - Positional variants (`| Some(Int)`) apply as function-call \
+                 syntax: `Some(42)`.\n\
+               - Record variants (`| Point { x: Int, y: Int }`) apply as \
+                 record-literal syntax: `Point { x: 1, y: 2 }`.\n\n\
+               E0115 also fires on positional-arity mismatch (wrong number \
+               of arguments for a positional variant) and on record-field \
+               mismatches (missing, unknown, or duplicate field name for a \
+               record variant). The mismatch kind is named in the message.",
+        fix_example: "type Point = { x: Int, y: Int }\n\
+                      // p: Point = Point(1, 2);   // E0115: record shape expected\n\
+                      // p: Point = Point { x: 1 }; // E0115: missing field `y`\n\
+                      let p: Point = Point { x: 1, y: 2 };  // correct",
+    },
+    ErrorEntry {
+        code: "E0118",
+        short: "duplicate constructor name across types",
+        long: "Two user-defined types declared variants with the same \
+               constructor name. Plan A3 registers constructor names in a \
+               single flat namespace across all `type` declarations; a \
+               constructor name like `Some` therefore belongs to exactly \
+               one type program-wide.\n\n\
+               Rename one of the colliding variants. Future plans may \
+               introduce path-qualified syntax (`Option::Some`) to \
+               disambiguate, but v1 keeps the surface flat to match the \
+               rest of the identifier namespace.",
+        fix_example: "type Option = | None | Some(Int)\n\
+                      type Result = | Ok(Int) | Err(String)    // different names, fine\n\n\
+                      // NOT:\n\
+                      // type Option = | None | Some(Int)\n\
+                      // type Maybe = | Nothing | Some(Int)  // E0118: Some collides",
     },
     ErrorEntry {
         code: "E0113",
