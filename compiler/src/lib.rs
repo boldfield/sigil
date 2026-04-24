@@ -17,6 +17,7 @@ pub mod color;
 pub mod cps;
 pub mod elaborate;
 pub mod errors;
+pub mod layout;
 pub mod lexer;
 pub mod link;
 pub mod monomorphize;

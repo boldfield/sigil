@@ -240,3 +240,146 @@ closure capture (`compose`'s body-lambda captures both `f` and `g`)
 and a call-of-a-call at the application site. A valid A2-only
 approximation using nested IIFEs is not accepted because it doesn't
 define `compose` as a first-class higher-order function.
+
+## P11 — length of a cons-list via recursive match
+
+**Prompt:** Declare `type List = | Nil | Cons(Int, List)`. Declare
+`fn length(xs: List) -> Int ![] { match xs { Nil => 0, Cons(_, rest)
+=> 1 + length(rest), } }`. In `main`, build the list `Cons(10,
+Cons(20, Cons(30, Nil)))`, call `length` on it, convert the result
+via `int_to_string`, print via `perform IO.println`, and return `0`.
+
+**Oracle (stdout):**
+```
+3
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises Plan A3's new nominal sum-type
+machinery end-to-end: the `type` decl allocates a per-program tag
+(0x10+), constructor application `Cons(..)` synthesises a
+`sigil_alloc` call with the right payload-word count and pointer
+bitmap (bit for `List` pointer field set; bit for `Int` field clear,
+plus bit 0 for the discriminant word is clear by convention), the
+`match` arms become a discriminant test then a field load, and the
+recursive `length(rest)` call lands the closure-calling-convention
+path on a user-declared function carrying a user-typed parameter.
+`Nil` is a nullary constructor pattern — the parser emits
+`Pattern::Var("Nil")` and the typechecker reinterprets it against
+`length`'s scrutinee type. The wildcard `_` in `Cons(_, rest)` binds
+no variable; `rest` is a fresh variable pattern.
+
+## P12 — sum of a cons-list
+
+**Prompt:** Reuse the `type List = | Nil | Cons(Int, List)` from P11
+(or declare it again in-file). Declare `fn sum(xs: List) -> Int ![] {
+match xs { Nil => 0, Cons(x, rest) => x + sum(rest), } }`. In
+`main`, build `Cons(1, Cons(2, Cons(3, Cons(4, Cons(5, Nil)))))`,
+call `sum` on it, convert via `int_to_string`, print via `perform
+IO.println`, return `0`.
+
+**Oracle (stdout):**
+```
+15
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Same machinery as P11 but the `Cons` arm now
+destructures the head field into a variable. Exercises that each
+constructor-pattern positional slot can bind a distinct fresh
+variable that is in scope for the arm body. The arm-body expression
+is `Binary { op: Add, .. }` which the elaborator already ANF-
+flattens for binary operators, so the recursive call `sum(rest)`
+becomes a hoisted `let $elab_tN: Int = sum(rest);` pre-existing
+in the A2 pipeline — Plan A3 just preserves that shape past its
+new pattern-desugaring step.
+
+## P13 — Option-returning safe lookup
+
+**Prompt:** Declare `type List = | Nil | Cons(Int, List)` and `type
+Option = | None | Some(Int)`. Declare `fn lookup(xs: List, i: Int) ->
+Option ![] { match xs { Nil => None, Cons(x, rest) => if i == 0 {
+Some(x) } else { lookup(rest, i - 1) }, } }`. Declare `fn
+describe(o: Option) -> String ![] { match o { None => "not found",
+Some(n) => int_to_string(n), } }`. In `main`, build `Cons(100,
+Cons(200, Cons(300, Nil)))`, call `lookup(..., 1)` to get the
+second element, call `describe` on the result, `perform IO.println`
+the resulting string, return `0`.
+
+**Oracle (stdout):**
+```
+200
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Demonstrates two sum types in the same program
+(each gets its own type tag) and two matches (one scrutinee is
+`List`, one is `Option`). Exhaustiveness must accept
+`None => ..., Some(n) => ...` as complete over `Option`'s variant
+set without a wildcard. The nested `if/else` inside `Cons`'s arm
+body desugars through the elaborator's existing A2 `if → match on
+Bool` pass, independent of the outer match on `List`.
+
+## P14 — 2D-point record with Euclidean-ish distance
+
+**Prompt:** Declare `type Point = { x: Int, y: Int }` (single-
+constructor record shorthand). Declare `fn sq(n: Int) -> Int ![] {
+n * n }` and `fn dist_sq(p: Point, q: Point) -> Int ![] { match p
+{ Point { x: px, y: py } => match q { Point { x: qx, y: qy } =>
+sq(px - qx) + sq(py - qy), }, } }` (two nested matches because
+Plan A3 has no field-access syntax — destructuring is the only way
+to read record fields). In `main`, build `Point { x: 0, y: 0 }` and
+`Point { x: 3, y: 4 }`, call `dist_sq` on them, convert via
+`int_to_string`, print, return `0`.
+
+**Oracle (stdout):**
+```
+25
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** The record shorthand produces a single-variant
+sum type whose variant's name equals the type name (`Point`). The
+match on a single-variant type is exhaustive with one arm. Record
+constructor patterns use rename syntax (`x: px`) to separate the
+field name from the binding name. Plan A3 intentionally omits
+field-access syntax (`p.x`) — matching / destructuring is the only
+field read primitive, and doubly so for types that might grow into
+multi-variant sums in a later plan revision. If field-access syntax
+arrives in a later plan, the oracle body may be rewritten to
+`sq(p.x - q.x) + sq(p.y - q.y)` — either form is accepted once
+both surface forms exist.
+
+## P15 — map a function over a cons-list
+
+**Prompt:** Reuse `type List = | Nil | Cons(Int, List)` from P11.
+Declare `fn map_inc(xs: List) -> List ![] { match xs { Nil => Nil,
+Cons(x, rest) => Cons(x + 1, map_inc(rest)), } }`. Declare `fn
+sum(xs: List) -> Int ![] { match xs { Nil => 0, Cons(x, rest) => x
++ sum(rest), } }`. In `main`, build `Cons(10, Cons(20, Cons(30,
+Nil)))`, pass through `map_inc`, call `sum` on the result (which
+should be `11 + 21 + 31 = 63`), `int_to_string`, print, return `0`.
+
+**Oracle (stdout):**
+```
+63
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Approximation of the classical `map` under
+Plan A3's lack of higher-order generics — the incrementing function
+is hard-coded into `map_inc`'s arm body. A proper `map: (List, (Int)
+-> Int ![]) -> List ![]` requires `TypeExpr::Fn` surface syntax
+(first widely useful in Plan A3 via the `[PLAN-A3]` deferral from
+P09/P10) AND generic list types (deferred to Plan B). The semantic
+target here is that each arm of a recursive function can both
+destructure an input sum-type and allocate a fresh constructor of
+the same type — exercising that constructor allocation is a full
+`sigil_alloc` call at every recursive step, not a borrow / pointer
+reuse (aligned with Plan A3's "no interior pointers" discipline
+from the design doc).

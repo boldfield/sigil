@@ -10,6 +10,13 @@
 //!   not distinguish unary from binary `-`; the parser does.
 //! - Character literals: `'x'`, with `\n`, `\t`, `\r`, `\\`, `\'` escapes.
 //!
+//! Stage-4 additions (plan A3 task 36):
+//! - Keyword: `type`.
+//! - Single-char token: `|` (bare `Pipe`). Two-char `||` still wins
+//!   under longest-match; bare `|` only lexes when the next byte is
+//!   not `|`. Used by `type` decls to separate constructors in
+//!   `type Foo = | Ctor | Ctor(T)`.
+//!
 //! Unknown characters produce `E0010` at the position of the offending byte.
 //! Every token carries a `Span` back to the source.
 
@@ -28,6 +35,8 @@ pub enum TokenKind {
     If,
     Else,
     Match,
+    // Stage-4 (plan A3 task 36).
+    Type,
 
     // atoms
     Ident(String),
@@ -66,6 +75,9 @@ pub enum TokenKind {
     AndAnd,
     OrOr,
     FatArrow,
+    // Stage-4 (plan A3 task 36). Single `|`; `||` lexes as `OrOr`
+    // under the two-char-lookahead path above.
+    Pipe,
 
     Eof,
 }
@@ -112,6 +124,7 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
                 "if" => TokenKind::If,
                 "else" => TokenKind::Else,
                 "match" => TokenKind::Match,
+                "type" => TokenKind::Type,
                 _ => TokenKind::Ident(ident),
             };
             tokens.push(Token {
@@ -272,6 +285,7 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
             '%' => Some(TokenKind::Percent),
             '<' => Some(TokenKind::Lt),
             '>' => Some(TokenKind::Gt),
+            '|' => Some(TokenKind::Pipe),
             _ => None,
         };
         if let Some(kind) = single {
@@ -711,5 +725,68 @@ mod tests {
         let (_toks, errs) = lex("x.sigil", "'ab'");
         assert!(!errs.is_empty());
         assert_eq!(errs[0].code.as_str(), "E0010");
+    }
+
+    // ===== Plan A3 task 36 — Stage-4 tokens =========================
+
+    #[test]
+    fn type_keyword_lexes_as_keyword() {
+        let (toks, errs) = lex("x.sigil", "type Foo = Bar");
+        assert!(errs.is_empty(), "{errs:?}");
+        use TokenKind::*;
+        let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
+        assert!(matches!(ks.first(), Some(Type)));
+        // `Foo` is still an Ident; only the keyword is reserved.
+        assert!(ks.contains(&Ident("Foo".into())));
+    }
+
+    #[test]
+    fn bare_pipe_lexes_as_pipe() {
+        // `|` alone, not `||`. Used to separate sum-type variants in
+        // `type Name = | Ctor | Ctor(T)`.
+        let (toks, errs) = lex("x.sigil", "| a | b");
+        assert!(errs.is_empty(), "{errs:?}");
+        use TokenKind::*;
+        let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
+        assert_eq!(
+            ks,
+            vec![Pipe, Ident("a".into()), Pipe, Ident("b".into()), Eof],
+        );
+    }
+
+    #[test]
+    fn double_pipe_still_lexes_as_oror() {
+        // Regression: after adding bare `|` as Pipe, the OrOr
+        // two-char lookahead must still win for `||`.
+        let (toks, errs) = lex("x.sigil", "a || b");
+        assert!(errs.is_empty(), "{errs:?}");
+        use TokenKind::*;
+        let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
+        assert!(ks.contains(&OrOr));
+        assert!(!ks.contains(&Pipe));
+    }
+
+    #[test]
+    fn type_decl_skeleton_tokenises_cleanly() {
+        // Full `type` decl skeleton: keyword, ident, `=`, pipes, idents,
+        // parens, commas. No errors.
+        let (toks, errs) = lex("x.sigil", "type Option = | None | Some(Int)");
+        assert!(errs.is_empty(), "{errs:?}");
+        use TokenKind::*;
+        let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
+        let expected = vec![
+            Type,
+            Ident("Option".into()),
+            Eq,
+            Pipe,
+            Ident("None".into()),
+            Pipe,
+            Ident("Some".into()),
+            LParen,
+            Ident("Int".into()),
+            RParen,
+            Eof,
+        ];
+        assert_eq!(ks, expected);
     }
 }

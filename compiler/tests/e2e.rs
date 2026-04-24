@@ -540,3 +540,111 @@ fn nested_iife_transitive_capture() {
         "x=7 threaded through outer closure; inner adds y=3 -> 10"
     );
 }
+
+// ===== Plan A3 Task 42 — user-defined sum types + pattern matching ==========
+
+/// `examples/option_demo.sigil` — the canonical Plan A3 end-to-end
+/// example. Declares `type Option = | None | Some(Int)`, writes a
+/// match-based `unwrap_or`, and prints two results. Exercises both
+/// Unit and Positional variant allocation (task 41.1) plus the match
+/// decision-tree lowerer (task 41.2): discriminant compare + field
+/// load for `Some(n)` and nullary-ctor promotion for `None`.
+#[test]
+fn option_demo_example_prints_42_and_minus_one() {
+    let root = workspace_root();
+    let source = root.join("examples/option_demo.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "option_demo_example");
+    assert_eq!(code, 0, "option_demo.sigil exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n-1\n",
+        "option_demo.sigil stdout must print unwrap_or(Some(42), 0) and unwrap_or(None, -1)"
+    );
+}
+
+// ===== Plan A3 Tasks 43 + 44 — recursive sum-type + perf floor ==============
+
+/// `examples/tree.sigil` — recursive sum type with nested constructor
+/// patterns. `sum_tree(build(15))` folds across a depth-15 full binary
+/// tree (65,535 nodes total, 32,767 internal) and prints the exact sum
+/// `2^15 - 1 = 32767`. Both the correctness assertion (Task 43) and
+/// the 500ms wall-clock bound (Task 44) are pinned here so the single
+/// example carries both plan-level invariants.
+///
+/// The bound is a normative acceptance criterion from the plan; a flake
+/// should land as a DEVIATION entry, not a silent relaxation.
+#[test]
+fn tree_example_prints_32767_under_500ms() {
+    let root = workspace_root();
+    let source = root.join("examples/tree.sigil");
+    let (stdout, stderr, code, elapsed) = compile_file_and_run_timed(&source, "tree_example");
+    assert_eq!(code, 0, "tree.sigil exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "32767\n",
+        "tree.sigil stdout must be exactly \"32767\\n\" (sum of a full depth-15 tree with 1 at every internal node)"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "tree.sigil wall-clock {elapsed:?} exceeds the 500ms Plan A3 floor",
+    );
+}
+
+// ===== Plan A3 Task 45 — E0120 non-exhaustive-match regression ==============
+
+/// Compile a deliberately non-exhaustive `match` on `Option` with
+/// `--human-errors` and assert the compile failure surfaces E0120 plus
+/// the counterexample witness `None` in stderr. This pins both the
+/// code-emission path (which Plan B refines) and the witness-string
+/// generator (Task 38.4) against silent regression.
+#[test]
+fn e0120_non_exhaustive_match_names_witness_in_stderr() {
+    let source = "type Option = | None | Some(Int)\n\
+                  fn f(o: Option) -> Int ![] {\n  \
+                    match o {\n    \
+                      Some(n) => n,\n  \
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![] { 0 }\n";
+
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_e0120_non_exhaustive_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_e0120_non_exhaustive_{}",
+        std::process::id()
+    ));
+
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+    let compile = Command::new(&sigil_bin)
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .current_dir(&root)
+        .output()
+        .expect("failed to invoke sigil compiler");
+
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+
+    assert!(
+        !compile.status.success(),
+        "compile must fail for a non-exhaustive Option match; stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        stderr.contains("E0120"),
+        "stderr missing E0120 code: {stderr}"
+    );
+    // The witness string names the uncovered variant. `None` is a Unit
+    // variant so the witness is the bare constructor name (no
+    // parentheses / braces).
+    assert!(
+        stderr.contains("None"),
+        "stderr missing witness `None`: {stderr}"
+    );
+}

@@ -1,0 +1,35 @@
+// examples/option_demo.sigil
+//
+// Plan A3 Task 42: minimum surface form for user-defined sum types +
+// constructor application + pattern matching with exhaustiveness.
+//
+// Exercises the full Plan A3 pipeline end-to-end:
+//   - Task 36 lexer tokens (`type`, `|`).
+//   - Task 37 parser syntax (type decl, Positional ctor patterns, bare-
+//     ident Unit ctor patterns in expression + pattern position).
+//   - Task 38 typecheck (nominal `Ty::User("Option")`, pattern typing
+//     with Var binding `n`, top-level exhaustiveness across None/Some).
+//   - Task 40 runtime layout (tag 0x10 for Option; None = 1-word
+//     payload discriminant-only, Some = 2-word payload with Int field).
+//   - Task 41.1 ctor allocation (bare `None`, positional `Some(42)`).
+//   - Task 41.2 match decision-tree lowering (discriminant compare,
+//     field load at offset 16, Pattern::Var binding of `n` into env).
+//
+// Invariant: writes exactly "42\n-1\n" to stdout and exits 0.
+
+import std.io
+
+type Option = | None | Some(Int)
+
+fn unwrap_or(o: Option, d: Int) -> Int ![] {
+  match o {
+    None => d,
+    Some(n) => n,
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(int_to_string(unwrap_or(Some(42), 0)));
+  perform IO.println(int_to_string(unwrap_or(None, -1)));
+  0
+}

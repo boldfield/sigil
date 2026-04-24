@@ -12,7 +12,14 @@ use super::catalog::ErrorCode;
 /// Byte-offset source span inside a single file. Line/column pairs are
 /// 1-based, matching editor conventions. Both ends are inclusive at the
 /// start and exclusive at the end.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Ord`/`PartialOrd` are derived so `Span` can key a `BTreeMap` —
+/// Plan A3 task 41.2 keys the `CheckedProgram.match_scrut_tys` map by
+/// match-expression span to thread scrutinee types from typecheck into
+/// codegen. Ordering is lexicographic over the derived field order
+/// (`file`, then line/column quadruple); stability is incidental, the
+/// map usage does not rely on any particular order.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Span {
     pub file: String,
     pub line: u32,

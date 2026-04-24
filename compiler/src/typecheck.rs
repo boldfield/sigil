@@ -47,6 +47,12 @@ pub enum Ty {
     /// in a program are primitives, and boxing the fn case keeps the
     /// discriminant + payload fit into a register on 64-bit hosts.
     Fn(Box<FnSig>),
+    /// Nominal user-defined type introduced via `type Name = ...`
+    /// (Plan A3 task 38). Name equality is sufficient — type equality
+    /// is nominal in v1, not structural. The full declaration lives
+    /// in `CheckedProgram.types` keyed by the same name so downstream
+    /// passes (elaborate, codegen) can look up the variant layout.
+    User(String),
 }
 
 /// Structural function signature. Used in `Ty::Fn` and built for
@@ -77,16 +83,99 @@ pub struct CheckedProgram {
     /// in source-order of lambda appearance; the `Ty` for each capture
     /// is the type the name held in the outer scope at lambda-entry.
     pub lambda_captures: Vec<(Span, Vec<(String, Ty)>)>,
+    /// Nominal user-type symbol table (Plan A3 task 38). Keyed by the
+    /// type's declared name; the value is the full parser `TypeDecl` so
+    /// downstream passes (constructor resolution, pattern typing,
+    /// exhaustiveness, codegen layout) can inspect variants and field
+    /// shapes without re-scanning the program. Duplicate declarations
+    /// produce E0113 at check time and the first declaration wins here.
+    pub types: BTreeMap<String, TypeDecl>,
+    /// Plan A3 task 41.2: scrutinee `Ty` for every `Expr::Match` whose
+    /// scrutinee typechecked, keyed by the match expression's span.
+    /// Codegen reads this map to disambiguate `Pattern::Var(name)`
+    /// between a fresh binding and a nullary-constructor promotion —
+    /// a decision that requires knowing whether the scrutinee has type
+    /// `Ty::User(u)` whose variant registry lists `name` as a Unit
+    /// variant. Absent entries (malformed scrutinee, or a synthetic
+    /// match introduced by elaborate's if→match desugaring) let codegen
+    /// fall back to primitive-scalar dispatch.
+    pub match_scrut_tys: BTreeMap<Span, Ty>,
+}
+
+/// Where a constructor is registered. Indexes a `TypeDecl` in the
+/// program's types registry by type name + variant index (Plan A3 task
+/// 38.2). Lookup is O(1) so the checker doesn't rescan every type at
+/// each use site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtorInfo {
+    pub type_name: String,
+    pub variant_index: usize,
 }
 
 pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
-    // Pre-pass: build a global environment from every top-level
+    // Pre-pass 1 (Plan A3 task 38): build the nominal-type symbol table.
+    // Must precede the fn-env pre-pass so a `fn f(o: Option) -> ...`
+    // declaration can resolve `Option` to `Ty::User("Option")` when
+    // `Option` is declared further down in the file. Duplicate
+    // declarations record E0113 against the second (and subsequent)
+    // offender; the first declaration wins in the symbol table so
+    // downstream passes always see a single canonical variant set.
+    let mut types: BTreeMap<String, TypeDecl> = BTreeMap::new();
+    let mut errors: Vec<CompilerError> = Vec::new();
+    for item in &program.items {
+        if let Item::Type(td) = item {
+            if types.contains_key(&td.name) {
+                errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0113"),
+                    td.name_span.clone(),
+                    format!("duplicate type declaration `{}`", td.name),
+                ));
+            } else {
+                types.insert(td.name.clone(), (**td).clone());
+            }
+        }
+    }
+
+    // Pre-pass 1b (Plan A3 task 38.2): build the constructor registry.
+    // Constructor names live in a single flat namespace across all
+    // user-defined types in v1; collisions are rejected with E0118 at
+    // the colliding variant's name span. The first declaration wins in
+    // the registry so downstream typing always picks a single canonical
+    // constructor per name.
+    let mut ctors: BTreeMap<String, CtorInfo> = BTreeMap::new();
+    for td in types.values() {
+        for (idx, v) in td.variants.iter().enumerate() {
+            if let Some(existing) = ctors.get(&v.name) {
+                errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0118"),
+                    v.name_span.clone(),
+                    format!(
+                        "constructor `{}` is already defined on type `{}`",
+                        v.name, existing.type_name
+                    ),
+                ));
+            } else {
+                ctors.insert(
+                    v.name.clone(),
+                    CtorInfo {
+                        type_name: td.name.clone(),
+                        variant_index: idx,
+                    },
+                );
+            }
+        }
+    }
+
+    // Pre-pass 2: build a global environment from every top-level
     // `FnDecl`'s declared signature. This lets recursive and mutually-
     // recursive user functions reference each other by name during
     // `check_fn`'s body walk. Any `FnDecl` whose declared types don't
     // resolve to known `Ty`s is recorded with its best-effort partial
     // signature; the full diagnostic surfaces when the decl's own body
-    // is checked.
+    // is checked (E0112 at the offending `TypeExpr`, E0044 at mismatch
+    // sites with Unit fallback per E0112's documented behavior).
     //
     // Seeded first with language builtins (Plan A2 task 34):
     // `int_to_string(n: Int) -> String` exposes the runtime
@@ -102,9 +191,9 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 params: f
                     .params
                     .iter()
-                    .map(|p| ty_from_type_expr(&p.ty).unwrap_or(Ty::Unit))
+                    .map(|p| ty_from_type_expr(&p.ty, &types).unwrap_or(Ty::Unit))
                     .collect(),
-                ret: ty_from_type_expr(&f.return_type).unwrap_or(Ty::Unit),
+                ret: ty_from_type_expr(&f.return_type, &types).unwrap_or(Ty::Unit),
                 effects: f.effects.clone(),
             };
             fn_env.insert(f.name.clone(), Ty::Fn(Box::new(sig)));
@@ -112,16 +201,53 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     }
 
     let mut tc = Tc {
-        errors: Vec::new(),
+        errors,
         string_literals: Vec::new(),
         lambda_captures: Vec::new(),
         fn_env,
         env: BTreeMap::new(),
+        types,
+        ctors,
+        match_scrut_tys: BTreeMap::new(),
     };
+    // E0112 sweep: any TypeExpr in an FnDecl signature that does not
+    // resolve to a primitive or registered user type is reported against
+    // the TypeExpr's span. Runs after the types pre-pass so forward
+    // references are fine. The fn_env above already committed Unit as
+    // the fallback for unresolved types; this sweep attaches the real
+    // diagnostic so the user sees why.
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            for p in &f.params {
+                tc.check_type_expr_known(&p.ty);
+            }
+            tc.check_type_expr_known(&f.return_type);
+        }
+    }
     for item in &program.items {
         match item {
             Item::Fn(f) => tc.check_fn(f),
             Item::Import(_) => {}
+            // Plan A3 task 38: `Item::Type` declarations are registered
+            // in the pre-pass above. Here we validate that each field
+            // / positional variant's `TypeExpr` resolves.
+            Item::Type(td) => {
+                for v in &td.variants {
+                    match &v.fields {
+                        VariantFields::Unit => {}
+                        VariantFields::Positional(ts) => {
+                            for t in ts {
+                                tc.check_type_expr_known(t);
+                            }
+                        }
+                        VariantFields::Record(fs) => {
+                            for f in fs {
+                                tc.check_type_expr_known(&f.ty);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     let has_main = program
@@ -142,6 +268,8 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             program,
             string_literals: tc.string_literals,
             lambda_captures: tc.lambda_captures,
+            types: tc.types,
+            match_scrut_tys: tc.match_scrut_tys,
         },
         tc.errors,
     )
@@ -195,6 +323,20 @@ struct Tc {
     /// functions. A `BTreeMap` keeps iteration order stable (the
     /// catalog-integrity discipline).
     env: BTreeMap<String, Ty>,
+    /// Nominal user-type registry (Plan A3 task 38). Built by the
+    /// top-level pre-pass before any fn body is checked so forward
+    /// references resolve. Moved into `CheckedProgram.types` on exit.
+    types: BTreeMap<String, TypeDecl>,
+    /// Constructor name -> (owning type name, variant index) index,
+    /// built alongside `types` from every `Item::Type`'s variants
+    /// (Plan A3 task 38.2). Duplicate names across types surface as
+    /// E0118 at pre-pass time; the first writer wins in the map.
+    /// Lookup is O(1) per use-site resolution.
+    ctors: BTreeMap<String, CtorInfo>,
+    /// Mirror of `CheckedProgram.match_scrut_tys`, moved into the
+    /// checked program on typecheck completion. `check_match`
+    /// populates an entry when the scrutinee has a known `Ty`.
+    match_scrut_tys: BTreeMap<Span, Ty>,
 }
 
 impl Tc {
@@ -205,6 +347,284 @@ impl Tc {
             span,
             msg,
         ));
+    }
+
+    /// Emit E0112 against `t`'s span if the named type is neither a
+    /// Plan A2 primitive nor a registered user type. Idempotent in
+    /// effect: the caller's fallback treats unresolved names as
+    /// `Ty::Unit` so body-level type errors still surface.
+    fn check_type_expr_known(&mut self, t: &TypeExpr) {
+        if ty_from_type_expr(t, &self.types).is_none() {
+            let TypeExpr::Named(n, span) = t;
+            self.push_error(
+                "E0112",
+                span.clone(),
+                format!(
+                    "unknown type `{n}` (expected a primitive or a type declared via `type {n} = ...`)"
+                ),
+            );
+        }
+    }
+
+    /// Plan A3 task 38.2 constructor resolution — bare identifier use.
+    ///
+    /// Called from `Expr::Ident` when `name` is a registered constructor.
+    /// A bare identifier can only apply a Unit variant (`None`, etc.);
+    /// positional and record variants require call / record-literal
+    /// syntax and produce E0115 "shape mismatch" from here.
+    ///
+    /// On success returns `Some(Ty::User(...))`. On shape mismatch,
+    /// emits E0115 and returns `None`.
+    fn resolve_ctor_unit_use(&mut self, name: &str, span: &Span) -> Option<Ty> {
+        let info = self.ctors.get(name).cloned()?;
+        let td = self.types.get(&info.type_name)?.clone();
+        let variant = &td.variants[info.variant_index];
+        match &variant.fields {
+            VariantFields::Unit => Some(Ty::User(info.type_name)),
+            VariantFields::Positional(params) => {
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` has {} positional field{}; apply with `{name}(...)` syntax",
+                        info.type_name,
+                        params.len(),
+                        if params.len() == 1 { "" } else { "s" }
+                    ),
+                );
+                None
+            }
+            VariantFields::Record(_) => {
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` has record fields; apply with `{name} {{ .. }}` syntax",
+                        info.type_name
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// Plan A3 task 38.2 constructor resolution — positional call form.
+    ///
+    /// Called from `Expr::Call` when the callee is an `Ident(name)` and
+    /// `name` is a registered constructor. Checks arity and per-argument
+    /// types against the variant's positional field list, emits E0043
+    /// on arity mismatch and E0044 on field-type mismatch (reusing the
+    /// existing call-site diagnostic vocabulary). E0115 fires when the
+    /// variant is Unit or Record.
+    ///
+    /// On success returns `Some(Ty::User(...))`. On shape mismatch
+    /// returns `None`.
+    fn resolve_ctor_positional_use(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        span: &Span,
+        row: &[String],
+    ) -> Option<Ty> {
+        let info = self.ctors.get(name).cloned()?;
+        let td = self.types.get(&info.type_name)?.clone();
+        let variant = &td.variants[info.variant_index];
+        // Always type-check each arg so user errors inside args still surface.
+        let arg_tys: Vec<Option<Ty>> = args.iter().map(|a| self.check_expr(a, row)).collect();
+        match &variant.fields {
+            VariantFields::Positional(param_tys) => {
+                let expected_tys: Vec<Option<Ty>> = param_tys
+                    .iter()
+                    .map(|t| ty_from_type_expr(t, &self.types))
+                    .collect();
+                if args.len() != param_tys.len() {
+                    self.push_error(
+                        "E0043",
+                        span.clone(),
+                        format!(
+                            "constructor `{name}` expects {} argument{}, got {}",
+                            param_tys.len(),
+                            if param_tys.len() == 1 { "" } else { "s" },
+                            args.len()
+                        ),
+                    );
+                }
+                for (i, (arg_ty, exp)) in arg_tys.iter().zip(expected_tys.iter()).enumerate() {
+                    match (arg_ty, exp) {
+                        (Some(a), Some(e)) if a != e => {
+                            let arg_span =
+                                args.get(i).map(Expr::span).unwrap_or_else(|| span.clone());
+                            self.push_error(
+                                "E0044",
+                                arg_span,
+                                format!(
+                                    "constructor `{name}` field {i} has type `{}` but argument has type `{}`",
+                                    ty_display(e),
+                                    ty_display(a),
+                                ),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                Some(Ty::User(info.type_name))
+            }
+            VariantFields::Unit => {
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` is nullary; apply as a bare identifier (no parens)",
+                        info.type_name
+                    ),
+                );
+                None
+            }
+            VariantFields::Record(_) => {
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` has record fields; apply with `{name} {{ .. }}` syntax",
+                        info.type_name
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// Plan A3 task 38.2 constructor resolution — record literal form.
+    ///
+    /// Called from `Expr::RecordLit`. Checks that each declared field
+    /// is provided exactly once and that each supplied value has the
+    /// declared field type. Emits E0114 on unknown field, E0115 on
+    /// missing / duplicate field or shape mismatch, E0044 on value-type
+    /// mismatch. Evaluates every provided value regardless so errors
+    /// inside field values still surface.
+    ///
+    /// On success returns `Some(Ty::User(...))`. On failure (including
+    /// unknown ctor name), returns `None`.
+    fn resolve_ctor_record_use(
+        &mut self,
+        name: &str,
+        fields: &[RecordFieldLit],
+        span: &Span,
+        row: &[String],
+    ) -> Option<Ty> {
+        let info = match self.ctors.get(name).cloned() {
+            Some(i) => i,
+            None => {
+                // Still evaluate field values so errors inside them surface.
+                for f in fields {
+                    let _ = self.check_expr(&f.value, row);
+                }
+                self.push_error(
+                    "E0114",
+                    span.clone(),
+                    format!(
+                        "unknown constructor `{name}` — no `type` declaration has this variant"
+                    ),
+                );
+                return None;
+            }
+        };
+        let td = self.types.get(&info.type_name)?.clone();
+        let variant = &td.variants[info.variant_index];
+        let declared: Vec<RecordFieldDecl> = match &variant.fields {
+            VariantFields::Record(fs) => fs.clone(),
+            VariantFields::Unit => {
+                for f in fields {
+                    let _ = self.check_expr(&f.value, row);
+                }
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` is nullary; apply as a bare identifier (no braces)",
+                        info.type_name
+                    ),
+                );
+                return None;
+            }
+            VariantFields::Positional(_) => {
+                for f in fields {
+                    let _ = self.check_expr(&f.value, row);
+                }
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` has positional fields; apply with `{name}(...)` syntax",
+                        info.type_name
+                    ),
+                );
+                return None;
+            }
+        };
+        // Check duplicate field names in the literal itself.
+        let mut seen_in_lit: BTreeMap<String, Span> = BTreeMap::new();
+        for f in fields {
+            if let Some(first) = seen_in_lit.get(&f.name).cloned() {
+                self.push_error(
+                    "E0115",
+                    f.span.clone(),
+                    format!(
+                        "constructor `{name}` got duplicate field `{}` (first occurrence at {}:{})",
+                        f.name, first.line, first.column
+                    ),
+                );
+            } else {
+                seen_in_lit.insert(f.name.clone(), f.span.clone());
+            }
+        }
+        // Check each supplied field's value type against the declared
+        // field's type.
+        for f in fields {
+            let v_ty = self.check_expr(&f.value, row);
+            let Some(decl) = declared.iter().find(|d| d.name == f.name) else {
+                self.push_error(
+                    "E0115",
+                    f.span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` has no field `{}`",
+                        info.type_name, f.name
+                    ),
+                );
+                continue;
+            };
+            let Some(exp) = ty_from_type_expr(&decl.ty, &self.types) else {
+                continue;
+            };
+            if let Some(vt) = v_ty {
+                if vt != exp {
+                    self.push_error(
+                        "E0044",
+                        f.value.span(),
+                        format!(
+                            "constructor `{name}` field `{}` has type `{}` but value has type `{}`",
+                            f.name,
+                            ty_display(&exp),
+                            ty_display(&vt),
+                        ),
+                    );
+                }
+            }
+        }
+        // Check that every declared field is supplied.
+        for d in &declared {
+            if !fields.iter().any(|f| f.name == d.name) {
+                self.push_error(
+                    "E0115",
+                    span.clone(),
+                    format!(
+                        "constructor `{name}` of type `{}` is missing field `{}`",
+                        info.type_name, d.name
+                    ),
+                );
+            }
+        }
+        Some(Ty::User(info.type_name))
     }
 
     /// Insert a binding into the current function's environment.
@@ -251,7 +671,7 @@ impl Tc {
         // insert-collision and capture-analysis paths.
         self.env.clear();
         for p in &f.params {
-            if let Some(ty) = ty_from_type_expr(&p.ty) {
+            if let Some(ty) = ty_from_type_expr(&p.ty, &self.types) {
                 self.env_insert(p.name.clone(), ty);
             }
         }
@@ -325,7 +745,7 @@ impl Tc {
                     // the declaration rather than the inferred type so a
                     // type mismatch in the initializer doesn't cascade into
                     // spurious E0044/E0046 at downstream sites.
-                    if let Some(ty) = ty_from_type_expr(&l.ty) {
+                    if let Some(ty) = ty_from_type_expr(&l.ty, &self.types) {
                         self.env_insert(l.name.clone(), ty);
                     }
                 }
@@ -412,6 +832,14 @@ impl Tc {
                 // lets `let foo: Int = ...` locally shadow a
                 // top-level `fn foo() -> ...` without `env_insert`'s
                 // debug-assert tripping (see PR #6 review).
+                //
+                // Plan A3 task 38.2: if the name isn't bound to a
+                // value or top-level fn, check the ctor registry —
+                // a nullary variant (`None`) surfaces as a bare
+                // identifier. Positional / record variants here
+                // fire E0115 "shape mismatch". Value bindings always
+                // win; a user who writes `let None = ...` keeps the
+                // local in scope for this identifier's span.
                 match self
                     .env
                     .get(name)
@@ -420,16 +848,36 @@ impl Tc {
                 {
                     Some(ty) => Some(ty),
                     None => {
-                        self.push_error(
-                            "E0046",
-                            span.clone(),
-                            format!("unknown identifier `{name}`"),
-                        );
-                        None
+                        if self.ctors.contains_key(name) {
+                            self.resolve_ctor_unit_use(name, span)
+                        } else {
+                            self.push_error(
+                                "E0046",
+                                span.clone(),
+                                format!("unknown identifier `{name}`"),
+                            );
+                            None
+                        }
                     }
                 }
             }
-            Expr::Call { callee, args, span } => self.check_call(callee, args, span.clone(), row),
+            Expr::Call { callee, args, span } => {
+                // Plan A3 task 38.2: intercept Ctor(args...) before
+                // the generic callee-as-function path. An Ident
+                // callee whose name is a registered ctor resolves
+                // as a constructor application; anything else falls
+                // through to `check_call` for the ordinary fn-call
+                // rules (E0046 / E0068 / E0043 / E0044 / E0042).
+                if let Expr::Ident(name, _) = callee.as_ref() {
+                    if self.ctors.contains_key(name)
+                        && !self.env.contains_key(name)
+                        && !self.fn_env.contains_key(name)
+                    {
+                        return self.resolve_ctor_positional_use(name, args, span, row);
+                    }
+                }
+                self.check_call(callee, args, span.clone(), row)
+            }
             Expr::Perform(p) => {
                 self.check_perform(p, row);
                 Some(Ty::Unit)
@@ -508,6 +956,14 @@ impl Tc {
             // strictly before closure conversion.
             Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
                 unreachable!("typecheck: closure-conversion nodes should not appear pre-CC")
+            }
+            // Plan A3 task 38.2: record literal `Ctor { f: v, ... }`.
+            // Resolves the constructor name in the ctor registry and
+            // checks field names and value types against the declared
+            // record variant. E0114 / E0115 / E0044 cover the various
+            // failure modes.
+            Expr::RecordLit { name, fields, span } => {
+                self.resolve_ctor_record_use(name, fields, span, row)
             }
         }
     }
@@ -738,9 +1194,9 @@ impl Tc {
         //     the lambda's own return type even if the body fails.
         let param_tys: Vec<Ty> = params
             .iter()
-            .map(|p| ty_from_type_expr(&p.ty).unwrap_or(Ty::Unit))
+            .map(|p| ty_from_type_expr(&p.ty, &self.types).unwrap_or(Ty::Unit))
             .collect();
-        let ret_ty = ty_from_type_expr(return_type).unwrap_or(Ty::Unit);
+        let ret_ty = ty_from_type_expr(return_type, &self.types).unwrap_or(Ty::Unit);
         let sig = FnSig {
             params: param_tys.clone(),
             ret: ret_ty.clone(),
@@ -829,34 +1285,54 @@ impl Tc {
     ) -> Option<Ty> {
         let scrut_ty = self.check_expr(scrutinee, row);
 
+        // Record the scrutinee type for codegen's pattern disambiguator
+        // (Plan A3 task 41.2). Only well-typed scrutinees land in the
+        // map; codegen falls back to primitive-scalar dispatch when a
+        // span is absent.
+        if let Some(ref t) = scrut_ty {
+            self.match_scrut_tys.insert(span.clone(), t.clone());
+        }
+
         if arms.is_empty() {
             self.push_error("E0066", span, "`match` must have at least one arm");
             return None;
         }
 
-        // (1) pattern types vs scrutinee
-        if let Some(ref st) = scrut_ty {
-            for arm in arms {
-                if let Some(pt) = pattern_ty(&arm.pattern) {
-                    if pt != *st {
-                        self.push_error(
-                            "E0064",
-                            arm.pattern.span(),
-                            format!(
-                                "pattern type `{}` does not match scrutinee type `{}`",
-                                ty_display(&pt),
-                                ty_display(st),
-                            ),
-                        );
+        // (1) pattern-structure check + arm-body unification. Patterns
+        // introduce bindings (`Pattern::Var(name)` and nested patterns
+        // inside constructor arms) that must scope only over their own
+        // arm body; `check_pattern` gathers them into a list so we can
+        // snapshot/restore the enclosing env correctly.
+        let mut result_ty: Option<Ty> = None;
+        for arm in arms {
+            let mut bindings: Vec<(String, Ty)> = Vec::new();
+            match &scrut_ty {
+                Some(st) => self.check_pattern(&arm.pattern, st, &mut bindings),
+                None => self.check_pattern_shape_only(&arm.pattern, &mut bindings),
+            }
+            // Snapshot the prior binding (if any) for each name the
+            // pattern introduces so we can restore exact state after
+            // the arm body is checked. Pattern::Var names are fresh
+            // per arm (resolve.rs does not track match-arm scopes),
+            // so there is no redefinition concern inside a single arm.
+            let saved: Vec<(String, Option<Ty>)> = bindings
+                .iter()
+                .map(|(name, _)| (name.clone(), self.env.get(name).cloned()))
+                .collect();
+            for (name, ty) in &bindings {
+                self.env.insert(name.clone(), ty.clone());
+            }
+            let body_ty = self.check_expr(&arm.body, row);
+            for (name, prev) in saved {
+                match prev {
+                    Some(ty) => {
+                        self.env.insert(name, ty);
+                    }
+                    None => {
+                        self.env.remove(&name);
                     }
                 }
             }
-        }
-
-        // (2) arm body unification
-        let mut result_ty: Option<Ty> = None;
-        for arm in arms {
-            let body_ty = self.check_expr(&arm.body, row);
             match (&result_ty, &body_ty) {
                 (None, Some(_)) => {
                     result_ty = body_ty;
@@ -876,9 +1352,30 @@ impl Tc {
             }
         }
 
-        // (3) exhaustiveness
+        // (2) exhaustiveness.
+        //
+        // User types (Plan A3 task 38.4): top-level Maranget-style
+        // coverage — either a catch-all arm (wildcard or non-promotion
+        // var binding) is present, or every declared variant has an
+        // arm. Missing variants → E0120 with a witness string naming
+        // the uncovered ctor with `_` fields.
+        //
+        // Primitives (Plan A2): retained `is_exhaustive` rule → E0066.
+        //
+        // Nested non-exhaustiveness inside ctor fields falls through
+        // to the runtime `TRAP_NONEXHAUSTIVE_MATCH` trap in Plan A3
+        // v1 (documented in the E0120 catalog long-form); Plan B
+        // refines to full nested exhaustiveness.
         if let Some(ref st) = scrut_ty {
-            if !is_exhaustive(st, arms) {
+            if let Ty::User(u) = st {
+                if let Some(witness) = self.user_type_witness(u, arms) {
+                    self.push_error(
+                        "E0120",
+                        span,
+                        format!("`match` on `{u}` is not exhaustive; missing case `{witness}`"),
+                    );
+                }
+            } else if !is_exhaustive(st, arms) {
                 self.push_error(
                     "E0066",
                     span,
@@ -888,6 +1385,335 @@ impl Tc {
         }
 
         result_ty
+    }
+
+    /// Plan A3 task 38.4 — top-level exhaustiveness witness for a
+    /// user-typed scrutinee. Returns `None` when exhaustive; returns
+    /// `Some(witness_string)` naming the first uncovered variant when
+    /// not. The witness is pasteable directly into a new arm: `Foo`
+    /// for Unit, `Foo(_, _)` for Positional, `Foo { x: _, y: _ }` for
+    /// Record.
+    ///
+    /// A catch-all arm (wildcard or bare-var binding that is not a
+    /// nullary-ctor promotion) short-circuits to exhaustive. The
+    /// v1 algorithm only checks top-level coverage; nested non-
+    /// exhaustiveness inside a covered ctor's fields falls through to
+    /// the runtime trap and is documented as such in the E0120 catalog
+    /// long-form.
+    fn user_type_witness(&self, type_name: &str, arms: &[MatchArm]) -> Option<String> {
+        let td = self.types.get(type_name)?;
+        // A wildcard arm (`_ => ..`) or a bare-var arm whose name is
+        // not a nullary ctor of this type is a true catch-all.
+        let has_catchall = arms.iter().any(|a| match &a.pattern {
+            Pattern::Wildcard(_) => true,
+            Pattern::Var(name, _) => {
+                if let Some(info) = self.ctors.get(name) {
+                    if info.type_name == type_name {
+                        if let Some(variant) = td.variants.get(info.variant_index) {
+                            if matches!(variant.fields, VariantFields::Unit) {
+                                return false; // nullary-ctor promotion, not a catchall
+                            }
+                        }
+                    }
+                }
+                true
+            }
+            _ => false,
+        });
+        if has_catchall {
+            return None;
+        }
+        for variant in &td.variants {
+            let covered = arms
+                .iter()
+                .any(|a| Self::arm_covers_variant(&a.pattern, &variant.name));
+            if !covered {
+                return Some(ctor_witness_string(variant));
+            }
+        }
+        None
+    }
+
+    fn arm_covers_variant(p: &Pattern, variant_name: &str) -> bool {
+        match p {
+            Pattern::Ctor { name, .. } => name == variant_name,
+            Pattern::Var(name, _) => name == variant_name,
+            _ => false,
+        }
+    }
+
+    /// Plan A3 task 38.3 structural pattern typing. Verifies the
+    /// pattern's shape against the scrutinee's type and collects every
+    /// `Pattern::Var` binding (excluding bare-ident nullary-ctor
+    /// promotions) into `bindings` paired with the type the name
+    /// should have inside the arm's body.
+    ///
+    /// Emits E0064 for primitive-literal mismatches (preserving Plan
+    /// A2's code) and E0117 for constructor / tuple / variable shape
+    /// mismatches introduced in Plan A3.
+    fn check_pattern(&mut self, p: &Pattern, scrut_ty: &Ty, bindings: &mut Vec<(String, Ty)>) {
+        match p {
+            Pattern::Wildcard(_) => {}
+            Pattern::IntLit(_, span) => {
+                if scrut_ty != &Ty::Int {
+                    self.push_error(
+                        "E0064",
+                        span.clone(),
+                        format!(
+                            "integer-literal pattern does not match scrutinee type `{}`",
+                            ty_display(scrut_ty)
+                        ),
+                    );
+                }
+            }
+            Pattern::BoolLit(_, span) => {
+                if scrut_ty != &Ty::Bool {
+                    self.push_error(
+                        "E0064",
+                        span.clone(),
+                        format!(
+                            "boolean-literal pattern does not match scrutinee type `{}`",
+                            ty_display(scrut_ty)
+                        ),
+                    );
+                }
+            }
+            Pattern::CharLit(_, span) => {
+                if scrut_ty != &Ty::Char {
+                    self.push_error(
+                        "E0064",
+                        span.clone(),
+                        format!(
+                            "character-literal pattern does not match scrutinee type `{}`",
+                            ty_display(scrut_ty)
+                        ),
+                    );
+                }
+            }
+            Pattern::Var(name, _span) => {
+                // Nullary-ctor promotion: a bare identifier pattern
+                // whose name matches a nullary variant of the
+                // scrutinee's user type is not a binding — it is a
+                // zero-arity constructor pattern. Task 39's elaborate
+                // reads the AST and this binding/non-binding
+                // distinction directly from the recorded bindings
+                // vector (empty for nullary ctors).
+                if let Ty::User(u) = scrut_ty {
+                    if let Some(info) = self.ctors.get(name).cloned() {
+                        if info.type_name == *u {
+                            if let Some(td) = self.types.get(&info.type_name) {
+                                if matches!(
+                                    td.variants[info.variant_index].fields,
+                                    VariantFields::Unit
+                                ) {
+                                    // nullary-ctor pattern, no binding
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                bindings.push((name.clone(), scrut_ty.clone()));
+            }
+            Pattern::Tuple(pats, span) => {
+                // Plan A3 v1 has no tuple types in the surface; a
+                // tuple pattern never matches any scrutinee type. We
+                // still recurse into sub-patterns with the scrutinee
+                // type as a conservative placeholder so any inner
+                // pattern-shape errors still surface, but emit E0117
+                // at the top-level tuple pattern.
+                self.push_error(
+                    "E0117",
+                    span.clone(),
+                    format!(
+                        "tuple pattern does not match scrutinee type `{}` (no tuple types in Plan A3 v1)",
+                        ty_display(scrut_ty)
+                    ),
+                );
+                for sub in pats {
+                    self.check_pattern(sub, scrut_ty, bindings);
+                }
+            }
+            Pattern::Ctor { name, fields, span } => {
+                let Some(info) = self.ctors.get(name).cloned() else {
+                    self.push_error(
+                        "E0114",
+                        span.clone(),
+                        format!("unknown constructor `{name}` in pattern"),
+                    );
+                    // Still walk sub-patterns shape-only so nested
+                    // errors surface.
+                    match fields {
+                        CtorPatternFields::Unit => {}
+                        CtorPatternFields::Positional(ps) => {
+                            for sub in ps {
+                                self.check_pattern_shape_only(sub, bindings);
+                            }
+                        }
+                        CtorPatternFields::Record(fs) => {
+                            for f in fs {
+                                self.check_pattern_shape_only(&f.pattern, bindings);
+                            }
+                        }
+                    }
+                    return;
+                };
+                // Nominal type-match: the ctor's owning type must
+                // equal the scrutinee type.
+                match scrut_ty {
+                    Ty::User(u) if *u == info.type_name => {}
+                    _ => {
+                        self.push_error(
+                            "E0117",
+                            span.clone(),
+                            format!(
+                                "constructor `{name}` is a variant of type `{}`; scrutinee has type `{}`",
+                                info.type_name,
+                                ty_display(scrut_ty)
+                            ),
+                        );
+                    }
+                }
+                let td = match self.types.get(&info.type_name).cloned() {
+                    Some(t) => t,
+                    None => return,
+                };
+                let variant = &td.variants[info.variant_index];
+                match (&variant.fields, fields) {
+                    (VariantFields::Unit, CtorPatternFields::Unit) => {}
+                    (VariantFields::Positional(param_tys), CtorPatternFields::Positional(pats)) => {
+                        if param_tys.len() != pats.len() {
+                            self.push_error(
+                                "E0115",
+                                span.clone(),
+                                format!(
+                                    "constructor `{name}` pattern expects {} positional field{}, got {}",
+                                    param_tys.len(),
+                                    if param_tys.len() == 1 { "" } else { "s" },
+                                    pats.len()
+                                ),
+                            );
+                        }
+                        for (sub, decl_ty) in pats.iter().zip(param_tys.iter()) {
+                            let inner = ty_from_type_expr(decl_ty, &self.types).unwrap_or(Ty::Unit);
+                            self.check_pattern(sub, &inner, bindings);
+                        }
+                    }
+                    (VariantFields::Record(decl_fields), CtorPatternFields::Record(pat_fields)) => {
+                        // Duplicate pattern-field names
+                        let mut seen: BTreeMap<String, Span> = BTreeMap::new();
+                        for f in pat_fields {
+                            if let Some(first) = seen.get(&f.name).cloned() {
+                                self.push_error(
+                                    "E0115",
+                                    f.span.clone(),
+                                    format!(
+                                        "pattern for constructor `{name}` got duplicate field `{}` (first at {}:{})",
+                                        f.name, first.line, first.column
+                                    ),
+                                );
+                            } else {
+                                seen.insert(f.name.clone(), f.span.clone());
+                            }
+                        }
+                        for f in pat_fields {
+                            let Some(decl) = decl_fields.iter().find(|d| d.name == f.name) else {
+                                self.push_error(
+                                    "E0115",
+                                    f.span.clone(),
+                                    format!(
+                                        "pattern for constructor `{name}` of type `{}` has no field `{}`",
+                                        info.type_name, f.name
+                                    ),
+                                );
+                                continue;
+                            };
+                            let inner =
+                                ty_from_type_expr(&decl.ty, &self.types).unwrap_or(Ty::Unit);
+                            self.check_pattern(&f.pattern, &inner, bindings);
+                        }
+                        for d in decl_fields {
+                            if !pat_fields.iter().any(|f| f.name == d.name) {
+                                self.push_error(
+                                    "E0115",
+                                    span.clone(),
+                                    format!(
+                                        "pattern for constructor `{name}` of type `{}` is missing field `{}`",
+                                        info.type_name, d.name
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    // Shape mismatches (Unit vs Positional, etc.) —
+                    // E0115 naming the declared shape.
+                    (VariantFields::Unit, _) => {
+                        self.push_error(
+                            "E0115",
+                            span.clone(),
+                            format!(
+                                "constructor `{name}` of type `{}` is nullary; pattern must be a bare identifier (no parens or braces)",
+                                info.type_name
+                            ),
+                        );
+                    }
+                    (VariantFields::Positional(_), _) => {
+                        self.push_error(
+                            "E0115",
+                            span.clone(),
+                            format!(
+                                "constructor `{name}` of type `{}` has positional fields; pattern must use `{name}(..)` form",
+                                info.type_name
+                            ),
+                        );
+                    }
+                    (VariantFields::Record(_), _) => {
+                        self.push_error(
+                            "E0115",
+                            span.clone(),
+                            format!(
+                                "constructor `{name}` of type `{}` has record fields; pattern must use `{name} {{ .. }}` form",
+                                info.type_name
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shape-only walk used when the scrutinee has unknown type
+    /// (propagated `None` from a prior error). Binds every
+    /// `Pattern::Var` to `Ty::Unit` so the arm body can at least
+    /// reference the names without cascade-NPE-shaped errors.
+    fn check_pattern_shape_only(&mut self, p: &Pattern, bindings: &mut Vec<(String, Ty)>) {
+        match p {
+            Pattern::Wildcard(_)
+            | Pattern::IntLit(_, _)
+            | Pattern::BoolLit(_, _)
+            | Pattern::CharLit(_, _) => {}
+            Pattern::Var(name, _) => {
+                bindings.push((name.clone(), Ty::Unit));
+            }
+            Pattern::Tuple(pats, _) => {
+                for sub in pats {
+                    self.check_pattern_shape_only(sub, bindings);
+                }
+            }
+            Pattern::Ctor { fields, .. } => match fields {
+                CtorPatternFields::Unit => {}
+                CtorPatternFields::Positional(ps) => {
+                    for sub in ps {
+                        self.check_pattern_shape_only(sub, bindings);
+                    }
+                }
+                CtorPatternFields::Record(fs) => {
+                    for f in fs {
+                        self.check_pattern_shape_only(&f.pattern, bindings);
+                    }
+                }
+            },
+        }
     }
 }
 
@@ -903,11 +1729,12 @@ fn type_name(t: &TypeExpr) -> &str {
     }
 }
 
-/// Lift a surface `TypeExpr` into the checker's `Ty` lattice. Unknown
-/// type names return `None`; Plan A2's surface names `Int`, `String`,
-/// `Unit`, `Bool`, `Char`, `Byte`. Any other name is a no-op here (the
-/// checker elsewhere emits a diagnostic for the surrounding declaration).
-fn ty_from_type_expr(t: &TypeExpr) -> Option<Ty> {
+/// Lift a surface `TypeExpr` into the checker's `Ty` lattice. Resolves
+/// Plan A2 primitives first (`Int`, `String`, `Unit`, `Bool`, `Char`,
+/// `Byte`), then Plan A3 user-defined types by consulting the types
+/// registry. Unknown names return `None`; the caller (fn_env pre-pass
+/// or `check_type_expr_known`) handles the fallback/diagnostic split.
+pub(crate) fn ty_from_type_expr(t: &TypeExpr, types: &BTreeMap<String, TypeDecl>) -> Option<Ty> {
     match t {
         TypeExpr::Named(n, _) => match n.as_str() {
             "Int" => Some(Ty::Int),
@@ -916,7 +1743,13 @@ fn ty_from_type_expr(t: &TypeExpr) -> Option<Ty> {
             "Bool" => Some(Ty::Bool),
             "Char" => Some(Ty::Char),
             "Byte" => Some(Ty::Byte),
-            _ => None,
+            other => {
+                if types.contains_key(other) {
+                    Some(Ty::User(other.to_string()))
+                } else {
+                    None
+                }
+            }
         },
     }
 }
@@ -937,6 +1770,8 @@ fn type_matches(expected: &TypeExpr, actual: &Ty) -> bool {
         // expr>;` therefore never matches, so a named left-hand
         // type against a `Ty::Fn` right-hand is a hard mismatch.
         (TypeExpr::Named(_, _), Ty::Fn(_)) => false,
+        // Plan A3 task 38: nominal user-defined types match by name.
+        (TypeExpr::Named(n, _), Ty::User(u)) => n == u,
     }
 }
 
@@ -963,6 +1798,7 @@ fn ty_display(t: &Ty) -> String {
             let effects = sig.effects.join(", ");
             format!("({params}) -> {ret} ![{effects}]")
         }
+        Ty::User(n) => n.clone(),
     }
 }
 
@@ -984,14 +1820,29 @@ fn binop_symbol(op: BinOp) -> &'static str {
     }
 }
 
-/// Type of a pattern, for pattern-vs-scrutinee compatibility. Wildcard
-/// returns `None` (it is not a type error against any scrutinee).
-fn pattern_ty(p: &Pattern) -> Option<Ty> {
-    match p {
-        Pattern::IntLit(_, _) => Some(Ty::Int),
-        Pattern::BoolLit(_, _) => Some(Ty::Bool),
-        Pattern::CharLit(_, _) => Some(Ty::Char),
-        Pattern::Wildcard(_) => None,
+/// Build a paste-able witness pattern for an uncovered variant
+/// (Plan A3 task 38.4). Shape follows the variant declaration:
+/// - `Unit` → `Foo`
+/// - `Positional(T1, ..., Tn)` → `Foo(_, ..., _)` (n wildcards)
+/// - `Record { f1: T1, ... }` → `Foo { f1: _, ... }` (one wildcard
+///   per declared field, preserving field-name order)
+fn ctor_witness_string(variant: &Variant) -> String {
+    match &variant.fields {
+        VariantFields::Unit => variant.name.clone(),
+        VariantFields::Positional(params) => {
+            let args = std::iter::repeat_n("_", params.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({args})", variant.name)
+        }
+        VariantFields::Record(fields) => {
+            let fs = fields
+                .iter()
+                .map(|f| format!("{}: _", f.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{} {{ {fs} }}", variant.name)
+        }
     }
 }
 
@@ -1019,6 +1870,44 @@ fn pattern_ty(p: &Pattern) -> Option<Ty> {
 /// the outer set expanded to include the outer lambda's params — a
 /// nested lambda captures not only the enclosing lambda's outer
 /// scope but also the enclosing lambda's params.
+/// Recursively collect every `Pattern::Var` binding name from a
+/// pattern (Plan A3 task 39). Nullary-ctor promotion is NOT applied
+/// here — this helper is used by capture analysis and closure
+/// conversion's local-tracking path where a promoted nullary variant
+/// is indistinguishable from a fresh binding at the syntactic layer
+/// (both are Pattern::Var). Treating every `Var` as a binding is
+/// safe: the over-approximation adds an unused entry to `locals`
+/// that simply fails to match any later capture.
+pub(crate) fn pattern_bindings(p: &Pattern, out: &mut std::collections::BTreeSet<String>) {
+    match p {
+        Pattern::Wildcard(_)
+        | Pattern::IntLit(_, _)
+        | Pattern::BoolLit(_, _)
+        | Pattern::CharLit(_, _) => {}
+        Pattern::Var(name, _) => {
+            out.insert(name.clone());
+        }
+        Pattern::Tuple(pats, _) => {
+            for sub in pats {
+                pattern_bindings(sub, out);
+            }
+        }
+        Pattern::Ctor { fields, .. } => match fields {
+            CtorPatternFields::Unit => {}
+            CtorPatternFields::Positional(ps) => {
+                for sub in ps {
+                    pattern_bindings(sub, out);
+                }
+            }
+            CtorPatternFields::Record(fs) => {
+                for f in fs {
+                    pattern_bindings(&f.pattern, out);
+                }
+            }
+        },
+    }
+}
+
 fn collect_free_vars(
     e: &Expr,
     outer_names: &std::collections::BTreeSet<String>,
@@ -1071,7 +1960,15 @@ fn collect_free_vars(
             } => {
                 walk(scrutinee, outer_names, param_names, locals, captures);
                 for arm in arms {
+                    // Plan A3 task 39: pattern `Pattern::Var(name)` —
+                    // including names nested inside `Ctor`/`Tuple`
+                    // sub-patterns — introduces a local binding for
+                    // the arm body. Snapshot `locals`, add the arm's
+                    // bindings, walk the body, then restore.
+                    let saved = locals.clone();
+                    pattern_bindings(&arm.pattern, locals);
                     walk(&arm.body, outer_names, param_names, locals, captures);
+                    *locals = saved;
                 }
             }
             Expr::Block(b) => {
@@ -1120,6 +2017,15 @@ fn collect_free_vars(
             // before closure conversion. These nodes never appear here.
             Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
                 unreachable!("collect_free_vars: closure-conversion nodes should not appear pre-CC")
+            }
+            // Plan A3 task 37: record literal. Each field value is a
+            // potential capture source. The name of the constructor
+            // is not itself a captureable identifier (it resolves to
+            // the registered type, not a binding).
+            Expr::RecordLit { fields, .. } => {
+                for f in fields {
+                    walk(&f.value, outer_names, param_names, locals, captures);
+                }
             }
         }
     }
@@ -1176,6 +2082,14 @@ fn is_exhaustive(scrut: &Ty, arms: &[MatchArm]) -> bool {
         // infinite or (for `Fn`) structurally un-enumerable, so a
         // wildcard arm is the only way to reach exhaustiveness.
         Ty::Int | Ty::Char | Ty::String | Ty::Byte | Ty::Fn(_) => false,
+        // Plan A3 task 38.4 replaces this with Maranget's algorithm
+        // that enumerates constructors and emits E0120 with a witness.
+        // Until 38.4 lands, a user-typed scrutinee is conservatively
+        // treated as an infinite-domain value: only a wildcard arm can
+        // reach exhaustiveness. Structural ctor-pattern coverage
+        // (`match o { None => .., Some(_) => .. }`) still fires E0066
+        // until 38.4 teaches the checker to enumerate variants.
+        Ty::User(_) => false,
     }
 }
 
@@ -1327,6 +2241,13 @@ mod tests {
             "fn main() -> Int ![] { let n: Int = match 0 { 0 => 1, _ => \"x\" }; 0 }\n",
             "fn main() -> Int ![] { let n: Int = match 0 { 0 => 1, 1 => 2 }; 0 }\n",
             "fn main() -> Int ![] { let n: Int = match true { true => 1 }; 0 }\n",
+            // Plan A3 task 37: record literal is a user-reachable
+            // surface form. With codegen (Task 41) landed the type
+            // resolves cleanly; the `let p: Int = ...` binding type
+            // mismatch is the user-visible error here (E0045), never
+            // E0001. Review of PR #12 flagged the original E0001
+            // regression for this surface form.
+            "type Point = { x: Int, y: Int }\nfn main() -> Int ![] { let p: Int = Point { x: 1, y: 2 }; 0 }\n",
         ];
         for src in programs {
             let errs = pipeline(src);
@@ -1817,6 +2738,757 @@ mod tests {
         assert!(
             errs.is_empty(),
             "user shadow of int_to_string should typecheck clean; got: {errs:?}"
+        );
+    }
+
+    // ===== Plan A3 Task 38.1 — nominal-type symbol table =====
+
+    fn pipeline_checked(src: &str) -> (CheckedProgram, Vec<CompilerError>) {
+        let (toks, lex_errs) = lex("x.sigil", src);
+        assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
+        let (prog, parse_errs) = parse("x.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse: {parse_errs:?}");
+        let (rp, res_errs) = resolve(prog);
+        assert!(res_errs.is_empty(), "resolve: {res_errs:?}");
+        typecheck(rp.program)
+    }
+
+    #[test]
+    fn type_decl_registers_in_types_table() {
+        // Forward reference — `Option` is declared after use in the
+        // fn signature, but the pre-pass resolves it. No errors.
+        let src = "fn f(o: Option) -> Int ![] { 0 }\n\
+                   type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert!(cp.types.contains_key("Option"));
+        assert_eq!(cp.types["Option"].variants.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_type_declaration_is_e0113() {
+        let src = "type Foo = | A\n\
+                   type Foo = | B\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0113"), "expected E0113, got: {errs:?}");
+    }
+
+    #[test]
+    fn unknown_type_in_fn_param_is_e0112() {
+        let src = "fn f(x: Foo) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0112"), "expected E0112, got: {errs:?}");
+    }
+
+    #[test]
+    fn unknown_type_in_fn_return_is_e0112() {
+        let src = "fn g() -> Bar ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0112"), "expected E0112, got: {errs:?}");
+    }
+
+    #[test]
+    fn unknown_type_in_variant_positional_is_e0112() {
+        // `type T = | X(Missing)` — Missing is undeclared.
+        let src = "type T = | X(Missing)\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0112"), "expected E0112, got: {errs:?}");
+    }
+
+    #[test]
+    fn unknown_type_in_variant_record_is_e0112() {
+        let src = "type P = { x: Missing }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0112"), "expected E0112, got: {errs:?}");
+    }
+
+    #[test]
+    fn user_type_in_let_binding_typechecks_against_param() {
+        // Pass a user-type-valued parameter into a let with the same
+        // declared type. Param-carried user values already work without
+        // needing a construction site.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] { let p: Option = o; 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+    }
+
+    #[test]
+    fn user_type_let_type_mismatch_is_e0045() {
+        // User-typed param bound to a differently-typed let. The
+        // user-type `Option` resolves via the registry; mismatch
+        // against declared `Int` surfaces as E0045 (let-decl vs init).
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] { let n: Int = o; 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0045"), "expected E0045, got: {errs:?}");
+    }
+
+    #[test]
+    fn type_decl_only_emits_no_e0001_surface_errors() {
+        // A lone type decl + empty main must not surface any
+        // user-reachable E0001. Extends the sweep: the Item::Type
+        // arm must not introduce internal-error paths.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0001"),
+            "unexpected E0001: {errs:?}"
+        );
+    }
+
+    // ===== Plan A3 Task 38.2 — constructor resolution =====
+
+    #[test]
+    fn nullary_ctor_bare_ident_typechecks_cleanly() {
+        // `None` as an expression is a bare ctor ident. Resolves to
+        // Ty::User("Option") and flows into the `let`'s declared
+        // `Option` type without any error.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = None; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_call_typechecks_cleanly() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = Some(42); 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_literal_typechecks_cleanly() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point { x: 1, y: 2 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
+    }
+
+    #[test]
+    fn unknown_record_ctor_is_e0114() {
+        let src = "fn main() -> Int ![] { let p: Int = Missing { x: 1 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0114"), "expected E0114, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_arity_mismatch_is_e0043() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = Some(1, 2); 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0043"), "expected E0043, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_arg_type_mismatch_is_e0044() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = Some(true); 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_missing_field_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point { x: 1 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_unknown_field_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point { x: 1, y: 2, z: 3 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_duplicate_field_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point { x: 1, x: 2, y: 3 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_field_value_type_mismatch_is_e0044() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point { x: 1, y: true }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
+    }
+
+    #[test]
+    fn nullary_ctor_with_parens_is_e0115() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = None(); 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_as_positional_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn main() -> Int ![] { let p: Point = Point(1, 2); 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_as_record_is_e0115() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] { let o: Option = Some { inner: 1 }; 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn duplicate_ctor_name_across_types_is_e0118() {
+        let src = "type Option = | None | Some(Int)\n\
+                   type Maybe = | Nothing | Some(Bool)\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0118"), "expected E0118, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_in_function_arg_typechecks() {
+        // Ctor call used as a function argument whose declared type
+        // matches. Exercises that `Some(42): Option` flows into the
+        // parameter type-check correctly.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn take(o: Option) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { take(Some(42)) }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
+    }
+
+    #[test]
+    fn ctor_resolution_does_not_fire_e0001() {
+        // Sweep-style check: every well-formed ctor use typechecks
+        // cleanly (the E0001 "internal compiler error" catalog entry
+        // is reserved for bugs, never surface errors).
+        let programs = [
+            "type Option = | None | Some(Int)\nfn main() -> Int ![] { let o: Option = None; 0 }\n",
+            "type Option = | None | Some(Int)\nfn main() -> Int ![] { let o: Option = Some(1); 0 }\n",
+            "type Point = { x: Int, y: Int }\nfn main() -> Int ![] { let p: Point = Point { x: 1, y: 2 }; 0 }\n",
+        ];
+        for src in programs {
+            let errs = pipeline_checked(src).1;
+            assert!(
+                !errs.iter().any(|e| e.code.as_str() == "E0001"),
+                "program surfaced E0001: src={src:?} errs={errs:?}",
+            );
+        }
+    }
+
+    // ===== Plan A3 Task 38.3 — structural pattern typing =====
+
+    #[test]
+    fn match_on_option_with_unit_and_positional_ctors_typechecks() {
+        // E0066 still fires (user-type exhaustiveness deferred to
+        // 38.4), so we tolerate it here but check the pattern-shape
+        // check does not surface E0064/E0117 for the ctor arms.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn unwrap(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(n) => n, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e.code.as_str(), "E0064" | "E0117")),
+            "unexpected pattern-shape error: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn match_pattern_var_binds_into_arm_body() {
+        // `Some(n) => n` — `n` binds to Int inside the arm body.
+        // Using `n` against a declared Int return in the match
+        // expression flows cleanly; swapping with a Bool would fire
+        // E0065 (arm body type mismatch) on a different arm.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn unwrap_or(o: Option, d: Int) -> Int ![] {\n  \
+                     match o { None => d, Some(n) => n, _ => d }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        // The arm-body `n` should be typed as Int by the binding,
+        // so neither E0046 (unknown ident) nor E0044/E0065 fires
+        // on it.
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0046"),
+            "arm-scope binding missed: E0046 fired: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn ctor_pattern_against_wrong_user_type_is_e0117() {
+        let src = "type Option = | None | Some(Int)\n\
+                   type Result = | Ok(Int) | Err(String)\n\
+                   fn f(r: Result) -> Int ![] {\n  \
+                     match r { Some(n) => n, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0117"), "expected E0117, got: {errs:?}");
+    }
+
+    #[test]
+    fn ctor_pattern_against_primitive_is_e0117() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn main() -> Int ![] {\n  \
+                     match 0 { Some(n) => n, _ => 0 }\n\
+                   }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0117"), "expected E0117, got: {errs:?}");
+    }
+
+    #[test]
+    fn tuple_pattern_always_fires_e0117_in_a3() {
+        let src = "fn main() -> Int ![] {\n  \
+                     match 0 { (a, b) => a, _ => 0 }\n\
+                   }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0117"), "expected E0117, got: {errs:?}");
+    }
+
+    #[test]
+    fn unit_ctor_with_parens_pattern_is_e0115() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None() => 0, _ => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn positional_ctor_pattern_arity_mismatch_is_e0115() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Some(x, y) => x, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_pattern_missing_field_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn f(p: Point) -> Int ![] {\n  \
+                     match p { Point { x } => x, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn record_ctor_pattern_unknown_field_is_e0115() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn f(p: Point) -> Int ![] {\n  \
+                     match p { Point { x, y, z } => x, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0115"), "expected E0115, got: {errs:?}");
+    }
+
+    #[test]
+    fn nested_ctor_pattern_sub_type_mismatch_is_e0064() {
+        // `Some(true)` has Int in its positional field; pattern
+        // `Some(BoolLit(true))` mismatches the declared inner Int.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Some(true) => 1, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0064"),
+            "expected E0064 on inner, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn record_ctor_pattern_binds_inner_vars() {
+        // `Point { x, y }` binds `x: Int` and `y: Int`. Using them
+        // as Int in arm body must typecheck clean (beyond the
+        // user-type-exhaustiveness E0066 which 38.4 resolves).
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn f(p: Point) -> Int ![] {\n  \
+                     match p { Point { x, y } => x + y, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0046"),
+            "inner record binding missed: E0046 fired: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0044"),
+            "inner record binding typed wrong: E0044 fired: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pattern_var_binds_primitive_scrutinee() {
+        // `match n { x => x }` on Int scrutinee — `x` binds to Int.
+        // Exhaustive via wildcard-like binding (but E0066 may still
+        // fire because Var on primitives isn't structurally known;
+        // we just check no E0046 for the arm-body use of x).
+        let src = "fn main() -> Int ![] {\n  \
+                     let r: Int = match 5 { x => x };\n  0\n\
+                   }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0046"),
+            "primitive-scrutinee Pattern::Var binding missed: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_ctor_in_explicit_pattern_is_e0114() {
+        // Explicit `Ctor(args)` pattern form whose name isn't
+        // registered fires E0114. (Bare-identifier unknown names are
+        // treated as fresh-variable bindings in pattern position —
+        // the ML-family convention — so they do not fire E0114.)
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Nope(x) => x, _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(has_code(&errs, "E0114"), "expected E0114, got: {errs:?}");
+    }
+
+    // ===== Plan A3 Task 38.4 — exhaustiveness witness =====
+
+    #[test]
+    fn exhaustive_option_match_no_e0120() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(n) => n }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "unexpected E0120: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_option_missing_some_is_e0120_with_witness() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Some(_)"),
+            "witness missing `Some(_)`: {}",
+            e120.message
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_option_missing_none_is_e0120_with_witness() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Some(n) => n }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("`None`"),
+            "witness missing `None`: {}",
+            e120.message
+        );
+    }
+
+    #[test]
+    fn wildcard_catchall_is_exhaustive_no_e0120() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, _ => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "unexpected E0120 with wildcard: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn var_binding_catchall_is_exhaustive_no_e0120() {
+        // `x` is a fresh name (not a registered ctor) → bind whole
+        // scrutinee; catchall.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, x => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "unexpected E0120 with var catchall: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn nullary_ctor_bare_var_promotion_does_not_count_as_catchall() {
+        // `None` as a bare ident is a nullary-ctor promotion, not a
+        // catchall. The match misses `Some(_)` → E0120 fires with
+        // witness.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Some(_)"),
+            "witness missing `Some(_)`: {}",
+            e120.message
+        );
+    }
+
+    #[test]
+    fn three_variant_exhaustiveness_witness_names_first_missing() {
+        // Type with three variants; arm only covers the middle one.
+        // Witness must name the first missing variant (top-down
+        // declaration order).
+        let src = "type Shape = | Point | Circle(Int) | Square { side: Int }\n\
+                   fn f(s: Shape) -> Int ![] {\n  \
+                     match s { Circle(r) => r }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("`Point`"),
+            "witness should name `Point` first: {}",
+            e120.message
+        );
+    }
+
+    #[test]
+    fn exhaustive_single_record_variant_no_e0120() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn f(p: Point) -> Int ![] {\n  \
+                     match p { Point { x, y } => x + y }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "unexpected E0120 on exhaustive record match: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn witness_for_positional_ctor_has_wildcards_per_field() {
+        let src = "type Pair = | Pair(Int, Int)\n\
+                   fn f(p: Pair) -> Int ![] {\n  \
+                     match p {  }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        // Parser rejects empty match arm list (E0066 or similar) —
+        // skip this program if parse fails.
+        let (_, errs) = pipeline_checked(src);
+        // Either parse-time arm-list rule fires, or exhaustiveness
+        // witness appears. We test the latter with a shape where
+        // at least one arm exists but none is the constructor:
+        let src2 = "type Pair = | Pair(Int, Int) | Single(Int)\n\
+                    fn f(p: Pair) -> Int ![] {\n  \
+                      match p { Single(x) => x }\n\
+                    }\n\
+                    fn main() -> Int ![] { 0 }\n";
+        let errs2 = pipeline_checked(src2).1;
+        let e120 = errs2
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs2:?}\n(part1 errs: {errs:?})"));
+        assert!(
+            e120.message.contains("Pair(_, _)"),
+            "witness missing `Pair(_, _)`: {}",
+            e120.message
+        );
+    }
+
+    #[test]
+    fn witness_for_record_ctor_has_field_wildcards() {
+        let src = "type Shape = | Circle(Int) | Rect { w: Int, h: Int }\n\
+                   fn f(s: Shape) -> Int ![] {\n  \
+                     match s { Circle(r) => r }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Rect { w: _, h: _ }"),
+            "witness format wrong: {}",
+            e120.message
+        );
+    }
+
+    // ===== Plan A3 Task 39 — capture analysis respects pattern bindings =====
+
+    #[test]
+    fn pattern_bindings_collects_all_var_names_from_nested_patterns() {
+        use crate::ast::{CtorPatternField, CtorPatternFields, Pattern};
+        let span = Span::synthetic("x");
+        // `Cons(h, Cons(mid, Nil))` — two Var bindings: `h`, `mid`.
+        let pat = Pattern::Ctor {
+            name: "Cons".to_string(),
+            fields: CtorPatternFields::Positional(vec![
+                Pattern::Var("h".to_string(), span.clone()),
+                Pattern::Ctor {
+                    name: "Cons".to_string(),
+                    fields: CtorPatternFields::Positional(vec![
+                        Pattern::Var("mid".to_string(), span.clone()),
+                        Pattern::Ctor {
+                            name: "Nil".to_string(),
+                            fields: CtorPatternFields::Unit,
+                            span: span.clone(),
+                        },
+                    ]),
+                    span: span.clone(),
+                },
+            ]),
+            span: span.clone(),
+        };
+        let mut bindings = std::collections::BTreeSet::new();
+        pattern_bindings(&pat, &mut bindings);
+        assert_eq!(bindings.len(), 2, "expected h + mid, got {bindings:?}");
+        assert!(bindings.contains("h"));
+        assert!(bindings.contains("mid"));
+        // Record-style Ctor pattern — field-pun and renamed fields.
+        let pat2 = Pattern::Ctor {
+            name: "Point".to_string(),
+            fields: CtorPatternFields::Record(vec![
+                CtorPatternField {
+                    name: "x".to_string(),
+                    pattern: Pattern::Var("x".to_string(), span.clone()),
+                    span: span.clone(),
+                },
+                CtorPatternField {
+                    name: "y".to_string(),
+                    pattern: Pattern::Var("why".to_string(), span.clone()),
+                    span: span.clone(),
+                },
+            ]),
+            span,
+        };
+        let mut bindings2 = std::collections::BTreeSet::new();
+        pattern_bindings(&pat2, &mut bindings2);
+        assert_eq!(bindings2.len(), 2);
+        assert!(bindings2.contains("x"));
+        assert!(bindings2.contains("why"));
+    }
+
+    // ===== Plan A3 Task 41.2 — scrutinee type side-table =====
+
+    #[test]
+    fn match_scrut_tys_records_user_type_for_well_typed_match() {
+        // A well-typed match on a user-defined `Option` must land its
+        // scrutinee's `Ty::User("Option")` in the side-table so codegen
+        // can disambiguate `Pattern::Var` between binding and nullary
+        // ctor promotion.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(n) => n }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
+        assert_eq!(
+            cp.match_scrut_tys.len(),
+            1,
+            "exactly one match in the program should appear in the map"
+        );
+        let ty = cp
+            .match_scrut_tys
+            .values()
+            .next()
+            .expect("map has one entry");
+        assert_eq!(*ty, Ty::User("Option".to_string()));
+    }
+
+    #[test]
+    fn match_scrut_tys_records_primitive_scrutinee() {
+        // Primitive-scrutinee matches also land in the map; codegen's
+        // fall-back path handles them but the entry should still be
+        // present for consistency with how check_match runs.
+        let src = "fn f(x: Int) -> Int ![] {\n  \
+                     match x { 0 => 10, _ => 20 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert_eq!(cp.match_scrut_tys.len(), 1);
+        let ty = cp.match_scrut_tys.values().next().expect("one entry");
+        assert_eq!(*ty, Ty::Int);
+    }
+
+    #[test]
+    fn match_scrut_tys_skips_malformed_scrutinee() {
+        // A scrutinee that fails to typecheck has `None` as its Ty;
+        // check_match skips the side-table insertion. Codegen's
+        // fallback path treats the absent entry as "primitive
+        // scalar dispatch" (which is correct because if/match-desugar
+        // is the other producer of absent entries and those are
+        // Bool-only).
+        let src = "fn f() -> Int ![] {\n  \
+                     match undefined_name { _ => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0046"),
+            "expected E0046 unknown identifier; got: {errs:?}"
+        );
+        assert!(
+            cp.match_scrut_tys.is_empty(),
+            "malformed scrutinee should not be recorded"
         );
     }
 }

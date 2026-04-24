@@ -351,6 +351,16 @@ impl Elaborator {
             Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
                 unreachable!("elaborate: closure-conversion nodes should not appear pre-CC")
             }
+            // Plan A3 task 37: record literal passes through elaborate
+            // unchanged at this scope. Record fields are not ANF-
+            // flattened in task 37 — the constructor allocator in
+            // task 41's codegen accepts compound field values and
+            // evaluates them in order. If later tasks want ANF
+            // flattening for record-literal field values, they can
+            // extend this arm.
+            Expr::RecordLit { name, fields, span } => {
+                (Expr::RecordLit { name, fields, span }, Vec::new())
+            }
         }
     }
 

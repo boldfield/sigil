@@ -319,6 +319,223 @@ pub const CATALOG: &[ErrorEntry] = &[
         fix_example: "let inc = fn (x: Int) -> Int ![] => x + 1;  // body is Int, matches",
     },
     ErrorEntry {
+        code: "E0110",
+        short: "pattern form not supported in v1",
+        long: "Plan A3 pattern matching deliberately excludes three ergonomic \
+               extensions that other ML/Rust-family languages include:\n\n\
+               - **Or-patterns** `p1 | p2 => body`. Write each variant as a \
+                 separate arm. Rationale: or-patterns obscure which names \
+                 bind where and make exhaustiveness errors harder to read; \
+                 explicit arms keep the match intent obvious.\n\
+               - **Pattern guards** `pat if cond => body`. Move the \
+                 condition into the arm body (an `if`) or into an explicit \
+                 nested match. Rationale: guards turn exhaustiveness checks \
+                 from trivial into a decidable-but-subtle problem, and they \
+                 hide flow control behind seemingly-declarative syntax.\n\
+               - **As-bindings** `pat as name`. Destructure via constructor \
+                 / tuple patterns that already name the pieces you want. \
+                 Rationale: as-bindings introduce a second, redundant \
+                 binding path that makes reading a match arm harder.\n\n\
+               These are all \"fight-the-priors\" decisions: the extensions \
+               are popular but they consistently degrade the code they \
+               appear in. A3 patterns are literal, wildcard `_`, fresh \
+               variable, constructor `Ctor(..)` / `Ctor { .. }`, and tuple \
+               `(pat, pat)`. That surface handles the full set of data \
+               shapes Plan A3 introduces.\n\n\
+               If a v1 program reaches a point where an or-pattern or guard \
+               would be the right tool, the answer is to restructure the \
+               match into multiple arms or to use a nested `match` / `if` \
+               in the arm body — the cost is a few extra lines; the \
+               benefit is that the pattern shape fully determines which \
+               names bind and which arm runs.",
+        fix_example: "// Or-pattern — instead of `Red | Green => ...`:\n\
+                      match c {\n  Red => handle_primary(),\n  Green => handle_primary(),\n  Blue => handle_blue(),\n}\n\n\
+                      // Guard — instead of `Some(n) if n > 0 => ...`:\n\
+                      match o {\n  Some(n) => if n > 0 { positive() } else { non_positive() },\n  None => default(),\n}\n\n\
+                      // As-binding — instead of `Pair(a, b) as whole => ...`:\n\
+                      match p {\n  Pair(a, b) => use_parts(a, b),  // reference `a`, `b` directly\n}",
+    },
+    ErrorEntry {
+        code: "E0112",
+        short: "unknown type name",
+        long: "A `TypeExpr` referenced a type name that is neither a Plan A2 \
+               primitive (`Int`, `String`, `Unit`, `Bool`, `Char`, `Byte`) nor \
+               a user-defined type declared in the current program via \
+               `type Name = ...`.\n\n\
+               Plan A3 resolves type names in a single pre-pass before any \
+               function body is typechecked; forward references are therefore \
+               fine, but the referenced name must still exist somewhere in \
+               the program. Typos, a missing `type` declaration, and imports \
+               that never landed (imports are Plan A1 stdlib-only in v1) are \
+               the common causes.\n\n\
+               When E0112 fires on a function signature, the checker falls \
+               back to `Unit` for the unresolved type so body-level type \
+               errors still surface on the same compile — downstream \
+               diagnostics may therefore reference `Unit` where the source \
+               said the missing name.",
+        fix_example: "// Declare the type before (or after) using it:\n\
+                      type Option = | None | Some(Int)\n\
+                      fn unwrap_or(o: Option, d: Int) -> Int ![] { d }",
+    },
+    ErrorEntry {
+        code: "E0114",
+        short: "unknown constructor",
+        long: "A constructor application referenced a name that does not belong \
+               to any registered user-defined type's variant list. Plan A3 \
+               registers constructor names in a single flat namespace across \
+               all `type` declarations in the program; a missing `type` decl, \
+               a typo in the constructor name, or a constructor defined in a \
+               separate file (imports are Plan A1 stdlib-only) all trip this \
+               diagnostic.\n\n\
+               E0114 fires regardless of how the constructor is applied: \
+               bare identifier (for nullary constructors), `Foo(args)` \
+               positional call, or `Foo { fields }` record form. If the \
+               constructor exists under a different name, or if the call \
+               shape doesn't match the declared shape, E0115 surfaces that \
+               distinct problem.",
+        fix_example: "type Option = | None | Some(Int)\n\
+                      fn f() -> Option ![] { Some(1) }  // Some is a registered ctor\n\n\
+                      // NOT:\n\
+                      // fn g() -> Option ![] { Maybe(1) }  // E0114: Maybe unknown",
+    },
+    ErrorEntry {
+        code: "E0115",
+        short: "constructor application shape mismatch",
+        long: "A constructor application used a form (bare identifier, \
+               positional call, record literal) that does not match the \
+               constructor's declared variant shape. Each variant declares \
+               exactly one shape in its `type` declaration:\n\n\
+               - Unit variants (`| None`) apply as bare identifiers: `None`.\n\
+               - Positional variants (`| Some(Int)`) apply as function-call \
+                 syntax: `Some(42)`.\n\
+               - Record variants (`| Point { x: Int, y: Int }`) apply as \
+                 record-literal syntax: `Point { x: 1, y: 2 }`.\n\n\
+               E0115 also fires on positional-arity mismatch (wrong number \
+               of arguments for a positional variant) and on record-field \
+               mismatches (missing, unknown, or duplicate field name for a \
+               record variant). The mismatch kind is named in the message.",
+        fix_example: "type Point = { x: Int, y: Int }\n\
+                      // p: Point = Point(1, 2);   // E0115: record shape expected\n\
+                      // p: Point = Point { x: 1 }; // E0115: missing field `y`\n\
+                      let p: Point = Point { x: 1, y: 2 };  // correct",
+    },
+    ErrorEntry {
+        code: "E0117",
+        short: "pattern shape does not match scrutinee type",
+        long: "A constructor, tuple, or variable pattern in a `match` arm \
+               names or structures a value that cannot belong to the \
+               scrutinee's type. Plan A3 verifies pattern shape against \
+               the scrutinee's type after Task 38 resolves the scrutinee's \
+               nominal type:\n\n\
+               - A constructor pattern `Ctor(...)` or `Ctor { .. }` matches \
+                 only a scrutinee of the user-defined type that declared \
+                 `Ctor`. Matching `Some(n)` against an `Int` fires E0117.\n\
+               - A tuple pattern `(a, b)` requires a tuple-typed scrutinee. \
+                 Plan A3 v1 has no tuple types in the surface, so every \
+                 tuple pattern fires E0117 against every scrutinee.\n\
+               - Constructor-argument sub-patterns are checked recursively \
+                 against the declared field types; a mismatched sub-pattern \
+                 fires E0117 with the sub-scrutinee position.\n\n\
+               E0064 (Plan A2) handles the literal-pattern-vs-primitive \
+               mismatch case (`0 => ...` against a String scrutinee). \
+               E0117 is the Plan A3 counterpart for the structural pattern \
+               forms introduced in task 37.",
+        fix_example: "type Option = | None | Some(Int)\n\
+                      // match opt { None => 0, Some(n) => n }  // ok\n\
+                      // match n { Some(k) => k, _ => 0 }       // E0117: Some not a ctor of Int\n\
+                      // match opt { (a, b) => a, _ => 0 }     // E0117: no tuple type",
+    },
+    ErrorEntry {
+        code: "E0118",
+        short: "duplicate constructor name across types",
+        long: "Two user-defined types declared variants with the same \
+               constructor name. Plan A3 registers constructor names in a \
+               single flat namespace across all `type` declarations; a \
+               constructor name like `Some` therefore belongs to exactly \
+               one type program-wide.\n\n\
+               Rename one of the colliding variants. Future plans may \
+               introduce path-qualified syntax (`Option::Some`) to \
+               disambiguate, but v1 keeps the surface flat to match the \
+               rest of the identifier namespace.",
+        fix_example: "type Option = | None | Some(Int)\n\
+                      type Result = | Ok(Int) | Err(String)    // different names, fine\n\n\
+                      // NOT:\n\
+                      // type Option = | None | Some(Int)\n\
+                      // type Maybe = | Nothing | Some(Int)  // E0118: Some collides",
+    },
+    ErrorEntry {
+        code: "E0113",
+        short: "duplicate type declaration",
+        long: "Two `type` declarations in the same program share a name. Plan \
+               A3 registers user types in a single flat namespace keyed by \
+               name; there is no module scoping in v1 and no shadowing of a \
+               prior type declaration. Rename the second declaration or \
+               delete it if it is redundant.\n\n\
+               A duplicate-type diagnostic is distinct from the redefinition \
+               rule for identifiers (E0020): a `type Foo = ...` and a value \
+               binding `let Foo: Int = 1` do not collide (distinct \
+               namespaces), but two `type Foo = ...` lines do.",
+        fix_example: "// Rename or remove one of:\n\
+                      type Option = | None | Some(Int)\n\
+                      type Result = | Ok(Int) | Err(String)   // different name, fine\n\n\
+                      // NOT:\n\
+                      // type Option = | None | Some(Int)\n\
+                      // type Option = | Nope | Yep(Int)  // E0113: duplicate `Option`",
+    },
+    ErrorEntry {
+        code: "E0120",
+        short: "non-exhaustive match on user-defined type",
+        long: "A `match` expression on a user-defined (nominal) type does \
+               not cover every constructor of the type. Plan A3 requires \
+               user-type matches to be structurally exhaustive — either a \
+               wildcard arm (`_ => ...`) or a variable-pattern arm that \
+               binds the whole scrutinee must be present, OR every \
+               declared variant must appear as a dedicated arm. Missing \
+               variants are named in the diagnostic message with their \
+               field positions filled in by wildcards so the user can \
+               paste the witness directly into a new arm.\n\n\
+               Related codes:\n\
+               - E0066: non-exhaustive match on a primitive scrutinee \
+                 (Plan A2 rule — wildcard required except for `Bool` where \
+                 both `true` and `false` literals may cover).\n\
+               - E0117: pattern shape does not match scrutinee type \
+                 (different failure mode — well-formed exhaustiveness \
+                 implies well-formed shapes first).\n\n\
+               Plan A3 v1 only verifies top-level exhaustiveness for user \
+               types. Nested non-exhaustive cases inside constructor \
+               fields (`match o { Some(true) => .., None => .. }` missing \
+               `Some(false)`) may fall through to the runtime's \
+               `TRAP_NONEXHAUSTIVE_MATCH` trap in the first release; \
+               Plan B refines to full nested Maranget exhaustiveness.",
+        fix_example: "type Option = | None | Some(Int)\n\
+                      // match o { None => 0 }  // E0120: missing `Some(_)`\n\
+                      match o {\n  None => 0,\n  Some(_) => 1,\n}  // exhaustive",
+    },
+    ErrorEntry {
+        code: "E0130",
+        short: "user-type layout too large (reserved)",
+        long: "Plan A3 user types whose payload word count exceeds the \
+               6-bit field in the object header (>63 payload words) need \
+               the external-descriptor escape hatch (tag `0xFF`), which \
+               ships in Plan B. v1 emits E0130 at codegen when a type's \
+               computed layout would require it, so the user sees a clear \
+               size ceiling rather than a silent header truncation. In \
+               practice Plan A3's surface syntax (records + positional \
+               variants with primitive or user-type fields) rarely \
+               approaches the ceiling; the guard exists primarily for \
+               safety, not as a regular user-facing diagnostic.\n\n\
+               This catalog entry is reserved: Plan A3 registers the \
+               diagnostic without emitting it in Stage 4 code paths \
+               (Task 40's codegen layout check is the emission site and \
+               it fires only at the 64-word boundary). Presence here \
+               keeps `sigil explain E0130` informative if a user ever \
+               trips it.",
+        fix_example: "// Refactor the type to nest records instead of\n\
+                      // flattening: a `Page { lines: Lines }` with\n\
+                      // `Lines = { l0: ..., l1: ..., .. }` pushes the\n\
+                      // top-level payload under the 64-word ceiling.",
+    },
+    ErrorEntry {
         code: "E0401",
         short: "runtime arithmetic abort",
         long: "A division or modulo operation was performed with a zero \

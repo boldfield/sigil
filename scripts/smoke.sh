@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# smoke.sh — plan A1 Stage 1 task 18.
+# smoke.sh — plan A1 Stage 1 task 18, extended across later plans.
 #
-# Builds the sigil compiler, compiles examples/hello.sigil, runs the
-# produced binary, and asserts stdout is exactly "hello, world" and
-# exit status is zero. Later plans extend this with additional
-# examples.
+# Builds the sigil compiler and runs every shipped example, asserting
+# stdout matches the documented invariant and exit status is zero.
+# Plan A3 adds option_demo.sigil and tree.sigil to the coverage.
 #
 # Cargo is expected on PATH. Works from any cwd.
 
@@ -17,22 +16,33 @@ cd "${repo_root}"
 cargo build --release --workspace --quiet
 
 sigil_bin="${repo_root}/target/release/sigil"
-source_path="${repo_root}/examples/hello.sigil"
 
 tmpdir="$(mktemp -d -t sigil-smoke.XXXXXX)"
 trap 'rm -rf "${tmpdir}"' EXIT
-out_path="${tmpdir}/hello"
 
-"${sigil_bin}" "${source_path}" -o "${out_path}"
+# Compile + run an example, assert stdout matches `expected` byte-for-byte.
+check_example() {
+    local source_path="$1"
+    local expected="$2"
+    local name
+    name="$(basename "${source_path}" .sigil)"
+    local out_path="${tmpdir}/${name}"
 
-actual="$("${out_path}")"
-expected="hello, world"
+    "${sigil_bin}" "${source_path}" -o "${out_path}"
+    local actual
+    actual="$("${out_path}")"
 
-if [[ "${actual}" != "${expected}" ]]; then
-    echo "smoke: FAIL — stdout mismatch" >&2
-    echo "  expected: ${expected}" >&2
-    echo "  actual:   ${actual}" >&2
-    exit 1
-fi
+    if [[ "${actual}" != "${expected}" ]]; then
+        echo "smoke: FAIL — ${name} stdout mismatch" >&2
+        echo "  expected: ${expected}" >&2
+        echo "  actual:   ${actual}" >&2
+        exit 1
+    fi
+    echo "smoke: OK (${name})"
+}
 
-echo "smoke: OK (hello-world printed as expected)"
+check_example "${repo_root}/examples/hello.sigil" "hello, world"
+check_example "${repo_root}/examples/option_demo.sigil" "$(printf '42\n-1')"
+check_example "${repo_root}/examples/tree.sigil" "32767"
+
+echo "smoke: OK (all examples passed)"
