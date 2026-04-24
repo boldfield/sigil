@@ -148,3 +148,41 @@ conditionals + match"; Stage 3 is "multi-arg functions + recursion +
 closures". Factorial belongs to the latter. Fibonacci is a better
 benchmark oracle anyway (non-trivial call depth, classic
 branching-recursion pattern, printed oracle is unambiguous).
+
+## 2026-04-24 — [PLAN-A3] Main's return tagging is type-agnostic
+
+**Context:** `compiler/src/codegen.rs` applies `ishl_imm 1` to `main`'s
+tail value on the way to `return_` so the C-main shim can `sshr_imm 1`
+the tagged Int and narrow it to `i32` for the process exit code. The
+shift is unconditional — it doesn't consult `main`'s declared return
+type. Today every `main` declares `-> Int` (typechecked by E0040's
+well-formed-check which requires `fn main() -> Int ![IO]` or
+`fn main() -> Int ![]`), so the shift is correct in practice. Flagged
+by the PR #7 reviewer as pre-existing from Plan A1 and not a
+regression.
+
+**Question:** What is the main-return-type contract in Plan A3+?
+
+- (a) Lock `main -> Int` in the grammar / typechecker as a structural
+  invariant. The shift stays correct by construction; codegen never
+  needs to branch on the return type.
+- (b) Allow `main -> Bool` / `main -> Unit` / etc. Codegen's tag-on-
+  return becomes type-dependent: `Int` shifts, `Bool` / `Byte` / `Unit`
+  narrow to i32 directly, `String` needs a serialization path. Also
+  the C-main shim becomes type-dependent.
+- (c) Drop the tagging convention entirely (deferred Plan B /
+  tagged-vs-raw ABI decision reviewer also flagged on this PR).
+  `main` returns raw i64; shim `ireduce`s to i32 without untagging.
+  Requires reconciling the tagged-Int ABI choice at every user-code
+  boundary.
+
+**Status:** open (tracked for Plan A3).
+
+**Resolution:** (pending)
+
+**Forward implications:** Option (c) dovetails with the broader
+tagged-vs-raw Int ABI decision the PR #7 reviewer also called out
+("raw everywhere internally, tag only at the C ABI boundary"). If
+that ABI decision resolves to "no internal tagging", main's tagging
+problem disappears with it. If the tagging stays, (a) or (b) is the
+relevant question.
