@@ -691,17 +691,16 @@ struct Lowerer<'a, 'b> {
     /// Plan A3 task 40 layout descriptors for every user-defined
     /// type in the program. Keyed by type name. Codegen reads the
     /// per-variant tag, payload word count, pointer bitmap, and
-    /// field types to emit constructor allocations and match
-    /// decision trees. Built once at `emit_object` entry. Wired
-    /// into lowering by Task 41.
-    #[allow(dead_code)] // consumed by Task 41.1 constructor lowering
+    /// field types to emit constructor allocations (task 41.1) and
+    /// match decision trees (task 41.2). Built once at `emit_object`
+    /// entry.
     type_layouts: &'b BTreeMap<String, crate::layout::TypeLayout>,
 
     /// Constructor-name → (type_name, variant_index) index rebuilt
-    /// from `type_layouts` (Plan A3 task 40). Used to recognise a
-    /// bare `Expr::Ident(ctor)` or `Expr::Call { callee: Ident(ctor), .. }`
-    /// site in lowering; look-up resolves in O(log n).
-    #[allow(dead_code)] // consumed by Task 41.1 constructor lowering
+    /// from `type_layouts` (Plan A3 task 40). Used to recognise
+    /// bare `Expr::Ident(ctor)`, `Expr::Call { callee: Ident(ctor), .. }`,
+    /// and `Expr::RecordLit` sites in lowering; look-up resolves in
+    /// O(log n).
     ctor_index: &'b BTreeMap<String, (String, usize)>,
 }
 
@@ -755,10 +754,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::BoolLit(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
             Expr::CharLit(c, _) => self.builder.ins().iconst(types::I32, *c as i64),
             Expr::StringLit(_, span) => self.lower_string_literal(span),
-            Expr::Ident(name, _) => *self
-                .env
-                .get(name)
-                .unwrap_or_else(|| unreachable!("codegen: unknown ident `{name}`")),
+            Expr::Ident(name, _) => {
+                // Plan A3 task 41.1: if the identifier isn't in the
+                // local env and matches a registered nullary
+                // constructor, lower as a user-type allocation (Unit
+                // variant, zero fields). The typechecker's
+                // nullary-ctor promotion path (task 38.2) already
+                // gated this case to be a Ty::User result.
+                if let Some(v) = self.env.get(name) {
+                    *v
+                } else if let Some((type_name, variant_idx)) = self.ctor_index.get(name).cloned() {
+                    self.lower_ctor_alloc(&type_name, variant_idx, &[])
+                } else {
+                    unreachable!("codegen: unknown ident `{name}`")
+                }
+            }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let l = self.lower_expr(lhs);
                 let r = self.lower_expr(rhs);
@@ -802,17 +812,37 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 ..
             } => self.lower_closure_record(code_fn_name, env_exprs, env_slot_kinds),
             Expr::ClosureEnvLoad { index, kind, .. } => self.lower_closure_env_load(*index, *kind),
-            // Plan A3 task 41 replaces this stub with record-literal
-            // allocation (heap, user type-tag, fields written per the
-            // registered layout). For task 37 (parser), this arm is an
-            // `unreachable!` because no well-typed Plan A3 program can
-            // reach codegen with a `RecordLit` until task 38's nominal-
-            // types symbol table lands — the typechecker will reject
-            // any program using the new surface syntax until then.
-            Expr::RecordLit { name, .. } => {
-                unreachable!(
-                    "codegen: Expr::RecordLit `{name}` requires Plan A3 task 41's record-allocation lowering; unreachable pre-task-41"
-                )
+            // Plan A3 task 41.1: record literal `Ctor { f: v, .. }`
+            // lowers to `sigil_alloc(header, payload_bytes)` followed
+            // by a discriminant store and per-field stores at the
+            // declared-order offsets (field names reordered to match
+            // the type declaration).
+            Expr::RecordLit { name, fields, .. } => {
+                let (type_name, variant_idx) =
+                    self.ctor_index.get(name).cloned().unwrap_or_else(|| {
+                        unreachable!("codegen: RecordLit `{name}` not in ctor index")
+                    });
+                let layout = &self.type_layouts[&type_name];
+                let variant = &layout.variants[variant_idx];
+                // Reorder the user's field values to match the declared
+                // field order. The typechecker guarantees every declared
+                // field is present exactly once (E0115 otherwise).
+                let ordered_values: Vec<Value> = variant
+                    .field_names
+                    .iter()
+                    .map(|decl_name| {
+                        let ast = fields
+                            .iter()
+                            .find(|f| &f.name == decl_name)
+                            .unwrap_or_else(|| {
+                                unreachable!(
+                                    "codegen: RecordLit `{name}` missing field `{decl_name}` post-typecheck"
+                                )
+                            });
+                        self.lower_expr(&ast.value)
+                    })
+                    .collect();
+                self.lower_ctor_alloc(&type_name, variant_idx, &ordered_values)
             }
         }
     }
@@ -827,6 +857,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     fn lower_call(&mut self, callee: &crate::ast::Expr, args: &[crate::ast::Expr]) -> Value {
         use crate::ast::Expr;
         match callee {
+            // Plan A3 task 41.1: positional constructor application
+            // `Ctor(a, b, ..)` where `Ctor` is a registered ctor name
+            // and not shadowed by a user fn or local. Lowers to heap
+            // allocation + discriminant + per-field stores in the
+            // declared field order (same order as args, since these
+            // are positional).
+            Expr::Ident(name, _)
+                if !self.user_fn_refs.contains_key(name)
+                    && !self.env.contains_key(name)
+                    && self.ctor_index.contains_key(name) =>
+            {
+                let (type_name, variant_idx) = self.ctor_index[name].clone();
+                let field_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+                self.lower_ctor_alloc(&type_name, variant_idx, &field_vals)
+            }
             Expr::Ident(name, _) if self.user_fn_refs.contains_key(name) => {
                 let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let func_ref = self.user_fn_refs[name];
@@ -976,6 +1021,77 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         }
 
         closure_ptr
+    }
+
+    /// Plan A3 task 41.1 constructor allocation.
+    ///
+    /// Emits `sigil_alloc(header, payload_bytes)`, stores the
+    /// variant's 1-byte discriminant at payload word 0, and stores
+    /// each field value at subsequent payload words in the variant's
+    /// declared order. Returns the header pointer (never an interior
+    /// pointer — the callers load fields back via offsets from the
+    /// header pointer).
+    ///
+    /// Every ctor allocation is a safepoint (heap-touching call); the
+    /// placeholder stackmap record is pushed at the `sigil_alloc`
+    /// instruction, matching Plan A2's closure-record pattern.
+    fn lower_ctor_alloc(
+        &mut self,
+        type_name: &str,
+        variant_index: usize,
+        field_values: &[Value],
+    ) -> Value {
+        let layout = &self.type_layouts[type_name];
+        let variant = &layout.variants[variant_index];
+        debug_assert_eq!(
+            field_values.len(),
+            variant.field_count(),
+            "ctor field count mismatch for `{type_name}::{}`",
+            variant.name,
+        );
+
+        let header = crate::layout::variant_header_word(layout.type_tag, variant);
+        let payload_bytes: i64 = (variant.payload_words as i64) * 8;
+
+        let header_v = self.builder.ins().iconst(types::I64, header as i64);
+        let size_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
+        let alloc_call = self.builder.ins().call(self.alloc_ref, &[header_v, size_v]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, alloc_call));
+        let ptr = self.builder.inst_results(alloc_call)[0];
+
+        // Discriminant in payload word 0 (bytes 8..16 past header).
+        // We store the full 8-byte word even though only the low
+        // byte carries meaning — matches the word-aligned store the
+        // match-side discriminant load uses, avoids partial-write
+        // aliasing.
+        let disc_v = self
+            .builder
+            .ins()
+            .iconst(types::I64, i64::from(variant.discriminant));
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), disc_v, ptr, 8);
+
+        // Fields in payload words 1..N. Each field stores an 8-byte
+        // word; sub-word primitives (Bool, Byte, Char, Unit) are
+        // zero-extended on store, pointer-typed fields flow through
+        // unchanged.
+        for (i, &val) in field_values.iter().enumerate() {
+            let val_ty = self.builder.func.dfg.value_type(val);
+            let store_val = if val_ty == types::I64 || val_ty == self.pointer_ty {
+                val
+            } else {
+                self.builder.ins().uextend(types::I64, val)
+            };
+            // Offset = 8 (header) + 8 (discriminant word) + 8*i.
+            let offset: i32 = 16 + 8 * i as i32;
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), store_val, ptr, offset);
+        }
+
+        ptr
     }
 
     /// Load the `index`-th env slot from the current fn's closure_ptr.
@@ -1190,11 +1306,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::CharLit(..) => types::I32,
             Expr::StringLit(..) | Expr::RecordLit { .. } => self.pointer_ty,
             Expr::Ident(name, _) => {
-                let v = *self
-                    .env
-                    .get(name)
-                    .unwrap_or_else(|| unreachable!("type_of_expr: unknown ident `{name}`"));
-                self.builder.func.dfg.value_type(v)
+                if let Some(v) = self.env.get(name) {
+                    self.builder.func.dfg.value_type(*v)
+                } else if self.ctor_index.contains_key(name) {
+                    // Plan A3 task 41.1: a bare-ident nullary
+                    // constructor allocates a heap record — result is
+                    // a pointer.
+                    self.pointer_ty
+                } else {
+                    unreachable!("type_of_expr: unknown ident `{name}`")
+                }
             }
             Expr::Binary { op, .. } => match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => types::I64,
@@ -1214,6 +1335,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 None => types::I8,
             },
             Expr::Call { callee, .. } => match callee.as_ref() {
+                // Plan A3 task 41.1: constructor application returns a
+                // heap pointer to the newly-allocated user-type record.
+                Expr::Ident(name, _)
+                    if self.ctor_index.contains_key(name) && !self.user_fns.contains_key(name) =>
+                {
+                    self.pointer_ty
+                }
                 Expr::Ident(name, _) if self.user_fns.contains_key(name) => {
                     self.user_fns[name].ret_ty
                 }
