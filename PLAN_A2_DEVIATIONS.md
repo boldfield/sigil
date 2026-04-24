@@ -5,7 +5,7 @@ Retroactive entries are forbidden.
 
 ## [Task 32] `call_indirect` path is `unreachable!` in Plan A2; direct-call covers every well-typed program
 
-**Commit:** (pending)
+**Commit:** cb6967c
 
 **Plan text:** "Extend codegen: closure calling convention (`arg0 = closure
 ptr, arg1..argN = args`); indirect call via the closure's code pointer;
