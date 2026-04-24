@@ -1357,12 +1357,30 @@ impl Tc {
             }
         }
 
-        // (2) exhaustiveness. Task 38.4 replaces the Plan A2 coarse
-        // check with Maranget's algorithm + counterexample witness for
-        // user types (E0120); until that lands, user-typed scrutinees
-        // are conservatively treated as requiring a wildcard arm.
+        // (2) exhaustiveness.
+        //
+        // User types (Plan A3 task 38.4): top-level Maranget-style
+        // coverage — either a catch-all arm (wildcard or non-promotion
+        // var binding) is present, or every declared variant has an
+        // arm. Missing variants → E0120 with a witness string naming
+        // the uncovered ctor with `_` fields.
+        //
+        // Primitives (Plan A2): retained `is_exhaustive` rule → E0066.
+        //
+        // Nested non-exhaustiveness inside ctor fields falls through
+        // to the runtime `TRAP_NONEXHAUSTIVE_MATCH` trap in Plan A3
+        // v1 (documented in the E0120 catalog long-form); Plan B
+        // refines to full nested exhaustiveness.
         if let Some(ref st) = scrut_ty {
-            if !is_exhaustive(st, arms) {
+            if let Ty::User(u) = st {
+                if let Some(witness) = self.user_type_witness(u, arms) {
+                    self.push_error(
+                        "E0120",
+                        span,
+                        format!("`match` on `{u}` is not exhaustive; missing case `{witness}`"),
+                    );
+                }
+            } else if !is_exhaustive(st, arms) {
                 self.push_error(
                     "E0066",
                     span,
@@ -1372,6 +1390,61 @@ impl Tc {
         }
 
         result_ty
+    }
+
+    /// Plan A3 task 38.4 — top-level exhaustiveness witness for a
+    /// user-typed scrutinee. Returns `None` when exhaustive; returns
+    /// `Some(witness_string)` naming the first uncovered variant when
+    /// not. The witness is pasteable directly into a new arm: `Foo`
+    /// for Unit, `Foo(_, _)` for Positional, `Foo { x: _, y: _ }` for
+    /// Record.
+    ///
+    /// A catch-all arm (wildcard or bare-var binding that is not a
+    /// nullary-ctor promotion) short-circuits to exhaustive. The
+    /// v1 algorithm only checks top-level coverage; nested non-
+    /// exhaustiveness inside a covered ctor's fields falls through to
+    /// the runtime trap and is documented as such in the E0120 catalog
+    /// long-form.
+    fn user_type_witness(&self, type_name: &str, arms: &[MatchArm]) -> Option<String> {
+        let td = self.types.get(type_name)?;
+        // A wildcard arm (`_ => ..`) or a bare-var arm whose name is
+        // not a nullary ctor of this type is a true catch-all.
+        let has_catchall = arms.iter().any(|a| match &a.pattern {
+            Pattern::Wildcard(_) => true,
+            Pattern::Var(name, _) => {
+                if let Some(info) = self.ctors.get(name) {
+                    if info.type_name == type_name {
+                        if let Some(variant) = td.variants.get(info.variant_index) {
+                            if matches!(variant.fields, VariantFields::Unit) {
+                                return false; // nullary-ctor promotion, not a catchall
+                            }
+                        }
+                    }
+                }
+                true
+            }
+            _ => false,
+        });
+        if has_catchall {
+            return None;
+        }
+        for variant in &td.variants {
+            let covered = arms
+                .iter()
+                .any(|a| Self::arm_covers_variant(&a.pattern, &variant.name));
+            if !covered {
+                return Some(ctor_witness_string(variant));
+            }
+        }
+        None
+    }
+
+    fn arm_covers_variant(p: &Pattern, variant_name: &str) -> bool {
+        match p {
+            Pattern::Ctor { name, .. } => name == variant_name,
+            Pattern::Var(name, _) => name == variant_name,
+            _ => false,
+        }
     }
 
     /// Plan A3 task 38.3 structural pattern typing. Verifies the
@@ -1749,6 +1822,32 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::GtEq => ">=",
         BinOp::And => "&&",
         BinOp::Or => "||",
+    }
+}
+
+/// Build a paste-able witness pattern for an uncovered variant
+/// (Plan A3 task 38.4). Shape follows the variant declaration:
+/// - `Unit` → `Foo`
+/// - `Positional(T1, ..., Tn)` → `Foo(_, ..., _)` (n wildcards)
+/// - `Record { f1: T1, ... }` → `Foo { f1: _, ... }` (one wildcard
+///   per declared field, preserving field-name order)
+fn ctor_witness_string(variant: &Variant) -> String {
+    match &variant.fields {
+        VariantFields::Unit => variant.name.clone(),
+        VariantFields::Positional(params) => {
+            let args = std::iter::repeat_n("_", params.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({args})", variant.name)
+        }
+        VariantFields::Record(fields) => {
+            let fs = fields
+                .iter()
+                .map(|f| format!("{}: _", f.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{} {{ {fs} }}", variant.name)
+        }
     }
 }
 
@@ -3062,5 +3161,196 @@ mod tests {
                    fn main() -> Int ![] { 0 }\n";
         let errs = pipeline_checked(src).1;
         assert!(has_code(&errs, "E0114"), "expected E0114, got: {errs:?}");
+    }
+
+    // ===== Plan A3 Task 38.4 — exhaustiveness witness =====
+
+    #[test]
+    fn exhaustive_option_match_no_e0120() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(n) => n }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "unexpected E0120: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_option_missing_some_is_e0120_with_witness() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Some(_)"),
+            "witness missing `Some(_)`: {}",
+            e120.message
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_option_missing_none_is_e0120_with_witness() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Some(n) => n }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("`None`"),
+            "witness missing `None`: {}",
+            e120.message
+        );
+    }
+
+    #[test]
+    fn wildcard_catchall_is_exhaustive_no_e0120() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, _ => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "unexpected E0120 with wildcard: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn var_binding_catchall_is_exhaustive_no_e0120() {
+        // `x` is a fresh name (not a registered ctor) → bind whole
+        // scrutinee; catchall.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, x => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "unexpected E0120 with var catchall: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn nullary_ctor_bare_var_promotion_does_not_count_as_catchall() {
+        // `None` as a bare ident is a nullary-ctor promotion, not a
+        // catchall. The match misses `Some(_)` → E0120 fires with
+        // witness.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Some(_)"),
+            "witness missing `Some(_)`: {}",
+            e120.message
+        );
+    }
+
+    #[test]
+    fn three_variant_exhaustiveness_witness_names_first_missing() {
+        // Type with three variants; arm only covers the middle one.
+        // Witness must name the first missing variant (top-down
+        // declaration order).
+        let src = "type Shape = | Point | Circle(Int) | Square { side: Int }\n\
+                   fn f(s: Shape) -> Int ![] {\n  \
+                     match s { Circle(r) => r }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("`Point`"),
+            "witness should name `Point` first: {}",
+            e120.message
+        );
+    }
+
+    #[test]
+    fn exhaustive_single_record_variant_no_e0120() {
+        let src = "type Point = { x: Int, y: Int }\n\
+                   fn f(p: Point) -> Int ![] {\n  \
+                     match p { Point { x, y } => x + y }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "unexpected E0120 on exhaustive record match: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn witness_for_positional_ctor_has_wildcards_per_field() {
+        let src = "type Pair = | Pair(Int, Int)\n\
+                   fn f(p: Pair) -> Int ![] {\n  \
+                     match p {  }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        // Parser rejects empty match arm list (E0066 or similar) —
+        // skip this program if parse fails.
+        let (_, errs) = pipeline_checked(src);
+        // Either parse-time arm-list rule fires, or exhaustiveness
+        // witness appears. We test the latter with a shape where
+        // at least one arm exists but none is the constructor:
+        let src2 = "type Pair = | Pair(Int, Int) | Single(Int)\n\
+                    fn f(p: Pair) -> Int ![] {\n  \
+                      match p { Single(x) => x }\n\
+                    }\n\
+                    fn main() -> Int ![] { 0 }\n";
+        let errs2 = pipeline_checked(src2).1;
+        let e120 = errs2
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs2:?}\n(part1 errs: {errs:?})"));
+        assert!(
+            e120.message.contains("Pair(_, _)"),
+            "witness missing `Pair(_, _)`: {}",
+            e120.message
+        );
+    }
+
+    #[test]
+    fn witness_for_record_ctor_has_field_wildcards() {
+        let src = "type Shape = | Circle(Int) | Rect { w: Int, h: Int }\n\
+                   fn f(s: Shape) -> Int ![] {\n  \
+                     match s { Circle(r) => r }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Rect { w: _, h: _ }"),
+            "witness format wrong: {}",
+            e120.message
+        );
     }
 }

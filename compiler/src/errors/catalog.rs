@@ -513,6 +513,59 @@ pub const CATALOG: &[ErrorEntry] = &[
                       // type Option = | Nope | Yep(Int)  // E0113: duplicate `Option`",
     },
     ErrorEntry {
+        code: "E0120",
+        short: "non-exhaustive match on user-defined type",
+        long: "A `match` expression on a user-defined (nominal) type does \
+               not cover every constructor of the type. Plan A3 requires \
+               user-type matches to be structurally exhaustive — either a \
+               wildcard arm (`_ => ...`) or a variable-pattern arm that \
+               binds the whole scrutinee must be present, OR every \
+               declared variant must appear as a dedicated arm. Missing \
+               variants are named in the diagnostic message with their \
+               field positions filled in by wildcards so the user can \
+               paste the witness directly into a new arm.\n\n\
+               Related codes:\n\
+               - E0066: non-exhaustive match on a primitive scrutinee \
+                 (Plan A2 rule — wildcard required except for `Bool` where \
+                 both `true` and `false` literals may cover).\n\
+               - E0117: pattern shape does not match scrutinee type \
+                 (different failure mode — well-formed exhaustiveness \
+                 implies well-formed shapes first).\n\n\
+               Plan A3 v1 only verifies top-level exhaustiveness for user \
+               types. Nested non-exhaustive cases inside constructor \
+               fields (`match o { Some(true) => .., None => .. }` missing \
+               `Some(false)`) may fall through to the runtime's \
+               `TRAP_NONEXHAUSTIVE_MATCH` trap in the first release; \
+               Plan B refines to full nested Maranget exhaustiveness.",
+        fix_example: "type Option = | None | Some(Int)\n\
+                      // match o { None => 0 }  // E0120: missing `Some(_)`\n\
+                      match o {\n  None => 0,\n  Some(_) => 1,\n}  // exhaustive",
+    },
+    ErrorEntry {
+        code: "E0130",
+        short: "user-type layout too large (reserved)",
+        long: "Plan A3 user types whose payload word count exceeds the \
+               6-bit field in the object header (>63 payload words) need \
+               the external-descriptor escape hatch (tag `0xFF`), which \
+               ships in Plan B. v1 emits E0130 at codegen when a type's \
+               computed layout would require it, so the user sees a clear \
+               size ceiling rather than a silent header truncation. In \
+               practice Plan A3's surface syntax (records + positional \
+               variants with primitive or user-type fields) rarely \
+               approaches the ceiling; the guard exists primarily for \
+               safety, not as a regular user-facing diagnostic.\n\n\
+               This catalog entry is reserved: Plan A3 registers the \
+               diagnostic without emitting it in Stage 4 code paths \
+               (Task 40's codegen layout check is the emission site and \
+               it fires only at the 64-word boundary). Presence here \
+               keeps `sigil explain E0130` informative if a user ever \
+               trips it.",
+        fix_example: "// Refactor the type to nest records instead of\n\
+                      // flattening: a `Page { lines: Lines }` with\n\
+                      // `Lines = { l0: ..., l1: ..., .. }` pushes the\n\
+                      // top-level payload under the 64-word ceiling.",
+    },
+    ErrorEntry {
         code: "E0401",
         short: "runtime arithmetic abort",
         long: "A division or modulo operation was performed with a zero \
