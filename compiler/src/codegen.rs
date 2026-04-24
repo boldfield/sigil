@@ -579,16 +579,21 @@ impl<'a> Lowerer<'a> {
                 unreachable!("codegen: Expr::Call lowering lands in plan A2 task 32")
             }
             Expr::Lambda { .. } => {
-                // Typecheck (plan A2 task 30) accepts lambdas and
-                // records their captures in
-                // `CheckedProgram.lambda_captures`; Task 31's
-                // closure conversion consumes that side table and
-                // rewrites lambdas into explicit closure records,
-                // after which Task 32 emits the indirect-call
-                // convention. Hand-crafted programs that build a
-                // `Lambda` will trip this `unreachable!` until those
-                // tasks land.
-                unreachable!("codegen: Expr::Lambda lowering lands in plan A2 tasks 31+32")
+                // Closure conversion (plan A2 task 31) rewrites every
+                // `Expr::Lambda` into an `Expr::ClosureRecord`; codegen
+                // only sees the post-CC form. Hitting this arm means
+                // closure conversion skipped a lambda.
+                unreachable!(
+                    "codegen: Expr::Lambda should have been replaced by ClosureRecord in closure_convert"
+                )
+            }
+            // ClosureRecord / ClosureEnvLoad lowering lands in plan A2
+            // task 32; the variants ship in task 31 so closure
+            // conversion can produce them.
+            Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
+                unreachable!(
+                    "codegen: ClosureRecord/ClosureEnvLoad lowering lands in plan A2 task 32"
+                )
             }
         }
     }
@@ -802,6 +807,20 @@ impl<'a> Lowerer<'a> {
             // Pick `pointer_ty` defensively: a closure lowers to a
             // GC-heap pointer in Task 32.
             Expr::Lambda { .. } => self.pointer_ty,
+            // Closure records are heap-allocated; a load from the
+            // closure env uses the slot's kind to pick its Cranelift
+            // type. Both land as real implementations in task 32.
+            Expr::ClosureRecord { .. } => self.pointer_ty,
+            Expr::ClosureEnvLoad { kind, .. } => match kind {
+                crate::ast::EnvSlotKind::Int => types::I64,
+                crate::ast::EnvSlotKind::Bool
+                | crate::ast::EnvSlotKind::Byte
+                | crate::ast::EnvSlotKind::Unit => types::I8,
+                crate::ast::EnvSlotKind::Char => types::I32,
+                crate::ast::EnvSlotKind::String | crate::ast::EnvSlotKind::Closure => {
+                    self.pointer_ty
+                }
+            },
         }
     }
 }
