@@ -72,6 +72,6 @@ is complete but whose CI run has not yet reported green.
   - commits: []
   - notes:
 - Task 46 — Seed prompt bank (P11–P15)
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: Added P11 (list length), P12 (list sum), P13 (Option-returning safe lookup over list), P14 (2D Point record + dist_sq via nested destructuring — no field-access syntax in A3 by design), P15 (map_inc: hard-coded increment over a list since `TypeExpr::Fn` + generics are deferred). Each prompt's oracle-notes block spells out the Plan A3 machinery exercised (type-tag allocation, constructor lowering, match-as-discriminant-test, field loads, nominal exhaustiveness) so downstream graders can cross-reference the semantic target. P13 documents the two-sum-types-one-program case.
