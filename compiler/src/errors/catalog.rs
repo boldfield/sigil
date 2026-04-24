@@ -356,36 +356,6 @@ pub const CATALOG: &[ErrorEntry] = &[
                       match p {\n  Pair(a, b) => use_parts(a, b),  // reference `a`, `b` directly\n}",
     },
     ErrorEntry {
-        code: "E0111",
-        short: "constructor application pending Plan A3 Task 41",
-        long: "Plan A3 Task 38 resolves constructor applications against \
-               registered user-defined types (both positional `Ctor(args)` and \
-               record `Ctor { fields }` forms, plus bare-identifier use for \
-               Unit variants). Task 41 implements the codegen side — heap \
-               allocation with the correct type header, discriminant store, \
-               and field population. Between Task 38's landing and Task 41's \
-               landing, this staged diagnostic fires at every successful \
-               constructor resolution so a well-formed user program stops at \
-               typecheck and never reaches codegen's still-unreachable \
-               allocation path. The diagnostic disappears when Task 41 \
-               flips the gate.\n\n\
-               This is an \"unimplemented feature\" error, not a user bug: \
-               the surface syntax is correct and the constructor's fields \
-               and types agree with the declaration (otherwise E0114 or \
-               E0115 would have surfaced instead). The compiler rejects \
-               the program only because the downstream codegen pipeline \
-               cannot yet produce executable machine code for it.\n\n\
-               Fires at all three construction sites: bare Ident for Unit \
-               variants (`None`), positional Call for Positional variants \
-               (`Some(42)`), and record literal for Record variants \
-               (`Point { x: 1, y: 2 }`). Deconstruction sites (patterns \
-               in a `match`) do not emit E0111 in Task 38 — they only \
-               typecheck into structural information; codegen wires them \
-               up in Task 41's decision-tree lowerer.",
-        fix_example: "// No user-side fix in Plan A3 v1 between Tasks 38 and 41.\n\
-                      // Track PR #12 for the flip-commit that removes this gate.",
-    },
-    ErrorEntry {
         code: "E0112",
         short: "unknown type name",
         long: "A `TypeExpr` referenced a type name that is neither a Plan A2 \

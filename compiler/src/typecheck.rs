@@ -373,25 +373,14 @@ impl Tc {
     /// positional and record variants require call / record-literal
     /// syntax and produce E0115 "shape mismatch" from here.
     ///
-    /// On success, emits the staged E0111 gate and returns
-    /// `Some(Ty::User(...))`. On shape mismatch, emits E0115 and
-    /// returns `None`.
+    /// On success returns `Some(Ty::User(...))`. On shape mismatch,
+    /// emits E0115 and returns `None`.
     fn resolve_ctor_unit_use(&mut self, name: &str, span: &Span) -> Option<Ty> {
         let info = self.ctors.get(name).cloned()?;
         let td = self.types.get(&info.type_name)?.clone();
         let variant = &td.variants[info.variant_index];
         match &variant.fields {
-            VariantFields::Unit => {
-                self.push_error(
-                    "E0111",
-                    span.clone(),
-                    format!(
-                        "constructor `{name}` (of type `{}`) is well-formed but codegen support lands in Plan A3 Task 41",
-                        info.type_name
-                    ),
-                );
-                Some(Ty::User(info.type_name))
-            }
+            VariantFields::Unit => Some(Ty::User(info.type_name)),
             VariantFields::Positional(params) => {
                 self.push_error(
                     "E0115",
@@ -428,8 +417,8 @@ impl Tc {
     /// existing call-site diagnostic vocabulary). E0115 fires when the
     /// variant is Unit or Record.
     ///
-    /// On success, emits the staged E0111 gate and returns
-    /// `Some(Ty::User(...))`. On shape mismatch, returns `None`.
+    /// On success returns `Some(Ty::User(...))`. On shape mismatch
+    /// returns `None`.
     fn resolve_ctor_positional_use(
         &mut self,
         name: &str,
@@ -478,14 +467,6 @@ impl Tc {
                         _ => {}
                     }
                 }
-                self.push_error(
-                    "E0111",
-                    span.clone(),
-                    format!(
-                        "constructor `{name}` (of type `{}`) is well-formed but codegen support lands in Plan A3 Task 41",
-                        info.type_name
-                    ),
-                );
                 Some(Ty::User(info.type_name))
             }
             VariantFields::Unit => {
@@ -522,9 +503,8 @@ impl Tc {
     /// mismatch. Evaluates every provided value regardless so errors
     /// inside field values still surface.
     ///
-    /// On success, emits the staged E0111 gate and returns
-    /// `Some(Ty::User(...))`. On failure (including unknown ctor
-    /// name), returns `None`.
+    /// On success returns `Some(Ty::User(...))`. On failure (including
+    /// unknown ctor name), returns `None`.
     fn resolve_ctor_record_use(
         &mut self,
         name: &str,
@@ -644,14 +624,6 @@ impl Tc {
                 );
             }
         }
-        self.push_error(
-            "E0111",
-            span.clone(),
-            format!(
-                "constructor `{name}` (of type `{}`) is well-formed but codegen support lands in Plan A3 Task 41",
-                info.type_name
-            ),
-        );
         Some(Ty::User(info.type_name))
     }
 
@@ -986,11 +958,10 @@ impl Tc {
                 unreachable!("typecheck: closure-conversion nodes should not appear pre-CC")
             }
             // Plan A3 task 38.2: record literal `Ctor { f: v, ... }`.
-            // Resolves the constructor name in the ctor registry,
+            // Resolves the constructor name in the ctor registry and
             // checks field names and value types against the declared
-            // record variant, and emits the staged E0111 gate on
-            // success (removed when Task 41 ships codegen). E0114 /
-            // E0115 / E0044 cover the various failure modes.
+            // record variant. E0114 / E0115 / E0044 cover the various
+            // failure modes.
             Expr::RecordLit { name, fields, span } => {
                 self.resolve_ctor_record_use(name, fields, span, row)
             }
@@ -2270,9 +2241,12 @@ mod tests {
             "fn main() -> Int ![] { let n: Int = match 0 { 0 => 1, _ => \"x\" }; 0 }\n",
             "fn main() -> Int ![] { let n: Int = match 0 { 0 => 1, 1 => 2 }; 0 }\n",
             "fn main() -> Int ![] { let n: Int = match true { true => 1 }; 0 }\n",
-            // Plan A3 task 37: record literal is a user-reachable surface
-            // form whose typecheck stub lives behind E0111, not E0001.
-            // Review of PR #12 flagged the original E0001 regression here.
+            // Plan A3 task 37: record literal is a user-reachable
+            // surface form. With codegen (Task 41) landed the type
+            // resolves cleanly; the `let p: Int = ...` binding type
+            // mismatch is the user-visible error here (E0045), never
+            // E0001. Review of PR #12 flagged the original E0001
+            // regression for this surface form.
             "type Point = { x: Int, y: Int }\nfn main() -> Int ![] { let p: Int = Point { x: 1, y: 2 }; 0 }\n",
         ];
         for src in programs {
@@ -2837,8 +2811,8 @@ mod tests {
     #[test]
     fn user_type_in_let_binding_typechecks_against_param() {
         // Pass a user-type-valued parameter into a let with the same
-        // declared type. No construction site needed (still E0111
-        // until the flip), but param-carried user values already work.
+        // declared type. Param-carried user values already work without
+        // needing a construction site.
         let src = "type Option = | None | Some(Int)\n\
                    fn f(o: Option) -> Int ![] { let p: Option = o; 0 }\n\
                    fn main() -> Int ![] { 0 }\n";
@@ -2875,51 +2849,30 @@ mod tests {
     // ===== Plan A3 Task 38.2 — constructor resolution =====
 
     #[test]
-    fn nullary_ctor_bare_ident_fires_e0111_and_resolves_type() {
+    fn nullary_ctor_bare_ident_typechecks_cleanly() {
         // `None` as an expression is a bare ctor ident. Resolves to
-        // Ty::User("Option"); E0111 gates the compile.
+        // Ty::User("Option") and flows into the `let`'s declared
+        // `Option` type without any error.
         let src = "type Option = | None | Some(Int)\n\
                    fn main() -> Int ![] { let o: Option = None; 0 }\n";
         let errs = pipeline_checked(src).1;
-        assert!(
-            has_code(&errs, "E0111"),
-            "expected E0111 gate, got: {errs:?}"
-        );
-        // Must NOT fire E0046 for `None` — we resolved it to a ctor.
-        assert!(
-            !errs.iter().any(|e| e.code.as_str() == "E0046"),
-            "unexpected E0046: {errs:?}"
-        );
-        // Must NOT fire E0045 (let type mismatch) — the ctor's type
-        // matches the declared `Option` lhs.
-        assert!(
-            !errs.iter().any(|e| e.code.as_str() == "E0045"),
-            "unexpected E0045: {errs:?}"
-        );
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
     }
 
     #[test]
-    fn positional_ctor_call_fires_e0111_and_resolves_type() {
+    fn positional_ctor_call_typechecks_cleanly() {
         let src = "type Option = | None | Some(Int)\n\
                    fn main() -> Int ![] { let o: Option = Some(42); 0 }\n";
         let errs = pipeline_checked(src).1;
-        assert!(has_code(&errs, "E0111"), "expected E0111, got: {errs:?}");
-        assert!(
-            !errs.iter().any(|e| e.code.as_str() == "E0045"),
-            "unexpected E0045: {errs:?}"
-        );
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
     }
 
     #[test]
-    fn record_ctor_literal_fires_e0111_and_resolves_type() {
+    fn record_ctor_literal_typechecks_cleanly() {
         let src = "type Point = { x: Int, y: Int }\n\
                    fn main() -> Int ![] { let p: Point = Point { x: 1, y: 2 }; 0 }\n";
         let errs = pipeline_checked(src).1;
-        assert!(has_code(&errs, "E0111"), "expected E0111, got: {errs:?}");
-        assert!(
-            !errs.iter().any(|e| e.code.as_str() == "E0045"),
-            "unexpected E0045: {errs:?}"
-        );
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
     }
 
     #[test]
@@ -3019,21 +2972,14 @@ mod tests {
                    fn take(o: Option) -> Int ![] { 0 }\n\
                    fn main() -> Int ![] { take(Some(42)) }\n";
         let errs = pipeline_checked(src).1;
-        assert!(
-            has_code(&errs, "E0111"),
-            "expected E0111 gate, got: {errs:?}"
-        );
-        // No E0044 — Some(42) has type Option, matches the param.
-        assert!(
-            !errs.iter().any(|e| e.code.as_str() == "E0044"),
-            "unexpected E0044: {errs:?}"
-        );
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
     }
 
     #[test]
     fn ctor_resolution_does_not_fire_e0001() {
-        // Sweep-style check: every well-formed ctor use surfaces the
-        // staged E0111 and nothing internal-compiler-error-shaped.
+        // Sweep-style check: every well-formed ctor use typechecks
+        // cleanly (the E0001 "internal compiler error" catalog entry
+        // is reserved for bugs, never surface errors).
         let programs = [
             "type Option = | None | Some(Int)\nfn main() -> Int ![] { let o: Option = None; 0 }\n",
             "type Option = | None | Some(Int)\nfn main() -> Int ![] { let o: Option = Some(1); 0 }\n",
@@ -3493,14 +3439,7 @@ mod tests {
                    }\n\
                    fn main() -> Int ![] { 0 }\n";
         let (cp, errs) = pipeline_checked(src);
-        // E0111 is expected (ctor resolution still gated). All other
-        // errors would be real bugs; filter E0111 out when validating.
-        let non_gate: Vec<_> =
-            errs.iter().filter(|e| e.code.as_str() != "E0111").collect();
-        assert!(
-            non_gate.is_empty(),
-            "only E0111 should remain; got: {non_gate:?}"
-        );
+        assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
         assert_eq!(
             cp.match_scrut_tys.len(),
             1,
