@@ -10,25 +10,18 @@
 //! | 14..46 | 32    | GC pointer bitmap (bit k ⇒ payload[k] is a GC pointer) |
 //! | 46..64 | 18    | reserved (forwarding pointer / generation / mark) |
 //!
-//! This module is the SINGLE source of truth for header construction.
-//! Every allocation site — runtime and codegen — builds its header through
-//! `Header::new`. Constructing a header as a raw `u64` at an allocation
-//! site is a bug.
+//! The bit-layout constants and the `header_word` construction formula
+//! live in the shared `sigil_header_constants` crate so both the
+//! runtime and the compiler build headers from a single source. This
+//! module wraps them with the `Header` struct and accessor methods
+//! runtime callers use; every runtime allocation site must still route
+//! through `Header::new`. The compiler's codegen consumes the same
+//! constants + `header_word` directly because it emits header
+//! immediates inline at each allocation site in generated code.
 
-/// Reserved type-tag sentinel for "see external descriptor table" (v2 only).
-pub const TAG_EXTERNAL_DESCRIPTOR: u8 = 0xFF;
+pub use sigil_header_constants::{TAG_CLOSURE, TAG_EXTERNAL_DESCRIPTOR, TAG_INT64, TAG_STRING};
 
-// v1 type tags. Add new tags at the next free slot; never renumber.
-pub const TAG_STRING: u8 = 0x01;
-pub const TAG_INT64: u8 = 0x02;
-
-const COUNT_BITS: u32 = 6;
-const COUNT_SHIFT: u32 = 8;
-const COUNT_MASK: u64 = (1u64 << COUNT_BITS) - 1;
-
-const BITMAP_BITS: u32 = 32;
-const BITMAP_SHIFT: u32 = 14;
-const BITMAP_MASK: u64 = ((1u64 << BITMAP_BITS) - 1) << BITMAP_SHIFT;
+use sigil_header_constants::{header_word, BITMAP_MASK, BITMAP_SHIFT, COUNT_MASK, COUNT_SHIFT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header(pub u64);
@@ -53,10 +46,7 @@ impl Header {
             "Header::new: count {count} exceeds 6-bit field",
         );
 
-        let w = (type_tag as u64)
-            | (((count as u64) & COUNT_MASK) << COUNT_SHIFT)
-            | ((bitmap as u64) << BITMAP_SHIFT);
-        Header(w)
+        Header(header_word(type_tag, count, bitmap))
     }
 
     #[inline]

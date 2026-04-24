@@ -70,6 +70,38 @@ pub struct LetStmt {
     pub span: Span,
 }
 
+/// Cranelift-level classification of a closure env slot. Set by closure
+/// conversion (plan A2 task 31) from each capture's Sigil `Ty`; consumed
+/// by codegen (task 32) to pick the right load/store width and to decide
+/// whether to set the corresponding bit in the closure header's GC pointer
+/// bitmap. Lives in `ast.rs` (not `typecheck.rs`) so the new `Expr`
+/// variants can carry slot metadata without pulling the typechecker's
+/// `Ty` into the AST layer.
+///
+/// Every env slot stores its value in a fixed 8-byte word. Smaller types
+/// (`Bool`, `Byte`, `Char`, `Unit`) are zero-extended on store and
+/// truncated on load. `String` and `Closure` are word-sized GC pointers
+/// and are the only variants that set a bitmap bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvSlotKind {
+    Int,
+    Bool,
+    Char,
+    Byte,
+    Unit,
+    String,
+    Closure,
+}
+
+impl EnvSlotKind {
+    /// Whether this slot holds a GC-managed pointer. Codegen ORs bit `k+1`
+    /// (past the code_ptr word at bit 0) into the closure header's pointer
+    /// bitmap iff this returns `true` for slot `k`.
+    pub fn is_pointer(self) -> bool {
+        matches!(self, EnvSlotKind::String | EnvSlotKind::Closure)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Expr {
     IntLit(i64, Span),
@@ -133,6 +165,40 @@ pub enum Expr {
         return_type: TypeExpr,
         effects: Vec<String>,
         body: Box<Expr>,
+        span: Span,
+    },
+    /// Post-closure-conversion node (plan A2 task 31). Replaces the
+    /// original `Expr::Lambda` at its source position. At runtime,
+    /// codegen (task 32) allocates a flat closure record on the GC
+    /// heap: `{header, code_ptr, env[0], ..., env[N-1]}`. `code_fn_name`
+    /// names a synthetic top-level `FnDecl` hoisted into the program's
+    /// `items` list by closure conversion; its body holds the lambda's
+    /// original body with captured-variable `Ident`s rewritten into
+    /// `ClosureEnvLoad`s. `env_exprs[k]` evaluates (in the scope where
+    /// the original lambda was written) to the captured value stored at
+    /// env slot `k`; `env_slot_kinds[k]` tells codegen the Cranelift
+    /// store width and whether to flip the GC bitmap bit for that slot.
+    ///
+    /// The parser never produces this variant — it only appears after
+    /// closure conversion runs. Pre-CC passes (typecheck, elaborate)
+    /// treat it as unreachable.
+    ClosureRecord {
+        code_fn_name: String,
+        env_exprs: Vec<Expr>,
+        env_slot_kinds: Vec<EnvSlotKind>,
+        span: Span,
+    },
+    /// Post-closure-conversion node (plan A2 task 31). Inside a
+    /// synthetic lambda fn hoisted by closure conversion, every original
+    /// `Expr::Ident` that named a captured outer variable is rewritten
+    /// into a `ClosureEnvLoad`. Codegen (task 32) lowers this to a load
+    /// from `closure_ptr + 16 + 8*index` (past the 8-byte header and
+    /// the 8-byte code_ptr word), narrowed or zero-extended as `kind`
+    /// dictates. `name` is kept for diagnostics and pretty-printing only.
+    ClosureEnvLoad {
+        name: String,
+        index: usize,
+        kind: EnvSlotKind,
         span: Span,
     },
 }
@@ -207,7 +273,9 @@ impl Expr {
             | Expr::Unary { span: s, .. }
             | Expr::If { span: s, .. }
             | Expr::Match { span: s, .. }
-            | Expr::Lambda { span: s, .. } => s.clone(),
+            | Expr::Lambda { span: s, .. }
+            | Expr::ClosureRecord { span: s, .. }
+            | Expr::ClosureEnvLoad { span: s, .. } => s.clone(),
             Expr::Perform(p) => p.span.clone(),
             Expr::Block(b) => b.span.clone(),
         }

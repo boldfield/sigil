@@ -344,6 +344,13 @@ impl Elaborator {
                     Vec::new(),
                 )
             }
+            // `ClosureRecord` / `ClosureEnvLoad` are synthesized by
+            // plan A2 task 31's closure conversion, which runs strictly
+            // after elaborate. They cannot appear in the AST elaborate
+            // sees.
+            Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
+                unreachable!("elaborate: closure-conversion nodes should not appear pre-CC")
+            }
         }
     }
 

@@ -3,6 +3,81 @@
 Each deviation from the plan is logged here *before* the implementing commit.
 Retroactive entries are forbidden.
 
+## [Task 32] `call_indirect` path is `unreachable!` in Plan A2; direct-call covers every well-typed program
+
+**Commit:** cb6967c
+
+**Plan text:** "Extend codegen: closure calling convention (`arg0 = closure
+ptr, arg1..argN = args`); indirect call via the closure's code pointer;
+closure allocation on the GC heap."
+
+**What was done instead:** Every `Expr::Call` whose callee is syntactically
+`Expr::Ident(name)` (where `name` is a registered user fn) or
+`Expr::ClosureRecord { code_fn_name, .. }` is lowered as a **direct**
+Cranelift `call` to the relevant `FuncRef`. Direct calls to top-level fns
+pass a null pointer as the closure_ptr argument; calls whose callee is a
+`ClosureRecord` allocate the record first (via `sigil_alloc` + `store`
+sequence) and pass the record's header pointer as closure_ptr. Callees
+with any other syntactic shape hit an `unreachable!("codegen: indirect
+call deferred to Plan A3 (TypeExpr::Fn not in A2)")` arm in `lower_call`.
+
+Closure allocation and the `code_ptr` field of `ClosureRecord` are
+*fully* implemented — every closure record stores a valid code_ptr
+suitable for an indirect call, even though no call site in a well-typed
+Plan A2 program actually loads it.
+
+**Why:** Indirect calls require the callee's Cranelift signature at the
+call site (param types + return type) to build a Cranelift `SigRef` via
+`builder.import_signature`. For a callee like `Expr::Ident(local_name)`
+where `local_name` was bound to a closure value, the signature lives on
+that closure's `Ty::Fn(FnSig)` — which in turn requires the
+`TypeExpr::Fn` surface syntax so that let bindings, function parameters,
+and return types can carry function types through the type system.
+Plan A2 deliberately defers `TypeExpr::Fn` (see Task 30's PROGRESS
+note: "`TypeExpr::Fn` surface syntax deliberately deferred"). Without
+it, no well-typed Plan A2 program can produce a call site whose callee
+is not already an `Ident(top_level_fn)` or a `ClosureRecord`. Every such
+callee is direct-callable, so implementing `call_indirect` in Plan A2
+would add a code path that cannot be exercised by any program — a
+testing void that's worse than leaving the arm unreachable with a
+helpful message.
+
+The closure record's `code_ptr` field is still populated correctly (via
+`func_addr` over the synthetic fn's `FuncRef`), so when Plan A3 lands
+`TypeExpr::Fn` the indirect-call path only needs to (a) reconstruct the
+callee signature from the callee's typechecked `Ty::Fn(FnSig)` and (b)
+emit `builder.ins().call_indirect(sig_ref, code_ptr_loaded, &all_args)`
+— the runtime layout it loads against is already the shipped shape.
+
+**Forward implications:** Plan A3 (`TypeExpr::Fn` surface syntax +
+typechecker support for fn-typed lets and params) must:
+
+1. Replace the `unreachable!` arm in `Lowerer::lower_call` with a real
+   indirect-call lowering. The path loads `code_ptr` from the callee
+   pointer at offset 8 (past the 8-byte header), builds a Cranelift
+   `SigRef` matching the callee's `Ty::Fn` signature, and emits
+   `call_indirect`.
+2. Re-apply `push_placeholder` after the indirect call (stackmap
+   discipline unchanged).
+3. Remove the defensive `types::I64` fall-back in `Lowerer::type_of_expr`
+   for the `Expr::Call` arm whose callee is neither an `Ident` of a
+   top-level fn nor a `ClosureRecord` — that fall-back exists only to
+   make `lower_match` well-typed in the presence of a `Call` scrutinee
+   that Plan A2 cannot construct.
+4. Extend the e2e test suite with indirect-call tests once fn-typed let
+   bindings parse.
+
+**Tests that pin this scope:** the five closure e2e tests added in this
+PR in `compiler/tests/e2e.rs` bound what `done-pending-ci` meant for
+Task 32 — if Plan A3's indirect-call lowering breaks any of them,
+something in the direct-call path has regressed:
+
+- `direct_call_top_level_fn` — `inc(41) -> 42` (Ident-callee direct call).
+- `recursion_via_direct_call` — `fact(5) -> 120` (self-recursive direct call).
+- `iife_no_captures` — `(fn(x)=>x+1)(41) -> 42` (ClosureRecord-callee direct call, empty env).
+- `iife_with_int_capture` — `let x=10; (fn(y)=>x+y)(32) -> 42` (ClosureRecord-callee direct call, single Int env slot).
+- `nested_iife_transitive_capture` — `x=7` threaded through two nested closures to produce `10` (ClosureRecord-callee direct call, transitive capture).
+
 ## [Task 1.5.5 — revision] Move staticlib materialisation out of build.rs into the e2e test itself
 
 **Commit:** db3ae5e

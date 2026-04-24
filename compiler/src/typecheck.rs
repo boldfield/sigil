@@ -72,9 +72,11 @@ pub struct CheckedProgram {
     /// Per-lambda free-variable sets, keyed by the lambda's span. Populated
     /// by `check_expr` when it enters an `Expr::Lambda`; consumed by
     /// closure conversion (plan A2 task 31) to size the closure's
-    /// environment. Each entry is `(lambda_span, captured_ident_names)`
-    /// in source-order of lambda appearance.
-    pub lambda_captures: Vec<(Span, Vec<String>)>,
+    /// environment AND to compute the GC pointer bitmap for the closure
+    /// record's header. Each entry is `(lambda_span, [(name, ty)...])`
+    /// in source-order of lambda appearance; the `Ty` for each capture
+    /// is the type the name held in the outer scope at lambda-entry.
+    pub lambda_captures: Vec<(Span, Vec<(String, Ty)>)>,
 }
 
 pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
@@ -141,8 +143,10 @@ struct Tc {
     errors: Vec<CompilerError>,
     string_literals: Vec<(Span, String)>,
     /// Accumulated lambda free-variable sets; moved into `CheckedProgram`
-    /// at typecheck completion.
-    lambda_captures: Vec<(Span, Vec<String>)>,
+    /// at typecheck completion. Each capture carries its outer-scope type
+    /// so closure conversion can compute the GC pointer bitmap without
+    /// re-looking-up types.
+    lambda_captures: Vec<(Span, Vec<(String, Ty)>)>,
     /// Global environment: every top-level `FnDecl`'s declared signature,
     /// pre-populated before any body is checked. Makes recursive and
     /// mutually-recursive user functions typeable without a fix-point
@@ -462,6 +466,13 @@ impl Tc {
                 body,
                 span,
             } => self.check_lambda(params, return_type, effects, body, span.clone()),
+            // `ClosureRecord` / `ClosureEnvLoad` are post-closure-
+            // conversion nodes synthesized by plan A2 task 31. They
+            // never appear in a parser-produced AST; typecheck runs
+            // strictly before closure conversion.
+            Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
+                unreachable!("typecheck: closure-conversion nodes should not appear pre-CC")
+            }
         }
     }
 
@@ -703,12 +714,30 @@ impl Tc {
         // (2) capture analysis: snapshot the outer env *before*
         //     adding params. Any Ident reference in the body whose
         //     name is in `outer_names` (not a param, not a lambda-
-        //     local let) is a captured free variable.
+        //     local let) is a captured free variable. Each capture
+        //     is paired with its outer-scope `Ty` so closure
+        //     conversion can compute the GC pointer bitmap without a
+        //     separate re-lookup pass.
         let outer_names: std::collections::BTreeSet<String> = self.env.keys().cloned().collect();
         let param_names: std::collections::BTreeSet<String> =
             params.iter().map(|p| p.name.clone()).collect();
-        let mut captures: Vec<String> = Vec::new();
-        collect_free_vars(body, &outer_names, &param_names, &mut captures);
+        let mut capture_names: Vec<String> = Vec::new();
+        collect_free_vars(body, &outer_names, &param_names, &mut capture_names);
+        let captures: Vec<(String, Ty)> = capture_names
+            .into_iter()
+            .map(|name| {
+                // `outer_names` is the `env` keyset before params are
+                // added, so every captured name is guaranteed present
+                // in `self.env` at this point. Unwrap is an invariant,
+                // not a bet.
+                let ty = self
+                    .env
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| unreachable!("capture {name} missing from outer env"));
+                (name, ty)
+            })
+            .collect();
         self.lambda_captures.push((span.clone(), captures));
 
         // (3) extend env with params for the body walk. We *add*
@@ -1050,6 +1079,11 @@ fn collect_free_vars(
                     &mut inner_locals,
                     captures,
                 );
+            }
+            // Capture analysis runs during typecheck, which is strictly
+            // before closure conversion. These nodes never appear here.
+            Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
+                unreachable!("collect_free_vars: closure-conversion nodes should not appear pre-CC")
             }
         }
     }
@@ -1567,13 +1601,14 @@ mod tests {
         assert!(errs.is_empty(), "expected clean, got: {errs:?}");
         assert_eq!(checked.lambda_captures.len(), 1, "one lambda");
         let (_, captures) = &checked.lambda_captures[0];
+        // `x` appears with its outer-scope type `Int`.
         assert!(
-            captures.iter().any(|n| n == "x"),
-            "lambda should capture `x`, captures={captures:?}"
+            captures.iter().any(|(n, t)| n == "x" && *t == Ty::Int),
+            "lambda should capture `x: Int`, captures={captures:?}"
         );
         // The param `y` is NOT a capture.
         assert!(
-            !captures.iter().any(|n| n == "y"),
+            !captures.iter().any(|(n, _)| n == "y"),
             "param `y` should not appear in captures, got {captures:?}"
         );
     }
@@ -1612,7 +1647,7 @@ mod tests {
         assert_eq!(checked.lambda_captures.len(), 1, "one lambda");
         let (_, captures) = &checked.lambda_captures[0];
         assert!(
-            !captures.iter().any(|n| n == "inc"),
+            !captures.iter().any(|(n, _)| n == "inc"),
             "top-level fn `inc` must not appear in captures, got {captures:?}"
         );
     }
@@ -1664,18 +1699,18 @@ mod tests {
         // `_p` is its only param.
         let (_, outer_caps) = &checked.lambda_captures[0];
         assert!(
-            outer_caps.iter().any(|n| n == "x"),
-            "outer lambda's captures should include `x`, got {outer_caps:?}"
+            outer_caps.iter().any(|(n, t)| n == "x" && *t == Ty::Int),
+            "outer lambda's captures should include `x: Int`, got {outer_caps:?}"
         );
         // Inner lambda captures `x` too — but `y` (its own param) is
         // excluded.
         let (_, inner_caps) = &checked.lambda_captures[1];
         assert!(
-            inner_caps.iter().any(|n| n == "x"),
-            "inner lambda's captures should include `x`, got {inner_caps:?}"
+            inner_caps.iter().any(|(n, t)| n == "x" && *t == Ty::Int),
+            "inner lambda's captures should include `x: Int`, got {inner_caps:?}"
         );
         assert!(
-            !inner_caps.iter().any(|n| n == "y"),
+            !inner_caps.iter().any(|(n, _)| n == "y"),
             "inner lambda's own param `y` should not be a capture"
         );
     }
