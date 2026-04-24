@@ -23,7 +23,18 @@ use crate::ast::*;
 use crate::errors::{self, CompilerError, Severity, Span};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The checker's type lattice. Expanded in plan A2 task 30 to include
+/// `Fn` for user function/lambda values.
+///
+/// Plan A2's type surface remains monomorphic: no generics, no type
+/// variables, no subtyping. Type equality is structural and cheap —
+/// direct `PartialEq` on `Ty`.
+///
+/// `Ty` no longer derives `Copy` starting from task 30 because `Ty::Fn`
+/// carries owned `Vec`s (parameter list and effect row). The small
+/// primitive cases still benefit from `Clone`, and every call site
+/// that needed a by-value copy now uses `.clone()` explicitly.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ty {
     Int,
     String,
@@ -31,6 +42,25 @@ pub enum Ty {
     Bool,
     Char,
     Byte,
+    /// Function type: `(param_tys...) -> ret_ty ![effect_names...]`.
+    /// Boxed to keep the overall `Ty` size small — most `Ty` values
+    /// in a program are primitives, and boxing the fn case keeps the
+    /// discriminant + payload fit into a register on 64-bit hosts.
+    Fn(Box<FnSig>),
+}
+
+/// Structural function signature. Used in `Ty::Fn` and built for
+/// every top-level `FnDecl` plus every `Expr::Lambda`.
+///
+/// Effects are stored as `Vec<String>` rather than a dedicated enum
+/// so the runtime row-extension rules (v2+) can add new effect names
+/// without breaking the typechecker. Plan A2 only ever sees `IO` in
+/// an effect row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FnSig {
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+    pub effects: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,15 +69,45 @@ pub struct CheckedProgram {
     /// Ordered list of (string-literal span, literal value). Codegen uses
     /// this to interleave static-data sections with the pipeline output.
     pub string_literals: Vec<(Span, String)>,
+    /// Per-lambda free-variable sets, keyed by the lambda's span. Populated
+    /// by `check_expr` when it enters an `Expr::Lambda`; consumed by
+    /// closure conversion (plan A2 task 31) to size the closure's
+    /// environment. Each entry is `(lambda_span, captured_ident_names)`
+    /// in source-order of lambda appearance.
+    pub lambda_captures: Vec<(Span, Vec<String>)>,
 }
 
 pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
+    // Pre-pass: build a global environment from every top-level
+    // `FnDecl`'s declared signature. This lets recursive and mutually-
+    // recursive user functions reference each other by name during
+    // `check_fn`'s body walk. Any `FnDecl` whose declared types don't
+    // resolve to known `Ty`s is recorded with its best-effort partial
+    // signature; the full diagnostic surfaces when the decl's own body
+    // is checked.
+    let mut fn_env: BTreeMap<String, Ty> = BTreeMap::new();
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            let sig = FnSig {
+                params: f
+                    .params
+                    .iter()
+                    .map(|p| ty_from_type_expr(&p.ty).unwrap_or(Ty::Unit))
+                    .collect(),
+                ret: ty_from_type_expr(&f.return_type).unwrap_or(Ty::Unit),
+                effects: f.effects.clone(),
+            };
+            fn_env.insert(f.name.clone(), Ty::Fn(Box::new(sig)));
+        }
+    }
+
     let mut tc = Tc {
         errors: Vec::new(),
         string_literals: Vec::new(),
+        lambda_captures: Vec::new(),
+        fn_env,
         env: BTreeMap::new(),
     };
-    // Validate main: for Stage 1 there must be exactly one fn named "main".
     for item in &program.items {
         match item {
             Item::Fn(f) => tc.check_fn(f),
@@ -71,6 +131,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         CheckedProgram {
             program,
             string_literals: tc.string_literals,
+            lambda_captures: tc.lambda_captures,
         },
         tc.errors,
     )
@@ -79,10 +140,20 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
 struct Tc {
     errors: Vec<CompilerError>,
     string_literals: Vec<(Span, String)>,
-    /// Type environment for the currently-checked function. Populated with
-    /// parameters on entry to `check_fn` and extended by `let` bindings as
-    /// each statement is checked. Cleared between functions. A BTreeMap
-    /// keeps iteration order stable (the catalog-integrity discipline).
+    /// Accumulated lambda free-variable sets; moved into `CheckedProgram`
+    /// at typecheck completion.
+    lambda_captures: Vec<(Span, Vec<String>)>,
+    /// Global environment: every top-level `FnDecl`'s declared signature,
+    /// pre-populated before any body is checked. Makes recursive and
+    /// mutually-recursive user functions typeable without a fix-point
+    /// iteration. Plan A2 task 30.
+    fn_env: BTreeMap<String, Ty>,
+    /// Type environment for the currently-checked function. Initialised
+    /// from `fn_env` on entry to `check_fn` (so user code can reference
+    /// sibling and own-recursive functions) and extended by parameters
+    /// and `let` bindings as each statement is checked. Reset between
+    /// functions. A `BTreeMap` keeps iteration order stable (the
+    /// catalog-integrity discipline).
     env: BTreeMap<String, Ty>,
 }
 
@@ -116,9 +187,28 @@ impl Tc {
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
-        // Fresh environment per function. Sigil has no closures in Plan A1
-        // (closure conversion is a no-op stub), so lexical scopes do not
-        // nest across function boundaries.
+        // Fresh per-function local env: holds only parameters and
+        // `let` bindings. Top-level function signatures live in
+        // `self.fn_env`, consulted as a fallback during Ident
+        // resolution (see `check_expr`/`Expr::Ident`). Keeping the
+        // two maps separate avoids two bugs that arose when fn_env
+        // was merged into env at fn entry:
+        //
+        //   1. Debug-assert in `env_insert` tripped on `let foo: Int
+        //      = ...` inside a function whose top-level namesake
+        //      is also `foo` — because `foo` was already in `env`
+        //      via the fn_env seeding. Release builds silently
+        //      overwrote, leaving fn_env's entry inconsistent with
+        //      the local binding.
+        //   2. Capture analysis treated every top-level fn name as
+        //      an outer free variable, so closure conversion would
+        //      allocate spurious env fields for statically-resolvable
+        //      top-level symbols.
+        //
+        // Reported on PR #6 review; fix preserves local-first lookup
+        // semantics (params/lets shadow top-level fns of the same
+        // name within their scope) while keeping fn_env out of the
+        // insert-collision and capture-analysis paths.
         self.env.clear();
         for p in &f.params {
             if let Some(ty) = ty_from_type_expr(&p.ty) {
@@ -177,7 +267,7 @@ impl Tc {
                 Stmt::Let(l) => {
                     let got = self.check_expr(&l.value, row);
                     if let Some(got_ty) = got {
-                        if !type_matches(&l.ty, got_ty) {
+                        if !type_matches(&l.ty, &got_ty) {
                             self.push_error(
                                 "E0045",
                                 l.span.clone(),
@@ -185,7 +275,7 @@ impl Tc {
                                     "let binding `{}` has declared type `{}` but initializer has type `{}`",
                                     l.name,
                                     type_name(&l.ty),
-                                    ty_display(got_ty),
+                                    ty_display(&got_ty),
                                 ),
                             );
                         }
@@ -239,7 +329,7 @@ impl Tc {
                         p.span.clone(),
                         format!(
                             "`IO.println` requires a `String` argument; got `{}`",
-                            ty_display(other)
+                            ty_display(&other)
                         ),
                     );
                 }
@@ -274,25 +364,32 @@ impl Tc {
                 self.string_literals.push((span.clone(), s.clone()));
                 Some(Ty::String)
             }
-            Expr::Ident(name, span) => match self.env.get(name).copied() {
-                Some(ty) => Some(ty),
-                None => {
-                    self.push_error(
-                        "E0046",
-                        span.clone(),
-                        format!("unknown identifier `{name}`"),
-                    );
-                    None
+            Expr::Ident(name, span) => {
+                // Local env first (params + lets + lambda captures
+                // stitched in during `check_lambda`), then fall
+                // through to the global fn_env for top-level
+                // function references. Keeping the two maps separate
+                // lets `let foo: Int = ...` locally shadow a
+                // top-level `fn foo() -> ...` without `env_insert`'s
+                // debug-assert tripping (see PR #6 review).
+                match self
+                    .env
+                    .get(name)
+                    .or_else(|| self.fn_env.get(name))
+                    .cloned()
+                {
+                    Some(ty) => Some(ty),
+                    None => {
+                        self.push_error(
+                            "E0046",
+                            span.clone(),
+                            format!("unknown identifier `{name}`"),
+                        );
+                        None
+                    }
                 }
-            },
-            Expr::Call { .. } => {
-                self.push_error(
-                    "E0043",
-                    e.span(),
-                    "function calls are Stage-2+; Plan A1 supports only `perform IO.println`",
-                );
-                None
             }
+            Expr::Call { callee, args, span } => self.check_call(callee, args, span.clone(), row),
             Expr::Perform(p) => {
                 self.check_perform(p, row);
                 Some(Ty::Unit)
@@ -320,7 +417,7 @@ impl Tc {
                         self.push_error(
                             "E0062",
                             cond.span(),
-                            format!("`if` condition must be `Bool`; got `{}`", ty_display(t)),
+                            format!("`if` condition must be `Bool`; got `{}`", ty_display(&t)),
                         );
                     }
                 }
@@ -334,8 +431,8 @@ impl Tc {
                             span.clone(),
                             format!(
                                 "`if` branches have incompatible types: `then` is `{}` but `else` is `{}`",
-                                ty_display(t),
-                                ty_display(e),
+                                ty_display(&t),
+                                ty_display(&e),
                             ),
                         );
                         // Recover with the `then` type so downstream
@@ -358,20 +455,13 @@ impl Tc {
             // the body of this arm is defensive rather than reached in
             // practice.
             Expr::Block(b) => self.check_block(b, row),
-            // Lambda expressions parse in Task 29 but don't gain
-            // function-type machinery (`Ty::Fn`, application-site
-            // unification, capture analysis) until Task 30. Reject
-            // with E0043 meanwhile so any Stage-3 program that
-            // reaches typecheck fails with a useful diagnostic rather
-            // than slipping through and crashing downstream.
-            Expr::Lambda { span, .. } => {
-                self.push_error(
-                    "E0043",
-                    span.clone(),
-                    "lambda expressions are Stage-3 (plan A2 task 30 adds function-type typing)",
-                );
-                None
-            }
+            Expr::Lambda {
+                params,
+                return_type,
+                effects,
+                body,
+                span,
+            } => self.check_lambda(params, return_type, effects, body, span.clone()),
         }
     }
 
@@ -422,8 +512,8 @@ impl Tc {
                             format!(
                                 "`{}` operands must have the same primitive type; got `{}` and `{}`",
                                 binop_symbol(op),
-                                ty_display(a),
-                                ty_display(b),
+                                ty_display(&a),
+                                ty_display(&b),
                             ),
                         );
                     }
@@ -442,8 +532,8 @@ impl Tc {
                     format!(
                         "`{}` requires `{}` operand; got `{}`",
                         binop_symbol(op),
-                        ty_display(expected),
-                        ty_display(a),
+                        ty_display(&expected),
+                        ty_display(&a),
                     ),
                 );
             }
@@ -458,7 +548,7 @@ impl Tc {
                         self.push_error(
                             "E0061",
                             span,
-                            format!("`-` requires `Int` operand; got `{}`", ty_display(a)),
+                            format!("`-` requires `Int` operand; got `{}`", ty_display(&a)),
                         );
                     }
                 }
@@ -470,13 +560,186 @@ impl Tc {
                         self.push_error(
                             "E0061",
                             span,
-                            format!("`!` requires `Bool` operand; got `{}`", ty_display(a)),
+                            format!("`!` requires `Bool` operand; got `{}`", ty_display(&a)),
                         );
                     }
                 }
                 Some(Ty::Bool)
             }
         }
+    }
+
+    /// Application-site typing for `Expr::Call` — plan A2 task 30.
+    ///
+    /// 1. Type the callee. If it is not a `Ty::Fn`, emit **E0068**
+    ///    ("applying a non-function value"). Propagate `None` on
+    ///    failure.
+    /// 2. Check argument arity against the callee's declared
+    ///    parameter count (**E0043** on mismatch).
+    /// 3. Type each argument and check it unifies with the
+    ///    corresponding parameter type (**E0044** on mismatch — the
+    ///    catalog entry's wording is already generic enough to cover
+    ///    user calls, not just the original `IO.println` case).
+    /// 4. Check every effect in the callee's row is present in the
+    ///    enclosing function's effect row (**E0042** on mismatch —
+    ///    same code `check_perform` emits for missing effects).
+    /// 5. Return the callee's declared return type. Even when some
+    ///    checks fail we return the return type (to suppress cascade
+    ///    errors downstream).
+    fn check_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+        row: &[String],
+    ) -> Option<Ty> {
+        let callee_ty = self.check_expr(callee, row);
+        // Always type-check args so we surface any errors in them.
+        let arg_tys: Vec<Option<Ty>> = args.iter().map(|a| self.check_expr(a, row)).collect();
+
+        let sig = match callee_ty {
+            Some(Ty::Fn(sig)) => sig,
+            Some(other) => {
+                self.push_error(
+                    "E0068",
+                    span,
+                    format!(
+                        "cannot apply a value of type `{}` — only function values can be called",
+                        ty_display(&other)
+                    ),
+                );
+                return None;
+            }
+            None => return None,
+        };
+
+        // (2) arity
+        if args.len() != sig.params.len() {
+            self.push_error(
+                "E0043",
+                span.clone(),
+                format!(
+                    "wrong argument count at call site: expected {}, got {}",
+                    sig.params.len(),
+                    args.len()
+                ),
+            );
+        }
+
+        // (3) arg types
+        for (i, (arg_ty, param_ty)) in arg_tys.iter().zip(sig.params.iter()).enumerate() {
+            if let Some(at) = arg_ty {
+                if at != param_ty {
+                    let arg_span = args.get(i).map(Expr::span).unwrap_or_else(|| span.clone());
+                    self.push_error(
+                        "E0044",
+                        arg_span,
+                        format!(
+                            "argument {} has type `{}` but the callee expects `{}`",
+                            i,
+                            ty_display(at),
+                            ty_display(param_ty),
+                        ),
+                    );
+                }
+            }
+        }
+
+        // (4) effect-row containment
+        for e in &sig.effects {
+            if !row.iter().any(|r| r == e) {
+                self.push_error(
+                    "E0042",
+                    span.clone(),
+                    format!(
+                        "calling a function that performs `{e}` requires `{e}` in the enclosing function's effect row",
+                    ),
+                );
+            }
+        }
+
+        // (5) result type
+        Some(sig.ret.clone())
+    }
+
+    /// Lambda typing — plan A2 task 30.
+    ///
+    /// 1. Build the lambda's own `Ty::Fn` from its declared parameter
+    ///    types and return type.
+    /// 2. Enter an inner scope: extend `self.env` with the parameter
+    ///    names bound to their declared types.
+    /// 3. Type the body against the lambda's own effect row.
+    /// 4. Check the body's type matches the declared return type
+    ///    (**E0069** on mismatch).
+    /// 5. Restore the outer env, record free-variable captures, and
+    ///    return the constructed `Ty::Fn`.
+    ///
+    /// Capture analysis (step 5) records every identifier referenced
+    /// in the body that was visible in the outer env *before* the
+    /// lambda's parameters were pushed. The result is keyed by the
+    /// lambda's `span` and stored in `self.lambda_captures` for
+    /// closure conversion (task 31) to consume.
+    fn check_lambda(
+        &mut self,
+        params: &[Param],
+        return_type: &TypeExpr,
+        effects: &[String],
+        body: &Expr,
+        span: Span,
+    ) -> Option<Ty> {
+        // (1) build the signature up front so Ty::Fn is available for
+        //     the lambda's own return type even if the body fails.
+        let param_tys: Vec<Ty> = params
+            .iter()
+            .map(|p| ty_from_type_expr(&p.ty).unwrap_or(Ty::Unit))
+            .collect();
+        let ret_ty = ty_from_type_expr(return_type).unwrap_or(Ty::Unit);
+        let sig = FnSig {
+            params: param_tys.clone(),
+            ret: ret_ty.clone(),
+            effects: effects.to_vec(),
+        };
+
+        // (2) capture analysis: snapshot the outer env *before*
+        //     adding params. Any Ident reference in the body whose
+        //     name is in `outer_names` (not a param, not a lambda-
+        //     local let) is a captured free variable.
+        let outer_names: std::collections::BTreeSet<String> = self.env.keys().cloned().collect();
+        let param_names: std::collections::BTreeSet<String> =
+            params.iter().map(|p| p.name.clone()).collect();
+        let mut captures: Vec<String> = Vec::new();
+        collect_free_vars(body, &outer_names, &param_names, &mut captures);
+        self.lambda_captures.push((span.clone(), captures));
+
+        // (3) extend env with params for the body walk. We *add*
+        //     rather than env_insert because a param can shadow an
+        //     outer binding (including a top-level fn name); the
+        //     env_insert debug-assert would fire on the shadow.
+        let saved_env = self.env.clone();
+        for (p, pty) in params.iter().zip(param_tys.iter()) {
+            self.env.insert(p.name.clone(), pty.clone());
+        }
+
+        // (4) check body against the lambda's own effect row.
+        let body_ty = self.check_expr(body, effects);
+
+        // (5) restore and check return-type unification.
+        self.env = saved_env;
+        if let Some(bt) = body_ty {
+            if bt != ret_ty {
+                self.push_error(
+                    "E0069",
+                    span.clone(),
+                    format!(
+                        "lambda body has type `{}` but the declared return type is `{}`",
+                        ty_display(&bt),
+                        ty_display(&ret_ty),
+                    ),
+                );
+            }
+        }
+
+        Some(Ty::Fn(Box::new(sig)))
     }
 
     /// Typing rule for `match` expressions.
@@ -507,16 +770,16 @@ impl Tc {
         }
 
         // (1) pattern types vs scrutinee
-        if let Some(st) = scrut_ty {
+        if let Some(ref st) = scrut_ty {
             for arm in arms {
                 if let Some(pt) = pattern_ty(&arm.pattern) {
-                    if pt != st {
+                    if pt != *st {
                         self.push_error(
                             "E0064",
                             arm.pattern.span(),
                             format!(
                                 "pattern type `{}` does not match scrutinee type `{}`",
-                                ty_display(pt),
+                                ty_display(&pt),
                                 ty_display(st),
                             ),
                         );
@@ -529,8 +792,10 @@ impl Tc {
         let mut result_ty: Option<Ty> = None;
         for arm in arms {
             let body_ty = self.check_expr(&arm.body, row);
-            match (result_ty, body_ty) {
-                (None, Some(t)) => result_ty = Some(t),
+            match (&result_ty, &body_ty) {
+                (None, Some(_)) => {
+                    result_ty = body_ty;
+                }
                 (Some(first), Some(t)) if first != t => {
                     self.push_error(
                         "E0065",
@@ -547,7 +812,7 @@ impl Tc {
         }
 
         // (3) exhaustiveness
-        if let Some(st) = scrut_ty {
+        if let Some(ref st) = scrut_ty {
             if !is_exhaustive(st, arms) {
                 self.push_error(
                     "E0066",
@@ -591,7 +856,7 @@ fn ty_from_type_expr(t: &TypeExpr) -> Option<Ty> {
     }
 }
 
-fn type_matches(expected: &TypeExpr, actual: Ty) -> bool {
+fn type_matches(expected: &TypeExpr, actual: &Ty) -> bool {
     match (expected, actual) {
         (TypeExpr::Named(n, _), Ty::Int) => n == "Int",
         (TypeExpr::Named(n, _), Ty::String) => n == "String",
@@ -599,19 +864,40 @@ fn type_matches(expected: &TypeExpr, actual: Ty) -> bool {
         (TypeExpr::Named(n, _), Ty::Bool) => n == "Bool",
         (TypeExpr::Named(n, _), Ty::Char) => n == "Char",
         (TypeExpr::Named(n, _), Ty::Byte) => n == "Byte",
+        // `TypeExpr` does not yet admit a function-type surface
+        // syntax (deferred from Task 30's minimum scope — the
+        // `FnSig`-bearing `Ty::Fn` lives entirely in the checker for
+        // now, constructed by `check_expr` on `Expr::Lambda` and by
+        // the global fn-env pre-pass). A `let f: Foo = <fn-typed
+        // expr>;` therefore never matches, so a named left-hand
+        // type against a `Ty::Fn` right-hand is a hard mismatch.
+        (TypeExpr::Named(_, _), Ty::Fn(_)) => false,
     }
 }
 
 /// User-facing display of a `Ty`. Keeps error messages readable without
-/// leaking the `Ty::` enum prefix that `{:?}` would emit.
-fn ty_display(t: Ty) -> &'static str {
+/// leaking the `Ty::` enum prefix that `{:?}` would emit. Returns
+/// `String` rather than `&'static str` now that `Ty::Fn` carries a
+/// non-constant structural signature (plan A2 task 30).
+fn ty_display(t: &Ty) -> String {
     match t {
-        Ty::Int => "Int",
-        Ty::String => "String",
-        Ty::Unit => "Unit",
-        Ty::Bool => "Bool",
-        Ty::Char => "Char",
-        Ty::Byte => "Byte",
+        Ty::Int => "Int".to_string(),
+        Ty::String => "String".to_string(),
+        Ty::Unit => "Unit".to_string(),
+        Ty::Bool => "Bool".to_string(),
+        Ty::Char => "Char".to_string(),
+        Ty::Byte => "Byte".to_string(),
+        Ty::Fn(sig) => {
+            let params = sig
+                .params
+                .iter()
+                .map(ty_display)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ret = ty_display(&sig.ret);
+            let effects = sig.effects.join(", ");
+            format!("({params}) -> {ret} ![{effects}]")
+        }
     }
 }
 
@@ -650,7 +936,152 @@ fn pattern_ty(p: &Pattern) -> Option<Ty> {
 /// at least one arm; other primitives (`Int`, `Char`, `String`, `Byte`)
 /// have infinite or effectively-infinite value domains in Plan A2's
 /// surface syntax and are only exhaustive via wildcard.
-fn is_exhaustive(scrut: Ty, arms: &[MatchArm]) -> bool {
+/// Walk `e` and collect the names of every `Ident` reference that
+/// resolves to an outer-scope binding from the perspective of a
+/// lambda body. Used by `check_lambda` for capture analysis (plan A2
+/// task 30).
+///
+/// `outer_names` is the set of names visible in the enclosing scope
+/// when the lambda was entered. `param_names` is the set of the
+/// lambda's own parameter names (which shadow the outer scope).
+/// `captures` is the accumulated result; names are pushed in the
+/// order they're encountered, with duplicates suppressed.
+///
+/// Lambda-local `let` bindings are handled via `locals`, a
+/// per-descent mutable set that mirrors the lexical scope.
+///
+/// Nested lambdas are handled by recursing into their bodies with
+/// the outer set expanded to include the outer lambda's params — a
+/// nested lambda captures not only the enclosing lambda's outer
+/// scope but also the enclosing lambda's params.
+fn collect_free_vars(
+    e: &Expr,
+    outer_names: &std::collections::BTreeSet<String>,
+    param_names: &std::collections::BTreeSet<String>,
+    captures: &mut Vec<String>,
+) {
+    let mut locals: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    walk(e, outer_names, param_names, &mut locals, captures);
+
+    fn walk(
+        e: &Expr,
+        outer_names: &std::collections::BTreeSet<String>,
+        param_names: &std::collections::BTreeSet<String>,
+        locals: &mut std::collections::BTreeSet<String>,
+        captures: &mut Vec<String>,
+    ) {
+        match e {
+            Expr::Ident(name, _) => {
+                // A free variable is an Ident that:
+                //  - is visible in the outer env (so it resolves),
+                //  - isn't a lambda param or lambda-local let.
+                if outer_names.contains(name)
+                    && !param_names.contains(name)
+                    && !locals.contains(name)
+                    && !captures.iter().any(|c| c == name)
+                {
+                    captures.push(name.clone());
+                }
+            }
+            Expr::IntLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => {}
+            Expr::Binary { lhs, rhs, .. } => {
+                walk(lhs, outer_names, param_names, locals, captures);
+                walk(rhs, outer_names, param_names, locals, captures);
+            }
+            Expr::Unary { operand, .. } => {
+                walk(operand, outer_names, param_names, locals, captures);
+            }
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+                ..
+            } => {
+                walk(cond, outer_names, param_names, locals, captures);
+                walk_block(then_block, outer_names, param_names, locals, captures);
+                walk_block(else_block, outer_names, param_names, locals, captures);
+            }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                walk(scrutinee, outer_names, param_names, locals, captures);
+                for arm in arms {
+                    walk(&arm.body, outer_names, param_names, locals, captures);
+                }
+            }
+            Expr::Block(b) => {
+                walk_block(b, outer_names, param_names, locals, captures);
+            }
+            Expr::Call { callee, args, .. } => {
+                walk(callee, outer_names, param_names, locals, captures);
+                for a in args {
+                    walk(a, outer_names, param_names, locals, captures);
+                }
+            }
+            Expr::Perform(p) => {
+                for a in &p.args {
+                    walk(a, outer_names, param_names, locals, captures);
+                }
+            }
+            Expr::Lambda {
+                params: inner_params,
+                body: inner_body,
+                ..
+            } => {
+                // A nested lambda captures from an expanded outer
+                // scope: the enclosing lambda's outer_names plus its
+                // params (which appear as "outer" to the nested
+                // lambda), minus the nested lambda's own params.
+                // Lambda-local lets accumulated so far also count as
+                // outer-visible to the nested lambda, though a nested
+                // capture of a local is already a capture from this
+                // lambda's perspective.
+                let mut expanded: std::collections::BTreeSet<String> = outer_names.clone();
+                expanded.extend(param_names.iter().cloned());
+                expanded.extend(locals.iter().cloned());
+                let inner_params_set: std::collections::BTreeSet<String> =
+                    inner_params.iter().map(|p| p.name.clone()).collect();
+                let mut inner_locals: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                walk(
+                    inner_body,
+                    &expanded,
+                    &inner_params_set,
+                    &mut inner_locals,
+                    captures,
+                );
+            }
+        }
+    }
+
+    fn walk_block(
+        b: &Block,
+        outer_names: &std::collections::BTreeSet<String>,
+        param_names: &std::collections::BTreeSet<String>,
+        locals: &mut std::collections::BTreeSet<String>,
+        captures: &mut Vec<String>,
+    ) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Let(l) => {
+                    walk(&l.value, outer_names, param_names, locals, captures);
+                    locals.insert(l.name.clone());
+                }
+                Stmt::Expr(e) => walk(e, outer_names, param_names, locals, captures),
+                Stmt::Perform(p) => {
+                    for a in &p.args {
+                        walk(a, outer_names, param_names, locals, captures);
+                    }
+                }
+            }
+        }
+        if let Some(tail) = &b.tail {
+            walk(tail, outer_names, param_names, locals, captures);
+        }
+    }
+}
+
+fn is_exhaustive(scrut: &Ty, arms: &[MatchArm]) -> bool {
     if arms.is_empty() {
         return false;
     }
@@ -671,7 +1102,10 @@ fn is_exhaustive(scrut: Ty, arms: &[MatchArm]) -> bool {
             has_true && has_false
         }
         Ty::Unit => true,
-        Ty::Int | Ty::Char | Ty::String | Ty::Byte => false,
+        // `Int`, `Char`, `String`, `Byte`, `Fn`: value domain is
+        // infinite or (for `Fn`) structurally un-enumerable, so a
+        // wildcard arm is the only way to reach exhaustiveness.
+        Ty::Int | Ty::Char | Ty::String | Ty::Byte | Ty::Fn(_) => false,
     }
 }
 
@@ -1027,5 +1461,222 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+    }
+
+    // ===== Plan A2 Task 30 — function types + application + lambdas =====
+
+    #[test]
+    fn lambda_typechecks_clean() {
+        // Migrated from PR #5's `lambda-rejection` expectation per the
+        // PR #5 reviewer directive: Task 30 moves lambdas from
+        // E0043-rejection to real `Ty::Fn` typing.
+        let src = "fn main() -> Int ![] { let f = fn (x: Int) -> Int ![] => x + 1; 0 }\n";
+        // The `let f = ...` binding has no declared type syntax that
+        // admits `Ty::Fn` yet (deferred from Task 30). Work around by
+        // dropping the `let` and just exercising the lambda in an
+        // expression position.
+        //
+        // Actually — our `let_stmt := 'let' ident ':' type '=' expr`
+        // requires a type annotation. `type` is `Named(ident)` only.
+        // So a user cannot bind a lambda to a let today; exercise the
+        // lambda inline via discard-as-Stmt::Expr with a Call.
+        let _ = src;
+        let src_inline = "fn main() -> Int ![] { (fn (x: Int) -> Int ![] => x + 1)(41) }\n";
+        let errs = pipeline(src_inline);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+    }
+
+    #[test]
+    fn lambda_body_mismatch_is_e0069() {
+        // Body is `Int` but declared return type is `Bool`.
+        let src = "fn main() -> Int ![] { (fn (x: Int) -> Bool ![] => x + 1)(0); 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0069"), "expected E0069, got: {errs:?}");
+    }
+
+    #[test]
+    fn call_user_fn_typechecks() {
+        // Top-level fn `inc(x: Int) -> Int ![]` is visible via the
+        // pre-populated `fn_env`; `main` calls it.
+        let src = "fn inc(x: Int) -> Int ![] { x + 1 }\n\
+                   fn main() -> Int ![] { inc(41) }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+    }
+
+    #[test]
+    fn recursive_fn_call_typechecks() {
+        // Recursion: `fib` references itself via the global fn_env,
+        // which is populated before any body is checked.
+        let src = "fn fib(n: Int) -> Int ![] {\n\
+                     if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n\
+                   }\n\
+                   fn main() -> Int ![] { fib(5) }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+    }
+
+    #[test]
+    fn call_wrong_arity_is_e0043() {
+        let src = "fn inc(x: Int) -> Int ![] { x + 1 }\n\
+                   fn main() -> Int ![] { inc(1, 2) }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0043"), "expected E0043, got: {errs:?}");
+    }
+
+    #[test]
+    fn call_wrong_arg_type_is_e0044() {
+        let src = "fn inc(x: Int) -> Int ![] { x + 1 }\n\
+                   fn main() -> Int ![] { inc(true) }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
+    }
+
+    #[test]
+    fn call_non_function_is_e0068() {
+        // `n` is an `Int`, not a function.
+        let src = "fn main() -> Int ![] { let n: Int = 42; n(1) }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0068"), "expected E0068, got: {errs:?}");
+    }
+
+    #[test]
+    fn call_requires_effect_in_row_e0042() {
+        // `emits_io` declares `![IO]`. `main` has `![]` — calling
+        // `emits_io` from `main` leaks IO into a pure context.
+        let src = "fn emits_io(x: Int) -> Int ![IO] { perform IO.println(\"hi\"); x }\n\
+                   fn main() -> Int ![] { emits_io(1) }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0042"), "expected E0042, got: {errs:?}");
+    }
+
+    #[test]
+    fn lambda_captures_outer_let() {
+        // The lambda body references `x`, which is an outer `let`.
+        // Capture analysis records `x` in `lambda_captures`. Pipeline
+        // stays clean; we inspect `lambda_captures` via a direct
+        // typecheck invocation.
+        let src = "fn main() -> Int ![] {\n\
+                     let x: Int = 10;\n\
+                     (fn (y: Int) -> Int ![] => x + y)(5)\n\
+                   }\n";
+        let (toks, _) = crate::lexer::lex("t.sigil", src);
+        let (prog, _) = crate::parser::parse("t.sigil", &toks);
+        let (rp, _) = crate::resolve::resolve(prog);
+        let (checked, errs) = typecheck(rp.program);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+        assert_eq!(checked.lambda_captures.len(), 1, "one lambda");
+        let (_, captures) = &checked.lambda_captures[0];
+        assert!(
+            captures.iter().any(|n| n == "x"),
+            "lambda should capture `x`, captures={captures:?}"
+        );
+        // The param `y` is NOT a capture.
+        assert!(
+            !captures.iter().any(|n| n == "y"),
+            "param `y` should not appear in captures, got {captures:?}"
+        );
+    }
+
+    #[test]
+    fn lambda_does_not_capture_own_params() {
+        let src = "fn main() -> Int ![] { (fn (y: Int) -> Int ![] => y + 1)(1) }\n";
+        let (toks, _) = crate::lexer::lex("t.sigil", src);
+        let (prog, _) = crate::parser::parse("t.sigil", &toks);
+        let (rp, _) = crate::resolve::resolve(prog);
+        let (checked, errs) = typecheck(rp.program);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+        assert_eq!(checked.lambda_captures.len(), 1);
+        let (_, captures) = &checked.lambda_captures[0];
+        assert!(
+            captures.is_empty(),
+            "lambda with no free vars should have no captures, got {captures:?}"
+        );
+    }
+
+    #[test]
+    fn lambda_does_not_capture_top_level_fn() {
+        // A lambda body references a top-level fn (`inc`). Top-level
+        // fn names must resolve through `fn_env`, not be treated as
+        // free variables — otherwise Task 31's closure conversion
+        // would allocate a spurious env field for a statically-
+        // resolvable symbol. Pinned here after PR #6 review found
+        // the capture-over-fn-names bug.
+        let src = "fn inc(x: Int) -> Int ![] { x + 1 }\n\
+                   fn main() -> Int ![] { (fn (y: Int) -> Int ![] => inc(y))(1) }\n";
+        let (toks, _) = crate::lexer::lex("t.sigil", src);
+        let (prog, _) = crate::parser::parse("t.sigil", &toks);
+        let (rp, _) = crate::resolve::resolve(prog);
+        let (checked, errs) = typecheck(rp.program);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+        assert_eq!(checked.lambda_captures.len(), 1, "one lambda");
+        let (_, captures) = &checked.lambda_captures[0];
+        assert!(
+            !captures.iter().any(|n| n == "inc"),
+            "top-level fn `inc` must not appear in captures, got {captures:?}"
+        );
+    }
+
+    #[test]
+    fn let_shadowing_top_level_fn_typechecks() {
+        // A function whose body `let`-binds a name that matches a
+        // top-level fn must typecheck clean in both debug and
+        // release. Pre-fix: the fn_env-seeding made the `let`
+        // collide with the top-level fn's entry in the local env,
+        // tripping `env_insert`'s debug-assert in debug builds and
+        // silently overwriting in release. PR #6 review found this.
+        let src = "fn foo() -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { let foo: Int = 3; foo }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "let shadowing a top-level fn name should typecheck clean, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn nested_lambda_captures_through_outer() {
+        // Inner lambda references `x` from the outermost scope. The
+        // outer lambda's param `_p` is unused. Capture analysis
+        // records `x` as captured by the inner lambda; the outer
+        // lambda's captures are empty (it doesn't reference `x`
+        // directly — the inner lambda does).
+        //
+        // Note: our analysis records `x` for both lambdas because
+        // the outer lambda's *body* (the inner lambda) references
+        // `x`, and `collect_free_vars` walks through lambda
+        // boundaries. This is conservative but correct for the
+        // closure-conversion use case (outer closure's env needs
+        // `x` so it can pass it down to the inner closure's env).
+        let src = "fn main() -> Int ![] {\n\
+                     let x: Int = 10;\n\
+                     ((fn (_p: Int) -> Int ![] => (fn (y: Int) -> Int ![] => x + y)(1))(0))\n\
+                   }\n";
+        let (toks, _) = crate::lexer::lex("t.sigil", src);
+        let (prog, _) = crate::parser::parse("t.sigil", &toks);
+        let (rp, _) = crate::resolve::resolve(prog);
+        let (checked, errs) = typecheck(rp.program);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+        // Two lambdas in source order.
+        assert_eq!(checked.lambda_captures.len(), 2, "two lambdas");
+        // Outer lambda (first recorded) walks into the inner lambda;
+        // `x` is free from the outer lambda's perspective because
+        // `_p` is its only param.
+        let (_, outer_caps) = &checked.lambda_captures[0];
+        assert!(
+            outer_caps.iter().any(|n| n == "x"),
+            "outer lambda's captures should include `x`, got {outer_caps:?}"
+        );
+        // Inner lambda captures `x` too — but `y` (its own param) is
+        // excluded.
+        let (_, inner_caps) = &checked.lambda_captures[1];
+        assert!(
+            inner_caps.iter().any(|n| n == "x"),
+            "inner lambda's captures should include `x`, got {inner_caps:?}"
+        );
+        assert!(
+            !inner_caps.iter().any(|n| n == "y"),
+            "inner lambda's own param `y` should not be a capture"
+        );
     }
 }

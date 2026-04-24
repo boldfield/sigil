@@ -569,15 +569,26 @@ impl<'a> Lowerer<'a> {
                 self.builder.ins().iconst(types::I8, 0)
             }
             Expr::Call { .. } => {
-                // User function calls are Stage 3 (plan A2 task 29+);
-                // typecheck rejects them with E0043 before codegen.
-                unreachable!("codegen: Expr::Call is Stage 3; typecheck should have rejected it")
+                // Typecheck (plan A2 task 30) accepts user function
+                // calls and assigns them a result type, but the
+                // closure-calling-convention codegen lands in Task
+                // 32. Hand-crafted programs that exercise `Call`
+                // will trip this `unreachable!` as an intentional
+                // interim state — the user-facing surface says "not
+                // yet compilable, Task 32 pending".
+                unreachable!("codegen: Expr::Call lowering lands in plan A2 task 32")
             }
             Expr::Lambda { .. } => {
-                // Lambdas parse (plan A2 task 29) but don't reach
-                // codegen until Task 32's closure machinery lands;
-                // typecheck rejects them with E0043 meanwhile.
-                unreachable!("codegen: Expr::Lambda is Stage 3; typecheck should have rejected it")
+                // Typecheck (plan A2 task 30) accepts lambdas and
+                // records their captures in
+                // `CheckedProgram.lambda_captures`; Task 31's
+                // closure conversion consumes that side table and
+                // rewrites lambdas into explicit closure records,
+                // after which Task 32 emits the indirect-call
+                // convention. Hand-crafted programs that build a
+                // `Lambda` will trip this `unreachable!` until those
+                // tasks land.
+                unreachable!("codegen: Expr::Lambda lowering lands in plan A2 tasks 31+32")
             }
         }
     }
