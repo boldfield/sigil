@@ -498,6 +498,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // main tags its Int return with `ishl_imm 1` so the C-main
             // shim can `sshr_imm 1` → i32. Other user fns return their
             // raw Cranelift value; callers (user code) use it directly.
+            //
+            // Invariant: main's return type is always `Int` — the
+            // typechecker rejects any other signature via E0041
+            // ("fn main has wrong signature"). See QUESTIONS.md
+            // [PLAN-A3] main-return-tagging, resolved 2026-04-24 as
+            // option (a): the main→Int constraint is structural, so
+            // this unconditional shift is safe. Any future relaxation
+            // of main's type surface must revise this site alongside.
             let ret_val = match tail_val {
                 Some(v) if is_main => lowerer.builder.ins().ishl_imm(v, 1),
                 Some(v) => v,
