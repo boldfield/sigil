@@ -62,21 +62,21 @@ is complete but whose CI run has not yet reported green.
     - 41.1 (done-pending-ci): new `Lowerer::lower_ctor_alloc(type_name, variant_index, field_values)` method. Emits `sigil_alloc(header, payload_bytes)` using `crate::layout::variant_header_word` for the immediate, registers a safepoint stackmap placeholder at the call instruction, stores the 1-byte discriminant as a full 8-byte word at header-offset 8 (payload word 0), and stores each field at offsets 16 + 8*i (payload words 1..N). Sub-word primitives (Bool / Byte / Char / Unit) zero-extend to i64 on store; pointer-typed values (String / Fn / User) flow through. Three `lower_expr` arms call into it: `Expr::Ident(name)` where `name` is a nullary ctor and not in env (Unit variant alloc), `Expr::Call { callee: Ident(name), args }` where `name` is a ctor and not a user fn (positional variant alloc), `Expr::RecordLit { name, fields }` (record variant alloc with user field order reordered to the declared order). `lower_call`'s arm-matching gained a guard so ctor-name idents route to `lower_ctor_alloc` before the generic direct-call path. `type_of_expr` learned that nullary-ctor Idents and ctor-Call expressions are pointer-typed (heap records). `lower_match` untouched until 41.2 — so no user program end-to-end yet; E0111 still gates every program before codegen runs.
     - 41.2 (done-pending-ci): replaced `lower_match`'s scalar-only compare-and-branch chain (driven by the Plan A2 `pattern_as_immediate` helper) with a per-arm decision tree. New `emit_pattern_test` recursively lowers primitive-literal equality, discriminant equality for `Pattern::Ctor`, and structural recursion into Positional/Record sub-patterns with per-field loads at the layout-provided offsets. `Pattern::Var` binds the scrutinee/field value into `self.env` for the arm body's scope unless `nullary_ctor_promotion` recognises the name as a Unit variant of the scrutinee's user type (in which case it becomes a discriminant-only test, matching the typechecker's promotion rule). A true catch-all arm (Wildcard or non-promoted Var) unconditionally enters its body and terminates the chain. To thread the scrutinee's semantic type from typecheck into codegen, added `CheckedProgram.match_scrut_tys: BTreeMap<Span, Ty>` (populated in `check_match` when the scrutinee has a known `Ty`, absent for synthetic if→match elaborations whose BoolLit-only arms need no user-type disambiguation). `Span` now derives `PartialOrd`/`Ord` for `BTreeMap` keying. `type_of_expr` takes an extra `preview: &BTreeMap<String, Type>` so the continue-block's param type can be sized from the first arm's body even when that body references a `Pattern::Var` binding not yet installed in `self.env`; inner matches extend the preview with their own first-arm bindings. New helpers on `Lowerer`: `emit_pattern_test`, `emit_scalar_eq`, `emit_discriminant_eq`, `load_field_value`, `nullary_ctor_promotion`, `is_catchall_pattern`, `predict_pattern_bindings`, `cranelift_ty_of`. Removed dead `pattern_as_immediate` free function. Nested non-exhaustiveness inside a top-level-covered ctor variant still falls through to the runtime `TRAP_NONEXHAUSTIVE_MATCH` trap (Plan A3 v1 scope, documented in the E0120 catalog long-form). 3 new typecheck unit tests (`match_scrut_tys_records_user_type_for_well_typed_match`, `match_scrut_tys_records_primitive_scrutinee`, `match_scrut_tys_skips_malformed_scrutinee`). 220 compiler lib tests pass (217 → 220). User programs still gated by E0111 at typecheck until the flip commit lands next.
 - Task 42 — `examples/option_demo.sigil`
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: `type Option = | None | Some(Int)`, match-based `unwrap_or`, two `perform IO.println(int_to_string(...))` sites against `Some(42)` and `None` scrutinees. Prints exactly "42\n-1\n". E2e test `option_demo_example_prints_42_and_minus_one`.
 - Task 43 — `examples/tree.sigil` with recursive `sum_tree`
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: `type Tree = | Leaf | Node(Int, Tree, Tree)`; `sum_tree` folds via a nested constructor pattern that binds `v`, `l`, `r`; `build(depth)` recursively constructs a full binary tree with `1` at every internal node. `main` prints `int_to_string(sum_tree(build(15)))`. A full depth-15 binary tree has 32,768 leaves + 32,767 internal nodes = 65,535 allocations; the fold yields `2^15 - 1 = 32767`. Shares an e2e test with Task 44.
 - Task 44 — Performance floor: `sum_tree` on depth-15 tree runs <500ms on both hosts
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: `tree_example_prints_32767_under_500ms` in `compiler/tests/e2e.rs` uses `compile_file_and_run_timed` on `tree.sigil`. Asserts stdout `"32767\n"`, exit 0, and end-to-end wall-clock <500ms on both CI hosts (Plan A3 normative acceptance; flake lands as a DEVIATION entry).
 - Task 45 — Exhaustiveness regression test (E0120 + counterexample witness)
-  - status: todo
-  - commits: []
-  - notes:
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: `e0120_non_exhaustive_match_names_witness_in_stderr` in `compiler/tests/e2e.rs` invokes `sigil --human-errors` on a temp file with a non-exhaustive Option match (only the `Some(n)` arm), captures stderr, asserts exit is non-zero, and verifies stderr contains both `E0120` and the witness string `None`. Guards against regression of the witness-string generator added in Task 38.4.
 - Task 46 — Seed prompt bank (P11–P15)
   - status: done-pending-ci
   - commits: [HEAD]

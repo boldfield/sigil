@@ -1,0 +1,54 @@
+// examples/tree.sigil
+//
+// Plan A3 Task 43: recursive sum-type example. `Tree` is a classic
+// binary-tree ADT with a nullary `Leaf` and a ternary `Node(Int,
+// Tree, Tree)`. `sum_tree` folds across the tree with a nested
+// constructor pattern, exercising:
+//
+//   - Discriminant dispatch (Task 41.2 match decision-tree lowerer)
+//     on a heap pointer whose type the codegen infers from the
+//     scrutinee-Ty side-table populated at typecheck.
+//   - Positional field loads at declared-order offsets (16 + 8*i)
+//     for `v: Int`, `l: Tree`, `r: Tree` — per the Task 40 layout
+//     descriptor convention.
+//   - `Pattern::Var` binding of three sub-scrutinees (`v`, `l`, `r`)
+//     into the arm body's env so the recursive calls see the child
+//     pointers directly.
+//   - Nullary-ctor promotion of the bare `Leaf` identifier pattern —
+//     a discriminant-only test with no binding, mirroring
+//     typecheck's Var-to-nullary-Ctor resolution.
+//
+// The `build` helper recursively constructs a full binary tree of the
+// requested depth with `1` at every internal node's value slot. A
+// full binary tree of depth `d` has `2^(d+1) - 1` nodes, with `2^d`
+// of them being leaves and `2^d - 1` being internal. Since every
+// internal node contributes `1`, the sum is exactly `2^d - 1`.
+//
+// This file exercises a depth-15 tree (32,768 leaves + 32,767
+// internal nodes = 65,535 total allocations) whose `sum_tree` fold
+// yields `32767`. The Plan A3 Task 44 performance floor bounds the
+// end-to-end run at 500ms on both CI hosts; the e2e test pins that
+// invariant alongside the stdout check.
+
+import std.io
+
+type Tree = | Leaf | Node(Int, Tree, Tree)
+
+fn sum_tree(t: Tree) -> Int ![] {
+  match t {
+    Leaf => 0,
+    Node(v, l, r) => v + sum_tree(l) + sum_tree(r),
+  }
+}
+
+fn build(depth: Int) -> Tree ![] {
+  match depth {
+    0 => Leaf,
+    _ => Node(1, build(depth - 1), build(depth - 1)),
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(int_to_string(sum_tree(build(15))));
+  0
+}
