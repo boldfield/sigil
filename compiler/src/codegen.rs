@@ -200,6 +200,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     let checked: &CheckedProgram = &cc.cps.colored.mono.anf.checked;
     let string_literals = &checked.string_literals;
 
+    // Plan A3 task 40: build per-type layout descriptors once before any
+    // function body is lowered. Layouts are shared across allocation
+    // sites (Task 41.1) and match decision trees (Task 41.2). Errors
+    // from `build_layouts` map to E0130 "type layout too large"; Plan
+    // A3 v1's surface stays well under the 63-word ceiling, so this
+    // only fires if a future user type exceeds the header's count
+    // field. The returned map is indexed by type name and iterates
+    // alphabetically (BTreeMap ordering), giving reproducible tag
+    // assignment across builds.
+    let type_layouts =
+        crate::layout::build_layouts(&checked.types).map_err(|e| format!("E0130: {e}"))?;
+    let ctor_index = crate::layout::build_ctor_index(&type_layouts);
+
     // Build the Cranelift ISA for the current host.
     let triple = Triple::host();
     let mut flag_builder = settings::builder();
@@ -470,6 +483,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 int_to_string_ref,
                 user_fn_refs,
                 user_fns: &user_fns,
+                type_layouts: &type_layouts,
+                ctor_index: &ctor_index,
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -672,6 +687,22 @@ struct Lowerer<'a, 'b> {
     /// fn's lowering — the Lowerer only reads return types and param
     /// types to size signature lookups.
     user_fns: &'b BTreeMap<String, UserFnEntry>,
+
+    /// Plan A3 task 40 layout descriptors for every user-defined
+    /// type in the program. Keyed by type name. Codegen reads the
+    /// per-variant tag, payload word count, pointer bitmap, and
+    /// field types to emit constructor allocations and match
+    /// decision trees. Built once at `emit_object` entry. Wired
+    /// into lowering by Task 41.
+    #[allow(dead_code)] // consumed by Task 41.1 constructor lowering
+    type_layouts: &'b BTreeMap<String, crate::layout::TypeLayout>,
+
+    /// Constructor-name → (type_name, variant_index) index rebuilt
+    /// from `type_layouts` (Plan A3 task 40). Used to recognise a
+    /// bare `Expr::Ident(ctor)` or `Expr::Call { callee: Ident(ctor), .. }`
+    /// site in lowering; look-up resolves in O(log n).
+    #[allow(dead_code)] // consumed by Task 41.1 constructor lowering
+    ctor_index: &'b BTreeMap<String, (String, usize)>,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {

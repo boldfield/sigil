@@ -1739,7 +1739,7 @@ fn type_name(t: &TypeExpr) -> &str {
 /// `Byte`), then Plan A3 user-defined types by consulting the types
 /// registry. Unknown names return `None`; the caller (fn_env pre-pass
 /// or `check_type_expr_known`) handles the fallback/diagnostic split.
-fn ty_from_type_expr(t: &TypeExpr, types: &BTreeMap<String, TypeDecl>) -> Option<Ty> {
+pub(crate) fn ty_from_type_expr(t: &TypeExpr, types: &BTreeMap<String, TypeDecl>) -> Option<Ty> {
     match t {
         TypeExpr::Named(n, _) => match n.as_str() {
             "Int" => Some(Ty::Int),
