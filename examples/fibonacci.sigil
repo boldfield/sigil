@@ -1,0 +1,32 @@
+// examples/fibonacci.sigil
+//
+// Plan A2 Task 33: canonical recursive-program example. Exercises
+// multi-argument-capable function declarations (Task 29 — single
+// param here), function-call expressions with arguments (Task 29),
+// application-site typing (Task 30), and the closure calling
+// convention's direct-call path for a top-level, self-referential
+// user fn (Task 32). The `match n { 0 => 0, 1 => 1, _ => ... }` form
+// is Stage-2 literal-pattern-chain codegen (Task 24) over a
+// Stage-2-typechecked match (Task 22).
+//
+// Invariant: running this program exits with status 55.
+//   fib(10) = 55
+//
+// Task 33 uses fib(10) because its return value fits in the 0..255
+// exit-code range that process exit-code assertions rely on. Task 34
+// (performance floor) is where fib(20) = 6765 is exercised — that
+// task wires `int_to_string` through the language and prints the
+// result via `IO.println`, at which point the exit-code ceiling no
+// longer bounds what this example can assert.
+
+fn fib(n: Int) -> Int ![] {
+  match n {
+    0 => 0,
+    1 => 1,
+    _ => fib(n - 1) + fib(n - 2),
+  }
+}
+
+fn main() -> Int ![] {
+  fib(10)
+}

@@ -298,6 +298,35 @@ fn div_by_zero_example_traps() {
     );
 }
 
+// ===== Plan A2 Task 33 — canonical recursion + higher-order examples =========
+
+/// Plan A2 task 33 — compiles and runs `examples/fibonacci.sigil`. The
+/// file's comment documents the invariant: `fib(10) == 55`, exit 55.
+/// Exercises multi-arg-capable fn decls + self-referential direct call
+/// under the closure calling convention (top-level fn, null closure_ptr).
+#[test]
+fn fibonacci_example_exits_55() {
+    let root = workspace_root();
+    let source = root.join("examples/fibonacci.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run(&source, "fibonacci_example");
+    assert_eq!(code, 55, "fibonacci.sigil exit code; stderr={stderr:?}");
+}
+
+/// Plan A2 task 33 — compiles and runs `examples/higher_order.sigil`.
+/// The file's comment documents the invariant: `weighted_sum(100, 3, 5)
+/// == 130`, exit 130. Exercises lambda syntax, application-site
+/// unification, capture analysis, closure conversion (capturing
+/// `delta` from the enclosing fn param), GC-heap closure allocation,
+/// and the closure-calling-convention ABI via direct-IIFE dispatch
+/// inside a recursive user fn.
+#[test]
+fn higher_order_example_exits_130() {
+    let root = workspace_root();
+    let source = root.join("examples/higher_order.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run(&source, "higher_order_example");
+    assert_eq!(code, 130, "higher_order.sigil exit code; stderr={stderr:?}");
+}
+
 // ===== Plan A2 Task 24 — Stage-2 codegen additional coverage ================
 //
 // These tests use inline-source programs so the canonical
