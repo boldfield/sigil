@@ -257,3 +257,60 @@ example after Task 49) is the long-tail check that closes when
 monomorphization lands — the assertion is now the canonical contract,
 and Task 49's reviewer just needs to confirm it doesn't fire on any
 example. **This entry is closed for Task 48.**
+
+## 2026-04-25 — [DEVIATION Task 48 / Stage 6] `subsume_row` rejects open-caller / closed-callee with extra effects
+
+**Context:** Task 48's call-site row check uses asymmetric `subsume_row`
+(`compiler/src/typecheck.rs:1074`) instead of symmetric `unify_row`,
+which preserves the caller's row variable for generalisation rather
+than collapsing it. This was the fix for the PR #15 review's "open-row
+caller silently collapses to closed" bug.
+
+**Deviation:** the asymmetric check requires `callee.effects ⊆
+caller.known_effects`, even when the caller declares an open row.
+For a caller `![IO | e]` invoking a callee `![Raise]` (closed):
+
+- `callee_set = {Raise}`, `caller_set = {IO}` (caller's *known* part only)
+- `missing = {Raise}` → `subsume_row` pushes E0042
+
+The caller's open tail `e` is supposed to be extensible — semantically,
+`![IO | e]` accepts any callee effect by absorbing the difference into
+`e`. The current check rejects this case rather than extending `e`.
+
+**Why deferred:** Sigil v1 only admits `IO` as a real surface effect.
+Multi-effect programs (the case where this bug bites) land with Stage 6
+effect handlers (Task 55 onward). There is no current example or test
+that exposes the wrong behavior, and the fix has a non-trivial design
+question: extending `e` requires either binding the caller's row var
+to a row that includes `missing` (which is the symmetric-unification
+behavior we explicitly rejected for the original bug) or threading
+effect *constraints* on row variables through scheme-generalisation
+so they accumulate without committing the row var to a specific shape.
+
+The Stage 6 work has the constraint machinery in scope anyway (handler
+typing requires reasoning about which effects flow through which
+continuations); piggy-backing the open-tail extension on that work
+keeps the design coherent rather than picking a v1-only stop-gap.
+
+**Closure point:** Stage 6 effect handlers (Task 55 — runtime, plus
+the typing rules that introduce additional surface effects).
+
+**Workaround until then:** declare the explicit effect on the caller's
+known list. `fn caller[e]() -> Int ![IO, Raise | e]` accepts callees
+performing `IO` *or* `Raise` (or both); only callees with effects
+outside `{IO, Raise}` would still trip E0042 against this caller.
+
+**Acceptance criterion for closure:**
+1. `subsume_row` (or its successor in the constraint-graph design)
+   accepts open-caller / closed-callee with callee effects not in
+   the caller's known list, by extending the caller's row constraints
+   rather than emitting E0042.
+2. A surface-level test in `compiler/src/typecheck.rs` covers the
+   case (a generic caller with `![IO | e]` calling a closed-row
+   callee that performs `Raise`) and confirms it typechecks.
+3. The Plan B Stage 6 effect-handler suite (TBD) exercises the path
+   end-to-end with at least one program where multi-effect flow
+   through an open-row caller is the intended pattern.
+
+**Implementing commit(s):** TBD — closes at Task 55 or earlier if a
+multi-effect program needs the path before then.
