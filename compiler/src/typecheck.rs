@@ -2530,16 +2530,38 @@ impl Tc {
                 (None, Some(_)) => {
                     result_ty = body_ty;
                 }
-                (Some(first), Some(t)) if first != t => {
-                    self.push_error(
-                        "E0065",
-                        arm.span.clone(),
-                        format!(
-                            "match arm body type `{}` does not match first arm's type `{}`",
-                            ty_display(t),
-                            ty_display(first),
-                        ),
-                    );
+                (Some(first), Some(t)) => {
+                    // Plan B Task 51: cross-arm body-type consistency
+                    // is a unification check, not a structural-equality
+                    // check. Generic-fn-internal matches (e.g.
+                    // `fn map[A](xs: List[A]) -> List[A] { match xs {
+                    // Nil => Nil, Cons(h, t) => Cons(h, map(t)), } }`)
+                    // produce arm body types containing fresh type
+                    // variables — `Nil` resolves to `List[?6]` and
+                    // `Cons(...)` to `List[?5]` via two distinct calls
+                    // to `fresh_user_instance_with_subst`. Equality
+                    // would reject `?6 != ?5` even though they unify.
+                    //
+                    // Snapshot the error list around `unify_ty`. On
+                    // failure, `unify_ty` pushes generic E0044 "type
+                    // mismatch" errors at internal recursion sites; we
+                    // truncate those and emit E0065 with arm-specific
+                    // phrasing instead, keeping the user-facing
+                    // diagnostic surface unchanged.
+                    let pre_unify_errors = self.errors.len();
+                    let unified = self.unify_ty(first, t, &arm.span);
+                    if !unified {
+                        self.errors.truncate(pre_unify_errors);
+                        self.push_error(
+                            "E0065",
+                            arm.span.clone(),
+                            format!(
+                                "match arm body type `{}` does not match first arm's type `{}`",
+                                ty_display(t),
+                                ty_display(first),
+                            ),
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -5218,6 +5240,49 @@ mod tests {
         assert!(
             errs.is_empty(),
             "self-recursive generic fn should typecheck; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn generic_match_returning_generic_unifies_arms() {
+        // Plan B Task 51 regression: generic-fn-internal match where
+        // arms return a generic-typed result (`List[A]`). `Nil` and
+        // `Cons(...)` each generate fresh user-instance vars — pre-
+        // fix, the cross-arm consistency check used structural Eq on
+        // `Ty`, so two `List[?N]` arms with different fresh-var ids
+        // tripped E0065 even when they trivially unify. Post-fix,
+        // `unify_ty` runs and binds the vars together.
+        let src = "type List[A] = | Nil | Cons(A, List[A])\n\
+                   fn map[A](xs: List[A]) -> List[A] ![] {\n  \
+                     match xs { Nil => Nil, Cons(h, t) => Cons(h, map(t)) }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "generic match with generic-typed arms should unify across arms; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn match_arm_type_unification_still_rejects_real_mismatch() {
+        // Regression-guard: the unify-based cross-arm check must
+        // still fire E0065 on a genuine arm-body type mismatch (Int
+        // vs String). This is the same shape as the long-standing
+        // `match_arm_types_must_unify_is_e0065` but expressed inside
+        // a generic fn — so the post-fix path doesn't accidentally
+        // accept rubbish that the pre-fix Eq check rejected.
+        let src = "fn pick[A](b: Bool, x: A, y: A) -> A ![] {\n  \
+                     match b { true => x, false => y }\n\
+                   }\n\
+                   fn main() -> Int ![] {\n  \
+                     let n: Int = match 0 { 0 => 1, _ => \"x\" };\n  \
+                     n\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0065"),
+            "expected E0065 on Int-vs-String arm mismatch, got: {errs:?}"
         );
     }
 
