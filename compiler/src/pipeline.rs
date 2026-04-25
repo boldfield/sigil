@@ -89,3 +89,46 @@ fn emit_errors(errs: &[CompilerError], format: ErrorFormat) {
         let _ = em.emit(e);
     }
 }
+
+/// Plan B Task 50 — `--dump-color`. Runs the front end through color
+/// inference and returns the rendered dump as a `String`. Front-end
+/// errors emit as usual on stderr and short-circuit with `Err`.
+pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, usize> {
+    let src = match std::fs::read_to_string(input) {
+        Ok(s) => s,
+        Err(e) => {
+            let stderr = std::io::stderr();
+            let mut out = stderr.lock();
+            let _ = writeln!(out, "sigil: cannot read `{input}`: {e}");
+            return Err(1);
+        }
+    };
+
+    let mut all_errs: Vec<CompilerError> = Vec::new();
+
+    let (tokens, lex_errs) = lexer::lex(input, &src);
+    all_errs.extend(lex_errs);
+
+    let (prog, parse_errs) = parser::parse(input, &tokens);
+    all_errs.extend(parse_errs);
+
+    let (resolved, resolve_errs) = resolve::resolve(prog);
+    all_errs.extend(resolve_errs);
+
+    let (checked, tc_errs) = typecheck::typecheck(resolved.program);
+    all_errs.extend(tc_errs);
+
+    if all_errs
+        .iter()
+        .any(|e| matches!(e.severity, crate::errors::Severity::Error))
+    {
+        emit_errors(&all_errs, format);
+        return Err(all_errs.len());
+    }
+
+    let anf = elaborate::elaborate(checked);
+    let mono = monomorphize::monomorphize(anf);
+    let colored = color::infer_colors(mono);
+    emit_errors(&all_errs, format);
+    Ok(color::dump_color(&colored))
+}

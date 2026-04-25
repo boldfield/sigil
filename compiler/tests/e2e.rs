@@ -648,3 +648,80 @@ fn e0120_non_exhaustive_match_names_witness_in_stderr() {
         "stderr missing witness `None`: {stderr}"
     );
 }
+
+// ===== Plan B Task 50 — `--dump-color` ====================================
+
+/// `sigil <input> --dump-color` runs the front end through color
+/// inference and prints one stable line per monomorph to stdout, then
+/// exits 0 without producing an executable. The hello-world example
+/// has a single `main` fn with row `![IO]`, which the color analysis
+/// classifies as native: pure row, leaf call graph (modulo perform IO
+/// which the local analysis treats as part of the IO-only row, not a
+/// non-IO body site).
+#[test]
+fn dump_color_hello_is_native_row_io() {
+    let root = workspace_root();
+    let source = root.join("examples/hello.sigil");
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("--dump-color")
+        .output()
+        .expect("invoke sigil --dump-color");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "--dump-color exit; stdout={stdout:?}, stderr={stderr:?}"
+    );
+    // hello.sigil declares `fn main() -> Int ![IO]`. Native row + leaf
+    // call graph + perform IO is entirely consistent with the native
+    // classification (Plan B Task 50 spec: row is `![IO]` → native).
+    assert!(
+        stdout.contains("main native"),
+        "expected `main native ...` in dump-color output, got: {stdout}"
+    );
+    // The reason text is stable; pin it loosely so the test survives
+    // future tweaks to the wording but catches accidental category
+    // flips.
+    assert!(
+        stdout.contains("native: row is `![IO]`"),
+        "expected reason `native: row is ![IO]`, got: {stdout}"
+    );
+}
+
+/// A multi-fn program: `helper` is pure, `main` calls `helper`. Both
+/// classify as native; `main`'s reason is the local "native" reason
+/// (not the transitive-CPS branch). The dump comes back in program
+/// order.
+#[test]
+fn dump_color_multi_fn_pure_program() {
+    let src = r#"
+        fn helper(n: Int) -> Int ![] { n + 1 }
+        fn main() -> Int ![] { helper(41) }
+    "#;
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_dump_color_pure_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write tmp source");
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("--dump-color")
+        .output()
+        .expect("invoke sigil --dump-color");
+    let _ = std::fs::remove_file(&tmp);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit; stdout={stdout:?}, stderr={stderr:?}"
+    );
+    // Program order: helper then main.
+    assert_eq!(
+        stdout.trim_end(),
+        "helper native native: pure row\nmain native native: pure row",
+        "dump-color output mismatch: {stdout}",
+    );
+}
