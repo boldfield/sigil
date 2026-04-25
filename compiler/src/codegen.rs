@@ -125,6 +125,14 @@ fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
 ///
 /// Both conditions indicate unmonomorphised IR — Task 49 will rewrite
 /// such occurrences into concrete clones.
+///
+/// Plan B task 49 — `effect_row_var` is **NOT** rejected. Rows are
+/// not monomorphized in v1 (effect dispatch is runtime-indirect; row
+/// variables are erased at codegen). The original Plan B Task 48 guard
+/// included `effect_row_var.is_some()`; Task 49 lifts that check
+/// because monomorphized fns whose surface declared `![ ... | e]`
+/// preserve their `effect_row_var` through this pass per the plan's
+/// "Effect rows are not monomorphized" clause.
 pub(crate) fn contains_apply_or_generic_ref(program: &crate::ast::Program) -> bool {
     use crate::ast::{Item, VariantFields};
     use std::collections::BTreeSet;
@@ -135,9 +143,6 @@ pub(crate) fn contains_apply_or_generic_ref(program: &crate::ast::Program) -> bo
                 // generic that monomorphization (Task 49) is required
                 // to clone before codegen — short-circuit immediately.
                 if !f.generic_params.is_empty() {
-                    return true;
-                }
-                if f.effect_row_var.is_some() {
                     return true;
                 }
                 // No declared params at this level — the in-scope
@@ -306,12 +311,12 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
             params: lparams,
             return_type,
             body,
-            effect_row_var,
+            // Plan B task 49 — lambda effect-row variable is not a
+            // rejection condition; rows pass through to codegen
+            // erasure like fn-decl effect rows do.
+            effect_row_var: _,
             ..
         } => {
-            if effect_row_var.is_some() {
-                return true;
-            }
             if type_expr_uses_apply_or_param(return_type, params) {
                 return true;
             }

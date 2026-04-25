@@ -314,3 +314,192 @@ outside `{IO, Raise}` would still trip E0042 against this caller.
 
 **Implementing commit(s):** TBD — closes at Task 55 or earlier if a
 multi-effect program needs the path before then.
+
+## 2026-04-25 — [DEVIATION Task 49] Mangled name format and ordering
+
+**Context:** Plan body specifies "Canonical specialization names use
+lexicographically-sorted type arguments with a canonical recursive form
+for nested generics: `list_map__List_Option_Int__List_Option_Int`."
+Two interpretation gaps:
+
+1. *Lexicographic sort of type arguments.* Read literally, this would
+   reorder a fn's type-argument list before mangling — losing the
+   positional binding between a declared generic parameter (`A`, `B`) and
+   its concrete instantiation. `f[A=Int, B=String]` and
+   `f[A=String, B=Int]` are different instantiations; lex-sorting their
+   args to `[Int, String]` and `[Int, String]` respectively would
+   produce identical mangled names but completely different bodies.
+2. *Canonical recursive form.* The example `list_map__List_Option_Int`
+   shows nested generics rendered with single underscores within a
+   type-arg, double underscores between top-level type-args. The
+   plan does not formalise the separator rule.
+
+**Deviation:**
+1. Type arguments are emitted in the callee's *declared* generic-
+   parameter order (positional), not lex-sorted. The lex-sort interpretation
+   is treated as a plan misstatement; positional ordering is the only
+   reading that preserves correctness.
+2. Canonical form is formalised in `compiler/src/monomorphize.rs` module
+   docs and pinned by unit tests:
+   - Primitives render as themselves: `Int`, `String`, etc.
+   - `User(name, [])` renders as `name`.
+   - `User(name, [a1, a2, ...])` renders as `name$<canon(a1)>$<canon(a2)>$...`
+     (single `$` between parts within a type-arg).
+   - Top-level fn/type instantiation: `fn_name$$<canon(a1)>$$<canon(a2)>$$...`
+     (double `$$` between top-level type-args).
+   - Ctor of generic type: `ctor_name$$<canon(a1)>$$<canon(a2)>$$...`
+     (same suffix as the owning type so the global ctor namespace stays
+     unique across instantiations).
+
+**Rationale (round 2 — separator change to `$`):** The first round of
+this PR used `_`/`__` separators. Reviewer round-2 feedback (PR #16
+comment 4318163326 #1) flagged that the asymmetric underscore separator
+is **not** unambiguous when user fn / type names contain underscores:
+`type List_Option[A]` instantiated at `Int` mangled to `List_Option_Int`,
+which collided with `List[Option[Int]]`'s rendering of `List_Option_Int`.
+`type_seen` would silently collapse the two distinct instantiations,
+producing miscompiled programs the GC would scan incorrectly.
+
+**Switched to `$` / `$$`** because the lexer rejects `$` as an identifier
+character (same constraint Plan A2 relied on for `$lambda_N` synthetic
+names from closure conversion). `List_Option$$Int` and `List$$Option$Int`
+are now structurally distinct strings regardless of underscore density
+in user-declared identifiers. Determinism flows from BTreeMap iteration
+order over the reachability worklist; argument ordering is positional
+because it's the only ordering that preserves the type-var → concrete-Ty
+binding. Codegen's `mangle_user_fn` rewrites `$` to `__` for ELF /
+Mach-O linker compatibility — the rewrite preserves AST-level
+unambiguity since uniqueness is enforced at the AST level (`fn_seen`
+/ `type_seen`) before any linker-symbol step.
+
+**Hardening:** `Ty::Var(_)` and `Ty::Fn(_)` reaching `canon_ty` /
+`ty_to_type_expr` now trip `unreachable!` rather than rendering a
+placeholder string. Reviewer round-1 feedback (PR #16 comment
+4318161359 #2) flagged the placeholders as silent collision vectors —
+two `Ty::Var(3)` and `Ty::Var(7)` rendering identically would collide
+in `fn_seen`. Closing that path requires both:
+  - The new E0132 diagnostic at end-of-typecheck rejecting any pending
+    instantiation whose type-arg resolves to an unbound `Ty::Var(_)`
+    that isn't an outer-fn's free var.
+  - The `unreachable!` arms in mangling so a future regression is loud,
+    not silent.
+
+**Acceptance criterion for closure:** if a future plan adds first-class
+function-typed values (`TypeExpr::Fn` surface syntax), `canon_ty`'s
+`Ty::Fn` arm needs to be replaced with a real rendering rule before
+the surface ships. Until then the `unreachable!` fires immediately
+on any code path that produces a `Ty::Fn` reaching mangling, surfacing
+the gap loudly.
+
+**Implementing commit(s):** Same commit as Task 49 (initial impl) +
+the PR #16 review fix-up commit (separator change + E0132 +
+hardened arms).
+
+## 2026-04-25 — [DEVIATION Task 49] Effect rows preserved through monomorphization (permanent v1 design choice — informational)
+
+**Status:** **permanent v1 design choice. Informational — no closure
+path expected.** Reviewer round-2 feedback (PR #16 comment
+4318163326 #4) flagged the original "open-ended / closes if v2 lands"
+framing as wrong-shape: row-specialised monomorphs are explicitly
+reserved for v2 in the design doc, and v1 effect dispatch is
+fundamentally runtime-indirect — there's no v1 path that would
+reopen this deviation. Reframed as informational so future readers
+don't waste time looking for a closure trigger.
+
+**Context:** Plan body's Task 49 entry: "Effect rows are not
+monomorphized in v1 — they remain polymorphic through this phase and
+are erased at codegen (effect dispatch is runtime-indirect). This is a
+v1 optimization-budget choice; the design doc explicitly reserves
+row-specialised monomorphs for v2."
+
+The Task 48 codegen-entry walker (`contains_apply_or_generic_ref`)
+treated `f.effect_row_var.is_some()` as a hard rejection. That made
+sense at Task 48 (before monomorphization existed and any program
+reaching codegen with a row variable was unmonomorphised). Task 49
+introduces monomorphization which intentionally preserves
+`effect_row_var` per the plan, so the existing walker rule needs
+relaxing.
+
+**Deviation:** the walker no longer rejects `f.effect_row_var.is_some()`
+or `Expr::Lambda { effect_row_var: Some(_), .. }`. The rejection is
+narrowed to:
+
+- `f.generic_params.is_empty()` (still rejected)
+- `td.generic_params.is_empty()` (still rejected)
+- `TypeExpr::Apply { .. }` anywhere (still rejected)
+- `TypeExpr::Named(name, _)` referencing a generic-param surface
+  name in scope (still rejected)
+
+Monomorphized fns retain their `effect_row_var` field as a sentinel
+that the body's row was polymorphic; codegen treats `Some(_)` as a
+no-op (effect dispatch is runtime-indirect; v1 codegen doesn't
+emit per-row dispatch tables).
+
+**Rationale:** The plan body explicitly carves out effect rows from
+monomorphization. v1 effect dispatch is runtime-indirect — the row
+variable serves no codegen purpose past type-checking. v2 row-specialised
+monomorphs are reserved for the design doc.
+
+**Closure path:** none for v1. If v2 ever introduces row-specialised
+monomorphs (a non-decision today), a fresh deviation entry should be
+opened then to track the new code path; this entry stays as historical
+record.
+
+**Implementing commit(s):** Same commit as Task 49.
+
+## 2026-04-25 — [DEVIATION Task 49] Pattern-ctor rewriting via scrutinee Ty + per-sub-pattern field-type threading
+
+**Context:** Plan body says "Typed IR preserved" but does not specify
+how monomorphization should resolve constructor names inside `match`
+arm patterns. The typecheck instantiation index keys construction sites
+(call / record-lit / unit-ident); pattern-ctor sites are not
+constructions and don't get their own instantiation entry.
+
+**Deviation:** Pattern ctors are rewritten by combining two existing
+indices: the scrutinee's `Ty::User(name, args)` from
+`CheckedProgram::match_scrut_tys`, plus the `ctor_to_type` reverse
+index built from the original program's TypeDecls. For
+`Pattern::Ctor { name: "Some", .. }` inside a match whose scrutinee
+typed as `Option[Int]`, the rewriter looks up "Some" → "Option" via
+`ctor_to_type`, observes the scrutinee's args `[Int]`, and produces
+`Some$$Int`.
+
+**Per-sub-pattern field-type threading.** Sub-patterns of a generic
+ctor pattern see the field's resolved `Ty` as their inner scrutinee,
+not the outer scrutinee's `Ty`. For `match opt: Option[List[Int]] { Some(Cons(h, t)) => ... }`:
+- Outer pattern `Some(Cons(h, t))` rewrites against scrut_ty `Ty::User("Option", [Ty::User("List", [Ty::Int])])` → mangled `Some$$List$Int`.
+- The variant `Some` of `Option` has positional field of declared type `Named("A")`. Under the substitution `A := List[Int]` (built from `Option`'s `generic_params` zipped with the scrut's args), the field's resolved Ty is `Ty::User("List", [Ty::Int])`.
+- Inner pattern `Cons(h, t)` rewrites against the field-resolved Ty → mangled `Cons$$Int`.
+
+Implemented via `Monomorphizer::variant_field_types` and the
+local `ty_from_type_expr_under_subst` helper in `monomorphize.rs`.
+Mirrors the same surface-name → Ty substitution mechanism the rest
+of the rewrite pass uses; reuses the existing typecheck-built type
+registry for variant field lookup.
+
+**Rationale:** Avoids extending the typecheck instantiation index with
+a third map keyed by pattern span. The two-index lookup plus the
+field-type threading covers all v1 generic patterns including nested
+ctor patterns (`Option[List[Int]]`, `Result[T, E]`, `Tree[T]`, etc.).
+
+**Round-3 review correction:** an earlier version of this code
+`unreachable!`d when a pattern ctor's owning type didn't match the
+*outer* scrutinee's User type, on the false assumption that v1 surface
+couldn't construct the case. v1 surface fully supports nested ctor
+patterns via `parser.rs::parse_pattern`'s positional-field recursion;
+running `match opt: Option[List[Int]] { Some(Cons(h, t)) => ... }` 
+triggered the panic on a legitimate program. The current per-sub-
+pattern field-type threading is the correct mechanism. Test
+`nested_generic_ctor_pattern_threads_inner_scrut_ty` pins the fix
+against the reviewer's exact reproducer.
+
+**Acceptance criterion for closure:** v1's pattern surface ships
+unchanged in Tasks 50–52; deviation closes when Stage 5 review
+checkpoint accepts the implementation. If Plan C / v2 introduces
+GADT-style refinement (where a sub-pattern's type depends on
+information *not* recoverable from the parent's variant signature
+alone), monomorph gains a per-pattern instantiation index.
+
+**Implementing commit(s):** Initial Task 49 impl commit, plus the
+PR #16 round-3 fix-up (per-sub-pattern field-type threading +
+nested-generic regression test).
