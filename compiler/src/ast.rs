@@ -41,10 +41,40 @@ pub struct ImportDecl {
 pub struct FnDecl {
     pub name: String,
     pub name_span: Span,
+    /// Plan B Task 47 — generic type parameters declared on this `fn`.
+    /// Empty for non-generic functions (every Plan A1/A2/A3 fn). The
+    /// parser captures these; semantic consumption (HM unification +
+    /// monomorphization) lands in Tasks 48-49.
+    pub generic_params: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub return_type: TypeExpr,
     pub effects: Vec<String>,
+    /// Plan B Task 47 — explicit row variable in the effect row,
+    /// `![IO | e]` introduces row variable `e`. `None` means a
+    /// closed row (default before Plan B). Semantic consumption (row
+    /// polymorphism in HM unification) lands in Task 48.
+    pub effect_row_var: Option<RowVar>,
     pub body: Block,
+    pub span: Span,
+}
+
+/// Plan B Task 47 — generic type parameter declaration on a `fn` or
+/// `type` declaration. Identifies an HM-bound type variable in the
+/// declaration's signature scope.
+#[derive(Clone, Debug)]
+pub struct GenericParam {
+    pub name: String,
+    pub span: Span,
+}
+
+/// Plan B Task 47 — explicit row variable in an effect row.
+///
+/// `![IO | e]` introduces a row variable `e` that the type checker
+/// (Task 48) treats as a free row to be unified or generalised.
+/// Closed rows like `![IO]` carry `effect_row_var: None`.
+#[derive(Clone, Debug)]
+pub struct RowVar {
+    pub name: String,
     pub span: Span,
 }
 
@@ -57,7 +87,43 @@ pub struct Param {
 
 #[derive(Clone, Debug)]
 pub enum TypeExpr {
+    /// Bare type name with no type arguments: `Int`, `String`,
+    /// `MyType`, or a generic-parameter reference inside a generic
+    /// function/type's signature scope.
     Named(String, Span),
+    /// Plan B Task 47 — generic type application: `List[Int]`,
+    /// `Map[String, List[Int]]`. Parser produces this whenever a
+    /// type-name token is followed by `[...]`. Semantic consumption
+    /// (monomorph keying by sorted type-argument tuple) is Task 49.
+    /// Until then, downstream passes treat `Apply { name, .. }`
+    /// equivalently to `Named(name, ..)` for compatibility — the
+    /// type arguments are silently ignored.
+    Apply {
+        name: String,
+        args: Vec<TypeExpr>,
+        span: Span,
+    },
+}
+
+impl TypeExpr {
+    /// Span of this type expression (whichever variant).
+    pub fn span(&self) -> Span {
+        match self {
+            TypeExpr::Named(_, s) => s.clone(),
+            TypeExpr::Apply { span, .. } => span.clone(),
+        }
+    }
+
+    /// Head name of this type expression. For `Named` it's the name
+    /// itself; for `Apply` it's the constructor's name (the part
+    /// before the `[...]`). Convenience for the many call sites that
+    /// only need the head and not the type arguments.
+    pub fn head_name(&self) -> &str {
+        match self {
+            TypeExpr::Named(n, _) => n,
+            TypeExpr::Apply { name, .. } => name,
+        }
+    }
 }
 
 /// Plan A3 task 37 — user-defined nominal type declaration.
@@ -65,6 +131,10 @@ pub enum TypeExpr {
 pub struct TypeDecl {
     pub name: String,
     pub name_span: Span,
+    /// Plan B Task 47 — generic type parameters declared on this
+    /// `type`. Empty for non-generic types (every Plan A3 type).
+    /// Semantic consumption lands with monomorphization in Task 49.
+    pub generic_params: Vec<GenericParam>,
     pub variants: Vec<Variant>,
     pub span: Span,
 }
@@ -221,6 +291,9 @@ pub enum Expr {
         params: Vec<Param>,
         return_type: TypeExpr,
         effects: Vec<String>,
+        /// Plan B Task 47 — explicit row variable in the lambda's
+        /// effect row. Mirrors `FnDecl::effect_row_var`.
+        effect_row_var: Option<RowVar>,
         body: Box<Expr>,
         span: Span,
     },

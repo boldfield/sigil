@@ -92,14 +92,17 @@ struct UserFnEntry {
 /// typecheck's E0112 sweep and isn't a primitive is a registered user
 /// type, represented at the ABI boundary as `pointer_ty`.
 fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
-    match te {
-        TypeExpr::Named(name, _) => match name.as_str() {
-            "Int" => types::I64,
-            "String" => pointer_ty,
-            "Bool" | "Byte" | "Unit" => types::I8,
-            "Char" => types::I32,
-            _ => pointer_ty,
-        },
+    // Plan B Task 47 — TypeExpr::Apply is parser-only (generic
+    // application, e.g. `List[Int]`). Codegen treats it as the head
+    // name for now: every user-type instance is a heap record passed
+    // by pointer regardless of its type arguments. Real specialised
+    // codegen lands with monomorphization (Task 49).
+    match te.head_name() {
+        "Int" => types::I64,
+        "String" => pointer_ty,
+        "Bool" | "Byte" | "Unit" => types::I8,
+        "Char" => types::I32,
+        _ => pointer_ty,
     }
 }
 

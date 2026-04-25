@@ -314,6 +314,7 @@ impl Elaborator {
                 params,
                 return_type,
                 effects,
+                effect_row_var,
                 body,
                 span,
             } => {
@@ -338,6 +339,7 @@ impl Elaborator {
                         params,
                         return_type,
                         effects,
+                        effect_row_var,
                         body: Box::new(final_body),
                         span,
                     },
@@ -649,9 +651,7 @@ mod tests {
                 _ => None,
             })
             .expect("synthetic let not found");
-        match &syn.ty {
-            TypeExpr::Named(n, _) => assert_eq!(n, "Int"),
-        }
+        assert_eq!(syn.ty.head_name(), "Int");
     }
 
     #[test]

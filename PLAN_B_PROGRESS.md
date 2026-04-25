@@ -55,8 +55,9 @@ is complete but whose CI run has not yet reported green.
 ## Stage 5 — Parametric polymorphism
 
 - Task 47 — Parser: `[A, B]` generic params, explicit row vars `![IO | e]`
-  - status: todo
-  - commits: []
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: AST extensions: new `GenericParam` and `RowVar` types; `FnDecl` and `TypeDecl` gain `generic_params: Vec<GenericParam>`; `FnDecl` and `Expr::Lambda` gain `effect_row_var: Option<RowVar>`; `TypeExpr::Apply { name, args, span }` for generic application (`List[Int]`, `Map[String, List[Int]]`). New `TypeExpr::head_name()` and `span()` helpers keep most consumers unchanged. Parser: `parse_generic_params()` for `[A, B]` between name and `(`/`=`; `parse_effect_row()` extracts effects + optional `| rowvar` body and replaces inline loops in `parse_fn_decl` and `parse_lambda_expr`; `parse_type` recognises `[T1, ...]` after a name and returns `TypeExpr::Apply`. **Semantic consumption deferred to Task 48 (HM unification)** — typecheck/elaborate/codegen treat `Apply` equivalently to `Named(head_name, _)`, ignore generic_params, and treat the row variable as if it were a closed row. 12 new parser tests pin the new shapes; all 232 prior compiler-lib tests pass unchanged. Pod-verify green.
 - Task 48 — Type checker: HM unification with row variables, closed rows
   - status: todo
   - commits: []

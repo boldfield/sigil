@@ -373,12 +373,12 @@ impl Tc {
     /// `Ty::Unit` so body-level type errors still surface.
     fn check_type_expr_known(&mut self, t: &TypeExpr) {
         if ty_from_type_expr(t, &self.types).is_none() {
-            let TypeExpr::Named(n, span) = t;
             self.push_error(
                 "E0112",
-                span.clone(),
+                t.span(),
                 format!(
-                    "unknown type `{n}` (expected a primitive or a type declared via `type {n} = ...`)"
+                    "unknown type `{n}` (expected a primitive or a type declared via `type {n} = ...`)",
+                    n = t.head_name(),
                 ),
             );
         }
@@ -965,6 +965,11 @@ impl Tc {
                 params,
                 return_type,
                 effects,
+                // Plan B Task 47 — row variable parsed but not yet
+                // consumed (Task 48 wires row polymorphism). Lambdas
+                // with `![IO | e]` typecheck as if the row were
+                // closed `![IO]` until then.
+                effect_row_var: _,
                 body,
                 span,
             } => self.check_lambda(params, return_type, effects, body, span.clone()),
@@ -1923,15 +1928,14 @@ impl Tc {
 }
 
 fn type_is(t: &TypeExpr, name: &str) -> bool {
-    match t {
-        TypeExpr::Named(n, _) => n == name,
-    }
+    // Plan B Task 47: head-name match — generic application
+    // (`List[Int]`) matches the head, ignoring args. Real type-arg
+    // matching arrives with Task 48 unification.
+    t.head_name() == name
 }
 
 fn type_name(t: &TypeExpr) -> &str {
-    match t {
-        TypeExpr::Named(n, _) => n.as_str(),
-    }
+    t.head_name()
 }
 
 /// Lift a surface `TypeExpr` into the checker's `Ty` lattice. Resolves
@@ -1939,34 +1943,44 @@ fn type_name(t: &TypeExpr) -> &str {
 /// `Byte`), then Plan A3 user-defined types by consulting the types
 /// registry. Unknown names return `None`; the caller (fn_env pre-pass
 /// or `check_type_expr_known`) handles the fallback/diagnostic split.
+///
+/// Plan B Task 47: TypeExpr::Apply is treated equivalently to
+/// `TypeExpr::Named(head_name, _)` here — the type arguments are
+/// silently dropped. Real generic resolution arrives with Task 48
+/// HM unification (effects: a `List[Int]` and a `List[String]` will
+/// remain indistinguishable to this lift until the Tc grows
+/// type-parameter substitution).
 pub(crate) fn ty_from_type_expr(t: &TypeExpr, types: &BTreeMap<String, TypeDecl>) -> Option<Ty> {
-    match t {
-        TypeExpr::Named(n, _) => match n.as_str() {
-            "Int" => Some(Ty::Int),
-            "String" => Some(Ty::String),
-            "Unit" => Some(Ty::Unit),
-            "Bool" => Some(Ty::Bool),
-            "Char" => Some(Ty::Char),
-            "Byte" => Some(Ty::Byte),
-            other => {
-                if types.contains_key(other) {
-                    Some(Ty::User(other.to_string()))
-                } else {
-                    None
-                }
+    match t.head_name() {
+        "Int" => Some(Ty::Int),
+        "String" => Some(Ty::String),
+        "Unit" => Some(Ty::Unit),
+        "Bool" => Some(Ty::Bool),
+        "Char" => Some(Ty::Char),
+        "Byte" => Some(Ty::Byte),
+        other => {
+            if types.contains_key(other) {
+                Some(Ty::User(other.to_string()))
+            } else {
+                None
             }
-        },
+        }
     }
 }
 
 fn type_matches(expected: &TypeExpr, actual: &Ty) -> bool {
-    match (expected, actual) {
-        (TypeExpr::Named(n, _), Ty::Int) => n == "Int",
-        (TypeExpr::Named(n, _), Ty::String) => n == "String",
-        (TypeExpr::Named(n, _), Ty::Unit) => n == "Unit",
-        (TypeExpr::Named(n, _), Ty::Bool) => n == "Bool",
-        (TypeExpr::Named(n, _), Ty::Char) => n == "Char",
-        (TypeExpr::Named(n, _), Ty::Byte) => n == "Byte",
+    // Plan B Task 47: head-name comparison only. Generic applications
+    // like `List[Int]` match `Ty::User("List")` regardless of the
+    // type argument; refinement to argument-aware matching is
+    // Task 48 / Task 49 work.
+    let n = expected.head_name();
+    match actual {
+        Ty::Int => n == "Int",
+        Ty::String => n == "String",
+        Ty::Unit => n == "Unit",
+        Ty::Bool => n == "Bool",
+        Ty::Char => n == "Char",
+        Ty::Byte => n == "Byte",
         // `TypeExpr` does not yet admit a function-type surface
         // syntax (deferred from Task 30's minimum scope — the
         // `FnSig`-bearing `Ty::Fn` lives entirely in the checker for
@@ -1974,9 +1988,9 @@ fn type_matches(expected: &TypeExpr, actual: &Ty) -> bool {
         // the global fn-env pre-pass). A `let f: Foo = <fn-typed
         // expr>;` therefore never matches, so a named left-hand
         // type against a `Ty::Fn` right-hand is a hard mismatch.
-        (TypeExpr::Named(_, _), Ty::Fn(_)) => false,
+        Ty::Fn(_) => false,
         // Plan A3 task 38: nominal user-defined types match by name.
-        (TypeExpr::Named(n, _), Ty::User(u)) => n == u,
+        Ty::User(u) => n == u,
     }
 }
 
