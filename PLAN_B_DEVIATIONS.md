@@ -314,3 +314,138 @@ outside `{IO, Raise}` would still trip E0042 against this caller.
 
 **Implementing commit(s):** TBD — closes at Task 55 or earlier if a
 multi-effect program needs the path before then.
+
+## 2026-04-25 — [DEVIATION Task 49] Mangled name format and ordering
+
+**Context:** Plan body specifies "Canonical specialization names use
+lexicographically-sorted type arguments with a canonical recursive form
+for nested generics: `list_map__List_Option_Int__List_Option_Int`."
+Two interpretation gaps:
+
+1. *Lexicographic sort of type arguments.* Read literally, this would
+   reorder a fn's type-argument list before mangling — losing the
+   positional binding between a declared generic parameter (`A`, `B`) and
+   its concrete instantiation. `f[A=Int, B=String]` and
+   `f[A=String, B=Int]` are different instantiations; lex-sorting their
+   args to `[Int, String]` and `[Int, String]` respectively would
+   produce identical mangled names but completely different bodies.
+2. *Canonical recursive form.* The example `list_map__List_Option_Int`
+   shows nested generics rendered with single underscores within a
+   type-arg, double underscores between top-level type-args. The
+   plan does not formalise the separator rule.
+
+**Deviation:**
+1. Type arguments are emitted in the callee's *declared* generic-
+   parameter order (positional), not lex-sorted. The lex-sort interpretation
+   is treated as a plan misstatement; positional ordering is the only
+   reading that preserves correctness.
+2. Canonical form is formalised in `compiler/src/monomorphize.rs` module
+   docs and pinned by unit tests:
+   - Primitives render as themselves: `Int`, `String`, etc.
+   - `User(name, [])` renders as `name`.
+   - `User(name, [a1, a2, ...])` renders as `name_<canon(a1)>_<canon(a2)>_...`
+     (single underscore between parts within a type-arg).
+   - Top-level fn/type instantiation: `fn_name__<canon(a1)>__<canon(a2)>__...`
+     (double underscore between top-level type-args).
+   - Ctor of generic type: `ctor_name__<canon(a1)>__<canon(a2)>__...`
+     (same suffix as the owning type so the global ctor namespace stays
+     unique across instantiations).
+
+**Rationale:** Determinism flows from BTreeMap iteration order over the
+reachability worklist; argument ordering is positional because it's the
+only ordering that preserves the type-var → concrete-Ty binding. The
+asymmetric `_`/`__` separator is unambiguous as long as user fn / type
+names contain no double-underscore — the same constraint Plan A2 relied
+on for `$lambda_N` synthetic names.
+
+**Acceptance criterion for closure:** if a future plan adds first-class
+function-typed values (`TypeExpr::Fn` surface syntax), `Ty::Fn` rendering
+in `canon_ty` needs to be revisited (currently a fixed `"Fn"` placeholder
+that would collide if a v1 program ever produced one — caught by the
+`canon_ty` `Ty::Var(_)` / `Ty::Fn(_)` arms emitting deterministic
+placeholders so collisions surface as visible build artefacts rather
+than silent miscompiles).
+
+**Implementing commit(s):** Same commit as Task 49.
+
+## 2026-04-25 — [DEVIATION Task 49] Effect rows preserved through monomorphization
+
+**Context:** Plan body's Task 49 entry: "Effect rows are not
+monomorphized in v1 — they remain polymorphic through this phase and
+are erased at codegen (effect dispatch is runtime-indirect). This is a
+v1 optimization-budget choice; the design doc explicitly reserves
+row-specialised monomorphs for v2."
+
+The Task 48 codegen-entry walker (`contains_apply_or_generic_ref`)
+treated `f.effect_row_var.is_some()` as a hard rejection. That made
+sense at Task 48 (before monomorphization existed and any program
+reaching codegen with a row variable was unmonomorphised). Task 49
+introduces monomorphization which intentionally preserves
+`effect_row_var` per the plan, so the existing walker rule needs
+relaxing.
+
+**Deviation:** the walker no longer rejects `f.effect_row_var.is_some()`
+or `Expr::Lambda { effect_row_var: Some(_), .. }`. The rejection is
+narrowed to:
+
+- `f.generic_params.is_empty()` (still rejected)
+- `td.generic_params.is_empty()` (still rejected)
+- `TypeExpr::Apply { .. }` anywhere (still rejected)
+- `TypeExpr::Named(name, _)` referencing a generic-param surface
+  name in scope (still rejected)
+
+Monomorphized fns retain their `effect_row_var` field as a sentinel
+that the body's row was polymorphic; codegen treats `Some(_)` as a
+no-op (effect dispatch is runtime-indirect; v1 codegen doesn't
+emit per-row dispatch tables).
+
+**Rationale:** The plan body explicitly carves out effect rows from
+monomorphization. v1 effect dispatch is runtime-indirect — the row
+variable serves no codegen purpose past type-checking. v2 row-specialised
+monomorphs are reserved for the design doc.
+
+**Acceptance criterion for closure:** Plan B Stage 6 (Tasks 55–60)
+verifies the effect-runtime works end-to-end with row-polymorphic
+callees and the trampoline / arena infrastructure; if v2 row
+specialisation lands, this deviation closes.
+
+**Implementing commit(s):** Same commit as Task 49.
+
+## 2026-04-25 — [DEVIATION Task 49] Pattern-ctor rewriting via scrutinee Ty
+
+**Context:** Plan body says "Typed IR preserved" but does not specify
+how monomorphization should resolve constructor names inside `match`
+arm patterns. The typecheck instantiation index keys construction sites
+(call / record-lit / unit-ident); pattern-ctor sites are not
+constructions and don't get their own instantiation entry.
+
+**Deviation:** Pattern ctors are rewritten by combining two existing
+indices: the scrutinee's `Ty::User(name, args)` from
+`CheckedProgram::match_scrut_tys`, plus the `ctor_to_type` reverse
+index built from the original program's TypeDecls. For
+`Pattern::Ctor { name: "Some", .. }` inside a match whose scrutinee
+typed as `Option[Int]`, the rewriter looks up "Some" → "Option" via
+`ctor_to_type`, observes the scrutinee's args `[Int]`, and produces
+`Some__Int`.
+
+Sub-patterns inherit the scrut_ty for their own ctor lookups —
+acceptable in v1 because nested ctor patterns either match the
+scrutinee's type (same args) or refer to a different type whose own
+args resolve via `ctor_to_type` of that ctor's owner-type. v1 doesn't
+yet thread per-sub-pattern type-args through inference; if Plan B
+Task 50+ exposes a need (e.g., GADT-flavoured cases), this gets
+revisited.
+
+**Rationale:** Avoids extending the typecheck instantiation index with
+a third map keyed by pattern span. The two-index lookup already covers
+all v1 patterns the test surface exercises (Option-style sums, single-
+ctor records, nested ctors of the same type).
+
+**Acceptance criterion for closure:** v1's pattern surface ships
+unchanged in Tasks 50–52; deviation closes when Stage 5 review
+checkpoint accepts the implementation. If Plan C / v2 introduces
+patterns whose sub-patterns reference different generic-type
+instantiations than the scrutinee's, monomorph gains a per-pattern
+instantiation index.
+
+**Implementing commit(s):** Same commit as Task 49.

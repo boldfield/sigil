@@ -106,6 +106,26 @@ pub struct Scheme {
     pub body: Ty,
 }
 
+/// Plan B task 49 — concrete-instantiation record for a single use
+/// site of a generic top-level fn or generic user type.
+///
+/// `name` is the surface name of the callee fn or type. `type_args`
+/// is the inferred per-call type-argument list, in the callee's
+/// `generic_params` declared order, fully resolved through the
+/// typecheck substitution. Empty `type_args` means the callee was
+/// non-generic at this site — kept for symmetry but monomorphization
+/// treats those as identity.
+///
+/// Type-args may still contain `Ty::Var` nodes when the surrounding
+/// fn is itself generic and the inferred args reference the outer
+/// fn's generic parameters; the monomorphizer resolves those when
+/// it descends into the cloned outer fn's body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericInstantiation {
+    pub name: String,
+    pub type_args: Vec<Ty>,
+}
+
 /// Effect row used during row unification. `tail = None` is a closed
 /// row; `tail = Some(id)` is open. Always carries effect labels in a
 /// canonical sorted-deduped form via `Row::canonicalise` so set
@@ -289,6 +309,27 @@ pub struct CheckedProgram {
     /// match introduced by elaborate's if→match desugaring) let codegen
     /// fall back to primitive-scalar dispatch.
     pub match_scrut_tys: BTreeMap<Span, Ty>,
+    /// Plan B task 49 — per-fn polymorphic schemes recorded at the
+    /// end of the typecheck pass. Monomorphization reads these to
+    /// build the surface-name → fresh-var mapping when cloning a
+    /// generic fn at a concrete type-arg tuple. Non-generic fns have
+    /// schemes with empty `type_vars`, kept for uniformity.
+    pub fn_schemes: BTreeMap<String, Scheme>,
+    /// Plan B task 49 — per-call-site instantiation index for
+    /// references to top-level fns. Keyed by the use-site span (the
+    /// `Expr::Ident` callee's span, or the bare-Ident value-context
+    /// span when the fn is referenced as a value). Monomorphization
+    /// looks up the type-args at each call/value reference and clones
+    /// the callee at the resolved type-arg tuple.
+    pub call_site_instantiations: BTreeMap<Span, GenericInstantiation>,
+    /// Plan B task 49 — per-construction-site instantiation index for
+    /// constructor uses of generic user types. Populated by all three
+    /// ctor resolution paths (unit ident, positional call, record
+    /// literal). Keyed by the construction span. The
+    /// `GenericInstantiation::name` is the *type* name (`Option`,
+    /// `List`), not the ctor name, since the type's generic parameters
+    /// are what got instantiated.
+    pub ctor_site_instantiations: BTreeMap<Span, GenericInstantiation>,
 }
 
 /// Where a constructor is registered. Indexes a `TypeDecl` in the
@@ -398,6 +439,8 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         subst: Subst::new(),
         current_generic_subst: BTreeMap::new(),
         current_row_var_subst: BTreeMap::new(),
+        pending_call_instantiations: Vec::new(),
+        pending_ctor_instantiations: Vec::new(),
     };
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
@@ -503,6 +546,37 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         );
     }
 
+    // Plan B task 49 — resolve pending per-call-site and per-ctor-
+    // site instantiations through the final substitution to produce
+    // concrete `Ty` arg tuples. Vars that remain unbound after
+    // inference (e.g. inside a generic fn body, where the inner call
+    // resolved to the *outer* fn's still-free type-var) are kept as
+    // `Ty::Var(_)`; the monomorphizer applies the outer fn's
+    // declared-name → concrete-Ty substitution when it descends into
+    // the cloned body and re-resolves these.
+    let resolved_calls: BTreeMap<Span, GenericInstantiation> = tc
+        .pending_call_instantiations
+        .into_iter()
+        .map(|(span, name, var_ids)| {
+            let type_args: Vec<Ty> = var_ids
+                .iter()
+                .map(|id| tc.subst.apply_ty(&Ty::Var(*id)))
+                .collect();
+            (span, GenericInstantiation { name, type_args })
+        })
+        .collect();
+    let resolved_ctors: BTreeMap<Span, GenericInstantiation> = tc
+        .pending_ctor_instantiations
+        .into_iter()
+        .map(|(span, name, var_ids)| {
+            let type_args: Vec<Ty> = var_ids
+                .iter()
+                .map(|id| tc.subst.apply_ty(&Ty::Var(*id)))
+                .collect();
+            (span, GenericInstantiation { name, type_args })
+        })
+        .collect();
+
     (
         CheckedProgram {
             program,
@@ -510,6 +584,9 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             lambda_captures: tc.lambda_captures,
             types: tc.types,
             match_scrut_tys: tc.match_scrut_tys,
+            fn_schemes: tc.fn_schemes,
+            call_site_instantiations: resolved_calls,
+            ctor_site_instantiations: resolved_ctors,
         },
         tc.errors,
     )
@@ -637,6 +714,20 @@ struct Tc {
     /// effect-row references in let-bound types). Empty for fns /
     /// lambdas with no explicit row variable.
     current_row_var_subst: BTreeMap<String, u32>,
+    /// Plan B task 49 — pending fn-call instantiation captures. Each
+    /// entry is `(use_site_span, fn_name, fresh_var_ids)` recorded
+    /// at the moment `instantiate` allocated fresh `Ty::Var`s for a
+    /// generic fn's bound type vars. The outer typecheck driver
+    /// resolves these through `subst` after all body checks complete
+    /// to produce `CheckedProgram::call_site_instantiations`.
+    pending_call_instantiations: Vec<(Span, String, Vec<u32>)>,
+    /// Plan B task 49 — pending ctor-site instantiation captures.
+    /// Each entry is `(use_site_span, type_name, fresh_var_ids)`
+    /// recorded by the three `resolve_ctor_*_use` paths when the
+    /// owning type has non-empty `generic_params`. Resolved through
+    /// `subst` at end of typecheck to produce
+    /// `CheckedProgram::ctor_site_instantiations`.
+    pending_ctor_instantiations: Vec<(Span, String, Vec<u32>)>,
 }
 
 impl Tc {
@@ -690,37 +781,37 @@ impl Tc {
     }
 
     /// Construct a `Ty::User(name, args)` instance for a registered
-    /// user-type declaration. Non-generic declarations return
-    /// `Ty::User(name, vec![])` — same shape Plan A3 produced.
-    /// Generic declarations allocate one fresh `Ty::Var` per
-    /// declared generic parameter so HM unification can later
-    /// resolve them. Caller (constructor resolution, scrutinee
-    /// shaping) keeps the resulting `Ty` in the inference graph.
-    fn fresh_user_instance(&mut self, name: &str, td: &TypeDecl) -> Ty {
-        let (ty, _) = self.fresh_user_instance_with_subst(name, td);
-        ty
-    }
-
-    /// Like `fresh_user_instance` but also returns the per-call
-    /// surface-name → `Ty::Var` substitution so the caller can
-    /// resolve constructor field types (which reference the type's
-    /// generic parameters by name) under the same fresh allocation.
-    fn fresh_user_instance_with_subst(
+    /// user-type declaration plus the per-call surface-name → `Ty::Var`
+    /// substitution and the freshly-allocated type-var ids in the
+    /// type's declared generic-parameter order.
+    ///
+    /// Non-generic declarations return `Ty::User(name, vec![])` —
+    /// same shape Plan A3 produced — with empty subst and empty ids.
+    /// Generic declarations allocate one fresh `Ty::Var` per declared
+    /// generic parameter so HM unification can later resolve them
+    /// (Plan B task 48); the parallel ids are recorded by the ctor
+    /// resolvers so monomorphization (Plan B task 49) can recover
+    /// the concrete per-construction-site type-arg tuple after
+    /// inference completes.
+    fn fresh_user_instance_with_subst_and_ids(
         &mut self,
         name: &str,
         td: &TypeDecl,
-    ) -> (Ty, BTreeMap<String, Ty>) {
+    ) -> (Ty, BTreeMap<String, Ty>, Vec<u32>) {
         let mut subst = BTreeMap::new();
         if td.generic_params.is_empty() {
-            return (Ty::User(name.to_string(), Vec::new()), subst);
+            return (Ty::User(name.to_string(), Vec::new()), subst, Vec::new());
         }
         let mut args: Vec<Ty> = Vec::with_capacity(td.generic_params.len());
+        let mut fresh_ids: Vec<u32> = Vec::with_capacity(td.generic_params.len());
         for gp in &td.generic_params {
-            let v = Ty::Var(self.fresh_ty_var());
+            let id = self.fresh_ty_var();
+            fresh_ids.push(id);
+            let v = Ty::Var(id);
             subst.insert(gp.name.clone(), v.clone());
             args.push(v);
         }
-        (Ty::User(name.to_string(), args), subst)
+        (Ty::User(name.to_string(), args), subst, fresh_ids)
     }
 
     /// Resolve a `Ty` through the current substitution. Convenience
@@ -732,18 +823,28 @@ impl Tc {
 
     /// Instantiate a scheme by allocating fresh type / row vars for
     /// each bound variable and substituting them through the body.
-    /// Returns the instantiated `Ty` ready for unification at the
-    /// call site.
-    fn instantiate(&mut self, scheme: &Scheme) -> Ty {
+    /// Returns the instantiated `Ty` plus the parallel list of
+    /// freshly-allocated type-var ids in the scheme's declared
+    /// order (`scheme.type_vars`).
+    ///
+    /// Plan B task 49 — the monomorphization pass needs the parallel
+    /// id list to recover the per-call-site type-arg tuple after
+    /// inference completes (apply `subst` to each fresh var to get
+    /// the concrete `Ty`). Non-generic schemes return an empty
+    /// `Vec`, kept for uniformity.
+    fn instantiate_with_vars(&mut self, scheme: &Scheme) -> (Ty, Vec<u32>) {
         let mut ty_map: BTreeMap<u32, Ty> = BTreeMap::new();
+        let mut fresh_ids: Vec<u32> = Vec::with_capacity(scheme.type_vars.len());
         for &id in &scheme.type_vars {
-            ty_map.insert(id, Ty::Var(self.fresh_ty_var()));
+            let fresh = self.fresh_ty_var();
+            fresh_ids.push(fresh);
+            ty_map.insert(id, Ty::Var(fresh));
         }
         let mut row_map: BTreeMap<u32, u32> = BTreeMap::new();
         for &id in &scheme.row_vars {
             row_map.insert(id, self.fresh_row_var());
         }
-        Self::rename_ty(&scheme.body, &ty_map, &row_map)
+        (Self::rename_ty(&scheme.body, &ty_map, &row_map), fresh_ids)
     }
 
     /// Rename bound variables in a scheme body during instantiation.
@@ -1205,7 +1306,20 @@ impl Tc {
         let td = self.types.get(&info.type_name)?.clone();
         let variant = &td.variants[info.variant_index];
         match &variant.fields {
-            VariantFields::Unit => Some(self.fresh_user_instance(&info.type_name, &td)),
+            VariantFields::Unit => {
+                let (ty, _subst, fresh_ids) =
+                    self.fresh_user_instance_with_subst_and_ids(&info.type_name, &td);
+                // Plan B task 49 — record the use site so monomorph
+                // can clone the type at the inferred type-arg tuple.
+                // Empty `fresh_ids` for non-generic types is recorded
+                // uniformly so monomorph keys all ctor sites the same.
+                self.pending_ctor_instantiations.push((
+                    span.clone(),
+                    info.type_name.clone(),
+                    fresh_ids,
+                ));
+                Some(ty)
+            }
             VariantFields::Positional(params) => {
                 self.push_error(
                     "E0115",
@@ -1264,8 +1378,17 @@ impl Tc {
                 // `B`, ...) and must resolve to the *same* fresh
                 // vars across this single ctor call so unifying each
                 // arg with its field pins the type's args.
-                let (result_ty, ctor_subst) =
-                    self.fresh_user_instance_with_subst(&info.type_name, &td);
+                let (result_ty, ctor_subst, fresh_ids) =
+                    self.fresh_user_instance_with_subst_and_ids(&info.type_name, &td);
+                // Plan B task 49 — record the construction site so
+                // monomorph can clone the type at the inferred type-
+                // arg tuple. Empty `fresh_ids` for non-generic types
+                // is recorded uniformly.
+                self.pending_ctor_instantiations.push((
+                    span.clone(),
+                    info.type_name.clone(),
+                    fresh_ids,
+                ));
                 let saved = self.current_generic_subst.clone();
                 for (k, v) in &ctor_subst {
                     self.current_generic_subst.insert(k.clone(), v.clone());
@@ -1425,7 +1548,12 @@ impl Tc {
         // parameters once for the whole record literal so unifying
         // each field's value with its declared type pins the type's
         // arguments consistently.
-        let (result_ty, ctor_subst) = self.fresh_user_instance_with_subst(&info.type_name, &td);
+        let (result_ty, ctor_subst, fresh_ids) =
+            self.fresh_user_instance_with_subst_and_ids(&info.type_name, &td);
+        // Plan B task 49 — record the construction site so monomorph
+        // can clone the type at the inferred type-arg tuple.
+        self.pending_ctor_instantiations
+            .push((span.clone(), info.type_name.clone(), fresh_ids));
         let saved = self.current_generic_subst.clone();
         for (k, v) in &ctor_subst {
             self.current_generic_subst.insert(k.clone(), v.clone());
@@ -1777,7 +1905,16 @@ impl Tc {
                     return Some(ty);
                 }
                 if let Some(scheme) = self.fn_schemes.get(name).cloned() {
-                    return Some(self.instantiate(&scheme));
+                    let (ty, fresh_ids) = self.instantiate_with_vars(&scheme);
+                    // Plan B task 49 — capture every top-level-fn use
+                    // site (callee in a Call, or value-position Ident
+                    // referencing a fn). Empty `fresh_ids` is the
+                    // non-generic case; recording it uniformly lets
+                    // monomorphize key all top-level-fn references the
+                    // same way regardless of genericity.
+                    self.pending_call_instantiations
+                        .push((span.clone(), name.clone(), fresh_ids));
+                    return Some(ty);
                 }
                 if let Some(ty) = self.fn_env.get(name).cloned() {
                     return Some(ty);
@@ -5221,6 +5358,8 @@ mod tests {
             subst: Subst::new(),
             current_generic_subst: BTreeMap::new(),
             current_row_var_subst: BTreeMap::new(),
+            pending_call_instantiations: Vec::new(),
+            pending_ctor_instantiations: Vec::new(),
         }
     }
 
