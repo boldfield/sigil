@@ -92,6 +92,9 @@ Pending — request human review of row-unification, let-generalization, color i
 - Task 54 — Type checker: row-polymorphic effect checking, handler typing, one-shot linearity (E0220)
   - status: todo
   - commits: []
+  - prep (carryover from Task 53 review, PR #19):
+    - **(10) Replace the staged-E0134 arm-walker with proper handler typing.** The Task 53 stub at `compiler/src/typecheck.rs::check_expr` `Expr::Handle` walks `body`, `return_arm.body`, and each `op_arm.body` after emitting E0134 but does NOT extend the local environment with op-arm parameter bindings or the continuation `k` before walking. Programs like `E.op(x, k) => x + 1` would emit a spurious E0046 "unknown identifier `x`" alongside E0134 today. Task 54 replaces the entire path with real handler typing — binding-scope extension lands as part of 54's scope, not as separate cleanup. Test `handle_arm_bodies_walked_during_e0134_emission` uses `body: true` which currently sidesteps the issue; Task 54 should extend that test (or its replacement) to cover the binding-scope-extending shape `E.op(x, k) => x + 1`.
+    - **(11) Codegen-gate alignment.** The `Item::Effect → return true` short-circuit in `compiler/src/codegen.rs::contains_apply_or_generic_ref` only catches programs with an `effect` decl in scope; a `handle` over an unhandled effect with no decl in scope would skip that gate and reach the `lower_expr` / `type_of_expr` `unreachable!`. If Task 54 lifts E0134 before Task 55's CPS expansion lands, codegen will panic. Task 54's PR description must explicitly verify both gates stay aligned — either keep E0134 live until Task 55 lands (preferred), or extend the codegen-entry walker to short-circuit on any `Expr::Handle` it sees in addition to the `Item::Effect` short-circuit (defensive belt-and-suspenders). Task 53 review item 6 + 11 (both PR #19).
 - Task 55 — CPS transform on CPS-color monomorphs; arena-allocated `NextStep` records
   - status: todo
   - commits: []

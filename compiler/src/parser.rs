@@ -1094,9 +1094,12 @@ impl<'a> Parser<'a> {
     /// than ambiguously trying to consume the brace block as a record
     /// literal. Parenthesising the body restores record-literal parsing.
     ///
-    /// At least one operation arm is required. The parser does not
-    /// reject duplicate `return` arms — the typechecker (Task 54)
-    /// produces a more specific diagnostic with both spans.
+    /// At least one operation arm is required. Duplicate `return`
+    /// arms are rejected at parse time with an error spanning the
+    /// duplicate; the AST keeps the first arm under "first wins"
+    /// semantics so a future cross-span diagnostic in Task 54 can
+    /// reference both positions through the recorded error and the
+    /// preserved AST.
     ///
     /// Each operation arm carries the discharged effect's name, the
     /// op's name, an op-parameter binding list (matching the op's
@@ -1124,16 +1127,22 @@ impl<'a> Parser<'a> {
                     let ra = self.parse_handle_return_arm(arm_start)?;
                     if return_arm.is_some() {
                         // Surface as a parser-level error so the user
-                        // sees the duplicate immediately. Typecheck
-                        // can refine with a "first / second" cross-
-                        // span diagnostic when the ergonomic shape of
-                        // E0220 / E0221 is locked in.
+                        // sees the duplicate immediately. **First-wins
+                        // semantics**: keep the original return arm in
+                        // the AST so downstream passes (Task 54+
+                        // typechecker, future cross-span diagnostics)
+                        // see a stable target. The duplicate is
+                        // dropped on the floor; the error span points
+                        // at the *second* (offending) arm so the
+                        // user's eye lands on the line they need to
+                        // remove. Reviewer feedback PR #19 item 2.
                         self.err(
                             ra.span.clone(),
                             "duplicate `return` arm in handler; only one is allowed",
                         );
+                    } else {
+                        return_arm = Some(Box::new(ra));
                     }
-                    return_arm = Some(Box::new(ra));
                 }
                 TokenKind::Ident(_) => {
                     let oa = self.parse_handle_op_arm(arm_start)?;
@@ -2878,6 +2887,42 @@ mod tests {
     }
 
     #[test]
+    fn effect_as_user_ident_in_let_is_rejected() {
+        // Reviewer feedback PR #19 item 9 — symmetric keyword-side
+        // adversarial. `effect` IS a lexer keyword as of Task 53, so
+        // `let effect: Int = 1;` cannot parse: the `let` arm expects
+        // an Ident binding name and gets a `TokenKind::Effect`
+        // instead, producing a parser-level error. This is the
+        // counterpart to `resumes_outside_effect_decl_remains_ident`,
+        // which pins the *non*-reserved attribute words to the Ident
+        // path; together they cover both halves of the keyword
+        // matrix.
+        let errs = parse_errs("fn main() -> Int ![] { let effect: Int = 1; 0 }\n");
+        assert!(
+            !errs.is_empty(),
+            "`let effect: Int = 1` must parse-error because `effect` is reserved; got no errors",
+        );
+    }
+
+    #[test]
+    fn handle_with_keywords_rejected_in_user_ident_position() {
+        // `handle` and `with` are reserved too. Same argument as
+        // above: a `let handle = 1` shape must not silently rebind
+        // them as user identifiers. Together with the `effect` test,
+        // this pins all three Stage-6 keywords.
+        let h_errs = parse_errs("fn main() -> Int ![] { let handle: Int = 1; 0 }\n");
+        assert!(
+            !h_errs.is_empty(),
+            "`let handle: Int = 1` must parse-error because `handle` is reserved; got no errors",
+        );
+        let w_errs = parse_errs("fn main() -> Int ![] { let with: Int = 1; 0 }\n");
+        assert!(
+            !w_errs.is_empty(),
+            "`let with: Int = 1` must parse-error because `with` is reserved; got no errors",
+        );
+    }
+
+    #[test]
     fn handle_expr_minimal_form() {
         // Smallest possible handle: one op arm, no return arm.
         let e = parse_tail_expr("handle 0 with { Raise.fail(msg, k) => 0 }");
@@ -2998,6 +3043,32 @@ mod tests {
             errs.iter()
                 .any(|e| e.message.contains("duplicate `return`")),
             "duplicate return arms should parse-error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_expr_duplicate_return_arm_first_wins_in_ast() {
+        // Reviewer feedback PR #19 item 2 — pin first-wins AST
+        // semantics: the parser drops the SECOND arm on the floor and
+        // keeps the first in the AST so downstream passes see a
+        // stable target. The error still fires (covered by the
+        // sibling test above); this one pins the AST shape.
+        let src = "fn main() -> Int ![] { handle 0 with { return(first) => first, return(second) => second, Raise.fail(k) => 0 } }\n";
+        let (toks, lex_errs) = lex("t.sigil", src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, _) = parse("t.sigil", &toks);
+        let Item::Fn(ref f) = prog.items[0] else {
+            panic!()
+        };
+        let Some(Expr::Handle { ref return_arm, .. }) = f.body.tail else {
+            panic!("expected tail Expr::Handle, got {:?}", f.body.tail);
+        };
+        let ra = return_arm
+            .as_ref()
+            .expect("return_arm should be populated by first-wins semantics");
+        assert_eq!(
+            ra.binding, "first",
+            "first-wins: return arm binding must be `first`, not `second`",
         );
     }
 

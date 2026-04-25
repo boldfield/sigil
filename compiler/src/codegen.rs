@@ -352,15 +352,16 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
             }
             false
         }
-        // Plan B task 53 — handler expressions never reach codegen on
-        // a successful compile (typecheck E0134 stops them). The
-        // codegen-entry walker still has to inspect them defensively
-        // so a future refactor that lets one through trips the
-        // entry-walker hard-reject rather than the `unreachable!` in
-        // `lower_expr`. We only check the body and arm bodies for
-        // generic refs; the arm parameter shapes are expressed at the
-        // type level only via the matching `EffectDecl`'s op
-        // signatures, which are caught by the Item::Effect arm above.
+        // Plan B task 53 — dead code today. Any program that reaches
+        // codegen with an `Expr::Handle` already triggered the
+        // `Item::Effect → return true` short-circuit at the top of
+        // `contains_apply_or_generic_ref`, since a `handle` requires
+        // an `effect` decl in scope to typecheck under Task 54+ (and
+        // typecheck E0134 stops it before then anyway). This arm is
+        // kept for the case where Task 54 lifts the `Item::Effect`
+        // gate but `Expr::Handle` still needs a guard during the
+        // CPS-transform handoff in Task 55. Reviewer feedback PR #19
+        // item 4.
         Expr::Handle {
             body,
             return_arm,
