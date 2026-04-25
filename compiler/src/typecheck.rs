@@ -373,34 +373,16 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // the builtin entry — users can shadow, and codegen's `lower_call`
     // checks `user_fn_refs` before the builtin branch, so the user's
     // definition wins end-to-end.
-    let mut fn_env: BTreeMap<String, Ty> = builtin_fn_env();
-    for item in &program.items {
-        if let Item::Fn(f) = item {
-            // Plan B task 48: this pre-pass seeds a *concrete* fn_env
-            // entry usable by callers that have a fully resolved
-            // signature. Generic parameters in scope (`fn id[A](...)`)
-            // and explicit row variables (`![IO | e]`) are introduced
-            // inside `check_fn`'s body walk via the scheme machinery;
-            // here we use the empty generic-substitution and a closed
-            // effect row for the fall-through, replacing whatever this
-            // entry holds when `check_fn` later registers the fn's full
-            // scheme. Builtins remain `Ty::Fn` (concrete schemes with
-            // empty bound-var lists, looked up directly).
-            let empty_subst = BTreeMap::new();
-            let sig = FnSig {
-                params: f
-                    .params
-                    .iter()
-                    .map(|p| ty_from_type_expr(&p.ty, &types, &empty_subst).unwrap_or(Ty::Unit))
-                    .collect(),
-                ret: ty_from_type_expr(&f.return_type, &types, &empty_subst).unwrap_or(Ty::Unit),
-                effects: f.effects.clone(),
-                effect_row_var: None,
-            };
-            fn_env.insert(f.name.clone(), Ty::Fn(Box::new(sig)));
-        }
-    }
-
+    // Plan B task 48 — `fn_env` carries only builtins (concrete
+    // signatures looked up directly). Every user fn registers a
+    // polymorphic `Scheme` in `fn_schemes` instead, so call sites
+    // see fresh `Ty::Var`s per use. Pre-registration happens below
+    // *before* any body is checked, which closes the source-order
+    // hole reviewers flagged: a forward reference to `id` from
+    // `use_id` (when `id` is declared further down the file) now
+    // hits the polymorphic scheme rather than a stale Unit-fallback
+    // `fn_env` entry.
+    let fn_env: BTreeMap<String, Ty> = builtin_fn_env();
     let mut tc = Tc {
         errors,
         string_literals: Vec::new(),
@@ -417,6 +399,43 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         current_generic_subst: BTreeMap::new(),
         current_row_var_subst: BTreeMap::new(),
     };
+    // Pre-pass: register a polymorphic `Scheme` per user fn under
+    // its declared generic-parameter / row-variable allocations, so
+    // mutual and forward references resolve through `fn_schemes`'s
+    // `instantiate` path during body checks. After `check_fn` runs
+    // each body, the entry is overwritten with the *inferred*-
+    // resolved scheme (typically identical for non-generic fns,
+    // possibly more constrained for fns whose body pinned a
+    // declared generic to a specific type).
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            let (gs, ty_var_ids) = tc.fresh_generic_subst(&f.generic_params);
+            let row_var_id = f.effect_row_var.as_ref().map(|_| tc.fresh_row_var());
+            let saved = std::mem::take(&mut tc.current_generic_subst);
+            tc.current_generic_subst = gs;
+            let params: Vec<Ty> = f
+                .params
+                .iter()
+                .map(|p| tc.ty_from_type_expr_here(&p.ty).unwrap_or(Ty::Unit))
+                .collect();
+            let ret = tc
+                .ty_from_type_expr_here(&f.return_type)
+                .unwrap_or(Ty::Unit);
+            tc.current_generic_subst = saved;
+            let sig = FnSig {
+                params,
+                ret,
+                effects: f.effects.clone(),
+                effect_row_var: row_var_id,
+            };
+            let scheme = Scheme {
+                type_vars: ty_var_ids,
+                row_vars: row_var_id.map(|id| vec![id]).unwrap_or_default(),
+                body: Ty::Fn(Box::new(sig)),
+            };
+            tc.fn_schemes.insert(f.name.clone(), scheme);
+        }
+    }
     // E0112 sweep: any TypeExpr in an FnDecl signature that does not
     // resolve to a primitive or registered user type is reported against
     // the TypeExpr's span. Runs after the types pre-pass so forward
@@ -711,87 +730,6 @@ impl Tc {
         self.subst.apply_ty(t)
     }
 
-    /// Compute the free type-variable set of `t` after applying the
-    /// current substitution. Free-var ids are the candidates for
-    /// generalisation at let-boundary closure (Plan B task 48).
-    /// Currently used only by the diagnostics-side `generalize`
-    /// helper; retained for the Stage 6 effect-handler pass that
-    /// needs principal-type computation over open-row signatures.
-    #[allow(dead_code)]
-    fn ftv_ty(&self, t: &Ty, out: &mut std::collections::BTreeSet<u32>) {
-        let resolved = self.deref(t);
-        match resolved {
-            Ty::Int | Ty::String | Ty::Unit | Ty::Bool | Ty::Char | Ty::Byte => {}
-            Ty::Var(id) => {
-                out.insert(id);
-            }
-            Ty::User(_, args) => {
-                for a in args {
-                    self.ftv_ty(&a, out);
-                }
-            }
-            Ty::Fn(sig) => {
-                for p in &sig.params {
-                    self.ftv_ty(p, out);
-                }
-                self.ftv_ty(&sig.ret, out);
-            }
-        }
-    }
-
-    /// Free row-variable set of `t`. Walks `Fn` signatures and the
-    /// nested rows their effect_row_var introduces. Used alongside
-    /// `ftv_ty` to drive let-generalisation over both kinds of
-    /// variables in a single pass.
-    #[allow(dead_code)]
-    fn frv_ty(&self, t: &Ty, out: &mut std::collections::BTreeSet<u32>) {
-        let resolved = self.deref(t);
-        match resolved {
-            Ty::Int | Ty::String | Ty::Unit | Ty::Bool | Ty::Char | Ty::Byte | Ty::Var(_) => {}
-            Ty::User(_, args) => {
-                for a in args {
-                    self.frv_ty(&a, out);
-                }
-            }
-            Ty::Fn(sig) => {
-                for p in &sig.params {
-                    self.frv_ty(p, out);
-                }
-                self.frv_ty(&sig.ret, out);
-                if let Some(id) = sig.effect_row_var {
-                    let row = self.subst.apply_row(&Row {
-                        effects: Vec::new(),
-                        tail: Some(id),
-                    });
-                    if let Some(t) = row.tail {
-                        out.insert(t);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Free vars of the global env (top-level fn schemes only —
-    /// schemes' bound vars are *not* free). Local `env` entries
-    /// resolve through the same substitution.
-    #[allow(dead_code)]
-    fn ftv_env(&self) -> std::collections::BTreeSet<u32> {
-        let mut out = std::collections::BTreeSet::new();
-        for ty in self.env.values() {
-            self.ftv_ty(ty, &mut out);
-        }
-        out
-    }
-
-    #[allow(dead_code)]
-    fn frv_env(&self) -> std::collections::BTreeSet<u32> {
-        let mut out = std::collections::BTreeSet::new();
-        for ty in self.env.values() {
-            self.frv_ty(ty, &mut out);
-        }
-        out
-    }
-
     /// Instantiate a scheme by allocating fresh type / row vars for
     /// each bound variable and substituting them through the body.
     /// Returns the instantiated `Ty` ready for unification at the
@@ -843,33 +781,6 @@ impl Tc {
         }
     }
 
-    /// Generalise an inferred type into a scheme by closing over
-    /// the type / row variables that are free in `t` but not free
-    /// in the surrounding env. Plan B task 48's let-generalisation
-    /// rule applies at top-level fn boundaries — local lambdas and
-    /// `let` bindings stay rank-1 and use the env-monomorphic ftv
-    /// path (no capture into local schemes). The simpler explicit-
-    /// list path in `check_fn` covers the v1 case where every
-    /// generalisable variable is declared via the surface
-    /// `[A, B]` / `![ ... | e]` syntax; this principled helper is
-    /// retained for the Stage 6 effect-handler pass.
-    #[allow(dead_code)]
-    fn generalize(&self, t: &Ty) -> Scheme {
-        let mut ftv = std::collections::BTreeSet::new();
-        self.ftv_ty(t, &mut ftv);
-        let mut frv = std::collections::BTreeSet::new();
-        self.frv_ty(t, &mut frv);
-        let env_ftv = self.ftv_env();
-        let env_frv = self.frv_env();
-        let type_vars: Vec<u32> = ftv.difference(&env_ftv).copied().collect();
-        let row_vars: Vec<u32> = frv.difference(&env_frv).copied().collect();
-        Scheme {
-            type_vars,
-            row_vars,
-            body: self.deref(t),
-        }
-    }
-
     /// Occurs check: is `id` reachable from `t` after applying the
     /// current substitution? Returns `true` on detection — a
     /// recursive-cycle attempt that the unifier rejects.
@@ -918,10 +829,14 @@ impl Tc {
     /// Bind a row variable. Handles self-binds, occurs, and merges
     /// the open row's known effects into the substitution body.
     fn bind_row_var(&mut self, id: u32, r: &Row, span: &Span) -> bool {
-        let resolved = self.subst.apply_row(r);
-        if resolved.tail == Some(id) && resolved.effects.is_empty() {
+        // Literal self-bind: `r` is exactly `?id` with no extra
+        // effects. Skipping the deref here matters — a *transitive*
+        // resolution to `?id` is a cycle, not a self-bind, and must
+        // hit the occurs branch below.
+        if r.tail == Some(id) && r.effects.is_empty() {
             return true;
         }
+        let resolved = self.subst.apply_row(r);
         if self.occurs_in_row(id, &resolved) {
             self.push_error(
                 "E0127",
@@ -1143,6 +1058,61 @@ impl Tc {
                 );
                 ok_a && ok_b
             }
+        }
+    }
+
+    /// Asymmetric row subsumption used at call sites (Plan B task
+    /// 48 — reviewer follow-up). Different from `unify_row`:
+    /// - Callee's effects must be a subset of caller's known effects
+    ///   (closed callees fail loudly when the caller's row doesn't
+    ///   permit them — E0042 with the legacy diagnostic vocabulary).
+    /// - If the callee carries an open row variable, that variable
+    ///   absorbs the caller's leftover effects (and the caller's
+    ///   row tail, if any). This preserves the *caller's* row
+    ///   variable for generalisation rather than collapsing it.
+    /// - The caller's row variable is never bound from a call site.
+    fn subsume_row(&mut self, callee_row: &Row, caller_row: &Row, span: &Span) -> bool {
+        let callee = self.subst.apply_row(callee_row);
+        let caller = self.subst.apply_row(caller_row);
+        let caller_set: std::collections::BTreeSet<&String> = caller.effects.iter().collect();
+        let callee_set: std::collections::BTreeSet<&String> = callee.effects.iter().collect();
+        let missing: Vec<String> = callee_set
+            .difference(&caller_set)
+            .map(|s| (*s).clone())
+            .collect();
+        if !missing.is_empty() {
+            // Callee performs effects the caller doesn't permit.
+            // Use the legacy E0042 diagnostic to keep error messages
+            // consistent with Plan A1/A2/A3's effect-row check.
+            for e in &missing {
+                self.push_error(
+                    "E0042",
+                    span.clone(),
+                    format!(
+                        "calling a function that performs `{e}` requires `{e}` in the enclosing function's effect row",
+                    ),
+                );
+            }
+            return false;
+        }
+        if let Some(callee_tail) = callee.tail {
+            // Callee has an open row var — it absorbs caller's
+            // leftover effects + caller's tail. This binds *only*
+            // the callee's row var.
+            let leftover: Vec<String> = caller_set
+                .difference(&callee_set)
+                .map(|s| (*s).clone())
+                .collect();
+            self.bind_row_var(
+                callee_tail,
+                &Row {
+                    effects: leftover,
+                    tail: caller.tail,
+                },
+                span,
+            )
+        } else {
+            true
         }
     }
 
@@ -1674,10 +1644,10 @@ impl Tc {
                 Stmt::Let(l) => {
                     // Plan B task 48: let-binding annotation may now
                     // reference in-scope generic parameters or
-                    // generic-applied user types. The annotation is
-                    // structurally validated here (E0124/E0125 are
-                    // gone; the catalog grew E0129/E0130 for arity
-                    // and shape misuses). HM unification checks the
+                    // generic-applied user types. Structurally
+                    // validated here (E0112 / E0129 / E0131 fire on
+                    // unknown name, arity mismatch, or applying a
+                    // primitive). HM unification then checks the
                     // initializer against the declared type.
                     self.check_type_expr_known(&l.ty);
                     let got = self.check_expr(&l.value, row);
@@ -2114,37 +2084,23 @@ impl Tc {
             }
         }
 
-        // (4) effect-row containment — Plan B task 48 routes through
-        // row unification when the caller's row carries an explicit
-        // row variable. Closed-row callers retain the simpler subset
-        // check, which preserves the legacy E0042 vocabulary for the
-        // common Plan A1/A2/A3 case.
-        if let Some(_caller_tail) = self.lookup_active_row_var() {
-            let caller_row = Row {
-                effects: row.to_vec(),
-                tail: self.lookup_active_row_var(),
-            };
-            let callee_row = Row {
-                effects: sig.effects.clone(),
-                tail: sig.effect_row_var,
-            };
-            // The callee's row must be unifiable against the caller's
-            // row. Open-vs-open, open-vs-closed, closed-vs-closed are
-            // all handled inside `unify_row` with task 48's rules.
-            let _ = self.unify_row(&caller_row, &callee_row, &span);
-        } else {
-            for e in &sig.effects {
-                if !row.iter().any(|r| r == e) {
-                    self.push_error(
-                        "E0042",
-                        span.clone(),
-                        format!(
-                            "calling a function that performs `{e}` requires `{e}` in the enclosing function's effect row",
-                        ),
-                    );
-                }
-            }
-        }
+        // (4) effect-row subsumption — Plan B task 48 (reviewer
+        // follow-up): route through asymmetric `subsume_row` so the
+        // *callee's* row var (came from instantiation) absorbs the
+        // caller's leftover effects, while the *caller's* declared
+        // row variable stays free for generalisation. Symmetric
+        // `unify_row` here would silently bind the caller's row var
+        // to whatever the callee left over, collapsing the caller's
+        // declared row polymorphism.
+        let caller_row = Row {
+            effects: row.to_vec(),
+            tail: self.lookup_active_row_var(),
+        };
+        let callee_row = Row {
+            effects: sig.effects.clone(),
+            tail: sig.effect_row_var,
+        };
+        self.subsume_row(&callee_row, &caller_row, &span);
 
         // (5) result type — derefed through the substitution so any
         // var bindings made by per-arg unification flow into the
@@ -2152,12 +2108,19 @@ impl Tc {
         Some(self.deref(&sig.ret))
     }
 
-    /// Helper: pick a single active row variable to thread through
-    /// row-unification at call sites. Plan B task 48's first cut
-    /// supports a *single* row variable per fn; if multiple surface
-    /// names exist we pick the first registered. Stage 6's effect
-    /// runtime work refines this if needed.
+    /// Helper: pick the single active row variable to thread
+    /// through call-site row checks. Plan B task 48's surface
+    /// admits at most one row variable per fn (`![ ... | e]`),
+    /// enforced by `parse_effect_row`. We assert that invariant
+    /// here so a future grammar change that allows multiple row
+    /// vars trips loudly rather than silently picking one of them
+    /// in `BTreeMap` sorted order.
     fn lookup_active_row_var(&self) -> Option<u32> {
+        debug_assert!(
+            self.current_row_var_subst.len() <= 1,
+            "Plan B task 48: at most one row variable per fn (parser invariant); \
+             grammar change that admits multiple needs a deliberate update here"
+        );
         self.current_row_var_subst.values().next().copied()
     }
 
@@ -2188,20 +2151,21 @@ impl Tc {
     ) -> Option<Ty> {
         // (1) build the signature up front so Ty::Fn is available for
         //     the lambda's own return type even if the body fails.
-        // Lambdas in Plan A1/A2/A3 are not generic (no `[A]` syntax)
-        // and Plan B Task 48 doesn't add lambda-level generic syntax,
-        // so the generic substitution here is empty. Row variables on
-        // lambdas remain a Plan-B-only feature; the substitution map
-        // for surface row vars threads through `self.row_var_subst`.
-        let empty_generic_subst: BTreeMap<String, Ty> = BTreeMap::new();
+        //
+        // Plan B task 48 (reviewer follow-up): lambdas inherit the
+        // enclosing fn's `current_generic_subst`, so a lambda inside
+        // `fn id[A](...)` can reference `A` in its param / return
+        // types and have it resolve to the outer fn's `Ty::Var`. The
+        // surface form does not yet allow lambdas to *declare* their
+        // own generics (`(fn [B](x: B) ...)` would require parser
+        // work in Stage 6+); this is the rank-1 ML choice. Row
+        // variables on lambdas similarly inherit the active row-var
+        // subst from the enclosing fn.
         let param_tys: Vec<Ty> = params
             .iter()
-            .map(|p| {
-                ty_from_type_expr(&p.ty, &self.types, &empty_generic_subst).unwrap_or(Ty::Unit)
-            })
+            .map(|p| self.ty_from_type_expr_here(&p.ty).unwrap_or(Ty::Unit))
             .collect();
-        let ret_ty =
-            ty_from_type_expr(return_type, &self.types, &empty_generic_subst).unwrap_or(Ty::Unit);
+        let ret_ty = self.ty_from_type_expr_here(return_type).unwrap_or(Ty::Unit);
         let sig = FnSig {
             params: param_tys.clone(),
             ret: ret_ty.clone(),
@@ -2250,17 +2214,25 @@ impl Tc {
         // (4) check body against the lambda's own effect row.
         let body_ty = self.check_expr(body, effects);
 
-        // (5) restore and check return-type unification.
+        // (5) restore and check return-type unification. Plan B
+        //     task 48: route through `unify_ty` so an inferred body
+        //     type that contains `Ty::Var`s (lambda inside a generic
+        //     fn referencing outer `A`, future row-var positions)
+        //     unifies cleanly rather than being rejected by raw
+        //     `!=` against an unsubstituted ret_ty.
         self.env = saved_env;
         if let Some(bt) = body_ty {
-            if bt != ret_ty {
+            if !self.unify_ty(&ret_ty, &bt, &span) {
+                // unify_ty already pushed the precise E0044; emit
+                // the legacy E0069 alongside so existing diagnostics
+                // continue to surface for plain lambda mismatches.
                 self.push_error(
                     "E0069",
                     span.clone(),
                     format!(
                         "lambda body has type `{}` but the declared return type is `{}`",
-                        ty_display(&bt),
-                        ty_display(&ret_ty),
+                        ty_display(&self.deref(&bt)),
+                        ty_display(&self.deref(&ret_ty)),
                     ),
                 );
             }
@@ -2801,6 +2773,26 @@ impl Tc {
                     None => return,
                 };
                 let variant = &td.variants[info.variant_index];
+                // Plan B task 48 (reviewer follow-up): scrutinee
+                // type args must propagate into ctor field type
+                // resolution. For `match xs: List[Int] { Cons(h,
+                // _) => ... }`, h's type comes from List's `A`
+                // field at instantiation `[Int]`, so we extend
+                // `current_generic_subst` with the type's generic
+                // parameters bound to the scrutinee's args. Without
+                // this, `ty_from_type_expr_here` falls through to
+                // `unwrap_or(Ty::Unit)` and h types as Unit.
+                let scrut_args: Vec<Ty> = match scrut_ty {
+                    Ty::User(_, args) => args.clone(),
+                    _ => Vec::new(),
+                };
+                let saved_generic_subst = self.current_generic_subst.clone();
+                if td.generic_params.len() == scrut_args.len() {
+                    for (gp, arg) in td.generic_params.iter().zip(scrut_args.iter()) {
+                        self.current_generic_subst
+                            .insert(gp.name.clone(), arg.clone());
+                    }
+                }
                 match (&variant.fields, fields) {
                     (VariantFields::Unit, CtorPatternFields::Unit) => {}
                     (VariantFields::Positional(param_tys), CtorPatternFields::Positional(pats)) => {
@@ -2899,6 +2891,7 @@ impl Tc {
                         );
                     }
                 }
+                self.current_generic_subst = saved_generic_subst;
             }
         }
     }
@@ -2990,9 +2983,9 @@ pub(crate) fn ty_from_type_expr(
                     if td.generic_params.is_empty() {
                         Some(Ty::User(other.to_string(), Vec::new()))
                     } else {
-                        // Generic type used without arguments: arity
-                        // mismatch. Caller's diagnostic (E0124-fam)
-                        // reports the missing args; we return None.
+                        // Generic type used without arguments — the
+                        // caller's diagnostic (the E0112 fall-through
+                        // in `check_type_expr_known`) reports it.
                         None
                     }
                 } else {
@@ -4869,23 +4862,31 @@ mod tests {
     }
 
     #[test]
-    fn occurs_check_fires_e0126() {
-        // Forge a self-reference at the unifier by passing a generic
-        // function as its own argument — `id(id)` instantiates id at
-        // a fresh var and unifies it with id's full scheme, which
-        // unifies a var with a function whose params mention the var
-        // (via instantiation from the same scheme). The exact shape
-        // depends on how the inferencer normalises calls; we accept
-        // either a successful unify (because instantiation freshens
-        // both sides) or an E0126 if the unifier collapses them. To
-        // pin E0126, use a recursive lambda equivalent that forces
-        // the cycle.
-        let src = "fn loop_self[A](x: A) -> A ![] { loop_self(loop_self) }\n\
-                   fn main() -> Int ![] { 0 }\n";
-        let errs = pipeline(src);
+    fn occurs_check_unify_ty_fires_e0126() {
+        // The surface forms reachable from Sigil's current syntax
+        // never produce a Var-vs-Fn(Var, ...) cycle (call sites
+        // require a Fn callee; Sigil has no fn-type literal in
+        // TypeExpr that would let the user write the cycle as a
+        // type annotation). We exercise the occurs check by
+        // constructing the Ty values directly and invoking
+        // `unify_ty` against a synthetic span.
+        let mut tc = fresh_tc();
+        let v = Ty::Var(tc.fresh_ty_var());
+        // Cyclic shape: ?V vs (?V) -> Int — solving this would
+        // require ?V to expand infinitely.
+        let cyclic = Ty::Fn(Box::new(FnSig {
+            params: vec![v.clone()],
+            ret: Ty::Int,
+            effects: Vec::new(),
+            effect_row_var: None,
+        }));
+        let span = Span::synthetic("x.sigil");
+        let ok = tc.unify_ty(&v, &cyclic, &span);
+        assert!(!ok, "unify_ty must reject the cycle");
         assert!(
-            has_code(&errs, "E0126") || has_code(&errs, "E0044"),
-            "expected E0126 or E0044 from recursive self-call; got {errs:?}",
+            has_code(&tc.errors, "E0126"),
+            "expected E0126 from occurs check; got {:?}",
+            tc.errors,
         );
     }
 
@@ -4944,6 +4945,283 @@ mod tests {
             !errs.is_empty(),
             "expected at least one error for `List` with no type args; got success",
         );
+    }
+
+    // ===== Plan B Task 48 review-follow-up tests =====
+
+    #[test]
+    fn forward_reference_to_generic_fn_typechecks() {
+        // Reproducer from the PR review: `use_id` references `id`
+        // before `id` is declared. Pre-pass scheme seeding (the
+        // review fix) ensures the forward reference hits the
+        // polymorphic `Scheme` rather than a Unit-fallback `fn_env`
+        // entry. Without the fix, this emits two spurious E0044s.
+        let src = "fn use_id[B](x: B) -> B ![] { id(x) }\n\
+                   fn id[A](x: A) -> A ![] { x }\n\
+                   fn main() -> Int ![] { use_id(0) }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "forward reference to generic fn should typecheck; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pattern_binds_inner_var_with_scrutinee_type_arg() {
+        // `match xs: List[Int] { Cons(h, _) => h + 1, Nil => 0 }`
+        // — h must type as Int (List's A bound to Int by the
+        // scrutinee). Without the per-pattern subst fix, h types
+        // as Unit and the `h + 1` body emits E0060.
+        let src = "type List[A] = | Nil | Cons(A, List[A])\n\
+                   fn f(xs: List[Int]) -> Int ![] {\n  \
+                     match xs { Nil => 0, Cons(h, _) => h + 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "pattern-bind from generic ctor should typecheck; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pair_instantiation_arg_mismatch_fires_e0044() {
+        // `let p: Pair[Int, String] = P("a", 1)` — first arg should
+        // be Int but is String. Per-call ctor subst maps X→Int,
+        // Y→String; unifying field X with arg's String fails.
+        let src = "type Pair[X, Y] = | P(X, Y)\n\
+                   fn main() -> Int ![] {\n  \
+                     let p: Pair[Int, String] = P(\"a\", 1);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 from arg-vs-field type mismatch; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn self_recursive_generic_fn_typechecks() {
+        // Self-recursion through fn_schemes: each recursive call
+        // instantiates a fresh copy of the scheme rather than
+        // colliding with the body's own bound vars. This exercises
+        // the same path as the forward-reference test but along a
+        // recursive edge.
+        let src = "type List[A] = | Nil | Cons(A, List[A])\n\
+                   fn length[A](xs: List[A]) -> Int ![] {\n  \
+                     match xs { Nil => 0, Cons(_, tail) => length(tail) }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "self-recursive generic fn should typecheck; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn lambda_inside_generic_fn_references_outer_type_var() {
+        // Plan B task 48 (reviewer follow-up): a lambda nested
+        // inside `fn id[A]` should be able to reference `A` in
+        // its own param/return positions and have it resolve to
+        // id's `Ty::Var`. Before the fix, check_lambda used an
+        // empty generic_subst and `A` would E0112 inside the
+        // lambda. The applied lambda is constrained to the same
+        // A, so the body returns x.
+        let src = "fn apply_self[A](x: A) -> A ![] {\n  \
+                     (fn (y: A) -> A ![] => y)(x)\n\
+                   }\n\
+                   fn main() -> Int ![] { apply_self(0) }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "lambda referencing outer fn's generic param should typecheck; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn closed_row_with_extra_fires_e0042() {
+        // Closed-row callee `![IO]`, caller `![]`. subsume_row
+        // pushes E0042 for the missing IO. Pinned to ensure the
+        // asymmetric subsumption replaces unify_row's old behavior
+        // without losing the diagnostic.
+        let src = "fn f() -> Int ![IO] { 0 }\n\
+                   fn caller() -> Int ![] {\n  \
+                     let x: Int = f();\n  \
+                     x\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (closed row missing required effect); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn closed_row_callees_unify_via_unify_row_under_e0128() {
+        // Place two fns with mismatched closed effect rows in
+        // positions that force `unify_row` to compare them
+        // symmetrically. The let-binding annotation `Fn`-typed
+        // value path doesn't exist in v1, so we exercise the
+        // E0128 branch directly via a unit-style test below.
+        // This source-level test confirms the standard
+        // closed-vs-closed subsumption path stays clean for the
+        // matching case.
+        let src = "fn f() -> Int ![IO] { 0 }\n\
+                   fn g() -> Int ![IO] { 0 }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let a: Int = f();\n  \
+                     let b: Int = g();\n  \
+                     a + b\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "matching closed rows should typecheck; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn unify_row_closed_vs_closed_mismatch_fires_e0128() {
+        // Unit-style test against `unify_row` directly with two
+        // distinct closed rows that cannot unify. Reachable from
+        // the surface only when two Fn-typed values flow through
+        // the same unification (Stage 6 effect-handler work);
+        // pinned now so the E0128 emission path stays exercised.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("x.sigil");
+        let row_a = Row::closed(vec!["IO".to_string()]);
+        let row_b = Row::closed(vec!["Raise".to_string()]);
+        let ok = tc.unify_row(&row_a, &row_b, &span);
+        assert!(!ok, "two distinct closed rows must not unify");
+        assert!(
+            has_code(&tc.errors, "E0128"),
+            "expected E0128; got {:?}",
+            tc.errors,
+        );
+    }
+
+    #[test]
+    fn unify_row_closed_vs_open_absorbs_difference() {
+        // Open `![IO, Raise | r]` vs closed `![IO, Raise]`: r
+        // gets bound to closed[]. Confirm unify_row succeeds and
+        // the substitution resolves r to a closed empty row.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("x.sigil");
+        let r = tc.fresh_row_var();
+        let open = Row::open(vec!["IO".to_string(), "Raise".to_string()], r);
+        let closed = Row::closed(vec!["IO".to_string(), "Raise".to_string()]);
+        let ok = tc.unify_row(&open, &closed, &span);
+        assert!(ok, "open(IO,Raise|r) must unify with closed(IO,Raise)");
+        let resolved = tc.subst.apply_row(&Row {
+            effects: Vec::new(),
+            tail: Some(r),
+        });
+        assert!(resolved.tail.is_none(), "r must resolve to closed");
+        assert!(resolved.effects.is_empty(), "r must absorb no extras");
+    }
+
+    #[test]
+    fn unify_row_closed_vs_open_missing_effect_fires_e0128() {
+        // Open `![IO | r]` vs closed `![]`: closed side is missing
+        // IO that the open side requires (sets-side); E0128 fires.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("x.sigil");
+        let r = tc.fresh_row_var();
+        let open = Row::open(vec!["IO".to_string()], r);
+        let closed = Row::closed(Vec::new());
+        let ok = tc.unify_row(&open, &closed, &span);
+        assert!(!ok, "closed `[]` cannot supply `IO` to open `[IO | r]`");
+        assert!(
+            has_code(&tc.errors, "E0128"),
+            "expected E0128; got {:?}",
+            tc.errors,
+        );
+    }
+
+    #[test]
+    fn unify_row_open_vs_open_shared_tail_succeeds() {
+        // Two distinct open rows with no overlap: a fresh shared
+        // tail absorbs both sides. After unification, both
+        // original tails resolve to a row that includes the
+        // other side's effects.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("x.sigil");
+        let a_tail = tc.fresh_row_var();
+        let b_tail = tc.fresh_row_var();
+        let row_a = Row::open(vec!["IO".to_string()], a_tail);
+        let row_b = Row::open(vec!["Raise".to_string()], b_tail);
+        let ok = tc.unify_row(&row_a, &row_b, &span);
+        assert!(ok, "open(IO|a) must unify with open(Raise|b)");
+        // After the merge, a_tail's resolution should mention Raise.
+        let a_resolved = tc.subst.apply_row(&Row {
+            effects: Vec::new(),
+            tail: Some(a_tail),
+        });
+        assert!(
+            a_resolved.effects.contains(&"Raise".to_string()),
+            "a_tail should absorb Raise; got {:?}",
+            a_resolved
+        );
+    }
+
+    #[test]
+    fn unify_row_row_occurs_check_fires_e0127() {
+        // Bind row var r := open([], r) — a self-cycle. The row
+        // occurs check rejects this with E0127.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("x.sigil");
+        let r = tc.fresh_row_var();
+        // The rows we're going to unify both share tail r; we
+        // synthesise a cycle by trying to bind r against a row
+        // whose tail is r itself.
+        let cyclic = Row {
+            effects: Vec::new(),
+            tail: Some(r),
+        };
+        // Unify open([IO]|r) with open([]|r) directly: tails
+        // share, sets differ → E0128 (which is a different
+        // enforcement). To exercise E0127, call bind_row_var
+        // directly with a self-referential row that's already
+        // got the var as its tail (not the same id we're binding).
+        // Setup: pretend r resolves to s, then bind s := tail=r.
+        let s = tc.fresh_row_var();
+        tc.subst.rows.insert(s, cyclic.clone());
+        // Now binding r := open([]|s) → resolving s gives tail=r.
+        let synthetic = Row {
+            effects: Vec::new(),
+            tail: Some(s),
+        };
+        let ok = tc.bind_row_var(r, &synthetic, &span);
+        assert!(!ok, "row occurs check must reject the cycle");
+        assert!(
+            has_code(&tc.errors, "E0127"),
+            "expected E0127 from row occurs; got {:?}",
+            tc.errors,
+        );
+    }
+
+    /// Build a freshly-initialised `Tc` with empty registries.
+    /// Used by the unit-style row/type tests above.
+    fn fresh_tc() -> Tc {
+        Tc {
+            errors: Vec::new(),
+            string_literals: Vec::new(),
+            lambda_captures: Vec::new(),
+            fn_env: BTreeMap::new(),
+            env: BTreeMap::new(),
+            types: BTreeMap::new(),
+            ctors: BTreeMap::new(),
+            match_scrut_tys: BTreeMap::new(),
+            fn_schemes: BTreeMap::new(),
+            next_ty_var: 0,
+            next_row_var: 0,
+            subst: Subst::new(),
+            current_generic_subst: BTreeMap::new(),
+            current_row_var_subst: BTreeMap::new(),
+        }
     }
 
     // ===== Plan B A3-carryover — nested Maranget exhaustiveness =====

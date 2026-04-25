@@ -131,23 +131,31 @@ pub(crate) fn contains_apply_or_generic_ref(program: &crate::ast::Program) -> bo
     for item in &program.items {
         match item {
             Item::Fn(f) => {
+                // The fn's own `[A, B, ...]` makes the whole decl a
+                // generic that monomorphization (Task 49) is required
+                // to clone before codegen — short-circuit immediately.
                 if !f.generic_params.is_empty() {
-                    return true;
-                }
-                let params: BTreeSet<String> =
-                    f.generic_params.iter().map(|gp| gp.name.clone()).collect();
-                for p in &f.params {
-                    if type_expr_uses_apply_or_param(&p.ty, &params) {
-                        return true;
-                    }
-                }
-                if type_expr_uses_apply_or_param(&f.return_type, &params) {
                     return true;
                 }
                 if f.effect_row_var.is_some() {
                     return true;
                 }
-                if block_uses_generic(&f.body, &params) {
+                // No declared params at this level — the in-scope
+                // set is empty, so `Named` references can only refer
+                // to primitives or registered user types. We still
+                // need to descend through `TypeExpr::Apply` shapes
+                // (an `Apply` anywhere is a hard reject regardless
+                // of the in-scope set).
+                let in_scope: BTreeSet<String> = BTreeSet::new();
+                for p in &f.params {
+                    if type_expr_uses_apply_or_param(&p.ty, &in_scope) {
+                        return true;
+                    }
+                }
+                if type_expr_uses_apply_or_param(&f.return_type, &in_scope) {
+                    return true;
+                }
+                if block_uses_generic(&f.body, &in_scope) {
                     return true;
                 }
             }
@@ -155,21 +163,20 @@ pub(crate) fn contains_apply_or_generic_ref(program: &crate::ast::Program) -> bo
                 if !td.generic_params.is_empty() {
                     return true;
                 }
-                let params: BTreeSet<String> =
-                    td.generic_params.iter().map(|gp| gp.name.clone()).collect();
+                let in_scope: BTreeSet<String> = BTreeSet::new();
                 for v in &td.variants {
                     match &v.fields {
                         VariantFields::Unit => {}
                         VariantFields::Positional(ts) => {
                             for t in ts {
-                                if type_expr_uses_apply_or_param(t, &params) {
+                                if type_expr_uses_apply_or_param(t, &in_scope) {
                                     return true;
                                 }
                             }
                         }
                         VariantFields::Record(fs) => {
                             for f in fs {
-                                if type_expr_uses_apply_or_param(&f.ty, &params) {
+                                if type_expr_uses_apply_or_param(&f.ty, &in_scope) {
                                     return true;
                                 }
                             }
@@ -188,7 +195,20 @@ fn type_expr_uses_apply_or_param(
     params: &std::collections::BTreeSet<String>,
 ) -> bool {
     match t {
-        TypeExpr::Apply { .. } => true,
+        TypeExpr::Apply { args, .. } => {
+            // An Apply node is itself a hard reject; we still recurse
+            // so a nested Apply or generic-param ref also surfaces in
+            // the diagnostic (defensive against future paths that
+            // accept partial Apply but reject specific arg shapes).
+            for a in args {
+                if type_expr_uses_apply_or_param(a, params) {
+                    // Already returning true; just keep walking
+                    // would be wasteful — short-circuit.
+                    return true;
+                }
+            }
+            true
+        }
         TypeExpr::Named(name, _) => params.contains(name),
     }
 }
@@ -2078,6 +2098,134 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes([bytes[r1], bytes[r1 + 1], bytes[r1 + 2], bytes[r1 + 3]]),
             0x3333_4444,
+        );
+    }
+
+    // ===== Plan B task 48 — codegen-entry walker tests =====
+
+    #[test]
+    fn walker_rejects_residual_apply_in_fn_param() {
+        // A program whose AST carries a `TypeExpr::Apply` in a fn
+        // param signature must round-trip the walker as `true`.
+        // Constructed directly via AST types, independent of any
+        // surface-syntax path that produces such a program.
+        use crate::ast::{Block, FnDecl, Item, Param, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "f".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![Param {
+                    name: "xs".to_string(),
+                    ty: TypeExpr::Apply {
+                        name: "List".to_string(),
+                        args: vec![TypeExpr::Named("Int".to_string(), span.clone())],
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                }],
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            contains_apply_or_generic_ref(&prog),
+            "walker must reject residual TypeExpr::Apply in fn param"
+        );
+    }
+
+    #[test]
+    fn walker_rejects_generic_param_decl() {
+        use crate::ast::{Block, FnDecl, GenericParam, Item, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "id".to_string(),
+                name_span: span.clone(),
+                generic_params: vec![GenericParam {
+                    name: "A".to_string(),
+                    span: span.clone(),
+                }],
+                params: Vec::new(),
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            contains_apply_or_generic_ref(&prog),
+            "walker must reject fn with declared [A]"
+        );
+    }
+
+    #[test]
+    fn walker_rejects_generic_type_decl() {
+        use crate::ast::{GenericParam, Item, Program, TypeDecl};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Type(Box::new(TypeDecl {
+                name: "List".to_string(),
+                name_span: span.clone(),
+                generic_params: vec![GenericParam {
+                    name: "A".to_string(),
+                    span: span.clone(),
+                }],
+                variants: Vec::new(),
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            contains_apply_or_generic_ref(&prog),
+            "walker must reject type with declared [A]"
+        );
+    }
+
+    #[test]
+    fn walker_accepts_concrete_program() {
+        use crate::ast::{Block, FnDecl, Item, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "main".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: Vec::new(),
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            !contains_apply_or_generic_ref(&prog),
+            "walker must accept fully-concrete program"
         );
     }
 }

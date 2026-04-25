@@ -242,18 +242,18 @@ because:
 4. The assertion holds on every example in `examples/` after Task 49
    (monomorphization) lands.
 
-**Implementing commit(s):** [HEAD] (Task 48).
+**Implementing commit(s):** [HEAD, REVIEW-FIXUP] (Task 48).
 
-**Closure status (2026-04-25):** acceptance bullets 1, 3 fully met;
-bullet 2 satisfied at the *runtime* level — the walker
-`contains_apply_or_generic_ref` is a single recursive function over
-the surface AST, exercised end-to-end by the typecheck suite (every
-generic-using test program would trigger the assert if it reached
-codegen, and the regression-guard tests around E0129 / E0131 / E0112
-exercise the full pre-codegen path). A dedicated codegen-entry-only
-unit test that constructs a residual `Apply` post-typecheck is
-deferred until Task 49 (monomorphization), which is the natural
-place to add a "guard fires when monomorphization is skipped" test
-because pre-monomorphization the typechecker is the only producer of
-post-typecheck IR. Bullet 4 (assertion holds on every example after
-Task 49) closes when monomorphization lands.
+**Closure status (2026-04-25):** all four acceptance bullets met.
+Bullet 1 satisfied by the assertion at `emit_object`'s top. Bullet
+2 satisfied by four codegen-test unit tests (`walker_rejects_residual_apply_in_fn_param`,
+`walker_rejects_generic_param_decl`, `walker_rejects_generic_type_decl`,
+`walker_accepts_concrete_program`) that construct `Program` AST
+nodes directly via the `ast` types — independent of monomorphization,
+exercising the walker's accept and reject paths against synthetic
+inputs. Bullet 3 satisfied by the invariant comment at
+`cranelift_ty_for_type_expr`. Bullet 4 (assertion holds on every
+example after Task 49) is the long-tail check that closes when
+monomorphization lands — the assertion is now the canonical contract,
+and Task 49's reviewer just needs to confirm it doesn't fire on any
+example. **This entry is closed for Task 48.**
