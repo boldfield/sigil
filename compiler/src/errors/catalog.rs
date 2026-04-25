@@ -647,6 +647,41 @@ pub const CATALOG: &[ErrorEntry] = &[
                       // Right:  fn f(x: Option[Int]) -> Int ![] { ... }",
     },
     ErrorEntry {
+        code: "E0132",
+        short: "ambiguous polymorphism: type parameter is unconstrained at this call site",
+        long: "Plan B task 49: when a generic function is called with no \
+               argument that pins one of its declared type parameters, \
+               the type parameter has no concrete value to specialise \
+               at. Monomorphization can't generate a clone, and the \
+               program would silently render with a placeholder name \
+               that two distinct unresolved sites might collide at.\n\n\
+               This fires for fns like `fn nothing[A]() -> Unit ![] { ... }` \
+               called as `nothing()` — `A` has no input that constrains \
+               it. The fix is either to give the call site a context \
+               that pins the parameter (e.g. via a let-binding's \
+               annotation, an `if`-branch unification, or by passing a \
+               value of the right shape), or to drop the parameter \
+               from the function's signature when the body doesn't \
+               need it.\n\n\
+               This diagnostic only fires at end-of-typecheck, after \
+               the substitution has been fully resolved — so it picks \
+               up only genuinely-unconstrained parameters, not ones \
+               that are still free because they reference an enclosing \
+               generic fn's parameters (those resolve when \
+               monomorphization clones the enclosing fn).",
+        fix_example: "// Wrong:\n\
+                      //   fn nothing[A]() -> Unit ![] { unit_value }\n\
+                      //   fn main() -> Int ![] {\n\
+                      //     nothing();   // E0132 — what is A?\n\
+                      //     0\n\
+                      //   }\n\n\
+                      // Right:  drop the unused parameter\n\
+                      //   fn nothing() -> Unit ![] { unit_value }\n\n\
+                      // Right:  pin via context\n\
+                      //   fn id[A](x: A) -> A ![] { x }\n\
+                      //   let v: Int = id(42);  // pins A := Int",
+    },
+    ErrorEntry {
         code: "E0401",
         short: "runtime arithmetic abort",
         long: "A division or modulo operation was performed with a zero \

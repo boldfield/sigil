@@ -343,32 +343,68 @@ Two interpretation gaps:
    docs and pinned by unit tests:
    - Primitives render as themselves: `Int`, `String`, etc.
    - `User(name, [])` renders as `name`.
-   - `User(name, [a1, a2, ...])` renders as `name_<canon(a1)>_<canon(a2)>_...`
-     (single underscore between parts within a type-arg).
-   - Top-level fn/type instantiation: `fn_name__<canon(a1)>__<canon(a2)>__...`
-     (double underscore between top-level type-args).
-   - Ctor of generic type: `ctor_name__<canon(a1)>__<canon(a2)>__...`
+   - `User(name, [a1, a2, ...])` renders as `name$<canon(a1)>$<canon(a2)>$...`
+     (single `$` between parts within a type-arg).
+   - Top-level fn/type instantiation: `fn_name$$<canon(a1)>$$<canon(a2)>$$...`
+     (double `$$` between top-level type-args).
+   - Ctor of generic type: `ctor_name$$<canon(a1)>$$<canon(a2)>$$...`
      (same suffix as the owning type so the global ctor namespace stays
      unique across instantiations).
 
-**Rationale:** Determinism flows from BTreeMap iteration order over the
-reachability worklist; argument ordering is positional because it's the
-only ordering that preserves the type-var → concrete-Ty binding. The
-asymmetric `_`/`__` separator is unambiguous as long as user fn / type
-names contain no double-underscore — the same constraint Plan A2 relied
-on for `$lambda_N` synthetic names.
+**Rationale (round 2 — separator change to `$`):** The first round of
+this PR used `_`/`__` separators. Reviewer round-2 feedback (PR #16
+comment 4318163326 #1) flagged that the asymmetric underscore separator
+is **not** unambiguous when user fn / type names contain underscores:
+`type List_Option[A]` instantiated at `Int` mangled to `List_Option_Int`,
+which collided with `List[Option[Int]]`'s rendering of `List_Option_Int`.
+`type_seen` would silently collapse the two distinct instantiations,
+producing miscompiled programs the GC would scan incorrectly.
+
+**Switched to `$` / `$$`** because the lexer rejects `$` as an identifier
+character (same constraint Plan A2 relied on for `$lambda_N` synthetic
+names from closure conversion). `List_Option$$Int` and `List$$Option$Int`
+are now structurally distinct strings regardless of underscore density
+in user-declared identifiers. Determinism flows from BTreeMap iteration
+order over the reachability worklist; argument ordering is positional
+because it's the only ordering that preserves the type-var → concrete-Ty
+binding. Codegen's `mangle_user_fn` rewrites `$` to `__` for ELF /
+Mach-O linker compatibility — the rewrite preserves AST-level
+unambiguity since uniqueness is enforced at the AST level (`fn_seen`
+/ `type_seen`) before any linker-symbol step.
+
+**Hardening:** `Ty::Var(_)` and `Ty::Fn(_)` reaching `canon_ty` /
+`ty_to_type_expr` now trip `unreachable!` rather than rendering a
+placeholder string. Reviewer round-1 feedback (PR #16 comment
+4318161359 #2) flagged the placeholders as silent collision vectors —
+two `Ty::Var(3)` and `Ty::Var(7)` rendering identically would collide
+in `fn_seen`. Closing that path requires both:
+  - The new E0132 diagnostic at end-of-typecheck rejecting any pending
+    instantiation whose type-arg resolves to an unbound `Ty::Var(_)`
+    that isn't an outer-fn's free var.
+  - The `unreachable!` arms in mangling so a future regression is loud,
+    not silent.
 
 **Acceptance criterion for closure:** if a future plan adds first-class
-function-typed values (`TypeExpr::Fn` surface syntax), `Ty::Fn` rendering
-in `canon_ty` needs to be revisited (currently a fixed `"Fn"` placeholder
-that would collide if a v1 program ever produced one — caught by the
-`canon_ty` `Ty::Var(_)` / `Ty::Fn(_)` arms emitting deterministic
-placeholders so collisions surface as visible build artefacts rather
-than silent miscompiles).
+function-typed values (`TypeExpr::Fn` surface syntax), `canon_ty`'s
+`Ty::Fn` arm needs to be replaced with a real rendering rule before
+the surface ships. Until then the `unreachable!` fires immediately
+on any code path that produces a `Ty::Fn` reaching mangling, surfacing
+the gap loudly.
 
-**Implementing commit(s):** Same commit as Task 49.
+**Implementing commit(s):** Same commit as Task 49 (initial impl) +
+the PR #16 review fix-up commit (separator change + E0132 +
+hardened arms).
 
-## 2026-04-25 — [DEVIATION Task 49] Effect rows preserved through monomorphization
+## 2026-04-25 — [DEVIATION Task 49] Effect rows preserved through monomorphization (permanent v1 design choice — informational)
+
+**Status:** **permanent v1 design choice. Informational — no closure
+path expected.** Reviewer round-2 feedback (PR #16 comment
+4318163326 #4) flagged the original "open-ended / closes if v2 lands"
+framing as wrong-shape: row-specialised monomorphs are explicitly
+reserved for v2 in the design doc, and v1 effect dispatch is
+fundamentally runtime-indirect — there's no v1 path that would
+reopen this deviation. Reframed as informational so future readers
+don't waste time looking for a closure trigger.
 
 **Context:** Plan body's Task 49 entry: "Effect rows are not
 monomorphized in v1 — they remain polymorphic through this phase and
@@ -404,10 +440,10 @@ monomorphization. v1 effect dispatch is runtime-indirect — the row
 variable serves no codegen purpose past type-checking. v2 row-specialised
 monomorphs are reserved for the design doc.
 
-**Acceptance criterion for closure:** Plan B Stage 6 (Tasks 55–60)
-verifies the effect-runtime works end-to-end with row-polymorphic
-callees and the trampoline / arena infrastructure; if v2 row
-specialisation lands, this deviation closes.
+**Closure path:** none for v1. If v2 ever introduces row-specialised
+monomorphs (a non-decision today), a fresh deviation entry should be
+opened then to track the new code path; this entry stays as historical
+record.
 
 **Implementing commit(s):** Same commit as Task 49.
 

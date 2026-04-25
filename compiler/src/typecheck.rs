@@ -554,28 +554,92 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // `Ty::Var(_)`; the monomorphizer applies the outer fn's
     // declared-name → concrete-Ty substitution when it descends into
     // the cloned body and re-resolves these.
-    let resolved_calls: BTreeMap<Span, GenericInstantiation> = tc
-        .pending_call_instantiations
-        .into_iter()
-        .map(|(span, name, var_ids)| {
-            let type_args: Vec<Ty> = var_ids
-                .iter()
-                .map(|id| tc.subst.apply_ty(&Ty::Var(*id)))
-                .collect();
-            (span, GenericInstantiation { name, type_args })
-        })
+    //
+    // **E0132 ambiguous polymorphism check.** If a resolved type-arg
+    // is still `Ty::Var(id)` AND `id` is not an outer fn's generic
+    // parameter id (which would resolve at clone time), the call site
+    // is genuinely unconstrained: monomorphization would silently
+    // mangle the use site to a placeholder name. Emit a hard error so
+    // the user can either pin the parameter via context or drop it
+    // from the signature.
+    let outer_fn_var_ids: std::collections::BTreeSet<u32> = tc
+        .fn_schemes
+        .values()
+        .flat_map(|s| s.type_vars.iter().copied())
         .collect();
-    let resolved_ctors: BTreeMap<Span, GenericInstantiation> = tc
-        .pending_ctor_instantiations
-        .into_iter()
-        .map(|(span, name, var_ids)| {
-            let type_args: Vec<Ty> = var_ids
-                .iter()
-                .map(|id| tc.subst.apply_ty(&Ty::Var(*id)))
-                .collect();
-            (span, GenericInstantiation { name, type_args })
-        })
-        .collect();
+    // Build a quick name → declared-generic-param-name list lookup
+    // from the program for the diagnostic's parameter name.
+    let mut fn_param_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut type_param_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for item in &program.items {
+        match item {
+            Item::Fn(f) => {
+                fn_param_names.insert(
+                    f.name.clone(),
+                    f.generic_params.iter().map(|gp| gp.name.clone()).collect(),
+                );
+            }
+            Item::Type(td) => {
+                type_param_names.insert(
+                    td.name.clone(),
+                    td.generic_params.iter().map(|gp| gp.name.clone()).collect(),
+                );
+            }
+            Item::Import(_) => {}
+        }
+    }
+    let pending_calls = std::mem::take(&mut tc.pending_call_instantiations);
+    let mut resolved_calls: BTreeMap<Span, GenericInstantiation> = BTreeMap::new();
+    for (span, name, var_ids) in pending_calls {
+        let mut type_args: Vec<Ty> = Vec::with_capacity(var_ids.len());
+        for (i, id) in var_ids.iter().enumerate() {
+            let resolved = tc.subst.apply_ty(&Ty::Var(*id));
+            if let Ty::Var(remaining_id) = &resolved {
+                if !outer_fn_var_ids.contains(remaining_id) {
+                    let pname = fn_param_names
+                        .get(&name)
+                        .and_then(|v| v.get(i))
+                        .cloned()
+                        .unwrap_or_else(|| format!("_{i}"));
+                    tc.push_error(
+                        "E0132",
+                        span.clone(),
+                        format!(
+                            "ambiguous polymorphism: type parameter `{pname}` of `{name}` is unconstrained at this call site"
+                        ),
+                    );
+                }
+            }
+            type_args.push(resolved);
+        }
+        resolved_calls.insert(span, GenericInstantiation { name, type_args });
+    }
+    let pending_ctors = std::mem::take(&mut tc.pending_ctor_instantiations);
+    let mut resolved_ctors: BTreeMap<Span, GenericInstantiation> = BTreeMap::new();
+    for (span, name, var_ids) in pending_ctors {
+        let mut type_args: Vec<Ty> = Vec::with_capacity(var_ids.len());
+        for (i, id) in var_ids.iter().enumerate() {
+            let resolved = tc.subst.apply_ty(&Ty::Var(*id));
+            if let Ty::Var(remaining_id) = &resolved {
+                if !outer_fn_var_ids.contains(remaining_id) {
+                    let pname = type_param_names
+                        .get(&name)
+                        .and_then(|v| v.get(i))
+                        .cloned()
+                        .unwrap_or_else(|| format!("_{i}"));
+                    tc.push_error(
+                        "E0132",
+                        span.clone(),
+                        format!(
+                            "ambiguous polymorphism: type parameter `{pname}` of `{name}` is unconstrained at this construction site"
+                        ),
+                    );
+                }
+            }
+            type_args.push(resolved);
+        }
+        resolved_ctors.insert(span, GenericInstantiation { name, type_args });
+    }
 
     (
         CheckedProgram {
@@ -5712,6 +5776,64 @@ mod tests {
         assert!(
             cp.match_scrut_tys.is_empty(),
             "malformed scrutinee should not be recorded"
+        );
+    }
+
+    // ===== Plan B Task 49 — E0132 ambiguous polymorphism =====
+
+    #[test]
+    fn ambiguous_polymorphism_at_call_site_is_e0132() {
+        // `nothing[A]()` declared with no params using `A` in the
+        // signature. Calling `nothing()` with no constraint on `A`
+        // means inference can't pin `A` to anything, and
+        // monomorphization would silently mangle to a placeholder.
+        // E0132 catches this at end-of-typecheck.
+        let src = "fn nothing[A]() -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { nothing() }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0132"),
+            "expected E0132 ambiguous polymorphism; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn polymorphism_constrained_at_call_site_is_clean() {
+        // Counterpart to the above: `id[A](x: A) -> A` instantiated
+        // at Int via the arg `42` typechecks cleanly — `A` is pinned
+        // by the input type. Regression guard for over-eager E0132.
+        let src = "fn id[A](x: A) -> A ![] { x }\n\
+                   fn main() -> Int ![] { id(42) }\n";
+        let errs = pipeline(src);
+        let hard: Vec<_> = errs
+            .iter()
+            .filter(|e| matches!(e.severity, Severity::Error))
+            .collect();
+        assert!(
+            hard.is_empty(),
+            "constrained polymorphism should not fire E0132; got: {hard:?}"
+        );
+    }
+
+    #[test]
+    fn polymorphism_inside_generic_fn_body_is_clean() {
+        // Inside a generic body, an inner generic call's type-args
+        // resolve to the *outer* fn's free vars (e.g., `id(x)` inside
+        // `fn use_id[B](y: B)` produces inner-A := outer-B). Those
+        // outer vars are listed in `fn_schemes[*].type_vars`, so the
+        // E0132 check correctly classifies them as legitimate (not
+        // ambiguous). Regression guard.
+        let src = "fn id[A](x: A) -> A ![] { x }\n\
+                   fn use_id[B](y: B) -> B ![] { id(y) }\n\
+                   fn main() -> Int ![] { use_id(42) }\n";
+        let errs = pipeline(src);
+        let hard: Vec<_> = errs
+            .iter()
+            .filter(|e| matches!(e.severity, Severity::Error))
+            .collect();
+        assert!(
+            hard.is_empty(),
+            "outer-fn-bound polymorphism should not fire E0132; got: {hard:?}"
         );
     }
 }

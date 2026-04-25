@@ -52,11 +52,11 @@
 //! For a generic fn `f[T1, T2, ...]` instantiated at concrete
 //! `Ty(T1) = TA, Ty(T2) = TB, ...`:
 //!
-//! - Mangled name: `f__<canon(TA)>__<canon(TB)>__...`.
+//! - Mangled name: `f$$<canon(TA)>$$<canon(TB)>$$...`.
 //!
 //! For a generic type `Foo[T1, T2, ...]` instantiated at the same
-//! tuple: `Foo__<canon(TA)>__<canon(TB)>__...`. Each ctor `C` of
-//! `Foo[T1, T2]` is renamed to `C__<canon(TA)>__<canon(TB)>` so
+//! tuple: `Foo$$<canon(TA)>$$<canon(TB)>$$...`. Each ctor `C` of
+//! `Foo[T1, T2]` is renamed to `C$$<canon(TA)>$$<canon(TB)>` so
 //! the global ctor namespace stays unique across instantiations.
 //!
 //! `canon(Ty)` is recursive:
@@ -64,12 +64,22 @@
 //!   `Char`, `Byte`, `Unit`.
 //! - `User(name, [])` renders as `name`.
 //! - `User(name, [a1, a2, ...])` renders as
-//!   `name_<canon(a1)>_<canon(a2)>_...` — single underscore between
-//!   parts within a single type-arg, double underscore between
-//!   top-level type-args. The asymmetric separator keeps the format
-//!   unambiguous as long as user fn / type names contain no
-//!   double-underscore (the same constraint plan A2 relied on for
-//!   `$lambda_N` synthetic names).
+//!   `name$<canon(a1)>$<canon(a2)>$...` — single `$` between parts
+//!   within a single type-arg, double `$$` between top-level
+//!   type-args.
+//!
+//! `$` is the separator because the lexer rejects it as an
+//! identifier character (same constraint Plan A2 relied on for
+//! `$lambda_N` synthetic names from closure conversion). This makes
+//! the format **structurally unambiguous regardless of underscore
+//! density in user identifiers**: a user-declared `type List_Option[A]`
+//! cannot collide with the canonical render of `List[Option[Int]]`,
+//! because the former uses underscores in the type *name* (`List_Option`)
+//! while the latter inserts `$` separators between the type and its
+//! args (`List$Option$Int`). Codegen's `mangle_user_fn` rewrites `$`
+//! to `__` for ELF / Mach-O linker compatibility — that rewrite
+//! preserves the unambiguity since at the AST level (where uniqueness
+//! is enforced) we always carry the `$`-form.
 //!
 //! Type arguments are emitted in the callee's *declared* generic-
 //! parameter order, not lex-sorted. This is a deliberate choice for
@@ -160,6 +170,15 @@ fn program_has_generics(program: &Program) -> bool {
 /// Canonical render of a `Ty` for use inside a mangled symbol name.
 /// See module-level docs for the exact format. Public so unit tests
 /// in this module can pin the contract.
+///
+/// `Ty::Var(_)` and `Ty::Fn(_)` are *unreachable* here in v1: the
+/// E0132 ambiguous-polymorphism diagnostic in typecheck rejects any
+/// `Ty::Var(_)` that would survive substitution to a use site, and
+/// `Ty::Fn(_)` requires a `TypeExpr::Fn` surface syntax that v1's
+/// grammar deliberately omits. Hitting either arm means an upstream
+/// invariant broke; we trip `unreachable!` rather than silently
+/// rendering a placeholder that two distinct vars would both collide
+/// to.
 pub fn canon_ty(ty: &Ty) -> String {
     match ty {
         Ty::Int => "Int".to_string(),
@@ -174,27 +193,36 @@ pub fn canon_ty(ty: &Ty) -> String {
             } else {
                 let mut s = name.clone();
                 for a in args {
-                    s.push('_');
+                    s.push('$');
                     s.push_str(&canon_ty(a));
                 }
                 s
             }
         }
-        Ty::Var(_) => {
-            // Should never appear in a fully-resolved type-arg tuple
-            // reaching mangling. If it does, the upstream resolver
-            // failed to substitute through the outer fn's generic
-            // params — we render a deterministic placeholder so the
-            // failure is visible in object dumps rather than producing
-            // collisions.
-            "VarUnresolved".to_string()
+        Ty::Var(id) => {
+            // Reachability-bounded mono never sees an unresolved var
+            // because (a) the E0132 ambiguous-polymorphism check at
+            // end-of-typecheck rejects unconstrained type parameters,
+            // and (b) descent into a generic clone substitutes outer-
+            // fn vars to concrete types via `Substitution::by_var`. If
+            // we reach this arm, an invariant in either of those two
+            // mechanisms broke; surface it loudly.
+            unreachable!(
+                "monomorphize::canon_ty: Ty::Var({id}) escaped substitution — \
+                 typecheck E0132 should have rejected this call site, or \
+                 monomorph descent missed an outer-fn var binding"
+            )
         }
         Ty::Fn(_) => {
-            // No `TypeExpr::Fn` surface syntax in v1 — a `Ty::Fn`
-            // reaching mangling would mean a future-plan feature
-            // landed without updating mangling. Render as a fixed
-            // placeholder so the name stays stable across builds.
-            "Fn".to_string()
+            // `Ty::Fn` requires `TypeExpr::Fn` surface syntax that v1
+            // doesn't accept. If a Ty::Fn reaches mangling, a future
+            // plan added the syntax without updating mangling — block
+            // the mangle so the gap is loud rather than silent.
+            unreachable!(
+                "monomorphize::canon_ty: Ty::Fn reached mangling — \
+                 first-class function types are out of scope for Plan B v1; \
+                 update canon_ty before introducing TypeExpr::Fn"
+            )
         }
     }
 }
@@ -207,7 +235,7 @@ pub fn mangle_fn(name: &str, args: &[Ty]) -> String {
     }
     let mut s = name.to_string();
     for a in args {
-        s.push_str("__");
+        s.push_str("$$");
         s.push_str(&canon_ty(a));
     }
     s
@@ -221,7 +249,7 @@ pub fn mangle_type(name: &str, args: &[Ty]) -> String {
     }
     let mut s = name.to_string();
     for a in args {
-        s.push_str("__");
+        s.push_str("$$");
         s.push_str(&canon_ty(a));
     }
     s
@@ -236,7 +264,7 @@ pub fn mangle_ctor(ctor: &str, type_args: &[Ty]) -> String {
     }
     let mut s = ctor.to_string();
     for a in type_args {
-        s.push_str("__");
+        s.push_str("$$");
         s.push_str(&canon_ty(a));
     }
     s
@@ -632,11 +660,34 @@ impl<'a> Monomorphizer<'a> {
                 Expr::Ident(name.clone(), span.clone())
             }
             Expr::Call { callee, args, span } => {
+                // Reviewer Comment 1 #1 closure: ctor positional-call
+                // instantiations are recorded in `ctor_sites` keyed by
+                // the *Call's* span, while fn-callee instantiations in
+                // `call_sites` are keyed by the *Ident's* span. Both
+                // lookups are performed explicitly here so a future
+                // parser change to the Call.span boundary doesn't
+                // silently break this path.
+                //
+                // Order: try ctor-site by Call span first (positional
+                // ctor application like `Cons(1, Nil)`); if miss, fall
+                // through to recursive `rewrite_expr` on the callee
+                // which catches Ident-keyed fn calls and unit-ctor
+                // bare-ident references.
+                if let Expr::Ident(callee_name, _) = callee.as_ref() {
+                    if let Some(inst) = self.ctor_sites.get(span) {
+                        let resolved = subst.resolve_instantiation(inst);
+                        if self.type_decls.contains_key(&resolved.name) {
+                            self.enqueue_type(resolved.name.clone(), resolved.type_args.clone());
+                            let mangled = mangle_ctor(callee_name, &resolved.type_args);
+                            return Expr::Call {
+                                callee: Box::new(Expr::Ident(mangled, callee.span())),
+                                args: args.iter().map(|a| self.rewrite_expr(a, subst)).collect(),
+                                span: span.clone(),
+                            };
+                        }
+                    }
+                }
                 let new_callee = self.rewrite_expr(callee, subst);
-                // If the call's callee is an Ident whose span has a
-                // captured ctor instantiation, the rewrite above
-                // already mangled the ctor name. Same for fn calls.
-                // Just pass through the rewritten components.
                 Expr::Call {
                     callee: Box::new(new_callee),
                     args: args.iter().map(|a| self.rewrite_expr(a, subst)).collect(),
@@ -783,7 +834,54 @@ impl<'a> Monomorphizer<'a> {
     fn rewrite_pattern(&mut self, p: &Pattern, scrut_ty: &Option<Ty>) -> Pattern {
         match p {
             Pattern::IntLit(_, _) | Pattern::BoolLit(_, _) | Pattern::CharLit(_, _) => p.clone(),
-            Pattern::Wildcard(_) | Pattern::Var(_, _) => p.clone(),
+            Pattern::Wildcard(_) => p.clone(),
+            Pattern::Var(name, span) => {
+                // Plan A3 task 38.3 nullary-ctor promotion: a bare
+                // identifier in pattern position whose name matches a
+                // Unit variant of the scrutinee's user type is a
+                // nullary ctor, not a fresh binding. Codegen's
+                // `nullary_ctor_promotion` does this dispatch from
+                // ctor name + scrut_ty; for monomorphization we need
+                // the post-mono ctor name (`Nada$$Int`, not `Nada`)
+                // to flow into the AST so codegen's `ctor_index`
+                // lookup succeeds. Rewrite to a `Pattern::Ctor` with
+                // mangled name when both the ctor exists in the
+                // ctor-to-type registry and the scrutinee type
+                // matches.
+                if let (Some(owning_type), Some(Ty::User(scrut_name, args))) =
+                    (self.ctor_to_type.get(name), scrut_ty)
+                {
+                    if owning_type == scrut_name {
+                        // Verify it really is a Unit variant of that
+                        // type before promoting.
+                        let is_unit_variant = self
+                            .type_decls
+                            .get(owning_type.as_str())
+                            .map(|td| {
+                                td.variants.iter().any(|v| {
+                                    v.name == *name && matches!(v.fields, VariantFields::Unit)
+                                })
+                            })
+                            .unwrap_or(false);
+                        if is_unit_variant {
+                            let mangled = if args.is_empty() {
+                                name.clone()
+                            } else {
+                                mangle_ctor(name, args)
+                            };
+                            if !args.is_empty() {
+                                self.enqueue_type(owning_type.clone(), args.clone());
+                            }
+                            return Pattern::Ctor {
+                                name: mangled,
+                                fields: CtorPatternFields::Unit,
+                                span: span.clone(),
+                            };
+                        }
+                    }
+                }
+                p.clone()
+            }
             Pattern::Tuple(ps, span) => Pattern::Tuple(
                 ps.iter()
                     .map(|sp| self.rewrite_pattern(sp, scrut_ty))
@@ -792,12 +890,38 @@ impl<'a> Monomorphizer<'a> {
             ),
             Pattern::Ctor { name, fields, span } => {
                 // Determine the type-args from the scrutinee's
-                // concrete type. Falls back to no-op (no mangling)
-                // when the scrutinee type is unavailable or non-
-                // generic.
+                // concrete type. Three cases:
+                //
+                // 1. Ctor's owning type matches the scrutinee's User
+                //    type AND the type is generic — mangle with the
+                //    scrutinee's args (the common case).
+                // 2. Ctor's owning type is non-generic — no mangling
+                //    needed; pass through.
+                // 3. Ctor's owning type is generic but doesn't match
+                //    the scrutinee's User type. v1 surface can't
+                //    construct this case (a pattern's ctor must
+                //    belong to the scrutinee's type), so it's an
+                //    invariant violation if hit. Reviewer Comment 1
+                //    #3 closure: surface loudly via `unreachable!`
+                //    rather than fall through to no-mangling, which
+                //    would silently produce a codegen lookup miss.
                 let owning_type = self.ctor_to_type.get(name).cloned();
+                let owning_decl_is_generic = owning_type
+                    .as_deref()
+                    .and_then(|t| self.type_decls.get(t))
+                    .map(|td| !td.generic_params.is_empty())
+                    .unwrap_or(false);
                 let type_args: Vec<Ty> = match (owning_type.as_deref(), scrut_ty) {
                     (Some(t), Some(Ty::User(scrut_name, args))) if t == scrut_name => args.clone(),
+                    (Some(_), _) if owning_decl_is_generic => {
+                        unreachable!(
+                            "monomorphize::rewrite_pattern: Pattern::Ctor `{name}` belongs to a generic type \
+                             whose instantiation is not the surrounding match's scrutinee type. v1 surface \
+                             cannot construct this case (every pattern ctor must match the scrutinee's \
+                             type); a future plan introducing GADT-style refinement needs to thread \
+                             per-sub-pattern type-args through inference"
+                        )
+                    }
                     _ => Vec::new(),
                 };
                 let new_name = if type_args.is_empty() {
@@ -883,6 +1007,16 @@ impl Substitution {
                 params: sig.params.iter().map(|p| self.apply_to_ty(p)).collect(),
                 ret: self.apply_to_ty(&sig.ret),
                 effects: sig.effects.clone(),
+                // `effect_row_var` is intentionally copied unchanged
+                // — Plan B v1's "Effect rows are not monomorphized"
+                // deviation (PLAN_B_DEVIATIONS.md Deviation #2):
+                // rows pass through this pass and are erased at
+                // codegen, not specialised. This arm is reachable
+                // only via `Ty::Fn` which itself currently can't
+                // appear at any mono use site (`canon_ty`'s Ty::Fn
+                // arm is `unreachable!`); kept here for forward
+                // structural correctness when Plan C+ adds the
+                // surface for first-class function values.
                 effect_row_var: sig.effect_row_var,
             })),
         }
@@ -920,15 +1054,24 @@ fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
             let mangled = mangle_type(name, args);
             TypeExpr::Named(mangled, span.clone())
         }
-        Ty::Var(_) => {
-            // Should never escape monomorphization. If it does,
-            // produce a deterministic placeholder so downstream
-            // failure is observable.
-            TypeExpr::Named("__VarUnresolved".to_string(), span.clone())
+        Ty::Var(id) => {
+            // Symmetric with `canon_ty`'s `Ty::Var` arm — if a
+            // var escaped substitution, an upstream invariant broke.
+            // E0132 should have rejected the call site at typecheck.
+            unreachable!(
+                "monomorphize::ty_to_type_expr: Ty::Var({id}) reached \
+                 TypeExpr rendering — typecheck E0132 should have rejected \
+                 this site"
+            )
         }
         Ty::Fn(_) => {
-            // No `TypeExpr::Fn` surface yet (Plan A3 carryover).
-            TypeExpr::Named("__Fn".to_string(), span.clone())
+            // Symmetric with `canon_ty`'s `Ty::Fn` arm — `TypeExpr::Fn`
+            // surface is out of scope for Plan B v1.
+            unreachable!(
+                "monomorphize::ty_to_type_expr: Ty::Fn reached TypeExpr \
+                 rendering — first-class function types are out of scope \
+                 for Plan B v1"
+            )
         }
     }
 }
@@ -979,20 +1122,37 @@ mod tests {
     #[test]
     fn canon_ty_renders_one_arg_user_type() {
         let t = Ty::User("Option".to_string(), vec![Ty::Int]);
-        assert_eq!(canon_ty(&t), "Option_Int");
+        assert_eq!(canon_ty(&t), "Option$Int");
     }
 
     #[test]
     fn canon_ty_renders_two_arg_user_type() {
         let t = Ty::User("Map".to_string(), vec![Ty::String, Ty::Int]);
-        assert_eq!(canon_ty(&t), "Map_String_Int");
+        assert_eq!(canon_ty(&t), "Map$String$Int");
     }
 
     #[test]
     fn canon_ty_renders_nested_user_type() {
         let inner = Ty::User("Option".to_string(), vec![Ty::Int]);
         let outer = Ty::User("List".to_string(), vec![inner]);
-        assert_eq!(canon_ty(&outer), "List_Option_Int");
+        assert_eq!(canon_ty(&outer), "List$Option$Int");
+    }
+
+    #[test]
+    fn canon_ty_disambiguates_underscore_named_user_types() {
+        // `type List_Option[A]` (legal user identifier with single
+        // underscore) instantiated at Int versus `List[Option[Int]]`
+        // (nested generic application). The `$` separator
+        // structurally distinguishes them — at the AST level, where
+        // uniqueness is enforced. Reviewer Comment 2 #1 closure.
+        let underscored = Ty::User("List_Option".to_string(), vec![Ty::Int]);
+        let nested = Ty::User(
+            "List".to_string(),
+            vec![Ty::User("Option".to_string(), vec![Ty::Int])],
+        );
+        assert_eq!(canon_ty(&underscored), "List_Option$Int");
+        assert_eq!(canon_ty(&nested), "List$Option$Int");
+        assert_ne!(canon_ty(&underscored), canon_ty(&nested));
     }
 
     #[test]
@@ -1002,9 +1162,9 @@ mod tests {
     }
 
     #[test]
-    fn mangle_fn_appends_double_underscore_per_arg() {
+    fn mangle_fn_appends_double_dollar_per_arg() {
         let args = vec![Ty::Int, Ty::String];
-        assert_eq!(mangle_fn("identity", &args), "identity__Int__String");
+        assert_eq!(mangle_fn("identity", &args), "identity$$Int$$String");
     }
 
     #[test]
@@ -1014,7 +1174,7 @@ mod tests {
         let args = vec![outer.clone(), outer];
         assert_eq!(
             mangle_fn("list_map", &args),
-            "list_map__List_Option_Int__List_Option_Int"
+            "list_map$$List$Option$Int$$List$Option$Int"
         );
     }
 
@@ -1026,7 +1186,7 @@ mod tests {
     #[test]
     fn mangle_type_appends_args() {
         let args = vec![Ty::Int];
-        assert_eq!(mangle_type("Option", &args), "Option__Int");
+        assert_eq!(mangle_type("Option", &args), "Option$$Int");
     }
 
     #[test]
@@ -1037,7 +1197,7 @@ mod tests {
     #[test]
     fn mangle_ctor_appends_type_args() {
         let args = vec![Ty::Int];
-        assert_eq!(mangle_ctor("Some", &args), "Some__Int");
+        assert_eq!(mangle_ctor("Some", &args), "Some$$Int");
     }
 
     #[test]
@@ -1055,7 +1215,7 @@ mod tests {
         let t = Ty::User("Option".to_string(), vec![Ty::Int]);
         let te = ty_to_type_expr(&t, &span);
         match te {
-            TypeExpr::Named(name, _) => assert_eq!(name, "Option__Int"),
+            TypeExpr::Named(name, _) => assert_eq!(name, "Option$$Int"),
             _ => panic!("expected Named, got {te:?}"),
         }
     }
@@ -1189,7 +1349,7 @@ mod tests {
             "generic `id` should be dropped from post-mono IR"
         );
         // Mangled clone exists.
-        let id_int = find_fn(&items, "id__Int").expect("id__Int clone present");
+        let id_int = find_fn(&items, "id$$Int").expect("id$$Int clone present");
         assert_eq!(
             id_int.generic_params.len(),
             0,
@@ -1223,8 +1383,8 @@ mod tests {
         "#;
         let items = run_pipeline_to_mono(src);
         assert!(find_fn(&items, "id").is_none());
-        assert!(find_fn(&items, "id__Int").is_some());
-        assert!(find_fn(&items, "id__String").is_some());
+        assert!(find_fn(&items, "id$$Int").is_some());
+        assert!(find_fn(&items, "id$$String").is_some());
     }
 
     #[test]
@@ -1241,7 +1401,7 @@ mod tests {
         // `id` is generic and never called from main → dropped
         // entirely. No clones produced because no use sites.
         assert!(find_fn(&items, "id").is_none());
-        assert!(find_fn(&items, "id__Int").is_none());
+        assert!(find_fn(&items, "id$$Int").is_none());
         let fn_count = items.iter().filter(|i| matches!(i, Item::Fn(_))).count();
         assert_eq!(fn_count, 1, "only main remains");
     }
@@ -1258,7 +1418,7 @@ mod tests {
         let items = run_pipeline_to_mono(src);
         // Generic type is dropped; concrete clone is present.
         assert!(find_type(&items, "Holder").is_none());
-        let holder_int = find_type(&items, "Holder__Int").expect("Holder__Int present");
+        let holder_int = find_type(&items, "Holder$$Int").expect("Holder$$Int present");
         assert_eq!(holder_int.generic_params.len(), 0);
         // Ctor names in the clone are mangled.
         let ctor_names: Vec<&str> = holder_int
@@ -1266,8 +1426,8 @@ mod tests {
             .iter()
             .map(|v| v.name.as_str())
             .collect();
-        assert!(ctor_names.contains(&"Empty__Int"), "Empty__Int present");
-        assert!(ctor_names.contains(&"Hold__Int"), "Hold__Int present");
+        assert!(ctor_names.contains(&"Empty$$Int"), "Empty$$Int present");
+        assert!(ctor_names.contains(&"Hold$$Int"), "Hold$$Int present");
     }
 
     #[test]
@@ -1282,8 +1442,8 @@ mod tests {
         "#;
         let items = run_pipeline_to_mono(src);
         assert!(find_type(&items, "Box").is_none());
-        assert!(find_type(&items, "Box__Int").is_some());
-        assert!(find_type(&items, "Box__String").is_some());
+        assert!(find_type(&items, "Box$$Int").is_some());
+        assert!(find_type(&items, "Box$$String").is_some());
     }
 
     #[test]
@@ -1343,10 +1503,10 @@ mod tests {
             }
         "#;
         let items = run_pipeline_to_mono(src);
-        let box_int = find_type(&items, "Box__Int").expect("Box__Int");
-        let box_string = find_type(&items, "Box__String").expect("Box__String");
-        assert_eq!(box_int.variants[0].name, "Wrap__Int");
-        assert_eq!(box_string.variants[0].name, "Wrap__String");
+        let box_int = find_type(&items, "Box$$Int").expect("Box$$Int");
+        let box_string = find_type(&items, "Box$$String").expect("Box$$String");
+        assert_eq!(box_int.variants[0].name, "Wrap$$Int");
+        assert_eq!(box_string.variants[0].name, "Wrap$$String");
     }
 
     #[test]
@@ -1363,18 +1523,301 @@ mod tests {
         "#;
         let items = run_pipeline_to_mono(src);
         let main = find_fn(&items, "main").expect("main");
-        // Walk main's body to find the Match expression. The match
-        // arms' patterns must reference the mangled ctor names.
-        let mut found_mangled = 0;
+        // Reviewer Comment 2 #3 closure: assert *both* mangled ctors
+        // are present, not just `>= 1`. Previous form would pass with
+        // only `Nada$$Int` even if `Just$$Int` was missing.
+        let mut saw_nada = false;
+        let mut saw_just = false;
         walk_block_for_ctor_patterns(&main.body, &mut |name| {
-            if name == "Nada__Int" || name == "Just__Int" {
-                found_mangled += 1;
+            if name == "Nada$$Int" {
+                saw_nada = true;
+            }
+            if name == "Just$$Int" {
+                saw_just = true;
             }
         });
-        assert!(
-            found_mangled >= 1,
-            "expected at least one mangled ctor pattern in match arms"
+        assert!(saw_nada, "Nada$$Int must appear in match patterns");
+        assert!(saw_just, "Just$$Int must appear in match patterns");
+    }
+
+    #[test]
+    fn recursive_generic_type_termination_one_clone_per_arg_tuple() {
+        // Reviewer Comment 2 #3 closure: a recursive generic type
+        // (`type List[A] = | Nil | Cons(A, List[A])`) used with a
+        // single instantiation must produce *exactly one* `List$$Int`
+        // clone, not loop or duplicate. The dedup-by-mangled-name
+        // worklist (`type_seen`) prevents the loop; this test pins
+        // the contract.
+        let src = r#"
+            type List[A] = | Nil | Cons(A, List[A])
+            fn main() -> Int ![] {
+                let xs: List[Int] = Cons(42, Cons(43, Nil));
+                42
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let list_int_count = items
+            .iter()
+            .filter(|i| matches!(i, Item::Type(t) if t.name == "List$$Int"))
+            .count();
+        assert_eq!(
+            list_int_count, 1,
+            "exactly one List$$Int clone — recursive type must dedup not loop"
         );
+        assert!(
+            find_type(&items, "List").is_none(),
+            "original generic List must be dropped"
+        );
+    }
+
+    #[test]
+    fn self_recursive_generic_fn_terminates() {
+        // Reviewer Comment 2 #3 closure: a generic fn that calls
+        // itself inside its own body must clone exactly once per
+        // (name, type-args) tuple — recursive call sites resolve to
+        // the *same* instantiation as the enclosing clone (because
+        // the inner call's fresh-var resolves to the outer fn's
+        // generic-param var, which `Substitution::by_var` then
+        // resolves to the concrete arg).
+        let src = r#"
+            fn loops[A](x: A) -> Int ![] {
+                let y: Int = loops_helper(x);
+                y
+            }
+            fn loops_helper[A](x: A) -> Int ![] {
+                42
+            }
+            fn main() -> Int ![] {
+                loops(7)
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let loops_clones = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Fn(f) if f.name.starts_with("loops") => Some(f.name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Exactly one `loops$$Int` clone (the outer) and one
+        // `loops_helper$$Int` clone (called from inside).
+        assert!(
+            loops_clones.contains(&"loops$$Int"),
+            "loops$$Int present, got {loops_clones:?}"
+        );
+        assert!(
+            loops_clones.contains(&"loops_helper$$Int"),
+            "loops_helper$$Int present, got {loops_clones:?}"
+        );
+        // Original generics dropped.
+        assert!(find_fn(&items, "loops").is_none());
+        assert!(find_fn(&items, "loops_helper").is_none());
+    }
+
+    #[test]
+    fn generic_fn_calling_generic_fn_resolves_var_chain() {
+        // Reviewer Comment 1 #5 closure: a generic fn calling
+        // another generic fn exercises the
+        // `Ty::Var(callee_fresh) → Ty::Var(outer_A) → concrete`
+        // chain through `Substitution::by_var`. The inner fn's
+        // captured instantiation references the outer fn's var; at
+        // mono descent, the outer fn's var resolves to the concrete
+        // arg from main's call site, then the inner's var-ref
+        // resolves through the same substitution.
+        let src = r#"
+            fn use_id[B](y: B) -> B ![] {
+                inner(y)
+            }
+            fn inner[A](x: A) -> A ![] {
+                x
+            }
+            fn main() -> Int ![] {
+                use_id(42)
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        // `use_id$$Int` cloned from main's call.
+        assert!(
+            find_fn(&items, "use_id$$Int").is_some(),
+            "use_id$$Int present"
+        );
+        // `inner$$Int` cloned from inside `use_id$$Int`'s body — its
+        // captured instantiation resolved through the var chain.
+        assert!(
+            find_fn(&items, "inner$$Int").is_some(),
+            "inner$$Int present (resolved via var chain)"
+        );
+        assert!(find_fn(&items, "inner$$VarUnresolved").is_none());
+    }
+
+    #[test]
+    fn end_to_end_nested_generic_clone_name_matches_pinned_format() {
+        // Reviewer Comment 2 #3 closure: end-to-end variant of
+        // `mangle_fn_handles_nested_generics` that runs a real
+        // sigil program through the full pipeline and asserts the
+        // resulting clone name matches the pinned format. Catches
+        // any drift between the unit-level format string and what
+        // the pipeline actually produces.
+        let src = r#"
+            type Option[A] = | None | Some(A)
+            fn unwrap[A](o: Option[A], d: A) -> A ![] {
+                d
+            }
+            fn main() -> Int ![] {
+                let inner: Option[Int] = Some(7);
+                let outer: Option[Option[Int]] = Some(inner);
+                let x: Option[Int] = unwrap(outer, None);
+                42
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let fn_names: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Fn(f) => Some(f.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        // unwrap is called at A=Option[Int], so the clone is named
+        // `unwrap$$Option$Int`. The nested `Option` arg renders with
+        // the within-arg `$` separator.
+        assert!(
+            fn_names.contains(&"unwrap$$Option$Int"),
+            "unwrap$$Option$Int present, got {fn_names:?}"
+        );
+        let type_names: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Type(t) => Some(t.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        // `Option[Int]` and `Option[Option[Int]]` are distinct
+        // instantiations, both cloned.
+        assert!(
+            type_names.contains(&"Option$$Int"),
+            "Option$$Int present, got {type_names:?}"
+        );
+        assert!(
+            type_names.contains(&"Option$$Option$Int"),
+            "Option$$Option$Int present, got {type_names:?}"
+        );
+    }
+
+    #[test]
+    fn ctor_call_site_callee_ident_is_rewritten() {
+        // Reviewer Comment 1 #1 closure: assert the *call-site*
+        // rewrite (not just the TypeDecl mangling) resolves the
+        // callee Ident to the mangled ctor name. Walks main's body
+        // to find the Call with callee `Wrap`, asserts its callee
+        // ident text is `Wrap$$Int` post-mono.
+        let src = r#"
+            type Box[A] = | Wrap(A)
+            fn main() -> Int ![] {
+                let bi: Box[Int] = Wrap(42);
+                42
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let main = find_fn(&items, "main").expect("main");
+        let mut saw_mangled_callee = false;
+        walk_block_for_call_callees(&main.body, &mut |callee_name| {
+            if callee_name == "Wrap$$Int" {
+                saw_mangled_callee = true;
+            }
+            assert_ne!(
+                callee_name, "Wrap",
+                "post-mono call site must NOT use unmangled `Wrap`"
+            );
+        });
+        assert!(
+            saw_mangled_callee,
+            "Wrap$$Int must appear as a call's callee Ident post-mono"
+        );
+    }
+
+    #[test]
+    fn two_fn_clones_with_nested_generic_type_args() {
+        // Reviewer Comment 1 #5 closure: two clones of the same
+        // generic fn, each at a *different* nested-generic
+        // instantiation, must produce two distinct clones.
+        let src = r#"
+            type Wrapper[A] = | Wrap(A)
+            fn idw[A](x: Wrapper[A]) -> Wrapper[A] ![] {
+                x
+            }
+            fn main() -> Int ![] {
+                let a: Wrapper[Int] = Wrap(1);
+                let b: Wrapper[String] = Wrap("x");
+                let _ai: Wrapper[Int] = idw(a);
+                let _as: Wrapper[String] = idw(b);
+                42
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let idw_clones: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Fn(f) if f.name.starts_with("idw") => Some(f.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            idw_clones.contains(&"idw$$Int"),
+            "idw$$Int present, got {idw_clones:?}"
+        );
+        assert!(
+            idw_clones.contains(&"idw$$String"),
+            "idw$$String present, got {idw_clones:?}"
+        );
+    }
+
+    fn walk_block_for_call_callees(b: &Block, cb: &mut impl FnMut(&str)) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Let(l) => walk_expr_for_call_callees(&l.value, cb),
+                Stmt::Expr(e) => walk_expr_for_call_callees(e, cb),
+                Stmt::Perform(p) => {
+                    for a in &p.args {
+                        walk_expr_for_call_callees(a, cb);
+                    }
+                }
+            }
+        }
+        if let Some(t) = &b.tail {
+            walk_expr_for_call_callees(t, cb);
+        }
+    }
+
+    fn walk_expr_for_call_callees(e: &Expr, cb: &mut impl FnMut(&str)) {
+        match e {
+            Expr::Call { callee, args, .. } => {
+                if let Expr::Ident(name, _) = callee.as_ref() {
+                    cb(name);
+                }
+                walk_expr_for_call_callees(callee, cb);
+                for a in args {
+                    walk_expr_for_call_callees(a, cb);
+                }
+            }
+            Expr::Match { arms, .. } => {
+                for a in arms {
+                    walk_expr_for_call_callees(&a.body, cb);
+                }
+            }
+            Expr::Block(b) => walk_block_for_call_callees(b, cb),
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+                ..
+            } => {
+                walk_expr_for_call_callees(cond, cb);
+                walk_block_for_call_callees(then_block, cb);
+                walk_block_for_call_callees(else_block, cb);
+            }
+            _ => {}
+        }
     }
 
     fn walk_block_for_ctor_patterns(b: &Block, cb: &mut impl FnMut(&str)) {
