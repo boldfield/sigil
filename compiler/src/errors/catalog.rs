@@ -742,6 +742,166 @@ pub const CATALOG: &[ErrorEntry] = &[
                       // a non-IO effect aren't expressible until Task 54).",
     },
     ErrorEntry {
+        code: "E0136",
+        short: "duplicate effect declaration",
+        long: "Plan B task 54: an effect name is declared by more than one \
+               `effect Name { ... }` item in the program. Effect names \
+               share a single flat namespace; duplicates would make \
+               handler dispatch ambiguous because a handler arm's \
+               `Effect.op` reference cannot pick between two declarations \
+               of `Effect`. Reported against the second (and subsequent) \
+               offender's name span; the first declaration wins in the \
+               registry so downstream typing always picks a single \
+               canonical operation set per effect name.",
+        fix_example: "// Wrong:\n\
+                      effect Raise { fail: (String) -> Int }\n\
+                      effect Raise { other: () -> Int }   // E0136 here\n\n\
+                      // Right (rename the second):\n\
+                      effect Raise { fail: (String) -> Int }\n\
+                      effect Other { other: () -> Int }",
+    },
+    ErrorEntry {
+        code: "E0137",
+        short: "duplicate operation name in effect declaration",
+        long: "Plan B task 54: an operation name appears more than once \
+               in the same `effect Name { ... }` body. Within a single \
+               effect declaration, operation names share a flat \
+               namespace — handler arms `Name.op(...)` reference an \
+               operation by name and cannot pick between two declarations \
+               of `op` on the same effect. Reported against the second \
+               occurrence's name span; the first wins.",
+        fix_example: "// Wrong:\n\
+                      effect Choose {\n\
+                        pick: () -> Int,\n\
+                        pick: (Int) -> Int,   // E0137 here\n\
+                      }\n\n\
+                      // Right (rename, or merge):\n\
+                      effect Choose {\n\
+                        pick: () -> Int,\n\
+                        pick_in: (Int) -> Int,\n\
+                      }",
+    },
+    ErrorEntry {
+        code: "E0138",
+        short: "handler arm references unknown effect",
+        long: "Plan B task 54: a `handle ... with { Effect.op(...) => ... }` \
+               arm names an `Effect` that is not declared anywhere in the \
+               program. Effect declarations are top-level items \
+               (`effect Effect { ... }`) and are visible everywhere in the \
+               file once present.\n\n\
+               This fires when the user typo's an effect name or forgets \
+               to declare it before writing the handler. The fix is either \
+               to add the matching `effect Effect { ... }` declaration or \
+               to correct the spelling.",
+        fix_example: "// Wrong (no `effect Raise`):\n\
+                      fn safe(x: Int) -> Int ![] {\n\
+                        handle x with { Raise.fail(msg, k) => 0 }   // E0138\n\
+                      }\n\n\
+                      // Right:\n\
+                      effect Raise { fail: (String) -> Int }\n\
+                      fn safe(x: Int) -> Int ![] {\n\
+                        handle x with { Raise.fail(msg, k) => 0 }\n\
+                      }",
+    },
+    ErrorEntry {
+        code: "E0139",
+        short: "handler arm references unknown operation on declared effect",
+        long: "Plan B task 54: a `handle ... with { Effect.op(...) => ... }` \
+               arm names an `Effect.op` whose `op` is not declared in \
+               `Effect`'s body. The effect itself is recognised; the \
+               operation is the part that doesn't match.\n\n\
+               This fires when the user typo's an operation name or \
+               references an operation that hasn't been added to the \
+               effect declaration yet. The fix is either to add the \
+               missing operation to the `effect` body or to correct the \
+               spelling.",
+        fix_example: "// Wrong (Raise has only `fail`, not `panic`):\n\
+                      effect Raise { fail: (String) -> Int }\n\
+                      handle x with { Raise.panic(msg, k) => 0 }   // E0139\n\n\
+                      // Right (correct the op name):\n\
+                      handle x with { Raise.fail(msg, k) => 0 }",
+    },
+    ErrorEntry {
+        code: "E0140",
+        short: "duplicate handler arm for the same Effect.op",
+        long: "Plan B task 54: a `handle ... with { ... }` expression has \
+               two arms that both name the same `Effect.op`. Handler \
+               dispatch is by op identity; two arms for the same op are \
+               redundant — the second is unreachable.\n\n\
+               Reported against the second (and subsequent) duplicate's \
+               span. The first declaration wins. The fix is to delete one \
+               of the redundant arms or merge their bodies.",
+        fix_example: "// Wrong:\n\
+                      handle x with {\n\
+                        Raise.fail(msg, k) => 0,\n\
+                        Raise.fail(msg2, k2) => 1,   // E0140 here\n\
+                      }\n\n\
+                      // Right (one arm per op):\n\
+                      handle x with {\n\
+                        Raise.fail(msg, k) => 0,\n\
+                      }",
+    },
+    ErrorEntry {
+        code: "E0141",
+        short: "handler arm parameter count does not match operation declaration",
+        long: "Plan B task 54: a `handle ... with { Effect.op(p1, ..., k) }` \
+               arm binds N user-parameters before the trailing continuation \
+               `k`, but the operation `Effect.op` declares M parameters. \
+               The arm's binding shape must match: one binding per declared \
+               operation parameter, plus exactly one trailing continuation \
+               parameter.\n\n\
+               This fires when the user adds or removes a parameter from \
+               an effect declaration without updating handler arms, or \
+               when an arm forgets the trailing `k`. The fix is to align \
+               the arm's binding count with the operation's declared \
+               parameter count.",
+        fix_example: "// Wrong (op declares 1 param, arm binds 2):\n\
+                      effect Raise { fail: (String) -> Int }\n\
+                      handle x with {\n\
+                        Raise.fail(msg, extra, k) => 0,   // E0141 here\n\
+                      }\n\n\
+                      // Right (one binding per declared param + k):\n\
+                      handle x with {\n\
+                        Raise.fail(msg, k) => 0,\n\
+                      }",
+    },
+    ErrorEntry {
+        code: "E0220",
+        short: "one-shot continuation used more than once on a code path",
+        long: "Plan B task 54: in a handler arm for a one-shot effect, \
+               the continuation `k` must be invoked or referenced at most \
+               once along every path through the arm body. One-shot is \
+               the default for effects declared as `effect Name { ... }`; \
+               opt-in multi-shot via `effect Name resumes: many { ... }` \
+               relaxes this rule.\n\n\
+               Zero uses of `k` (early-exit handlers) is fine; one use is \
+               fine; any path that uses `k` more than once is an error. \
+               Sibling branches of an `if` or `match` may each use `k` \
+               once independently — only sequential composition along a \
+               single path counts as accumulation.\n\n\
+               References to `k` from inside a `lambda` body are \
+               conservatively rejected: a lambda's call count is not \
+               statically known, so capturing `k` into a closure could \
+               invoke it any number of times. Move the `k` invocation out \
+               of the lambda, or annotate the effect with \
+               `resumes: many` if the closure-capture pattern is \
+               intended.",
+        fix_example: "// Wrong (k used twice on the same path):\n\
+                      effect Raise { fail: (String) -> Int }\n\
+                      handle x with {\n\
+                        Raise.fail(msg, k) => k(0) + k(1),   // E0220\n\
+                      }\n\n\
+                      // Right (each branch uses k at most once):\n\
+                      handle x with {\n\
+                        Raise.fail(msg, k) => if msg == \"x\" { k(0) } else { k(1) },\n\
+                      }\n\n\
+                      // Also right (multi-shot opt-in):\n\
+                      effect Choose resumes: many { pick: () -> Int }\n\
+                      handle x with {\n\
+                        Choose.pick(k) => k(1) + k(2),   // OK, multi-shot\n\
+                      }",
+    },
+    ErrorEntry {
         code: "E0401",
         short: "runtime arithmetic abort",
         long: "A division or modulo operation was performed with a zero \
