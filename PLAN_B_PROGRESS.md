@@ -17,25 +17,25 @@ is complete but whose CI run has not yet reported green.
 ## Stage 4.5 — Plan B scaffolding
 
 - Task 4.5.1 — Create `PLAN_B_PROGRESS.md`
-  - status: in-progress
-  - commits: [HEAD]
+  - status: done-pending-ci
+  - commits: [7aed987]
   - notes: This file.
 - Task 4.5.2 — Create empty `PLAN_B_DEVIATIONS.md`
-  - status: in-progress
-  - commits: [HEAD]
+  - status: done-pending-ci
+  - commits: [7aed987]
   - notes: Landed atomically with 4.5.1 (scaffolding is one unit).
 - Task 4.5.3 — Plan B questions use `[PLAN-B]` prefix in `QUESTIONS.md`
-  - status: in-progress
-  - commits: [HEAD]
+  - status: done-pending-ci
+  - commits: [7aed987]
   - notes: Convention already documented in `QUESTIONS.md` header (added in Plan A2 Task 1.5.3). B entries follow the same convention; no header update required.
 - Task 4.5.4 — Extend `.github/workflows/ci.yml` for Plan-B-specific invariants
   - status: todo
   - commits: []
-  - notes: Deep-recursion regression test, multi-shot stress test, selective-CPS correctness test. Wired in once the underlying features land in Stage 5/6 — placeholder steps that exit `0` on a `[skip plan-b-runtime]` marker can be added earlier so CI structure exists for incremental rollout.
+  - notes: Deep-recursion regression test, multi-shot stress test, selective-CPS correctness test. The real tests compile .sigil programs that depend on generics / effects and so can only pass after Stages 5/6 land. Stage 4.5 wires the steps as `scripts/plan-b-invariants.sh` (executed from CI) that currently short-circuits with a guard message; each invariant flips from short-circuit to real assertion as the underlying feature lands.
 - Task 4.5.5 — Create `sigil-abi` leaf crate; consolidate stackmap and cross-boundary constants
-  - status: todo
-  - commits: []
-  - notes: Workspace member, `lib` only, zero deps. Extracts stackmap wire-format constants and record layout structs (`StackMapRecordV0`, future `StackMapRecordV1`) plus tagged-pointer bit masks currently duplicated. Both `sigil-compiler` and `sigil-runtime` depend on it. Existing equality-asserting cross-crate tests retired.
+  - status: done-pending-ci
+  - commits: [e1c4286]
+  - notes: New `abi/` workspace member, `#![no_std]`, zero deps. Holds stackmap wire-format constants + `StackMapRecordV0` struct + tagged-Value bit masks + `TAG_INT_SHIFT`. `runtime::stackmap` and `runtime::value` `pub use`-re-export from it; the old `STACKMAP_*` pins in codegen.rs were removed. `sigil-header-constants` stays untouched (adjacent but distinct scope — the 8-byte object header). Pod-verify green.
 
 ## Plan A3 carryover
 
