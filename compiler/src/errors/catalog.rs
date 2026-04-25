@@ -501,12 +501,20 @@ pub const CATALOG: &[ErrorEntry] = &[
                - E0117: pattern shape does not match scrutinee type \
                  (different failure mode — well-formed exhaustiveness \
                  implies well-formed shapes first).\n\n\
-               Plan A3 v1 only verifies top-level exhaustiveness for user \
-               types. Nested non-exhaustive cases inside constructor \
-               fields (`match o { Some(true) => .., None => .. }` missing \
-               `Some(false)`) fall through to the runtime's \
-               `TRAP_NONEXHAUSTIVE_MATCH` trap in that release; Plan B \
-               extends the check to full nested Maranget exhaustiveness.\n\n\
+               Plan A3 shipped top-level exhaustiveness only. Plan B \
+               extends the check with full nested Maranget: \
+               `match o { Some(true) => .., None => .. }` on \
+               `Option = | None | Some(Bool)` now produces E0120 with \
+               witness `Some(false)` at compile time rather than \
+               falling through to the runtime `TRAP_NONEXHAUSTIVE_MATCH` \
+               trap. Nested witness formats follow the same paste-able \
+               rules: positional field holes with the uncovered value \
+               in place (`Some(false)`, `Holds(Node(_, _, _))`) and \
+               record fields (`P { a: false, b: _ }`) in declared \
+               field order. Infinite-domain primitive fields (Int, \
+               Char, String, Byte, Fn) still require a wildcard to \
+               cover — their witnesses use `_` since no concrete \
+               counterexample is surfaceable.\n\n\
                E0120 is suppressed when any match arm emits a \
                pattern-check or body-check error (E0117, E0115, E0065, \
                or any other code from `check_pattern`/`check_expr`). \

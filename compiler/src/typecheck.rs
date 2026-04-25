@@ -1440,17 +1440,144 @@ impl Tc {
     /// the runtime trap and is documented as such in the E0120 catalog
     /// long-form.
     fn user_type_witness(&self, type_name: &str, arms: &[MatchArm]) -> Option<String> {
-        let td = self.types.get(type_name)?;
-        // A wildcard arm (`_ => ..`) or a bare-var arm whose name is
-        // not a nullary ctor of this type is a true catch-all.
-        let has_catchall = arms.iter().any(|a| match &a.pattern {
+        let scrut_ty = Ty::User(type_name.to_string());
+        let patterns: Vec<&Pattern> = arms.iter().map(|a| &a.pattern).collect();
+        self.match_witness(&scrut_ty, &patterns)
+    }
+
+    /// Plan B A3-carryover — recursive Maranget exhaustiveness.
+    ///
+    /// Returns `None` if the given pattern list exhaustively covers
+    /// `scrut_ty`; otherwise returns `Some(witness)` naming a concrete
+    /// uncovered value. The witness is paste-able into a new arm.
+    ///
+    /// Primitive scrutinees honor the Plan A2 rule: wildcard required
+    /// except for `Bool` where both literals may cover, and `Unit`
+    /// where any arm covers the sole value.
+    ///
+    /// User-type scrutinees descend into constructor field patterns:
+    ///
+    ///   `match o { Some(true) => .., None => .. }` on
+    ///   `Option = | None | Some(Bool)` now returns `Some("Some(false)")`
+    ///   rather than falling through to a runtime trap.
+    ///
+    /// Pattern::Var is interpreted context-sensitively: on a user-type
+    /// scrutinee whose declared variants contain a Unit variant named
+    /// `V`, `Pattern::Var("V", _)` matches *that variant only* (the
+    /// nullary-ctor-promotion rule established in Task 38.3); on any
+    /// other scrutinee shape it is a fresh catch-all binder.
+    fn match_witness(&self, scrut_ty: &Ty, patterns: &[&Pattern]) -> Option<String> {
+        if patterns
+            .iter()
+            .any(|p| self.pattern_is_catchall(p, scrut_ty))
+        {
+            return None;
+        }
+        match scrut_ty {
+            Ty::Bool => {
+                let has_true = patterns
+                    .iter()
+                    .any(|p| matches!(p, Pattern::BoolLit(true, _)));
+                let has_false = patterns
+                    .iter()
+                    .any(|p| matches!(p, Pattern::BoolLit(false, _)));
+                match (has_true, has_false) {
+                    (true, true) => None,
+                    // Missing `false` — witness is the unseen literal.
+                    (true, false) => Some("false".to_string()),
+                    // Missing `true` — ditto.
+                    (false, true) => Some("true".to_string()),
+                    // Missing both — name `false` arbitrarily; the user
+                    // will see they need at least one literal arm.
+                    (false, false) => Some("false".to_string()),
+                }
+            }
+            Ty::Unit => None,
+            // Infinite / un-enumerable value domains: only a wildcard
+            // / fresh-var binder can reach exhaustiveness, and such a
+            // pattern was already caught above by `pattern_is_catchall`.
+            Ty::Int | Ty::Char | Ty::String | Ty::Byte | Ty::Fn(_) => Some("_".to_string()),
+            Ty::User(type_name) => {
+                let td = self.types.get(type_name)?;
+                for (variant_idx, variant) in td.variants.iter().enumerate() {
+                    // Gather per-arm field-pattern lists from every
+                    // pattern that matches this variant.
+                    let mut variant_rows: Vec<Vec<Pattern>> = Vec::new();
+                    for p in patterns {
+                        if let Some(fields) =
+                            self.pattern_matches_variant(p, type_name, variant_idx, variant)
+                        {
+                            variant_rows.push(fields);
+                        }
+                    }
+                    if variant_rows.is_empty() {
+                        return Some(ctor_witness_string(variant));
+                    }
+                    // Recurse per field position. The first uncovered
+                    // field yields the witness, with the other fields
+                    // wildcarded.
+                    match &variant.fields {
+                        VariantFields::Unit => {}
+                        VariantFields::Positional(field_tes) => {
+                            for (field_idx, field_te) in field_tes.iter().enumerate() {
+                                let field_ty = match ty_from_type_expr(field_te, &self.types) {
+                                    Some(t) => t,
+                                    None => continue,
+                                };
+                                let field_patterns: Vec<&Pattern> =
+                                    variant_rows.iter().map(|row| &row[field_idx]).collect();
+                                if let Some(sub) = self.match_witness(&field_ty, &field_patterns) {
+                                    return Some(positional_witness_with_hole(
+                                        variant, field_idx, &sub,
+                                    ));
+                                }
+                            }
+                        }
+                        VariantFields::Record(record_fields) => {
+                            for (field_idx, record_field) in record_fields.iter().enumerate() {
+                                let field_ty =
+                                    match ty_from_type_expr(&record_field.ty, &self.types) {
+                                        Some(t) => t,
+                                        None => continue,
+                                    };
+                                let field_patterns: Vec<&Pattern> =
+                                    variant_rows.iter().map(|row| &row[field_idx]).collect();
+                                if let Some(sub) = self.match_witness(&field_ty, &field_patterns) {
+                                    return Some(record_witness_with_hole(
+                                        variant,
+                                        record_fields,
+                                        field_idx,
+                                        &sub,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// True when `p` covers every possible value of `scrut_ty`.
+    ///
+    /// `Pattern::Wildcard` is always a catchall. `Pattern::Var(name)`
+    /// is a catchall unless it's a nullary-ctor promotion of `name`
+    /// to a Unit variant of a user-type scrutinee — in which case it
+    /// only covers that one variant.
+    fn pattern_is_catchall(&self, p: &Pattern, scrut_ty: &Ty) -> bool {
+        match p {
             Pattern::Wildcard(_) => true,
             Pattern::Var(name, _) => {
-                if let Some(info) = self.ctors.get(name) {
-                    if info.type_name == type_name {
-                        if let Some(variant) = td.variants.get(info.variant_index) {
-                            if matches!(variant.fields, VariantFields::Unit) {
-                                return false; // nullary-ctor promotion, not a catchall
+                if let Ty::User(u) = scrut_ty {
+                    if let Some(info) = self.ctors.get(name) {
+                        if info.type_name == *u {
+                            if let Some(td) = self.types.get(u) {
+                                if let Some(variant) = td.variants.get(info.variant_index) {
+                                    if matches!(variant.fields, VariantFields::Unit) {
+                                        return false;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1458,26 +1585,65 @@ impl Tc {
                 true
             }
             _ => false,
-        });
-        if has_catchall {
-            return None;
         }
-        for variant in &td.variants {
-            let covered = arms
-                .iter()
-                .any(|a| Self::arm_covers_variant(&a.pattern, &variant.name));
-            if !covered {
-                return Some(ctor_witness_string(variant));
-            }
-        }
-        None
     }
 
-    fn arm_covers_variant(p: &Pattern, variant_name: &str) -> bool {
+    /// If `p` matches `variant` (of `type_name` at index `variant_idx`),
+    /// return the per-field sub-patterns in the declared field order.
+    /// Otherwise `None`.
+    ///
+    /// For record patterns, sub-patterns are reordered to match the
+    /// declared field order so field-index recursion in
+    /// `match_witness` is straightforward. Pattern validity has
+    /// already been checked by `check_pattern`, so shape mismatches
+    /// here fall through to `None` and cannot surprise callers.
+    fn pattern_matches_variant(
+        &self,
+        p: &Pattern,
+        type_name: &str,
+        variant_idx: usize,
+        variant: &Variant,
+    ) -> Option<Vec<Pattern>> {
         match p {
-            Pattern::Ctor { name, .. } => name == variant_name,
-            Pattern::Var(name, _) => name == variant_name,
-            _ => false,
+            Pattern::Ctor { name, fields, .. } => {
+                if name != &variant.name {
+                    return None;
+                }
+                match (fields, &variant.fields) {
+                    (CtorPatternFields::Unit, VariantFields::Unit) => Some(Vec::new()),
+                    (
+                        CtorPatternFields::Positional(sub_pats),
+                        VariantFields::Positional(field_tes),
+                    ) if sub_pats.len() == field_tes.len() => Some(sub_pats.clone()),
+                    (CtorPatternFields::Record(cpf), VariantFields::Record(rfd)) => {
+                        let wild = Pattern::Wildcard(p.span());
+                        let mut out: Vec<Pattern> = Vec::with_capacity(rfd.len());
+                        for declared in rfd {
+                            match cpf.iter().find(|f| f.name == declared.name) {
+                                Some(f) => out.push(f.pattern.clone()),
+                                None => out.push(wild.clone()),
+                            }
+                        }
+                        Some(out)
+                    }
+                    _ => None,
+                }
+            }
+            Pattern::Var(name, _) => {
+                // Nullary-ctor promotion: matches exactly this variant
+                // when (a) the name resolves to this variant via the
+                // ctor registry and (b) the declared shape is Unit.
+                if let Some(info) = self.ctors.get(name) {
+                    if info.type_name == type_name
+                        && info.variant_index == variant_idx
+                        && matches!(variant.fields, VariantFields::Unit)
+                    {
+                        return Some(Vec::new());
+                    }
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -1883,6 +2049,49 @@ fn ctor_witness_string(variant: &Variant) -> String {
             format!("{} {{ {fs} }}", variant.name)
         }
     }
+}
+
+/// Plan B A3-carryover — build a positional-variant witness string
+/// with the `hole_idx`-th field replaced by `sub`, other fields left
+/// as `_`.
+fn positional_witness_with_hole(variant: &Variant, hole_idx: usize, sub: &str) -> String {
+    let arity = match &variant.fields {
+        VariantFields::Positional(params) => params.len(),
+        _ => return variant.name.clone(),
+    };
+    let args: Vec<String> = (0..arity)
+        .map(|i| {
+            if i == hole_idx {
+                sub.to_string()
+            } else {
+                "_".to_string()
+            }
+        })
+        .collect();
+    format!("{}({})", variant.name, args.join(", "))
+}
+
+/// Plan B A3-carryover — build a record-variant witness string with
+/// the `hole_idx`-th field (in declared-field order) set to `sub` and
+/// other fields left as `_`.
+fn record_witness_with_hole(
+    variant: &Variant,
+    fields: &[RecordFieldDecl],
+    hole_idx: usize,
+    sub: &str,
+) -> String {
+    let fs: Vec<String> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if i == hole_idx {
+                format!("{}: {sub}", f.name)
+            } else {
+                format!("{}: _", f.name)
+            }
+        })
+        .collect();
+    format!("{} {{ {} }}", variant.name, fs.join(", "))
 }
 
 /// Coarse exhaustiveness check. Wildcard-terminated arm lists are
@@ -3427,6 +3636,149 @@ mod tests {
             e120.message.contains("Rect { w: _, h: _ }"),
             "witness format wrong: {}",
             e120.message
+        );
+    }
+
+    // ===== Plan B A3-carryover — nested Maranget exhaustiveness =====
+
+    #[test]
+    fn nested_some_bool_missing_false_fires_e0120_with_witness() {
+        // `Option = | None | Some(Bool)`; arms cover None and Some(true)
+        // but not Some(false). Plan A3 shipped top-level-only coverage
+        // and let this fall through to the runtime trap; Plan B must
+        // catch it at compile time with the paste-able witness.
+        let src = "type Option = | None | Some(Bool)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(true) => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Some(false)"),
+            "witness must name Some(false); got {}",
+            e120.message,
+        );
+    }
+
+    #[test]
+    fn nested_some_bool_missing_true_fires_e0120_with_witness() {
+        let src = "type Option = | None | Some(Bool)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(false) => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Some(true)"),
+            "witness must name Some(true); got {}",
+            e120.message,
+        );
+    }
+
+    #[test]
+    fn nested_bool_exhaustive_with_both_literals_no_e0120() {
+        let src = "type Option = | None | Some(Bool)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(true) => 1, Some(false) => 2 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "all Some-field variants covered: no E0120 expected; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn nested_ctor_with_field_catchall_is_exhaustive() {
+        // `Some(_)` field-wildcards the Bool; together with `None`
+        // this is fully exhaustive.
+        let src = "type Option = | None | Some(Bool)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(_) => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "Some(_) catchall covers Bool field: no E0120 expected; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn nested_user_type_field_catches_inner_missing_variant() {
+        // Box holds a Tree; arms cover the outer variant but the inner
+        // Tree has Leaf and Node, and the Some-arm only handles Leaf.
+        // Witness must name Some(Node(_, _, _)).
+        let src = "type Tree = | Leaf | Node(Int, Tree, Tree)\n\
+                   type Box = | Empty | Holds(Tree)\n\
+                   fn f(b: Box) -> Int ![] {\n  \
+                     match b { Empty => 0, Holds(Leaf) => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Holds(Node(_, _, _))"),
+            "witness must name Holds(Node(_, _, _)); got {}",
+            e120.message,
+        );
+    }
+
+    #[test]
+    fn nested_record_field_missing_emits_record_witness() {
+        // `Pair { a: Bool, b: Bool }` with only the `true, true` arm.
+        // Witness should surface one missing field-of-Bool with the
+        // other(s) wildcarded.
+        let src = "type Pair = | P { a: Bool, b: Bool }\n\
+                   fn f(p: Pair) -> Int ![] {\n  \
+                     match p { P { a: true, b: true } => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        // The first uncovered field is `a` (Bool, missing `false`).
+        // Witness: P { a: false, b: _ }.
+        assert!(
+            e120.message.contains("P { a: false, b: _ }"),
+            "witness must surface P's uncovered field; got {}",
+            e120.message,
+        );
+    }
+
+    #[test]
+    fn nested_int_field_requires_wildcard() {
+        // `Some(Int)` with a literal-only field pattern cannot be
+        // exhaustive — Int domain is infinite, so match_witness
+        // returns the generic "_" witness at the field position.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(1) => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Some(_)"),
+            "Int field with only a literal pattern should surface Some(_) witness; got {}",
+            e120.message,
         );
     }
 

@@ -40,9 +40,9 @@ is complete but whose CI run has not yet reported green.
 ## Plan A3 carryover
 
 - Carryover — Full nested Maranget exhaustiveness
-  - status: todo
-  - commits: []
-  - notes: Plan A3 ships top-level coverage only; nested patterns inside ctor fields fall through to `TRAP_NONEXHAUSTIVE_MATCH`. Plan B extends `is_exhaustive` to descend into nested ctor/tuple/record patterns and generates the nested-shape counterexample witness.
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: New recursive `match_witness(scrut_ty, &[&Pattern])` on `Tc` returns the first uncovered witness across user-type variants and their field patterns. `user_type_witness` now delegates to it. Primitive field rules unchanged (Bool → both literals required unless catchall; Int/Char/String/Byte/Fn → wildcard required). Nested witness formatting via `positional_witness_with_hole` and `record_witness_with_hole` — preserves declared field order and fills other slots with `_`. Six new tests cover: Some(true) missing `Some(false)`, Some(false) missing `Some(true)`, both-literals exhaustive, `Some(_)` catchall is exhaustive, `Holds(Leaf)` missing `Holds(Node(_, _, _))` on nested user types, `P { a: true, b: true }` missing `P { a: false, b: _ }`, and Int-field literal-only producing `Some(_)` witness (infinite-domain fallback). E0120 catalog long-form updated.
 - Carryover — Suppress E0120 when an arm body fails type-checking
   - status: done-pending-ci
   - commits: [HEAD]
