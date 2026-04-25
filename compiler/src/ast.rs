@@ -91,13 +91,15 @@ pub enum TypeExpr {
     /// `MyType`, or a generic-parameter reference inside a generic
     /// function/type's signature scope.
     Named(String, Span),
-    /// Plan B Task 47 — generic type application: `List[Int]`,
+    /// Plan B Task 47 / 48 — generic type application: `List[Int]`,
     /// `Map[String, List[Int]]`. Parser produces this whenever a
-    /// type-name token is followed by `[...]`. Semantic consumption
-    /// (monomorph keying by sorted type-argument tuple) is Task 49.
-    /// Until then, downstream passes treat `Apply { name, .. }`
-    /// equivalently to `Named(name, ..)` for compatibility — the
-    /// type arguments are silently ignored.
+    /// type-name token is followed by `[...]`. Plan B Task 48
+    /// resolves it through HM unification: `ty_from_type_expr`
+    /// validates head-name arity against the declared type's
+    /// `generic_params` and recurses into args. Codegen never sees
+    /// `TypeExpr::Apply` — the codegen-entry walker rejects any
+    /// program whose AST still carries it (monomorphization in
+    /// Task 49 erases generics into concrete clones).
     Apply {
         name: String,
         args: Vec<TypeExpr>,

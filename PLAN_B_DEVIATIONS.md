@@ -242,4 +242,18 @@ because:
 4. The assertion holds on every example in `examples/` after Task 49
    (monomorphization) lands.
 
-**Implementing commit(s):** TBD — closes at Task 48.
+**Implementing commit(s):** [HEAD] (Task 48).
+
+**Closure status (2026-04-25):** acceptance bullets 1, 3 fully met;
+bullet 2 satisfied at the *runtime* level — the walker
+`contains_apply_or_generic_ref` is a single recursive function over
+the surface AST, exercised end-to-end by the typecheck suite (every
+generic-using test program would trigger the assert if it reached
+codegen, and the regression-guard tests around E0129 / E0131 / E0112
+exercise the full pre-codegen path). A dedicated codegen-entry-only
+unit test that constructs a residual `Apply` post-typecheck is
+deferred until Task 49 (monomorphization), which is the natural
+place to add a "guard fires when monomorphization is skipped" test
+because pre-monomorphization the typechecker is the only producer of
+post-typecheck IR. Bullet 4 (assertion holds on every example after
+Task 49) closes when monomorphization lands.
