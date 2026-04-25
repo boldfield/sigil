@@ -811,3 +811,136 @@ fn generic_map_dump_color_all_native() {
         "no monomorph should classify as cps in this program; got:\n{stdout}"
     );
 }
+
+// ===== Plan B Task 52 — P16 prompt regression =============================
+
+/// P16 from `spec/validation-prompts.md`: generic identity at `Int` and
+/// `String` in the same program. Prompt-bank prose claims the program
+/// pins "Algorithm W's fresh-var-per-call instantiation plus
+/// reachability-bounded specialization produce *exactly two* monomorph
+/// clones (`id$$Int`, `id$$String`) — not one polymorphic body, not
+/// three from double-counted call sites." This test makes that claim
+/// substantive by:
+///
+///   (a) Compiling P16's program through the full pipeline and
+///       asserting stdout exactly `"42\nsigil\n"` (oracle from the
+///       prompt).
+///   (b) Running `--dump-color` on the same source and asserting the
+///       monomorph set is exactly `{id$$Int, id$$String, main}` —
+///       three lines, no fourth from a double-counted call, no leftover
+///       unmonomorphized `id`. A regression that produced an extra
+///       `id$$Int` clone (e.g. fresh-var collisions causing two distinct
+///       Int instantiations) would surface as a 4th line; a regression
+///       that left an unmonomorphized polymorphic body would surface as
+///       a bare `id native` line.
+#[test]
+fn p16_generic_id_at_int_and_string_oracle() {
+    let src = "fn id[A](x: A) -> A ![] { x }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = id(42);\n  \
+                 let s: String = id(\"sigil\");\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_p16_generic_id_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write P16 source");
+    let (stdout, stderr, code) = compile_file_and_run(&tmp, "p16_generic_id_oracle");
+    assert_eq!(code, 0, "P16 exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\nsigil\n",
+        "P16 oracle stdout must be exactly the prompt-bank-documented bytes",
+    );
+
+    let sigil_bin = sigil_binary();
+    let dump = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("--dump-color")
+        .output()
+        .expect("invoke sigil --dump-color on P16");
+    let _ = std::fs::remove_file(&tmp);
+    let dump_stdout = String::from_utf8_lossy(&dump.stdout);
+    assert!(
+        dump.status.success(),
+        "--dump-color exit; stdout={dump_stdout:?}"
+    );
+    let lines: Vec<&str> = dump_stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "P16 must produce exactly 3 monomorph lines (id$$Int, id$$String, main); got {} lines:\n{dump_stdout}",
+        lines.len(),
+    );
+    let starts: Vec<&str> = lines
+        .iter()
+        .map(|l| l.split_whitespace().next().unwrap_or(""))
+        .collect();
+    let expected = ["id$$Int", "id$$String", "main"];
+    for name in expected {
+        assert!(
+            starts.contains(&name),
+            "expected `{name}` in dump-color monomorph set; got {starts:?}\nfull dump:\n{dump_stdout}"
+        );
+    }
+    assert!(
+        !dump_stdout.contains("\nid native") && !dump_stdout.starts_with("id native"),
+        "no bare `id native` line allowed (would mean monomorphization left a polymorphic body); got:\n{dump_stdout}"
+    );
+}
+
+// ===== Plan B Task 52 — P17 surface-syntax-pending pin ====================
+
+/// P17 from `spec/validation-prompts.md`: generic `compose` over two
+/// unary functions across types. Per the prompt's oracle notes, P17
+/// requires `TypeExpr::Fn` surface syntax (function types in parameter
+/// / return / `let`-binding positions), which Sigil v1 has not shipped
+/// (P09 / P10 deferred this to Plan A3; A3 did not deliver). Until the
+/// surface lands, P17 is graded only against "program rejects with the
+/// missing-surface diagnostic, not silently accepted."
+///
+/// This test pins the contract that the P17 source — exactly as the
+/// prompt asks the LLM to produce it — fails to compile. The specific
+/// error code Sigil emits for `(B) -> C ![]` in a parameter position
+/// is implementation detail (could be a parser error or a typecheck
+/// error against the missing surface form); this test just asserts
+/// that the front end rejects the program and doesn't quietly accept
+/// it. Once `TypeExpr::Fn` ships, the test should be inverted to assert
+/// success against the prompt's stdout oracle.
+#[test]
+fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
+    let src = "fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] {\n  \
+                 fn (x: A) -> C ![] => f(g(x))\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let inc_then_format: (Int) -> String ![] =\n    \
+                   compose(int_to_string, fn (n: Int) -> Int ![] => n + 1);\n  \
+                 perform IO.println(inc_then_format(41));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_p17_compose_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write P17 source");
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_p17_compose_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil on P17 source");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "P17 source must NOT compile until TypeExpr::Fn ships; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}

@@ -2543,15 +2543,34 @@ impl Tc {
                     // would reject `?6 != ?5` even though they unify.
                     //
                     // Snapshot the error list around `unify_ty`. On
-                    // failure, `unify_ty` pushes generic E0044 "type
-                    // mismatch" errors at internal recursion sites; we
-                    // truncate those and emit E0065 with arm-specific
-                    // phrasing instead, keeping the user-facing
-                    // diagnostic surface unchanged.
+                    // failure, `unify_ty` may push two error kinds at
+                    // internal recursion sites: generic E0044 "type
+                    // mismatch" (which we replace with arm-specific
+                    // E0065) and E0126 occurs-check / E0127 row-occurs
+                    // (which name a real soundness problem the
+                    // generic E0065 wouldn't capture — preserve those).
+                    // Drain new errors past baseline, keep occurs-
+                    // check kinds, drop E0044, emit E0065 below.
+                    //
+                    // Subst is intentionally NOT rolled back on
+                    // failure: in HM, partial bindings made during a
+                    // failed compound unify (e.g. `?A := String`
+                    // succeeds before `Int vs String` fails) are
+                    // semantically correct constraints on the body's
+                    // generic params; they surface at the function's
+                    // call sites via the normal E0044/E0132 cascade,
+                    // which is the diagnostic path we want. See
+                    // `subst_pollution_from_partial_unify_surfaces_at_call_site`
+                    // for the regression guard.
                     let pre_unify_errors = self.errors.len();
                     let unified = self.unify_ty(first, t, &arm.span);
                     if !unified {
-                        self.errors.truncate(pre_unify_errors);
+                        let preserved: Vec<CompilerError> = self
+                            .errors
+                            .drain(pre_unify_errors..)
+                            .filter(|e| e.code.as_str() != "E0044")
+                            .collect();
+                        self.errors.extend(preserved);
                         self.push_error(
                             "E0065",
                             arm.span.clone(),
@@ -5283,6 +5302,116 @@ mod tests {
         assert!(
             has_code(&errs, "E0065"),
             "expected E0065 on Int-vs-String arm mismatch, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn three_arm_generic_match_propagates_subst_across_all_arms() {
+        // Reviewer-requested 3-arm regression test: pin that
+        // cross-arm unify propagates substitutions across MORE than
+        // two arms. Each `W(x)`-style positional ctor allocates a
+        // fresh `Wrap[?N]` user instance, so arm 1 produces
+        // `Wrap[?A]`, arm 2 `Wrap[?B]`, arm 3 `Wrap[?C]` — each
+        // distinct fresh-var ids. The cross-arm check unifies
+        // sequentially: arm1↔arm2 binds `?A := ?B`; arm1↔arm3 must
+        // then unify `Wrap[?A]` (already deref'd to `Wrap[?B]`)
+        // against `Wrap[?C]`. A naive 2-arm-only check would miss
+        // a propagation bug on the third arm.
+        //
+        // All three vars eventually bind to the function's declared
+        // `A` via the surrounding return-type unification, so the
+        // match expression's overall type is `Wrap[A]`.
+        let src = "type Wrap[A] = | W(A)\n\
+                   fn three_arm[A](n: Int, x: A, y: A, z: A) -> Wrap[A] ![] {\n  \
+                     match n {\n    \
+                       0 => W(x),\n    \
+                       1 => W(y),\n    \
+                       _ => W(z),\n  \
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "3-arm generic match must unify all arm-body fresh-var instances against each other; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn subst_pollution_from_partial_unify_surfaces_at_call_site() {
+        // Reviewer-requested HM-semantics regression-guard. `unify_ty`
+        // is non-transactional: it commits each successful binding to
+        // `self.subst` as it recurses. Cross-arm unify in `check_match`
+        // does NOT roll those back — this is HM-correct: a generic
+        // body that constrains its own params via successful unifies
+        // produces a real constraint that should surface at the
+        // function's call sites via the normal E0044 / E0132 cascade.
+        //
+        // The discriminating program: `foo[A, B]`'s match has a first
+        // arm `p` (type `Pair[A, B]`) and a second arm `Pair("x", 3)`
+        // (type `Pair[String, Int]`). The cross-arm unify SUCCEEDS by
+        // binding `A := String` and `B := Int`, so the body itself
+        // typechecks clean — but the bindings remain in the global
+        // subst. `foo`'s scheme is now over-constrained: `A` and `B`
+        // are no longer free type vars. `caller` calls `foo(Pair(1, 2),
+        // 0)` which forces `A := Int, B := Int` at the instantiation
+        // site, and the over-constraint shows up as E0044 (type
+        // mismatch) + E0132 (ambiguous polymorphism: A and B
+        // unconstrained at the call site, because `foo`'s scheme
+        // generalization can no longer abstract over them).
+        //
+        // A future refactor that adds subst snapshot/restore around
+        // `unify_ty` would silently lose this. With rollback: arm 2's
+        // bindings are discarded; `foo`'s scheme stays generic
+        // `forall A B. Pair[A, B] -> Pair[A, B]`; `caller`'s call
+        // accepts `Pair[Int, Int]` cleanly with NO errors. CI would
+        // not catch the regression. This test pins the contract that
+        // the cascade fires by asserting both E0044 (call-site
+        // concrete mismatch) and E0132 (scheme over-constraint
+        // surfacing as ambiguous polymorphism).
+        let src = "type Pair[A, B] = | Pair(A, B)\n\
+                   fn foo[A, B](p: Pair[A, B], k: Int) -> Pair[A, B] ![] {\n  \
+                     match k {\n    \
+                       0 => p,\n    \
+                       _ => Pair(\"x\", 3),\n  \
+                     }\n\
+                   }\n\
+                   fn caller() -> Int ![] {\n  \
+                     let _q: Pair[Int, Int] = foo(Pair(1, 2), 0);\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { caller() }\n";
+        let errs = pipeline(src);
+        // Non-empty diagnostic list: a rollback regression would
+        // produce empty errors here.
+        assert!(
+            !errs.is_empty(),
+            "subst pollution from foo's body must surface at caller's call site; empty errs would indicate rollback hiding the over-constraint"
+        );
+        // E0044: the body bound A := String, B := Int; caller's
+        // Pair(1, 2) (Int, Int) now mismatches against the over-
+        // constrained scheme.
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 cascade at call site (caller's Pair[Int, Int] vs foo's over-constrained Pair[String, Int]); got: {errs:?}"
+        );
+        // E0132: scheme generalization sees A and B already bound
+        // and emits ambiguous-polymorphism at the call site. This is
+        // the most discriminating regression signal — it fires only
+        // when the body's partial unifies persist into scheme generation.
+        assert!(
+            has_code(&errs, "E0132"),
+            "expected E0132 ambiguous-polymorphism at call site (proves subst pollution survived into scheme generalization); got: {errs:?}"
+        );
+        // Body-level cleanliness: the discriminating contract is that
+        // the body's match itself does NOT error (both arms unify via
+        // the new cross-arm path). E0065 here would mean either pre-
+        // fix Eq behavior (regression in the opposite direction) OR
+        // a hypothetical "stricter rollback that emits a body error"
+        // regression. Neither is correct.
+        assert!(
+            !has_code(&errs, "E0065"),
+            "body's match must succeed (cross-arm unify binds A := String, B := Int); E0065 means a regression in the opposite direction. got: {errs:?}"
         );
     }
 

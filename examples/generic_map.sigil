@@ -64,7 +64,7 @@ fn map[A](xs: List[A]) -> List[A] ![] {
 fn length[A](xs: List[A]) -> Int ![] {
   match xs {
     Nil => 0,
-    Cons(h, t) => 1 + length(t),
+    Cons(_, t) => 1 + length(t),
   }
 }
 
