@@ -447,7 +447,7 @@ record.
 
 **Implementing commit(s):** Same commit as Task 49.
 
-## 2026-04-25 — [DEVIATION Task 49] Pattern-ctor rewriting via scrutinee Ty
+## 2026-04-25 — [DEVIATION Task 49] Pattern-ctor rewriting via scrutinee Ty + per-sub-pattern field-type threading
 
 **Context:** Plan body says "Typed IR preserved" but does not specify
 how monomorphization should resolve constructor names inside `match`
@@ -462,26 +462,44 @@ index built from the original program's TypeDecls. For
 `Pattern::Ctor { name: "Some", .. }` inside a match whose scrutinee
 typed as `Option[Int]`, the rewriter looks up "Some" → "Option" via
 `ctor_to_type`, observes the scrutinee's args `[Int]`, and produces
-`Some__Int`.
+`Some$$Int`.
 
-Sub-patterns inherit the scrut_ty for their own ctor lookups —
-acceptable in v1 because nested ctor patterns either match the
-scrutinee's type (same args) or refer to a different type whose own
-args resolve via `ctor_to_type` of that ctor's owner-type. v1 doesn't
-yet thread per-sub-pattern type-args through inference; if Plan B
-Task 50+ exposes a need (e.g., GADT-flavoured cases), this gets
-revisited.
+**Per-sub-pattern field-type threading.** Sub-patterns of a generic
+ctor pattern see the field's resolved `Ty` as their inner scrutinee,
+not the outer scrutinee's `Ty`. For `match opt: Option[List[Int]] { Some(Cons(h, t)) => ... }`:
+- Outer pattern `Some(Cons(h, t))` rewrites against scrut_ty `Ty::User("Option", [Ty::User("List", [Ty::Int])])` → mangled `Some$$List$Int`.
+- The variant `Some` of `Option` has positional field of declared type `Named("A")`. Under the substitution `A := List[Int]` (built from `Option`'s `generic_params` zipped with the scrut's args), the field's resolved Ty is `Ty::User("List", [Ty::Int])`.
+- Inner pattern `Cons(h, t)` rewrites against the field-resolved Ty → mangled `Cons$$Int`.
+
+Implemented via `Monomorphizer::variant_field_types` and the
+local `ty_from_type_expr_under_subst` helper in `monomorphize.rs`.
+Mirrors the same surface-name → Ty substitution mechanism the rest
+of the rewrite pass uses; reuses the existing typecheck-built type
+registry for variant field lookup.
 
 **Rationale:** Avoids extending the typecheck instantiation index with
-a third map keyed by pattern span. The two-index lookup already covers
-all v1 patterns the test surface exercises (Option-style sums, single-
-ctor records, nested ctors of the same type).
+a third map keyed by pattern span. The two-index lookup plus the
+field-type threading covers all v1 generic patterns including nested
+ctor patterns (`Option[List[Int]]`, `Result[T, E]`, `Tree[T]`, etc.).
+
+**Round-3 review correction:** an earlier version of this code
+`unreachable!`d when a pattern ctor's owning type didn't match the
+*outer* scrutinee's User type, on the false assumption that v1 surface
+couldn't construct the case. v1 surface fully supports nested ctor
+patterns via `parser.rs::parse_pattern`'s positional-field recursion;
+running `match opt: Option[List[Int]] { Some(Cons(h, t)) => ... }` 
+triggered the panic on a legitimate program. The current per-sub-
+pattern field-type threading is the correct mechanism. Test
+`nested_generic_ctor_pattern_threads_inner_scrut_ty` pins the fix
+against the reviewer's exact reproducer.
 
 **Acceptance criterion for closure:** v1's pattern surface ships
 unchanged in Tasks 50–52; deviation closes when Stage 5 review
 checkpoint accepts the implementation. If Plan C / v2 introduces
-patterns whose sub-patterns reference different generic-type
-instantiations than the scrutinee's, monomorph gains a per-pattern
-instantiation index.
+GADT-style refinement (where a sub-pattern's type depends on
+information *not* recoverable from the parent's variant signature
+alone), monomorph gains a per-pattern instantiation index.
 
-**Implementing commit(s):** Same commit as Task 49.
+**Implementing commit(s):** Initial Task 49 impl commit, plus the
+PR #16 round-3 fix-up (per-sub-pattern field-type threading +
+nested-generic regression test).

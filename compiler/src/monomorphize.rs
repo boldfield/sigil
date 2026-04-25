@@ -889,39 +889,33 @@ impl<'a> Monomorphizer<'a> {
                 span.clone(),
             ),
             Pattern::Ctor { name, fields, span } => {
-                // Determine the type-args from the scrutinee's
-                // concrete type. Three cases:
+                // Resolve the ctor's owning type and determine the
+                // type-arg tuple to mangle the ctor name with.
                 //
-                // 1. Ctor's owning type matches the scrutinee's User
-                //    type AND the type is generic — mangle with the
-                //    scrutinee's args (the common case).
-                // 2. Ctor's owning type is non-generic — no mangling
-                //    needed; pass through.
-                // 3. Ctor's owning type is generic but doesn't match
-                //    the scrutinee's User type. v1 surface can't
-                //    construct this case (a pattern's ctor must
-                //    belong to the scrutinee's type), so it's an
-                //    invariant violation if hit. Reviewer Comment 1
-                //    #3 closure: surface loudly via `unreachable!`
-                //    rather than fall through to no-mangling, which
-                //    would silently produce a codegen lookup miss.
+                // Common case: the ctor belongs to the scrutinee's
+                // outermost User type. The scrutinee's type-args
+                // pin the instantiation directly.
+                //
+                // Nested case (e.g. `match opt: Option[List[Int]] {
+                //   Some(Cons(h, t)) => ... }`): the inner pattern
+                // `Cons(h, t)` belongs to `List`, not `Option`. The
+                // recursive descent into the variant's field types
+                // (below, in the field-type computation for
+                // sub-patterns) propagates the *inner* scrutinee
+                // type so this branch sees `Ty::User("List", [Int])`
+                // when rewriting `Cons(h, t)`.
+                //
+                // Reviewer round-3 (Comment 4318208... regression
+                // closure): an earlier version of this arm
+                // `unreachable!`d when the ctor's owning type didn't
+                // match the scrutinee's User type, on the false
+                // assumption that v1 surface couldn't construct the
+                // case. Nested generic ctor patterns construct it
+                // routinely; the per-sub-pattern field-type
+                // threading below is the correct mechanism.
                 let owning_type = self.ctor_to_type.get(name).cloned();
-                let owning_decl_is_generic = owning_type
-                    .as_deref()
-                    .and_then(|t| self.type_decls.get(t))
-                    .map(|td| !td.generic_params.is_empty())
-                    .unwrap_or(false);
                 let type_args: Vec<Ty> = match (owning_type.as_deref(), scrut_ty) {
                     (Some(t), Some(Ty::User(scrut_name, args))) if t == scrut_name => args.clone(),
-                    (Some(_), _) if owning_decl_is_generic => {
-                        unreachable!(
-                            "monomorphize::rewrite_pattern: Pattern::Ctor `{name}` belongs to a generic type \
-                             whose instantiation is not the surrounding match's scrutinee type. v1 surface \
-                             cannot construct this case (every pattern ctor must match the scrutinee's \
-                             type); a future plan introducing GADT-style refinement needs to thread \
-                             per-sub-pattern type-args through inference"
-                        )
-                    }
                     _ => Vec::new(),
                 };
                 let new_name = if type_args.is_empty() {
@@ -936,31 +930,34 @@ impl<'a> Monomorphizer<'a> {
                         }
                     }
                 }
+                // Compute the per-sub-pattern field Ty under the
+                // owning type's generic-param substitution. For a
+                // sub-pattern at field index `i`, the scrut_ty
+                // becomes the field's declared `TypeExpr` resolved
+                // under (owning_type.generic_params -> type_args).
+                let field_tys = self.variant_field_types(owning_type.as_deref(), name, &type_args);
                 let new_fields = match fields {
                     CtorPatternFields::Unit => CtorPatternFields::Unit,
-                    CtorPatternFields::Positional(ps) => {
-                        // Sub-patterns are over the field types of
-                        // the variant — the field types may be
-                        // generic in the type's params, but Pattern
-                        // nodes don't carry types so the existing
-                        // sub-pattern walk just recurses with the
-                        // same scrut_ty for nested user-type
-                        // patterns. v1 doesn't yet thread per-
-                        // sub-pattern type-args; nested generic
-                        // ctor patterns are handled by re-resolving
-                        // through ctor_to_type at each level.
-                        CtorPatternFields::Positional(
-                            ps.iter()
-                                .map(|sp| self.rewrite_pattern(sp, scrut_ty))
-                                .collect(),
-                        )
-                    }
+                    CtorPatternFields::Positional(ps) => CtorPatternFields::Positional(
+                        ps.iter()
+                            .enumerate()
+                            .map(|(i, sp)| {
+                                let inner_scrut =
+                                    field_tys.as_ref().and_then(|fts| fts.get_positional(i));
+                                self.rewrite_pattern(sp, &inner_scrut)
+                            })
+                            .collect(),
+                    ),
                     CtorPatternFields::Record(fs) => CtorPatternFields::Record(
                         fs.iter()
-                            .map(|f| CtorPatternField {
-                                name: f.name.clone(),
-                                pattern: self.rewrite_pattern(&f.pattern, scrut_ty),
-                                span: f.span.clone(),
+                            .map(|f| {
+                                let inner_scrut =
+                                    field_tys.as_ref().and_then(|fts| fts.get_record(&f.name));
+                                CtorPatternField {
+                                    name: f.name.clone(),
+                                    pattern: self.rewrite_pattern(&f.pattern, &inner_scrut),
+                                    span: f.span.clone(),
+                                }
                             })
                             .collect(),
                     ),
@@ -972,6 +969,104 @@ impl<'a> Monomorphizer<'a> {
                 }
             }
         }
+    }
+
+    /// Resolve a constructor's field types under the owning type's
+    /// per-pattern instantiation, so nested patterns can be rewritten
+    /// against the right inner-scrutinee type.
+    ///
+    /// Returns `None` when the ctor's owning type can't be resolved
+    /// (foreign ctor, malformed input — defensive for the rewrite
+    /// pass even though typecheck would have caught these earlier).
+    fn variant_field_types(
+        &self,
+        owning_type: Option<&str>,
+        ctor_name: &str,
+        type_args: &[Ty],
+    ) -> Option<VariantFieldTys> {
+        let type_name = owning_type?;
+        let td = self.type_decls.get(type_name)?;
+        let variant = td.variants.iter().find(|v| v.name == ctor_name)?;
+        // Build the surface-name → Ty substitution from the type's
+        // declared generic_params and the per-instantiation type_args.
+        // Empty type_args (non-generic owning type) yields an empty
+        // subst; field types resolve as-is.
+        let mut subst: BTreeMap<String, Ty> = BTreeMap::new();
+        for (i, gp) in td.generic_params.iter().enumerate() {
+            if let Some(arg) = type_args.get(i) {
+                subst.insert(gp.name.clone(), arg.clone());
+            }
+        }
+        let resolve = |te: &TypeExpr| ty_from_type_expr_under_subst(te, &subst);
+        match &variant.fields {
+            VariantFields::Unit => Some(VariantFieldTys::Unit),
+            VariantFields::Positional(ts) => Some(VariantFieldTys::Positional(
+                ts.iter().map(resolve).collect(),
+            )),
+            VariantFields::Record(fs) => Some(VariantFieldTys::Record(
+                fs.iter()
+                    .map(|f| (f.name.clone(), resolve(&f.ty)))
+                    .collect(),
+            )),
+        }
+    }
+}
+
+/// Resolved per-pattern field types for a single ctor under one
+/// per-instantiation substitution. Mirrors `VariantFields` shape but
+/// carries `Ty` (resolved) rather than `TypeExpr` (unresolved).
+#[derive(Clone, Debug)]
+enum VariantFieldTys {
+    Unit,
+    Positional(Vec<Ty>),
+    Record(Vec<(String, Ty)>),
+}
+
+impl VariantFieldTys {
+    fn get_positional(&self, i: usize) -> Option<Ty> {
+        match self {
+            VariantFieldTys::Positional(ts) => ts.get(i).cloned(),
+            _ => None,
+        }
+    }
+
+    fn get_record(&self, name: &str) -> Option<Ty> {
+        match self {
+            VariantFieldTys::Record(fs) => {
+                fs.iter().find(|(n, _)| n == name).map(|(_, t)| t.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Resolve a `TypeExpr` to a concrete `Ty` under a surface-name →
+/// `Ty` substitution. Mirrors `typecheck::ty_from_type_expr` but
+/// without typecheck's error-collecting context — we know the input
+/// is well-formed because typecheck already accepted it.
+fn ty_from_type_expr_under_subst(te: &TypeExpr, subst: &BTreeMap<String, Ty>) -> Ty {
+    match te {
+        TypeExpr::Named(name, _) => match name.as_str() {
+            "Int" => Ty::Int,
+            "String" => Ty::String,
+            "Bool" => Ty::Bool,
+            "Char" => Ty::Char,
+            "Byte" => Ty::Byte,
+            "Unit" => Ty::Unit,
+            other => {
+                if let Some(resolved) = subst.get(other) {
+                    resolved.clone()
+                } else {
+                    Ty::User(other.to_string(), Vec::new())
+                }
+            }
+        },
+        TypeExpr::Apply { name, args, .. } => Ty::User(
+            name.clone(),
+            args.iter()
+                .map(|a| ty_from_type_expr_under_subst(a, subst))
+                .collect(),
+        ),
     }
 }
 
@@ -1733,6 +1828,104 @@ mod tests {
         assert!(
             saw_mangled_callee,
             "Wrap$$Int must appear as a call's callee Ident post-mono"
+        );
+    }
+
+    #[test]
+    fn nested_generic_ctor_pattern_threads_inner_scrut_ty() {
+        // Reviewer round-3 regression closure (PR #16 comment
+        // 4318208... — the "Request changes" verdict). This is the
+        // exact reproducer the reviewer ran against the previous
+        // fix-up commit, where `unreachable!` fired on a legitimate
+        // v1 program. The proper fix threads per-sub-pattern field
+        // types so an inner `Cons(h, t)` pattern of `Option[List[Int]]`
+        // sees `Ty::User("List", [Ty::Int])` and mangles to
+        // `Cons$$Int`, while the outer `Some(...)` mangles to
+        // `Some$$List$Int`.
+        let src = r#"
+            type List[A] = | Nil | Cons(A, List[A])
+            type Option[A] = | None | Some(A)
+            fn main() -> Int ![] {
+                let opt: Option[List[Int]] = Some(Cons(1, Nil));
+                match opt {
+                    None => 0,
+                    Some(Cons(h, t)) => h,
+                    Some(Nil) => 99,
+                }
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let main = find_fn(&items, "main").expect("main");
+        // Walk all ctor patterns in main and assert mangling. The
+        // outer Option ctors are mangled with the full type-arg
+        // tuple `List$Int`; the inner List ctors with `Int`.
+        let mut saw_some_outer = false;
+        let mut saw_none_outer = false;
+        let mut saw_cons_inner = false;
+        let mut saw_nil_inner = false;
+        walk_block_for_ctor_patterns(&main.body, &mut |name| {
+            // Reject any unmangled ctor remaining in patterns —
+            // every reachable ctor here belongs to a generic type.
+            assert_ne!(name, "Some", "outer Some must be mangled");
+            assert_ne!(name, "None", "outer None must be mangled");
+            assert_ne!(name, "Cons", "inner Cons must be mangled");
+            assert_ne!(name, "Nil", "inner Nil must be mangled");
+            if name == "Some$$List$Int" {
+                saw_some_outer = true;
+            }
+            if name == "None$$List$Int" {
+                saw_none_outer = true;
+            }
+            if name == "Cons$$Int" {
+                saw_cons_inner = true;
+            }
+            if name == "Nil$$Int" {
+                saw_nil_inner = true;
+            }
+        });
+        assert!(saw_some_outer, "Some$$List$Int must appear");
+        assert!(saw_none_outer, "None$$List$Int must appear");
+        assert!(saw_cons_inner, "Cons$$Int must appear (inner pattern)");
+        assert!(saw_nil_inner, "Nil$$Int must appear (inner pattern)");
+        // All four reachable type instantiations should be cloned.
+        assert!(find_type(&items, "Option$$List$Int").is_some());
+        assert!(find_type(&items, "List$$Int").is_some());
+    }
+
+    #[test]
+    fn effect_row_var_preserved_on_clone_passes_codegen_walker() {
+        // Reviewer round-3 closure: pin the effect_row_var
+        // preservation invariant. Plan B v1 doesn't monomorphize
+        // rows — clones inherit `effect_row_var` from the original.
+        // Codegen-entry walker (relaxed in this PR) must accept
+        // `Some(_)`. An accidental future change that drops
+        // effect_row_var on the clone wouldn't be caught without
+        // this test.
+        let src = r#"
+            fn id[A](x: A) -> A ![ | e] {
+                x
+            }
+            fn main() -> Int ![] {
+                id(42)
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let id_int = find_fn(&items, "id$$Int").expect("id$$Int clone");
+        // Original `id[A]` had a row variable; the clone preserves
+        // it (Plan B v1 row erasure happens at codegen, not mono).
+        assert!(
+            id_int.effect_row_var.is_some(),
+            "row variable should be preserved on the clone (rows aren't monomorphized in v1)"
+        );
+        // Walker now accepts the clone — pre-PR-#16 it would have
+        // rejected at the `effect_row_var.is_some()` arm.
+        let prog = Program {
+            file: "test.sigil".to_string(),
+            items,
+        };
+        assert!(
+            !crate::codegen::contains_apply_or_generic_ref(&prog),
+            "post-mono program with row-polymorphic clone must pass codegen-entry walker"
         );
     }
 
