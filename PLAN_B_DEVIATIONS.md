@@ -94,3 +94,152 @@ No other tag-shift sites exist in the compiler or runtime today.
 **Cross-references:** QUESTIONS.md — the `[PLAN-A3] main-return-tagging`
 entry's Forward-Implications paragraph is now closed by this decision.
 Added a `[PLAN-B] tagged-vs-raw-int-abi` entry pointing back here.
+
+## 2026-04-25 — [VERIFICATION DEBT] Tagged-vs-raw ABI contract enforcement
+
+**Context:** The Task 4.5.8 decision (raw `i64` internally; tag at GC-
+observable boundaries) creates a forward contract that today is just
+documentation. Stage 6 introduces the first non-`main` boundary moments:
+
+- `HandlerFrame` slots that hold continuation-captured `Int` arguments
+  must be **tagged** (heap-observable; the GC scans them).
+- Arena-allocated `NextStep` slots that hold per-step `Int` values must
+  be **raw `i64`** (arena resets per dispatch; not GC-scanned).
+
+Without an enforcement mechanism, the contract is easy to violate by
+accident — a developer writing `frame.args[0] = raw_int` instead of
+`frame.args[0] = tag(raw_int)` would compile and produce wrong-but-
+silent GC behavior under stress.
+
+**Closure point:** Task 56 (Stage 6 — `runtime/src/handlers.rs` and
+`runtime/src/arena.rs` ship the runtime-side data structures).
+
+**Picked mechanism:** **Newtype wrappers around `i64`.** Specifically:
+
+```rust
+// runtime/src/value.rs (or sigil-abi::tag, TBD at Task 56)
+#[repr(transparent)]
+pub struct TaggedInt(i64);
+
+#[repr(transparent)]
+pub struct RawInt(i64);
+
+impl TaggedInt {
+    pub fn from_raw(r: RawInt) -> Self { Self((r.0 as u64).wrapping_shl(TAG_INT_SHIFT) as i64) }
+    pub fn untag(self) -> RawInt { RawInt(self.0 >> TAG_INT_SHIFT) }
+}
+```
+
+`HandlerFrame` slot fields use `TaggedInt`; arena `NextStep` fields use
+`RawInt`. Conversion is explicit at every boundary; the Rust compiler
+rejects any direct assignment of one to the other. Conversion functions
+themselves consume `TAG_INT_SHIFT` from `sigil-abi::tag` so a future ABI
+revision still has a single mechanical edit point.
+
+This was picked over the alternatives because:
+
+- **Newtype wrappers** are statically enforced at compile time — every
+  contract violation is a Rust type error, not a runtime debug-only
+  assertion that production builds elide. The Stage 6 effect runtime
+  will be extensively used; runtime-only checks are weaker.
+- Newtypes are zero-cost (`#[repr(transparent)]`) and the conversion
+  functions inline; the trampoline hot path keeps its tight codegen.
+- The runtime side (where this contract matters most — `sigil_perform`,
+  handler-arm calling convention, arena `alloc` / `reset`) is in Rust;
+  newtypes work cleanly there.
+
+Codegen-side stores into Cranelift IR slots are outside the Rust type
+system (Cranelift `Value`s are opaque IDs). At those sites, a paired
+contract comment cross-referencing this entry is the practical follow-
+through; the test that the contract holds is end-to-end (the Stage 6
+multi-shot stress test in `examples/multishot_stress.sigil` will fail
+under stress if any boundary mis-tags).
+
+**Acceptance criterion for Task 56:**
+1. `runtime/src/handlers.rs` declares `HandlerFrame` with `TaggedInt`
+   for any `Int`-typed slot.
+2. `runtime/src/arena.rs` declares `NextStep` with `RawInt` for any
+   `Int`-typed slot.
+3. The `TaggedInt` <-> `RawInt` conversion functions consume
+   `sigil_abi::tag::TAG_INT_SHIFT` (no inline literal `1`).
+4. Every codegen site that emits a Cranelift store into a handler-frame
+   slot or arena slot has a contract comment cross-referencing this
+   entry and the Task 4.5.8 decision.
+5. The Plan B Task 60 multi-shot stress test passes on both hosts.
+
+**Implementing commit(s):** TBD — closes at Task 56.
+
+## 2026-04-25 — [VERIFICATION DEBT] Codegen path for un-monomorphized generic params
+
+**Context:** Plan B Task 47 grew the AST with `TypeExpr::Apply` and
+parser-only support for generic parameters on `fn` and `type`
+declarations. Today the typechecker rejects every `Apply` with E0124
+and rejects every `effect_row_var` with E0125, so codegen never sees
+generic-applied types or row-polymorphic effect rows.
+
+When Task 48 (HM unification with row variables) lands, those E0124 /
+E0125 rejections turn off — generic params become bound type variables
+that flow through typecheck. Task 49 (monomorphization) then specialises
+generics down to concrete instantiations. Codegen (in particular
+`cranelift_ty_for_type_expr` at `compiler/src/codegen.rs:95`) is
+written assuming monomorphization completed: it consults `head_name()`
+and falls through to `pointer_ty` for any unrecognised name. A
+post-Task-48-pre-Task-49 pipeline could in principle hand codegen an
+un-monomorphized generic-parameter reference (`A` from `fn id[A](x: A)`),
+which would silently lower as `pointer_ty` — wrong for `Int`-typed `A`,
+and undetectable until the program crashes at the platform-call
+boundary.
+
+**Closure point:** Task 48 (Stage 5 — HM unification binds the generic
+parameters; the codegen invariant becomes assertable for the first time).
+
+**Picked mechanism:** **Explicit `assert!` at the codegen entry point**
+that monomorphization has erased every `TypeExpr::Apply` and every
+generic-param reference, paired with an invariant comment at
+`cranelift_ty_for_type_expr` documenting the expectation.
+
+```rust
+// compiler/src/codegen.rs (added at the top of emit_object)
+assert!(
+    !checked.program.contains_apply_or_generic_ref(),
+    "codegen invariant: monomorphization (Task 49) must complete before \
+     codegen; received program still contains TypeExpr::Apply or generic-\
+     parameter references — see PLAN_B_DEVIATIONS verification-debt entry",
+);
+```
+
+`contains_apply_or_generic_ref()` is a small AST walker that scans every
+`TypeExpr` in the checked program for `Apply` nodes and for `Named` nodes
+whose name appears in any in-scope `generic_params` list. The assert
+fires in release builds (cheap walk), so a pipeline ordering bug is
+loud rather than silent.
+
+This was picked over the alternative (codegen detects generic-param
+references mid-emit and emits an internal-compiler-error diagnostic)
+because:
+
+- A single entry-point assert is simpler to audit than per-emission-site
+  ICE machinery. Reviewers see one invariant, one check, one place to
+  update if the contract evolves.
+- Failure mode is loud and immediate (process abort with a clear
+  message) rather than diffuse (an ICE deep in lowering is harder to
+  diagnose; the user sees \"compiler bug\" without knowing why).
+- Cost is one whole-program AST walk per `emit_object` invocation
+  (linear in IR size; cheap relative to Cranelift codegen).
+- The invariant comment at `cranelift_ty_for_type_expr` is the
+  documentation half: future readers see why the catchall is safe.
+
+**Acceptance criterion for Task 48:**
+1. `emit_object` (or its successor entry point if codegen is
+   restructured) opens with an `assert!` that the input IR contains no
+   `TypeExpr::Apply` and no generic-parameter references.
+2. The walker that backs the assert is a single function on
+   `CheckedProgram` (or whatever IR shape Task 48 settles on),
+   exercised by at least one unit test that constructs a program with
+   a residual `Apply` and confirms the assert fires.
+3. `cranelift_ty_for_type_expr` carries an invariant comment cross-
+   referencing this entry and the assertion site.
+4. The assertion holds on every example in `examples/` after Task 49
+   (monomorphization) lands.
+
+**Implementing commit(s):** TBD — closes at Task 48.

@@ -2317,4 +2317,54 @@ mod tests {
         assert_eq!(f.effects, vec!["IO".to_string()]);
         assert!(f.effect_row_var.is_none());
     }
+
+    // ===== Plan B Task 47 — negative-path / malformed-syntax pinning =====
+
+    #[test]
+    fn generic_params_trailing_comma_is_accepted() {
+        // `[A,]` — pin trailing comma as accepted, matching the
+        // param-list / argument-list convention elsewhere in the
+        // grammar. If a future plan adds bounds (`[A: Foo, B,]`) the
+        // trailing-comma rule still applies.
+        let p = parse_str("fn f[A,](x: A) -> A ![] { x }\n");
+        let f = first_fn(&p);
+        assert_eq!(f.generic_params.len(), 1);
+        assert_eq!(f.generic_params[0].name, "A");
+    }
+
+    #[test]
+    fn generic_params_missing_comma_errors() {
+        // `[A B]` — no comma between parameters. The expect(`]`) at
+        // the end of `parse_generic_params` fails on the second ident
+        // and the entire fn-decl parse aborts with at least one error.
+        let errs = parse_errs("fn f[A B](x: A) -> A ![] { x }\n");
+        assert!(
+            !errs.is_empty(),
+            "missing comma between generic params should parse-error"
+        );
+    }
+
+    #[test]
+    fn row_pipe_with_no_row_var_errors() {
+        // `![| ]` — pipe present but no row-variable identifier
+        // follows. Should produce a parser error pointing at the
+        // missing name.
+        let errs = parse_errs("fn f(x: Int) -> Int ![| ] { x }\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("row-variable")),
+            "pipe with absent row-var name should parse-error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn row_pipe_after_effects_with_no_var_errors() {
+        // `![IO |]` — effects followed by pipe followed by `]`. The
+        // pipe branch fires the same "expected row-variable name"
+        // diagnostic as the no-effect case.
+        let errs = parse_errs("fn f(x: Int) -> Int ![IO |] { x }\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("row-variable")),
+            "pipe with no row-var after effects should parse-error; got {errs:?}"
+        );
+    }
 }

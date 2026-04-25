@@ -1444,18 +1444,19 @@ impl Tc {
 
         // (2) exhaustiveness.
         //
-        // User types (Plan A3 task 38.4): top-level Maranget-style
-        // coverage — either a catch-all arm (wildcard or non-promotion
-        // var binding) is present, or every declared variant has an
-        // arm. Missing variants → E0120 with a witness string naming
-        // the uncovered ctor with `_` fields.
+        // User types (Plan A3 task 38.4 + Plan B carryover): full
+        // nested Maranget-style coverage — either a catch-all arm
+        // (wildcard or non-promotion var binding) is present, or
+        // every declared variant has an arm whose nested-pattern
+        // structure also covers the variant's field types. Missing
+        // coverage → E0120 with a witness string naming the
+        // uncovered case (variant + filled-in field witnesses).
+        // Implemented in `match_witness` (commit 62ba42a); the
+        // `TRAP_NONEXHAUSTIVE_MATCH` runtime trap survives only as
+        // a defensive safety net for codegen-internal errors and
+        // for non-exhaustive primitive-scrutinee paths.
         //
         // Primitives (Plan A2): retained `is_exhaustive` rule → E0066.
-        //
-        // Nested non-exhaustiveness inside ctor fields falls through
-        // to the runtime `TRAP_NONEXHAUSTIVE_MATCH` trap in Plan A3
-        // v1 (documented in the E0120 catalog long-form); Plan B
-        // refines to full nested exhaustiveness.
         //
         // Plan B A3-carryover: if any arm had a typecheck error above,
         // skip *only* the user-type E0120 path. The cascade pattern the
@@ -3791,22 +3792,18 @@ mod tests {
 
     #[test]
     fn explicit_row_variable_on_lambda_fires_e0125() {
-        // Lambdas use the same row-var path. Place the lambda inside
-        // a fn body so it actually reaches the typechecker.
+        // Lambdas reach the typechecker through any expression
+        // position. A let RHS works: the lambda's `![IO | e]` row
+        // variable triggers E0125. Incidental noise (E0045 from
+        // binding the Fn-typed lambda to an Int slot, E0112 from `Fn`
+        // not being a v1 primitive) is acceptable — the assertion
+        // only pins the E0125 placeholder, which is the contract
+        // under test.
         let src = "fn main() -> Int ![] {\n  \
-                     let f: Int = 0;\n  \
+                     let f: Fn = (fn (x: Int) -> Int ![IO | e] => x);\n  \
                      0\n\
                    }\n";
-        // Lambda in a let RHS: need a typechecker-reachable surface.
-        // Lambdas typecheck as Ty::Fn via check_lambda; binding to an
-        // Int will mismatch (E0045) but we only assert E0125 is also
-        // present.
-        let _ = src; // placeholder
-        let src2 = "fn main() -> Int ![] {\n  \
-                      let f: Fn = (fn (x: Int) -> Int ![IO | e] => x);\n  \
-                      0\n\
-                    }\n";
-        let errs = pipeline_checked(src2).1;
+        let errs = pipeline_checked(src).1;
         assert!(
             has_code(&errs, "E0125"),
             "expected E0125 for lambda `![IO | e]`, got {errs:?}",

@@ -1279,10 +1279,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ///   the subsequent arm's test.
     ///
     /// Exhaustiveness is enforced at typecheck (E0066 for primitives,
-    /// E0120 for user types). If the chain runs out of arms without a
-    /// catch-all, `TRAP_NONEXHAUSTIVE_MATCH` is a defensive safety net
-    /// — nested-pattern non-exhaustiveness falls through to this trap
-    /// per the Plan A3 v1 scope.
+    /// E0120 for user types — including full nested Maranget coverage
+    /// of ctor field patterns as of the Plan B carryover, commit
+    /// `62ba42a`). `TRAP_NONEXHAUSTIVE_MATCH` is a defensive safety
+    /// net that should not fire on a well-typed program: it guards
+    /// codegen-internal bugs and any future surface (e.g. infinite
+    /// primitive domains under Stage 6 effects) where the typechecker
+    /// cannot statically prove coverage.
     fn lower_match(
         &mut self,
         scrutinee: &crate::ast::Expr,

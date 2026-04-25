@@ -29,9 +29,9 @@ is complete but whose CI run has not yet reported green.
   - commits: [7aed987]
   - notes: Convention already documented in `QUESTIONS.md` header (added in Plan A2 Task 1.5.3). B entries follow the same convention; no header update required.
 - Task 4.5.4 — Extend `.github/workflows/ci.yml` for Plan-B-specific invariants
-  - status: todo
-  - commits: []
-  - notes: Deep-recursion regression test, multi-shot stress test, selective-CPS correctness test. The real tests compile .sigil programs that depend on generics / effects and so can only pass after Stages 5/6 land. Stage 4.5 wires the steps as `scripts/plan-b-invariants.sh` (executed from CI) that currently short-circuits with a guard message; each invariant flips from short-circuit to real assertion as the underlying feature lands.
+  - status: done-pending-ci
+  - commits: [8645f8c]
+  - notes: `scripts/plan-b-invariants.sh` runs as a CI step; three named invariants (deep-recursion trampoline, multi-shot continuation, selective CPS) drive off specific `.sigil` example files and e2e test names. Each prints `[SKIP]` until the underlying example lands in Stage 5/6, at which point the step flips to running the test. CI logs surface the invariant scoreboard from day one so it cannot be dropped before acceptance.
 - Task 4.5.5 — Create `sigil-abi` leaf crate; consolidate stackmap and cross-boundary constants
   - status: done-pending-ci
   - commits: [e1c4286]
