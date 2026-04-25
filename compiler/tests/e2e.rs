@@ -725,3 +725,89 @@ fn dump_color_multi_fn_pure_program() {
         "dump-color output mismatch: {stdout}",
     );
 }
+
+// ===== Plan B Task 51 — `examples/generic_map.sigil` =======================
+
+/// `examples/generic_map.sigil` — first user-authored generic syntax to
+/// flow through the full Sigil pipeline (lex → parse → resolve →
+/// typecheck → elaborate → monomorphize → color → codegen). Pinned by
+/// the PR #17 reviewer as the canonical reproducibility checkpoint for
+/// PR #16 (Task 49)'s `$$` mangling format: prior tests stop at the
+/// monomorph-IR level, and prior end-to-end examples (`option_demo`,
+/// `tree`, `higher_order`, `arith`, `fib_perf`) declare no generic
+/// parameters. This example crosses that gap by declaring `type
+/// List[A]`, `fn map[A]`, and `fn length[A]`, instantiating each at
+/// `Int` and `String` in `main`.
+///
+/// The expected stdout is exactly `"3\n2\n"` — `length(map(Cons(10,
+/// Cons(20, Cons(30, Nil)))))` for the Int instantiation and
+/// `length(map(Cons("a", Cons("b", Nil))))` for the String. The shapes
+/// are deliberately different (3 vs 2) so a copy-paste error between
+/// the two list literals would surface as a length mismatch.
+#[test]
+fn generic_map_example_prints_3_and_2() {
+    let root = workspace_root();
+    let source = root.join("examples/generic_map.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "generic_map_example");
+    assert_eq!(code, 0, "generic_map.sigil exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3\n2\n",
+        "generic_map.sigil stdout must print length(map(ints))=3 then length(map(strs))=2",
+    );
+}
+
+/// `sigil examples/generic_map.sigil --dump-color` — verifies that
+/// Task 50's per-monomorph color inference classifies all four
+/// monomorphs (`map$$Int`, `map$$String`, `length$$Int`,
+/// `length$$String`) plus `main` as native. The bodies have row
+/// `![]` and recurse only on Native peers; `main` has row `![IO]`
+/// and contains no `perform` to a non-IO effect, so it also lands
+/// native via the IO-row classification rule.
+///
+/// This pins the discriminating contract that color inference is
+/// per-monomorph (not per-source-fn): all four List-related clones
+/// share a single source declaration but each gets an independent
+/// color decision, all of which must come back native here. Any
+/// future regression that pessimizes generic-fn color via name-based
+/// rather than instantiation-based analysis will surface as a `cps`
+/// classification on at least one of the four clones.
+#[test]
+fn generic_map_dump_color_all_native() {
+    let root = workspace_root();
+    let source = root.join("examples/generic_map.sigil");
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("--dump-color")
+        .output()
+        .expect("invoke sigil --dump-color");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit; stdout={stdout:?}, stderr={stderr:?}"
+    );
+    // All four monomorphs + main must classify as native. Pin each
+    // expected mangled name independently so a regression on any
+    // single one (e.g. a mangling-format slip on map$$String) lands
+    // on a directed assertion rather than a opaque overall-string
+    // diff.
+    for expected in [
+        "map$$Int native",
+        "map$$String native",
+        "length$$Int native",
+        "length$$String native",
+        "main native",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "expected `{expected}` line in dump-color output, got:\n{stdout}"
+        );
+    }
+    // No CPS classifications should appear — this program is purely
+    // structural and should not require the trampoline.
+    assert!(
+        !stdout.contains(" cps "),
+        "no monomorph should classify as cps in this program; got:\n{stdout}"
+    );
+}

@@ -1,0 +1,79 @@
+// examples/generic_map.sigil
+//
+// Plan B Task 51: first user-authored generic syntax to flow through
+// the full Sigil pipeline (lex → parse → resolve → typecheck →
+// elaborate → monomorphize → color → codegen). PR #16 (Task 49)
+// pinned the canonical `$$`-mangling format via synthetic-program
+// unit tests in `compiler/src/monomorphize.rs`; this example is
+// where that format first survives end-to-end through Cranelift on
+// real source. The `--reproducibility` check in CI then verifies
+// compile-twice byte equality against this binary.
+//
+// Sigil v1's surface syntax does not include `TypeExpr::Fn`
+// (function types are not first-class in parameter / return
+// positions; see `examples/higher_order.sigil` for the inline-IIFE
+// workaround). The design doc's canonical `map[A, B, e](xs: List[A],
+// f: (A) -> B !e) -> List[B] !e` therefore cannot be expressed
+// here. The closest Plan B's surface admits is a structure-
+// preserving traversal — semantically `map id` — together with a
+// generic `length` fold. That pair is enough to exercise:
+//
+//   - Generic type cloning: `type List[A]` produces `List$$Int` and
+//     `List$$String` per Task 49 monomorphization. The recursive
+//     self-reference `Cons(A, List[A])` dedups via `type_seen` so
+//     each instantiation produces exactly one clone.
+//   - Mangled ctor sites: `Nil$$Int`, `Cons$$Int`, `Nil$$String`,
+//     `Cons$$String` allocated through the generic ctor sites
+//     in `map`'s and `length`'s match arms and in `main`'s list
+//     literals.
+//   - Generic fn cloning: `map$$Int` / `map$$String` and
+//     `length$$Int` / `length$$String`, four monomorph clones from
+//     two declared generic fns.
+//   - Pattern matching on generic ctors: scrutinee `Ty::User(_,
+//     args)` propagates into per-sub-pattern field types so the
+//     inner `Cons(h, t)` correctly types `h: A`, `t: List[A]`
+//     against the scrutinee's instantiated `A` (closes the
+//     reviewer-flagged regression that landed Task 49 round 3).
+//   - Color inference (Task 50): every fn here has row `![]` and
+//     transitively calls only Native peers, so all four monomorphs
+//     plus `main` (which has `![IO]`) classify as Native — the
+//     program contains no `perform` to a user-handled effect, only
+//     the IO shortcut. Verifiable via `sigil generic_map.sigil
+//     --dump-color`.
+//   - Final codegen acceptance: post-monomorphization names contain
+//     `$` separators. The lexer rejects `$` in surface syntax so
+//     these names cannot collide with user identifiers; codegen
+//     consumes them as opaque strings into Cranelift's symbol
+//     table.
+//
+// Invariant: writes exactly "3\n2\n" to stdout and exits 0.
+//   length(map(Cons(10, Cons(20, Cons(30, Nil)))))    = 3
+//   length(map(Cons("a", Cons("b", Nil))))            = 2
+
+import std.io
+
+type List[A] = | Nil | Cons(A, List[A])
+
+fn map[A](xs: List[A]) -> List[A] ![] {
+  match xs {
+    Nil => Nil,
+    Cons(h, t) => Cons(h, map(t)),
+  }
+}
+
+fn length[A](xs: List[A]) -> Int ![] {
+  match xs {
+    Nil => 0,
+    Cons(h, t) => 1 + length(t),
+  }
+}
+
+fn main() -> Int ![IO] {
+  let ints: List[Int] = Cons(10, Cons(20, Cons(30, Nil)));
+  let strs: List[String] = Cons("a", Cons("b", Nil));
+  let mapped_ints: List[Int] = map(ints);
+  let mapped_strs: List[String] = map(strs);
+  perform IO.println(int_to_string(length(mapped_ints)));
+  perform IO.println(int_to_string(length(mapped_strs)));
+  0
+}
