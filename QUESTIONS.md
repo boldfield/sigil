@@ -205,3 +205,32 @@ E0041 so any future relaxation revises both sites together.
 internally, tag only at the C ABI boundary" question reopens in Plan B
 alongside effect-runtime ABI decisions. If Plan B resolves it that way,
 main's tagging adjusts as part of the larger change — not independently.
+
+## 2026-04-25 — [PLAN-B] Tagged-vs-raw Int ABI
+
+**Context:** Plan A3 task `main-return-tagging` (resolved 2026-04-24
+above) explicitly reopened the broader ABI question for Plan B: should
+internal user-function calls pass `Int` as tagged 64-bit values, or as
+raw `i64` with tagging only at the C-ABI boundary? Plan B's effect
+runtime (Stage 6 Task 55+) needs a definitive answer.
+
+**Question:** See the PLAN-A3 entry above — options (a), (b), (c)
+restated there. The relevant axis for Plan B is (c) applied to
+user-fn calls and trampoline `NextStep` records.
+
+**Status:** resolved (2026-04-25).
+
+**Resolution:** keep raw `i64` internally in user-function calls;
+tag at the C-ABI boundary only (main's return path). The effect-
+runtime layer adds *new* boundary moments with clear rules:
+
+- Continuations captured across handler boundaries hold tagged Int
+  args (they live on the heap where GC scans them).
+- Arena-allocated `NextStep` records hold raw `i64` args (arena is
+  reset per dispatch, not scanned).
+- `TAG_INT_SHIFT` in `sigil-abi::tag` is the single shift-amount
+  reference; Stage 6 consumes it for its new tagging sites.
+
+Full rationale + audit table in `PLAN_B_DEVIATIONS.md` (same date).
+Cross-reference: the `2026-04-24 — [PLAN-A3] main-return-tagging`
+entry's Forward-Implications paragraph is closed by this resolution.

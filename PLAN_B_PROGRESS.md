@@ -48,9 +48,9 @@ is complete but whose CI run has not yet reported green.
   - commits: [HEAD]
   - notes: `check_match` tracks an `any_arm_erred` flag by snapshotting `self.errors.len()` before/after each arm's pattern + body check. If any arm added to the error list, the exhaustiveness branch (both the `Ty::User` E0120 path and the primitive `is_exhaustive` E0066 path) is skipped for this match so the user fixes the arm-level error first. Three tests: (1) suppression on arm-body type error (arithmetic on String), (2) suppression on arm-pattern E0117 (tuple pattern on user type), (3) regression-guard that E0120 still fires on clean-but-non-exhaustive arms. E0120 catalog long-form updated to describe the suppression behavior.
 - Carryover — Tagged-vs-raw Int ABI decision
-  - status: todo
-  - commits: []
-  - notes: Resolve in QUESTIONS.md alongside `sigil-abi` work in Stage 4.5; audit `ishl_imm 1` / `sshr_imm 1` sites against the chosen rule. Logged as a `[PLAN-B]` QUESTIONS.md entry before the implementing commit.
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: Resolved to option (c) applied narrowly — raw `i64` internally in user-fn calls; tag at the C-ABI boundary only (main return). Stage 6 adds new tagging sites: continuations captured across handlers hold tagged Ints (heap-observable); arena-allocated `NextStep` records hold raw `i64` (arena is reset, not scanned). Both `ishl_imm` / `sshr_imm` sites in `codegen.rs` (main-return tag, C-main-shim untag) replaced their literal `1` with `i64::from(TAG_INT_SHIFT)`. Full rationale + audit table in PLAN_B_DEVIATIONS.md; cross-referenced `[PLAN-B] Tagged-vs-raw Int ABI` entry added to QUESTIONS.md closing the Plan A3 Forward-Implications paragraph.
 
 ## Stage 5 — Parametric polymorphism
 

@@ -61,6 +61,7 @@ use sigil_abi::stackmap::{
     STACKMAP_FLAG_PLACEHOLDER, STACKMAP_HEADER_SIZE, STACKMAP_MAGIC, STACKMAP_RECORD_SIZE,
     STACKMAP_VERSION_PLACEHOLDER,
 };
+use sigil_abi::tag::TAG_INT_SHIFT;
 use sigil_header_constants::{header_word, TAG_CLOSURE};
 
 use crate::ast::{EnvSlotKind, TypeExpr};
@@ -500,9 +501,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
             let tail_val = lowerer.lower_block(&f.body);
 
-            // main tags its Int return with `ishl_imm 1` so the C-main
-            // shim can `sshr_imm 1` → i32. Other user fns return their
-            // raw Cranelift value; callers (user code) use it directly.
+            // main tags its Int return with `ishl_imm TAG_INT_SHIFT`
+            // so the C-main shim can `sshr_imm` → i32. Other user fns
+            // return their raw Cranelift value; callers (user code)
+            // use it directly.
             //
             // Invariant: main's return type is always `Int` — the
             // typechecker rejects any other signature via E0041
@@ -511,8 +513,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // option (a): the main→Int constraint is structural, so
             // this unconditional shift is safe. Any future relaxation
             // of main's type surface must revise this site alongside.
+            //
+            // Plan B A3-carryover decision: the broader tagged-vs-raw
+            // Int ABI question logged in PLAN_B_DEVIATIONS resolved to
+            // "raw i64 within user code, tag at the C-ABI boundary" —
+            // this is the C-ABI boundary. `TAG_INT_SHIFT` centralises
+            // the shift amount so any future ABI revision edits one
+            // constant in `sigil-abi` rather than hunting inline
+            // literals.
             let ret_val = match tail_val {
-                Some(v) if is_main => lowerer.builder.ins().ishl_imm(v, 1),
+                Some(v) if is_main => lowerer.builder.ins().ishl_imm(v, i64::from(TAG_INT_SHIFT)),
                 Some(v) => v,
                 // No tail → Unit. Return a zero of the expected Cranelift
                 // type. For main, ret_ty is i64 (tagged); `iconst(I64, 0)`
@@ -551,9 +561,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
         // user-main returns a tagged Int; untag to i32 via arithmetic
         // right-shift and narrow. Overflow beyond i32 is not observable in
-        // v1 (main returns Int, and hello-world returns 0).
+        // v1 (main returns Int, and hello-world returns 0). The shift
+        // amount is `TAG_INT_SHIFT` — paired with the `ishl_imm` in the
+        // user-main return path above; both sites reference the same
+        // `sigil-abi` constant so they cannot drift.
         let tagged = builder.inst_results(um_call)[0];
-        let untagged = builder.ins().sshr_imm(tagged, 1);
+        let untagged = builder.ins().sshr_imm(tagged, i64::from(TAG_INT_SHIFT));
         let narrowed = builder.ins().ireduce(types::I32, untagged);
         builder.ins().return_(&[narrowed]);
         builder.finalize();
