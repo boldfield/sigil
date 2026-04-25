@@ -29,6 +29,23 @@ pub enum Item {
     /// but a different name. Codegen (task 41) bakes a per-program
     /// type tag (0x10+) into each allocation site.
     Type(Box<TypeDecl>),
+    /// User-defined effect declaration — plan B task 53.
+    ///
+    /// Surface forms:
+    /// - `effect Name[T1, ...] { op: (T, ...) -> R, ... }` — default
+    ///   one-shot continuations. Each operation arm in a handler must
+    ///   use the continuation `k` at most once along every path
+    ///   (linearity check lands in Task 54 / E0220).
+    /// - `effect Name[T1, ...] resumes: many { op: ... -> R, ... }` —
+    ///   opt-in multi-shot. Handler arms may invoke `k` any number
+    ///   of times.
+    ///
+    /// Task 53 (this commit) ships the parser surface only; the
+    /// typechecker emits `E0133` for any `Item::Effect` it sees,
+    /// preventing well-formed effect declarations from reaching
+    /// downstream passes until Task 54 lands the row-polymorphic
+    /// effect-checker and effect registry.
+    Effect(Box<EffectDecl>),
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +143,51 @@ impl TypeExpr {
             TypeExpr::Apply { name, .. } => name,
         }
     }
+}
+
+/// Plan B task 53 — user-defined effect declaration.
+///
+/// `effect Name[T1, ...] { op: (T, ...) -> R, ... }` declares an
+/// algebraic effect with one or more operations. The optional
+/// `resumes: many` annotation between the generic-param header and
+/// the body's opening `{` switches the effect from one-shot (default)
+/// to multi-shot continuations.
+///
+/// Generic parameters declared on the effect (`T1`, ...) are in scope
+/// in every operation's parameter and return types but not in the
+/// effect's row-polymorphism story (effects in v1 do not themselves
+/// have an effect-row signature).
+///
+/// Semantic consumption — registry build, row-polymorphic checking,
+/// linearity check on the per-arm continuation — lands in Task 54.
+/// Until then, the typechecker emits `E0133` for every effect
+/// declaration so a partially-implemented program cannot reach
+/// downstream passes.
+#[derive(Clone, Debug)]
+pub struct EffectDecl {
+    pub name: String,
+    pub name_span: Span,
+    /// Generic-parameter list `[T1, ...]`. Empty when the effect is
+    /// declared without any generic parameters.
+    pub generic_params: Vec<GenericParam>,
+    /// `true` when the source carries `resumes: many` between the
+    /// (possibly empty) generic-param header and the operation list.
+    /// Default `false` (one-shot).
+    pub resumes_many: bool,
+    pub ops: Vec<EffectOp>,
+    pub span: Span,
+}
+
+/// Plan B task 53 — a single operation declared inside an
+/// `effect` body: `name : ( T1, T2, ... ) -> R`. Empty parameter
+/// lists are written `name: () -> R`.
+#[derive(Clone, Debug)]
+pub struct EffectOp {
+    pub name: String,
+    pub name_span: Span,
+    pub params: Vec<TypeExpr>,
+    pub return_type: TypeExpr,
+    pub span: Span,
 }
 
 /// Plan A3 task 37 — user-defined nominal type declaration.
@@ -345,6 +407,86 @@ pub enum Expr {
         fields: Vec<RecordFieldLit>,
         span: Span,
     },
+    /// Plan B task 53 — handler expression:
+    ///
+    /// ```text
+    /// handle <body> with {
+    ///   return(<binding>) => <expr>,
+    ///   <Effect>.<op>(<param>, ..., <k>) => <expr>,
+    ///   ...
+    /// }
+    /// ```
+    ///
+    /// Each operation arm names the discharged effect explicitly via
+    /// `Effect.op` so a single `handle` can dispatch operations from
+    /// more than one effect. The trailing parameter `k` is the
+    /// continuation, bound as a regular value inside the arm body
+    /// (post-CPS, continuations are values). Operation arms must
+    /// declare exactly one continuation parameter — Task 54 emits
+    /// `E0220` if the linearity check rejects multi-use along any
+    /// path of a one-shot effect's arm.
+    ///
+    /// The optional `return(v) => body` arm runs when the wrapped
+    /// expression evaluates to a value normally (no `perform`); `v`
+    /// is bound to that value. When omitted, the handler returns the
+    /// body's value unchanged.
+    ///
+    /// Task 53 (this commit) ships the parser surface only; the
+    /// typechecker emits `E0134` for every `Expr::Handle` it sees so
+    /// that no well-formed handler reaches downstream passes until
+    /// Task 54 / 55 / 56 land the typing rules, CPS transform, and
+    /// runtime support.
+    Handle {
+        body: Box<Expr>,
+        return_arm: Option<Box<HandleReturnArm>>,
+        op_arms: Vec<HandleOpArm>,
+        span: Span,
+    },
+}
+
+/// Plan B task 53 — the optional `return(v) => body` arm of a
+/// `handle` expression.
+#[derive(Clone, Debug)]
+pub struct HandleReturnArm {
+    pub binding: String,
+    pub binding_span: Span,
+    pub body: Expr,
+    pub span: Span,
+}
+
+/// Plan B task 53 — one operation arm of a `handle` expression:
+/// `Effect.op(p1, p2, ..., k) => body`.
+///
+/// Arms are stored separately from the optional `return` arm because
+/// the typechecker (Task 54) treats the two roles distinctly: the
+/// return arm consumes the body's value, while operation arms
+/// consume `perform Effect.op(...)` calls from the body.
+#[derive(Clone, Debug)]
+pub struct HandleOpArm {
+    pub effect: String,
+    pub effect_span: Span,
+    pub op: String,
+    pub op_span: Span,
+    /// Operation parameters bound by the arm, in source order. Their
+    /// types are pinned by the operation's declaration in
+    /// `EffectDecl::ops` and are filled in by Task 54's typechecker.
+    pub params: Vec<HandleArmParam>,
+    /// Continuation binding name. Always present and is the trailing
+    /// parameter of the arm's parameter list at the surface level.
+    /// Bound as a regular value inside the arm body.
+    pub k_name: String,
+    pub k_span: Span,
+    pub body: Expr,
+    pub span: Span,
+}
+
+/// Plan B task 53 — a named parameter binding in a handler op arm.
+/// The corresponding type comes from the matching operation's
+/// declaration in Task 54; the parser only records the binding name.
+#[derive(Clone, Debug)]
+pub struct HandleArmParam {
+    pub name: String,
+    pub span: Span,
 }
 
 /// A `field: value` pair in a record literal `Ctor { f: v, ... }`.
@@ -481,7 +623,8 @@ impl Expr {
             | Expr::Lambda { span: s, .. }
             | Expr::ClosureRecord { span: s, .. }
             | Expr::ClosureEnvLoad { span: s, .. }
-            | Expr::RecordLit { span: s, .. } => s.clone(),
+            | Expr::RecordLit { span: s, .. }
+            | Expr::Handle { span: s, .. } => s.clone(),
             Expr::Perform(p) => p.span.clone(),
             Expr::Block(b) => b.span.clone(),
         }

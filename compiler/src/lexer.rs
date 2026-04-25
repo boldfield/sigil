@@ -17,6 +17,14 @@
 //!   not `|`. Used by `type` decls to separate constructors in
 //!   `type Foo = | Ctor | Ctor(T)`.
 //!
+//! Stage-6 additions (plan B task 53):
+//! - Keywords: `effect`, `handle`, `with`. Surface forms `effect E[T]
+//!   { op: (T) -> R, ... }` (declaration) and `handle expr with { ... }`
+//!   (handler expression). The attributes `resumes` and `many` from
+//!   `effect E resumes: many { ... }` stay as plain identifiers and are
+//!   matched contextually by `parse_effect_decl` — reserving them would
+//!   break user code that legitimately wants `let resumes = 5` etc.
+//!
 //! Unknown characters produce `E0010` at the position of the offending byte.
 //! Every token carries a `Span` back to the source.
 
@@ -37,6 +45,10 @@ pub enum TokenKind {
     Match,
     // Stage-4 (plan A3 task 36).
     Type,
+    // Stage-6 (plan B task 53).
+    Effect,
+    Handle,
+    With,
 
     // atoms
     Ident(String),
@@ -125,6 +137,9 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
                 "else" => TokenKind::Else,
                 "match" => TokenKind::Match,
                 "type" => TokenKind::Type,
+                "effect" => TokenKind::Effect,
+                "handle" => TokenKind::Handle,
+                "with" => TokenKind::With,
                 _ => TokenKind::Ident(ident),
             };
             tokens.push(Token {
@@ -764,6 +779,54 @@ mod tests {
         let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
         assert!(ks.contains(&OrOr));
         assert!(!ks.contains(&Pipe));
+    }
+
+    // ===== Plan B task 53 — Stage-6 tokens ==========================
+
+    #[test]
+    fn effect_handle_with_lex_as_keywords() {
+        let (toks, errs) = lex("x.sigil", "effect handle with");
+        assert!(errs.is_empty(), "{errs:?}");
+        use TokenKind::*;
+        let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
+        assert!(ks.starts_with(&[Effect, Handle, With]));
+    }
+
+    #[test]
+    fn resumes_and_many_remain_idents() {
+        // Context keywords inside `effect E resumes: many { ... }`.
+        // Reserving them would break user variables; the parser handles
+        // them positionally via Ident-string match.
+        let (toks, errs) = lex("x.sigil", "let resumes = many;");
+        assert!(errs.is_empty(), "{errs:?}");
+        use TokenKind::*;
+        let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
+        assert!(ks.contains(&Ident("resumes".into())));
+        assert!(ks.contains(&Ident("many".into())));
+    }
+
+    #[test]
+    fn handle_expr_skeleton_tokenises_cleanly() {
+        let src = "handle e with { return(v) => v, IO.read(k) => 0 }";
+        let (toks, errs) = lex("x.sigil", src);
+        assert!(errs.is_empty(), "{errs:?}");
+        use TokenKind::*;
+        let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
+        assert!(ks.contains(&Handle));
+        assert!(ks.contains(&With));
+        assert!(ks.contains(&Return));
+    }
+
+    #[test]
+    fn effect_decl_skeleton_tokenises_cleanly() {
+        let src = "effect Raise[T] { fail: (String) -> T }";
+        let (toks, errs) = lex("x.sigil", src);
+        assert!(errs.is_empty(), "{errs:?}");
+        use TokenKind::*;
+        let ks: Vec<TokenKind> = toks.iter().map(|t| t.kind.clone()).collect();
+        assert!(ks.contains(&Effect));
+        assert!(ks.contains(&Ident("Raise".into())));
+        assert!(ks.contains(&Ident("fail".into())));
     }
 
     #[test]

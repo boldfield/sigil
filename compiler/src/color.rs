@@ -377,6 +377,38 @@ fn find_non_io_perform_in_expr(e: &Expr) -> Option<(String, String)> {
             }
             None
         }
+        // Plan B task 53 — handler expressions don't taint the
+        // surrounding fn's color: a `handle <body> with { ... }`
+        // *discharges* effects from the body's row at the type-
+        // checker level (Task 54), so for color purposes the body's
+        // performs are scoped to the handler. We still recurse into
+        // the arm bodies to surface their own intrinsic-CPS triggers
+        // (an arm body that itself performs an unhandled non-IO
+        // effect would taint the enclosing fn).
+        //
+        // Color inference runs after typecheck E0134 has already
+        // fired, so reaching this arm is fine — Task 55 will replace
+        // this stub with the proper handler-context color rule the
+        // PR #18 reviewer flagged for Stage 6. For now: just walk
+        // arm bodies (and the optional return arm), skip the wrapped
+        // body itself.
+        Expr::Handle {
+            return_arm,
+            op_arms,
+            ..
+        } => {
+            if let Some(ra) = return_arm {
+                if let Some(p) = find_non_io_perform_in_expr(&ra.body) {
+                    return Some(p);
+                }
+            }
+            for arm in op_arms {
+                if let Some(p) = find_non_io_perform_in_expr(&arm.body) {
+                    return Some(p);
+                }
+            }
+            None
+        }
     }
 }
 
@@ -486,6 +518,24 @@ fn collect_calls_in_expr(
         Expr::RecordLit { fields, .. } => {
             for f in fields {
                 collect_calls_in_expr(&f.value, fn_index, calls, out);
+            }
+        }
+        // Plan B task 53 — handler expressions: each arm body's
+        // calls contribute to the enclosing fn's call graph just like
+        // any other compound expression. The wrapped body's calls
+        // also contribute (they execute under the handler).
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            ..
+        } => {
+            collect_calls_in_expr(body, fn_index, calls, out);
+            if let Some(ra) = return_arm {
+                collect_calls_in_expr(&ra.body, fn_index, calls, out);
+            }
+            for arm in op_arms {
+                collect_calls_in_expr(&arm.body, fn_index, calls, out);
             }
         }
     }
@@ -942,6 +992,20 @@ mod tests {
             | Expr::BoolLit(_, _)
             | Expr::CharLit(_, _)
             | Expr::ClosureEnvLoad { .. } => {}
+            Expr::Handle {
+                body,
+                return_arm,
+                op_arms,
+                ..
+            } => {
+                walk_expr_for_fn_idents(body, fn_names, out);
+                if let Some(ra) = return_arm {
+                    walk_expr_for_fn_idents(&ra.body, fn_names, out);
+                }
+                for arm in op_arms {
+                    walk_expr_for_fn_idents(&arm.body, fn_names, out);
+                }
+            }
         }
     }
 

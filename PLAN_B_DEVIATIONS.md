@@ -558,3 +558,45 @@ and the three new Stage 6 perf tests, and updates this entry to
 
 **Implementing commit:** None yet — this entry tracks the debt
 forward. Surfacing entry shipped with PR #18 review fixups.
+
+---
+
+## [DEVIATION Task 53] Handler op-arm shape uses qualified `Effect.op(...)`
+
+**Plan body says** (Stage 6 task 53, paraphrased): handler arms have
+the shape `op(args, k) => arm`.
+
+**Implemented form** (this commit): `Effect.op(p1, ..., k) => arm` —
+the discharged effect's name is required as a prefix on every
+operation arm.
+
+**Why the deviation:**
+
+1. A single `handle` block can discharge operations from more than
+   one effect. The bare `op(...)` form would require Task 54 to
+   resolve each `op` against the entire effect registry to disambiguate
+   when two effects declare an op of the same name; qualified form
+   makes the discharge target lexically explicit and removes that
+   resolution ambiguity at the parser level.
+2. Symmetry with `perform Effect.op(args)`: both the produce-side
+   (`perform`) and consume-side (handler arm) name the effect
+   explicitly. Sigil's effect-typing rules (Task 54) treat an arm as
+   "discharges Effect's op"; the surface mirroring keeps that rule
+   readable without an effect-inference step.
+3. The plan body's bare-op shape was illustrative — the design doc
+   `docs/plans/2026-04-21-sigil-design.md` does not lock in the
+   parser surface, only the typing semantics.
+
+**Cost of the deviation:** programs read slightly more verbosely
+(`Raise.fail(msg, k) => 0` vs. `fail(msg, k) => 0`). Acceptable for
+v1 surface clarity. If Task 54+ ergonomic study finds that the
+unqualified form is overwhelmingly preferred, a future plan can lift
+the qualifier and resolve operation names against the typed handler
+context — this is a strict-extension change, not a breaking one
+(qualified arms remain valid).
+
+**Implementing commit:** Task 53 parser scaffolding (this PR).
+**Closure point:** open — Task 54 review can revisit the choice
+without code-rewrite cost (the AST already records both
+`effect` and `op` names; an unqualified form would just elide the
+`effect` field at parse time).

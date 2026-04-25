@@ -160,6 +160,15 @@ fn program_has_generics(program: &Program) -> bool {
                 }
             }
             Item::Import(_) => {}
+            // Plan B task 53 — effect declarations carry generic params
+            // for op signatures, but Task 49's reachability-bounded
+            // monomorphizer doesn't have a clone path for them yet. Task
+            // 54+ adds the effect registry; until then, typecheck has
+            // already emitted E0133, so any Item::Effect reaching here
+            // is on the error path. Don't trigger the full mono pass
+            // just because of an Item::Effect — keep the non-generic
+            // fast path live so non-effect programs stay zero-overhead.
+            Item::Effect(_) => {}
         }
     }
     false
@@ -337,6 +346,12 @@ impl<'a> Monomorphizer<'a> {
                     }
                 }
                 Item::Import(_) => {}
+                // Plan B task 53 — effect decls do not yet have an
+                // entry in the registry; Task 54 adds it. Skipping
+                // here keeps Task 53's parser-only commit compile-
+                // clean without prematurely committing to a registry
+                // shape Task 54 might revise.
+                Item::Effect(_) => {}
             }
         }
         Self {
@@ -391,10 +406,14 @@ impl<'a> Monomorphizer<'a> {
         // their relative ordering doesn't matter for codegen but
         // preserving it keeps the output diff-readable against input.
         let mut out: Vec<Item> = Vec::new();
-        // Imports first.
+        // Imports first; effect decls (Plan B task 53) preserved
+        // alongside imports so a future Task 54 registry build sees
+        // the full surface set even after monomorphization clones
+        // generic fns / types.
         for item in self.original_items {
-            if let Item::Import(_) = item {
-                out.push(item.clone());
+            match item {
+                Item::Import(_) | Item::Effect(_) => out.push(item.clone()),
+                _ => {}
             }
         }
         for td in self.output_types {
@@ -825,6 +844,48 @@ impl<'a> Monomorphizer<'a> {
                             span: f.span.clone(),
                         })
                         .collect(),
+                    span: span.clone(),
+                }
+            }
+            // Plan B task 53 — handler expressions pass through
+            // monomorphize with substitution applied to their body
+            // and arm bodies. The handler arms' op-parameter types
+            // come from the matching effect decl (Task 54), not from
+            // the AST shape, so this layer doesn't need to rewrite
+            // type expressions inside the arms themselves.
+            Expr::Handle {
+                body,
+                return_arm,
+                op_arms,
+                span,
+            } => {
+                let new_body = self.rewrite_expr(body, subst);
+                let new_return_arm = return_arm.as_ref().map(|ra| {
+                    Box::new(crate::ast::HandleReturnArm {
+                        binding: ra.binding.clone(),
+                        binding_span: ra.binding_span.clone(),
+                        body: self.rewrite_expr(&ra.body, subst),
+                        span: ra.span.clone(),
+                    })
+                });
+                let new_op_arms = op_arms
+                    .iter()
+                    .map(|arm| crate::ast::HandleOpArm {
+                        effect: arm.effect.clone(),
+                        effect_span: arm.effect_span.clone(),
+                        op: arm.op.clone(),
+                        op_span: arm.op_span.clone(),
+                        params: arm.params.clone(),
+                        k_name: arm.k_name.clone(),
+                        k_span: arm.k_span.clone(),
+                        body: self.rewrite_expr(&arm.body, subst),
+                        span: arm.span.clone(),
+                    })
+                    .collect();
+                Expr::Handle {
+                    body: Box::new(new_body),
+                    return_arm: new_return_arm,
+                    op_arms: new_op_arms,
                     span: span.clone(),
                 }
             }

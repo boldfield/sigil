@@ -531,6 +531,30 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 }
                 tc.current_generic_subst = saved_generic_subst;
             }
+            // Plan B task 53 — `effect Name[T] { op: ... }` is parsed
+            // but the registry build, row-polymorphic effect typing,
+            // and the linearity check all land in Task 54. Emit
+            // `E0133` once per effect declaration so partial Plan B
+            // programs cannot reach downstream passes; still walk the
+            // op-decl types so an unrelated type error in an op's
+            // signature surfaces in the same pass.
+            Item::Effect(ed) => {
+                tc.push_error(
+                    "E0133",
+                    ed.span.clone(),
+                    format!("`effect {}` is not yet supported (Plan B Task 54)", ed.name),
+                );
+                let saved_generic_subst = std::mem::take(&mut tc.current_generic_subst);
+                let (gs, _) = tc.fresh_generic_subst(&ed.generic_params);
+                tc.current_generic_subst = gs;
+                for op in &ed.ops {
+                    for p in &op.params {
+                        tc.check_type_expr_known(p);
+                    }
+                    tc.check_type_expr_known(&op.return_type);
+                }
+                tc.current_generic_subst = saved_generic_subst;
+            }
         }
     }
     let has_main = program
@@ -586,6 +610,11 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 );
             }
             Item::Import(_) => {}
+            // Plan B task 53 — effect declarations carry their own
+            // generic params for op signatures, but they don't
+            // participate in the call-site / ctor-site instantiation
+            // resolution this builder is wired to. Skip.
+            Item::Effect(_) => {}
         }
     }
     let pending_calls = std::mem::take(&mut tc.pending_call_instantiations);
@@ -2108,6 +2137,35 @@ impl Tc {
             Expr::RecordLit { name, fields, span } => {
                 self.resolve_ctor_record_use(name, fields, span, row)
             }
+            // Plan B task 53 — `handle <body> with { ... }` is parsed
+            // but its typing rules (handler signature, effect-row
+            // discharge, one-shot linearity check) land in Task 54.
+            // Emit `E0134` to keep partial Plan B programs from
+            // reaching downstream passes, then walk the children so
+            // any nested type errors still surface in the same compile
+            // pass (the user can fix them in parallel with waiting
+            // for Task 54). Returns `None` so the surrounding context
+            // does not double-report on the resulting type.
+            Expr::Handle {
+                body,
+                return_arm,
+                op_arms,
+                span,
+            } => {
+                self.push_error(
+                    "E0134",
+                    span.clone(),
+                    "`handle` expression is not yet supported (Plan B Task 54)",
+                );
+                let _ = self.check_expr(body, row);
+                if let Some(ra) = return_arm {
+                    let _ = self.check_expr(&ra.body, row);
+                }
+                for arm in op_arms {
+                    let _ = self.check_expr(&arm.body, row);
+                }
+                None
+            }
         }
     }
 
@@ -3567,6 +3625,42 @@ fn collect_free_vars(
                     walk(&f.value, outer_names, param_names, locals, captures);
                 }
             }
+            // Plan B task 53 — `handle <body> with { ... }` participates
+            // in capture analysis like any other expression: the body
+            // and arm bodies may reference outer-scope identifiers.
+            // Each arm introduces its own bindings (the `return` arm's
+            // single value, an op arm's parameter list and its
+            // continuation `k`); snapshot/restore `locals` at every
+            // arm boundary so the bindings don't leak out into peer
+            // arms or the surrounding scope.
+            //
+            // Capture analysis runs strictly before closure conversion;
+            // a `handle` reaching this code is fine — the typecheck
+            // E0134 flag at `Expr::Handle` is non-fatal and downstream
+            // passes still need a structurally correct walk.
+            Expr::Handle {
+                body,
+                return_arm,
+                op_arms,
+                ..
+            } => {
+                walk(body, outer_names, param_names, locals, captures);
+                if let Some(ra) = return_arm {
+                    let saved = locals.clone();
+                    locals.insert(ra.binding.clone());
+                    walk(&ra.body, outer_names, param_names, locals, captures);
+                    *locals = saved;
+                }
+                for arm in op_arms {
+                    let saved = locals.clone();
+                    for p in &arm.params {
+                        locals.insert(p.name.clone());
+                    }
+                    locals.insert(arm.k_name.clone());
+                    walk(&arm.body, outer_names, param_names, locals, captures);
+                    *locals = saved;
+                }
+            }
         }
     }
 
@@ -3792,6 +3886,14 @@ mod tests {
             // E0001. Review of PR #12 flagged the original E0001
             // regression for this surface form.
             "type Point = { x: Int, y: Int }\nfn main() -> Int ![] { let p: Int = Point { x: 1, y: 2 }; 0 }\n",
+            // Plan B task 53: every new staged-feature surface form
+            // must emit a real catalog code rather than E0001. These
+            // programs are well-formed in Plan B's surface but fire
+            // E0133 / E0134 until Tasks 54+55 land — the discipline
+            // sweep proves the staged diagnostic fires cleanly without
+            // a fall-through to the internal-only code.
+            "effect Raise { fail: (String) -> Int }\nfn main() -> Int ![] { 0 }\n",
+            "fn main() -> Int ![] { handle 0 with { E.op(k) => 0 } }\n",
         ];
         for src in programs {
             let errs = pipeline(src);
@@ -6028,6 +6130,90 @@ mod tests {
         assert!(
             hard.is_empty(),
             "outer-fn-bound polymorphism should not fire E0132; got: {hard:?}"
+        );
+    }
+
+    // ===== Plan B task 53 — staged-feature stubs ===========================
+
+    #[test]
+    fn effect_decl_emits_e0133() {
+        let src = "effect Raise { fail: (String) -> Int }\nfn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0133"),
+            "effect declaration should emit E0133 (Plan B Task 53 staged stub); got: {errs:?}"
+        );
+        assert!(
+            !has_code(&errs, "E0001"),
+            "must not surface E0001: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn effect_decl_with_invalid_op_type_still_emits_e0133() {
+        // The invalid op return type `Bogus` would normally fire E0112
+        // for an unknown type; the staged E0133 is independent from
+        // that. Both errors appear so the user can fix the type
+        // problem in parallel with waiting for Task 54.
+        let src = "effect E { fail: () -> Bogus }\nfn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0133"), "expected E0133: {errs:?}");
+        assert!(has_code(&errs, "E0112"), "expected E0112 too: {errs:?}");
+    }
+
+    #[test]
+    fn handle_expr_emits_e0134() {
+        let src = "fn main() -> Int ![] { handle 0 with { E.op(k) => 0 } }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0134"),
+            "handle expression should emit E0134 (Plan B Task 53 staged stub); got: {errs:?}"
+        );
+        assert!(
+            !has_code(&errs, "E0001"),
+            "must not surface E0001: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_expr_with_nested_type_error_surfaces_both() {
+        // Recursing into the body during the E0134 path lets a nested
+        // type error in the body fire alongside the staged-feature
+        // diagnostic. Confirms the E0134 arm walks children rather
+        // than short-circuiting after one error.
+        let src = "fn main() -> Int ![] {\n\
+                   let n: Int = handle (true && 1) with { E.op(k) => 0 };\n\
+                   n\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        // `true && 1` mismatches at the binop's right-hand side.
+        assert!(
+            errs.iter()
+                .any(|e| e.code.as_str().starts_with("E006")
+                    || e.code.as_str().starts_with("E004")),
+            "expected nested binop type error: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_arm_bodies_walked_during_e0134_emission() {
+        // Arm bodies are also walked so an arm-body type error
+        // surfaces alongside E0134. Same rationale as the body walk.
+        let src = "fn main() -> Int ![] {\n\
+                   let n: Int = handle 0 with { E.op(k) => true };\n\
+                   n\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        // `let n: Int = ... where the handle's E0134 returns None for
+        // its type, the let-binding's expected/got mismatch may not
+        // fire because we returned `None`. The point of this test is
+        // just that the arm body's `true` doesn't trigger an internal
+        // panic and doesn't bypass E0134.
+        assert!(
+            !has_code(&errs, "E0001"),
+            "must not surface E0001: {errs:?}"
         );
     }
 }
