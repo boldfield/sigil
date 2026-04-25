@@ -190,6 +190,14 @@ pub(crate) fn contains_apply_or_generic_ref(program: &crate::ast::Program) -> bo
                 }
             }
             Item::Import(_) => {}
+            // Plan B task 53 — `effect` declarations never reach
+            // codegen on a successful compile (typecheck E0133 stops
+            // them). Returning `true` here is a defensive guard: if a
+            // future refactor accidentally lets one through, the
+            // codegen-entry walker rejects with a hard assertion
+            // rather than silently producing a binary that ignores
+            // the declaration. Plan B Task 54 lifts this guard.
+            Item::Effect(_) => return true,
         }
     }
     false
@@ -339,6 +347,37 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
         Expr::RecordLit { fields, .. } => {
             for f in fields {
                 if expr_uses_generic(&f.value, params) {
+                    return true;
+                }
+            }
+            false
+        }
+        // Plan B task 53 — dead code today. Any program that reaches
+        // codegen with an `Expr::Handle` already triggered the
+        // `Item::Effect → return true` short-circuit at the top of
+        // `contains_apply_or_generic_ref`, since a `handle` requires
+        // an `effect` decl in scope to typecheck under Task 54+ (and
+        // typecheck E0134 stops it before then anyway). This arm is
+        // kept for the case where Task 54 lifts the `Item::Effect`
+        // gate but `Expr::Handle` still needs a guard during the
+        // CPS-transform handoff in Task 55. Reviewer feedback PR #19
+        // item 4.
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            ..
+        } => {
+            if expr_uses_generic(body, params) {
+                return true;
+            }
+            if let Some(ra) = return_arm {
+                if expr_uses_generic(&ra.body, params) {
+                    return true;
+                }
+            }
+            for arm in op_arms {
+                if expr_uses_generic(&arm.body, params) {
                     return true;
                 }
             }
@@ -1148,6 +1187,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     })
                     .collect();
                 self.lower_ctor_alloc(&type_name, variant_idx, &ordered_values)
+            }
+            Expr::Handle { .. } => {
+                // Typecheck (Plan B Task 53) emits E0134 for any
+                // `handle` expression; the codegen-entry walker
+                // additionally hard-rejects programs that contain one.
+                // Reaching this arm means an upstream invariant broke.
+                // Plan B Task 55 replaces this `unreachable!` with the
+                // CPS transform's expansion to `sigil_perform` /
+                // `sigil_handle_push` calls.
+                unreachable!(
+                    "codegen: Expr::Handle should be rejected by typecheck E0134 + entry walker before codegen"
+                )
             }
         }
     }
@@ -2013,6 +2064,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 | crate::ast::EnvSlotKind::Closure
                 | crate::ast::EnvSlotKind::User => self.pointer_ty,
             },
+            // Plan B task 53 — handler expressions are rejected by
+            // typecheck E0134 + the codegen-entry walker before this
+            // type predictor runs. Reaching this arm means an upstream
+            // invariant broke; trip `unreachable!` rather than guess
+            // a Cranelift type for a node Task 55's CPS transform
+            // hasn't yet expanded.
+            Expr::Handle { .. } => unreachable!(
+                "type_of_expr: Expr::Handle is rejected by typecheck E0134 + codegen entry walker"
+            ),
         }
     }
 }

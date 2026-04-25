@@ -558,3 +558,75 @@ and the three new Stage 6 perf tests, and updates this entry to
 
 **Implementing commit:** None yet — this entry tracks the debt
 forward. Surfacing entry shipped with PR #18 review fixups.
+
+---
+
+## [DEVIATION Task 53] Handler op-arm shape uses qualified `Effect.op(...)`
+
+**Plan body says** (Stage 6 task 53, paraphrased): handler arms have
+the shape `op(args, k) => arm`.
+
+**Implemented form** (this commit): `Effect.op(p1, ..., k) => arm` —
+the discharged effect's name is required as a prefix on every
+operation arm.
+
+**Why the deviation:**
+
+1. A single `handle` block can discharge operations from more than
+   one effect. The bare `op(...)` form would require Task 54 to
+   resolve each `op` against the entire effect registry to disambiguate
+   when two effects declare an op of the same name; qualified form
+   makes the discharge target lexically explicit and removes that
+   resolution ambiguity at the parser level.
+2. Symmetry with `perform Effect.op(args)`: both the produce-side
+   (`perform`) and consume-side (handler arm) name the effect
+   explicitly. Sigil's effect-typing rules (Task 54) treat an arm as
+   "discharges Effect's op"; the surface mirroring keeps that rule
+   readable without an effect-inference step.
+3. The plan body's bare-op shape was illustrative — the design doc
+   `docs/plans/2026-04-21-sigil-design.md` does not lock in the
+   parser surface, only the typing semantics.
+
+**Cost of the deviation:** programs read slightly more verbosely
+(`Raise.fail(msg, k) => 0` vs. `fail(msg, k) => 0`). Acceptable for
+v1 surface clarity. If Task 54+ ergonomic study finds that the
+unqualified form is overwhelmingly preferred, a future plan can lift
+the qualifier and resolve operation names against the typed handler
+context — this is a strict-extension change, not a breaking one
+(qualified arms remain valid).
+
+**Implementing commit:** Task 53 parser scaffolding (this PR).
+**Closure point:** open — tracked by `QUESTIONS.md` entry
+`[PLAN-B] Task 54: revisit handler arm surface (qualified-only vs
+bare-op-as-sugar)` (2026-04-25). Task 54 review can revisit the
+choice without code-rewrite cost (the AST already records both
+`effect` and `op` names; an unqualified form would just relax the
+`effect` field to `Option<String>` and let the typechecker's
+context fill it in).
+
+---
+
+## [DEVIATION Task 53] `resumes` and `many` shipped as context-sensitive idents (not lexer keywords)
+
+**Plan body / design doc says** (Stage 6 task 53 + `docs/plans/2026-04-21-sigil-design.md:61` keyword list, paraphrased): the `effect Name resumes: many { ... }` surface form lists `resumes` and `many` alongside `effect`, `handle`, `with` in the keyword set.
+
+**Implemented form** (this commit): only `effect`, `handle`, and `with` are reserved by the lexer. The attribute words `resumes` and `many` stay as plain `TokenKind::Ident(_)` and are matched contextually by string inside `parse_effect_decl` via the dedicated `eat_resumes_many_attr` helper.
+
+**Why the deviation:**
+
+1. **Narrower name reservation.** Reserving `resumes` and `many` as lexer keywords would break user code that legitimately wants `let resumes = 5` or `let many = 9`. Both names are common English words; the cost of reserving them outweighs the benefit, since the surface only references them in the single `effect <Name> resumes : many { ... }` position where context-sensitive matching is unambiguous.
+
+2. **Contextual unambiguity.** The position immediately after `effect Name` (and after the optional `[GenericParams]` header) is the only place either word carries semantic meaning. The parser sees the structure `effect Name [Generics?] (Ident=`resumes` Colon Ident=`many`)? LBrace ...`; the three-token sequence is unambiguous against any other valid continuation (which would be `LBrace` directly).
+
+3. **Forward-compatible.** A future plan that introduces additional `effect`-decl attributes (e.g., a hypothetical `resumes: at_most_one`, or a `linear: true` annotation) can extend the contextual matcher without growing the lexer keyword table.
+
+**Test coverage for the deviation:**
+
+- `lexer::tests::resumes_and_many_remain_idents` pins that `let resumes = many;` lexes as plain Idents.
+- `parser::tests::resumes_outside_effect_decl_remains_ident` is the parse-side regression guard: `let resumes: Int = 5; let many: Int = 9; resumes` round-trips through the full parser without misclassifying the names.
+- `parser::tests::effect_decl_resumes_without_many_errors` pins the `:` requirement and the `many`-only restriction inside the attribute position.
+
+**Cost of the deviation:** zero, in practice. Programs that want either word as a variable name are not regressed; programs that want the multi-shot annotation continue to write `effect E resumes: many { ... }` exactly as the design doc shows.
+
+**Implementing commit:** Task 53 parser scaffolding (this PR).
+**Closure point:** closed — context-sensitive matching is the chosen long-term form. If Task 54+ ergonomic data argues for adding `resumes` to the keyword set later, the change is a strict reservation: any program that broke under it would have used a now-reserved word as an identifier. The lexer test serves as the regression guard.

@@ -41,6 +41,17 @@
 //! # `'(' arg_list? ')'` chains. Task 29 only introduces `lambda_expr`
 //! # as a new grammar form.)
 //!
+//! # Stage 6 grammar additions (plan B task 53).
+//! program   := (import | fn_decl | type_decl | effect_decl)*
+//! effect_decl  := 'effect' ident generic_params? resumes_attr? '{' effect_op (',' effect_op)* ','? '}'
+//! resumes_attr := 'resumes' ':' 'many'   # context idents matched by string
+//! effect_op    := ident ':' '(' (type (',' type)* ','?)? ')' '->' type
+//! primary   := ... | 'handle' expr 'with' '{' handle_arm (',' handle_arm)* ','? '}'
+//! handle_arm   := 'return' '(' ident ')' '=>' expr     # return arm
+//!              | ident '.' ident '(' (ident (',' ident)* ','?) ')' '=>' expr
+//!                # operation arm: trailing ident is the continuation
+//!                # binding `k`. At least one parameter is required.
+//!
 //! # Stage 4 grammar additions (plan A3 task 37).
 //! program   := (import | fn_decl | type_decl)*
 //! type_decl := 'type' ident '=' ('|' variant)+
@@ -203,9 +214,16 @@ impl<'a> Parser<'a> {
                     Some(t) => items.push(Item::Type(Box::new(t))),
                     None => self.synchronise_to_semi_or_brace(),
                 },
+                TokenKind::Effect => match self.parse_effect_decl() {
+                    Some(e) => items.push(Item::Effect(Box::new(e))),
+                    None => self.synchronise_to_semi_or_brace(),
+                },
                 _ => {
                     let span = self.peek().span.clone();
-                    self.err(span, "expected `import`, `fn`, or `type` at top level");
+                    self.err(
+                        span,
+                        "expected `import`, `fn`, `type`, or `effect` at top level",
+                    );
                     self.synchronise_to_semi_or_brace();
                 }
             }
@@ -556,6 +574,148 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Plan B task 53 — parse a top-level `effect` declaration.
+    ///
+    /// Grammar:
+    /// ```text
+    /// effect Name [GenericParams] (resumes : many)? { op_decl, op_decl, ... }
+    /// op_decl := name : ( type, ... ) -> type
+    /// ```
+    ///
+    /// `resumes` and `many` are matched as plain Idents (not lexer
+    /// keywords) so the surface declaration is the only place those
+    /// names carry semantic meaning. A trailing comma after the last
+    /// op is allowed, mirroring the convention in record field
+    /// declarations and match arms.
+    fn parse_effect_decl(&mut self) -> Option<EffectDecl> {
+        let start = self.peek().span.clone();
+        self.expect(&TokenKind::Effect, "`effect`")?;
+        let name_tok = self.peek().clone();
+        let name = match name_tok.kind {
+            TokenKind::Ident(ref n) => {
+                self.advance();
+                n.clone()
+            }
+            _ => {
+                self.err(name_tok.span.clone(), "expected effect name after `effect`");
+                return None;
+            }
+        };
+        let name_span = name_tok.span;
+
+        // Optional `[A, B]` generic-parameter list between the effect
+        // name and the optional `resumes: many` attribute / opening `{`.
+        let generic_params = self.parse_generic_params()?;
+
+        // Optional `resumes : many` attribute. Matched on Ident strings
+        // so `resumes` and `many` are reusable as plain user identifiers
+        // outside this position.
+        let resumes_many = self.eat_resumes_many_attr()?;
+
+        self.expect(&TokenKind::LBrace, "`{` opening effect body")?;
+        let mut ops: Vec<EffectOp> = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            let op = self.parse_effect_op()?;
+            ops.push(op);
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}` closing effect body")?;
+        if ops.is_empty() {
+            // An effect must declare at least one operation. This is a
+            // hard parser-level rule rather than a typecheck one
+            // because empty `effect E { }` is unambiguously useless and
+            // catching it here gives a clearer source-position
+            // diagnostic than a downstream "no ops in registry" error.
+            self.err(
+                start.clone(),
+                "effect declaration must contain at least one operation `name: (...) -> T`",
+            );
+            return None;
+        }
+        Some(EffectDecl {
+            name,
+            name_span,
+            generic_params,
+            resumes_many,
+            ops,
+            span: start,
+        })
+    }
+
+    /// Plan B task 53 — recognise the optional `resumes : many`
+    /// attribute. Returns `Some(true)` when the three-token sequence
+    /// is present and consumed; `Some(false)` when the next token is
+    /// `{` (no attribute); `None` on a malformed partial match
+    /// (`resumes` followed by something other than `: many`) so the
+    /// caller can synchronise.
+    fn eat_resumes_many_attr(&mut self) -> Option<bool> {
+        let TokenKind::Ident(ref n) = self.peek().kind else {
+            return Some(false);
+        };
+        if n != "resumes" {
+            return Some(false);
+        }
+        let resumes_span = self.peek().span.clone();
+        self.advance();
+        self.expect(&TokenKind::Colon, "`:` after `resumes`")?;
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::Ident(ref n) if n == "many" => {
+                self.advance();
+                Some(true)
+            }
+            _ => {
+                self.err(
+                    resumes_span,
+                    "expected `many` after `resumes:`; v1 supports `resumes: many` (multi-shot) only",
+                );
+                None
+            }
+        }
+    }
+
+    /// Plan B task 53 — parse a single operation inside an effect
+    /// body: `name : ( T1, T2, ... ) -> R`. The parameter list is
+    /// always parenthesised; an empty list `()` is permitted.
+    fn parse_effect_op(&mut self) -> Option<EffectOp> {
+        let name_tok = self.peek().clone();
+        let (name, name_span) = match name_tok.kind {
+            TokenKind::Ident(ref n) => {
+                self.advance();
+                (n.clone(), name_tok.span.clone())
+            }
+            _ => {
+                self.err(name_tok.span.clone(), "expected operation name");
+                return None;
+            }
+        };
+        self.expect(&TokenKind::Colon, "`:` after operation name")?;
+        self.expect(&TokenKind::LParen, "`(` opening operation parameter list")?;
+        let mut params: Vec<TypeExpr> = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
+            params.push(self.parse_type()?);
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen, "`)` closing operation parameter list")?;
+        self.expect(&TokenKind::Arrow, "`->` before operation return type")?;
+        let return_type = self.parse_type()?;
+        Some(EffectOp {
+            name,
+            name_span: name_span.clone(),
+            params,
+            return_type,
+            span: name_span,
+        })
+    }
+
     /// Parse `ident ':' type (',' ident ':' type)* ','?` inside `{ ... }`.
     fn parse_record_field_decls(&mut self) -> Option<Vec<RecordFieldDecl>> {
         let mut fields = Vec::new();
@@ -853,6 +1013,7 @@ impl<'a> Parser<'a> {
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
             TokenKind::Fn => self.parse_lambda_expr(),
+            TokenKind::Handle => self.parse_handle_expr(),
             _ => {
                 self.err(tok.span.clone(), "expected an expression");
                 None
@@ -914,6 +1075,235 @@ impl<'a> Parser<'a> {
             effect_row_var,
             body: Box::new(body),
             span: start,
+        })
+    }
+
+    /// Plan B task 53 — parse a handler expression of the form
+    ///
+    /// ```text
+    /// handle <body-expr> with {
+    ///   return(<binding>) => <expr>,           # optional, at most one
+    ///   <Effect>.<op>(<param>, ..., <k>) => <expr>,
+    ///   ...
+    /// }
+    /// ```
+    ///
+    /// The body expression is parsed via the standard expression
+    /// grammar but with `no_record_lits` enabled so `handle Foo { ... }
+    /// with { ... }` parses as `handle (Ident Foo) with { ... }` rather
+    /// than ambiguously trying to consume the brace block as a record
+    /// literal. Parenthesising the body restores record-literal parsing.
+    ///
+    /// At least one operation arm is required. Duplicate `return`
+    /// arms are rejected at parse time with an error spanning the
+    /// duplicate; the AST keeps the first arm under "first wins"
+    /// semantics so a future cross-span diagnostic in Task 54 can
+    /// reference both positions through the recorded error and the
+    /// preserved AST.
+    ///
+    /// Each operation arm carries the discharged effect's name, the
+    /// op's name, an op-parameter binding list (matching the op's
+    /// declared parameters), and a trailing continuation binding `k`
+    /// (always present at the surface). Task 54 attaches op-parameter
+    /// types from the registered `EffectDecl::ops`.
+    fn parse_handle_expr(&mut self) -> Option<Expr> {
+        let start = self.peek().span.clone();
+        self.expect(&TokenKind::Handle, "`handle`")?;
+        // Disable record-literal recognition while parsing the body
+        // expression so `handle Foo with { ... }` doesn't try to read
+        // `Foo {` as the start of a record literal. Parens restore.
+        let saved = self.no_record_lits;
+        self.no_record_lits = true;
+        let body = self.parse_expr()?;
+        self.no_record_lits = saved;
+        self.expect(&TokenKind::With, "`with` between handle body and arms")?;
+        self.expect(&TokenKind::LBrace, "`{` opening handler arms")?;
+        let mut return_arm: Option<Box<HandleReturnArm>> = None;
+        let mut op_arms: Vec<HandleOpArm> = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            let arm_start = self.peek().span.clone();
+            match self.peek().kind {
+                TokenKind::Return => {
+                    let ra = self.parse_handle_return_arm(arm_start)?;
+                    if return_arm.is_some() {
+                        // Surface as a parser-level error so the user
+                        // sees the duplicate immediately. **First-wins
+                        // semantics**: keep the original return arm in
+                        // the AST so downstream passes (Task 54+
+                        // typechecker, future cross-span diagnostics)
+                        // see a stable target. The duplicate is
+                        // dropped on the floor; the error span points
+                        // at the *second* (offending) arm so the
+                        // user's eye lands on the line they need to
+                        // remove. Reviewer feedback PR #19 item 2.
+                        self.err(
+                            ra.span.clone(),
+                            "duplicate `return` arm in handler; only one is allowed",
+                        );
+                    } else {
+                        return_arm = Some(Box::new(ra));
+                    }
+                }
+                TokenKind::Ident(_) => {
+                    let oa = self.parse_handle_op_arm(arm_start)?;
+                    op_arms.push(oa);
+                }
+                _ => {
+                    let span = self.peek().span.clone();
+                    self.err(
+                        span,
+                        "expected `return(<binding>) => ...` or `<Effect>.<op>(...) => ...` in handler arm",
+                    );
+                    return None;
+                }
+            }
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}` closing handler arms")?;
+        if op_arms.is_empty() {
+            // A handler that discharges no operations is useless: it
+            // cannot interrupt any `perform`. Parser-level rejection
+            // gives a clearer message than waiting for the (Task 54)
+            // typechecker to flag an empty discharge set.
+            self.err(
+                start.clone(),
+                "handle expression must have at least one operation arm `<Effect>.<op>(..., k) => ...`",
+            );
+            return None;
+        }
+        Some(Expr::Handle {
+            body: Box::new(body),
+            return_arm,
+            op_arms,
+            span: start,
+        })
+    }
+
+    /// Parse `return ( <binding> ) => <expr>`, with the leading
+    /// `return` already at the cursor (consumed inside this fn).
+    fn parse_handle_return_arm(&mut self, arm_start: Span) -> Option<HandleReturnArm> {
+        self.expect(&TokenKind::Return, "`return`")?;
+        self.expect(&TokenKind::LParen, "`(` opening `return` arm binding")?;
+        let bind_tok = self.peek().clone();
+        let binding = match bind_tok.kind {
+            TokenKind::Ident(ref n) => {
+                self.advance();
+                n.clone()
+            }
+            _ => {
+                self.err(
+                    bind_tok.span.clone(),
+                    "expected binding name inside `return(...)` arm",
+                );
+                return None;
+            }
+        };
+        self.expect(&TokenKind::RParen, "`)` closing `return` arm binding")?;
+        self.expect(&TokenKind::FatArrow, "`=>` after `return(<binding>)`")?;
+        let body = self.parse_expr()?;
+        Some(HandleReturnArm {
+            binding,
+            binding_span: bind_tok.span,
+            body,
+            span: arm_start,
+        })
+    }
+
+    /// Parse `<Effect> '.' <op> '(' <p1>, ..., <k> ')' '=>' <expr>` —
+    /// a single operation arm of a `handle`. The trailing parameter is
+    /// the continuation binding `k`; at least one parameter is required.
+    fn parse_handle_op_arm(&mut self, arm_start: Span) -> Option<HandleOpArm> {
+        let eff_tok = self.peek().clone();
+        let (effect, effect_span) = match eff_tok.kind {
+            TokenKind::Ident(ref n) => {
+                self.advance();
+                (n.clone(), eff_tok.span.clone())
+            }
+            _ => {
+                self.err(eff_tok.span.clone(), "expected effect name in handler arm");
+                return None;
+            }
+        };
+        self.expect(&TokenKind::Dot, "`.` between effect name and operation")?;
+        let op_tok = self.peek().clone();
+        let (op, op_span) = match op_tok.kind {
+            TokenKind::Ident(ref n) => {
+                self.advance();
+                (n.clone(), op_tok.span.clone())
+            }
+            _ => {
+                self.err(op_tok.span.clone(), "expected operation name after `.`");
+                return None;
+            }
+        };
+        self.expect(
+            &TokenKind::LParen,
+            "`(` opening operation-arm parameter list",
+        )?;
+        // Collect parameter idents in source order. The trailing one
+        // becomes `k`; everything before it is an op parameter binding.
+        let mut idents: Vec<HandleArmParam> = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
+            let tok = self.peek().clone();
+            match tok.kind {
+                TokenKind::Ident(ref n) => {
+                    self.advance();
+                    idents.push(HandleArmParam {
+                        name: n.clone(),
+                        span: tok.span,
+                    });
+                }
+                _ => {
+                    self.err(
+                        tok.span.clone(),
+                        "expected binding name in handler-arm parameter list",
+                    );
+                    return None;
+                }
+            }
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(
+            &TokenKind::RParen,
+            "`)` closing operation-arm parameter list",
+        )?;
+        // The trailing continuation `k` is always present. Even an
+        // op declared with `()` -> R needs a continuation in its arm:
+        // `Effect.op(k) => body`. Reject empty arms here so the
+        // diagnostic spans the parameter list, not the body. Routing
+        // the structural pop through a single `match` keeps the empty
+        // case as a real `None` return without going through the
+        // `disallowed-methods` `Option::expect` lint.
+        let Some(k) = idents.pop() else {
+            self.err(
+                arm_start.clone(),
+                "handler operation arm requires a trailing continuation binding `k`",
+            );
+            return None;
+        };
+        self.expect(
+            &TokenKind::FatArrow,
+            "`=>` after operation-arm parameter list",
+        )?;
+        let body = self.parse_expr()?;
+        Some(HandleOpArm {
+            effect,
+            effect_span,
+            op,
+            op_span,
+            params: idents,
+            k_name: k.name,
+            k_span: k.span,
+            body,
+            span: arm_start,
         })
     }
 
@@ -2366,5 +2756,346 @@ mod tests {
             errs.iter().any(|e| e.message.contains("row-variable")),
             "pipe with no row-var after effects should parse-error; got {errs:?}"
         );
+    }
+
+    // ===== Plan B task 53 — effect declarations and handle expressions ====
+
+    fn parse_first_item(src: &str) -> Item {
+        let (toks, lex_errs) = lex("t.sigil", src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parse("t.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+        prog.items
+            .into_iter()
+            .next()
+            .expect("expected at least one top-level item")
+    }
+
+    fn parse_clean(src: &str) -> Program {
+        let (toks, lex_errs) = lex("t.sigil", src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parse("t.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+        prog
+    }
+
+    #[test]
+    fn effect_decl_one_op_default_one_shot() {
+        // Default form: no `resumes: many`. resumes_many should be false.
+        let item = parse_first_item("effect Raise { fail: (String) -> Int }\n");
+        let Item::Effect(ed) = item else {
+            panic!("expected Item::Effect, got {item:?}")
+        };
+        assert_eq!(ed.name, "Raise");
+        assert!(ed.generic_params.is_empty());
+        assert!(!ed.resumes_many);
+        assert_eq!(ed.ops.len(), 1);
+        assert_eq!(ed.ops[0].name, "fail");
+        assert_eq!(ed.ops[0].params.len(), 1);
+        assert_eq!(ed.ops[0].params[0].head_name(), "String");
+        assert_eq!(ed.ops[0].return_type.head_name(), "Int");
+    }
+
+    #[test]
+    fn effect_decl_with_generic_params() {
+        // `effect Raise[T] { fail: (String) -> T }` — generic effect.
+        let item = parse_first_item("effect Raise[T] { fail: (String) -> T }\n");
+        let Item::Effect(ed) = item else {
+            panic!("expected Item::Effect")
+        };
+        assert_eq!(ed.generic_params.len(), 1);
+        assert_eq!(ed.generic_params[0].name, "T");
+        assert_eq!(ed.ops[0].return_type.head_name(), "T");
+    }
+
+    #[test]
+    fn effect_decl_resumes_many_attr() {
+        // Multi-shot form via `resumes: many`.
+        let item = parse_first_item("effect Choose resumes: many { choose: (Int) -> Int }\n");
+        let Item::Effect(ed) = item else {
+            panic!("expected Item::Effect")
+        };
+        assert!(ed.resumes_many);
+        assert_eq!(ed.name, "Choose");
+        assert_eq!(ed.ops.len(), 1);
+    }
+
+    #[test]
+    fn effect_decl_resumes_many_with_generics() {
+        // `effect Choose[T] resumes: many { ... }` — both attributes.
+        let item = parse_first_item("effect Choose[T] resumes: many { pick: (T, T) -> T }\n");
+        let Item::Effect(ed) = item else {
+            panic!("expected Item::Effect")
+        };
+        assert_eq!(ed.generic_params.len(), 1);
+        assert!(ed.resumes_many);
+        assert_eq!(ed.ops[0].params.len(), 2);
+    }
+
+    #[test]
+    fn effect_decl_multiple_ops_with_trailing_comma() {
+        let item = parse_first_item("effect State[T] { get: () -> T, put: (T) -> Unit, }\n");
+        let Item::Effect(ed) = item else {
+            panic!("expected Item::Effect")
+        };
+        assert_eq!(ed.ops.len(), 2);
+        assert_eq!(ed.ops[0].name, "get");
+        assert!(ed.ops[0].params.is_empty());
+        assert_eq!(ed.ops[1].name, "put");
+        assert_eq!(ed.ops[1].params.len(), 1);
+    }
+
+    #[test]
+    fn effect_decl_empty_body_errors() {
+        // `effect E { }` — no ops; rejected at parser level.
+        let errs = parse_errs("effect E { }\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("at least one operation")),
+            "empty effect body should parse-error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn effect_decl_resumes_without_many_errors() {
+        // `effect E resumes: noway { ... }` — only `many` is accepted
+        // after `resumes:` in v1. The diagnostic spans the `resumes`
+        // keyword to anchor the user-visible position.
+        let errs = parse_errs("effect E resumes: noway { fail: () -> Int }\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("`many`")),
+            "non-`many` resumes value should parse-error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn resumes_outside_effect_decl_remains_ident() {
+        // `resumes` is a context keyword. Outside `effect ... resumes :
+        // many`, it must lex+parse as a plain Ident — no regression for
+        // user code that wants `let resumes = 5`.
+        let prog = parse_clean(
+            "fn main() -> Int ![] {\n  let resumes: Int = 5;\n  let many: Int = 9;\n  resumes\n}\n",
+        );
+        let Item::Fn(ref f) = prog.items[0] else {
+            panic!()
+        };
+        assert_eq!(f.body.stmts.len(), 2);
+        match &f.body.tail {
+            Some(Expr::Ident(n, _)) => assert_eq!(n, "resumes"),
+            other => panic!("expected tail Ident `resumes`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effect_as_user_ident_in_let_is_rejected() {
+        // Reviewer feedback PR #19 item 9 — symmetric keyword-side
+        // adversarial. `effect` IS a lexer keyword as of Task 53, so
+        // `let effect: Int = 1;` cannot parse: the `let` arm expects
+        // an Ident binding name and gets a `TokenKind::Effect`
+        // instead, producing a parser-level error. This is the
+        // counterpart to `resumes_outside_effect_decl_remains_ident`,
+        // which pins the *non*-reserved attribute words to the Ident
+        // path; together they cover both halves of the keyword
+        // matrix.
+        let errs = parse_errs("fn main() -> Int ![] { let effect: Int = 1; 0 }\n");
+        assert!(
+            !errs.is_empty(),
+            "`let effect: Int = 1` must parse-error because `effect` is reserved; got no errors",
+        );
+    }
+
+    #[test]
+    fn handle_with_keywords_rejected_in_user_ident_position() {
+        // `handle` and `with` are reserved too. Same argument as
+        // above: a `let handle = 1` shape must not silently rebind
+        // them as user identifiers. Together with the `effect` test,
+        // this pins all three Stage-6 keywords.
+        let h_errs = parse_errs("fn main() -> Int ![] { let handle: Int = 1; 0 }\n");
+        assert!(
+            !h_errs.is_empty(),
+            "`let handle: Int = 1` must parse-error because `handle` is reserved; got no errors",
+        );
+        let w_errs = parse_errs("fn main() -> Int ![] { let with: Int = 1; 0 }\n");
+        assert!(
+            !w_errs.is_empty(),
+            "`let with: Int = 1` must parse-error because `with` is reserved; got no errors",
+        );
+    }
+
+    #[test]
+    fn handle_expr_minimal_form() {
+        // Smallest possible handle: one op arm, no return arm.
+        let e = parse_tail_expr("handle 0 with { Raise.fail(msg, k) => 0 }");
+        let Expr::Handle {
+            return_arm,
+            op_arms,
+            ..
+        } = e
+        else {
+            panic!("expected Expr::Handle")
+        };
+        assert!(return_arm.is_none());
+        assert_eq!(op_arms.len(), 1);
+        let arm = &op_arms[0];
+        assert_eq!(arm.effect, "Raise");
+        assert_eq!(arm.op, "fail");
+        assert_eq!(arm.params.len(), 1);
+        assert_eq!(arm.params[0].name, "msg");
+        assert_eq!(arm.k_name, "k");
+    }
+
+    #[test]
+    fn handle_expr_with_return_arm() {
+        let e = parse_tail_expr("handle 42 with { return(v) => v, Raise.fail(msg, k) => 0 }");
+        let Expr::Handle {
+            return_arm,
+            op_arms,
+            ..
+        } = e
+        else {
+            panic!("expected Expr::Handle")
+        };
+        let ra = return_arm.expect("expected return arm");
+        assert_eq!(ra.binding, "v");
+        assert!(matches!(&ra.body, Expr::Ident(n, _) if n == "v"));
+        assert_eq!(op_arms.len(), 1);
+    }
+
+    #[test]
+    fn handle_expr_multiple_op_arms() {
+        // Multi-effect handle: arms from different effects share one
+        // handler. This form is the parser-level rationale for the
+        // qualified `Effect.op(...)` arm shape.
+        let e = parse_tail_expr(
+            "handle 0 with { Raise.fail(msg, k) => 0, State.get(k) => 1, State.put(v, k) => 2 }",
+        );
+        let Expr::Handle { op_arms, .. } = e else {
+            panic!()
+        };
+        assert_eq!(op_arms.len(), 3);
+        assert_eq!(op_arms[0].effect, "Raise");
+        assert_eq!(op_arms[1].effect, "State");
+        assert_eq!(op_arms[1].op, "get");
+        assert!(op_arms[1].params.is_empty()); // `get` has only `k`
+        assert_eq!(op_arms[1].k_name, "k");
+        assert_eq!(op_arms[2].effect, "State");
+        assert_eq!(op_arms[2].op, "put");
+        assert_eq!(op_arms[2].params.len(), 1);
+    }
+
+    #[test]
+    fn handle_expr_op_arm_continuation_is_last_param() {
+        // Verify the trailing-param-becomes-k convention: in
+        // `Effect.op(a, b, c, k) => body`, `c` is an op param and `k`
+        // is the continuation.
+        let e = parse_tail_expr("handle 0 with { E.op(a, b, c, k) => 0 }");
+        let Expr::Handle { op_arms, .. } = e else {
+            panic!()
+        };
+        let arm = &op_arms[0];
+        assert_eq!(arm.params.len(), 3);
+        assert_eq!(arm.params[0].name, "a");
+        assert_eq!(arm.params[1].name, "b");
+        assert_eq!(arm.params[2].name, "c");
+        assert_eq!(arm.k_name, "k");
+    }
+
+    #[test]
+    fn handle_expr_empty_arms_errors() {
+        // `handle 0 with { }` — at least one operation arm is required.
+        let errs = parse_errs("fn main() -> Int ![] { handle 0 with { } }\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("at least one operation arm")),
+            "empty handler arms should parse-error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_expr_op_arm_without_k_errors() {
+        // `handle 0 with { Raise.fail() => 0 }` — empty arm parameter
+        // list. The trailing `k` is mandatory at the surface level.
+        let errs = parse_errs("fn main() -> Int ![] { handle 0 with { Raise.fail() => 0 } }\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("trailing continuation binding")),
+            "op arm without `k` should parse-error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_expr_missing_with_errors() {
+        // `handle 0 { ... }` — `with` keyword missing.
+        let errs = parse_errs("fn main() -> Int ![] { handle 0 { Raise.fail(k) => 0 } }\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("`with`")),
+            "handle without `with` should parse-error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_expr_duplicate_return_arm_errors() {
+        // Two `return` arms: parser rejects with a "duplicate" message.
+        let errs = parse_errs(
+            "fn main() -> Int ![] { handle 0 with { return(a) => a, return(b) => b, Raise.fail(k) => 0 } }\n",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("duplicate `return`")),
+            "duplicate return arms should parse-error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_expr_duplicate_return_arm_first_wins_in_ast() {
+        // Reviewer feedback PR #19 item 2 — pin first-wins AST
+        // semantics: the parser drops the SECOND arm on the floor and
+        // keeps the first in the AST so downstream passes see a
+        // stable target. The error still fires (covered by the
+        // sibling test above); this one pins the AST shape.
+        let src = "fn main() -> Int ![] { handle 0 with { return(first) => first, return(second) => second, Raise.fail(k) => 0 } }\n";
+        let (toks, lex_errs) = lex("t.sigil", src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, _) = parse("t.sigil", &toks);
+        let Item::Fn(ref f) = prog.items[0] else {
+            panic!()
+        };
+        let Some(Expr::Handle { ref return_arm, .. }) = f.body.tail else {
+            panic!("expected tail Expr::Handle, got {:?}", f.body.tail);
+        };
+        let ra = return_arm
+            .as_ref()
+            .expect("return_arm should be populated by first-wins semantics");
+        assert_eq!(
+            ra.binding, "first",
+            "first-wins: return arm binding must be `first`, not `second`",
+        );
+    }
+
+    #[test]
+    fn handle_expr_body_does_not_consume_brace_as_record_literal() {
+        // Regression: `handle Foo with { ... }` must not try to read
+        // `Foo {` as a record literal start. The `no_record_lits` flag
+        // is enabled while parsing the handle body. (We use a synth
+        // ident `x` since we don't have an actual record type
+        // accessible here, but the structural property holds.)
+        let e = parse_tail_expr("handle x with { E.op(k) => 0 }");
+        let Expr::Handle { body, .. } = e else {
+            panic!()
+        };
+        assert!(matches!(*body, Expr::Ident(ref n, _) if n == "x"));
+    }
+
+    #[test]
+    fn effect_decl_in_program_alongside_fn_decl() {
+        // Both an `effect` decl and a `fn` decl in the same program.
+        // This is the integration-shape unit test — Task 54 will
+        // exercise the full pipeline; here we just want to make sure
+        // both items round-trip through the parser.
+        let prog =
+            parse_clean("effect Raise { fail: (String) -> Int }\nfn main() -> Int ![] { 0 }\n");
+        assert_eq!(prog.items.len(), 2);
+        assert!(matches!(prog.items[0], Item::Effect(_)));
+        assert!(matches!(prog.items[1], Item::Fn(_)));
     }
 }

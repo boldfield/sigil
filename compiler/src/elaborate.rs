@@ -363,6 +363,30 @@ impl Elaborator {
             Expr::RecordLit { name, fields, span } => {
                 (Expr::RecordLit { name, fields, span }, Vec::new())
             }
+            // Plan B task 53 — `handle <body> with { ... }` passes
+            // through elaborate unchanged. The CPS transform that
+            // expands handlers into runtime calls and arena-allocates
+            // `NextStep` records lands in Task 55; elaborate keeps the
+            // shape intact so Task 55 sees a structurally clean handle
+            // node. We do NOT recurse into children here — typecheck
+            // already emitted `E0134`, and the rest of the pipeline
+            // is short-circuited by the resulting compile abort, but
+            // the constructor preserves enough for unit tests of
+            // elaborate's own behaviour to round-trip the form.
+            Expr::Handle {
+                body,
+                return_arm,
+                op_arms,
+                span,
+            } => (
+                Expr::Handle {
+                    body,
+                    return_arm,
+                    op_arms,
+                    span,
+                },
+                Vec::new(),
+            ),
         }
     }
 

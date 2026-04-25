@@ -267,3 +267,46 @@ compiler↔runtime data declarations. Existing `sigil_header_constants::*`
 imports would change to `sigil_abi::header::*`; both crates' Cargo
 manifests would drop their dep on `sigil-header-constants`. The
 crate's `version`s remain `0.1.0`; nothing on crates.io is affected.
+
+## 2026-04-25 — [PLAN-B] Task 54: revisit handler arm surface (qualified-only vs bare-op-as-sugar)
+
+**Context:** Plan B Task 53 (parser scaffolding) shipped handler arms
+in fully-qualified `Effect.op(args, k) => arm` form. The plan body and
+the design doc both write the bare form `op(args, k) => arm`
+(see `queue/2026-04-21-sigil-effects.md:142`,
+`docs/plans/2026-04-21-sigil-design.md:95-99,207-211,215`). The Task
+53 PR documents the divergence as `[DEVIATION Task 53]` in
+`PLAN_B_DEVIATIONS.md`.
+
+The qualified form was chosen for three reasons:
+1. Multi-effect dispatch from a single `handle` is unambiguous at parse
+   time without needing to resolve op names against an effect
+   registry.
+2. The surface mirrors the producer side `perform Effect.op(args)`,
+   keeping the discharge-target name lexically explicit.
+3. The AST records both `effect` and `op` names per arm, so adding
+   bare-op-as-sugar is a strict forward-compatible extension — no
+   code rewrite needed if a future plan wants both shapes.
+
+**Question:** Once Task 54's typing rules and Task 55's CPS transform
+land, ergonomic data from real Sigil programs (the canonical
+examples plus `examples/catch.sigil` / `state.sigil` / `choose.sigil`
+from Task 59) will tell us whether qualified-only is too verbose.
+Should Task 54 keep qualified-only, or should it desugar bare
+`op(args, k) => arm` to qualified within unambiguous handler contexts
+(where every `op` resolves to exactly one effect in scope)?
+
+**Status:** open — pick at Task 54 review when handler typing data is
+in hand.
+
+**Forward implications:** if bare-op-as-sugar wins, Task 54's parser
+relaxes the `HandleOpArm::effect: String` field to `Option<String>`
+with `None` meaning "resolve from context", and the typechecker's
+effect resolution fills it in by looking up the op name in every
+effect declared on the body's residual row. Existing qualified arms
+continue to parse unchanged; bare arms are a purely additive surface
+extension.
+
+Cross-reference: the `[DEVIATION Task 53]` entry titled "Handler op-arm
+shape uses qualified `Effect.op(...)`" in `PLAN_B_DEVIATIONS.md`'s
+Closure-point line points back to this question.

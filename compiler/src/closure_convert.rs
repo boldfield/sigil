@@ -104,7 +104,7 @@ pub fn convert(mut cps: CpsProgram) -> ClosureConvertedProgram {
     let mut new_items: Vec<Item> = Vec::with_capacity(original_items.len());
     for item in original_items {
         match item {
-            Item::Import(_) | Item::Type(_) => new_items.push(item),
+            Item::Import(_) | Item::Type(_) | Item::Effect(_) => new_items.push(item),
             Item::Fn(mut f) => {
                 let param_names: BTreeSet<String> =
                     f.params.iter().map(|p| p.name.clone()).collect();
@@ -412,6 +412,62 @@ impl Converter {
                 Expr::RecordLit {
                     name,
                     fields: rewritten_fields,
+                    span,
+                }
+            }
+            // Plan B task 53 — handler expressions participate in
+            // closure conversion like any compound expression: each
+            // arm body may close over outer-scope captures, and the
+            // arms themselves introduce new locals that take
+            // precedence inside their bodies.
+            //
+            // The `return` arm binds a single value; each operation
+            // arm binds its parameter list plus the trailing
+            // continuation `k`. We recurse into all arm bodies under
+            // an extended locals set, then restore.
+            //
+            // (Closure conversion runs strictly after typecheck; a
+            // `handle` reaching this code is fine — the typecheck
+            // E0134 error is non-fatal and downstream passes still
+            // need a structurally correct walk so the workspace
+            // compiles cleanly.)
+            Expr::Handle {
+                body,
+                return_arm,
+                op_arms,
+                span,
+            } => {
+                let new_body = self.rewrite_expr(*body, locals, captures);
+                let new_return_arm = return_arm.map(|ra| {
+                    let mut arm_locals = locals.clone();
+                    arm_locals.insert(ra.binding.clone());
+                    let new_body = self.rewrite_expr(ra.body, &arm_locals, captures);
+                    Box::new(crate::ast::HandleReturnArm {
+                        binding: ra.binding,
+                        binding_span: ra.binding_span,
+                        body: new_body,
+                        span: ra.span,
+                    })
+                });
+                let new_op_arms = op_arms
+                    .into_iter()
+                    .map(|arm| {
+                        let mut arm_locals = locals.clone();
+                        for p in &arm.params {
+                            arm_locals.insert(p.name.clone());
+                        }
+                        arm_locals.insert(arm.k_name.clone());
+                        let new_body = self.rewrite_expr(arm.body, &arm_locals, captures);
+                        crate::ast::HandleOpArm {
+                            body: new_body,
+                            ..arm
+                        }
+                    })
+                    .collect();
+                Expr::Handle {
+                    body: Box::new(new_body),
+                    return_arm: new_return_arm,
+                    op_arms: new_op_arms,
                     span,
                 }
             }
