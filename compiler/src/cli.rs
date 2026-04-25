@@ -11,8 +11,26 @@ pub enum Command {
     Compile(CompileArgs),
     Explain(String),
     PrintRuntimeStats(CompileArgs),
+    /// Plan B Task 50 — `sigil <input> --dump-color`. Runs the front
+    /// end through color inference and prints one line per monomorph
+    /// to stdout, then exits without codegen. The output value `-o`
+    /// is optional in this mode (color analysis produces no
+    /// executable). Required for diagnosing performance-floor misses
+    /// and for the Stage 5 color-decision review checkpoint.
+    DumpColor(DumpColorArgs),
     Usage,
     UsageError(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DumpColorArgs {
+    pub input: String,
+    pub error_format: ErrorFormat,
+    /// Set when the user passed `-o <path>` alongside `--dump-color`.
+    /// Color analysis emits no executable; the driver in `main.rs`
+    /// uses this flag to print a stderr warning so the misuse is
+    /// visible rather than silent.
+    pub output_supplied: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,8 +53,11 @@ pub fn parse(args: &[String]) -> Command {
         };
     }
 
-    // Compile modes: `sigil [--print-runtime-stats] <input> -o <output> [--human-errors]`
+    // Compile modes:
+    //   sigil [--print-runtime-stats] <input> -o <output> [--human-errors]
+    //   sigil <input> --dump-color [--human-errors]
     let mut print_stats = false;
+    let mut dump_color = false;
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
     let mut error_format = ErrorFormat::JsonLines;
@@ -56,6 +77,9 @@ pub fn parse(args: &[String]) -> Command {
             }
             "--print-runtime-stats" => {
                 print_stats = true;
+            }
+            "--dump-color" => {
+                dump_color = true;
             }
             arg if arg.starts_with("--") => {
                 return Command::UsageError(format!("unknown flag `{arg}`"));
@@ -77,6 +101,24 @@ pub fn parse(args: &[String]) -> Command {
         Some(i) => i,
         None => return Command::UsageError("compile: missing <input.sigil>".into()),
     };
+
+    if dump_color {
+        if print_stats {
+            return Command::UsageError(
+                "--dump-color cannot be combined with --print-runtime-stats".into(),
+            );
+        }
+        // `-o <path>` is accepted under --dump-color for shell-history
+        // ergonomics, but color analysis emits no executable. The
+        // driver in `main.rs` prints a stderr warning when this is
+        // set so the misuse is visible.
+        return Command::DumpColor(DumpColorArgs {
+            input,
+            error_format,
+            output_supplied: output,
+        });
+    }
+
     let output = match output {
         Some(o) => o,
         None => return Command::UsageError("compile: missing -o <output>".into()),
@@ -97,12 +139,15 @@ pub const USAGE: &str = "\
 usage:
     sigil <input.sigil> -o <output> [--human-errors]
     sigil --print-runtime-stats <input.sigil> -o <output>
+    sigil <input.sigil> --dump-color [--human-errors]
     sigil explain <code>
 
 flags:
     -o <output>              Path for the compiled executable.
     --human-errors           Switch diagnostics from JSON Lines to human text.
     --print-runtime-stats    Compile, run, and print runtime counters at exit.
+    --dump-color             Run color inference and print one line per monomorph
+                             (`<name> native|cps <reason>`) to stdout. No codegen.
 ";
 
 #[cfg(test)]
@@ -176,5 +221,51 @@ mod tests {
     #[test]
     fn empty_is_usage() {
         assert_eq!(parse_argv(&[]), Command::Usage);
+    }
+
+    #[test]
+    fn dump_color_default_format() {
+        let c = parse_argv(&["hello.sigil", "--dump-color"]);
+        assert_eq!(
+            c,
+            Command::DumpColor(DumpColorArgs {
+                input: "hello.sigil".into(),
+                error_format: ErrorFormat::JsonLines,
+                output_supplied: None,
+            })
+        );
+    }
+
+    #[test]
+    fn dump_color_with_human_errors() {
+        let c = parse_argv(&["hello.sigil", "--dump-color", "--human-errors"]);
+        assert_eq!(
+            c,
+            Command::DumpColor(DumpColorArgs {
+                input: "hello.sigil".into(),
+                error_format: ErrorFormat::Human,
+                output_supplied: None,
+            })
+        );
+    }
+
+    #[test]
+    fn dump_color_records_dash_o_for_warning() {
+        // `-o` is accepted under --dump-color (shell-history
+        // ergonomics) but the path is recorded so `main.rs` can warn
+        // on stderr. The misuse is visible rather than silent.
+        let c = parse_argv(&["hello.sigil", "-o", "/tmp/x", "--dump-color"]);
+        match c {
+            Command::DumpColor(args) => {
+                assert_eq!(args.output_supplied.as_deref(), Some("/tmp/x"));
+            }
+            other => panic!("expected DumpColor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dump_color_conflicts_with_print_runtime_stats() {
+        let c = parse_argv(&["hello.sigil", "--dump-color", "--print-runtime-stats"]);
+        assert!(matches!(c, Command::UsageError(_)));
     }
 }

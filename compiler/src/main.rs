@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
-use sigil_compiler::cli::{self, CompileArgs};
+use sigil_compiler::cli::{self, CompileArgs, DumpColorArgs};
 use sigil_compiler::errors::catalog;
 use sigil_compiler::pipeline;
 
@@ -11,6 +11,7 @@ fn main() -> ExitCode {
     match cli::parse(&args) {
         cli::Command::Compile(cargs) => compile(cargs),
         cli::Command::PrintRuntimeStats(cargs) => print_runtime_stats(cargs),
+        cli::Command::DumpColor(dargs) => dump_color(dargs),
         cli::Command::Explain(code) => explain(&code),
         cli::Command::Usage => {
             eprintln!("{}", cli::USAGE);
@@ -59,6 +60,26 @@ fn print_runtime_stats(cargs: CompileArgs) -> ExitCode {
             eprintln!("sigil: cannot run compiled binary: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn dump_color(dargs: DumpColorArgs) -> ExitCode {
+    if let Some(path) = &dargs.output_supplied {
+        let stderr = std::io::stderr();
+        let mut err = stderr.lock();
+        let _ = writeln!(
+            err,
+            "sigil: warning: `-o {path}` ignored under --dump-color (no executable produced)"
+        );
+    }
+    match pipeline::dump_color(&dargs.input, dargs.error_format) {
+        Ok(text) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            let _ = out.write_all(text.as_bytes());
+            ExitCode::SUCCESS
+        }
+        Err(_) => ExitCode::from(1),
     }
 }
 
