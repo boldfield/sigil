@@ -552,6 +552,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sigil-abi"
+version = "0.1.0"
+
+[[package]]
 name = "sigil-compiler"
 version = "0.1.0"
 dependencies = [
@@ -560,6 +564,7 @@ dependencies = [
  "cranelift-object",
  "include_dir",
  "insta",
+ "sigil-abi",
  "sigil-header-constants",
  "sigil-runtime",
  "target-lexicon",
@@ -573,6 +578,7 @@ version = "0.1.0"
 name = "sigil-runtime"
 version = "0.1.0"
 dependencies = [
+ "sigil-abi",
  "sigil-header-constants",
 ]
 

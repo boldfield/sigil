@@ -501,12 +501,28 @@ pub const CATALOG: &[ErrorEntry] = &[
                - E0117: pattern shape does not match scrutinee type \
                  (different failure mode — well-formed exhaustiveness \
                  implies well-formed shapes first).\n\n\
-               Plan A3 v1 only verifies top-level exhaustiveness for user \
-               types. Nested non-exhaustive cases inside constructor \
-               fields (`match o { Some(true) => .., None => .. }` missing \
-               `Some(false)`) may fall through to the runtime's \
-               `TRAP_NONEXHAUSTIVE_MATCH` trap in the first release; \
-               Plan B refines to full nested Maranget exhaustiveness.",
+               Plan A3 shipped top-level exhaustiveness only. Plan B \
+               extends the check with full nested Maranget: \
+               `match o { Some(true) => .., None => .. }` on \
+               `Option = | None | Some(Bool)` now produces E0120 with \
+               witness `Some(false)` at compile time rather than \
+               falling through to the runtime `TRAP_NONEXHAUSTIVE_MATCH` \
+               trap. Nested witness formats follow the same paste-able \
+               rules: positional field holes with the uncovered value \
+               in place (`Some(false)`, `Holds(Node(_, _, _))`) and \
+               record fields (`P { a: false, b: _ }`) in declared \
+               field order. Infinite-domain primitive fields (Int, \
+               Char, String, Byte, Fn) still require a wildcard to \
+               cover — their witnesses use `_` since no concrete \
+               counterexample is surfaceable.\n\n\
+               E0120 is suppressed when any match arm emits a \
+               pattern-check or body-check error (E0117, E0115, E0065, \
+               or any other code from `check_pattern`/`check_expr`). \
+               Fix the arm-level error first; re-running typecheck \
+               re-evaluates exhaustiveness against the corrected arms. \
+               The suppression mirrors the common cascade pattern where \
+               a mistyped arm looks like a \"missing variant\" to the \
+               exhaustiveness pass and produces a noisy double-fire.",
         fix_example: "type Option = | None | Some(Int)\n\
                       // match o { None => 0 }  // E0120: missing `Some(_)`\n\
                       match o {\n  None => 0,\n  Some(_) => 1,\n}  // exhaustive",
@@ -534,6 +550,54 @@ pub const CATALOG: &[ErrorEntry] = &[
                       // flattening: a `Page { lines: Lines }` with\n\
                       // `Lines = { l0: ..., l1: ..., .. }` pushes the\n\
                       // top-level payload under the 64-word ceiling.",
+    },
+    ErrorEntry {
+        code: "E0124",
+        short: "generic type application not yet supported",
+        long: "Plan B Task 47 grew the parser to accept generic type \
+               application syntax (`List[Int]`, `Map[String, List[Int]]`), \
+               but the typechecker does not yet implement HM unification \
+               + monomorphization that gives those types meaning. Until \
+               Task 48 (HM unification) and Task 49 (monomorphization) \
+               land, every `TypeExpr::Apply` is rejected at typecheck \
+               time so a program does not silently compile with the \
+               head name treated as a non-generic type.\n\n\
+               This is a temporary diagnostic. When Plan B Stage 5 \
+               completes, E0124 disappears and `List[Int]` resolves \
+               against a generic `type List[A] = ...` declaration in \
+               the usual way. Until then, hand-monomorphise: declare \
+               `type IntList = | INil | ICons(Int, IntList)` and use \
+               that instead of a parameterised list. The forward path \
+               is not blocked — the syntax just isn't usable yet.",
+        fix_example: "// Pre-Task-48 workaround: hand-monomorphise.\n\
+                      type IntList = | INil | ICons(Int, IntList)\n\
+                      // becomes (post-Task-48):\n\
+                      // type List[A] = | Nil | Cons(A, List[A])\n\
+                      // and `IntList` is `List[Int]`.",
+    },
+    ErrorEntry {
+        code: "E0125",
+        short: "explicit row variable not yet supported",
+        long: "Plan B Task 47 grew the parser to accept `![IO | e]` \
+               row-polymorphic effect-row syntax, but the typechecker \
+               does not yet implement row-variable unification. Until \
+               Task 48 (HM unification with row polymorphism) lands, \
+               every `effect_row_var.is_some()` site is rejected so a \
+               program does not silently compile as if the row were \
+               closed.\n\n\
+               This is a temporary diagnostic. When Plan B Stage 5 \
+               completes, row variables become first-class — a \
+               function declared `![IO | e]` will accept any callee \
+               whose effect row is `![IO]` or richer (extending the \
+               row at the open end). Until then, write the closed \
+               form `![IO]` (or list every effect explicitly). \
+               Polymorphism over the row is not available yet.",
+        fix_example: "// Pre-Task-48 workaround: closed row.\n\
+                      fn caller(x: Int) -> Int ![IO] {\n  x\n}\n\
+                      // becomes (post-Task-48):\n\
+                      // fn caller[e](x: Int) -> Int ![IO | e] { x }\n\
+                      // which lets caller be invoked from contexts\n\
+                      // with a richer effect row than just ![IO].",
     },
     ErrorEntry {
         code: "E0401",

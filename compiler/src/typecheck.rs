@@ -372,13 +372,54 @@ impl Tc {
     /// effect: the caller's fallback treats unresolved names as
     /// `Ty::Unit` so body-level type errors still surface.
     fn check_type_expr_known(&mut self, t: &TypeExpr) {
+        // Plan B Task 47: TypeExpr::Apply parses but is not yet
+        // semantically supported. Reject any Apply (recursively into
+        // its args) with E0124 so the parser-only Stage 5 surface
+        // does not silently accept generic application as if it were
+        // a head-name reference. Task 48 (HM unification) replaces
+        // this with real type-argument resolution.
+        if let TypeExpr::Apply { args, .. } = t {
+            self.push_error(
+                "E0124",
+                t.span(),
+                format!(
+                    "generic type application is not yet supported (head: `{}`); Task 48 \
+                     will enable it",
+                    t.head_name(),
+                ),
+            );
+            for a in args {
+                self.check_type_expr_known(a);
+            }
+            return;
+        }
         if ty_from_type_expr(t, &self.types).is_none() {
-            let TypeExpr::Named(n, span) = t;
             self.push_error(
                 "E0112",
-                span.clone(),
+                t.span(),
                 format!(
-                    "unknown type `{n}` (expected a primitive or a type declared via `type {n} = ...`)"
+                    "unknown type `{n}` (expected a primitive or a type declared via `type {n} = ...`)",
+                    n = t.head_name(),
+                ),
+            );
+        }
+    }
+
+    /// Plan B Task 47: explicit row variables in effect rows
+    /// (`![IO | e]`) parse but are not yet semantically supported.
+    /// Push E0125 against the row-variable's span so an effect-row
+    /// declaration does not silently behave as if the row were closed.
+    /// Task 48 (HM unification with row polymorphism) replaces this
+    /// with real row-variable inference.
+    fn report_row_var_unsupported(&mut self, row_var: &Option<RowVar>) {
+        if let Some(rv) = row_var {
+            self.push_error(
+                "E0125",
+                rv.span.clone(),
+                format!(
+                    "explicit row variable `{}` is not yet supported in effect rows; \
+                     Task 48 will enable it",
+                    rv.name,
                 ),
             );
         }
@@ -687,6 +728,9 @@ impl Tc {
         // semantics (params/lets shadow top-level fns of the same
         // name within their scope) while keeping fn_env out of the
         // insert-collision and capture-analysis paths.
+        // Plan B Task 47: emit E0125 for explicit row variables on
+        // this fn's effect row until HM unification (Task 48) lands.
+        self.report_row_var_unsupported(&f.effect_row_var);
         self.env.clear();
         for p in &f.params {
             if let Some(ty) = ty_from_type_expr(&p.ty, &self.types) {
@@ -743,6 +787,9 @@ impl Tc {
                     self.check_perform(p, row);
                 }
                 Stmt::Let(l) => {
+                    // Plan B Task 47: also check let-binding types
+                    // for unsupported generic application (E0124).
+                    self.check_type_expr_known(&l.ty);
                     let got = self.check_expr(&l.value, row);
                     if let Some(got_ty) = got {
                         if !type_matches(&l.ty, &got_ty) {
@@ -965,9 +1012,17 @@ impl Tc {
                 params,
                 return_type,
                 effects,
+                // Plan B Task 47 — explicit row variables are parser-
+                // accepted but not yet semantically supported. Emit
+                // E0125 against the row-variable's span; check_lambda
+                // proceeds with the closed effect row.
+                effect_row_var,
                 body,
                 span,
-            } => self.check_lambda(params, return_type, effects, body, span.clone()),
+            } => {
+                self.report_row_var_unsupported(effect_row_var);
+                self.check_lambda(params, return_type, effects, body, span.clone())
+            }
             // `ClosureRecord` / `ClosureEnvLoad` are post-closure-
             // conversion nodes synthesized by plan A2 task 31. They
             // never appear in a parser-produced AST; typecheck runs
@@ -1321,8 +1376,22 @@ impl Tc {
         // inside constructor arms) that must scope only over their own
         // arm body; `check_pattern` gathers them into a list so we can
         // snapshot/restore the enclosing env correctly.
+        //
+        // Plan B A3-carryover: track whether any arm emitted a typecheck
+        // error during its pattern or body. If so, suppress the
+        // user-type exhaustiveness check (E0120) below — the user
+        // fixes the arm-level error first and exhaustiveness re-runs
+        // on the next compile.
+        //
+        // Narrow behaviour: primitive E0066 non-exhaustiveness stays
+        // on (it rarely cascades from arm-body errors), and only the
+        // user-type E0120 surface gets suppressed. The check below
+        // gates the E0120 emission on `!any_arm_erred`; the E0066
+        // path runs regardless.
         let mut result_ty: Option<Ty> = None;
+        let mut any_arm_erred = false;
         for arm in arms {
+            let arm_error_baseline = self.errors.len();
             let mut bindings: Vec<(String, Ty)> = Vec::new();
             match &scrut_ty {
                 Some(st) => self.check_pattern(&arm.pattern, st, &mut bindings),
@@ -1368,30 +1437,44 @@ impl Tc {
                 }
                 _ => {}
             }
+            if self.errors.len() > arm_error_baseline {
+                any_arm_erred = true;
+            }
         }
 
         // (2) exhaustiveness.
         //
-        // User types (Plan A3 task 38.4): top-level Maranget-style
-        // coverage — either a catch-all arm (wildcard or non-promotion
-        // var binding) is present, or every declared variant has an
-        // arm. Missing variants → E0120 with a witness string naming
-        // the uncovered ctor with `_` fields.
+        // User types (Plan A3 task 38.4 + Plan B carryover): full
+        // nested Maranget-style coverage — either a catch-all arm
+        // (wildcard or non-promotion var binding) is present, or
+        // every declared variant has an arm whose nested-pattern
+        // structure also covers the variant's field types. Missing
+        // coverage → E0120 with a witness string naming the
+        // uncovered case (variant + filled-in field witnesses).
+        // Implemented in `match_witness` (commit 62ba42a); the
+        // `TRAP_NONEXHAUSTIVE_MATCH` runtime trap survives only as
+        // a defensive safety net for codegen-internal errors and
+        // for non-exhaustive primitive-scrutinee paths.
         //
         // Primitives (Plan A2): retained `is_exhaustive` rule → E0066.
         //
-        // Nested non-exhaustiveness inside ctor fields falls through
-        // to the runtime `TRAP_NONEXHAUSTIVE_MATCH` trap in Plan A3
-        // v1 (documented in the E0120 catalog long-form); Plan B
-        // refines to full nested exhaustiveness.
+        // Plan B A3-carryover: if any arm had a typecheck error above,
+        // skip *only* the user-type E0120 path. The cascade pattern the
+        // carryover targets is mistyped ctor-arms making the user-type
+        // exhaustiveness pass look like it's missing variants — that's
+        // an E0120 noise problem. Primitive scrutinees rarely cascade
+        // the same way (literal-pattern errors don't typically pretend
+        // to be coverage holes), so the E0066 path runs unconditionally.
         if let Some(ref st) = scrut_ty {
             if let Ty::User(u) = st {
-                if let Some(witness) = self.user_type_witness(u, arms) {
-                    self.push_error(
-                        "E0120",
-                        span,
-                        format!("`match` on `{u}` is not exhaustive; missing case `{witness}`"),
-                    );
+                if !any_arm_erred {
+                    if let Some(witness) = self.user_type_witness(u, arms) {
+                        self.push_error(
+                            "E0120",
+                            span,
+                            format!("`match` on `{u}` is not exhaustive; missing case `{witness}`"),
+                        );
+                    }
                 }
             } else if !is_exhaustive(st, arms) {
                 self.push_error(
@@ -1419,17 +1502,144 @@ impl Tc {
     /// the runtime trap and is documented as such in the E0120 catalog
     /// long-form.
     fn user_type_witness(&self, type_name: &str, arms: &[MatchArm]) -> Option<String> {
-        let td = self.types.get(type_name)?;
-        // A wildcard arm (`_ => ..`) or a bare-var arm whose name is
-        // not a nullary ctor of this type is a true catch-all.
-        let has_catchall = arms.iter().any(|a| match &a.pattern {
+        let scrut_ty = Ty::User(type_name.to_string());
+        let patterns: Vec<&Pattern> = arms.iter().map(|a| &a.pattern).collect();
+        self.match_witness(&scrut_ty, &patterns)
+    }
+
+    /// Plan B A3-carryover — recursive Maranget exhaustiveness.
+    ///
+    /// Returns `None` if the given pattern list exhaustively covers
+    /// `scrut_ty`; otherwise returns `Some(witness)` naming a concrete
+    /// uncovered value. The witness is paste-able into a new arm.
+    ///
+    /// Primitive scrutinees honor the Plan A2 rule: wildcard required
+    /// except for `Bool` where both literals may cover, and `Unit`
+    /// where any arm covers the sole value.
+    ///
+    /// User-type scrutinees descend into constructor field patterns:
+    ///
+    ///   `match o { Some(true) => .., None => .. }` on
+    ///   `Option = | None | Some(Bool)` now returns `Some("Some(false)")`
+    ///   rather than falling through to a runtime trap.
+    ///
+    /// Pattern::Var is interpreted context-sensitively: on a user-type
+    /// scrutinee whose declared variants contain a Unit variant named
+    /// `V`, `Pattern::Var("V", _)` matches *that variant only* (the
+    /// nullary-ctor-promotion rule established in Task 38.3); on any
+    /// other scrutinee shape it is a fresh catch-all binder.
+    fn match_witness(&self, scrut_ty: &Ty, patterns: &[&Pattern]) -> Option<String> {
+        if patterns
+            .iter()
+            .any(|p| self.pattern_is_catchall(p, scrut_ty))
+        {
+            return None;
+        }
+        match scrut_ty {
+            Ty::Bool => {
+                let has_true = patterns
+                    .iter()
+                    .any(|p| matches!(p, Pattern::BoolLit(true, _)));
+                let has_false = patterns
+                    .iter()
+                    .any(|p| matches!(p, Pattern::BoolLit(false, _)));
+                match (has_true, has_false) {
+                    (true, true) => None,
+                    // Missing `false` — witness is the unseen literal.
+                    (true, false) => Some("false".to_string()),
+                    // Missing `true` — ditto.
+                    (false, true) => Some("true".to_string()),
+                    // Missing both — name `false` arbitrarily; the user
+                    // will see they need at least one literal arm.
+                    (false, false) => Some("false".to_string()),
+                }
+            }
+            Ty::Unit => None,
+            // Infinite / un-enumerable value domains: only a wildcard
+            // / fresh-var binder can reach exhaustiveness, and such a
+            // pattern was already caught above by `pattern_is_catchall`.
+            Ty::Int | Ty::Char | Ty::String | Ty::Byte | Ty::Fn(_) => Some("_".to_string()),
+            Ty::User(type_name) => {
+                let td = self.types.get(type_name)?;
+                for (variant_idx, variant) in td.variants.iter().enumerate() {
+                    // Gather per-arm field-pattern lists from every
+                    // pattern that matches this variant.
+                    let mut variant_rows: Vec<Vec<Pattern>> = Vec::new();
+                    for p in patterns {
+                        if let Some(fields) =
+                            self.pattern_matches_variant(p, type_name, variant_idx, variant)
+                        {
+                            variant_rows.push(fields);
+                        }
+                    }
+                    if variant_rows.is_empty() {
+                        return Some(ctor_witness_string(variant));
+                    }
+                    // Recurse per field position. The first uncovered
+                    // field yields the witness, with the other fields
+                    // wildcarded.
+                    match &variant.fields {
+                        VariantFields::Unit => {}
+                        VariantFields::Positional(field_tes) => {
+                            for (field_idx, field_te) in field_tes.iter().enumerate() {
+                                let field_ty = match ty_from_type_expr(field_te, &self.types) {
+                                    Some(t) => t,
+                                    None => continue,
+                                };
+                                let field_patterns: Vec<&Pattern> =
+                                    variant_rows.iter().map(|row| &row[field_idx]).collect();
+                                if let Some(sub) = self.match_witness(&field_ty, &field_patterns) {
+                                    return Some(positional_witness_with_hole(
+                                        variant, field_idx, &sub,
+                                    ));
+                                }
+                            }
+                        }
+                        VariantFields::Record(record_fields) => {
+                            for (field_idx, record_field) in record_fields.iter().enumerate() {
+                                let field_ty =
+                                    match ty_from_type_expr(&record_field.ty, &self.types) {
+                                        Some(t) => t,
+                                        None => continue,
+                                    };
+                                let field_patterns: Vec<&Pattern> =
+                                    variant_rows.iter().map(|row| &row[field_idx]).collect();
+                                if let Some(sub) = self.match_witness(&field_ty, &field_patterns) {
+                                    return Some(record_witness_with_hole(
+                                        variant,
+                                        record_fields,
+                                        field_idx,
+                                        &sub,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// True when `p` covers every possible value of `scrut_ty`.
+    ///
+    /// `Pattern::Wildcard` is always a catchall. `Pattern::Var(name)`
+    /// is a catchall unless it's a nullary-ctor promotion of `name`
+    /// to a Unit variant of a user-type scrutinee — in which case it
+    /// only covers that one variant.
+    fn pattern_is_catchall(&self, p: &Pattern, scrut_ty: &Ty) -> bool {
+        match p {
             Pattern::Wildcard(_) => true,
             Pattern::Var(name, _) => {
-                if let Some(info) = self.ctors.get(name) {
-                    if info.type_name == type_name {
-                        if let Some(variant) = td.variants.get(info.variant_index) {
-                            if matches!(variant.fields, VariantFields::Unit) {
-                                return false; // nullary-ctor promotion, not a catchall
+                if let Ty::User(u) = scrut_ty {
+                    if let Some(info) = self.ctors.get(name) {
+                        if info.type_name == *u {
+                            if let Some(td) = self.types.get(u) {
+                                if let Some(variant) = td.variants.get(info.variant_index) {
+                                    if matches!(variant.fields, VariantFields::Unit) {
+                                        return false;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1437,26 +1647,71 @@ impl Tc {
                 true
             }
             _ => false,
-        });
-        if has_catchall {
-            return None;
         }
-        for variant in &td.variants {
-            let covered = arms
-                .iter()
-                .any(|a| Self::arm_covers_variant(&a.pattern, &variant.name));
-            if !covered {
-                return Some(ctor_witness_string(variant));
-            }
-        }
-        None
     }
 
-    fn arm_covers_variant(p: &Pattern, variant_name: &str) -> bool {
+    /// If `p` matches `variant` (of `type_name` at index `variant_idx`),
+    /// return the per-field sub-patterns in the declared field order.
+    /// Otherwise `None`.
+    ///
+    /// For record patterns, sub-patterns are reordered to match the
+    /// declared field order so field-index recursion in
+    /// `match_witness` is straightforward. Pattern validity has
+    /// already been checked by `check_pattern`, so shape mismatches
+    /// here fall through to `None` and cannot surprise callers.
+    fn pattern_matches_variant(
+        &self,
+        p: &Pattern,
+        type_name: &str,
+        variant_idx: usize,
+        variant: &Variant,
+    ) -> Option<Vec<Pattern>> {
         match p {
-            Pattern::Ctor { name, .. } => name == variant_name,
-            Pattern::Var(name, _) => name == variant_name,
-            _ => false,
+            Pattern::Ctor { name, fields, .. } => {
+                if name != &variant.name {
+                    return None;
+                }
+                match (fields, &variant.fields) {
+                    (CtorPatternFields::Unit, VariantFields::Unit) => Some(Vec::new()),
+                    (
+                        CtorPatternFields::Positional(sub_pats),
+                        VariantFields::Positional(field_tes),
+                    ) if sub_pats.len() == field_tes.len() => Some(sub_pats.clone()),
+                    (CtorPatternFields::Record(cpf), VariantFields::Record(rfd)) => {
+                        // `check_pattern` rejects record patterns with
+                        // missing fields via E0115. If we hit a missing
+                        // field here the AST is already malformed —
+                        // bail out of variant matching for this arm
+                        // rather than wildcarding (which would silently
+                        // over-approximate coverage and mask bugs in
+                        // upstream validation).
+                        let mut out: Vec<Pattern> = Vec::with_capacity(rfd.len());
+                        for declared in rfd {
+                            match cpf.iter().find(|f| f.name == declared.name) {
+                                Some(f) => out.push(f.pattern.clone()),
+                                None => return None,
+                            }
+                        }
+                        Some(out)
+                    }
+                    _ => None,
+                }
+            }
+            Pattern::Var(name, _) => {
+                // Nullary-ctor promotion: matches exactly this variant
+                // when (a) the name resolves to this variant via the
+                // ctor registry and (b) the declared shape is Unit.
+                if let Some(info) = self.ctors.get(name) {
+                    if info.type_name == type_name
+                        && info.variant_index == variant_idx
+                        && matches!(variant.fields, VariantFields::Unit)
+                    {
+                        return Some(Vec::new());
+                    }
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -1736,15 +1991,14 @@ impl Tc {
 }
 
 fn type_is(t: &TypeExpr, name: &str) -> bool {
-    match t {
-        TypeExpr::Named(n, _) => n == name,
-    }
+    // Plan B Task 47: head-name match — generic application
+    // (`List[Int]`) matches the head, ignoring args. Real type-arg
+    // matching arrives with Task 48 unification.
+    t.head_name() == name
 }
 
 fn type_name(t: &TypeExpr) -> &str {
-    match t {
-        TypeExpr::Named(n, _) => n.as_str(),
-    }
+    t.head_name()
 }
 
 /// Lift a surface `TypeExpr` into the checker's `Ty` lattice. Resolves
@@ -1752,34 +2006,44 @@ fn type_name(t: &TypeExpr) -> &str {
 /// `Byte`), then Plan A3 user-defined types by consulting the types
 /// registry. Unknown names return `None`; the caller (fn_env pre-pass
 /// or `check_type_expr_known`) handles the fallback/diagnostic split.
+///
+/// Plan B Task 47: TypeExpr::Apply is treated equivalently to
+/// `TypeExpr::Named(head_name, _)` here — the type arguments are
+/// silently dropped. Real generic resolution arrives with Task 48
+/// HM unification (effects: a `List[Int]` and a `List[String]` will
+/// remain indistinguishable to this lift until the Tc grows
+/// type-parameter substitution).
 pub(crate) fn ty_from_type_expr(t: &TypeExpr, types: &BTreeMap<String, TypeDecl>) -> Option<Ty> {
-    match t {
-        TypeExpr::Named(n, _) => match n.as_str() {
-            "Int" => Some(Ty::Int),
-            "String" => Some(Ty::String),
-            "Unit" => Some(Ty::Unit),
-            "Bool" => Some(Ty::Bool),
-            "Char" => Some(Ty::Char),
-            "Byte" => Some(Ty::Byte),
-            other => {
-                if types.contains_key(other) {
-                    Some(Ty::User(other.to_string()))
-                } else {
-                    None
-                }
+    match t.head_name() {
+        "Int" => Some(Ty::Int),
+        "String" => Some(Ty::String),
+        "Unit" => Some(Ty::Unit),
+        "Bool" => Some(Ty::Bool),
+        "Char" => Some(Ty::Char),
+        "Byte" => Some(Ty::Byte),
+        other => {
+            if types.contains_key(other) {
+                Some(Ty::User(other.to_string()))
+            } else {
+                None
             }
-        },
+        }
     }
 }
 
 fn type_matches(expected: &TypeExpr, actual: &Ty) -> bool {
-    match (expected, actual) {
-        (TypeExpr::Named(n, _), Ty::Int) => n == "Int",
-        (TypeExpr::Named(n, _), Ty::String) => n == "String",
-        (TypeExpr::Named(n, _), Ty::Unit) => n == "Unit",
-        (TypeExpr::Named(n, _), Ty::Bool) => n == "Bool",
-        (TypeExpr::Named(n, _), Ty::Char) => n == "Char",
-        (TypeExpr::Named(n, _), Ty::Byte) => n == "Byte",
+    // Plan B Task 47: head-name comparison only. Generic applications
+    // like `List[Int]` match `Ty::User("List")` regardless of the
+    // type argument; refinement to argument-aware matching is
+    // Task 48 / Task 49 work.
+    let n = expected.head_name();
+    match actual {
+        Ty::Int => n == "Int",
+        Ty::String => n == "String",
+        Ty::Unit => n == "Unit",
+        Ty::Bool => n == "Bool",
+        Ty::Char => n == "Char",
+        Ty::Byte => n == "Byte",
         // `TypeExpr` does not yet admit a function-type surface
         // syntax (deferred from Task 30's minimum scope — the
         // `FnSig`-bearing `Ty::Fn` lives entirely in the checker for
@@ -1787,9 +2051,9 @@ fn type_matches(expected: &TypeExpr, actual: &Ty) -> bool {
         // the global fn-env pre-pass). A `let f: Foo = <fn-typed
         // expr>;` therefore never matches, so a named left-hand
         // type against a `Ty::Fn` right-hand is a hard mismatch.
-        (TypeExpr::Named(_, _), Ty::Fn(_)) => false,
+        Ty::Fn(_) => false,
         // Plan A3 task 38: nominal user-defined types match by name.
-        (TypeExpr::Named(n, _), Ty::User(u)) => n == u,
+        Ty::User(u) => n == u,
     }
 }
 
@@ -1862,6 +2126,49 @@ fn ctor_witness_string(variant: &Variant) -> String {
             format!("{} {{ {fs} }}", variant.name)
         }
     }
+}
+
+/// Plan B A3-carryover — build a positional-variant witness string
+/// with the `hole_idx`-th field replaced by `sub`, other fields left
+/// as `_`.
+fn positional_witness_with_hole(variant: &Variant, hole_idx: usize, sub: &str) -> String {
+    let arity = match &variant.fields {
+        VariantFields::Positional(params) => params.len(),
+        _ => return variant.name.clone(),
+    };
+    let args: Vec<String> = (0..arity)
+        .map(|i| {
+            if i == hole_idx {
+                sub.to_string()
+            } else {
+                "_".to_string()
+            }
+        })
+        .collect();
+    format!("{}({})", variant.name, args.join(", "))
+}
+
+/// Plan B A3-carryover — build a record-variant witness string with
+/// the `hole_idx`-th field (in declared-field order) set to `sub` and
+/// other fields left as `_`.
+fn record_witness_with_hole(
+    variant: &Variant,
+    fields: &[RecordFieldDecl],
+    hole_idx: usize,
+    sub: &str,
+) -> String {
+    let fs: Vec<String> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if i == hole_idx {
+                format!("{}: {sub}", f.name)
+            } else {
+                format!("{}: _", f.name)
+            }
+        })
+        .collect();
+    format!("{} {{ {} }}", variant.name, fs.join(", "))
 }
 
 /// Coarse exhaustiveness check. Wildcard-terminated arm lists are
@@ -3406,6 +3713,353 @@ mod tests {
             e120.message.contains("Rect { w: _, h: _ }"),
             "witness format wrong: {}",
             e120.message
+        );
+    }
+
+    // ===== Plan B Task 47 — E0124/E0125 placeholders until Task 48 =====
+
+    #[test]
+    fn generic_application_in_param_type_fires_e0124() {
+        let src = "fn f(xs: List[Int]) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0124"),
+            "expected E0124 for List[Int], got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn generic_application_in_return_type_fires_e0124() {
+        let src = "fn f() -> List[Int] ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0124"),
+            "expected E0124 in return type, got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn generic_application_in_variant_field_fires_e0124() {
+        let src = "type Box = | Empty | Holds(List[Int])\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0124"),
+            "expected E0124 in variant field, got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn generic_application_in_let_type_fires_e0124() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let xs: List[Int] = 0;\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0124"),
+            "expected E0124 in let-binding type, got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn nested_generic_application_fires_e0124_for_each() {
+        // `Map[String, List[Int]]` should report E0124 for both the
+        // outer `Map[..]` and the inner `List[..]`. Recurses into args.
+        let src = "fn f(m: Map[String, List[Int]]) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let n_e0124 = errs.iter().filter(|e| e.code.as_str() == "E0124").count();
+        assert!(
+            n_e0124 >= 2,
+            "expected at least 2 E0124 (outer + inner Apply); got {} / {errs:?}",
+            n_e0124,
+        );
+    }
+
+    #[test]
+    fn explicit_row_variable_on_fn_fires_e0125() {
+        let src = "fn f(x: Int) -> Int ![IO | e] { x }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0125"),
+            "expected E0125 for `![IO | e]`, got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn explicit_row_variable_on_lambda_fires_e0125() {
+        // Lambdas reach the typechecker through any expression
+        // position. A let RHS works: the lambda's `![IO | e]` row
+        // variable triggers E0125. Incidental noise (E0045 from
+        // binding the Fn-typed lambda to an Int slot, E0112 from `Fn`
+        // not being a v1 primitive) is acceptable — the assertion
+        // only pins the E0125 placeholder, which is the contract
+        // under test.
+        let src = "fn main() -> Int ![] {\n  \
+                     let f: Fn = (fn (x: Int) -> Int ![IO | e] => x);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0125"),
+            "expected E0125 for lambda `![IO | e]`, got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn closed_row_does_not_fire_e0125() {
+        let src = "fn f(x: Int) -> Int ![IO] { x }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !has_code(&errs, "E0125"),
+            "closed row `![IO]` must not fire E0125; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn non_generic_named_type_does_not_fire_e0124() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !has_code(&errs, "E0124"),
+            "plain Named (Option) must not fire E0124; got {errs:?}",
+        );
+    }
+
+    // ===== Plan B A3-carryover — nested Maranget exhaustiveness =====
+
+    #[test]
+    fn nested_some_bool_missing_false_fires_e0120_with_witness() {
+        // `Option = | None | Some(Bool)`; arms cover None and Some(true)
+        // but not Some(false). Plan A3 shipped top-level-only coverage
+        // and let this fall through to the runtime trap; Plan B must
+        // catch it at compile time with the paste-able witness.
+        let src = "type Option = | None | Some(Bool)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(true) => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Some(false)"),
+            "witness must name Some(false); got {}",
+            e120.message,
+        );
+    }
+
+    #[test]
+    fn nested_some_bool_missing_true_fires_e0120_with_witness() {
+        let src = "type Option = | None | Some(Bool)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(false) => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Some(true)"),
+            "witness must name Some(true); got {}",
+            e120.message,
+        );
+    }
+
+    #[test]
+    fn nested_bool_exhaustive_with_both_literals_no_e0120() {
+        let src = "type Option = | None | Some(Bool)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(true) => 1, Some(false) => 2 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "all Some-field variants covered: no E0120 expected; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn nested_ctor_with_field_catchall_is_exhaustive() {
+        // `Some(_)` field-wildcards the Bool; together with `None`
+        // this is fully exhaustive.
+        let src = "type Option = | None | Some(Bool)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(_) => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "Some(_) catchall covers Bool field: no E0120 expected; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn nested_user_type_field_catches_inner_missing_variant() {
+        // Box holds a Tree; arms cover the outer variant but the inner
+        // Tree has Leaf and Node, and the Some-arm only handles Leaf.
+        // Witness must name Some(Node(_, _, _)).
+        let src = "type Tree = | Leaf | Node(Int, Tree, Tree)\n\
+                   type Box = | Empty | Holds(Tree)\n\
+                   fn f(b: Box) -> Int ![] {\n  \
+                     match b { Empty => 0, Holds(Leaf) => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Holds(Node(_, _, _))"),
+            "witness must name Holds(Node(_, _, _)); got {}",
+            e120.message,
+        );
+    }
+
+    #[test]
+    fn nested_record_field_missing_emits_record_witness() {
+        // `Pair { a: Bool, b: Bool }` with only the `true, true` arm.
+        // Witness should surface one missing field-of-Bool with the
+        // other(s) wildcarded.
+        let src = "type Pair = | P { a: Bool, b: Bool }\n\
+                   fn f(p: Pair) -> Int ![] {\n  \
+                     match p { P { a: true, b: true } => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        // The first uncovered field is `a` (Bool, missing `false`).
+        // Witness: P { a: false, b: _ }.
+        assert!(
+            e120.message.contains("P { a: false, b: _ }"),
+            "witness must surface P's uncovered field; got {}",
+            e120.message,
+        );
+    }
+
+    #[test]
+    fn nested_int_field_requires_wildcard() {
+        // `Some(Int)` with a literal-only field pattern cannot be
+        // exhaustive — Int domain is infinite, so match_witness
+        // returns the generic "_" witness at the field position.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { None => 0, Some(1) => 1 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let e120 = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0120")
+            .unwrap_or_else(|| panic!("expected E0120, got: {errs:?}"));
+        assert!(
+            e120.message.contains("Some(_)"),
+            "Int field with only a literal pattern should surface Some(_) witness; got {}",
+            e120.message,
+        );
+    }
+
+    // ===== Plan B A3-carryover — E0120 suppression when an arm errs =====
+
+    #[test]
+    fn e0120_suppressed_when_arm_body_has_type_error() {
+        // Non-exhaustive match (only `Some`) PLUS an arm body that
+        // fails type-checking (arithmetic on a String). Pre-Plan-B
+        // this emitted BOTH the body error and E0120; the A3-carryover
+        // cleanup suppresses E0120 so the user focuses on the body.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Some(n) => n + \"bad\" }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        // A body-level error (arithmetic on String) must still fire.
+        assert!(
+            errs.iter().any(|e| e.code.as_str() != "E0120"),
+            "expected a non-E0120 error (arm body type mismatch) — got only {errs:?}",
+        );
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "E0120 should be suppressed while the arm body is malformed; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn e0120_suppressed_when_arm_pattern_has_e0117() {
+        // Non-exhaustive match plus a pattern that doesn't match the
+        // scrutinee type (E0117). Suppress E0120 so the user focuses
+        // on fixing the pattern first.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { (a, b) => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0117"),
+            "expected E0117 pattern-shape error, got {errs:?}",
+        );
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "E0120 should be suppressed while a pattern fails shape check; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn e0066_still_fires_on_primitive_when_arm_body_errs() {
+        // Primitive Bool scrutinee with only one literal arm AND a
+        // body that fails type-checking. E0120 suppression is
+        // user-type-only — the primitive E0066 path stays on so the
+        // user still sees the missing-literal coverage hole.
+        let src = "fn f(b: Bool) -> Int ![] {\n  \
+                     match b { true => 1 + \"bad\" }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        // The arm body's type error must still fire.
+        assert!(
+            errs.iter().any(|e| e.code.as_str() != "E0066"),
+            "expected an arm-body type error; got only {errs:?}",
+        );
+        // E0066 must NOT be suppressed: primitive coverage runs
+        // unconditionally per the A3-carryover design.
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0066"),
+            "E0066 must still fire on a non-exhaustive Bool match; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn e0120_still_fires_when_all_arms_typecheck_cleanly() {
+        // Regression-guard the suppression: a truly non-exhaustive
+        // match with every arm well-typed must still produce E0120.
+        // Protects against over-suppression from the A3-carryover.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Some(n) => n }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "clean arms but non-exhaustive — E0120 must still fire; got {errs:?}",
         );
     }
 

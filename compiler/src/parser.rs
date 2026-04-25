@@ -277,6 +277,9 @@ impl<'a> Parser<'a> {
         };
         let name_span = name_tok.span;
 
+        // Plan B Task 47 — optional `[A, B]` generic-parameter list.
+        let generic_params = self.parse_generic_params()?;
+
         self.expect(&TokenKind::LParen, "`(`")?;
         let mut params = Vec::new();
         while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
@@ -300,8 +303,32 @@ impl<'a> Parser<'a> {
         let return_type = self.parse_type()?;
         self.expect(&TokenKind::Bang, "`!` before effect row")?;
         self.expect(&TokenKind::LBracket, "`[` opening effect row")?;
+        let (effects, effect_row_var) = self.parse_effect_row()?;
+        let body = self.parse_block()?;
+        Some(FnDecl {
+            name,
+            name_span,
+            generic_params,
+            params,
+            return_type,
+            effects,
+            effect_row_var,
+            body,
+            span: start,
+        })
+    }
+
+    /// Plan B Task 47 — parse the body of an effect row:
+    /// `IO, Foo, Bar` or `IO | e` (row-variable). Caller already
+    /// consumed the opening `[`; this method consumes through the
+    /// closing `]`. Returns (effects, optional row variable).
+    fn parse_effect_row(&mut self) -> Option<(Vec<String>, Option<RowVar>)> {
         let mut effects = Vec::new();
-        while !matches!(self.peek().kind, TokenKind::RBracket | TokenKind::Eof) {
+        let mut row_var = None;
+        while !matches!(
+            self.peek().kind,
+            TokenKind::RBracket | TokenKind::Pipe | TokenKind::Eof
+        ) {
             let e = self.parse_ident("effect name")?;
             effects.push(e);
             if matches!(self.peek().kind, TokenKind::Comma) {
@@ -310,17 +337,66 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        if matches!(self.peek().kind, TokenKind::Pipe) {
+            self.advance();
+            let tok = self.peek().clone();
+            match tok.kind {
+                TokenKind::Ident(name) => {
+                    self.advance();
+                    row_var = Some(RowVar {
+                        name,
+                        span: tok.span,
+                    });
+                }
+                _ => {
+                    self.err(tok.span, "expected row-variable name after `|`");
+                }
+            }
+        }
         self.expect(&TokenKind::RBracket, "`]` closing effect row")?;
-        let body = self.parse_block()?;
-        Some(FnDecl {
-            name,
-            name_span,
-            params,
-            return_type,
-            effects,
-            body,
-            span: start,
-        })
+        Some((effects, row_var))
+    }
+
+    /// Plan B Task 47 — optional `[A, B, ...]` generic-param header
+    /// preceding a fn or type's main body. Returns `Some(Vec::new())`
+    /// when the next token isn't `[` (a non-generic decl); returns
+    /// `None` if a malformed list aborts parsing of the enclosing
+    /// item. Mirrors `parse_effect_row`'s shape so callers propagate
+    /// failures via `?` consistently — bounds and defaults extensions
+    /// in a future plan can repurpose the same shape.
+    fn parse_generic_params(&mut self) -> Option<Vec<GenericParam>> {
+        if !matches!(self.peek().kind, TokenKind::LBracket) {
+            return Some(Vec::new());
+        }
+        // Lookahead: `[` could open a non-generic `[A, B]` decl or
+        // start a value-level expression in a different context. Here
+        // (between a fn/type name and its parameter list / `=`), the
+        // only valid `[...]` is a generic-param list.
+        self.advance();
+        let mut params = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBracket | TokenKind::Eof) {
+            let tok = self.peek().clone();
+            match tok.kind {
+                TokenKind::Ident(name) => {
+                    self.advance();
+                    params.push(GenericParam {
+                        name,
+                        span: tok.span,
+                    });
+                }
+                _ => {
+                    self.err(tok.span, "expected generic-parameter name");
+                    return None;
+                }
+            }
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBracket, "`]` closing generic-parameter list")?;
+        Some(params)
     }
 
     fn parse_type(&mut self) -> Option<TypeExpr> {
@@ -330,6 +406,29 @@ impl<'a> Parser<'a> {
             return None;
         };
         self.advance();
+        // Plan B Task 47 — optional generic application
+        // `Name[T1, T2, ...]`. The arguments are themselves
+        // TypeExprs, so generic application nests:
+        // `Map[String, List[Int]]` parses recursively.
+        if matches!(self.peek().kind, TokenKind::LBracket) {
+            self.advance();
+            let mut args = Vec::new();
+            while !matches!(self.peek().kind, TokenKind::RBracket | TokenKind::Eof) {
+                let arg = self.parse_type()?;
+                args.push(arg);
+                if matches!(self.peek().kind, TokenKind::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RBracket, "`]` closing generic-argument list")?;
+            return Some(TypeExpr::Apply {
+                name: n,
+                args,
+                span: tok.span,
+            });
+        }
         Some(TypeExpr::Named(n, tok.span))
     }
 
@@ -360,6 +459,11 @@ impl<'a> Parser<'a> {
             }
         };
         let name_span = name_tok.span;
+
+        // Plan B Task 47 — optional `[A, B]` generic-parameter list
+        // between the type name and `=`.
+        let generic_params = self.parse_generic_params()?;
+
         self.expect(&TokenKind::Eq, "`=`")?;
 
         // Single-constructor record shorthand `type Name = { f: T, ... }`.
@@ -376,6 +480,7 @@ impl<'a> Parser<'a> {
             return Some(TypeDecl {
                 name,
                 name_span,
+                generic_params,
                 variants: vec![variant],
                 span: start,
             });
@@ -399,6 +504,7 @@ impl<'a> Parser<'a> {
         Some(TypeDecl {
             name,
             name_span,
+            generic_params,
             variants,
             span: start,
         })
@@ -798,23 +904,14 @@ impl<'a> Parser<'a> {
         let return_type = self.parse_type()?;
         self.expect(&TokenKind::Bang, "`!` before lambda effect row")?;
         self.expect(&TokenKind::LBracket, "`[` opening lambda effect row")?;
-        let mut effects = Vec::new();
-        while !matches!(self.peek().kind, TokenKind::RBracket | TokenKind::Eof) {
-            let e = self.parse_ident("effect name")?;
-            effects.push(e);
-            if matches!(self.peek().kind, TokenKind::Comma) {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        self.expect(&TokenKind::RBracket, "`]` closing lambda effect row")?;
+        let (effects, effect_row_var) = self.parse_effect_row()?;
         self.expect(&TokenKind::FatArrow, "`=>` before lambda body")?;
         let body = self.parse_expr()?;
         Some(Expr::Lambda {
             params,
             return_type,
             effects,
+            effect_row_var,
             body: Box::new(body),
             span: start,
         })
@@ -1523,9 +1620,7 @@ mod tests {
                 ..
             } => {
                 assert!(params.is_empty());
-                match return_type {
-                    TypeExpr::Named(n, _) => assert_eq!(n, "Int"),
-                }
+                assert_eq!(return_type.head_name(), "Int");
                 assert!(effects.is_empty());
                 assert!(matches!(*body, Expr::IntLit(42, _)));
             }
@@ -1546,12 +1641,8 @@ mod tests {
             } => {
                 assert_eq!(params.len(), 1);
                 assert_eq!(params[0].name, "x");
-                match &params[0].ty {
-                    TypeExpr::Named(n, _) => assert_eq!(n, "Int"),
-                }
-                match return_type {
-                    TypeExpr::Named(n, _) => assert_eq!(n, "Int"),
-                }
+                assert_eq!(params[0].ty.head_name(), "Int");
+                assert_eq!(return_type.head_name(), "Int");
                 assert!(effects.is_empty());
                 match *body {
                     Expr::Ident(ref n, _) => assert_eq!(n, "x"),
@@ -2040,6 +2131,240 @@ mod tests {
         assert!(
             errs.iter().any(|e| e.code.as_str() == "E0110"),
             "expected E0110 for as-binding, got: {errs:?}"
+        );
+    }
+
+    // ===== Plan B Task 47 — generic params + row variables =====
+
+    fn parse_str(src: &str) -> Program {
+        let (toks, lex_errs) = lex("t.sigil", src);
+        assert!(lex_errs.is_empty(), "lex errors: {lex_errs:?}");
+        let (prog, parse_errs) = parse("t.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
+        prog
+    }
+
+    fn first_fn(p: &Program) -> &FnDecl {
+        for it in &p.items {
+            if let Item::Fn(f) = it {
+                return f;
+            }
+        }
+        panic!("no fn in program");
+    }
+
+    fn first_type(p: &Program) -> &TypeDecl {
+        for it in &p.items {
+            if let Item::Type(td) = it {
+                return td;
+            }
+        }
+        panic!("no type decl in program");
+    }
+
+    #[test]
+    fn fn_with_no_generic_params_has_empty_list() {
+        // Backward-compat guard: existing non-generic fn signatures
+        // continue to parse with `generic_params: []`.
+        let p = parse_str("fn id(x: Int) -> Int ![] { x }\n");
+        let f = first_fn(&p);
+        assert!(f.generic_params.is_empty());
+        assert!(f.effect_row_var.is_none());
+    }
+
+    #[test]
+    fn fn_with_single_generic_param_parses() {
+        let p = parse_str("fn id[A](x: A) -> A ![] { x }\n");
+        let f = first_fn(&p);
+        assert_eq!(f.generic_params.len(), 1);
+        assert_eq!(f.generic_params[0].name, "A");
+        assert_eq!(f.params[0].ty.head_name(), "A");
+        assert_eq!(f.return_type.head_name(), "A");
+    }
+
+    #[test]
+    fn fn_with_two_generic_params_parses() {
+        let p = parse_str("fn pair[A, B](a: A, b: B) -> Int ![] { 0 }\n");
+        let f = first_fn(&p);
+        assert_eq!(f.generic_params.len(), 2);
+        assert_eq!(f.generic_params[0].name, "A");
+        assert_eq!(f.generic_params[1].name, "B");
+    }
+
+    #[test]
+    fn type_application_in_param_position_parses_as_apply() {
+        let p = parse_str("fn f(xs: List[Int]) -> Int ![] { 0 }\n");
+        let f = first_fn(&p);
+        match &f.params[0].ty {
+            TypeExpr::Apply { name, args, .. } => {
+                assert_eq!(name, "List");
+                assert_eq!(args.len(), 1);
+                assert_eq!(args[0].head_name(), "Int");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_type_application_parses_recursively() {
+        let p = parse_str("fn f(m: Map[String, List[Int]]) -> Int ![] { 0 }\n");
+        let f = first_fn(&p);
+        match &f.params[0].ty {
+            TypeExpr::Apply { name, args, .. } => {
+                assert_eq!(name, "Map");
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0].head_name(), "String");
+                match &args[1] {
+                    TypeExpr::Apply { name, args, .. } => {
+                        assert_eq!(name, "List");
+                        assert_eq!(args.len(), 1);
+                        assert_eq!(args[0].head_name(), "Int");
+                    }
+                    other => panic!("expected nested Apply, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_row_variable_parses() {
+        let p = parse_str("fn f(x: Int) -> Int ![IO | e] { x }\n");
+        let f = first_fn(&p);
+        assert_eq!(f.effects, vec!["IO".to_string()]);
+        let rv = f
+            .effect_row_var
+            .as_ref()
+            .expect("expected row variable `e`");
+        assert_eq!(rv.name, "e");
+    }
+
+    #[test]
+    fn row_variable_alone_with_no_effects_parses() {
+        // `![| r]` introduces only a row variable, no concrete effects.
+        let p = parse_str("fn f(x: Int) -> Int ![| r] { x }\n");
+        let f = first_fn(&p);
+        assert!(f.effects.is_empty());
+        assert_eq!(
+            f.effect_row_var.as_ref().map(|r| r.name.as_str()),
+            Some("r")
+        );
+    }
+
+    #[test]
+    fn type_decl_with_generic_param_parses() {
+        let p = parse_str("type List[A] = | Nil | Cons(A, List[A])\n");
+        let td = first_type(&p);
+        assert_eq!(td.generic_params.len(), 1);
+        assert_eq!(td.generic_params[0].name, "A");
+        assert_eq!(td.variants.len(), 2);
+        // The Cons variant's first field is `A`, second is `List[A]`.
+        match &td.variants[1].fields {
+            VariantFields::Positional(field_tes) => {
+                assert_eq!(field_tes.len(), 2);
+                assert_eq!(field_tes[0].head_name(), "A");
+                match &field_tes[1] {
+                    TypeExpr::Apply { name, args, .. } => {
+                        assert_eq!(name, "List");
+                        assert_eq!(args[0].head_name(), "A");
+                    }
+                    other => panic!("expected Apply, got {other:?}"),
+                }
+            }
+            other => panic!("expected Positional, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_decl_with_two_generic_params_parses() {
+        let p = parse_str("type Pair[A, B] = | P(A, B)\n");
+        let td = first_type(&p);
+        assert_eq!(td.generic_params.len(), 2);
+        assert_eq!(td.generic_params[0].name, "A");
+        assert_eq!(td.generic_params[1].name, "B");
+    }
+
+    #[test]
+    fn record_type_decl_with_generic_params_parses() {
+        let p = parse_str("type Wrapper[A] = { value: A }\n");
+        let td = first_type(&p);
+        assert_eq!(td.generic_params.len(), 1);
+        assert_eq!(td.generic_params[0].name, "A");
+    }
+
+    #[test]
+    fn lambda_with_row_variable_parses() {
+        // Lambdas accept `![IO | e]` row syntax too.
+        let e = parse_tail_expr("fn (x: Int) -> Int ![IO | e] => x");
+        match e {
+            Expr::Lambda {
+                effects,
+                effect_row_var,
+                ..
+            } => {
+                assert_eq!(effects, vec!["IO".to_string()]);
+                assert_eq!(effect_row_var.map(|r| r.name), Some("e".to_string()));
+            }
+            other => panic!("expected Lambda, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closed_row_has_no_row_variable() {
+        // Regression-guard: pre-Plan-B `![IO]` parses as closed row.
+        let p = parse_str("fn f(x: Int) -> Int ![IO] { x }\n");
+        let f = first_fn(&p);
+        assert_eq!(f.effects, vec!["IO".to_string()]);
+        assert!(f.effect_row_var.is_none());
+    }
+
+    // ===== Plan B Task 47 — negative-path / malformed-syntax pinning =====
+
+    #[test]
+    fn generic_params_trailing_comma_is_accepted() {
+        // `[A,]` — pin trailing comma as accepted, matching the
+        // param-list / argument-list convention elsewhere in the
+        // grammar. If a future plan adds bounds (`[A: Foo, B,]`) the
+        // trailing-comma rule still applies.
+        let p = parse_str("fn f[A,](x: A) -> A ![] { x }\n");
+        let f = first_fn(&p);
+        assert_eq!(f.generic_params.len(), 1);
+        assert_eq!(f.generic_params[0].name, "A");
+    }
+
+    #[test]
+    fn generic_params_missing_comma_errors() {
+        // `[A B]` — no comma between parameters. The expect(`]`) at
+        // the end of `parse_generic_params` fails on the second ident
+        // and the entire fn-decl parse aborts with at least one error.
+        let errs = parse_errs("fn f[A B](x: A) -> A ![] { x }\n");
+        assert!(
+            !errs.is_empty(),
+            "missing comma between generic params should parse-error"
+        );
+    }
+
+    #[test]
+    fn row_pipe_with_no_row_var_errors() {
+        // `![| ]` — pipe present but no row-variable identifier
+        // follows. Should produce a parser error pointing at the
+        // missing name.
+        let errs = parse_errs("fn f(x: Int) -> Int ![| ] { x }\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("row-variable")),
+            "pipe with absent row-var name should parse-error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn row_pipe_after_effects_with_no_var_errors() {
+        // `![IO |]` — effects followed by pipe followed by `]`. The
+        // pipe branch fires the same "expected row-variable name"
+        // diagnostic as the no-effect case.
+        let errs = parse_errs("fn f(x: Int) -> Int ![IO |] { x }\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("row-variable")),
+            "pipe with no row-var after effects should parse-error; got {errs:?}"
         );
     }
 }

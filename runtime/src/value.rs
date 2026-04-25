@@ -19,22 +19,12 @@
 /// Tagged 64-bit value.
 pub type Value = u64;
 
-/// Bitmask isolating the low tag bit (Int vs non-Int).
-pub const TAG_INT_MASK: u64 = 0b1;
-
-/// Bitmask isolating the low two tag bits (heap vs immediate when non-Int).
-pub const TAG_WIDE_MASK: u64 = 0b11;
-
-/// Tag bits for a heap pointer. `(ptr & !TAG_WIDE_MASK)` recovers the raw
-/// pointer; `raw_ptr | TAG_HEAP` tags it.
-pub const TAG_HEAP: u64 = 0b01;
-
-/// Tag bits for immediates.
-pub const TAG_IMMEDIATE: u64 = 0b11;
-
-/// Lower / upper inclusive range of Sigil's 63-bit `Int` type.
-pub const INT_MIN: i64 = -(1 << 62);
-pub const INT_MAX: i64 = (1 << 62) - 1;
+// Tag bit-layout constants live in `sigil-abi::tag` (Plan B Stage 4.5.5)
+// so codegen and runtime share one source of truth. Re-export keeps
+// `sigil_runtime::value::TAG_*` callers stable.
+pub use sigil_abi::tag::{
+    INT_MAX, INT_MIN, TAG_HEAP, TAG_IMMEDIATE, TAG_INT_MASK, TAG_INT_SHIFT, TAG_WIDE_MASK,
+};
 
 #[inline]
 pub fn is_int(v: Value) -> bool {
@@ -55,10 +45,11 @@ pub fn is_immediate(v: Value) -> bool {
 /// design's two's-complement semantics.
 #[inline]
 pub fn from_int(n: i64) -> Value {
-    // Canonical encoding: shift left by one, low bit becomes the Int tag (0).
-    // `wrapping_shl` gives two's-complement wraparound at 64 bits, matching
-    // the design's overflow-wraps semantics at the 63-bit boundary.
-    (n as u64).wrapping_shl(1)
+    // Canonical encoding: shift left by TAG_INT_SHIFT so the low bit
+    // becomes the Int tag (0). `wrapping_shl` gives two's-complement
+    // wraparound at 64 bits, matching the design's overflow-wraps
+    // semantics at the 63-bit boundary.
+    (n as u64).wrapping_shl(TAG_INT_SHIFT)
 }
 
 /// Sign-extend the high 63 bits of the tagged int back to a full `i64`.
@@ -66,7 +57,7 @@ pub fn from_int(n: i64) -> Value {
 /// the sense that it will return an arbitrary integer reinterpretation.
 #[inline]
 pub fn as_int(v: Value) -> i64 {
-    (v as i64) >> 1
+    (v as i64) >> TAG_INT_SHIFT
 }
 
 /// Tag a raw pointer as a heap Value. The pointer must be ≥8-byte aligned

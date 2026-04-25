@@ -319,6 +319,7 @@ mod tests {
         TypeDecl {
             name: name.to_string(),
             name_span: span(),
+            generic_params: Vec::new(),
             variants,
             span: span(),
         }

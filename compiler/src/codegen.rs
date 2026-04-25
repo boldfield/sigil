@@ -57,6 +57,11 @@ use cranelift_object::object::BinaryFormat;
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use target_lexicon::Triple;
 
+use sigil_abi::stackmap::{
+    STACKMAP_FLAG_PLACEHOLDER, STACKMAP_HEADER_SIZE, STACKMAP_MAGIC, STACKMAP_RECORD_SIZE,
+    STACKMAP_VERSION_PLACEHOLDER,
+};
+use sigil_abi::tag::TAG_INT_SHIFT;
 use sigil_header_constants::{header_word, TAG_CLOSURE};
 
 use crate::ast::{EnvSlotKind, TypeExpr};
@@ -87,14 +92,17 @@ struct UserFnEntry {
 /// typecheck's E0112 sweep and isn't a primitive is a registered user
 /// type, represented at the ABI boundary as `pointer_ty`.
 fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
-    match te {
-        TypeExpr::Named(name, _) => match name.as_str() {
-            "Int" => types::I64,
-            "String" => pointer_ty,
-            "Bool" | "Byte" | "Unit" => types::I8,
-            "Char" => types::I32,
-            _ => pointer_ty,
-        },
+    // Plan B Task 47 — TypeExpr::Apply is parser-only (generic
+    // application, e.g. `List[Int]`). Codegen treats it as the head
+    // name for now: every user-type instance is a heap record passed
+    // by pointer regardless of its type arguments. Real specialised
+    // codegen lands with monomorphization (Task 49).
+    match te.head_name() {
+        "Int" => types::I64,
+        "String" => pointer_ty,
+        "Bool" | "Byte" | "Unit" => types::I8,
+        "Char" => types::I32,
+        _ => pointer_ty,
     }
 }
 
@@ -111,11 +119,19 @@ fn mangle_user_fn(name: &str) -> String {
     format!("sigil_user_{sanitized}")
 }
 
-/// Stackmap section layout. Plan A1 emits **version 0 (placeholder)**:
+/// Accumulator for safepoint records emitted during function lowering.
+///
+/// Wire-format constants (`STACKMAP_MAGIC`, `STACKMAP_VERSION_PLACEHOLDER`,
+/// `STACKMAP_HEADER_SIZE`, `STACKMAP_RECORD_SIZE`, `STACKMAP_FLAG_PLACEHOLDER`)
+/// live in `sigil-abi::stackmap` (Plan B Stage 4.5.5). The runtime's
+/// section parser (`sigil_runtime::stackmap::parse_section`) reads
+/// against the same constants.
+///
+/// Plan A1 emits **version 0 (placeholder)** records:
 ///
 /// ```text
-/// header  = magic:4 "SGST" | version:4 | record_count:4           // 12 bytes
-/// record  = pc_offset:4    | live_count:2 (always 0 in v0) | flags:2   // 8 bytes
+/// header  = magic:4 "SGST" | version:4 | record_count:4              // 12 bytes
+/// record  = pc_offset:4    | live_count:2 (always 0 in v0) | flags:2 //  8 bytes
 /// ```
 ///
 /// `flags` has bit 0 (`STACKMAP_FLAG_PLACEHOLDER`) set in v0 so a v2
@@ -125,13 +141,6 @@ fn mangle_user_fn(name: &str) -> String {
 /// Version 1 (Plan B) will reuse the same header; the record format
 /// gains a live-value list per record and `pc_offset` becomes a real
 /// post-regalloc code offset via Cranelift's safepoint API.
-pub const STACKMAP_MAGIC: &[u8; 4] = b"SGST";
-pub const STACKMAP_VERSION_PLACEHOLDER: u32 = 0;
-pub const STACKMAP_HEADER_SIZE: usize = 12;
-pub const STACKMAP_RECORD_SIZE: usize = 8;
-pub const STACKMAP_FLAG_PLACEHOLDER: u16 = 0x0001;
-
-/// Accumulator for safepoint records emitted during function lowering.
 ///
 /// Stage 1 populates each record with an opaque placeholder (the
 /// Cranelift `Inst` handle of the call site, not a real post-regalloc
@@ -495,9 +504,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
             let tail_val = lowerer.lower_block(&f.body);
 
-            // main tags its Int return with `ishl_imm 1` so the C-main
-            // shim can `sshr_imm 1` → i32. Other user fns return their
-            // raw Cranelift value; callers (user code) use it directly.
+            // main tags its Int return with `ishl_imm TAG_INT_SHIFT`
+            // so the C-main shim can `sshr_imm` → i32. Other user fns
+            // return their raw Cranelift value; callers (user code)
+            // use it directly.
             //
             // Invariant: main's return type is always `Int` — the
             // typechecker rejects any other signature via E0041
@@ -506,8 +516,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // option (a): the main→Int constraint is structural, so
             // this unconditional shift is safe. Any future relaxation
             // of main's type surface must revise this site alongside.
+            //
+            // Plan B A3-carryover decision: the broader tagged-vs-raw
+            // Int ABI question logged in PLAN_B_DEVIATIONS resolved to
+            // "raw i64 within user code, tag at the C-ABI boundary" —
+            // this is the C-ABI boundary. `TAG_INT_SHIFT` centralises
+            // the shift amount so any future ABI revision edits one
+            // constant in `sigil-abi` rather than hunting inline
+            // literals.
             let ret_val = match tail_val {
-                Some(v) if is_main => lowerer.builder.ins().ishl_imm(v, 1),
+                Some(v) if is_main => lowerer.builder.ins().ishl_imm(v, i64::from(TAG_INT_SHIFT)),
                 Some(v) => v,
                 // No tail → Unit. Return a zero of the expected Cranelift
                 // type. For main, ret_ty is i64 (tagged); `iconst(I64, 0)`
@@ -546,9 +564,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
         // user-main returns a tagged Int; untag to i32 via arithmetic
         // right-shift and narrow. Overflow beyond i32 is not observable in
-        // v1 (main returns Int, and hello-world returns 0).
+        // v1 (main returns Int, and hello-world returns 0). The shift
+        // amount is `TAG_INT_SHIFT` — paired with the `ishl_imm` in the
+        // user-main return path above; both sites reference the same
+        // `sigil-abi` constant so they cannot drift.
         let tagged = builder.inst_results(um_call)[0];
-        let untagged = builder.ins().sshr_imm(tagged, 1);
+        let untagged = builder.ins().sshr_imm(tagged, i64::from(TAG_INT_SHIFT));
         let narrowed = builder.ins().ireduce(types::I32, untagged);
         builder.ins().return_(&[narrowed]);
         builder.finalize();
@@ -1258,10 +1279,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ///   the subsequent arm's test.
     ///
     /// Exhaustiveness is enforced at typecheck (E0066 for primitives,
-    /// E0120 for user types). If the chain runs out of arms without a
-    /// catch-all, `TRAP_NONEXHAUSTIVE_MATCH` is a defensive safety net
-    /// — nested-pattern non-exhaustiveness falls through to this trap
-    /// per the Plan A3 v1 scope.
+    /// E0120 for user types — including full nested Maranget coverage
+    /// of ctor field patterns as of the Plan B carryover, commit
+    /// `62ba42a`). `TRAP_NONEXHAUSTIVE_MATCH` is a defensive safety
+    /// net that should not fire on a well-typed program: it guards
+    /// codegen-internal bugs and any future surface (e.g. infinite
+    /// primitive domains under Stage 6 effects) where the typechecker
+    /// cannot statically prove coverage.
     fn lower_match(
         &mut self,
         scrutinee: &crate::ast::Expr,
@@ -1757,9 +1781,10 @@ mod tests {
 
     #[test]
     fn stackmap_header_layout() {
-        // Constants pin the shipped format. Bumping STACKMAP_VERSION_PLACEHOLDER
-        // from 0 should be paired with a corresponding change in
-        // runtime/src/stackmap.rs so both crates agree on what v1 looks like.
+        // Constants pin the shipped format. The single source is
+        // `sigil_abi::stackmap`; any future v1 bump (Plan B Task 55+)
+        // lands there, and both this builder and the runtime parser
+        // pick it up automatically.
         assert_eq!(STACKMAP_MAGIC, b"SGST");
         assert_eq!(STACKMAP_VERSION_PLACEHOLDER, 0);
         assert_eq!(STACKMAP_HEADER_SIZE, 12);

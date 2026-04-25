@@ -24,6 +24,12 @@ include_dir = { workspace = true }
 # the duplicated bit-layout formula that lived in `codegen.rs` as a
 # parallel copy of `runtime::header`. PR #7 review item 3.
 sigil-header-constants = { path = "../header-constants" }
+# Stackmap wire-format constants (and forward-compatible v1 record
+# layout) plus tagged-Value bit masks. Plan B Stage 4.5.5 extracted
+# these from `compiler/src/codegen.rs` (where they were duplicated with
+# `runtime/src/stackmap.rs`) and `runtime/src/value.rs` (where codegen
+# referenced the bit layout via inlined literals).
+sigil-abi = { path = "../abi" }
 
 [dev-dependencies]
 insta = { workspace = true }

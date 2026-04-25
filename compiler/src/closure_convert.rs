@@ -330,6 +330,7 @@ impl Converter {
                 params,
                 return_type,
                 effects,
+                effect_row_var,
                 body,
                 span,
             } => {
@@ -370,9 +371,15 @@ impl Converter {
                 let synthetic = FnDecl {
                     name: fn_name.clone(),
                     name_span: span.clone(),
+                    // Plan B Task 47: synthetic fn-from-lambda inherits
+                    // the lambda's row variable (if any) and has no
+                    // generic parameters of its own — closure
+                    // conversion never introduces new type parameters.
+                    generic_params: Vec::new(),
                     params,
                     return_type,
                     effects,
+                    effect_row_var,
                     body: body_block,
                     span: span.clone(),
                 };
