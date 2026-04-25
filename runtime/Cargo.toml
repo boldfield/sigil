@@ -15,3 +15,8 @@ crate-type = ["staticlib", "rlib"]
 # while codegen replicated the bit-layout inline; that claim is now
 # correct because both crates consume from this shared crate.
 sigil-header-constants = { path = "../header-constants" }
+# Plan B Stage 4.5.5: shared stackmap wire format + tagged-Value bit
+# layout. `runtime::stackmap` and `runtime::value` re-export from this
+# crate so the public surface (`sigil_runtime::stackmap::STACKMAP_*`,
+# `sigil_runtime::value::TAG_*`) stays backward-compatible.
+sigil-abi = { path = "../abi" }

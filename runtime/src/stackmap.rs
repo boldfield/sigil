@@ -1,53 +1,21 @@
 //! Safepoint metadata — plan A1 task 0.11.
 //!
-//! The compiler emits one safepoint record per Cranelift `call` /
-//! `call_indirect` into an object-file section:
-//!
-//! - ELF (Linux):   `.sigil_stackmaps`
-//! - Mach-O:        `__SIGIL,__stackmaps`
-//!
-//! Plan A1 ships **version 0 (placeholder)** records. v1 Boehm ignores the
-//! section entirely; v2 precise GC parses it and will recognise version 0
-//! as placeholder data — the reader is expected to skip the section and
-//! resynthesise safepoint metadata from relocations, or bail. See
-//! `PLAN_A1_DEVIATIONS.md` (`[DEVIATION Task 0.11]`) for the full
-//! rationale and the v0 → v1 upgrade path.
-//!
-//! Binary format (little-endian, host bytes):
-//!
-//! ```text
-//! header  = magic:4 "SGST" | version:4 | record_count:4          // 12 bytes
-//! record  = pc_offset:4    | live_count:2 | flags:2              //  8 bytes
-//! ```
-//!
-//! In v0: `live_count` is always 0, `pc_offset` is a placeholder (the
-//! Cranelift `Inst` handle, not a post-regalloc code offset), and
-//! `flags` has bit 0 (`STACKMAP_FLAG_PLACEHOLDER`) set on every record.
+//! Wire-format constants and the v0 record layout live in `sigil-abi`
+//! (Plan B Stage 4.5.5). This module re-exports them so existing
+//! `sigil_runtime::stackmap::*` callers keep working, and adds the
+//! parser that turns section bytes into a Rust-side `ParsedSection`.
+//! v1 Boehm ignores the section entirely; v2 precise GC parses it and
+//! will recognise version 0 as placeholder data — the reader is
+//! expected to skip the section and resynthesise safepoint metadata
+//! from relocations, or bail. See `PLAN_A1_DEVIATIONS.md`
+//! (`[DEVIATION Task 0.11]`) for the full rationale and the v0 → v1
+//! upgrade path.
 
-/// ELF section name used on `x86_64-unknown-linux-gnu`.
-pub const ELF_SECTION_NAME: &str = ".sigil_stackmaps";
-
-/// Mach-O segment + section pair used on `aarch64-apple-darwin`.
-pub const MACHO_SEGMENT_NAME: &str = "__SIGIL";
-pub const MACHO_SECTION_NAME: &str = "__stackmaps";
-
-/// Section-header magic bytes. Identifies a Sigil stackmap section to a
-/// precise-GC reader regardless of the enclosing object format.
-pub const STACKMAP_MAGIC: &[u8; 4] = b"SGST";
-
-/// Section version. Plan A1 ships version 0 (placeholder); Plan B ships
-/// version 1 with real post-regalloc PC offsets and live-value lists.
-pub const STACKMAP_VERSION_PLACEHOLDER: u32 = 0;
-
-/// Header width in bytes: 4 magic + 4 version + 4 record_count.
-pub const STACKMAP_HEADER_SIZE: usize = 12;
-
-/// Record width in bytes: 4 pc_offset + 2 live_count + 2 flags.
-pub const STACKMAP_RECORD_SIZE: usize = 8;
-
-/// Flag bit: record is a placeholder (Plan A1 v0 invariant — every record
-/// has this bit set).
-pub const STACKMAP_FLAG_PLACEHOLDER: u16 = 0x0001;
+pub use sigil_abi::stackmap::{
+    StackMapRecordV0, ELF_SECTION_NAME, MACHO_SECTION_NAME, MACHO_SEGMENT_NAME,
+    STACKMAP_FLAG_PLACEHOLDER, STACKMAP_HEADER_SIZE, STACKMAP_MAGIC, STACKMAP_RECORD_SIZE,
+    STACKMAP_VERSION_PLACEHOLDER, STACKMAP_VERSION_V1,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
@@ -57,18 +25,16 @@ pub enum ParseError {
     BadMagic,
     /// Version field names a format this build does not understand. Plan
     /// A1 only accepts `STACKMAP_VERSION_PLACEHOLDER`; Plan B will accept
-    /// `STACKMAP_VERSION_PLACEHOLDER | STACKMAP_VERSION_V1`.
+    /// `STACKMAP_VERSION_PLACEHOLDER | STACKMAP_VERSION_V1` once the v1
+    /// record format ships.
     UnknownVersion(u32),
     /// Header promised more records than the section carries.
     TruncatedRecords,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ParsedRecord {
-    pub pc_offset: u32,
-    pub live_count: u16,
-    pub flags: u16,
-}
+/// Parsed v0 record. Alias for the shared `StackMapRecordV0` so callers
+/// who imported `ParsedRecord` from this module keep their imports.
+pub type ParsedRecord = StackMapRecordV0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedSection {
@@ -131,19 +97,28 @@ mod tests {
     }
 
     #[test]
-    fn section_names_are_fixed() {
-        assert_eq!(ELF_SECTION_NAME, ".sigil_stackmaps");
-        assert_eq!(MACHO_SEGMENT_NAME, "__SIGIL");
-        assert_eq!(MACHO_SECTION_NAME, "__stackmaps");
-    }
-
-    #[test]
-    fn format_constants_are_fixed() {
-        assert_eq!(STACKMAP_MAGIC, b"SGST");
-        assert_eq!(STACKMAP_VERSION_PLACEHOLDER, 0);
-        assert_eq!(STACKMAP_HEADER_SIZE, 12);
-        assert_eq!(STACKMAP_RECORD_SIZE, 8);
-        assert_eq!(STACKMAP_FLAG_PLACEHOLDER, 0x0001);
+    fn re_exported_constants_match_abi_crate() {
+        // The previous incarnation of this module pinned the constants
+        // by re-declaring them here. Now they come from `sigil-abi`,
+        // and this test guards against accidental aliasing drift if
+        // someone replaces the re-export with a local copy.
+        assert_eq!(STACKMAP_MAGIC, sigil_abi::stackmap::STACKMAP_MAGIC);
+        assert_eq!(
+            STACKMAP_VERSION_PLACEHOLDER,
+            sigil_abi::stackmap::STACKMAP_VERSION_PLACEHOLDER
+        );
+        assert_eq!(
+            STACKMAP_HEADER_SIZE,
+            sigil_abi::stackmap::STACKMAP_HEADER_SIZE
+        );
+        assert_eq!(
+            STACKMAP_RECORD_SIZE,
+            sigil_abi::stackmap::STACKMAP_RECORD_SIZE
+        );
+        assert_eq!(
+            STACKMAP_FLAG_PLACEHOLDER,
+            sigil_abi::stackmap::STACKMAP_FLAG_PLACEHOLDER
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["compiler", "header-constants", "runtime"]
+members = ["abi", "compiler", "header-constants", "runtime"]
 
 [workspace.package]
 edition = "2021"

@@ -57,6 +57,10 @@ use cranelift_object::object::BinaryFormat;
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use target_lexicon::Triple;
 
+use sigil_abi::stackmap::{
+    STACKMAP_FLAG_PLACEHOLDER, STACKMAP_HEADER_SIZE, STACKMAP_MAGIC, STACKMAP_RECORD_SIZE,
+    STACKMAP_VERSION_PLACEHOLDER,
+};
 use sigil_header_constants::{header_word, TAG_CLOSURE};
 
 use crate::ast::{EnvSlotKind, TypeExpr};
@@ -111,11 +115,19 @@ fn mangle_user_fn(name: &str) -> String {
     format!("sigil_user_{sanitized}")
 }
 
-/// Stackmap section layout. Plan A1 emits **version 0 (placeholder)**:
+/// Accumulator for safepoint records emitted during function lowering.
+///
+/// Wire-format constants (`STACKMAP_MAGIC`, `STACKMAP_VERSION_PLACEHOLDER`,
+/// `STACKMAP_HEADER_SIZE`, `STACKMAP_RECORD_SIZE`, `STACKMAP_FLAG_PLACEHOLDER`)
+/// live in `sigil-abi::stackmap` (Plan B Stage 4.5.5). The runtime's
+/// section parser (`sigil_runtime::stackmap::parse_section`) reads
+/// against the same constants.
+///
+/// Plan A1 emits **version 0 (placeholder)** records:
 ///
 /// ```text
-/// header  = magic:4 "SGST" | version:4 | record_count:4           // 12 bytes
-/// record  = pc_offset:4    | live_count:2 (always 0 in v0) | flags:2   // 8 bytes
+/// header  = magic:4 "SGST" | version:4 | record_count:4              // 12 bytes
+/// record  = pc_offset:4    | live_count:2 (always 0 in v0) | flags:2 //  8 bytes
 /// ```
 ///
 /// `flags` has bit 0 (`STACKMAP_FLAG_PLACEHOLDER`) set in v0 so a v2
@@ -125,13 +137,6 @@ fn mangle_user_fn(name: &str) -> String {
 /// Version 1 (Plan B) will reuse the same header; the record format
 /// gains a live-value list per record and `pc_offset` becomes a real
 /// post-regalloc code offset via Cranelift's safepoint API.
-pub const STACKMAP_MAGIC: &[u8; 4] = b"SGST";
-pub const STACKMAP_VERSION_PLACEHOLDER: u32 = 0;
-pub const STACKMAP_HEADER_SIZE: usize = 12;
-pub const STACKMAP_RECORD_SIZE: usize = 8;
-pub const STACKMAP_FLAG_PLACEHOLDER: u16 = 0x0001;
-
-/// Accumulator for safepoint records emitted during function lowering.
 ///
 /// Stage 1 populates each record with an opaque placeholder (the
 /// Cranelift `Inst` handle of the call site, not a real post-regalloc
@@ -1757,9 +1762,10 @@ mod tests {
 
     #[test]
     fn stackmap_header_layout() {
-        // Constants pin the shipped format. Bumping STACKMAP_VERSION_PLACEHOLDER
-        // from 0 should be paired with a corresponding change in
-        // runtime/src/stackmap.rs so both crates agree on what v1 looks like.
+        // Constants pin the shipped format. The single source is
+        // `sigil_abi::stackmap`; any future v1 bump (Plan B Task 55+)
+        // lands there, and both this builder and the runtime parser
+        // pick it up automatically.
         assert_eq!(STACKMAP_MAGIC, b"SGST");
         assert_eq!(STACKMAP_VERSION_PLACEHOLDER, 0);
         assert_eq!(STACKMAP_HEADER_SIZE, 12);
