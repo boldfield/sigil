@@ -44,9 +44,9 @@ is complete but whose CI run has not yet reported green.
   - commits: []
   - notes: Plan A3 ships top-level coverage only; nested patterns inside ctor fields fall through to `TRAP_NONEXHAUSTIVE_MATCH`. Plan B extends `is_exhaustive` to descend into nested ctor/tuple/record patterns and generates the nested-shape counterexample witness.
 - Carryover — Suppress E0120 when an arm body fails type-checking
-  - status: todo
-  - commits: []
-  - notes: Today an arm whose body has E0117 plus a non-exhaustive match emits both. Suppress E0120 when at least one arm body failed type-checking.
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: `check_match` tracks an `any_arm_erred` flag by snapshotting `self.errors.len()` before/after each arm's pattern + body check. If any arm added to the error list, the exhaustiveness branch (both the `Ty::User` E0120 path and the primitive `is_exhaustive` E0066 path) is skipped for this match so the user fixes the arm-level error first. Three tests: (1) suppression on arm-body type error (arithmetic on String), (2) suppression on arm-pattern E0117 (tuple pattern on user type), (3) regression-guard that E0120 still fires on clean-but-non-exhaustive arms. E0120 catalog long-form updated to describe the suppression behavior.
 - Carryover — Tagged-vs-raw Int ABI decision
   - status: todo
   - commits: []

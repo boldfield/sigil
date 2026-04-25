@@ -504,9 +504,17 @@ pub const CATALOG: &[ErrorEntry] = &[
                Plan A3 v1 only verifies top-level exhaustiveness for user \
                types. Nested non-exhaustive cases inside constructor \
                fields (`match o { Some(true) => .., None => .. }` missing \
-               `Some(false)`) may fall through to the runtime's \
-               `TRAP_NONEXHAUSTIVE_MATCH` trap in the first release; \
-               Plan B refines to full nested Maranget exhaustiveness.",
+               `Some(false)`) fall through to the runtime's \
+               `TRAP_NONEXHAUSTIVE_MATCH` trap in that release; Plan B \
+               extends the check to full nested Maranget exhaustiveness.\n\n\
+               E0120 is suppressed when any match arm emits a \
+               pattern-check or body-check error (E0117, E0115, E0065, \
+               or any other code from `check_pattern`/`check_expr`). \
+               Fix the arm-level error first; re-running typecheck \
+               re-evaluates exhaustiveness against the corrected arms. \
+               The suppression mirrors the common cascade pattern where \
+               a mistyped arm looks like a \"missing variant\" to the \
+               exhaustiveness pass and produces a noisy double-fire.",
         fix_example: "type Option = | None | Some(Int)\n\
                       // match o { None => 0 }  // E0120: missing `Some(_)`\n\
                       match o {\n  None => 0,\n  Some(_) => 1,\n}  // exhaustive",

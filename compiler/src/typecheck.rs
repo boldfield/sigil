@@ -1321,8 +1321,18 @@ impl Tc {
         // inside constructor arms) that must scope only over their own
         // arm body; `check_pattern` gathers them into a list so we can
         // snapshot/restore the enclosing env correctly.
+        //
+        // Plan B A3-carryover: track whether any arm emitted a typecheck
+        // error during its pattern or body. If so, suppress the
+        // exhaustiveness check below — the user fixes the arm-level
+        // error first and exhaustiveness is re-run on the next compile.
+        // Narrow behaviour: primitive E0066 non-exhaustiveness stays on
+        // (it rarely cascades); the user-type E0120 + E0066 surfaces
+        // are the ones reviewers flagged as noisy.
         let mut result_ty: Option<Ty> = None;
+        let mut any_arm_erred = false;
         for arm in arms {
+            let arm_error_baseline = self.errors.len();
             let mut bindings: Vec<(String, Ty)> = Vec::new();
             match &scrut_ty {
                 Some(st) => self.check_pattern(&arm.pattern, st, &mut bindings),
@@ -1368,6 +1378,9 @@ impl Tc {
                 }
                 _ => {}
             }
+            if self.errors.len() > arm_error_baseline {
+                any_arm_erred = true;
+            }
         }
 
         // (2) exhaustiveness.
@@ -1384,6 +1397,14 @@ impl Tc {
         // to the runtime `TRAP_NONEXHAUSTIVE_MATCH` trap in Plan A3
         // v1 (documented in the E0120 catalog long-form); Plan B
         // refines to full nested exhaustiveness.
+        //
+        // Plan B A3-carryover: if any arm had a typecheck error above,
+        // skip the exhaustiveness check. The user fixes the arm-level
+        // error first, and re-running typecheck on the next compile
+        // re-evaluates exhaustiveness against the corrected arms.
+        if any_arm_erred {
+            return result_ty;
+        }
         if let Some(ref st) = scrut_ty {
             if let Ty::User(u) = st {
                 if let Some(witness) = self.user_type_witness(u, arms) {
@@ -3406,6 +3427,69 @@ mod tests {
             e120.message.contains("Rect { w: _, h: _ }"),
             "witness format wrong: {}",
             e120.message
+        );
+    }
+
+    // ===== Plan B A3-carryover — E0120 suppression when an arm errs =====
+
+    #[test]
+    fn e0120_suppressed_when_arm_body_has_type_error() {
+        // Non-exhaustive match (only `Some`) PLUS an arm body that
+        // fails type-checking (arithmetic on a String). Pre-Plan-B
+        // this emitted BOTH the body error and E0120; the A3-carryover
+        // cleanup suppresses E0120 so the user focuses on the body.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Some(n) => n + \"bad\" }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        // A body-level error (arithmetic on String) must still fire.
+        assert!(
+            errs.iter().any(|e| e.code.as_str() != "E0120"),
+            "expected a non-E0120 error (arm body type mismatch) — got only {errs:?}",
+        );
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "E0120 should be suppressed while the arm body is malformed; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn e0120_suppressed_when_arm_pattern_has_e0117() {
+        // Non-exhaustive match plus a pattern that doesn't match the
+        // scrutinee type (E0117). Suppress E0120 so the user focuses
+        // on fixing the pattern first.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { (a, b) => 0 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0117"),
+            "expected E0117 pattern-shape error, got {errs:?}",
+        );
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "E0120 should be suppressed while a pattern fails shape check; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn e0120_still_fires_when_all_arms_typecheck_cleanly() {
+        // Regression-guard the suppression: a truly non-exhaustive
+        // match with every arm well-typed must still produce E0120.
+        // Protects against over-suppression from the A3-carryover.
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] {\n  \
+                     match o { Some(n) => n }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0120"),
+            "clean arms but non-exhaustive — E0120 must still fire; got {errs:?}",
         );
     }
 
