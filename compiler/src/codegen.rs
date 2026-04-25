@@ -91,18 +91,254 @@ struct UserFnEntry {
 /// records addressed by a GC pointer — any name that passes
 /// typecheck's E0112 sweep and isn't a primitive is a registered user
 /// type, represented at the ABI boundary as `pointer_ty`.
+///
+/// Invariant (Plan B task 48): the caller has already verified
+/// monomorphization completed — the entry-point assertion in
+/// `emit_object` rejects any program whose AST still carries
+/// `TypeExpr::Apply` or generic-parameter references. So the
+/// catchall fall-through to `pointer_ty` here is always a registered
+/// user type at this point; an unrecognised name would have been
+/// caught upstream.
 fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
-    // Plan B Task 47 — TypeExpr::Apply is parser-only (generic
-    // application, e.g. `List[Int]`). Codegen treats it as the head
-    // name for now: every user-type instance is a heap record passed
-    // by pointer regardless of its type arguments. Real specialised
-    // codegen lands with monomorphization (Task 49).
     match te.head_name() {
         "Int" => types::I64,
         "String" => pointer_ty,
         "Bool" | "Byte" | "Unit" => types::I8,
         "Char" => types::I32,
         _ => pointer_ty,
+    }
+}
+
+/// Plan B task 48 — codegen-entry walker that asserts monomorphization
+/// has erased every generic-application and every generic-parameter
+/// reference. Called once at the top of `emit_object`. Closure point
+/// for the verification-debt entry "Codegen path for un-monomorphized
+/// generic params" in `PLAN_B_DEVIATIONS.md`.
+///
+/// Returns `true` if the program contains *any* of:
+///   - a `TypeExpr::Apply` node anywhere in a fn signature, type
+///     declaration, or let-binding annotation, or
+///   - a `TypeExpr::Named(name, _)` where `name` is the surface name
+///     of a generic parameter declared on an enclosing fn or type
+///     (and is therefore not a primitive or a registered user-type
+///     name from the type registry).
+///
+/// Both conditions indicate unmonomorphised IR — Task 49 will rewrite
+/// such occurrences into concrete clones.
+pub(crate) fn contains_apply_or_generic_ref(program: &crate::ast::Program) -> bool {
+    use crate::ast::{Item, VariantFields};
+    use std::collections::BTreeSet;
+    for item in &program.items {
+        match item {
+            Item::Fn(f) => {
+                // The fn's own `[A, B, ...]` makes the whole decl a
+                // generic that monomorphization (Task 49) is required
+                // to clone before codegen — short-circuit immediately.
+                if !f.generic_params.is_empty() {
+                    return true;
+                }
+                if f.effect_row_var.is_some() {
+                    return true;
+                }
+                // No declared params at this level — the in-scope
+                // set is empty, so `Named` references can only refer
+                // to primitives or registered user types. We still
+                // need to descend through `TypeExpr::Apply` shapes
+                // (an `Apply` anywhere is a hard reject regardless
+                // of the in-scope set).
+                let in_scope: BTreeSet<String> = BTreeSet::new();
+                for p in &f.params {
+                    if type_expr_uses_apply_or_param(&p.ty, &in_scope) {
+                        return true;
+                    }
+                }
+                if type_expr_uses_apply_or_param(&f.return_type, &in_scope) {
+                    return true;
+                }
+                if block_uses_generic(&f.body, &in_scope) {
+                    return true;
+                }
+            }
+            Item::Type(td) => {
+                if !td.generic_params.is_empty() {
+                    return true;
+                }
+                let in_scope: BTreeSet<String> = BTreeSet::new();
+                for v in &td.variants {
+                    match &v.fields {
+                        VariantFields::Unit => {}
+                        VariantFields::Positional(ts) => {
+                            for t in ts {
+                                if type_expr_uses_apply_or_param(t, &in_scope) {
+                                    return true;
+                                }
+                            }
+                        }
+                        VariantFields::Record(fs) => {
+                            for f in fs {
+                                if type_expr_uses_apply_or_param(&f.ty, &in_scope) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Item::Import(_) => {}
+        }
+    }
+    false
+}
+
+fn type_expr_uses_apply_or_param(
+    t: &TypeExpr,
+    params: &std::collections::BTreeSet<String>,
+) -> bool {
+    match t {
+        TypeExpr::Apply { args, .. } => {
+            // An Apply node is itself a hard reject; we still recurse
+            // so a nested Apply or generic-param ref also surfaces in
+            // the diagnostic (defensive against future paths that
+            // accept partial Apply but reject specific arg shapes).
+            for a in args {
+                if type_expr_uses_apply_or_param(a, params) {
+                    // Already returning true; just keep walking
+                    // would be wasteful — short-circuit.
+                    return true;
+                }
+            }
+            true
+        }
+        TypeExpr::Named(name, _) => params.contains(name),
+    }
+}
+
+fn block_uses_generic(b: &crate::ast::Block, params: &std::collections::BTreeSet<String>) -> bool {
+    use crate::ast::Stmt;
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                if type_expr_uses_apply_or_param(&l.ty, params) {
+                    return true;
+                }
+                if expr_uses_generic(&l.value, params) {
+                    return true;
+                }
+            }
+            Stmt::Expr(e) => {
+                if expr_uses_generic(e, params) {
+                    return true;
+                }
+            }
+            Stmt::Perform(p) => {
+                for a in &p.args {
+                    if expr_uses_generic(a, params) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tail) = &b.tail {
+        if expr_uses_generic(tail, params) {
+            return true;
+        }
+    }
+    false
+}
+
+fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<String>) -> bool {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::CharLit(_, _)
+        | Expr::Ident(_, _) => false,
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_uses_generic(lhs, params) || expr_uses_generic(rhs, params)
+        }
+        Expr::Unary { operand, .. } => expr_uses_generic(operand, params),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            expr_uses_generic(cond, params)
+                || block_uses_generic(then_block, params)
+                || block_uses_generic(else_block, params)
+        }
+        Expr::Block(b) => block_uses_generic(b, params),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            if expr_uses_generic(scrutinee, params) {
+                return true;
+            }
+            for a in arms {
+                if expr_uses_generic(&a.body, params) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::Call { callee, args, .. } => {
+            if expr_uses_generic(callee, params) {
+                return true;
+            }
+            for a in args {
+                if expr_uses_generic(a, params) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::Perform(p) => {
+            for a in &p.args {
+                if expr_uses_generic(a, params) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::Lambda {
+            params: lparams,
+            return_type,
+            body,
+            effect_row_var,
+            ..
+        } => {
+            if effect_row_var.is_some() {
+                return true;
+            }
+            if type_expr_uses_apply_or_param(return_type, params) {
+                return true;
+            }
+            for p in lparams {
+                if type_expr_uses_apply_or_param(&p.ty, params) {
+                    return true;
+                }
+            }
+            expr_uses_generic(body, params)
+        }
+        Expr::ClosureRecord { env_exprs, .. } => {
+            for ee in env_exprs {
+                if expr_uses_generic(ee, params) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::ClosureEnvLoad { .. } => false,
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                if expr_uses_generic(&f.value, params) {
+                    return true;
+                }
+            }
+            false
+        }
     }
 }
 
@@ -212,6 +448,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // Plan A1 Stage 1 stops at the hello-world shape. Validate that shape
     // up front so codegen can assume it.
     let checked: &CheckedProgram = &cc.cps.colored.mono.anf.checked;
+
+    // Plan B task 48 — codegen-entry guard. The verification-debt
+    // entry "Codegen path for un-monomorphized generic params" in
+    // `PLAN_B_DEVIATIONS.md` reserves this assertion: monomorphization
+    // (Task 49) must complete before codegen, so the IR reaching this
+    // point cannot contain `TypeExpr::Apply` or generic-parameter
+    // references. If either survives, the assert fires loudly rather
+    // than letting `cranelift_ty_for_type_expr` silently lower an
+    // unmonomorphised type as a pointer (which would crash at the
+    // platform-call boundary).
+    assert!(
+        !contains_apply_or_generic_ref(&checked.program),
+        "codegen invariant: monomorphization (Task 49) must complete before codegen; \
+         received program still contains TypeExpr::Apply or generic-parameter references — \
+         see PLAN_B_DEVIATIONS verification-debt entry \"Codegen path for un-monomorphized \
+         generic params\""
+    );
+
     let string_literals = &checked.string_literals;
 
     // Plan A3 task 40: build per-type layout descriptors once before any
@@ -1516,7 +1770,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Ty::Int => raw,
             Ty::Bool | Ty::Byte | Ty::Unit => self.builder.ins().ireduce(types::I8, raw),
             Ty::Char => self.builder.ins().ireduce(types::I32, raw),
-            Ty::String | Ty::Fn(_) | Ty::User(_) => raw,
+            Ty::String | Ty::Fn(_) | Ty::User(_, _) => raw,
+            // Plan B task 48 invariant — codegen-entry walker
+            // (`contains_apply_or_generic_ref`) rejects programs
+            // whose AST has surface generic syntax, so a stray
+            // `Ty::Var` here is an internal-compiler bug.
+            Ty::Var(_) => unreachable!(
+                "codegen: Ty::Var is impossible after Plan B task 48 codegen-entry guard"
+            ),
         }
     }
 
@@ -1530,7 +1791,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         name: &str,
         scrut_ty: Option<&Ty>,
     ) -> Option<crate::layout::VariantLayout> {
-        let Some(Ty::User(type_name)) = scrut_ty else {
+        let Some(Ty::User(type_name, _)) = scrut_ty else {
             return None;
         };
         let (ctor_type_name, variant_index) = self.ctor_index.get(name)?.clone();
@@ -1637,7 +1898,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Ty::Int => types::I64,
             Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
             Ty::Char => types::I32,
-            Ty::String | Ty::Fn(_) | Ty::User(_) => self.pointer_ty,
+            Ty::String | Ty::Fn(_) | Ty::User(_, _) => self.pointer_ty,
+            // Plan B task 48: surface-AST guard at codegen entry
+            // ensures `Ty::Var` cannot reach this point. A stray
+            // var means the guard is broken.
+            Ty::Var(_) => unreachable!(
+                "codegen: Ty::Var is impossible after Plan B task 48 codegen-entry guard"
+            ),
         }
     }
 
@@ -1831,6 +2098,134 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes([bytes[r1], bytes[r1 + 1], bytes[r1 + 2], bytes[r1 + 3]]),
             0x3333_4444,
+        );
+    }
+
+    // ===== Plan B task 48 — codegen-entry walker tests =====
+
+    #[test]
+    fn walker_rejects_residual_apply_in_fn_param() {
+        // A program whose AST carries a `TypeExpr::Apply` in a fn
+        // param signature must round-trip the walker as `true`.
+        // Constructed directly via AST types, independent of any
+        // surface-syntax path that produces such a program.
+        use crate::ast::{Block, FnDecl, Item, Param, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "f".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![Param {
+                    name: "xs".to_string(),
+                    ty: TypeExpr::Apply {
+                        name: "List".to_string(),
+                        args: vec![TypeExpr::Named("Int".to_string(), span.clone())],
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                }],
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            contains_apply_or_generic_ref(&prog),
+            "walker must reject residual TypeExpr::Apply in fn param"
+        );
+    }
+
+    #[test]
+    fn walker_rejects_generic_param_decl() {
+        use crate::ast::{Block, FnDecl, GenericParam, Item, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "id".to_string(),
+                name_span: span.clone(),
+                generic_params: vec![GenericParam {
+                    name: "A".to_string(),
+                    span: span.clone(),
+                }],
+                params: Vec::new(),
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            contains_apply_or_generic_ref(&prog),
+            "walker must reject fn with declared [A]"
+        );
+    }
+
+    #[test]
+    fn walker_rejects_generic_type_decl() {
+        use crate::ast::{GenericParam, Item, Program, TypeDecl};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Type(Box::new(TypeDecl {
+                name: "List".to_string(),
+                name_span: span.clone(),
+                generic_params: vec![GenericParam {
+                    name: "A".to_string(),
+                    span: span.clone(),
+                }],
+                variants: Vec::new(),
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            contains_apply_or_generic_ref(&prog),
+            "walker must reject type with declared [A]"
+        );
+    }
+
+    #[test]
+    fn walker_accepts_concrete_program() {
+        use crate::ast::{Block, FnDecl, Item, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "main".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: Vec::new(),
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            !contains_apply_or_generic_ref(&prog),
+            "walker must accept fully-concrete program"
         );
     }
 }

@@ -428,7 +428,15 @@ fn slot_kind_for_ty(ty: &Ty) -> EnvSlotKind {
         Ty::Unit => EnvSlotKind::Unit,
         Ty::String => EnvSlotKind::String,
         Ty::Fn(_) => EnvSlotKind::Closure,
-        Ty::User(_) => EnvSlotKind::User,
+        Ty::User(_, _) => EnvSlotKind::User,
+        // Plan B task 48 — post-typecheck IR shouldn't have unbound
+        // type variables in capture types: the codegen-entry walker
+        // (`contains_apply_or_generic_ref`) rejects programs whose
+        // AST has surface generic syntax, and closure conversion
+        // runs after that gate.
+        Ty::Var(_) => unreachable!(
+            "closure conversion: Ty::Var is impossible after Plan B task 48 codegen-entry guard"
+        ),
     }
 }
 

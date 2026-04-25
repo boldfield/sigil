@@ -131,15 +131,21 @@ pub fn build_layouts(
         next_tag = next_tag.saturating_add(1);
         let mut variants = Vec::new();
         for (idx, v) in td.variants.iter().enumerate() {
+            // Plan B task 48: layout runs after codegen-entry guard
+            // accepts only programs with no surface generic syntax,
+            // so empty generic-substitution is the right default
+            // here. Generic-type field types resolved into `Ty::Var`
+            // would have been rejected upstream.
+            let empty_subst: BTreeMap<String, Ty> = BTreeMap::new();
             let field_tys: Vec<Ty> = match &v.fields {
                 VariantFields::Unit => Vec::new(),
                 VariantFields::Positional(ts) => ts
                     .iter()
-                    .map(|t| ty_from_type_expr(t, types).unwrap_or(Ty::Unit))
+                    .map(|t| ty_from_type_expr(t, types, &empty_subst).unwrap_or(Ty::Unit))
                     .collect(),
                 VariantFields::Record(fs) => fs
                     .iter()
-                    .map(|f| ty_from_type_expr(&f.ty, types).unwrap_or(Ty::Unit))
+                    .map(|f| ty_from_type_expr(&f.ty, types, &empty_subst).unwrap_or(Ty::Unit))
                     .collect(),
             };
             let field_names: Vec<String> = match &v.fields {
@@ -194,7 +200,7 @@ fn compute_pointer_bitmap(fields: &[Ty]) -> u32 {
 /// Whether a `Ty` is represented at runtime as a GC-managed heap
 /// pointer (String, Fn/closure record, or another user type).
 pub fn is_gc_pointer_ty(ty: &Ty) -> bool {
-    matches!(ty, Ty::String | Ty::Fn(_) | Ty::User(_))
+    matches!(ty, Ty::String | Ty::Fn(_) | Ty::User(_, _))
 }
 
 /// Build an O(1) constructor-name → (type_name, variant_index) index
@@ -505,11 +511,12 @@ mod tests {
     fn is_gc_pointer_ty_matches_expected_types() {
         use crate::typecheck::FnSig;
         assert!(is_gc_pointer_ty(&Ty::String));
-        assert!(is_gc_pointer_ty(&Ty::User("X".to_string())));
+        assert!(is_gc_pointer_ty(&Ty::User("X".to_string(), Vec::new())));
         assert!(is_gc_pointer_ty(&Ty::Fn(Box::new(FnSig {
             params: vec![],
             ret: Ty::Int,
             effects: vec![],
+            effect_row_var: None,
         }))));
         assert!(!is_gc_pointer_ty(&Ty::Int));
         assert!(!is_gc_pointer_ty(&Ty::Bool));

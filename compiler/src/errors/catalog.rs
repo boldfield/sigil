@@ -552,52 +552,99 @@ pub const CATALOG: &[ErrorEntry] = &[
                       // top-level payload under the 64-word ceiling.",
     },
     ErrorEntry {
-        code: "E0124",
-        short: "generic type application not yet supported",
-        long: "Plan B Task 47 grew the parser to accept generic type \
-               application syntax (`List[Int]`, `Map[String, List[Int]]`), \
-               but the typechecker does not yet implement HM unification \
-               + monomorphization that gives those types meaning. Until \
-               Task 48 (HM unification) and Task 49 (monomorphization) \
-               land, every `TypeExpr::Apply` is rejected at typecheck \
-               time so a program does not silently compile with the \
-               head name treated as a non-generic type.\n\n\
-               This is a temporary diagnostic. When Plan B Stage 5 \
-               completes, E0124 disappears and `List[Int]` resolves \
-               against a generic `type List[A] = ...` declaration in \
-               the usual way. Until then, hand-monomorphise: declare \
-               `type IntList = | INil | ICons(Int, IntList)` and use \
-               that instead of a parameterised list. The forward path \
-               is not blocked — the syntax just isn't usable yet.",
-        fix_example: "// Pre-Task-48 workaround: hand-monomorphise.\n\
-                      type IntList = | INil | ICons(Int, IntList)\n\
-                      // becomes (post-Task-48):\n\
-                      // type List[A] = | Nil | Cons(A, List[A])\n\
-                      // and `IntList` is `List[Int]`.",
+        code: "E0126",
+        short: "occurs check failed (recursive type)",
+        long: "HM unification (Plan B task 48) tried to bind a type \
+               variable to a structure that mentions the same \
+               variable, which would create an infinite type. The \
+               classic example is unifying `?A` with `?A -> Int`: \
+               solving the equation requires `?A = (?A -> Int) = \
+               ((?A -> Int) -> Int) = ...` ad infinitum. The checker \
+               rejects the binding rather than diverge.\n\n\
+               Common cause: a generic function used non-uniformly. \
+               For example, `fn loop[A](x: A) -> A { loop(loop) }` \
+               unifies `A` with `A -> A`, which fails the occurs \
+               check. The fix is usually to split the recursive \
+               case into two separate generic parameters or to \
+               rethink the recursion's type shape.",
+        fix_example: "// Avoid unifying a variable with itself wrapped\n\
+                      // in a constructor — split the recursion's\n\
+                      // generic params so each occurrence is fresh.",
     },
     ErrorEntry {
-        code: "E0125",
-        short: "explicit row variable not yet supported",
-        long: "Plan B Task 47 grew the parser to accept `![IO | e]` \
-               row-polymorphic effect-row syntax, but the typechecker \
-               does not yet implement row-variable unification. Until \
-               Task 48 (HM unification with row polymorphism) lands, \
-               every `effect_row_var.is_some()` site is rejected so a \
-               program does not silently compile as if the row were \
-               closed.\n\n\
-               This is a temporary diagnostic. When Plan B Stage 5 \
-               completes, row variables become first-class — a \
-               function declared `![IO | e]` will accept any callee \
-               whose effect row is `![IO]` or richer (extending the \
-               row at the open end). Until then, write the closed \
-               form `![IO]` (or list every effect explicitly). \
-               Polymorphism over the row is not available yet.",
-        fix_example: "// Pre-Task-48 workaround: closed row.\n\
-                      fn caller(x: Int) -> Int ![IO] {\n  x\n}\n\
-                      // becomes (post-Task-48):\n\
-                      // fn caller[e](x: Int) -> Int ![IO | e] { x }\n\
-                      // which lets caller be invoked from contexts\n\
-                      // with a richer effect row than just ![IO].",
+        code: "E0127",
+        short: "row occurs check failed (recursive effect row)",
+        long: "HM row unification (Plan B task 48) tried to bind a \
+               row variable to a row that mentions the same \
+               variable, which would create an infinite effect row. \
+               This typically only arises through accidental \
+               aliasing during inference; a clean program rarely \
+               hits this directly.\n\n\
+               If you see E0127 it usually points to a row-polymorphic \
+               function being called with mutually-recursive row \
+               constraints. The fix is to declare separate row \
+               variables on each generic position rather than \
+               sharing one across nested calls.",
+        fix_example: "// Use distinct row variables on each generic\n\
+                      // position rather than sharing one through\n\
+                      // mutually-recursive callers.",
+    },
+    ErrorEntry {
+        code: "E0128",
+        short: "effect row mismatch",
+        long: "HM row unification (Plan B task 48) found two effect \
+               rows that cannot be reconciled. The closed-row \
+               discipline is the most common source: a function \
+               declared with a closed row `![IO]` cannot absorb \
+               additional effects, so unifying `![IO]` with `![IO, \
+               Raise[String]]` fails — the closed row says \"these \
+               are the only effects this function performs\".\n\n\
+               Open rows (those declared with an explicit row \
+               variable, `![IO | e]`) can absorb additional effects \
+               at unification time. Mixing closed and open is fine \
+               as long as the closed side covers the open side's \
+               known effects.\n\n\
+               Fix: either add the missing effect to the closed-row \
+               function's declared effect list, or add an explicit \
+               row variable so the row becomes open.",
+        fix_example: "// closed row — only IO, fails to absorb Raise:\n\
+                      // fn f() -> Int ![IO] { ... }\n\
+                      // open row — accepts richer caller rows:\n\
+                      // fn f[e]() -> Int ![IO | e] { ... }",
+    },
+    ErrorEntry {
+        code: "E0129",
+        short: "type-argument arity mismatch",
+        long: "Plan B task 48: a generic type was applied with a \
+               number of type arguments that doesn't match its \
+               declaration. `type List[A] = ...` requires exactly \
+               one argument; writing `List[Int, String]` or `List` \
+               (no args) fails this check.\n\n\
+               Plan B v1 does not infer omitted type arguments at \
+               type-name positions; every `Apply` must list every \
+               declared parameter. Future plans may add inference \
+               for omitted arguments, but the explicit form remains \
+               canonical.",
+        fix_example: "// Declared:  type List[A] = | Nil | Cons(A, List[A])\n\
+                      // Wrong:     fn use(xs: List)            // E0129\n\
+                      // Wrong:     fn use(xs: List[Int, Int])  // E0129\n\
+                      // Right:     fn use(xs: List[Int])",
+    },
+    ErrorEntry {
+        code: "E0131",
+        short: "primitive or generic-parameter type cannot take type arguments",
+        long: "Plan B task 48: only declared generic types accept \
+               type arguments via the `Name[T1, T2]` syntax. \
+               Primitives (`Int`, `String`, `Unit`, `Bool`, `Char`, \
+               `Byte`) are atomic — they have no parameters. \
+               Generic parameters (the `A` in `fn id[A](x: A)`) \
+               are placeholders for types and likewise cannot be \
+               applied to other types.\n\n\
+               If you want to wrap a primitive in a generic \
+               container, use a declared generic type and apply \
+               *it*: `Option[Int]` or `List[Int]`, not `Int[Foo]`.",
+        fix_example: "// Wrong:  fn f(x: Int[Foo]) -> Int ![] { x }   // E0131\n\
+                      // Right:  fn f(x: Option[Int]) -> Int ![] { ... }",
     },
     ErrorEntry {
         code: "E0401",
