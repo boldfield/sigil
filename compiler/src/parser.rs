@@ -278,7 +278,7 @@ impl<'a> Parser<'a> {
         let name_span = name_tok.span;
 
         // Plan B Task 47 — optional `[A, B]` generic-parameter list.
-        let generic_params = self.parse_generic_params();
+        let generic_params = self.parse_generic_params()?;
 
         self.expect(&TokenKind::LParen, "`(`")?;
         let mut params = Vec::new();
@@ -358,12 +358,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Plan B Task 47 — optional `[A, B, ...]` generic-param header
-    /// preceding a fn or type's main body. Returns an empty Vec when
-    /// the next token isn't `[`. Each parameter is a single
-    /// identifier; bounds and defaults are not in v1.
-    fn parse_generic_params(&mut self) -> Vec<GenericParam> {
+    /// preceding a fn or type's main body. Returns `Some(Vec::new())`
+    /// when the next token isn't `[` (a non-generic decl); returns
+    /// `None` if a malformed list aborts parsing of the enclosing
+    /// item. Mirrors `parse_effect_row`'s shape so callers propagate
+    /// failures via `?` consistently — bounds and defaults extensions
+    /// in a future plan can repurpose the same shape.
+    fn parse_generic_params(&mut self) -> Option<Vec<GenericParam>> {
         if !matches!(self.peek().kind, TokenKind::LBracket) {
-            return Vec::new();
+            return Some(Vec::new());
         }
         // Lookahead: `[` could open a non-generic `[A, B]` decl or
         // start a value-level expression in a different context. Here
@@ -383,7 +386,7 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     self.err(tok.span, "expected generic-parameter name");
-                    break;
+                    return None;
                 }
             }
             if matches!(self.peek().kind, TokenKind::Comma) {
@@ -392,9 +395,8 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        // `expect` advances past `]` and reports an error if missing.
-        let _ = self.expect(&TokenKind::RBracket, "`]` closing generic-parameter list");
-        params
+        self.expect(&TokenKind::RBracket, "`]` closing generic-parameter list")?;
+        Some(params)
     }
 
     fn parse_type(&mut self) -> Option<TypeExpr> {
@@ -460,7 +462,7 @@ impl<'a> Parser<'a> {
 
         // Plan B Task 47 — optional `[A, B]` generic-parameter list
         // between the type name and `=`.
-        let generic_params = self.parse_generic_params();
+        let generic_params = self.parse_generic_params()?;
 
         self.expect(&TokenKind::Eq, "`=`")?;
 

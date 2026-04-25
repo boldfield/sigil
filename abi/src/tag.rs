@@ -44,9 +44,13 @@ pub const TAG_IMMEDIATE: u64 = 0b11;
 /// `[PLAN-B]`) has a single mechanical site to audit.
 pub const TAG_INT_SHIFT: u32 = 1;
 
-/// Lower / upper inclusive range of Sigil's 63-bit `Int`.
-pub const INT_MIN: i64 = -(1 << 62);
-pub const INT_MAX: i64 = (1 << 62) - 1;
+/// Lower / upper inclusive range of Sigil's 63-bit `Int`. Derived
+/// from `TAG_INT_SHIFT` so a future shift change updates both bounds
+/// in a single place. `63 - TAG_INT_SHIFT` is the number of payload
+/// bits available for the signed value (with one sign bit on top of
+/// that, hence the `-` for `INT_MIN`).
+pub const INT_MIN: i64 = -(1i64 << (63 - TAG_INT_SHIFT));
+pub const INT_MAX: i64 = (1i64 << (63 - TAG_INT_SHIFT)) - 1;
 
 #[cfg(test)]
 mod tests {

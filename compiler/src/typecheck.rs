@@ -372,6 +372,27 @@ impl Tc {
     /// effect: the caller's fallback treats unresolved names as
     /// `Ty::Unit` so body-level type errors still surface.
     fn check_type_expr_known(&mut self, t: &TypeExpr) {
+        // Plan B Task 47: TypeExpr::Apply parses but is not yet
+        // semantically supported. Reject any Apply (recursively into
+        // its args) with E0124 so the parser-only Stage 5 surface
+        // does not silently accept generic application as if it were
+        // a head-name reference. Task 48 (HM unification) replaces
+        // this with real type-argument resolution.
+        if let TypeExpr::Apply { args, .. } = t {
+            self.push_error(
+                "E0124",
+                t.span(),
+                format!(
+                    "generic type application is not yet supported (head: `{}`); Task 48 \
+                     will enable it",
+                    t.head_name(),
+                ),
+            );
+            for a in args {
+                self.check_type_expr_known(a);
+            }
+            return;
+        }
         if ty_from_type_expr(t, &self.types).is_none() {
             self.push_error(
                 "E0112",
@@ -379,6 +400,26 @@ impl Tc {
                 format!(
                     "unknown type `{n}` (expected a primitive or a type declared via `type {n} = ...`)",
                     n = t.head_name(),
+                ),
+            );
+        }
+    }
+
+    /// Plan B Task 47: explicit row variables in effect rows
+    /// (`![IO | e]`) parse but are not yet semantically supported.
+    /// Push E0125 against the row-variable's span so an effect-row
+    /// declaration does not silently behave as if the row were closed.
+    /// Task 48 (HM unification with row polymorphism) replaces this
+    /// with real row-variable inference.
+    fn report_row_var_unsupported(&mut self, row_var: &Option<RowVar>) {
+        if let Some(rv) = row_var {
+            self.push_error(
+                "E0125",
+                rv.span.clone(),
+                format!(
+                    "explicit row variable `{}` is not yet supported in effect rows; \
+                     Task 48 will enable it",
+                    rv.name,
                 ),
             );
         }
@@ -687,6 +728,9 @@ impl Tc {
         // semantics (params/lets shadow top-level fns of the same
         // name within their scope) while keeping fn_env out of the
         // insert-collision and capture-analysis paths.
+        // Plan B Task 47: emit E0125 for explicit row variables on
+        // this fn's effect row until HM unification (Task 48) lands.
+        self.report_row_var_unsupported(&f.effect_row_var);
         self.env.clear();
         for p in &f.params {
             if let Some(ty) = ty_from_type_expr(&p.ty, &self.types) {
@@ -743,6 +787,9 @@ impl Tc {
                     self.check_perform(p, row);
                 }
                 Stmt::Let(l) => {
+                    // Plan B Task 47: also check let-binding types
+                    // for unsupported generic application (E0124).
+                    self.check_type_expr_known(&l.ty);
                     let got = self.check_expr(&l.value, row);
                     if let Some(got_ty) = got {
                         if !type_matches(&l.ty, &got_ty) {
@@ -965,14 +1012,17 @@ impl Tc {
                 params,
                 return_type,
                 effects,
-                // Plan B Task 47 — row variable parsed but not yet
-                // consumed (Task 48 wires row polymorphism). Lambdas
-                // with `![IO | e]` typecheck as if the row were
-                // closed `![IO]` until then.
-                effect_row_var: _,
+                // Plan B Task 47 — explicit row variables are parser-
+                // accepted but not yet semantically supported. Emit
+                // E0125 against the row-variable's span; check_lambda
+                // proceeds with the closed effect row.
+                effect_row_var,
                 body,
                 span,
-            } => self.check_lambda(params, return_type, effects, body, span.clone()),
+            } => {
+                self.report_row_var_unsupported(effect_row_var);
+                self.check_lambda(params, return_type, effects, body, span.clone())
+            }
             // `ClosureRecord` / `ClosureEnvLoad` are post-closure-
             // conversion nodes synthesized by plan A2 task 31. They
             // never appear in a parser-produced AST; typecheck runs
@@ -1329,11 +1379,15 @@ impl Tc {
         //
         // Plan B A3-carryover: track whether any arm emitted a typecheck
         // error during its pattern or body. If so, suppress the
-        // exhaustiveness check below — the user fixes the arm-level
-        // error first and exhaustiveness is re-run on the next compile.
-        // Narrow behaviour: primitive E0066 non-exhaustiveness stays on
-        // (it rarely cascades); the user-type E0120 + E0066 surfaces
-        // are the ones reviewers flagged as noisy.
+        // user-type exhaustiveness check (E0120) below — the user
+        // fixes the arm-level error first and exhaustiveness re-runs
+        // on the next compile.
+        //
+        // Narrow behaviour: primitive E0066 non-exhaustiveness stays
+        // on (it rarely cascades from arm-body errors), and only the
+        // user-type E0120 surface gets suppressed. The check below
+        // gates the E0120 emission on `!any_arm_erred`; the E0066
+        // path runs regardless.
         let mut result_ty: Option<Ty> = None;
         let mut any_arm_erred = false;
         for arm in arms {
@@ -1404,20 +1458,22 @@ impl Tc {
         // refines to full nested exhaustiveness.
         //
         // Plan B A3-carryover: if any arm had a typecheck error above,
-        // skip the exhaustiveness check. The user fixes the arm-level
-        // error first, and re-running typecheck on the next compile
-        // re-evaluates exhaustiveness against the corrected arms.
-        if any_arm_erred {
-            return result_ty;
-        }
+        // skip *only* the user-type E0120 path. The cascade pattern the
+        // carryover targets is mistyped ctor-arms making the user-type
+        // exhaustiveness pass look like it's missing variants — that's
+        // an E0120 noise problem. Primitive scrutinees rarely cascade
+        // the same way (literal-pattern errors don't typically pretend
+        // to be coverage holes), so the E0066 path runs unconditionally.
         if let Some(ref st) = scrut_ty {
             if let Ty::User(u) = st {
-                if let Some(witness) = self.user_type_witness(u, arms) {
-                    self.push_error(
-                        "E0120",
-                        span,
-                        format!("`match` on `{u}` is not exhaustive; missing case `{witness}`"),
-                    );
+                if !any_arm_erred {
+                    if let Some(witness) = self.user_type_witness(u, arms) {
+                        self.push_error(
+                            "E0120",
+                            span,
+                            format!("`match` on `{u}` is not exhaustive; missing case `{witness}`"),
+                        );
+                    }
                 }
             } else if !is_exhaustive(st, arms) {
                 self.push_error(
@@ -1621,12 +1677,18 @@ impl Tc {
                         VariantFields::Positional(field_tes),
                     ) if sub_pats.len() == field_tes.len() => Some(sub_pats.clone()),
                     (CtorPatternFields::Record(cpf), VariantFields::Record(rfd)) => {
-                        let wild = Pattern::Wildcard(p.span());
+                        // `check_pattern` rejects record patterns with
+                        // missing fields via E0115. If we hit a missing
+                        // field here the AST is already malformed —
+                        // bail out of variant matching for this arm
+                        // rather than wildcarding (which would silently
+                        // over-approximate coverage and mask bugs in
+                        // upstream validation).
                         let mut out: Vec<Pattern> = Vec::with_capacity(rfd.len());
                         for declared in rfd {
                             match cpf.iter().find(|f| f.name == declared.name) {
                                 Some(f) => out.push(f.pattern.clone()),
-                                None => out.push(wild.clone()),
+                                None => return None,
                             }
                         }
                         Some(out)
@@ -3653,6 +3715,127 @@ mod tests {
         );
     }
 
+    // ===== Plan B Task 47 — E0124/E0125 placeholders until Task 48 =====
+
+    #[test]
+    fn generic_application_in_param_type_fires_e0124() {
+        let src = "fn f(xs: List[Int]) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0124"),
+            "expected E0124 for List[Int], got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn generic_application_in_return_type_fires_e0124() {
+        let src = "fn f() -> List[Int] ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0124"),
+            "expected E0124 in return type, got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn generic_application_in_variant_field_fires_e0124() {
+        let src = "type Box = | Empty | Holds(List[Int])\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0124"),
+            "expected E0124 in variant field, got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn generic_application_in_let_type_fires_e0124() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let xs: List[Int] = 0;\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0124"),
+            "expected E0124 in let-binding type, got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn nested_generic_application_fires_e0124_for_each() {
+        // `Map[String, List[Int]]` should report E0124 for both the
+        // outer `Map[..]` and the inner `List[..]`. Recurses into args.
+        let src = "fn f(m: Map[String, List[Int]]) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        let n_e0124 = errs.iter().filter(|e| e.code.as_str() == "E0124").count();
+        assert!(
+            n_e0124 >= 2,
+            "expected at least 2 E0124 (outer + inner Apply); got {} / {errs:?}",
+            n_e0124,
+        );
+    }
+
+    #[test]
+    fn explicit_row_variable_on_fn_fires_e0125() {
+        let src = "fn f(x: Int) -> Int ![IO | e] { x }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            has_code(&errs, "E0125"),
+            "expected E0125 for `![IO | e]`, got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn explicit_row_variable_on_lambda_fires_e0125() {
+        // Lambdas use the same row-var path. Place the lambda inside
+        // a fn body so it actually reaches the typechecker.
+        let src = "fn main() -> Int ![] {\n  \
+                     let f: Int = 0;\n  \
+                     0\n\
+                   }\n";
+        // Lambda in a let RHS: need a typechecker-reachable surface.
+        // Lambdas typecheck as Ty::Fn via check_lambda; binding to an
+        // Int will mismatch (E0045) but we only assert E0125 is also
+        // present.
+        let _ = src; // placeholder
+        let src2 = "fn main() -> Int ![] {\n  \
+                      let f: Fn = (fn (x: Int) -> Int ![IO | e] => x);\n  \
+                      0\n\
+                    }\n";
+        let errs = pipeline_checked(src2).1;
+        assert!(
+            has_code(&errs, "E0125"),
+            "expected E0125 for lambda `![IO | e]`, got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn closed_row_does_not_fire_e0125() {
+        let src = "fn f(x: Int) -> Int ![IO] { x }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !has_code(&errs, "E0125"),
+            "closed row `![IO]` must not fire E0125; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn non_generic_named_type_does_not_fire_e0124() {
+        let src = "type Option = | None | Some(Int)\n\
+                   fn f(o: Option) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        assert!(
+            !has_code(&errs, "E0124"),
+            "plain Named (Option) must not fire E0124; got {errs:?}",
+        );
+    }
+
     // ===== Plan B A3-carryover — nested Maranget exhaustiveness =====
 
     #[test]
@@ -3839,6 +4022,30 @@ mod tests {
         assert!(
             !errs.iter().any(|e| e.code.as_str() == "E0120"),
             "E0120 should be suppressed while a pattern fails shape check; got {errs:?}",
+        );
+    }
+
+    #[test]
+    fn e0066_still_fires_on_primitive_when_arm_body_errs() {
+        // Primitive Bool scrutinee with only one literal arm AND a
+        // body that fails type-checking. E0120 suppression is
+        // user-type-only — the primitive E0066 path stays on so the
+        // user still sees the missing-literal coverage hole.
+        let src = "fn f(b: Bool) -> Int ![] {\n  \
+                     match b { true => 1 + \"bad\" }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_checked(src).1;
+        // The arm body's type error must still fire.
+        assert!(
+            errs.iter().any(|e| e.code.as_str() != "E0066"),
+            "expected an arm-body type error; got only {errs:?}",
+        );
+        // E0066 must NOT be suppressed: primitive coverage runs
+        // unconditionally per the A3-carryover design.
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0066"),
+            "E0066 must still fire on a non-exhaustive Bool match; got {errs:?}",
         );
     }
 

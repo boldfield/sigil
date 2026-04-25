@@ -234,3 +234,36 @@ runtime layer adds *new* boundary moments with clear rules:
 Full rationale + audit table in `PLAN_B_DEVIATIONS.md` (same date).
 Cross-reference: the `2026-04-24 — [PLAN-A3] main-return-tagging`
 entry's Forward-Implications paragraph is closed by this resolution.
+
+## 2026-04-25 — [PLAN-B] Merge `sigil-abi` and `sigil-header-constants`?
+
+**Context:** Plan B Task 4.5.5 added a new `sigil-abi` leaf crate
+(stackmap wire format + tagged-Value bit layout). Plan A2 PR #7 had
+already added `sigil-header-constants` (8-byte object-header bit
+layout). Both crates are `#![no_std]`, zero-dep, depended on by
+`sigil-compiler` and `sigil-runtime`, and exist for the same reason
+(single source of truth for cross-boundary constants). Splitting
+them by purpose was Plan B's deviation budget; reviewer flagged the
+two-crates-of-the-same-shape as a smell that should not drift.
+
+**Question:** When and how should the two crates merge into a
+single ABI crate? Options:
+
+- (a) Merge in Plan B Stage 6 Task 56, after `runtime/src/handlers.rs`
+  + `runtime/src/arena.rs` introduce the next batch of cross-boundary
+  constants (handler-frame layout, arena-allocator bit fields). The
+  third crate-worth of header-style data is the natural prompt for
+  consolidation.
+- (b) Defer to Plan C scaffolding when the next major surface lands.
+- (c) Merge as a `[CHORE]` PR after Plan B closes, so it sits between
+  Plan B and Plan C without entangling either.
+
+**Status:** open — pick at Plan B Task 56 review.
+
+**Forward implications:** the merged crate would absorb
+`sigil-header-constants`'s 8-byte object-header bit layout under
+`sigil_abi::header`, making `sigil-abi` the canonical name for all
+compiler↔runtime data declarations. Existing `sigil_header_constants::*`
+imports would change to `sigil_abi::header::*`; both crates' Cargo
+manifests would drop their dep on `sigil-header-constants`. The
+crate's `version`s remain `0.1.0`; nothing on crates.io is affected.
