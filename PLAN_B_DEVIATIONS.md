@@ -503,3 +503,58 @@ alone), monomorph gains a per-pattern instantiation index.
 **Implementing commit(s):** Initial Task 49 impl commit, plus the
 PR #16 round-3 fix-up (per-sub-pattern field-type threading +
 nested-generic regression test).
+
+
+## 2026-04-25 — [VERIFICATION DEBT — flag for Task 60] Perf-floor wall-clock instability on debug builds
+
+Surfaced during PR #18 (Tasks 51 + 52) review. Pre-existing on `main`;
+not Task 51's fault, but recorded here so Task 60 (performance floor)
+doesn't have to rediscover it.
+
+**Symptom:** `fib_perf_example_prints_6765_under_50ms` and
+`tree_example_prints_32767_under_500ms` exceed their declared wall-
+clock floors by ~4x on `aarch64-apple-darwin` in debug mode (~200ms
+each observed during local manual exercise). CI runs use release
+profile and stay green; the gap manifests only when running the e2e
+test suite via plain `cargo test --workspace --no-fail-fast` (the
+default profile).
+
+**Plan A2 / A3 acceptance text** for both tests does not specify
+whether the floor is debug-profile-relative or release-profile-only.
+The release-only interpretation is the practical one given Cranelift's
+debug-build penalty, but the literal test reads "wall-clock {elapsed:?}
+exceeds the 500ms Plan A3 floor" without profile qualification.
+
+**Why this matters now:** Plan B Task 60 introduces THREE new
+performance-floor tests (native `fib(20)` <50ms, CPS-forced `fib(20)`
+<500ms, multi-shot Choose <5s). The pre-existing instability on debug
+builds means a Task 60 author who runs the new tests locally without
+remembering to set `--release` will see flaky failures and may waste
+time chasing a non-bug. Worse, if the new floors are tightened on
+the same debug-vs-release ambiguity, Task 60's CI gates will be
+unreliable.
+
+**Resolution options for Task 60:**
+1. **Profile-aware floors:** detect `cfg!(debug_assertions)` in the
+   test bodies and apply a multiplier (e.g., 10x) for debug builds.
+   Backwards-compatible; touches all five existing + new perf tests.
+2. **Release-only perf gates:** `#[cfg(not(debug_assertions))]` on the
+   timing-assert sections; debug runs verify correctness only and
+   skip the wall-clock check. Cleanest semantically; explicit about
+   the gate's scope.
+3. **Document and leave alone:** add a top-of-file note to
+   `compiler/tests/e2e.rs` saying perf gates assume release profile,
+   plus an `eprintln!` warning at runtime if `debug_assertions` is
+   set. Cheapest; punts the underlying brittleness.
+
+The reviewer of PR #18 explicitly noted: "Either platform-aware
+tightening of the perf gates or a release-only mode would close
+this." Task 60 is the natural moment to pick option 1 or 2.
+
+**Acceptance criterion for closure:** Task 60 PR documents which
+option it picked, applies it across both pre-existing perf tests
+and the three new Stage 6 perf tests, and updates this entry to
+"closed" with the implementing commit hash.
+
+**Implementing commit:** None yet — this entry tracks the debt
+forward. Surfacing entry shipped with PR #18 review fixups.

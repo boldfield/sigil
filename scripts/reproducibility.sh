@@ -80,5 +80,6 @@ check_example() {
 check_example "${repo_root}/examples/hello.sigil"
 check_example "${repo_root}/examples/option_demo.sigil"
 check_example "${repo_root}/examples/tree.sigil"
+check_example "${repo_root}/examples/generic_map.sigil"
 
 echo "reproducibility: OK (all examples reproducible)"

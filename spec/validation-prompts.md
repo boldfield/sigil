@@ -383,3 +383,68 @@ the same type — exercising that constructor allocation is a full
 `sigil_alloc` call at every recursive step, not a borrow / pointer
 reuse (aligned with Plan A3's "no interior pointers" discipline
 from the design doc).
+
+## P16 — generic identity function applied at Int and String
+
+**Prompt:** Declare `fn id[A](x: A) -> A ![] { x }`. In `main`, bind
+`let n: Int = id(42);` and `let s: String = id("sigil");`, then
+`perform IO.println(int_to_string(n))` and `perform IO.println(s)`.
+Return `0`.
+
+**Oracle (stdout):**
+```
+42
+sigil
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises Plan B Stage 5 generics end-to-end:
+single-parameter generic fn declaration (Task 47 parser surface
+`fn id[A]`), HM let-polymorphism with two distinct call-site
+instantiations of the same generic in one program scope (Task 48
+type checker), and reachability-bounded monomorphization producing
+exactly two clones `id$$Int` and `id$$String` (Task 49). Both
+monomorphs classify as native under Task 50 color inference (row
+`![]`, leaf body, no `perform` to a non-IO effect). The semantic
+target is that fresh-var-per-call instantiation (Algorithm W) plus
+reachability-bounded specialization produce *exactly two* clones —
+not one polymorphic body with erased types, and not three from
+double-counted call sites. The id-of-String case also pins that the
+codegen path for an `Ident` reference whose declared type contains
+no user-defined sum type still routes through Task 49's call-site
+mangling rewrite (so the call resolves to `id$$String`, not the
+unspecialized `id`).
+
+## P17 — compose two unary functions across types
+
+**Prompt:** Declare `fn compose[A, B, C](f: (B) -> C ![], g: (A) ->
+B ![]) -> (A) -> C ![]` whose body is the lambda `fn (x: A) -> C
+![] => f(g(x))`. In `main`, bind `let inc_then_format: (Int) ->
+String ![] = compose(int_to_string, fn (n: Int) -> Int ![] => n +
+1);`, then `perform IO.println(inc_then_format(41))`. Return `0`.
+
+**Oracle (stdout):**
+```
+42
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Requires `TypeExpr::Fn` surface syntax — the
+ability to declare `(B) -> C ![]` as a parameter type, a return
+type, and a `let`-binding type. P09 and P10 already deferred this
+to Plan A3; A3 did not deliver it (deferred again, currently
+unscheduled for v1). Until `TypeExpr::Fn` ships, this prompt is
+graded only against "program compiles"; the run portion of the
+oracle is deferred. The semantic target is that compose is generic
+in three types (`A`, `B`, `C`), the inferred instantiation here is
+`(A=Int, B=Int, C=String)`, and Task 49's reachability-bounded
+specialization produces exactly one `compose` monomorph clone
+mangled `compose$$Int$$Int$$String`. P10 exercised the same shape at
+a single concrete `(Int, Int, Int)` triple; P17's distinguishing
+addition is `A != C`, which forces the result type to genuinely
+travel through composition rather than absorbing into the trivial
+endo-functor case. Like P09/P10's status, the underlying generics
+machinery is shipped (Plan B Stage 5); only the function-type
+surface syntax blocks end-to-end execution.
