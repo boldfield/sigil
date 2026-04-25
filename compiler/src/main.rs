@@ -64,6 +64,14 @@ fn print_runtime_stats(cargs: CompileArgs) -> ExitCode {
 }
 
 fn dump_color(dargs: DumpColorArgs) -> ExitCode {
+    if let Some(path) = &dargs.output_supplied {
+        let stderr = std::io::stderr();
+        let mut err = stderr.lock();
+        let _ = writeln!(
+            err,
+            "sigil: warning: `-o {path}` ignored under --dump-color (no executable produced)"
+        );
+    }
     match pipeline::dump_color(&dargs.input, dargs.error_format) {
         Ok(text) => {
             let stdout = std::io::stdout();

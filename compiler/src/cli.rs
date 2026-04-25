@@ -26,6 +26,11 @@ pub enum Command {
 pub struct DumpColorArgs {
     pub input: String,
     pub error_format: ErrorFormat,
+    /// Set when the user passed `-o <path>` alongside `--dump-color`.
+    /// Color analysis emits no executable; the driver in `main.rs`
+    /// uses this flag to print a stderr warning so the misuse is
+    /// visible rather than silent.
+    pub output_supplied: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,11 +108,14 @@ pub fn parse(args: &[String]) -> Command {
                 "--dump-color cannot be combined with --print-runtime-stats".into(),
             );
         }
-        // `-o` is silently ignored under --dump-color; color analysis
-        // emits text to stdout, no executable.
+        // `-o <path>` is accepted under --dump-color for shell-history
+        // ergonomics, but color analysis emits no executable. The
+        // driver in `main.rs` prints a stderr warning when this is
+        // set so the misuse is visible.
         return Command::DumpColor(DumpColorArgs {
             input,
             error_format,
+            output_supplied: output,
         });
     }
 
@@ -223,6 +231,7 @@ mod tests {
             Command::DumpColor(DumpColorArgs {
                 input: "hello.sigil".into(),
                 error_format: ErrorFormat::JsonLines,
+                output_supplied: None,
             })
         );
     }
@@ -235,18 +244,23 @@ mod tests {
             Command::DumpColor(DumpColorArgs {
                 input: "hello.sigil".into(),
                 error_format: ErrorFormat::Human,
+                output_supplied: None,
             })
         );
     }
 
     #[test]
-    fn dump_color_ignores_dash_o() {
-        // `-o` is accepted but unused under --dump-color; the output
-        // file would be ignored either way. Order-independence
-        // matters: users may build via shell history that already
-        // includes `-o`.
+    fn dump_color_records_dash_o_for_warning() {
+        // `-o` is accepted under --dump-color (shell-history
+        // ergonomics) but the path is recorded so `main.rs` can warn
+        // on stderr. The misuse is visible rather than silent.
         let c = parse_argv(&["hello.sigil", "-o", "/tmp/x", "--dump-color"]);
-        assert!(matches!(c, Command::DumpColor(_)));
+        match c {
+            Command::DumpColor(args) => {
+                assert_eq!(args.output_supplied.as_deref(), Some("/tmp/x"));
+            }
+            other => panic!("expected DumpColor, got {other:?}"),
+        }
     }
 
     #[test]

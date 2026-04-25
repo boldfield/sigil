@@ -90,17 +90,34 @@ fn emit_errors(errs: &[CompilerError], format: ErrorFormat) {
     }
 }
 
+/// Plan B Task 50 — failure modes for [`dump_color`]. The driver in
+/// `main.rs` maps every variant to a non-zero exit code; downstream
+/// tooling (e.g., adversarial-review harnesses) can branch on the
+/// variant for clearer diagnostics.
+#[derive(Debug)]
+pub enum DumpColorError {
+    /// `std::fs::read_to_string` failed (missing file, permission
+    /// denied, etc.). The underlying error is already printed to
+    /// stderr by `dump_color` before returning.
+    ReadFailed,
+    /// At least one front-end error fired (lex / parse / resolve /
+    /// typecheck). The carried `usize` is the total error count for
+    /// telemetry; diagnostics are already on stderr.
+    FrontEndErrors(usize),
+}
+
 /// Plan B Task 50 — `--dump-color`. Runs the front end through color
 /// inference and returns the rendered dump as a `String`. Front-end
-/// errors emit as usual on stderr and short-circuit with `Err`.
-pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, usize> {
+/// errors emit as usual on stderr and short-circuit with a typed
+/// [`DumpColorError`].
+pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, DumpColorError> {
     let src = match std::fs::read_to_string(input) {
         Ok(s) => s,
         Err(e) => {
             let stderr = std::io::stderr();
             let mut out = stderr.lock();
             let _ = writeln!(out, "sigil: cannot read `{input}`: {e}");
-            return Err(1);
+            return Err(DumpColorError::ReadFailed);
         }
     };
 
@@ -122,8 +139,9 @@ pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, usize> {
         .iter()
         .any(|e| matches!(e.severity, crate::errors::Severity::Error))
     {
+        let n = all_errs.len();
         emit_errors(&all_errs, format);
-        return Err(all_errs.len());
+        return Err(DumpColorError::FrontEndErrors(n));
     }
 
     let anf = elaborate::elaborate(checked);

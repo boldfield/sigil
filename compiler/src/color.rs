@@ -33,7 +33,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::{Block, Expr, FnDecl, Item, MatchArm, PerformExpr, Stmt};
+use crate::errors::Span;
 use crate::monomorphize::MonoProgram;
+use crate::typecheck::GenericInstantiation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
@@ -100,92 +102,122 @@ pub fn infer_colors(mono: MonoProgram) -> ColoredProgram {
     }
 
     // -------- Step 3: build call graph (caller idx -> set of callee idxs) --------
-    // Edges only point at known top-level fns; calls to lambdas /
-    // closure-record values / first-class fn-typed args are deliberately
-    // ignored because they can't be statically resolved here without
-    // closure conversion. Plan B v1's color model is conservative on
-    // those cases via the local analysis (lambdas inside a fn body are
-    // walked for performs and effects already).
+    // Edges are driven by `CheckedProgram::call_site_instantiations`,
+    // a span-keyed map populated by the typechecker for every Ident
+    // (call-position or value-position) that resolved to a top-level
+    // fn under the env-precedence rules at that span. Locals that
+    // shadow a top-level fn name are not in the map (the typechecker's
+    // `env.get` wins before `fn_schemes.get`), so this drive is
+    // precise — a body that references a parameter or `let`-binding
+    // that happens to share a name with a top-level fn does not get
+    // a spurious edge.
+    //
+    // Edges still cover both call-position (`Call { callee: Ident }`)
+    // and value-position references (`let f = some_fn`) because
+    // typecheck records both; that preserves the soundness claim that
+    // a parent binding a CPS fn as a value is itself CPS.
+    //
+    // Lambda bodies are walked: closure conversion runs after color,
+    // so nested lambdas are still part of their parent fn's edge set.
+    let calls = &mono.anf.checked.call_site_instantiations;
     let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
     for (i, f) in fn_decls.iter().enumerate() {
         let mut out: BTreeSet<usize> = BTreeSet::new();
-        collect_calls_in_block(&f.body, &fn_index, &mut out);
+        collect_calls_in_block(&f.body, &fn_index, calls, &mut out);
         edges[i] = out;
     }
 
     // -------- Step 4: Tarjan SCC --------
-    // Returns SCCs in reverse-topological order (sinks first), and a
-    // node->scc index map.
+    // Iterative; reverse-topological order (sinks first); within-SCC
+    // node order is ascending.
     let (sccs, scc_of) = tarjan_scc(n, &edges);
 
     // -------- Step 5: propagate CPS color across SCCs --------
     let mut scc_color: Vec<Color> = vec![Color::Native; sccs.len()];
-    // Per-fn reason after propagation.
     let mut node_reason: Vec<String> = vec![String::new(); n];
 
     for (scc_idx, scc) in sccs.iter().enumerate() {
-        // (a) intrinsic-CPS check
-        let mut intrinsic_member: Option<(usize, &str)> = None;
+        // (a) Identify each member's most-proximate cause: the first
+        // intrinsic-CPS member (by program order), and the first
+        // bridge-out-to-a-CPS-SCC member (by program order).
+        let mut intrinsic_member: Option<usize> = None;
         for &node in scc {
-            if let LocalColor::Cps(reason) = &local[node] {
-                intrinsic_member = Some((node, reason.as_str()));
-                break; // first by program order
+            if matches!(local[node], LocalColor::Cps(_)) {
+                intrinsic_member = Some(node);
+                break;
             }
         }
 
-        // (b) transitive-CPS check (only meaningful if no intrinsic member)
-        let mut transitive_callee: Option<(usize, usize)> = None;
-        if intrinsic_member.is_none() {
-            'outer: for &node in scc {
-                for &callee in &edges[node] {
-                    let callee_scc = scc_of[callee];
-                    if callee_scc == scc_idx {
-                        continue;
-                    }
-                    if scc_color[callee_scc] == Color::Cps {
-                        transitive_callee = Some((node, callee));
-                        break 'outer;
-                    }
+        // For each node, the first cross-SCC callee that's already
+        // CPS (sinks first means the callee's color is decided).
+        // Stored once per node for O(1) reason lookup below.
+        let mut bridge_callee_of: BTreeMap<usize, usize> = BTreeMap::new();
+        for &node in scc {
+            for &callee in &edges[node] {
+                let callee_scc = scc_of[callee];
+                if callee_scc == scc_idx {
+                    continue;
+                }
+                if scc_color[callee_scc] == Color::Cps {
+                    bridge_callee_of.entry(node).or_insert(callee);
                 }
             }
         }
+        // First bridge member, by program order.
+        let mut bridge_member: Option<usize> = None;
+        for &node in scc {
+            if bridge_callee_of.contains_key(&node) {
+                bridge_member = Some(node);
+                break;
+            }
+        }
 
-        // (c) decide SCC color and reason text
-        match (intrinsic_member, transitive_callee) {
-            (Some((member, reason)), _) => {
-                scc_color[scc_idx] = Color::Cps;
-                let reason_owned = reason.to_string();
-                for &node in scc {
-                    if node == member {
-                        node_reason[node] = reason_owned.clone();
-                    } else {
-                        node_reason[node] =
-                            format!("cps: in SCC with cps member `{}`", fn_names[member]);
-                    }
+        // (b) SCC color: CPS if any intrinsic OR any bridge.
+        let scc_is_cps = intrinsic_member.is_some() || bridge_member.is_some();
+        if !scc_is_cps {
+            scc_color[scc_idx] = Color::Native;
+            for &node in scc {
+                if let LocalColor::Native(r) = &local[node] {
+                    node_reason[node] = r.clone();
                 }
             }
-            (None, Some((caller, callee))) => {
-                scc_color[scc_idx] = Color::Cps;
-                let caller_reason = format!(
+            continue;
+        }
+        scc_color[scc_idx] = Color::Cps;
+
+        // (c) Per-node reason: each node's *own* most-proximate cause.
+        for &node in scc {
+            // Intrinsic locally-CPS members keep their specific reason.
+            if let LocalColor::Cps(r) = &local[node] {
+                node_reason[node] = r.clone();
+                continue;
+            }
+            // Bridge members reference their actual outgoing callee.
+            if let Some(&callee) = bridge_callee_of.get(&node) {
+                node_reason[node] = format!(
                     "cps: transitively calls `{}` which is cps",
                     fn_names[callee]
                 );
-                for &node in scc {
-                    if node == caller {
-                        node_reason[node] = caller_reason.clone();
-                    } else {
-                        node_reason[node] =
-                            format!("cps: in SCC with cps member `{}`", fn_names[caller]);
-                    }
-                }
+                continue;
             }
-            (None, None) => {
-                scc_color[scc_idx] = Color::Native;
-                for &node in scc {
-                    if let LocalColor::Native(r) = &local[node] {
-                        node_reason[node] = r.clone();
-                    }
-                }
+            // Non-intrinsic, non-bridge member: pulled into CPS by SCC
+            // membership only. Distinguish "propagated through an
+            // intrinsic peer" from "propagated through a bridge peer"
+            // so the `--dump-color` user can follow the causal chain.
+            if let Some(intrinsic) = intrinsic_member {
+                node_reason[node] = format!(
+                    "cps: in SCC with intrinsically-cps member `{}`",
+                    fn_names[intrinsic]
+                );
+            } else if let Some(bridge) = bridge_member {
+                node_reason[node] = format!(
+                    "cps: in SCC bridging to cps callee via `{}`",
+                    fn_names[bridge]
+                );
+            } else {
+                // Cannot happen: scc_is_cps requires at least one of
+                // intrinsic_member / bridge_member to be Some.
+                unreachable!("color: SCC marked CPS but has neither intrinsic nor bridge member");
             }
         }
     }
@@ -359,191 +391,247 @@ fn find_non_io_perform_in_perform(p: &PerformExpr) -> Option<(String, String)> {
     None
 }
 
-/// Walk `b` and its nested expressions for direct calls whose callee
-/// is a known top-level fn name; insert each callee's index into `out`.
+/// Walk `b` and its nested expressions for top-level-fn references
+/// (call-position or value-position). An `Expr::Ident(name, span)`
+/// becomes an outgoing edge iff `calls.contains_key(span)` — i.e.,
+/// typecheck recorded it as a top-level-fn reference under the
+/// env-precedence rules at that span. Locals shadowing a top-level
+/// name are not in the map and produce no edge.
 fn collect_calls_in_block(
     b: &Block,
     fn_index: &BTreeMap<String, usize>,
+    calls: &BTreeMap<Span, GenericInstantiation>,
     out: &mut BTreeSet<usize>,
 ) {
     for s in &b.stmts {
         match s {
-            Stmt::Let(l) => collect_calls_in_expr(&l.value, fn_index, out),
-            Stmt::Expr(e) => collect_calls_in_expr(e, fn_index, out),
+            Stmt::Let(l) => collect_calls_in_expr(&l.value, fn_index, calls, out),
+            Stmt::Expr(e) => collect_calls_in_expr(e, fn_index, calls, out),
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    collect_calls_in_expr(a, fn_index, out);
+                    collect_calls_in_expr(a, fn_index, calls, out);
                 }
             }
         }
     }
     if let Some(t) = &b.tail {
-        collect_calls_in_expr(t, fn_index, out);
+        collect_calls_in_expr(t, fn_index, calls, out);
     }
 }
 
-fn collect_calls_in_expr(e: &Expr, fn_index: &BTreeMap<String, usize>, out: &mut BTreeSet<usize>) {
+fn collect_calls_in_expr(
+    e: &Expr,
+    fn_index: &BTreeMap<String, usize>,
+    calls: &BTreeMap<Span, GenericInstantiation>,
+    out: &mut BTreeSet<usize>,
+) {
     match e {
         Expr::IntLit(_, _)
         | Expr::StringLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
         | Expr::ClosureEnvLoad { .. } => {}
-        Expr::Ident(name, _) => {
-            // Bare identifier in expression position can be the
-            // callee of a `Call` — that case is handled below — or a
-            // value reference (e.g., `let f = some_fn`). Plan A2's
-            // closure model treats top-level fn names as values via
-            // `lower_call`'s direct-Ident branch; outside of that
-            // branch the Ident still resolves to the same top-level
-            // fn, so we conservatively count any reference as an
-            // outgoing edge. This keeps the call graph sound when
-            // future passes add fn-as-value propagation.
-            if let Some(&idx) = fn_index.get(name) {
-                out.insert(idx);
-            }
-        }
-        Expr::Call { callee, args, .. } => {
-            if let Expr::Ident(name, _) = callee.as_ref() {
+        Expr::Ident(name, span) => {
+            if calls.contains_key(span) {
                 if let Some(&idx) = fn_index.get(name) {
                     out.insert(idx);
                 }
-            } else {
-                collect_calls_in_expr(callee, fn_index, out);
             }
+        }
+        Expr::Call { callee, args, .. } => {
+            // The callee Ident is handled by recursing — its span
+            // resolves through `calls`. Non-Ident callees fall
+            // through to recursive descent (no static target).
+            collect_calls_in_expr(callee, fn_index, calls, out);
             for a in args {
-                collect_calls_in_expr(a, fn_index, out);
+                collect_calls_in_expr(a, fn_index, calls, out);
             }
         }
         Expr::Perform(p) => {
             for a in &p.args {
-                collect_calls_in_expr(a, fn_index, out);
+                collect_calls_in_expr(a, fn_index, calls, out);
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            collect_calls_in_expr(lhs, fn_index, out);
-            collect_calls_in_expr(rhs, fn_index, out);
+            collect_calls_in_expr(lhs, fn_index, calls, out);
+            collect_calls_in_expr(rhs, fn_index, calls, out);
         }
-        Expr::Unary { operand, .. } => collect_calls_in_expr(operand, fn_index, out),
+        Expr::Unary { operand, .. } => collect_calls_in_expr(operand, fn_index, calls, out),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
         } => {
-            collect_calls_in_expr(cond, fn_index, out);
-            collect_calls_in_block(then_block, fn_index, out);
-            collect_calls_in_block(else_block, fn_index, out);
+            collect_calls_in_expr(cond, fn_index, calls, out);
+            collect_calls_in_block(then_block, fn_index, calls, out);
+            collect_calls_in_block(else_block, fn_index, calls, out);
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            collect_calls_in_expr(scrutinee, fn_index, out);
+            collect_calls_in_expr(scrutinee, fn_index, calls, out);
             for MatchArm { body, .. } in arms {
-                collect_calls_in_expr(body, fn_index, out);
+                collect_calls_in_expr(body, fn_index, calls, out);
             }
         }
-        Expr::Block(b) => collect_calls_in_block(b, fn_index, out),
-        Expr::Lambda { body, .. } => collect_calls_in_expr(body, fn_index, out),
+        Expr::Block(b) => collect_calls_in_block(b, fn_index, calls, out),
+        Expr::Lambda { body, .. } => collect_calls_in_expr(body, fn_index, calls, out),
         Expr::ClosureRecord { env_exprs, .. } => {
             for ex in env_exprs {
-                collect_calls_in_expr(ex, fn_index, out);
+                collect_calls_in_expr(ex, fn_index, calls, out);
             }
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                collect_calls_in_expr(&f.value, fn_index, out);
+                collect_calls_in_expr(&f.value, fn_index, calls, out);
             }
         }
     }
 }
 
-/// Tarjan's SCC. Returns `(sccs, scc_of)` where `sccs[i]` is a
-/// vector of node indices in SCC `i` (sorted ascending for
+/// Tarjan's SCC, iterative. Returns `(sccs, scc_of)` where `sccs[i]`
+/// is a vector of node indices in SCC `i` (sorted ascending for
 /// determinism within each SCC) and `scc_of[node]` is the SCC index
-/// of `node`. Tarjan's algorithm naturally emits SCCs in
-/// reverse-topological order — sinks first — which is exactly what
-/// the propagation pass needs.
+/// of `node`. SCCs are emitted in reverse-topological order — sinks
+/// first — which is exactly what the propagation pass needs.
+///
+/// Why iterative: the recursive form's stack frames are bounded by
+/// the longest call chain in the monomorph graph. Plan B's typeclass
+/// dictionary specialization will grow that bound; conversion now
+/// removes the stack-overflow risk before user-visible programs hit
+/// it. Tested against the recursive form's behavior on every existing
+/// test case before swap.
 fn tarjan_scc(n: usize, edges: &[BTreeSet<usize>]) -> (Vec<Vec<usize>>, Vec<usize>) {
-    struct State<'a> {
-        edges: &'a [BTreeSet<usize>],
-        index_counter: usize,
-        index_of: Vec<Option<usize>>,
-        lowlink: Vec<usize>,
-        on_stack: Vec<bool>,
-        stack: Vec<usize>,
-        sccs: Vec<Vec<usize>>,
-        scc_of: Vec<usize>,
+    // Per-node bookkeeping.
+    let mut index_of: Vec<Option<usize>> = vec![None; n];
+    let mut lowlink: Vec<usize> = vec![0; n];
+    let mut on_stack: Vec<bool> = vec![false; n];
+    // Tarjan's value stack — nodes on the path from a root to the
+    // current frontier. Distinct from the recursion-replacement
+    // `work` stack below.
+    let mut tj_stack: Vec<usize> = Vec::new();
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+    let mut scc_of: Vec<usize> = vec![0; n];
+    let mut index_counter: usize = 0;
+
+    // Each work-stack frame represents one in-flight `strongconnect`.
+    // `neighbors` is the materialized neighbor list (sorted ascending
+    // because it came from a BTreeSet); `next` is the index into
+    // `neighbors` of the next neighbor to process. When `next ==
+    // neighbors.len()`, the frame finalizes (SCC root check, pop).
+    struct Frame {
+        v: usize,
+        neighbors: Vec<usize>,
+        next: usize,
     }
-    fn strongconnect(st: &mut State<'_>, v: usize) {
-        st.index_of[v] = Some(st.index_counter);
-        st.lowlink[v] = st.index_counter;
-        st.index_counter += 1;
-        st.stack.push(v);
-        st.on_stack[v] = true;
-        // Snapshot v's edges to drop the immutable borrow before
-        // recursive descent (which mutates `st`). Sorted-set iteration
-        // gives deterministic SCC numbering.
-        let neighbors: Vec<usize> = st.edges[v].iter().copied().collect();
-        for w in neighbors {
-            if st.index_of[w].is_none() {
-                strongconnect(st, w);
-                st.lowlink[v] = st.lowlink[v].min(st.lowlink[w]);
-            } else if st.on_stack[w] {
-                // `on_stack` was set together with `index_of`, so an
-                // on-stack node is always indexed. Pattern-match for
-                // structural exhaustiveness rather than `.expect()`,
-                // which the compiler's clippy gate forbids in non-test
-                // code.
-                if let Some(w_index) = st.index_of[w] {
-                    st.lowlink[v] = st.lowlink[v].min(w_index);
-                } else {
-                    unreachable!("Tarjan invariant: on_stack node has an index");
-                }
-            }
+    let mut work: Vec<Frame> = Vec::new();
+
+    let push_frame = |v: usize,
+                      index_counter: &mut usize,
+                      index_of: &mut [Option<usize>],
+                      lowlink: &mut [usize],
+                      on_stack: &mut [bool],
+                      tj_stack: &mut Vec<usize>,
+                      work: &mut Vec<Frame>| {
+        index_of[v] = Some(*index_counter);
+        lowlink[v] = *index_counter;
+        *index_counter += 1;
+        tj_stack.push(v);
+        on_stack[v] = true;
+        let neighbors: Vec<usize> = edges[v].iter().copied().collect();
+        work.push(Frame {
+            v,
+            neighbors,
+            next: 0,
+        });
+    };
+
+    for start in 0..n {
+        if index_of[start].is_some() {
+            continue;
         }
-        let v_index = match st.index_of[v] {
-            Some(i) => i,
-            None => unreachable!("Tarjan invariant: just-set index"),
-        };
-        if st.lowlink[v] == v_index {
-            let mut comp: Vec<usize> = Vec::new();
-            loop {
-                let w = match st.stack.pop() {
-                    Some(w) => w,
-                    None => unreachable!("Tarjan invariant: SCC root must be on stack"),
-                };
-                st.on_stack[w] = false;
-                comp.push(w);
-                if w == v {
-                    break;
+        push_frame(
+            start,
+            &mut index_counter,
+            &mut index_of,
+            &mut lowlink,
+            &mut on_stack,
+            &mut tj_stack,
+            &mut work,
+        );
+
+        while let Some(top) = work.last_mut() {
+            let v = top.v;
+            if top.next < top.neighbors.len() {
+                let w = top.neighbors[top.next];
+                top.next += 1;
+                if index_of[w].is_none() {
+                    // Descend into w as a fresh frame. Lowlink min
+                    // with w's lowlink will fold in when w finishes.
+                    push_frame(
+                        w,
+                        &mut index_counter,
+                        &mut index_of,
+                        &mut lowlink,
+                        &mut on_stack,
+                        &mut tj_stack,
+                        &mut work,
+                    );
+                } else if on_stack[w] {
+                    // Back-edge / cross-edge to an on-stack node.
+                    // Tarjan's original paper: use w's *index*, not
+                    // its lowlink, to ensure SCC root identification.
+                    let w_index = match index_of[w] {
+                        Some(i) => i,
+                        None => unreachable!("Tarjan invariant: on_stack implies indexed"),
+                    };
+                    if w_index < lowlink[v] {
+                        lowlink[v] = w_index;
+                    }
+                }
+                continue;
+            }
+
+            // No more neighbors — finalize this frame. First check
+            // SCC root status, then pop and propagate `lowlink[v]`
+            // into the parent frame's `lowlink[parent]`.
+            let v_index = match index_of[v] {
+                Some(i) => i,
+                None => unreachable!("Tarjan invariant: just-set on entry"),
+            };
+            if lowlink[v] == v_index {
+                let mut comp: Vec<usize> = Vec::new();
+                loop {
+                    let w = match tj_stack.pop() {
+                        Some(w) => w,
+                        None => unreachable!("Tarjan invariant: SCC root must be on stack"),
+                    };
+                    on_stack[w] = false;
+                    comp.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                comp.sort();
+                let scc_idx = sccs.len();
+                for &node in &comp {
+                    scc_of[node] = scc_idx;
+                }
+                sccs.push(comp);
+            }
+
+            let v_lowlink = lowlink[v];
+            work.pop();
+            if let Some(parent) = work.last_mut() {
+                if v_lowlink < lowlink[parent.v] {
+                    lowlink[parent.v] = v_lowlink;
                 }
             }
-            comp.sort();
-            let scc_idx = st.sccs.len();
-            for &node in &comp {
-                st.scc_of[node] = scc_idx;
-            }
-            st.sccs.push(comp);
         }
     }
 
-    let mut st = State {
-        edges,
-        index_counter: 0,
-        index_of: vec![None; n],
-        lowlink: vec![0; n],
-        on_stack: vec![false; n],
-        stack: Vec::new(),
-        sccs: Vec::new(),
-        scc_of: vec![0; n],
-    };
-    for v in 0..n {
-        if st.index_of[v].is_none() {
-            strongconnect(&mut st, v);
-        }
-    }
-    (st.sccs, st.scc_of)
+    (sccs, scc_of)
 }
 
 /// Render a colored program for `--dump-color`. One line per
@@ -727,7 +815,121 @@ mod tests {
         }))
     }
 
+    /// Walk items collecting every `Expr::Ident(name, span)` whose
+    /// name matches a top-level fn — this is what the typechecker
+    /// would have recorded in `call_site_instantiations`. Lets
+    /// synthetic-program tests exercise edge insertion through the
+    /// span-keyed call map without going through typecheck.
+    fn build_synthetic_calls_map(items: &[Item]) -> BTreeMap<Span, GenericInstantiation> {
+        let mut fn_names: BTreeSet<String> = BTreeSet::new();
+        for item in items {
+            if let Item::Fn(f) = item {
+                fn_names.insert(f.name.clone());
+            }
+        }
+        let mut out: BTreeMap<Span, GenericInstantiation> = BTreeMap::new();
+        for item in items {
+            if let Item::Fn(f) = item {
+                walk_block_for_fn_idents(&f.body, &fn_names, &mut out);
+            }
+        }
+        out
+    }
+
+    fn walk_block_for_fn_idents(
+        b: &AstBlock,
+        fn_names: &BTreeSet<String>,
+        out: &mut BTreeMap<Span, GenericInstantiation>,
+    ) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Let(l) => walk_expr_for_fn_idents(&l.value, fn_names, out),
+                Stmt::Expr(e) => walk_expr_for_fn_idents(e, fn_names, out),
+                Stmt::Perform(p) => {
+                    for a in &p.args {
+                        walk_expr_for_fn_idents(a, fn_names, out);
+                    }
+                }
+            }
+        }
+        if let Some(t) = &b.tail {
+            walk_expr_for_fn_idents(t, fn_names, out);
+        }
+    }
+
+    fn walk_expr_for_fn_idents(
+        e: &Expr,
+        fn_names: &BTreeSet<String>,
+        out: &mut BTreeMap<Span, GenericInstantiation>,
+    ) {
+        match e {
+            Expr::Ident(name, span) => {
+                if fn_names.contains(name) {
+                    out.insert(
+                        span.clone(),
+                        GenericInstantiation {
+                            name: name.clone(),
+                            type_args: Vec::new(),
+                        },
+                    );
+                }
+            }
+            Expr::Call { callee, args, .. } => {
+                walk_expr_for_fn_idents(callee, fn_names, out);
+                for a in args {
+                    walk_expr_for_fn_idents(a, fn_names, out);
+                }
+            }
+            Expr::Perform(p) => {
+                for a in &p.args {
+                    walk_expr_for_fn_idents(a, fn_names, out);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                walk_expr_for_fn_idents(lhs, fn_names, out);
+                walk_expr_for_fn_idents(rhs, fn_names, out);
+            }
+            Expr::Unary { operand, .. } => walk_expr_for_fn_idents(operand, fn_names, out),
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+                ..
+            } => {
+                walk_expr_for_fn_idents(cond, fn_names, out);
+                walk_block_for_fn_idents(then_block, fn_names, out);
+                walk_block_for_fn_idents(else_block, fn_names, out);
+            }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                walk_expr_for_fn_idents(scrutinee, fn_names, out);
+                for MatchArm { body, .. } in arms {
+                    walk_expr_for_fn_idents(body, fn_names, out);
+                }
+            }
+            Expr::Block(b) => walk_block_for_fn_idents(b, fn_names, out),
+            Expr::Lambda { body, .. } => walk_expr_for_fn_idents(body, fn_names, out),
+            Expr::ClosureRecord { env_exprs, .. } => {
+                for ex in env_exprs {
+                    walk_expr_for_fn_idents(ex, fn_names, out);
+                }
+            }
+            Expr::RecordLit { fields, .. } => {
+                for f in fields {
+                    walk_expr_for_fn_idents(&f.value, fn_names, out);
+                }
+            }
+            Expr::IntLit(_, _)
+            | Expr::StringLit(_, _)
+            | Expr::BoolLit(_, _)
+            | Expr::CharLit(_, _)
+            | Expr::ClosureEnvLoad { .. } => {}
+        }
+    }
+
     fn synth_program(items: Vec<Item>) -> MonoProgram {
+        let calls = build_synthetic_calls_map(&items);
         let program = Program {
             items,
             file: "test.sigil".to_string(),
@@ -739,7 +941,7 @@ mod tests {
             types: BTreeMap::new(),
             match_scrut_tys: BTreeMap::new(),
             fn_schemes: BTreeMap::new(),
-            call_site_instantiations: BTreeMap::new(),
+            call_site_instantiations: calls,
             ctor_site_instantiations: BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
@@ -866,9 +1068,13 @@ mod tests {
         let cp = infer_colors(prog);
         assert_eq!(color_of(&cp, "ping"), Color::Cps);
         assert_eq!(color_of(&cp, "pong"), Color::Cps);
+        // ping's only outgoing edge is intra-SCC (to pong), so ping
+        // is not a bridge — it's pulled in via SCC membership. The
+        // reason names pong as the intrinsic peer that caused the
+        // taint, with the explicit "intrinsically-cps" wording.
         let ping_reason = reason_of(&cp, "ping");
-        assert!(
-            ping_reason.contains("in SCC with cps member `pong`"),
+        assert_eq!(
+            ping_reason, "cps: in SCC with intrinsically-cps member `pong`",
             "got: {ping_reason}"
         );
         assert_eq!(reason_of(&cp, "pong"), "cps: row contains effect `Raise`");
@@ -979,8 +1185,11 @@ mod tests {
     }
 
     #[test]
-    fn unused_param_warning_silenced() {
-        // Sanity: synth_fn with a parameter list compiles without error.
+    fn synth_fn_with_param_classifies_native() {
+        // Sanity check: `synth_fn` extended with a parameter list
+        // still classifies native when its row is pure and its body
+        // has no perform sites. Pins the test scaffolding, not a
+        // language invariant.
         let body = empty_block();
         let mut item = synth_fn("p", vec![], body);
         if let Item::Fn(ref mut f) = item {
@@ -993,5 +1202,240 @@ mod tests {
         let prog = synth_program(vec![item]);
         let cp = infer_colors(prog);
         assert_eq!(color_of(&cp, "p"), Color::Native);
+    }
+
+    // ---------------- Review-driven additions: SCC algorithm coverage,
+    //                  shadowing precision, edge soundness.
+
+    /// Single-node SCC with self-loop, native body. `fib` calling
+    /// itself directly is a single-node SCC; its lowlink doesn't
+    /// drop below its index, so it stays a singleton SCC. Color
+    /// inference must propagate correctly within: pure row + pure
+    /// callee = native.
+    #[test]
+    fn self_loop_single_node_scc_native() {
+        let body = AstBlock {
+            stmts: Vec::new(),
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("fib".to_string(), span())),
+                args: Vec::new(),
+                span: span(),
+            }),
+            span: span(),
+        };
+        let prog = synth_program(vec![synth_fn("fib", vec![], body)]);
+        let cp = infer_colors(prog);
+        assert_eq!(color_of(&cp, "fib"), Color::Native);
+        assert_eq!(reason_of(&cp, "fib"), "native: pure row");
+    }
+
+    /// Single-node SCC with self-loop, locally-CPS body. Reason
+    /// should be the intrinsic CPS reason (own row), not the
+    /// SCC-membership fallback.
+    #[test]
+    fn self_loop_single_node_scc_cps() {
+        let body = AstBlock {
+            stmts: Vec::new(),
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("loopy".to_string(), span())),
+                args: Vec::new(),
+                span: span(),
+            }),
+            span: span(),
+        };
+        let prog = synth_program(vec![synth_fn("loopy", vec!["Raise"], body)]);
+        let cp = infer_colors(prog);
+        assert_eq!(color_of(&cp, "loopy"), Color::Cps);
+        // Intrinsic-CPS reason wins over any SCC fallback.
+        assert_eq!(reason_of(&cp, "loopy"), "cps: row contains effect `Raise`");
+    }
+
+    /// `let f = some_cps_fn` in an otherwise-Native parent must
+    /// still taint the parent. Pins the load-bearing soundness
+    /// claim from the PR description: bare-Ident value-position
+    /// references count as outgoing edges, not just call-position
+    /// callees.
+    #[test]
+    fn let_bound_fn_value_taints_parent_via_outgoing_edge() {
+        // fn cps_fn() -> Int ![Raise] { 0 }      <- intrinsic CPS
+        // fn parent() -> Int ![] {
+        //   let f = cps_fn;                       <- value-position fn ref
+        //   0
+        // }
+        let parent_body = AstBlock {
+            stmts: vec![Stmt::Let(crate::ast::LetStmt {
+                name: "f".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span()),
+                value: Expr::Ident("cps_fn".to_string(), span()),
+                span: span(),
+            })],
+            tail: Some(Expr::IntLit(0, span())),
+            span: span(),
+        };
+        let cps_fn = synth_fn("cps_fn", vec!["Raise"], empty_block());
+        let parent = synth_fn("parent", vec![], parent_body);
+        let prog = synth_program(vec![cps_fn, parent]);
+        let cp = infer_colors(prog);
+        assert_eq!(color_of(&cp, "cps_fn"), Color::Cps);
+        assert_eq!(color_of(&cp, "parent"), Color::Cps);
+        // `parent`'s reason is the bridge form — it has an outgoing
+        // edge to `cps_fn` (a different SCC, already Cps when this
+        // SCC is processed because Tarjan emits sinks first).
+        assert_eq!(
+            reason_of(&cp, "parent"),
+            "cps: transitively calls `cps_fn` which is cps"
+        );
+    }
+
+    /// 3-SCC chain: `c` is intrinsic CPS, `b` calls `c`, `a` calls
+    /// `b`. Both `a` and `b` should propagate to CPS. Pins
+    /// reverse-topological propagation across depth-N hops, not just
+    /// the single-hop case.
+    #[test]
+    fn cps_propagates_through_three_scc_chain() {
+        let a_body = AstBlock {
+            stmts: Vec::new(),
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("b".to_string(), span())),
+                args: Vec::new(),
+                span: span(),
+            }),
+            span: span(),
+        };
+        let b_body = AstBlock {
+            stmts: Vec::new(),
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("c".to_string(), span())),
+                args: Vec::new(),
+                span: span(),
+            }),
+            span: span(),
+        };
+        let a = synth_fn("a", vec![], a_body);
+        let b = synth_fn("b", vec![], b_body);
+        let c = synth_fn("c", vec!["Raise"], empty_block());
+        let prog = synth_program(vec![a, b, c]);
+        let cp = infer_colors(prog);
+        assert_eq!(color_of(&cp, "c"), Color::Cps);
+        assert_eq!(color_of(&cp, "b"), Color::Cps);
+        assert_eq!(color_of(&cp, "a"), Color::Cps);
+        assert_eq!(reason_of(&cp, "c"), "cps: row contains effect `Raise`");
+        assert_eq!(
+            reason_of(&cp, "b"),
+            "cps: transitively calls `c` which is cps"
+        );
+        assert_eq!(
+            reason_of(&cp, "a"),
+            "cps: transitively calls `b` which is cps"
+        );
+    }
+
+    /// Transitive-only SCC reason branch: a mutually-recursive SCC
+    /// {pure_a, pure_b} where neither is intrinsically CPS, but
+    /// pure_a has an outgoing edge to a separate intrinsically-CPS
+    /// fn `cps_x`. The whole SCC becomes CPS via the bridge. The
+    /// non-bridge member (pure_b) gets the
+    /// `in SCC bridging to cps callee via <bridge>` reason.
+    #[test]
+    fn scc_taint_via_transitive_only_branch() {
+        // pure_a calls pure_b AND cps_x; pure_b calls pure_a only.
+        let pure_a_body = AstBlock {
+            stmts: vec![Stmt::Expr(Expr::Call {
+                callee: Box::new(Expr::Ident("cps_x".to_string(), span())),
+                args: Vec::new(),
+                span: span(),
+            })],
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("pure_b".to_string(), span())),
+                args: Vec::new(),
+                span: span(),
+            }),
+            span: span(),
+        };
+        let pure_b_body = AstBlock {
+            stmts: Vec::new(),
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("pure_a".to_string(), span())),
+                args: Vec::new(),
+                span: span(),
+            }),
+            span: span(),
+        };
+        let pure_a = synth_fn("pure_a", vec![], pure_a_body);
+        let pure_b = synth_fn("pure_b", vec![], pure_b_body);
+        let cps_x = synth_fn("cps_x", vec!["Raise"], empty_block());
+        let prog = synth_program(vec![pure_a, pure_b, cps_x]);
+        let cp = infer_colors(prog);
+        assert_eq!(color_of(&cp, "cps_x"), Color::Cps);
+        assert_eq!(color_of(&cp, "pure_a"), Color::Cps);
+        assert_eq!(color_of(&cp, "pure_b"), Color::Cps);
+        assert_eq!(reason_of(&cp, "cps_x"), "cps: row contains effect `Raise`");
+        // pure_a is the bridge — has direct outgoing edge to cps_x.
+        assert_eq!(
+            reason_of(&cp, "pure_a"),
+            "cps: transitively calls `cps_x` which is cps"
+        );
+        // pure_b is in the SCC but has no direct outgoing edge to a
+        // CPS SCC; it gets the bridging-via-peer reason naming
+        // pure_a, NOT the intrinsically-cps phrasing (no member is
+        // intrinsically CPS in this SCC).
+        assert_eq!(
+            reason_of(&cp, "pure_b"),
+            "cps: in SCC bridging to cps callee via `pure_a`"
+        );
+    }
+
+    /// Shadowing precision: a parameter or `let` binding sharing a
+    /// name with a top-level fn must NOT produce a spurious outgoing
+    /// edge to that fn. The previous heuristic-based edge logic
+    /// (every Ident matching a fn name) over-approximated and
+    /// pessimized this case to CPS. Driving from
+    /// `call_site_instantiations` makes it precise — typecheck's
+    /// env-precedence rules win, and the local reference is not
+    /// recorded.
+    ///
+    /// This test goes through the real front end so the
+    /// `call_site_instantiations` map gets populated correctly by
+    /// the actual typechecker. Synthetic-program tests can't
+    /// exercise shadowing semantics because they bypass typecheck.
+    #[test]
+    fn parameter_shadowing_top_level_fn_does_not_taint_caller() {
+        // helper takes a parameter named `dangerous` — the same name
+        // as a top-level fn. `dangerous + 1` references the parameter
+        // (env-precedence wins over fn_schemes), not the fn. Color
+        // analysis must NOT add a `helper -> dangerous` edge, so
+        // helper stays Native.
+        //
+        // We use `IO` for `dangerous`'s effect rather than `Raise`
+        // because typecheck rejects non-IO effect names. `dangerous`
+        // is then locally Native too, but the test still pins the
+        // shadowing-precision invariant: if the bare-Ident heuristic
+        // were still in play, `helper` would get a spurious outgoing
+        // edge to `dangerous` and (under any future change that
+        // makes `dangerous` Cps) would falsely classify Cps.
+        let src = r#"
+            import std.io
+            fn dangerous() -> Int ![IO] {
+                perform IO.println("real");
+                0
+            }
+            fn caller(dangerous: Int) -> Int ![] {
+                dangerous + 1
+            }
+            fn main() -> Int ![] { caller(0) }
+        "#;
+        let cp = color_from_src(src);
+        assert_eq!(color_of(&cp, "dangerous"), Color::Native);
+        assert_eq!(color_of(&cp, "caller"), Color::Native);
+        assert_eq!(color_of(&cp, "main"), Color::Native);
+        // The `caller`'s native reason is "row is `![]`", which our
+        // local analysis renders as `native: pure row`. If the bare-
+        // Ident heuristic were still applied, `caller` would have an
+        // outgoing edge to `dangerous` and the SCC pass would still
+        // classify Native here (because dangerous is also Native),
+        // but switching `dangerous` to a Cps row in a future test
+        // would expose the bug. We pin the reason text as a forward-
+        // looking guard.
+        assert_eq!(reason_of(&cp, "caller"), "native: pure row");
     }
 }
