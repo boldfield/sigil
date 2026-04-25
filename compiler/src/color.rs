@@ -137,9 +137,7 @@ pub fn infer_colors(mono: MonoProgram) -> ColoredProgram {
     let mut node_reason: Vec<String> = vec![String::new(); n];
 
     for (scc_idx, scc) in sccs.iter().enumerate() {
-        // (a) Identify each member's most-proximate cause: the first
-        // intrinsic-CPS member (by program order), and the first
-        // bridge-out-to-a-CPS-SCC member (by program order).
+        // (a) First intrinsic-CPS member by program order.
         let mut intrinsic_member: Option<usize> = None;
         for &node in scc {
             if matches!(local[node], LocalColor::Cps(_)) {
@@ -148,9 +146,12 @@ pub fn infer_colors(mono: MonoProgram) -> ColoredProgram {
             }
         }
 
-        // For each node, the first cross-SCC callee that's already
-        // CPS (sinks first means the callee's color is decided).
-        // Stored once per node for O(1) reason lookup below.
+        // (b) Per-node bridge-callee map. Always computed because
+        // the per-node reason loop below uses it to assign bridge-
+        // form reasons to non-intrinsic SCC members regardless of
+        // whether the SCC has an intrinsic CPS member. The walk is
+        // O(edges_out_of_scc); pure leaf SCCs naturally hit the
+        // empty case without an explicit skip.
         let mut bridge_callee_of: BTreeMap<usize, usize> = BTreeMap::new();
         for &node in scc {
             for &callee in &edges[node] {
@@ -172,7 +173,7 @@ pub fn infer_colors(mono: MonoProgram) -> ColoredProgram {
             }
         }
 
-        // (b) SCC color: CPS if any intrinsic OR any bridge.
+        // (c) SCC color: CPS if any intrinsic OR any bridge.
         let scc_is_cps = intrinsic_member.is_some() || bridge_member.is_some();
         if !scc_is_cps {
             scc_color[scc_idx] = Color::Native;
@@ -185,7 +186,7 @@ pub fn infer_colors(mono: MonoProgram) -> ColoredProgram {
         }
         scc_color[scc_idx] = Color::Cps;
 
-        // (c) Per-node reason: each node's *own* most-proximate cause.
+        // (d) Per-node reason: each node's *own* most-proximate cause.
         for &node in scc {
             // Intrinsic locally-CPS members keep their specific reason.
             if let LocalColor::Cps(r) = &local[node] {
@@ -773,6 +774,22 @@ mod tests {
         Span::new("test.sigil", 1, 1, 1, 1)
     }
 
+    /// Test-only span generator producing a fresh unique span per
+    /// call. Used by tests that need to disambiguate individual
+    /// `Expr::Ident` occurrences via their span — specifically the
+    /// shadowing-precision tests which model env-precedence by
+    /// excluding specific Ident spans from the synthetic
+    /// `call_site_instantiations` map. The constant `span()` helper
+    /// above suffices for all other synth tests because they don't
+    /// care which Ident has which span; only this family needs
+    /// uniqueness.
+    fn unique_span() -> Span {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(1);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        Span::new("test.sigil", n, 1, n, 2)
+    }
+
     fn empty_block() -> AstBlock {
         AstBlock {
             stmts: Vec::new(),
@@ -930,6 +947,21 @@ mod tests {
 
     fn synth_program(items: Vec<Item>) -> MonoProgram {
         let calls = build_synthetic_calls_map(&items);
+        synth_program_with_calls(items, calls)
+    }
+
+    /// Build a synthetic `MonoProgram` with a caller-supplied
+    /// `call_site_instantiations` map. The auto-built map produced
+    /// by `build_synthetic_calls_map` matches every Ident whose name
+    /// is a top-level fn — that's a name-only heuristic, not
+    /// env-precedence-aware. Tests that need to model env precedence
+    /// (a parameter or `let` binding shadowing a top-level fn name)
+    /// supply their own map: include the spans typecheck *would*
+    /// have recorded under env-precedence rules, exclude the rest.
+    fn synth_program_with_calls(
+        items: Vec<Item>,
+        calls: BTreeMap<Span, GenericInstantiation>,
+    ) -> MonoProgram {
         let program = Program {
             items,
             file: "test.sigil".to_string(),
@@ -1394,48 +1426,94 @@ mod tests {
     /// env-precedence rules win, and the local reference is not
     /// recorded.
     ///
-    /// This test goes through the real front end so the
-    /// `call_site_instantiations` map gets populated correctly by
-    /// the actual typechecker. Synthetic-program tests can't
-    /// exercise shadowing semantics because they bypass typecheck.
+    /// This test is **discriminating**: it constructs a synthetic
+    /// program where:
+    /// 1. `dangerous` is intrinsically CPS (non-IO effect row).
+    /// 2. `caller(dangerous: Int)` has a body that references both
+    ///    the parameter `dangerous` (Ident in expression position)
+    ///    AND makes a real call to a separate top-level fn `unrelated`.
+    /// 3. The `call_site_instantiations` map is supplied **manually**
+    ///    with only `unrelated`'s call-site span — modeling what a
+    ///    real env-precedence-aware typecheck pass would record.
+    ///
+    /// Under the precise edge logic, `caller`'s only outgoing edge
+    /// is to `unrelated` (Native), so `caller` stays Native. Under
+    /// the old name-only heuristic, `caller` would also acquire a
+    /// spurious edge to `dangerous` and falsely classify CPS.
+    /// Asserting `Color::Native` for `caller` while `dangerous` is
+    /// CPS *discriminates* the two regimes — which the prior
+    /// front-end-driven version of this test could not do under
+    /// Stage 5's `IO`-only typecheck.
     #[test]
     fn parameter_shadowing_top_level_fn_does_not_taint_caller() {
-        // helper takes a parameter named `dangerous` — the same name
-        // as a top-level fn. `dangerous + 1` references the parameter
-        // (env-precedence wins over fn_schemes), not the fn. Color
-        // analysis must NOT add a `helper -> dangerous` edge, so
-        // helper stays Native.
+        // unique_span() per Ident so the call map can target an
+        // exact occurrence; the param-ref `dangerous` Ident's span
+        // is deliberately *omitted* from the calls map.
+        let dangerous_fn = synth_fn("dangerous", vec!["Raise"], empty_block());
+        let unrelated_fn = synth_fn("unrelated", vec![], empty_block());
+
+        // caller body: `unrelated(); dangerous + 1`
+        // Both Idents have unique spans. We capture the span of the
+        // unrelated-call Ident so it can be recorded in the calls
+        // map (a real env-precedence pass would record it). The
+        // shadow Ident's span is deliberately not recorded.
+        let unrelated_callee_span = unique_span();
+        let caller_body = AstBlock {
+            stmts: vec![Stmt::Expr(Expr::Call {
+                callee: Box::new(Expr::Ident(
+                    "unrelated".to_string(),
+                    unrelated_callee_span.clone(),
+                )),
+                args: Vec::new(),
+                span: unique_span(),
+            })],
+            tail: Some(Expr::Binary {
+                op: crate::ast::BinOp::Add,
+                lhs: Box::new(Expr::Ident("dangerous".to_string(), unique_span())),
+                rhs: Box::new(Expr::IntLit(1, unique_span())),
+                span: unique_span(),
+            }),
+            span: unique_span(),
+        };
+        let mut caller = synth_fn("caller", vec![], caller_body);
+        if let Item::Fn(ref mut f) = caller {
+            f.params.push(Param {
+                name: "dangerous".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), unique_span()),
+                span: unique_span(),
+            });
+        }
+
+        // Build the calls map manually: only the real call to
+        // `unrelated` is recorded. The shadow Ident is excluded —
+        // this is exactly what an env-precedence-aware typecheck
+        // would emit (param wins, fn_schemes lookup never runs).
+        let mut calls: BTreeMap<Span, GenericInstantiation> = BTreeMap::new();
+        calls.insert(
+            unrelated_callee_span,
+            GenericInstantiation {
+                name: "unrelated".to_string(),
+                type_args: Vec::new(),
+            },
+        );
+
+        let prog = synth_program_with_calls(vec![dangerous_fn, unrelated_fn, caller], calls);
+        let cp = infer_colors(prog);
+
+        // `dangerous` is intrinsically CPS via its row.
+        assert_eq!(color_of(&cp, "dangerous"), Color::Cps);
+        // `unrelated` is Native (pure row, leaf).
+        assert_eq!(color_of(&cp, "unrelated"), Color::Native);
+        // `caller`'s only outgoing edge is to `unrelated` (Native);
+        // the shadow Ident produces no edge under the precise calls-
+        // map drive. Caller stays Native.
         //
-        // We use `IO` for `dangerous`'s effect rather than `Raise`
-        // because typecheck rejects non-IO effect names. `dangerous`
-        // is then locally Native too, but the test still pins the
-        // shadowing-precision invariant: if the bare-Ident heuristic
-        // were still in play, `helper` would get a spurious outgoing
-        // edge to `dangerous` and (under any future change that
-        // makes `dangerous` Cps) would falsely classify Cps.
-        let src = r#"
-            import std.io
-            fn dangerous() -> Int ![IO] {
-                perform IO.println("real");
-                0
-            }
-            fn caller(dangerous: Int) -> Int ![] {
-                dangerous + 1
-            }
-            fn main() -> Int ![] { caller(0) }
-        "#;
-        let cp = color_from_src(src);
-        assert_eq!(color_of(&cp, "dangerous"), Color::Native);
+        // Discrimination: under the old name-only heuristic, caller
+        // would also have an edge to `dangerous` (CPS) and the SCC
+        // pass would classify caller as CPS. Asserting Native here
+        // genuinely tests the precision fix — not a tautology under
+        // either edge regime.
         assert_eq!(color_of(&cp, "caller"), Color::Native);
-        assert_eq!(color_of(&cp, "main"), Color::Native);
-        // The `caller`'s native reason is "row is `![]`", which our
-        // local analysis renders as `native: pure row`. If the bare-
-        // Ident heuristic were still applied, `caller` would have an
-        // outgoing edge to `dangerous` and the SCC pass would still
-        // classify Native here (because dangerous is also Native),
-        // but switching `dangerous` to a Cps row in a future test
-        // would expose the bug. We pin the reason text as a forward-
-        // looking guard.
         assert_eq!(reason_of(&cp, "caller"), "native: pure row");
     }
 }
