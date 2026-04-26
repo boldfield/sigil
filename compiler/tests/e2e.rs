@@ -910,6 +910,295 @@ fn p16_generic_id_at_int_and_string_oracle() {
 /// it. Once `TypeExpr::Fn` ships, the test should be inverted to assert
 /// success against the prompt's stdout oracle.
 #[test]
+fn effect_decl_with_no_handler_use_compiles_and_runs() {
+    // Plan B Task 55 (foundation phase): an `effect` declaration that
+    // is never used by `handle` or `perform` flows through the
+    // pipeline as a no-op. The codegen-entry walker no longer
+    // short-circuits on `Item::Effect`, monomorphize/color/closure-
+    // convert pass it through unchanged, and codegen emits no
+    // additional symbols for it. The program below should compile
+    // cleanly and behave identically to the IO-only program (`hello,
+    // world\n` to stdout, exit 0).
+    let src = "effect Raise { fail: (String) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(\"hello, world\");\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "effect_decl_no_use");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "hello, world\n",
+        "stdout mismatch; stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn handle_with_no_perform_in_body_compiles_and_runs() {
+    // Plan B Task 55 (Phase 2 minimum): a `handle <body> with { ...
+    // }` expression where the body contains no non-IO `perform`
+    // compiles to just the body's value (the handler is statically
+    // optimised away — its arms are dead code at runtime). The
+    // program below uses an effect declaration AND a handle
+    // expression for the first time end-to-end. The handle's body is
+    // the literal `42`; the `Raise.fail` arm is never invoked. Final
+    // stdout: `42\n` (via int_to_string + IO.println), exit 0.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 42 with { Raise.fail(k) => 0 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_no_perform");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_non_io_perform_runs_arm_and_returns_value() {
+    // Plan B Task 55 (Phase 3b): handle expression whose body
+    // performs the handled effect now compiles and runs end-to-end.
+    // The body's `perform Raise.fail()` calls `sigil_perform`, which
+    // walks the handler stack, finds the frame's `Raise.fail` arm
+    // (a synthetic CPS fn registered via `sigil_handler_frame_set_arm`),
+    // invokes it with packed `(k_closure, k_fn)` args (both null —
+    // the arm ignores `k`), and the arm returns
+    // `sigil_next_step_done(42)`. The native code reads the value
+    // from the returned `*mut NextStep` and treats it as the
+    // perform's value, which is the handle's value. Final stdout:
+    // `42\n`, exit 0.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Raise.fail()) with { Raise.fail(k) => 42 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_perform_arm_value");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_two_arms_dispatches_correct_arm_by_op_id() {
+    // Plan B Task 55 (Phase 4a): multi-arm handlers are now
+    // supported when all arms target the same effect. The runtime's
+    // `sigil_perform` looks up the arm by op_id within the matched
+    // frame; codegen registers each arm via a separate
+    // `sigil_handler_frame_set_arm` call. Test program performs
+    // `Choose.right()` and expects the `right` arm (not the `left`
+    // arm) to fire. Op IDs are assigned alphabetically per effect:
+    // `left` → 0, `right` → 1, so this exercises the non-zero op_id
+    // path through the runtime arm-slot table.
+    let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Choose.right()) with {\n    \
+                   Choose.left(k) => 10,\n    \
+                   Choose.right(k) => 20,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_two_arms_dispatches");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "20\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_mixed_effect_arms_is_rejected_at_codegen() {
+    // Plan B Task 55 (Phase 4a restriction): multi-arm handlers
+    // must reference a single effect (the runtime
+    // `HandlerFrame.effect_id` is a single u32). Mixed-effect
+    // handlers need a frame-per-effect approach that lands in
+    // Phase 4e+. Until then, the codegen-entry guard rejects.
+    let src = "effect Raise { fail: () -> Int }\n\
+               effect Other { other: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 42 with {\n    \
+                   Raise.fail(k) => 0,\n    \
+                   Other.other(k) => 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_handle_mixed_effect_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_handle_mixed_effect_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail until Phase 4e ships; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Task 55") || stderr.contains("Phase 4") || stderr.contains("multi-effect"),
+        "error message should reference Plan B Task 55 / Phase 4 / multi-effect; got stderr={stderr:?}",
+    );
+}
+
+#[test]
+fn statement_form_non_io_perform_inside_handle_compiles_and_runs() {
+    // Plan B Task 55 (Phase 3b) — regression for the `Stmt::Perform`
+    // crash. Before the fix, `lower_stmt` unconditionally called
+    // `lower_perform`, which asserts `effect == "IO"`. Statement-form
+    // non-IO performs (e.g. `perform Raise.fail();` followed by more
+    // code) hit the assertion and crashed the compiler. The fix
+    // dispatches the same way `Expr::Perform` does: IO → side-effect
+    // path; non-IO → `lower_perform_non_io_to_value` with the value
+    // discarded.
+    //
+    // Phase 3b semantics note: the arm value flows back to the
+    // perform site (via `sigil_perform` → `sigil_run_loop`), not to
+    // the handle site. So in this test, helper's `perform E.op();`
+    // returns 99 (the arm value) which is discarded by the Stmt;
+    // helper continues to its tail `42` and returns 42. The handle
+    // expression therefore evaluates to 42, NOT to 99. Phase 4d's
+    // continuation reification will revise this so a `k`-ignoring
+    // arm aborts helper's continuation back to the handle site.
+    let src = "effect E { op: () -> Int }\n\
+               fn helper() -> Int ![E] {\n  \
+                 perform E.op();\n  \
+                 42\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with { E.op(k) => 99 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "stmt_perform_non_io_in_handle");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
+    // Plan B Task 55 — regression for the walker recursion bug: a
+    // nested `handle` appearing in another handle's body must surface
+    // its own Phase-4 restrictions. Before the fix, the outer
+    // walker only recursed into arm bodies, so the inner handle's
+    // multi-effect restriction (Phase 4e) was missed and the program
+    // would have reached codegen with arms registered under the wrong
+    // `effect_id` — at runtime that crashes inside `sigil_perform`'s
+    // handler-stack walk.
+    let src = "effect A { op1: () -> Int }\n\
+               effect B { op2: () -> Int }\n\
+               effect Outer { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle\n    \
+                   (handle 0 with { A.op1(k) => 1, B.op2(k) => 2 })\n  \
+                 with { Outer.op(k) => 0 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_nested_handle_walker_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_nested_handle_walker_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail — inner nested handle is multi-effect; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("multi-effect") || stderr.contains("Phase 4"),
+        "error message should reference the inner handle's multi-effect restriction; got stderr={stderr:?}",
+    );
+}
+
+#[test]
+fn handle_with_non_intlit_arm_body_is_rejected_at_codegen() {
+    // Plan B Task 55 (Phase 3b restriction): arm bodies must be
+    // literal `Int` expressions (Phase 4+ adds richer arm bodies +
+    // `k`-using arms via continuation reification + the trampoline).
+    // Until then, any non-`IntLit` arm body — `k(0)` (a Call), `1 +
+    // 1` (a Binary) — is rejected at codegen entry by
+    // `unsupported_handle_construct`. The IntLit guard fires before
+    // any "k usage" check, so this test pins the IntLit-only check
+    // itself rather than k-specific handling. A real "k is referenced
+    // inside an IntLit context" test will land alongside Phase 4c
+    // when richer arm bodies + k-usage analysis ship.
+    fn assert_rejects_arm_body(arm_body_src: &str, marker: &str) {
+        let src = format!(
+            "effect Raise {{ fail: () -> Int }}\n\
+             fn main() -> Int ![IO] {{\n  \
+               let n: Int = handle 42 with {{ Raise.fail(k) => {arm_body_src} }};\n  \
+               perform IO.println(int_to_string(n));\n  \
+               0\n\
+             }}\n"
+        );
+        let tmp = std::env::temp_dir().join(format!(
+            "sigil_e2e_handle_non_intlit_{}_{}.sigil",
+            marker,
+            std::process::id()
+        ));
+        std::fs::write(&tmp, src).expect("write source");
+        let bin_path = std::env::temp_dir().join(format!(
+            "sigil_e2e_handle_non_intlit_{}_{}",
+            marker,
+            std::process::id()
+        ));
+        let sigil_bin = sigil_binary();
+        let out = Command::new(&sigil_bin)
+            .arg(&tmp)
+            .arg("-o")
+            .arg(&bin_path)
+            .arg("--human-errors")
+            .output()
+            .expect("invoke sigil");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bin_path);
+        assert!(
+            !out.status.success(),
+            "{marker}: compile must fail until Phase 4+ lands; got success with stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Task 55") || stderr.contains("Phase 4") || stderr.contains("IntLit"),
+            "{marker}: error message should reference Plan B Task 55 / Phase 4 / IntLit; got stderr={stderr:?}",
+        );
+    }
+    // Call shape — original case.
+    assert_rejects_arm_body("k(0)", "k_call");
+    // Binary shape — exercises the same IntLit-only guard from a
+    // different arm-body shape.
+    assert_rejects_arm_body("1 + 1", "binary");
+}
+
+#[test]
 fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
     let src = "fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] {\n  \
                  fn (x: A) -> C ![] => f(g(x))\n\
@@ -943,4 +1232,299 @@ fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+}
+
+// ----- Plan B Task 55 (MF2) — differential identity property test -----
+//
+// **What this pins.** For any "Native-eligible" Sigil expression
+// (one that produces an `Int` and contains no non-IO `perform` site,
+// so it could in principle be lowered without any handler-frame
+// machinery), wrapping the expression in a vacuous handler must NOT
+// change its observed value. The wrapper installs the handler-frame
+// ABI (`sigil_handler_frame_new` + `sigil_handle_push` +
+// `sigil_handle_pop`) plus a synthetic CPS arm fn that never gets
+// dispatched (the body never `perform`s the handled effect). If the
+// wrapper changes the answer, the codegen-side handler-frame setup
+// has corrupted some piece of state on the path Phase 4+ will build
+// on (caller's stack, register save/restore, GC roots, etc.).
+//
+// **Why a property test rather than hand-rolled cases.** The shape
+// of the bug we're guarding against ("CPS lowering breaks native
+// semantics") generalises across every native-color expression
+// shape; a fuzz of expression shapes catches accidental
+// shape-specific corruption that hand-rolled tests would miss.
+//
+// **Determinism.** A fixed seed + xorshift PRNG produces the same
+// 24 expressions on every run. CI failures pin a single expression
+// reproducibly and the seed/index can be inverted for triage.
+//
+// **Scope.** Phase 3b/4a's codegen-entry guard rejects arm bodies
+// that aren't `IntLit` and ops with user args, so the wrapper
+// stays inside the supported subset by using `effect E { op: () ->
+// Int }` with arm body `999`. The body expression itself contains
+// no `perform` (the generator never emits one), so all Phase 3b
+// restrictions on the body are trivially satisfied. As Phase 4b/4c
+// lift restrictions, this test continues to pin the wrapper's
+// identity property — and stays load-bearing precisely because the
+// shape of the bug it guards against doesn't shrink.
+//
+// **What this test does NOT exercise.** The body never performs
+// the handled effect, so the synthetic CPS arm fn is dead code at
+// runtime — the test pins only the Phase 3a frame plumbing
+// (`frame_new` + `set_arm` + `push` + `pop`) against the wrapped
+// expression's native semantics. The Phase 3b/4a dispatch path
+// (`sigil_perform` → `sigil_run_loop` → arm → `next_step_done`
+// → value extraction) is exercised instead by the paired test
+// `cps_dispatch_returns_arm_value_across_op_id_shape_space`
+// below, which uses a body of `(perform E_eff.op())` so every
+// trial drives the dispatch loop end-to-end.
+
+/// Tiny deterministic PRNG. The differential-identity test runs in
+/// CI on every commit and we want bit-exact reproducibility — using
+/// `rand` would pull in a transitive dep tree just for one test.
+/// Xorshift64 is a 25-line state machine with adequate quality for
+/// this scale (24 expressions, ~5 random choices per expression).
+struct Xorshift64 {
+    state: u64,
+}
+
+impl Xorshift64 {
+    fn new(seed: u64) -> Self {
+        // Avoid the all-zero state which xorshift cannot escape;
+        // 0xdeadbeef is an acceptable substitute.
+        Self {
+            state: if seed == 0 { 0xdeadbeef } else { seed },
+        }
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    /// Inclusive range. `lo <= hi` required.
+    fn range(&mut self, lo: i64, hi: i64) -> i64 {
+        debug_assert!(lo <= hi);
+        let span = (hi - lo + 1) as u64;
+        lo + (self.next() % span) as i64
+    }
+
+    fn next_bool(&mut self) -> bool {
+        (self.next() & 1) == 1
+    }
+}
+
+/// Generate a Sigil source-level expression that evaluates to an
+/// `Int`. Bounded by `depth_remaining` to keep pathological growth
+/// in check. Contains no `perform` (Native-eligible by construction)
+/// and no division/modulo (avoids div-by-zero traps that would mask
+/// the real signal). Operand magnitudes are kept small enough that
+/// chained `*`s don't overflow i64.
+fn gen_int_expr(rng: &mut Xorshift64, depth_remaining: u32) -> String {
+    if depth_remaining == 0 || rng.next_bool() {
+        // Leaf — small int, occasionally negated via unary `-`.
+        let n = rng.range(0, 9);
+        if rng.next_bool() {
+            format!("(-{n})")
+        } else {
+            format!("{n}")
+        }
+    } else {
+        match rng.range(0, 3) {
+            0 => format!(
+                "({} + {})",
+                gen_int_expr(rng, depth_remaining - 1),
+                gen_int_expr(rng, depth_remaining - 1),
+            ),
+            1 => format!(
+                "({} - {})",
+                gen_int_expr(rng, depth_remaining - 1),
+                gen_int_expr(rng, depth_remaining - 1),
+            ),
+            2 => format!(
+                "({} * {})",
+                gen_int_expr(rng, depth_remaining - 1),
+                gen_int_expr(rng, depth_remaining - 1),
+            ),
+            // if-else branch — bool literal cond keeps the test
+            // deterministic without risking unrelated comparison-
+            // op coverage gaps in our shape sample.
+            _ => format!(
+                "(if {} {{ {} }} else {{ {} }})",
+                if rng.next_bool() { "true" } else { "false" },
+                gen_int_expr(rng, depth_remaining - 1),
+                gen_int_expr(rng, depth_remaining - 1),
+            ),
+        }
+    }
+}
+
+#[test]
+fn cps_wrapped_identity_matches_native_on_native_eligible_programs() {
+    // Plan B Task 55 (MF2 / standing precondition [P1]): for every
+    // generated Native-eligible expression `E`, the program
+    //
+    //   fn main() -> Int ![IO] {
+    //     perform IO.println(int_to_string(E));
+    //     0
+    //   }
+    //
+    // and the program
+    //
+    //   effect E_eff { op: () -> Int }
+    //   fn main() -> Int ![IO] {
+    //     let n: Int = handle E with { E_eff.op(k) => 999 };
+    //     perform IO.println(int_to_string(n));
+    //     0
+    //   }
+    //
+    // must produce identical stdout. The wrapper installs the
+    // handler-frame ABI + synthetic CPS arm fn around `E`; if the
+    // wrapper changes the answer, codegen has corrupted state on
+    // the path that Phase 4b/4c/4d builds on. See block comment
+    // above for full rationale.
+    //
+    // Iteration count is intentionally modest (24 trials) — each
+    // trial is two `sigil` compile+run cycles, and CI time is
+    // billable. Increase if/when the failure rate stays at zero
+    // across a stable window of phases.
+    const SEED: u64 = 0x55_2055_2055_2055; // "Task 55, MF2".
+    const TRIALS: u32 = 24;
+    const MAX_DEPTH: u32 = 3;
+
+    let mut rng = Xorshift64::new(SEED);
+    for trial in 0..TRIALS {
+        let expr = gen_int_expr(&mut rng, MAX_DEPTH);
+
+        let native_src = format!(
+            "fn main() -> Int ![IO] {{\n  \
+               perform IO.println(int_to_string({expr}));\n  \
+               0\n\
+             }}\n"
+        );
+        let wrapped_src = format!(
+            "effect E_eff {{ op: () -> Int }}\n\
+             fn main() -> Int ![IO] {{\n  \
+               let n: Int = handle {expr} with {{ E_eff.op(k) => 999 }};\n  \
+               perform IO.println(int_to_string(n));\n  \
+               0\n\
+             }}\n"
+        );
+
+        let (native_stdout, native_stderr, native_exit) =
+            compile_and_run(&native_src, &format!("mf2_native_{trial}"));
+        let (wrapped_stdout, wrapped_stderr, wrapped_exit) =
+            compile_and_run(&wrapped_src, &format!("mf2_wrapped_{trial}"));
+
+        assert_eq!(
+            native_exit, 0,
+            "trial {trial}: native compile/run failed.\nexpr: {expr}\nstderr: {native_stderr}",
+        );
+        assert_eq!(
+            wrapped_exit, 0,
+            "trial {trial}: wrapped compile/run failed.\nexpr: {expr}\nstderr: {wrapped_stderr}",
+        );
+        assert_eq!(
+            native_stdout, wrapped_stdout,
+            "trial {trial}: CPS-wrapped output diverged from native.\n\
+             expr: {expr}\n\
+             native stdout: {native_stdout:?}\n\
+             wrapped stdout: {wrapped_stdout:?}\n\
+             native stderr: {native_stderr}\n\
+             wrapped stderr: {wrapped_stderr}",
+        );
+    }
+}
+
+#[test]
+fn cps_dispatch_returns_arm_value_across_op_id_shape_space() {
+    // Plan B Task 55 (paired MF2 — perform-dispatch coverage):
+    // exercises the full Phase 3b/4a dispatch path
+    //
+    //   sigil_perform → sigil_run_loop → arm fn → sigil_next_step_done
+    //   → run_loop returns u64 → caller reads value
+    //
+    // on every trial. The body is `(perform E_eff.op())`, so the
+    // arm runs end-to-end on every iteration; the arm body is the
+    // generated `IntLit` (Phase 4a's IntLit-only restriction
+    // satisfied), and the program prints the arm's value.
+    //
+    // The "shape space" sampled here is small — Phase 4a restricts
+    // arm bodies to `Expr::IntLit` so the only variation per trial
+    // is the integer constant. That is sufficient to catch
+    // dispatch-path regressions: any miscompile of `sigil_perform`
+    // arg-passing, run_loop dispatch, or `next_step_done` → value
+    // extraction surfaces as a wrong constant on stdout.
+    //
+    // Phase 4b/4c will widen the "shape space" once arm bodies and
+    // op-args grow. The xorshift PRNG is reused with a different
+    // seed so the two property tests don't overlap.
+    const SEED: u64 = 0x4D_46_32_44_49_53_50_00; // "MF2DISP\0"
+    const TRIALS: u32 = 12;
+
+    let mut rng = Xorshift64::new(SEED);
+    for trial in 0..TRIALS {
+        // Arm value sampled from a wider range than MF2's leaf
+        // generator: this is the full thing being checked, so we
+        // want both small positives, negatives, and "unusual"
+        // values like 0.
+        let arm_value: i64 = rng.range(-99, 99);
+
+        let src = format!(
+            "effect E_eff {{ op: () -> Int }}\n\
+             fn main() -> Int ![IO] {{\n  \
+               let n: Int = handle (perform E_eff.op()) with {{ E_eff.op(k) => {arm_value} }};\n  \
+               perform IO.println(int_to_string(n));\n  \
+               0\n\
+             }}\n"
+        );
+        let (stdout, stderr, exit) = compile_and_run(&src, &format!("mf2_dispatch_{trial}"));
+        assert_eq!(
+            exit, 0,
+            "trial {trial}: compile/run failed for arm_value={arm_value}.\nstderr: {stderr}",
+        );
+        assert_eq!(
+            stdout,
+            format!("{arm_value}\n"),
+            "trial {trial}: dispatch returned wrong value for arm_value={arm_value}.\nstderr: {stderr}",
+        );
+    }
+}
+
+#[test]
+fn handle_with_three_arms_dispatches_op_id_two() {
+    // Plan B Task 55 (Phase 4a — substantive #3): the existing 1-arm
+    // and 2-arm e2e tests cover op_id ∈ {0, 1}. This test extends
+    // coverage to op_id = 2, validating that
+    //   - effect/op ID assignment is alphabetical and stable
+    //     (`a=0, b=1, c=2`)
+    //   - `sigil_handler_frame_set_arm` indexes the arm slot bitmap
+    //     correctly at index 2
+    //   - `sigil_perform`'s linear walk dispatches to op_id=2 even
+    //     when arms 0 and 1 are present and unmatched
+    //
+    // Without this test, off-by-one in op_id arithmetic would
+    // surface only at MAX_HANDLER_ARMS=14 (covered by runtime unit
+    // tests) — never at the small index where most user code lives.
+    let src = "effect Pick {\n  \
+                 a: () -> Int,\n  \
+                 b: () -> Int,\n  \
+                 c: () -> Int,\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Pick.c()) with {\n    \
+                   Pick.a(k) => 0,\n    \
+                   Pick.b(k) => 1,\n    \
+                   Pick.c(k) => 2,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "handle_three_arms_op_id_two");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "2\n", "stderr={stderr:?}");
 }

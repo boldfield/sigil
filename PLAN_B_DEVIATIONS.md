@@ -20,6 +20,96 @@ Format:
 
 Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
+## 2026-04-26 — [DEVIATION Task 55] Foundation phase ships separately from CPS codegen on the same branch
+
+**Context:** Task 55 spans (a) the typecheck-side gate lifts for E0133 + E0134, (b) wiring `Item::Effect` and `Expr::Handle` through the codegen entry walker, (c) the full CPS transform for CPS-color monomorphs, (d) per-handler-arm closure synthesis, (e) `sigil_perform` call emission for non-IO `Expr::Perform`, (f) handler-frame setup + `sigil_handle_push`/`sigil_handle_pop` at `Expr::Handle` sites, (g) native↔CPS interop wrappers, (h) trampoline integration for CPS-color `main`, and (i) `CpsCallCount` / `NativeCallCount` counter wiring. Implementation scope is comparable to Task 56 (~1500 LOC + 34 unit tests + 4 review rounds).
+
+**Deviation:** Task 55 lands across multiple commits on a single branch (`plan-b-task-55`) rather than as one monolithic commit. The first commit (foundation phase) ships only the easy and safe pieces — E0133 lift + entry-walker update + e2e test for effect-decl-with-no-handler-use — while leaving the E0134 gate live so well-formed `handle` expressions still surface a clean diagnostic instead of tripping the still-`unreachable!` codegen arms in `lower_expr` / `type_of_expr`. The CPS calling convention, body transform, arm synthesis, frame setup, and counter wiring land in follow-up commits on the same branch. PR opens only when the full Task 55 path actually compiles and runs at least one real handler example end-to-end.
+
+**Rationale:** The all-or-nothing alternative (single commit landing every piece together) would require holding the entire ~2000-LOC change in working state across multiple sessions before any pod-verify or CI checkpoint. Splitting at the asymmetric-gate boundary gives a clean intermediate state where (1) effect-only programs gain a real codegen path immediately, (2) handle-using programs continue to surface E0134 with a clear "in-progress" message, and (3) each follow-up commit can be pod-verified independently. The **single-PR convention** from Tasks 49 / 53 / 54 / 56 still holds — only one PR opens for Task 55, and it includes the full chain of foundation + CPS commits. The squash-merged result will look identical to a one-shot landing.
+
+**Implementing commit(s):** `b3af204` (foundation phase: E0133 lift + entry walker), `2d69b52` (Phase 2 minimum: E0134 lift + handle body-pass-through + effect/op IDs + e2e tests), `ef4be8d` (Phase 3a), `d0aa4c4` + `2e7c0de` (Phase 3b), `adcb897` (Phase 4a), [HEAD] (review-fixup batch).
+
+**Closure point:** PR #22 squash-merge — at which point the multi-commit branch collapses to a single mainline commit. The `[DEVIATION]` entry stays as a permanent record of the split.
+
+## 2026-04-26 — [DEVIATION Task 55] Phase 2 ships handle as body-pass-through; full CPS path in Phase 3+
+
+**Context:** With E0134 lifted, well-formed `handle` expressions reach codegen. The full plan (CPS calling convention + handler-frame setup + per-arm CPS fn synthesis + trampoline integration) is too large for one commit.
+
+**Deviation:** Phase 2 implements the simplest meaningful codegen path: `handle BODY with { arms }` lowers to just `BODY` when the body contains no non-IO `perform` (statically optimised away — handler arms are dead code at runtime). Programs whose body actually performs a non-IO effect are rejected at codegen entry by the new `unsupported_handle_construct` walker, with a clear in-progress message. Phase 3+ replaces this pass-through with the full handler-frame setup + CPS calling convention + arm synthesis + `sigil_perform` wiring.
+
+**Rationale:** This ships a real codegen path that exercises the full pipeline for handle expressions for the first time (parser + typecheck + monomorphize + color + closure_convert + codegen all touch handle now), without committing to the much larger CPS infrastructure. The cost is that handlers don't actually do anything useful yet — but the surface compiles, the test infrastructure works end-to-end, and Phase 3 can build incrementally on this base. The static walker in `unsupported_handle_construct` is intentionally conservative: it inspects only `Expr::Perform` nodes appearing directly in handle bodies, not transitive performs through called fns. A handle whose body calls a fn that itself performs a non-IO effect would slip through this guard and crash at runtime when `sigil_perform` walks an empty handler stack — acceptable for the Phase 2 test program (body is a literal) but a known footgun until Phase 3+ ships the proper handler-frame setup.
+
+**Implementing commit(s):** `2d69b52`; superseded by Phase 3a (`ef4be8d`), Phase 3b (`d0aa4c4` + `2e7c0de`), and Phase 4a (`adcb897`).
+
+**Closure point:** Phase 3b (`d0aa4c4`) replaced the body-pass-through with real handler-frame setup + per-arm CPS fn dispatch + `sigil_perform` lowering. The Phase 2 codegen-entry guard's "no non-IO perform in body" rejection was lifted in Phase 3b for the supported subset; Phase 4b lifts the zero-arg-perform restriction.
+
+## 2026-04-26 — [DEVIATION Task 55] Phase 3a wires frame ABI without arm dispatch (single-arm/single-effect/no-return handles only)
+
+**Context:** Phase 2 (`2d69b52`) shipped `Expr::Handle` codegen as a body-pass-through (no runtime FFI calls). Phase 3 needs to actually invoke the runtime handler ABI from Task 56 — but full arm-dispatch + `sigil_perform` lowering + per-arm CPS fn synthesis is too large for one commit.
+
+**Deviation:** Phase 3a wires `sigil_handler_frame_new(effect_id, arm_count)` + `sigil_handle_push(frame)` + `sigil_handle_pop()` around every `handle` body but does NOT yet set arm fn pointers (leaves them null). This is safe because the existing `unsupported_handle_construct` codegen-entry guard still rejects programs whose body would actually perform the handled effect — the runtime never reads an arm slot for these handles. Phase 3a additionally tightens the guard to reject multi-arm handles, return arms, and zero-arm handles (defensively) so the codegen path only takes single-arm/single-effect/no-return handles. Phase 3b adds per-arm CPS fn synthesis + `sigil_handler_frame_set_arm` calls + `sigil_perform` lowering for non-IO performs in handle bodies; Phase 4+ adds continuation-using arms (`k` actually invoked) + multi-shot + multi-arm/multi-effect handles + return arms.
+
+**Rationale:** Splitting at the frame-ABI / arm-dispatch boundary lets the runtime FFI plumbing get exercised end-to-end (real `sigil_handler_frame_new` + push + pop calls in compiled output, observable via `objdump`) without committing to the much larger CPS calling convention + synthetic fn synthesis. The Phase 2 e2e test `handle_with_no_perform_in_body_compiles_and_runs` continues to pass through Phase 3a, now exercising the frame ABI on the path Phase 3b builds on. The cost is a tiny runtime regression: the no-perform handle now allocates + pushes + pops a frame on every invocation (previously a no-op pass-through). For Phase 3a this is acceptable; Phase 3b makes the frame functional rather than just present.
+
+**Implementing commit(s):** `ef4be8d` (Phase 3a); superseded by Phase 3b (`d0aa4c4` + `2e7c0de`) and Phase 4a (`adcb897`).
+
+**Closure point:** Phase 3b (`d0aa4c4`) wired arm fn pointers via `sigil_handler_frame_set_arm` between `frame_new` and `push`; the Phase 3a "arms are null" stub no longer exists in the codegen path. Single-arm restriction was lifted in Phase 4a (`adcb897`); single-effect remains pending Phase 4e; return arms remain pending Phase 4f.
+
+## 2026-04-26 — [DEVIATION Task 55] Phase 3b Phase-3b restrictions: literal arm bodies, zero-arg ops, no `k` use, single arm, single effect
+
+**Context:** Phase 3a (`ef4be8d`) wired the runtime handler-frame ABI but kept arm fn pointers null. Phase 3b makes arms actually dispatch — handlers now do real work at runtime. To keep this commit tractable, Phase 3b ships the simplest meaningful subset: arm bodies are literal `Expr::IntLit` only, ops have zero user args, arms can't reference the continuation `k`, single arm per handle, single effect per handle, no `return` arm. Phase 4+ lifts each restriction.
+
+**Deviation:** The synthetic arm fn definition pass at the bottom of `emit_object` lowers arm bodies via a small hand-rolled Cranelift sequence (`iconst(value)` → `call sigil_next_step_done(value)` → `return result`) instead of routing through a full `Lowerer`. This is sufficient for `IntLit`-only arm bodies; richer bodies need a CPS-aware lowerer that handles op-arg unpacking from `args_ptr`, `k` usage via `sigil_next_step_call`, and outer-scope captures via a closure record. Phase 4+ ships that lowerer. The `lower_perform_non_io_to_value` helper similarly assumes zero user args (`args_ptr=null, args_len=0`); args-buffer packing on the perform side and unpacking on the arm side ship together in Phase 4+. The `unsupported_handle_construct` codegen-entry guard enforces every Phase 3b restriction so handlers that escape the supported subset get a clear in-progress diagnostic instead of an obscure runtime crash.
+
+**Rationale:** The simplest meaningful test program — `handle (perform Raise.fail()) with { Raise.fail(k) => 42 }` — exercises the entire FFI surface end-to-end (`frame_new → set_arm → push → sigil_perform → sigil_run_loop dispatch → arm fn → next_step_done → run_loop returns u64 → pop`) without committing to the much larger CPS calling convention infrastructure. The Phase 3b fixup commit (`2e7c0de`) inserted the `sigil_run_loop` step between `sigil_perform` and the value extraction; codegen no longer reads the `NextStep` layout directly (it just consumes `run_loop`'s `u64` return). The simplifying restrictions can be lifted one at a time, each as its own focused commit. The single-shot one-shot-arm path is also the most common handler shape in practice (Raise-style early-exit), so it's not just a stepping stone — it covers a real use case.
+
+**Implementing commit(s):** `d0aa4c4` (Phase 3b initial), `2e7c0de` (Phase 3b fixup: route perform's NextStep::Call through `sigil_run_loop` instead of reading `(*ns).value` directly), `adcb897` (Phase 4a: multi-arm single-effect handlers).
+
+**Closure point** (per-restriction):
+- *Single arm* — closed in Phase 4a (`adcb897`).
+- *IntLit-only arm body* — pending Phase 4c (richer arm bodies via dedicated CPS-aware lowerer).
+- *Zero-arg ops* — pending Phase 4b (args-buffer packing on perform side, unpacking on arm side).
+- *No `k` use* — pending Phase 4d (continuation reification + lambda-lifting of perform's continuation).
+- *Single effect per handle* — pending Phase 4e (frame-per-effect).
+- *No return arm* — pending Phase 4f (synthetic return-fn registered via `sigil_handler_frame_set_return`).
+
+## 2026-04-26 — [DEVIATION Task 55] `unsupported_handle_construct` walker does not follow call edges
+
+**Context:** Phase 3b's codegen-entry guard `unsupported_handle_construct` walks every handle expression's body looking for direct `Expr::Perform` sites. It does NOT follow `Expr::Call` edges into called fns. A handle whose body is `helper()` where `helper` itself performs the handled effect therefore slips past the guard's "non-IO perform with args" check.
+
+**Deviation:** The walker stays syntactic and shallow. Once MF1's `Stmt::Perform` dispatch fix landed (review-fixup commit `54b4a60`), this is **no longer a soundness concern** — there is no longer any `unreachable!` or IO-only assertion that a transitive perform would crash into. A non-IO perform reached through a call edge now lowers correctly via `sigil_perform` → `sigil_run_loop` against whatever handler frame is on the runtime stack at call time. The walker's role is reduced to a *Phase-4 ergonomic gate*: it surfaces a friendly "this shape isn't supported yet" diagnostic for shapes Phase 3b/4a's codegen can't handle. Transitive performs through call edges are not in that set today; they work because the called fn's own Stmt/Expr Perform sites lower through the runtime ABI like any other.
+
+**Rationale:** Following call edges in the codegen-entry walker would require fixed-point analysis over the call graph (intentional, since a fn could call another that performs) and would duplicate work the colorer already does. Leaving the walker syntactic keeps it simple and CI-fast. The standing precondition that programs reach codegen with all `Item::Effect` registered + all op IDs assigned + every reachable handle visible to the per-arm CPS-fn synthesis pre-pass holds regardless of transitive analysis — those passes walk every fn body, so a perform reached via a call edge gets its `effect_id` / `op_id` looked up correctly.
+
+**Implementing commit(s):** original walker `2d69b52`, recursion fix into nested handle bodies `54b4a60`.
+
+**Closure point:** Phase 4b (op-arg packing) lifts the "non-IO perform with args" gate, at which point the walker's guard check becomes `if body_contains_unsupported_op_arg(body)` — still syntactic, still shallow, still serving the same Phase-4 ergonomic role. Phase 4c/4d may need a colorer-driven check (per-monomorph color variance under handler-context — the PR #18 reviewer's open ask) to decide which monomorphs sit at the native↔CPS boundary; that check is NOT a property of the walker, it's a property of color inference, and it lives in `compiler/src/color.rs`. The walker stays as-is.
+
+## 2026-04-26 — [DEVIATION Task 55] Handler frame leaks on body unwind; depends on Task 57 to surface
+
+**Context:** `Expr::Handle` codegen lowers to `frame_new → set_arm* → push → body → pop`. If the body aborts mid-execution, the frame stays on the runtime handler stack until the process dies. Today the only way to abort mid-body is `sigil_panic_arith_error` (div/mod by zero, integer overflow), which kills the process — so the leak never matters because there is no surviving program state to observe it.
+
+**Deviation:** No frame-pop-on-unwind path is wired in Phase 3b/4a. The codegen sequence is straight-line; there is no scope-guard / drop-glue / unwind-resumption mechanism for the handler frame. Programs that compile under Phase 3b/4a today never observe this leak because no recoverable abort path exists.
+
+**Rationale:** Adding scope-guard machinery now requires designing the unwind contract before there's a recoverable abort path to test it against. The contract would have to be revised when Task 57 replaces `sigil_panic_arith_error` with `Raise[ArithError]` (the ArithError handler would itself pop frames). Building the contract once, against the real ArithError path, is cheaper than building it twice.
+
+**Implementing commit(s):** `d0aa4c4` (Phase 3b — straight-line frame_new/push/pop, no unwind path).
+
+**Closure point:** **Task 57.** When `sigil_panic_arith_error` is replaced with `perform ArithError.divide_by_zero(...)`, the recovery path (the surrounding `handle ArithError` arm) becomes a real observation point for any leaked frames. Task 57's PR must either (a) add a scope guard at every `Expr::Handle` codegen site that pops the frame on every exit edge from the body (success or unwind), or (b) make `sigil_handle_pop` idempotent + tear down the leaked frames on the unwind path before the next `sigil_perform` walks the stack. The arithmetic-overflow recoverable-abort case is what makes this load-bearing; until Task 57 lands, the dependency is documented but the bug is not user-observable.
+
+## 2026-04-26 — [DEVIATION Task 55] Native callers drive `sigil_run_loop` synchronously; tail-call discipline lifts in Phase 4d
+
+**Context:** Phase 3b's `lower_perform_non_io_to_value` lowers a non-IO `perform Effect.op(...)` site as `sigil_perform(...) → sigil_run_loop(call_ns)`. The native caller blocks on `sigil_run_loop` until it returns a terminal `Done(value)`. This works for Phase 3b/4a's restricted shape (synchronous, single-shot, `IntLit` arm body, no `k` use) because `run_loop` completes in one or two trampoline dispatches and returns promptly.
+
+**Deviation:** Native callers issue `sigil_run_loop` calls synchronously rather than handing the perform's `NextStep::Call` to a containing trampoline as a tail position. For Phase 3b/4a this is fine — there's no enclosing trampoline yet because `main` and helper fns are both Native-color. The synchronous-blocking shape would defeat the trampoline's stack-amortisation guarantee if a deep chain of CPS calls landed on it (each one pushing a native stack frame), but Phase 3b's restrictions cap chain depth at 1–2 dispatches.
+
+**Rationale:** Wiring a real native↔CPS interop boundary (color-driven CC, native fns that detect they're inside a handler-discharge context and emit `NextStep::Call` instead of synchronous `run_loop`) requires the colorer to refine handler-discharge — which is exactly the MF3 / PR #18-reviewer Stage-6 ask. Phase 3b/4a ship the synchronous shape because it's correct under their narrow restrictions and because designing the interop boundary alongside the color refinement gives us one design pass instead of two.
+
+**Implementing commit(s):** `d0aa4c4` (Phase 3b — synchronous `sigil_perform` + `sigil_run_loop` from `lower_perform_non_io_to_value`).
+
+**Closure point:** **Phase 4d** (k-using arms via continuation reification). Phase 4d makes arm bodies that invoke `k(value)` work end-to-end, which means the body's "rest of computation after the perform" gets lambda-lifted into a CPS-color synthetic closure. At that point native-color fns that contain a perform site under a handle MUST be recoloured CPS (or wrapped in a per-call trampoline) so the perform's `NextStep::Call` goes to the enclosing trampoline rather than to a synchronous `sigil_run_loop` invocation. The colorer's handler-discharge refinement (the PR #18 reviewer's ask, `compiler/src/color.rs::find_non_io_perform_in_expr` Phase 4d closure point) is what enables this — a fn whose only non-IO performs are discharged by enclosing handlers stays Native, but a fn whose performs reach a `k`-reifying handler arm becomes CPS. Until Phase 4d, the synchronous-blocking shape is the correct lowering.
+
 ## 2026-04-25 — [Task 4.5.5 / A3-carryover] Tagged-vs-raw Int ABI decision
 
 **Context:** Plan A3's `QUESTIONS.md` entry `[PLAN-A3] main-return-tagging`

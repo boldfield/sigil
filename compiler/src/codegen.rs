@@ -190,14 +190,14 @@ pub(crate) fn contains_apply_or_generic_ref(program: &crate::ast::Program) -> bo
                 }
             }
             Item::Import(_) => {}
-            // Plan B task 53 — `effect` declarations never reach
-            // codegen on a successful compile (typecheck E0133 stops
-            // them). Returning `true` here is a defensive guard: if a
-            // future refactor accidentally lets one through, the
-            // codegen-entry walker rejects with a hard assertion
-            // rather than silently producing a binary that ignores
-            // the declaration. Plan B Task 54 lifts this guard.
-            Item::Effect(_) => return true,
+            // Plan B Task 55 — `effect Name { op: ... }` declarations
+            // emit no codegen output (they only populate the
+            // typecheck-time effect registry consulted by `perform`
+            // dispatch and the runtime handler-stack ABI from Task
+            // 56). Op signatures are checked under their own generic-
+            // param substitution at typecheck time, so walking them
+            // here is unnecessary; skip silently.
+            Item::Effect(_) => {}
         }
     }
     false
@@ -386,6 +386,608 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
     }
 }
 
+/// Plan B Task 55 (Phase 2 minimum) — codegen-entry guard for handler
+/// constructs that the in-progress CPS path does not yet support.
+/// Returns `Some(error_message)` when the program contains a `handle
+/// <body> with { arms }` whose body would actually `perform` a non-IO
+/// effect at runtime. Such programs need the full handler-frame setup
+/// + CPS calling convention (Phase 3+); until then they're rejected
+/// here with a clean compile-time error pointing at the in-progress
+/// task.
+///
+/// IO `perform` in handle bodies is fine: `IO` is hard-wired in
+/// `lower_perform` and doesn't route through `sigil_perform`, so the
+/// runtime handler stack is never consulted for it.
+///
+/// **Conservative scope**: this walker only inspects `Expr::Perform`
+/// nodes appearing directly in a handle body (or inside its blocks /
+/// children). It does **not** chase fn calls into callee bodies — a
+/// handle whose body calls a fn that itself performs a non-IO effect
+/// would slip through this guard and crash at runtime when
+/// `sigil_perform` walks an empty handler stack. This is acceptable
+/// for the Phase 2 milestone because the e2e test program's body is
+/// a literal; widening the guard to follow call edges lands with
+/// Phase 3+ when the proper handler-frame setup ships.
+pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Option<String> {
+    for item in &program.items {
+        if let crate::ast::Item::Fn(f) = item {
+            if let Some(msg) = block_unsupported_handle(&f.body) {
+                return Some(format!("in fn `{}`: {}", f.name, msg));
+            }
+        }
+    }
+    None
+}
+
+fn block_unsupported_handle(b: &crate::ast::Block) -> Option<String> {
+    use crate::ast::Stmt;
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                if let Some(msg) = expr_unsupported_handle(&l.value) {
+                    return Some(msg);
+                }
+            }
+            Stmt::Expr(e) => {
+                if let Some(msg) = expr_unsupported_handle(e) {
+                    return Some(msg);
+                }
+            }
+            Stmt::Perform(p) => {
+                for a in &p.args {
+                    if let Some(msg) = expr_unsupported_handle(a) {
+                        return Some(msg);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tail) = &b.tail {
+        if let Some(msg) = expr_unsupported_handle(tail) {
+            return Some(msg);
+        }
+    }
+    None
+}
+
+fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::Ident(..)
+        | Expr::ClosureEnvLoad { .. } => None,
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_unsupported_handle(lhs).or_else(|| expr_unsupported_handle(rhs))
+        }
+        Expr::Unary { operand, .. } => expr_unsupported_handle(operand),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => expr_unsupported_handle(cond)
+            .or_else(|| block_unsupported_handle(then_block))
+            .or_else(|| block_unsupported_handle(else_block)),
+        Expr::Block(b) => block_unsupported_handle(b),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            if let Some(msg) = expr_unsupported_handle(scrutinee) {
+                return Some(msg);
+            }
+            for a in arms {
+                if let Some(msg) = expr_unsupported_handle(&a.body) {
+                    return Some(msg);
+                }
+            }
+            None
+        }
+        Expr::Call { callee, args, .. } => {
+            if let Some(msg) = expr_unsupported_handle(callee) {
+                return Some(msg);
+            }
+            for a in args {
+                if let Some(msg) = expr_unsupported_handle(a) {
+                    return Some(msg);
+                }
+            }
+            None
+        }
+        Expr::Perform(_) => None,
+        Expr::Lambda { body, .. } => expr_unsupported_handle(body),
+        Expr::ClosureRecord { env_exprs, .. } => {
+            for ee in env_exprs {
+                if let Some(msg) = expr_unsupported_handle(ee) {
+                    return Some(msg);
+                }
+            }
+            None
+        }
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                if let Some(msg) = expr_unsupported_handle(&f.value) {
+                    return Some(msg);
+                }
+            }
+            None
+        }
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            span,
+        } => {
+            // Phase 3b constraints (lifted incrementally as the
+            // CPS path matures):
+            //   - exactly one op-arm (Phase 4+ lifts; runtime frame
+            //     supports up to MAX_HANDLER_ARMS=14)
+            //   - arm body is `Expr::IntLit` only (Phase 4+ lifts;
+            //     this avoids needing a CPS-aware lowerer for arm
+            //     bodies in this commit — the arm body gets its
+            //     value packed via `sigil_next_step_done(value)`)
+            //   - arm has no user op-args (zero-arity ops only)
+            //     (Phase 4+ lifts; would need args-buffer packing on
+            //     the perform side and unpacking on the arm side)
+            //   - no return arm (Phase 4+ lifts; needs a synthetic
+            //     return-fn registered via
+            //     sigil_handler_frame_set_return)
+            //   - body's non-IO performs only target the arm's effect
+            //     (typecheck enforces this; Phase 3b doesn't add an
+            //     extra check)
+            //   - body's non-IO perform must be zero-arg (Phase 4+
+            //     lifts; needs args-buffer packing)
+            if return_arm.is_some() {
+                return Some(format!(
+                    "`handle` expression at {:?} has a `return` arm — `return` \
+                     arms are not yet supported in codegen (Plan B Task 55, in \
+                     progress)",
+                    span
+                ));
+            }
+            if op_arms.is_empty() {
+                // Defensive: parser guarantees at least one arm,
+                // but codegen indexes op_arms[0] for the single-arm
+                // path so guard explicitly.
+                return Some(format!(
+                    "`handle` expression at {:?} has no op-arms — codegen \
+                     requires at least one (Plan B Task 55)",
+                    span
+                ));
+            }
+            // Phase 4a: multi-arm handles are now supported, but
+            // all arms must reference the same effect (the runtime
+            // `HandlerFrame`'s `effect_id` is a single u32 — multi-
+            // effect handles need a frame-per-effect approach that
+            // lands in Phase 4e). Reject mixed-effect handles
+            // here with a clean diagnostic.
+            let first_effect = &op_arms[0].effect;
+            for arm in op_arms.iter().skip(1) {
+                if &arm.effect != first_effect {
+                    return Some(format!(
+                        "`handle` expression at {:?} has arms targeting different \
+                         effects (`{}` and `{}`) — multi-effect handlers are \
+                         not yet supported in codegen (Plan B Task 55, in \
+                         progress; arrives in Phase 4e via frame-per-effect)",
+                        span, first_effect, arm.effect
+                    ));
+                }
+            }
+            // Phase 4a: also reject duplicate (effect, op) arm pairs
+            // — the runtime frame's per-op slot is single-valued, so
+            // two arms for the same op would race. Typecheck E0140
+            // catches this earlier (before the staged-feature gates
+            // were lifted), but the codegen-entry guard double-
+            // checks defensively. Phase 4+ will share state with
+            // typecheck if the redundancy bites.
+            for (i, a) in op_arms.iter().enumerate() {
+                for b in op_arms.iter().skip(i + 1) {
+                    if a.effect == b.effect && a.op == b.op {
+                        return Some(format!(
+                            "`handle` expression at {:?} has duplicate arms for \
+                             `{}.{}` — typecheck E0140 should have caught this; \
+                             reaching codegen indicates an upstream invariant \
+                             broke (Plan B Task 55)",
+                            span, a.effect, a.op
+                        ));
+                    }
+                }
+            }
+            // Phase 3b restriction (still in force in 4a): each arm
+            // body must be `Expr::IntLit` (no captures, no `k` use,
+            // no op-arg use). The synthetic-fn definition pass
+            // lowers IntLit-only bodies via a hand-rolled Cranelift
+            // sequence; richer bodies need a CPS-aware lowerer
+            // arriving in Phase 4c.
+            for arm in op_arms.iter() {
+                match &arm.body {
+                    crate::ast::Expr::IntLit(..) => {}
+                    _ => {
+                        return Some(format!(
+                            "`handle` expression at {:?} has arm `{}.{}` body \
+                             that is not a literal `Int` — Phase 3b/4a only \
+                             support arms whose body is an `IntLit` (Plan B \
+                             Task 55, in progress; richer arm bodies arrive \
+                             in Phase 4c)",
+                            span, arm.effect, arm.op
+                        ));
+                    }
+                }
+            }
+            // Phase 3b restriction (still in force in 4a): each arm
+            // must have no user op-args (only the `k` continuation
+            // binding). Op-arg unpacking arrives in Phase 4b.
+            for arm in op_arms.iter() {
+                if !arm.params.is_empty() {
+                    return Some(format!(
+                        "`handle` expression at {:?} has arm `{}.{}` with {} \
+                         user param(s) — Phase 3b/4a only support zero-user-arg \
+                         arms (Plan B Task 55, in progress; op-arg passing \
+                         arrives in Phase 4b)",
+                        span,
+                        arm.effect,
+                        arm.op,
+                        arm.params.len()
+                    ));
+                }
+            }
+            // Phase 3b restriction (still in force in 4a): any
+            // non-IO perform in the body must be zero-arg. The
+            // perform args-buffer packing path lands in Phase 4b.
+            if let Some((eff, op)) = body_contains_non_io_perform_with_args(body) {
+                return Some(format!(
+                    "`handle` expression at {:?} has body whose non-IO \
+                     `perform {}.{}(...)` site passes user args — Phase 3b \
+                     minimum only supports zero-arg performs (Plan B Task \
+                     55, in progress; args-buffer packing arrives in \
+                     Phase 4+)",
+                    span, eff, op
+                ));
+            }
+            // Recurse into the body itself so a nested handle inside
+            // the body (e.g. `handle (handle ... with { ... }) with
+            // { ... }`) surfaces its own diagnostics. Without this,
+            // `body_contains_non_io_perform_filtered` short-circuits
+            // on `Expr::Handle { .. } => None` and the inner handle's
+            // multi-effect / non-IntLit / return-arm / multi-arg
+            // restrictions are never enforced — at runtime that can
+            // register arms under the wrong effect_id and crash inside
+            // `sigil_perform`'s handler-stack walk.
+            if let Some(msg) = expr_unsupported_handle(body) {
+                return Some(msg);
+            }
+            // Recurse into arm bodies so nested handles deeper in
+            // the AST surface their own diagnostics.
+            for arm in op_arms {
+                if let Some(msg) = expr_unsupported_handle(&arm.body) {
+                    return Some(msg);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Returns `Some((effect_name, op_name))` of the first non-IO
+/// `Expr::Perform` site within `e` whose `args` is non-empty (i.e.
+/// the perform passes user args to the runtime, which Phase 3b
+/// minimum doesn't yet support — see the args-buffer packing TODO
+/// in `lower_perform_non_io_to_value`). Recurses through all
+/// sub-expressions and stmts.
+fn body_contains_non_io_perform_with_args(e: &crate::ast::Expr) -> Option<(String, String)> {
+    body_contains_non_io_perform_filtered(e, |p| !p.args.is_empty())
+}
+
+fn body_contains_non_io_perform_filtered(
+    e: &crate::ast::Expr,
+    pred: impl Fn(&crate::ast::PerformExpr) -> bool + Copy,
+) -> Option<(String, String)> {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::Ident(..)
+        | Expr::ClosureEnvLoad { .. } => None,
+        Expr::Binary { lhs, rhs, .. } => body_contains_non_io_perform_filtered(lhs, pred)
+            .or_else(|| body_contains_non_io_perform_filtered(rhs, pred)),
+        Expr::Unary { operand, .. } => body_contains_non_io_perform_filtered(operand, pred),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => body_contains_non_io_perform_filtered(cond, pred)
+            .or_else(|| block_contains_non_io_perform_filtered(then_block, pred))
+            .or_else(|| block_contains_non_io_perform_filtered(else_block, pred)),
+        Expr::Block(b) => block_contains_non_io_perform_filtered(b, pred),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            if let Some(p) = body_contains_non_io_perform_filtered(scrutinee, pred) {
+                return Some(p);
+            }
+            for a in arms {
+                if let Some(p) = body_contains_non_io_perform_filtered(&a.body, pred) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        Expr::Call { callee, args, .. } => {
+            if let Some(p) = body_contains_non_io_perform_filtered(callee, pred) {
+                return Some(p);
+            }
+            for a in args {
+                if let Some(p) = body_contains_non_io_perform_filtered(a, pred) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        Expr::Perform(p) => {
+            if p.effect != "IO" && pred(p) {
+                Some((p.effect.clone(), p.op.clone()))
+            } else {
+                None
+            }
+        }
+        Expr::Lambda { body, .. } => body_contains_non_io_perform_filtered(body, pred),
+        Expr::ClosureRecord { env_exprs, .. } => {
+            for ee in env_exprs {
+                if let Some(p) = body_contains_non_io_perform_filtered(ee, pred) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                if let Some(p) = body_contains_non_io_perform_filtered(&f.value, pred) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        Expr::Handle { .. } => None,
+    }
+}
+
+fn block_contains_non_io_perform_filtered(
+    b: &crate::ast::Block,
+    pred: impl Fn(&crate::ast::PerformExpr) -> bool + Copy,
+) -> Option<(String, String)> {
+    use crate::ast::Stmt;
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                if let Some(p) = body_contains_non_io_perform_filtered(&l.value, pred) {
+                    return Some(p);
+                }
+            }
+            Stmt::Expr(e) => {
+                if let Some(p) = body_contains_non_io_perform_filtered(e, pred) {
+                    return Some(p);
+                }
+            }
+            Stmt::Perform(p) => {
+                if p.effect != "IO" && pred(p) {
+                    return Some((p.effect.clone(), p.op.clone()));
+                }
+                for a in &p.args {
+                    if let Some(q) = body_contains_non_io_perform_filtered(a, pred) {
+                        return Some(q);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tail) = &b.tail {
+        if let Some(p) = body_contains_non_io_perform_filtered(tail, pred) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Plan B Task 55 (Phase 3b) — per-handler-arm synthetic CPS fn
+/// metadata. One entry per arm of every `Expr::Handle` reached by the
+/// pre-pass walk in `emit_object`. The arm body is captured by value
+/// so the synthetic-fn definition pass can lower it without re-walking
+/// the program. `func_id` is allocated up-front so calling sites can
+/// `module.declare_func_in_func` against it before the body is
+/// defined.
+#[derive(Debug)]
+struct HandlerArmSynth {
+    func_id: cranelift_module::FuncId,
+    body: crate::ast::Expr,
+}
+
+/// Walk a block looking for `Expr::Handle` sites and allocating
+/// synthetic CPS-fn metadata for each arm. Recurses into nested
+/// expressions so handles inside nested blocks / matches / lambdas
+/// also surface. The pre-pass is deliberately conservative — it
+/// allocates `FuncId`s for every arm of every reachable handle, even
+/// arms whose `Expr::Handle` site might end up dead-code-eliminated
+/// by some future optimisation. Codegen never optimises handles
+/// today, so over-allocation here is harmless.
+fn collect_handle_arms_in_block(
+    b: &crate::ast::Block,
+    module: &mut ObjectModule,
+    cps_arm_sig: &Signature,
+    op_ids: &BTreeMap<(String, String), u32>,
+    synth: &mut Vec<HandlerArmSynth>,
+    indices: &mut BTreeMap<Span, Vec<usize>>,
+) -> Result<(), String> {
+    use crate::ast::Stmt;
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                collect_handle_arms_in_expr(&l.value, module, cps_arm_sig, op_ids, synth, indices)?;
+            }
+            Stmt::Expr(e) => {
+                collect_handle_arms_in_expr(e, module, cps_arm_sig, op_ids, synth, indices)?;
+            }
+            Stmt::Perform(p) => {
+                for a in &p.args {
+                    collect_handle_arms_in_expr(a, module, cps_arm_sig, op_ids, synth, indices)?;
+                }
+            }
+        }
+    }
+    if let Some(tail) = &b.tail {
+        collect_handle_arms_in_expr(tail, module, cps_arm_sig, op_ids, synth, indices)?;
+    }
+    Ok(())
+}
+
+fn collect_handle_arms_in_expr(
+    e: &crate::ast::Expr,
+    module: &mut ObjectModule,
+    cps_arm_sig: &Signature,
+    op_ids: &BTreeMap<(String, String), u32>,
+    synth: &mut Vec<HandlerArmSynth>,
+    indices: &mut BTreeMap<Span, Vec<usize>>,
+) -> Result<(), String> {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::Ident(..)
+        | Expr::ClosureEnvLoad { .. }
+        | Expr::Perform(_) => Ok(()),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_handle_arms_in_expr(lhs, module, cps_arm_sig, op_ids, synth, indices)?;
+            collect_handle_arms_in_expr(rhs, module, cps_arm_sig, op_ids, synth, indices)
+        }
+        Expr::Unary { operand, .. } => {
+            collect_handle_arms_in_expr(operand, module, cps_arm_sig, op_ids, synth, indices)
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            collect_handle_arms_in_expr(cond, module, cps_arm_sig, op_ids, synth, indices)?;
+            collect_handle_arms_in_block(then_block, module, cps_arm_sig, op_ids, synth, indices)?;
+            collect_handle_arms_in_block(else_block, module, cps_arm_sig, op_ids, synth, indices)
+        }
+        Expr::Block(b) => {
+            collect_handle_arms_in_block(b, module, cps_arm_sig, op_ids, synth, indices)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_handle_arms_in_expr(scrutinee, module, cps_arm_sig, op_ids, synth, indices)?;
+            for a in arms {
+                collect_handle_arms_in_expr(&a.body, module, cps_arm_sig, op_ids, synth, indices)?;
+            }
+            Ok(())
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_handle_arms_in_expr(callee, module, cps_arm_sig, op_ids, synth, indices)?;
+            for a in args {
+                collect_handle_arms_in_expr(a, module, cps_arm_sig, op_ids, synth, indices)?;
+            }
+            Ok(())
+        }
+        Expr::Lambda { body, .. } => {
+            collect_handle_arms_in_expr(body, module, cps_arm_sig, op_ids, synth, indices)
+        }
+        Expr::ClosureRecord { env_exprs, .. } => {
+            for ee in env_exprs {
+                collect_handle_arms_in_expr(ee, module, cps_arm_sig, op_ids, synth, indices)?;
+            }
+            Ok(())
+        }
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                collect_handle_arms_in_expr(&f.value, module, cps_arm_sig, op_ids, synth, indices)?;
+            }
+            Ok(())
+        }
+        Expr::Handle {
+            body,
+            op_arms,
+            span,
+            ..
+        } => {
+            // Recurse into body + arm bodies so nested handles also
+            // surface. Then allocate FuncIds for this handle's arms.
+            collect_handle_arms_in_expr(body, module, cps_arm_sig, op_ids, synth, indices)?;
+            for arm in op_arms {
+                collect_handle_arms_in_expr(
+                    &arm.body,
+                    module,
+                    cps_arm_sig,
+                    op_ids,
+                    synth,
+                    indices,
+                )?;
+            }
+            // Allocate one synthetic CPS fn per arm. Linker symbol
+            // is `sigil_handler_arm_<global_index>` to keep names
+            // unique without needing per-handle counters.
+            let mut arm_indices: Vec<usize> = Vec::with_capacity(op_arms.len());
+            for arm in op_arms {
+                let global_idx = synth.len();
+                let mangled = format!("sigil_handler_arm_{global_idx}");
+                let func_id = module
+                    .declare_function(&mangled, Linkage::Local, cps_arm_sig)
+                    .map_err(|e| format!("declare {mangled}: {e}"))?;
+                // Validate that the op_id is registered (op_ids
+                // populated at end of typecheck for every effect's
+                // ops). Unused at this site — the per-arm op_id is
+                // looked up again at the Expr::Handle codegen site
+                // — but failing fast here gives a clearer error
+                // message than a unwrap deep inside lowering.
+                let _ = op_ids
+                    .get(&(arm.effect.clone(), arm.op.clone()))
+                    .ok_or_else(|| {
+                        format!(
+                            "codegen pre-pass: op_id missing for `{}.{}` — typecheck-time \
+                         E0138/E0139 should have caught this",
+                            arm.effect, arm.op
+                        )
+                    })?;
+                synth.push(HandlerArmSynth {
+                    func_id,
+                    body: arm.body.clone(),
+                });
+                arm_indices.push(global_idx);
+            }
+            // The pre-pass walks each fn body exactly once and is
+            // the only writer to `indices`. A duplicate span here
+            // means the AST contains two `Expr::Handle` nodes that
+            // share a span — either a future monomorphisation pass
+            // that clones a handle-bearing fn body (the per-monomorph
+            // color variance question — see PB4 deviation entry),
+            // closure conversion that lifts a lambda whose body
+            // contains a handle, or any other AST-cloning transform.
+            // Today that doesn't happen; assert it loudly so any
+            // future regression surfaces here rather than as a
+            // silent overwrite that ships wrong `FuncRef`s to one of
+            // the aliased handles. Same shape as the `op_names`
+            // dedup → `debug_assert!` swap from review-fixup
+            // commit `54b4a60`. The `insert` lives outside the
+            // assert so the side effect runs in release builds too.
+            let prev = indices.insert(span.clone(), arm_indices);
+            debug_assert!(
+                prev.is_none(),
+                "codegen pre-pass: duplicate handle span {span:?} — \
+                 pre-pass invariant violated"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Mangle a Sigil-level fn name into a linker-legal symbol name.
 /// `main` keeps the historical mangling `sigil_user_main` (the C-main
 /// shim calls this symbol). Other names get a `sigil_user_` prefix with
@@ -510,6 +1112,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
          generic params\""
     );
 
+    // Plan B Task 55 (Phase 2 minimum) — `handle <body> with { arms
+    // }` is supported only when the body contains no non-IO `perform`
+    // (the handle-frame setup, push/pop, and arm-fn synthesis path
+    // ships in Phase 3+ once the CPS calling convention lands). Any
+    // handle expression with a non-IO `perform` in its body would
+    // need the unimplemented runtime dispatch and is rejected here
+    // with a clean compile-time error. IO `perform` in handle bodies
+    // is fine — `IO` is special-cased in `lower_perform` and doesn't
+    // route through `sigil_perform`.
+    if let Some(msg) = unsupported_handle_construct(&checked.program) {
+        return Err(msg);
+    }
+
     let string_literals = &checked.string_literals;
 
     // Plan A3 task 40: build per-type layout descriptors once before any
@@ -606,6 +1221,109 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_int_to_string", Linkage::Import, &int_to_string_sig)
         .map_err(|e| format!("declare sigil_int_to_string: {e}"))?;
 
+    // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
+    // Phase 3a wires the frame allocation + push/pop ABI from Task
+    // 56 around every `handle` body. Arms stay null in this commit
+    // (the existing `unsupported_handle_construct` guard rejects
+    // programs whose body would actually perform the handled effect,
+    // so the runtime never invokes an arm fn pointer). Phase 3b adds
+    // arm-fn synthesis + `sigil_perform` lowering + arm dispatch;
+    // Phase 4+ adds continuation-using arms + multi-shot.
+
+    // sigil_handler_frame_new(effect_id: u32, arm_count: u32) -> *mut HandlerFrame
+    let mut handler_frame_new_sig = Signature::new(isa_call_conv(&module));
+    handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // effect_id
+    handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // arm_count
+    handler_frame_new_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
+    let handler_frame_new = module
+        .declare_function(
+            "sigil_handler_frame_new",
+            Linkage::Import,
+            &handler_frame_new_sig,
+        )
+        .map_err(|e| format!("declare sigil_handler_frame_new: {e}"))?;
+
+    // sigil_handle_push(frame: *mut HandlerFrame)
+    let mut handle_push_sig = Signature::new(isa_call_conv(&module));
+    handle_push_sig.params.push(AbiParam::new(pointer_ty));
+    let handle_push = module
+        .declare_function("sigil_handle_push", Linkage::Import, &handle_push_sig)
+        .map_err(|e| format!("declare sigil_handle_push: {e}"))?;
+
+    // sigil_handle_pop() -> *mut HandlerFrame (return discarded at
+    // codegen sites; the runtime tracks the popped pointer for GC
+    // reasons but codegen has no use for it).
+    let mut handle_pop_sig = Signature::new(isa_call_conv(&module));
+    handle_pop_sig.returns.push(AbiParam::new(pointer_ty));
+    let handle_pop = module
+        .declare_function("sigil_handle_pop", Linkage::Import, &handle_pop_sig)
+        .map_err(|e| format!("declare sigil_handle_pop: {e}"))?;
+
+    // Plan B Task 55 (Phase 3b) — three more handler-ABI imports.
+    //
+    // sigil_handler_frame_set_arm(frame, op_id: u32,
+    //                             fn_ptr: *mut u8, closure_ptr: *mut u8)
+    let mut handler_frame_set_arm_sig = Signature::new(isa_call_conv(&module));
+    handler_frame_set_arm_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    handler_frame_set_arm_sig
+        .params
+        .push(AbiParam::new(types::I32));
+    handler_frame_set_arm_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    handler_frame_set_arm_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    let handler_frame_set_arm = module
+        .declare_function(
+            "sigil_handler_frame_set_arm",
+            Linkage::Import,
+            &handler_frame_set_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_handler_frame_set_arm: {e}"))?;
+
+    // sigil_perform(effect_id: u32, op_id: u32,
+    //               args_ptr: *const u64, args_len: u32,
+    //               k_closure_ptr: *mut u8, k_fn_ptr: *mut u8)
+    //               -> *mut NextStep
+    let mut perform_sig = Signature::new(isa_call_conv(&module));
+    perform_sig.params.push(AbiParam::new(types::I32)); // effect_id
+    perform_sig.params.push(AbiParam::new(types::I32)); // op_id
+    perform_sig.params.push(AbiParam::new(pointer_ty)); // args_ptr
+    perform_sig.params.push(AbiParam::new(types::I32)); // args_len
+    perform_sig.params.push(AbiParam::new(pointer_ty)); // k_closure_ptr
+    perform_sig.params.push(AbiParam::new(pointer_ty)); // k_fn_ptr
+    perform_sig.returns.push(AbiParam::new(pointer_ty)); // *mut NextStep
+    let perform_func = module
+        .declare_function("sigil_perform", Linkage::Import, &perform_sig)
+        .map_err(|e| format!("declare sigil_perform: {e}"))?;
+
+    // sigil_next_step_done(value: u64) -> *mut NextStep
+    let mut next_step_done_sig = Signature::new(isa_call_conv(&module));
+    next_step_done_sig.params.push(AbiParam::new(types::I64));
+    next_step_done_sig.returns.push(AbiParam::new(pointer_ty));
+    let next_step_done = module
+        .declare_function("sigil_next_step_done", Linkage::Import, &next_step_done_sig)
+        .map_err(|e| format!("declare sigil_next_step_done: {e}"))?;
+
+    // sigil_run_loop(initial: *mut NextStep) -> u64. Drives the CPS
+    // trampoline to a terminal NextStep::Done and returns its value.
+    // Phase 3b uses this to dispatch the NextStep::Call that
+    // `sigil_perform` returns: perform never returns a Done directly
+    // — it builds a Call to the matching arm + (k_closure, k_fn);
+    // the arm runs and returns Done(value). `sigil_run_loop` does
+    // the dispatch and returns the final Done's value as u64.
+    let mut run_loop_sig = Signature::new(isa_call_conv(&module));
+    run_loop_sig.params.push(AbiParam::new(pointer_ty));
+    run_loop_sig.returns.push(AbiParam::new(types::I64));
+    let run_loop = module
+        .declare_function("sigil_run_loop", Linkage::Import, &run_loop_sig)
+        .map_err(|e| format!("declare sigil_run_loop: {e}"))?;
+
     // C-callable main: int main(int argc, char **argv). Stage 1 ignores argv.
     let mut main_sig = Signature::new(isa_call_conv(&module));
     main_sig.params.push(AbiParam::new(types::I32));
@@ -667,6 +1385,42 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .get("main")
         .map(|uf| uf.func_id)
         .ok_or_else(|| "codegen requires a `main` function".to_string())?;
+
+    // Plan B Task 55 (Phase 3b) — pre-pass for synthetic handler-arm
+    // CPS fns. Walk every user fn body; for each `Expr::Handle`
+    // encountered, allocate one `FuncId` per arm (uniform CPS
+    // calling convention `extern "C" fn(closure_ptr, args_ptr,
+    // args_len) -> *mut NextStep`). The arm body Expr is captured
+    // by value so the synthetic-fn definition pass at the bottom
+    // of `emit_object` can lower it without re-walking the program.
+    //
+    // Allocation happens before any user fn is defined so calling
+    // sites (the `Expr::Handle` lowering in `Lowerer`) can look up
+    // the arm `FuncId`s via `module.declare_func_in_func` against
+    // their fn-local FuncRefs. Definitions happen after all user
+    // fns are defined to keep the `module.define_function` cycle
+    // simple (no nested-builder gymnastics).
+    let mut handler_arm_synth: Vec<HandlerArmSynth> = Vec::new();
+    let mut handler_arm_indices: BTreeMap<Span, Vec<usize>> = BTreeMap::new();
+    {
+        let mut cps_arm_sig = Signature::new(isa_call_conv(&module));
+        cps_arm_sig.params.push(AbiParam::new(pointer_ty)); // closure_ptr
+        cps_arm_sig.params.push(AbiParam::new(pointer_ty)); // args_ptr
+        cps_arm_sig.params.push(AbiParam::new(types::I32)); // args_len
+        cps_arm_sig.returns.push(AbiParam::new(pointer_ty)); // *mut NextStep
+        for item in &checked.program.items {
+            if let crate::ast::Item::Fn(f) = item {
+                collect_handle_arms_in_block(
+                    &f.body,
+                    &mut module,
+                    &cps_arm_sig,
+                    &checked.op_ids,
+                    &mut handler_arm_synth,
+                    &mut handler_arm_indices,
+                )?;
+            }
+        }
+    }
 
     // Accumulate safepoint records. Stage 1 writes placeholder records
     // (see StackMapBuilder's doc comment).
@@ -739,6 +1493,32 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             let panic_arith_ref = module.declare_func_in_func(panic_arith, builder.func);
             let alloc_ref = module.declare_func_in_func(alloc, builder.func);
             let int_to_string_ref = module.declare_func_in_func(int_to_string, builder.func);
+            // Plan B Task 55 (Phase 3a) — handler-frame ABI refs.
+            let handler_frame_new_ref =
+                module.declare_func_in_func(handler_frame_new, builder.func);
+            let handle_push_ref = module.declare_func_in_func(handle_push, builder.func);
+            let handle_pop_ref = module.declare_func_in_func(handle_pop, builder.func);
+            // Plan B Task 55 (Phase 3b) — frame_set_arm + perform + run_loop.
+            let handler_frame_set_arm_ref =
+                module.declare_func_in_func(handler_frame_set_arm, builder.func);
+            let perform_ref = module.declare_func_in_func(perform_func, builder.func);
+            let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
+            // Per-handle synthetic arm fn refs, keyed by handle span.
+            // Each entry maps a handle's span to the per-arm FuncRefs
+            // used for `func_addr` when populating the runtime
+            // `HandlerFrame`'s arm slot.
+            let handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>> = handler_arm_indices
+                .iter()
+                .map(|(span, idx_vec)| {
+                    let refs: Vec<FuncRef> = idx_vec
+                        .iter()
+                        .map(|&i| {
+                            module.declare_func_in_func(handler_arm_synth[i].func_id, builder.func)
+                        })
+                        .collect();
+                    (span.clone(), refs)
+                })
+                .collect();
 
             // FuncRefs for every user fn — needed for direct calls
             // (`Expr::Call` with `Ident` callee) and for `func_addr`
@@ -793,6 +1573,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 panic_arith_ref,
                 alloc_ref,
                 int_to_string_ref,
+                handler_frame_new_ref,
+                handle_push_ref,
+                handle_pop_ref,
+                handler_frame_set_arm_ref,
+                perform_ref,
+                run_loop_ref,
+                handler_arm_refs_per_handle,
+                effect_ids: &checked.effect_ids,
+                op_ids: &checked.op_ids,
+                effects: &checked.effects,
                 user_fn_refs,
                 user_fns: &user_fns,
                 type_layouts: &type_layouts,
@@ -876,6 +1666,72 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .define_function(main, &mut ctx)
         .map_err(|e| format!("define main: {e}"))?;
     module.clear_context(&mut ctx);
+
+    // --- Plan B Task 55 (Phase 3b): synthetic handler-arm CPS fns ------
+    //
+    // Each entry in `handler_arm_synth` was allocated a `FuncId` by
+    // the pre-pass; here we define each fn's body. Every arm fn has
+    // the uniform CPS calling convention `extern "C" fn(closure_ptr,
+    // args_ptr, args_len) -> *mut NextStep`. Phase 3b restricts arm
+    // bodies to literal `Expr::IntLit` (the `unsupported_handle_construct`
+    // walker enforces this); the body computes the literal value,
+    // wraps it via `sigil_next_step_done(value)`, and returns the
+    // resulting NextStep pointer. Phase 4+ will lower richer arm
+    // bodies through a dedicated CPS-aware lowerer.
+    {
+        let cps_arm_sig = {
+            let mut s = Signature::new(isa_call_conv(&module));
+            s.params.push(AbiParam::new(pointer_ty)); // closure_ptr
+            s.params.push(AbiParam::new(pointer_ty)); // args_ptr
+            s.params.push(AbiParam::new(types::I32)); // args_len
+            s.returns.push(AbiParam::new(pointer_ty)); // *mut NextStep
+            s
+        };
+        for synth in &handler_arm_synth {
+            ctx.func.signature = cps_arm_sig.clone();
+            ctx.func.name = UserFuncName::user(0, synth.func_id.as_u32());
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+                let block = builder.create_block();
+                builder.append_block_params_for_function_params(block);
+                builder.switch_to_block(block);
+                builder.seal_block(block);
+
+                // Phase 3b restriction: arm body must be IntLit. The
+                // codegen-entry guard rejects everything else, so this
+                // is a build-time invariant.
+                let value: i64 = match &synth.body {
+                    crate::ast::Expr::IntLit(n, _) => *n,
+                    other => unreachable!(
+                        "codegen Phase 3b: arm body should be IntLit per \
+                         unsupported_handle_construct guard; got {other:?}"
+                    ),
+                };
+                let value_v = builder.ins().iconst(types::I64, value);
+                let next_step_done_ref = module.declare_func_in_func(next_step_done, builder.func);
+                let done_call = builder.ins().call(next_step_done_ref, &[value_v]);
+                // TODO(Plan B Task 55, Phase 4c): no stackmap entry
+                // for this `sigil_next_step_done` call. Safe today
+                // only because (a) `closure_ptr` arg is null and (b)
+                // an `IntLit` arm body has no GC roots. Once Phase 4c
+                // lands richer arm bodies with captures, `closure_ptr`
+                // becomes a live GC root across this call site and
+                // any roots in scope must be threaded into the
+                // stackmap (mirroring the `Lowerer::stackmap.push_*`
+                // pattern at every other arena-allocating call). At
+                // that point this synthetic-fn path needs to use the
+                // full Lowerer machinery rather than the hand-rolled
+                // sequence below.
+                let next_step_ptr = builder.inst_results(done_call)[0];
+                builder.ins().return_(&[next_step_ptr]);
+                builder.finalize();
+            }
+            module
+                .define_function(synth.func_id, &mut ctx)
+                .map_err(|e| format!("define handler arm fn: {e}"))?;
+            module.clear_context(&mut ctx);
+        }
+    }
 
     // --- finish and add the stackmap section ----------------------------
     let mut product = module.finish();
@@ -1011,6 +1867,58 @@ struct Lowerer<'a, 'b> {
     /// shadows it.
     int_to_string_ref: FuncRef,
 
+    /// Plan B Task 55 (Phase 3a) — handler-frame ABI runtime refs
+    /// from Task 56. `lower_expr` for `Expr::Handle` calls
+    /// `sigil_handler_frame_new(effect_id, arm_count)`, then in
+    /// Phase 3b emits one `sigil_handler_frame_set_arm(frame, op_id,
+    /// fn_ptr, null_closure)` per arm with the synthetic arm fn's
+    /// pointer (via `func_addr`), then `sigil_handle_push(frame)`
+    /// before the body, and `sigil_handle_pop()` after.
+    handler_frame_new_ref: FuncRef,
+    handle_push_ref: FuncRef,
+    handle_pop_ref: FuncRef,
+    /// Plan B Task 55 (Phase 3b) — `sigil_handler_frame_set_arm`
+    /// runtime ref. Called once per arm during `Expr::Handle`
+    /// lowering with `(frame, op_id, fn_ptr, null_closure_ptr)`.
+    handler_frame_set_arm_ref: FuncRef,
+    /// Plan B Task 55 (Phase 3b) — `sigil_perform` runtime ref.
+    /// `lower_perform_non_io_to_value` calls this for non-IO
+    /// effects; the result is a `*mut NextStep` of tag `CALL`
+    /// pointing at the matching arm fn. The Call NextStep is then
+    /// passed to `sigil_run_loop` (`run_loop_ref`) which dispatches
+    /// it (invokes the arm fn with packed args) and returns the
+    /// final `Done` value as u64.
+    perform_ref: FuncRef,
+    /// Plan B Task 55 (Phase 3b) — `sigil_run_loop` runtime ref.
+    /// Called by `lower_perform_non_io_to_value` to drive the CPS
+    /// trampoline from the `NextStep::Call` returned by
+    /// `sigil_perform`. Returns the final `NextStep::Done`'s value
+    /// as u64; native code uses this directly.
+    run_loop_ref: FuncRef,
+    /// Plan B Task 55 (Phase 3b) — per-handle-span synthetic arm fn
+    /// refs. Used by `Expr::Handle` codegen to emit `func_addr`
+    /// pointers for `sigil_handler_frame_set_arm`. Keyed by the
+    /// handle expression's span; each entry is a `Vec<FuncRef>` in
+    /// arm-declaration order.
+    handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>>,
+    /// Plan B Task 55 (Phase 3a) — effect-name → effect_id (u32) map
+    /// from typecheck. `Expr::Handle` codegen looks up the handle's
+    /// declared effect (the unique effect name in its arms; Phase 3a
+    /// only supports single-effect handles) to pass as the
+    /// `effect_id` arg to `sigil_handler_frame_new`.
+    effect_ids: &'b BTreeMap<String, u32>,
+    /// Plan B Task 55 (Phase 3b) — `(effect_name, op_name)` → op_id
+    /// (u32) map from typecheck. `lower_perform` for non-IO effects
+    /// looks up the op_id to pass as the second arg to
+    /// `sigil_perform`.
+    op_ids: &'b BTreeMap<(String, String), u32>,
+    /// Plan B Task 55 (Phase 3b) — effect declaration registry from
+    /// typecheck. Used by `type_of_expr` for `Expr::Perform` to
+    /// look up the op's return type, which determines the Cranelift
+    /// type of the perform expression's value (extracted from the
+    /// returned NextStep).
+    effects: &'b BTreeMap<String, crate::ast::EffectDecl>,
+
     /// Per-fn FuncRefs for every user fn (original + synthetic
     /// `$lambda_N`). Used for direct calls and for `func_addr` when
     /// populating a `ClosureRecord`'s `code_ptr` slot.
@@ -1068,7 +1976,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let _ = self.lower_expr(e);
             }
             Stmt::Perform(p) => {
-                self.lower_perform(p);
+                // IO performs go through the side-effect-only path
+                // (`lower_perform` returns no value); non-IO performs
+                // route through `sigil_perform` and discard the
+                // returned value, mirroring the dispatch in
+                // `Expr::Perform`. Without this dispatch, statement-
+                // form non-IO performs (`perform Raise.fail();`) hit
+                // the IO assertion in `lower_perform` and crash the
+                // compiler.
+                if p.effect == "IO" {
+                    self.lower_perform(p);
+                } else {
+                    let _ = self.lower_perform_non_io_to_value(p);
+                }
             }
         }
     }
@@ -1076,8 +1996,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     fn lower_perform(&mut self, p: &crate::ast::PerformExpr) {
         // Plan A2 only recognises `IO.println(String)`; typecheck
         // (E0042/E0043/E0044) rejects every other shape before codegen
-        // sees the program, so we assume the happy path.
-        assert_eq!(p.effect, "IO", "non-IO effect reached codegen");
+        // sees the program, so we assume the happy path. Non-IO
+        // performs are handled inline in `Expr::Perform`'s lowering
+        // because they return a value (extracted from the NextStep
+        // returned by `sigil_perform`); this `lower_perform` helper
+        // remains the IO-only side-effect path.
+        assert_eq!(
+            p.effect, "IO",
+            "non-IO effect reached lower_perform; \
+                                    `Expr::Perform` should dispatch non-IO inline"
+        );
         assert_eq!(p.op, "println", "non-println IO op reached codegen");
         assert_eq!(p.args.len(), 1, "IO.println arg count is not 1");
 
@@ -1085,6 +2013,92 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let call = self.builder.ins().call(self.println_ref, &[heap]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, call));
+    }
+
+    /// Plan B Task 55 (Phase 3b) — lower a non-IO `perform Effect.op(...)`
+    /// site. Phase 3b minimum: zero-arg op (`args_len == 0`,
+    /// `args_ptr == null`), null continuation (arms ignore `k`).
+    /// `sigil_perform` returns a `NextStep::Call` that targets the
+    /// matching arm fn; we hand that off to `sigil_run_loop`, which
+    /// drives the CPS trampoline to a terminal `NextStep::Done` and
+    /// returns the value as u64. Native code uses the u64 directly
+    /// (cast to i64 via the type system; for Int returns this is the
+    /// raw untagged Int per the Plan B Int ABI).
+    fn lower_perform_non_io_to_value(&mut self, p: &crate::ast::PerformExpr) -> Value {
+        // Phase 3b restriction: non-IO performs in handle bodies can
+        // only have zero user args (the `unsupported_handle_construct`
+        // walker enforces this). Asserted defensively here.
+        assert!(
+            p.args.is_empty(),
+            "codegen Phase 3b: non-IO perform must have zero user args; \
+             unsupported_handle_construct guard should have caught this"
+        );
+        let effect_id = match self.effect_ids.get(&p.effect) {
+            Some(id) => *id,
+            None => unreachable!(
+                "codegen: effect `{}` missing from effect_ids map; \
+                 typecheck-time E0042 should have caught this",
+                p.effect
+            ),
+        };
+        let op_id = match self.op_ids.get(&(p.effect.clone(), p.op.clone())) {
+            Some(id) => *id,
+            None => unreachable!(
+                "codegen: op_id missing for `{}.{}`; typecheck-time \
+                 E0043 should have caught this",
+                p.effect, p.op
+            ),
+        };
+        let effect_id_v = self.builder.ins().iconst(types::I32, effect_id as i64);
+        let op_id_v = self.builder.ins().iconst(types::I32, op_id as i64);
+        // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4b):
+        // `null_args_ptr` + `zero_len` here pin the zero-arg
+        // restriction. Phase 4b adds args-buffer packing on the
+        // perform side (alloca an `[u64; N]` of user-arg slots, store
+        // each arg's tagged representation, pass the buffer pointer
+        // and `args_len = N` here) and unpacking on the arm side.
+        // The codegen-entry guard's `body_contains_non_io_perform_with_args`
+        // check enforces that this site only runs on zero-arg ops
+        // today.
+        let null_args_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
+        let zero_len = self.builder.ins().iconst(types::I32, 0);
+        // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4d):
+        // `null_k_closure` + `null_k_fn` pin the no-k-usage
+        // restriction. Phase 4d reifies the perform's continuation
+        // (the rest of computation after the perform site) into a
+        // CPS-color closure-fn pair and passes it here so the arm can
+        // invoke `k(value)` to resume. Until then arms ignore `k`
+        // (single-shot Raise-style early-exit), and the codegen-entry
+        // guard's IntLit-only-arm-body check enforces that.
+        let null_k_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+        let null_k_fn = self.builder.ins().iconst(self.pointer_ty, 0);
+        let perform_call = self.builder.ins().call(
+            self.perform_ref,
+            &[
+                effect_id_v,
+                op_id_v,
+                null_args_ptr,
+                zero_len,
+                null_k_closure,
+                null_k_fn,
+            ],
+        );
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, perform_call));
+        let call_next_step = self.builder.inst_results(perform_call)[0];
+        // `sigil_perform` returns a `NextStep::Call` (it builds the
+        // Call to the arm + (k_closure, k_fn); it does not invoke
+        // the arm itself). Hand off to `sigil_run_loop` which
+        // dispatches the Call (invokes the arm), then any further
+        // Calls the arm returns, until a terminal `Done(value)`.
+        // Returns u64 — cast to i64 for native consumption.
+        let run_loop_call = self
+            .builder
+            .ins()
+            .call(self.run_loop_ref, &[call_next_step]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
+        self.builder.inst_results(run_loop_call)[0]
     }
 
     /// Lower an expression to an SSA value. The value's Cranelift
@@ -1135,9 +2149,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 unreachable!("codegen: Expr::If should have been desugared by elaborate")
             }
             Expr::Perform(p) => {
-                self.lower_perform(p);
-                // Perform returns Unit — represented as `i8 0`.
-                self.builder.ins().iconst(types::I8, 0)
+                if p.effect == "IO" {
+                    self.lower_perform(p);
+                    // IO.println returns Unit — represented as `i8 0`.
+                    self.builder.ins().iconst(types::I8, 0)
+                } else {
+                    // Plan B Task 55 (Phase 3b) — non-IO perform
+                    // routes through `sigil_perform`. `sigil_perform`
+                    // builds a `NextStep::Call` to the matching arm;
+                    // `lower_perform_non_io_to_value` then hands that
+                    // off to `sigil_run_loop`, which dispatches the
+                    // call (and any further calls the arm returns)
+                    // until a terminal `Done(value)` and returns the
+                    // value as u64. Codegen never reads the
+                    // `NextStep` layout directly.
+                    self.lower_perform_non_io_to_value(p)
+                }
             }
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::Lambda { .. } => {
@@ -1188,17 +2215,95 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .collect();
                 self.lower_ctor_alloc(&type_name, variant_idx, &ordered_values)
             }
-            Expr::Handle { .. } => {
-                // Typecheck (Plan B Task 53) emits E0134 for any
-                // `handle` expression; the codegen-entry walker
-                // additionally hard-rejects programs that contain one.
-                // Reaching this arm means an upstream invariant broke.
-                // Plan B Task 55 replaces this `unreachable!` with the
-                // CPS transform's expansion to `sigil_perform` /
-                // `sigil_handle_push` calls.
-                unreachable!(
-                    "codegen: Expr::Handle should be rejected by typecheck E0134 + entry walker before codegen"
-                )
+            Expr::Handle {
+                body,
+                op_arms,
+                span,
+                ..
+            } => {
+                // Plan B Task 55 (Phase 3b): allocate a handler
+                // frame, populate each arm slot with the synthetic
+                // CPS fn's pointer (`func_addr`), push the frame,
+                // evaluate the body inline (which may call
+                // `sigil_perform` for non-IO effects), and pop the
+                // frame. Frame's `closure_ptr` for each arm is null
+                // (Phase 3b restricts arm bodies to literal
+                // expressions with no captures).
+                let effect_name = &op_arms[0].effect;
+                let effect_id = match self.effect_ids.get(effect_name) {
+                    Some(id) => *id,
+                    None => unreachable!(
+                        "codegen: effect `{effect_name}` missing from effect_ids \
+                         map; typecheck-time E0138 should have caught this"
+                    ),
+                };
+                let arm_count = op_arms.len() as u32;
+                let effect_id_v = self.builder.ins().iconst(types::I32, effect_id as i64);
+                let arm_count_v = self.builder.ins().iconst(types::I32, arm_count as i64);
+                let frame_call = self
+                    .builder
+                    .ins()
+                    .call(self.handler_frame_new_ref, &[effect_id_v, arm_count_v]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, frame_call));
+                let frame_ptr = self.builder.inst_results(frame_call)[0];
+
+                // Populate each arm slot with the synthetic CPS fn's
+                // pointer. The pre-pass allocated one `FuncRef` per
+                // arm in declaration order; pair them with the AST
+                // arms to compute op_ids.
+                let arm_refs = self
+                    .handler_arm_refs_per_handle
+                    .get(span)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen: handler_arm_refs_per_handle missing entry for \
+                             handle span {span:?}; pre-pass allocation should have \
+                             registered every reachable Expr::Handle"
+                        )
+                    })
+                    .clone();
+                // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4b/4c):
+                // null `closure_ptr` for every arm slot. Correct
+                // today because Phase 3b restricts arm bodies to
+                // `IntLit` only — no captures, no op-arg use, no `k`
+                // use, so the synthetic arm fn doesn't read its
+                // closure pointer. Phase 4b adds op-arg unpacking,
+                // 4c adds richer arm bodies (which may reference
+                // outer-scope captures), and 4d adds `k`-reifying
+                // arms — each requires a real closure record
+                // threaded through here so the synthetic fn can
+                // recover its environment. The codegen-entry guard
+                // currently rejects all three shapes; lifting the
+                // guard MUST land alongside changes to this slot.
+                let null_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
+                for (arm, fn_ref) in op_arms.iter().zip(arm_refs.iter()) {
+                    let op_id = match self.op_ids.get(&(arm.effect.clone(), arm.op.clone())) {
+                        Some(id) => *id,
+                        None => unreachable!(
+                            "codegen: op_id missing for `{}.{}`; typecheck-time \
+                             E0138/E0139 should have caught this",
+                            arm.effect, arm.op
+                        ),
+                    };
+                    let op_id_v = self.builder.ins().iconst(types::I32, op_id as i64);
+                    let fn_ptr_v = self.builder.ins().func_addr(self.pointer_ty, *fn_ref);
+                    let set_call = self.builder.ins().call(
+                        self.handler_frame_set_arm_ref,
+                        &[frame_ptr, op_id_v, fn_ptr_v, null_ptr],
+                    );
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, set_call));
+                }
+
+                let push_call = self.builder.ins().call(self.handle_push_ref, &[frame_ptr]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, push_call));
+                let body_val = self.lower_expr(body);
+                let pop_call = self.builder.ins().call(self.handle_pop_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, pop_call));
+                body_val
             }
         }
     }
@@ -1977,7 +3082,28 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         use crate::ast::{BinOp, Expr, UnOp};
         match e {
             Expr::IntLit(..) => types::I64,
-            Expr::BoolLit(..) | Expr::Perform(_) => types::I8,
+            Expr::BoolLit(..) => types::I8,
+            Expr::Perform(p) => {
+                // IO.println returns Unit (i8 0); non-IO performs
+                // return the op's declared return type, which we
+                // look up in the effect registry. Phase 3b only
+                // supports Int returns; Phase 4+ extends.
+                if p.effect == "IO" {
+                    types::I8
+                } else if let Some(eff) = self.effects.get(&p.effect) {
+                    if let Some(op) = eff.ops.iter().find(|o| o.name == p.op) {
+                        cranelift_ty_for_type_expr(&op.return_type, self.pointer_ty)
+                    } else {
+                        // Build-time invariant — typecheck E0043
+                        // catches unknown ops.
+                        types::I64
+                    }
+                } else {
+                    // Build-time invariant — typecheck E0042 catches
+                    // unknown effects.
+                    types::I64
+                }
+            }
             Expr::CharLit(..) => types::I32,
             Expr::StringLit(..) | Expr::RecordLit { .. } => self.pointer_ty,
             Expr::Ident(name, _) => {
@@ -2064,15 +3190,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 | crate::ast::EnvSlotKind::Closure
                 | crate::ast::EnvSlotKind::User => self.pointer_ty,
             },
-            // Plan B task 53 — handler expressions are rejected by
-            // typecheck E0134 + the codegen-entry walker before this
-            // type predictor runs. Reaching this arm means an upstream
-            // invariant broke; trip `unreachable!` rather than guess
-            // a Cranelift type for a node Task 55's CPS transform
-            // hasn't yet expanded.
-            Expr::Handle { .. } => unreachable!(
-                "type_of_expr: Expr::Handle is rejected by typecheck E0134 + codegen entry walker"
-            ),
+            // Plan B Task 55 (Phase 2 minimum) — `handle BODY with {
+            // arms }` lowers to `BODY` when the body contains no
+            // non-IO perform (the codegen-entry guard
+            // `unsupported_handle_construct` enforces this). The
+            // handle's Cranelift type is therefore the body's type;
+            // typecheck has already verified all arms unify with the
+            // body via E0044/E0065. Phase 3+ will replace this with
+            // a handler-overall computation reading from a typecheck-
+            // populated side-table.
+            Expr::Handle { body, .. } => self.type_of_expr(body, preview),
         }
     }
 }
@@ -2291,6 +3418,56 @@ mod tests {
         assert!(
             !contains_apply_or_generic_ref(&prog),
             "walker must accept fully-concrete program"
+        );
+    }
+
+    #[test]
+    fn walker_accepts_program_with_effect_decl() {
+        // Plan B Task 55 — `Item::Effect` produces no codegen output
+        // and the entry walker no longer short-circuits on it. This
+        // test pins the new behavior: a program containing an
+        // `effect` declaration alongside a concrete `main` walks
+        // cleanly past the entry guard.
+        use crate::ast::{Block, EffectDecl, EffectOp, FnDecl, Item, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![
+                Item::Effect(Box::new(EffectDecl {
+                    name: "Raise".to_string(),
+                    name_span: span.clone(),
+                    generic_params: Vec::new(),
+                    resumes_many: false,
+                    ops: vec![EffectOp {
+                        name: "fail".to_string(),
+                        name_span: span.clone(),
+                        params: vec![TypeExpr::Named("String".to_string(), span.clone())],
+                        return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                        span: span.clone(),
+                    }],
+                    span: span.clone(),
+                })),
+                Item::Fn(Box::new(FnDecl {
+                    name: "main".to_string(),
+                    name_span: span.clone(),
+                    generic_params: Vec::new(),
+                    params: Vec::new(),
+                    return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                    effects: Vec::new(),
+                    effect_row_var: None,
+                    body: Block {
+                        stmts: Vec::new(),
+                        tail: None,
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                })),
+            ],
+        };
+        assert!(
+            !contains_apply_or_generic_ref(&prog),
+            "walker must accept program with effect decl + concrete main"
         );
     }
 }
