@@ -1010,18 +1010,25 @@ revisit by tracking precise pointer slots per `NextStep`.
 `closure_in_handler_arm_slot_survives_gc`,
 `closure_in_next_step_survives_gc_via_arena_root`) that allocate
 sentinel-bearing closures, push handlers, force `GC_gcollect`, and
-verify the survival contract. The tests are `#[ignore]`-gated because
-Boehm thread enrolment / re-enrolment doesn't compose cleanly with
-cargo test's per-test thread teardowns even with explicit
-`GC_unregister_my_thread`; manual verification via
-`cargo test -- --ignored survives_gc` runs them. Each passes in
-isolation; rooting correctness in production is unaffected by the
-test-harness limitation.
+verify the survival contract. The tests run by default under `cargo
+test`. Each one's outer `#[test]` body re-execs the test binary with
+`--exact handlers::tests::<name> --nocapture` and a
+`SIGIL_GC_STRESS_INNER=1` env var; the inner subprocess runs only that
+single test, drops its `GcThreadEnrolment`, and exits. The OS reclaims
+all per-process state, so the Boehm thread enrolment / re-enrolment
+issue (cargo test thread teardown + Boehm thread re-registration on
+the next test in the same process) cannot accumulate stale ranges
+across tests.
+
+The subprocess pattern is the test-only counterpart to v1's
+single-threaded production model: every stress scenario runs on its
+own pristine thread that owns its registration for its lifetime. v2's
+multi-threaded trampoline will need a precise per-thread root
+lifecycle anyway; the production rooting contract is unchanged by
+this test-harness adaptation.
 
 **Implementing commit:** [HEAD]
-**Closure point:** open for the test-harness composition issue
-(cargo test thread teardown + Boehm thread re-registration); production
-rooting contract is closed by the `GC_add_roots` registration here.
+**Closure point:** closed at PR #21 merge.
 
 ---
 

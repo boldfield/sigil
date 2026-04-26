@@ -1274,14 +1274,67 @@ mod tests {
     // `register_handler_stack_root_for_calling_thread` and
     // `register_arena_root_for_calling_thread` fixes; without them,
     // the affected reads after GC would see freed memory.
+    //
+    // Each test re-execs the test binary in a subprocess so the
+    // stress scenario runs against a fresh Boehm state. Sidesteps
+    // the original "Boehm thread enrolment composes poorly with
+    // cargo test's per-test thread teardowns" issue: only ONE test
+    // runs in the subprocess, drops its `GcThreadEnrolment`, and
+    // the process exits. The OS reclaims everything; no stale
+    // ranges leak into Boehm's root list across tests.
+    //
+    // Outer mode (no env var): spawn the subprocess, wait for it,
+    // assert success. Inner mode (env var set): run the actual body.
     // ----------------------------------------------------------------
 
+    /// Env-var marker that switches a stress test into "inner" mode
+    /// (run the actual body) instead of "outer" mode (spawn a child
+    /// subprocess that runs only this one test).
+    const STRESS_INNER_VAR: &str = "SIGIL_GC_STRESS_INNER";
+
+    fn in_stress_subprocess() -> bool {
+        std::env::var(STRESS_INNER_VAR).is_ok()
+    }
+
+    /// Outer-mode helper: re-exec this test binary, filtered to
+    /// `handlers::tests::<test_name>` with `--exact`, with the
+    /// inner-mode env var set. Asserts the child exited zero. Errors
+    /// surface via the project's eprintln+abort convention; the test
+    /// process aborts (visible as failure to the harness) rather than
+    /// panicking, matching the rest of the runtime crate's error style
+    /// (clippy disallows `unwrap`/`expect`/`panic!`).
+    fn run_stress_in_subprocess(test_name: &str) {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("run_stress_in_subprocess: current_exe failed: {e}");
+                std::process::abort();
+            }
+        };
+        let full_name = format!("handlers::tests::{test_name}");
+        let status = match std::process::Command::new(&exe)
+            .args(["--exact", &full_name, "--nocapture"])
+            .env(STRESS_INNER_VAR, "1")
+            .status()
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("run_stress_in_subprocess: spawn for `{full_name}` failed: {e}");
+                std::process::abort();
+            }
+        };
+        assert!(
+            status.success(),
+            "GC-stress subprocess for `{full_name}` failed: {status}"
+        );
+    }
+
     #[test]
-    #[ignore = "GC stress tests interact with Boehm thread enrolment in ways \
-                that don't compose across cargo test's per-test thread teardowns; \
-                run with `cargo test -- --ignored survives_gc` for manual \
-                verification of the rooting contract"]
     fn handler_frame_survives_forced_gc_while_pushed() {
+        if !in_stress_subprocess() {
+            run_stress_in_subprocess("handler_frame_survives_forced_gc_while_pushed");
+            return;
+        }
         // Frame is reachable through HANDLER_STACK only after we drop
         // the local. Without the HANDLER_STACK root registration,
         // GC_gcollect would reclaim it; perform would then walk into
@@ -1332,11 +1385,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "GC stress tests interact with Boehm thread enrolment in ways \
-                that don't compose across cargo test's per-test thread teardowns; \
-                run with `cargo test -- --ignored survives_gc` for manual \
-                verification of the rooting contract"]
     fn closure_in_handler_arm_slot_survives_gc() {
+        if !in_stress_subprocess() {
+            run_stress_in_subprocess("closure_in_handler_arm_slot_survives_gc");
+            return;
+        }
         let _guard = crate::test_support::gc_test_lock();
         ensure_gc();
         let _enrol = crate::test_support::GcThreadEnrolment::acquire();
@@ -1398,11 +1451,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "GC stress tests interact with Boehm thread enrolment in ways \
-                that don't compose across cargo test's per-test thread teardowns; \
-                run with `cargo test -- --ignored survives_gc` for manual \
-                verification of the rooting contract"]
     fn closure_in_next_step_survives_gc_via_arena_root() {
+        if !in_stress_subprocess() {
+            run_stress_in_subprocess("closure_in_next_step_survives_gc_via_arena_root");
+            return;
+        }
         let _guard = crate::test_support::gc_test_lock();
         ensure_gc();
         let _enrol = crate::test_support::GcThreadEnrolment::acquire();
