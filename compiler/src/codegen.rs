@@ -520,17 +520,25 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
             op_arms,
             span,
         } => {
-            // Found a handle expression — the Phase 2 guard checks
-            // whether *this* handle's body contains any non-IO
-            // `Expr::Perform` site directly. Nested handles within
-            // the body don't get cleared here either (over-
-            // conservative; widens with Phase 3+).
+            // Phase 3a constraints (lifted incrementally as the
+            // CPS path matures):
+            //   - body contains no non-IO perform (Phase 3b lifts)
+            //   - exactly one op-arm (Phase 3+ lifts; runtime frame
+            //     supports up to MAX_HANDLER_ARMS=14)
+            //   - all arms reference the same effect (Phase 3+ may
+            //     keep this — the runtime frame's effect_id field is
+            //     a single u32, so multi-effect would need separate
+            //     frames per effect)
+            //   - no return arm (Phase 3+ lifts; needs a synthetic
+            //     return-fn registered via
+            //     sigil_handler_frame_set_return)
             if let Some(eff_op) = body_contains_non_io_perform(body) {
                 return Some(format!(
                     "`handle` expression at {:?} has body that performs `{}.{}` — \
                      non-IO `perform` inside a handle body is not yet supported \
-                     in codegen (Plan B Task 55, in progress; the handler-frame \
-                     setup + CPS calling convention land in a follow-up commit)",
+                     in codegen (Plan B Task 55, in progress; the per-arm CPS \
+                     fn synthesis + `sigil_perform` lowering land in a follow-up \
+                     commit)",
                     span, eff_op.0, eff_op.1,
                 ));
             }
@@ -542,11 +550,32 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
                     span
                 ));
             }
+            if op_arms.is_empty() {
+                // Defensive: parser guarantees at least one arm,
+                // but codegen indexes op_arms[0] for the single-arm
+                // path so guard explicitly.
+                return Some(format!(
+                    "`handle` expression at {:?} has no op-arms — codegen \
+                     requires at least one (Plan B Task 55)",
+                    span
+                ));
+            }
+            if op_arms.len() > 1 {
+                return Some(format!(
+                    "`handle` expression at {:?} has {} op-arms — multi-arm \
+                     handlers are not yet supported in codegen (Plan B Task \
+                     55, in progress; runtime frame supports up to \
+                     MAX_HANDLER_ARMS but per-arm CPS fn synthesis ships in \
+                     a follow-up commit)",
+                    span,
+                    op_arms.len()
+                ));
+            }
             // Recurse into arm bodies so nested handles deeper in
             // the AST surface their own diagnostics. Arm bodies are
-            // dead code in Phase 2 (the handle is statically
-            // optimised away) but a nested handle with a non-IO-
-            // perform body would still need to be flagged.
+            // dead code in Phase 3a (the handle's runtime frame is
+            // pushed/popped but never dispatches an arm because the
+            // body has no non-IO perform).
             for arm in op_arms {
                 if let Some(msg) = expr_unsupported_handle(&arm.body) {
                     return Some(msg);
@@ -907,6 +936,46 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_int_to_string", Linkage::Import, &int_to_string_sig)
         .map_err(|e| format!("declare sigil_int_to_string: {e}"))?;
 
+    // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
+    // Phase 3a wires the frame allocation + push/pop ABI from Task
+    // 56 around every `handle` body. Arms stay null in this commit
+    // (the existing `unsupported_handle_construct` guard rejects
+    // programs whose body would actually perform the handled effect,
+    // so the runtime never invokes an arm fn pointer). Phase 3b adds
+    // arm-fn synthesis + `sigil_perform` lowering + arm dispatch;
+    // Phase 4+ adds continuation-using arms + multi-shot.
+
+    // sigil_handler_frame_new(effect_id: u32, arm_count: u32) -> *mut HandlerFrame
+    let mut handler_frame_new_sig = Signature::new(isa_call_conv(&module));
+    handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // effect_id
+    handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // arm_count
+    handler_frame_new_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
+    let handler_frame_new = module
+        .declare_function(
+            "sigil_handler_frame_new",
+            Linkage::Import,
+            &handler_frame_new_sig,
+        )
+        .map_err(|e| format!("declare sigil_handler_frame_new: {e}"))?;
+
+    // sigil_handle_push(frame: *mut HandlerFrame)
+    let mut handle_push_sig = Signature::new(isa_call_conv(&module));
+    handle_push_sig.params.push(AbiParam::new(pointer_ty));
+    let handle_push = module
+        .declare_function("sigil_handle_push", Linkage::Import, &handle_push_sig)
+        .map_err(|e| format!("declare sigil_handle_push: {e}"))?;
+
+    // sigil_handle_pop() -> *mut HandlerFrame (return discarded at
+    // codegen sites; the runtime tracks the popped pointer for GC
+    // reasons but codegen has no use for it).
+    let mut handle_pop_sig = Signature::new(isa_call_conv(&module));
+    handle_pop_sig.returns.push(AbiParam::new(pointer_ty));
+    let handle_pop = module
+        .declare_function("sigil_handle_pop", Linkage::Import, &handle_pop_sig)
+        .map_err(|e| format!("declare sigil_handle_pop: {e}"))?;
+
     // C-callable main: int main(int argc, char **argv). Stage 1 ignores argv.
     let mut main_sig = Signature::new(isa_call_conv(&module));
     main_sig.params.push(AbiParam::new(types::I32));
@@ -1040,6 +1109,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             let panic_arith_ref = module.declare_func_in_func(panic_arith, builder.func);
             let alloc_ref = module.declare_func_in_func(alloc, builder.func);
             let int_to_string_ref = module.declare_func_in_func(int_to_string, builder.func);
+            // Plan B Task 55 (Phase 3a) — handler-frame ABI refs.
+            let handler_frame_new_ref =
+                module.declare_func_in_func(handler_frame_new, builder.func);
+            let handle_push_ref = module.declare_func_in_func(handle_push, builder.func);
+            let handle_pop_ref = module.declare_func_in_func(handle_pop, builder.func);
 
             // FuncRefs for every user fn — needed for direct calls
             // (`Expr::Call` with `Ident` callee) and for `func_addr`
@@ -1094,6 +1168,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 panic_arith_ref,
                 alloc_ref,
                 int_to_string_ref,
+                handler_frame_new_ref,
+                handle_push_ref,
+                handle_pop_ref,
+                effect_ids: &checked.effect_ids,
                 user_fn_refs,
                 user_fns: &user_fns,
                 type_layouts: &type_layouts,
@@ -1312,6 +1390,24 @@ struct Lowerer<'a, 'b> {
     /// shadows it.
     int_to_string_ref: FuncRef,
 
+    /// Plan B Task 55 (Phase 3a) — handler-frame ABI runtime refs
+    /// from Task 56. `lower_expr` for `Expr::Handle` calls
+    /// `sigil_handler_frame_new(effect_id, arm_count)` then
+    /// `sigil_handle_push(frame)` before the body, and
+    /// `sigil_handle_pop()` after. Arm fn pointers are not yet set
+    /// (the existing `unsupported_handle_construct` codegen-entry
+    /// guard rejects programs whose body would actually perform the
+    /// handled effect, so the runtime never reads an arm slot).
+    handler_frame_new_ref: FuncRef,
+    handle_push_ref: FuncRef,
+    handle_pop_ref: FuncRef,
+    /// Plan B Task 55 (Phase 3a) — effect-name → effect_id (u32) map
+    /// from typecheck. `Expr::Handle` codegen looks up the handle's
+    /// declared effect (the unique effect name in its arms; Phase 3a
+    /// only supports single-effect handles) to pass as the
+    /// `effect_id` arg to `sigil_handler_frame_new`.
+    effect_ids: &'b BTreeMap<String, u32>,
+
     /// Per-fn FuncRefs for every user fn (original + synthetic
     /// `$lambda_N`). Used for direct calls and for `func_addr` when
     /// populating a `ClosureRecord`'s `code_ptr` slot.
@@ -1489,22 +1585,68 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .collect();
                 self.lower_ctor_alloc(&type_name, variant_idx, &ordered_values)
             }
-            Expr::Handle { body, .. } => {
-                // Plan B Task 55 (Phase 2 minimum): lower `handle BODY
-                // with { arms }` as just BODY when the body contains
-                // no non-IO `perform`. Color analysis (`color.rs`)
-                // already treats handle-discharged performs as native
-                // for color purposes; for the codegen path until the
-                // full CPS calling convention lands (Phase 3+), the
-                // handle is statically optimized away when the body
-                // wouldn't reach any of the arms at runtime. The
-                // codegen-entry guard `unsupported_handle_construct`
-                // (called from `emit_object`) rejects programs whose
-                // body actually performs a non-IO effect; reaching
-                // this arm guarantees the body's runtime effect set
-                // is a subset of `![IO]`, so dropping the handler
-                // frame is safe.
-                self.lower_expr(body)
+            Expr::Handle { body, op_arms, .. } => {
+                // Plan B Task 55 (Phase 3a): allocate a handler
+                // frame, push it on the runtime handler stack,
+                // evaluate the body inline, and pop the frame. Arm
+                // fn pointers are not set (left null by
+                // `sigil_handler_frame_new`'s zero-init), which is
+                // safe because the codegen-entry guard
+                // `unsupported_handle_construct` rejects programs
+                // whose body would actually `perform` the handled
+                // effect — the runtime never reads an arm slot for
+                // these handles. Phase 3b adds arm-fn synthesis +
+                // `sigil_perform` lowering so handlers actually
+                // dispatch at runtime; until then the frame
+                // allocation + push/pop is observable runtime
+                // behaviour but functionally a no-op.
+                //
+                // Single-effect-per-handle is a Phase 3a constraint:
+                // the runtime handler frame's `effect_id` field is a
+                // single u32, so `handle (...) with { A.x => ..., B.y
+                // => ... }` would need two separate frames (or a
+                // multi-effect frame layout, which isn't in the v1
+                // ABI). Phase 3+ generalises to multi-arm /
+                // multi-effect; until then the codegen-entry guard
+                // rejects multi-effect handles.
+                let effect_name = &op_arms[0].effect;
+                let effect_id = match self.effect_ids.get(effect_name) {
+                    Some(id) => *id,
+                    None => {
+                        // Build-time invariant: typecheck E0138 fires
+                        // for arms referencing unknown effects, and
+                        // the typecheck-end ID-assignment pass
+                        // populates `effect_ids` for every entry in
+                        // `effects`. Reaching here means an upstream
+                        // contract broke.
+                        unreachable!(
+                            "codegen: effect `{effect_name}` missing from effect_ids \
+                             map; typecheck-time E0138 should have caught this"
+                        )
+                    }
+                };
+                let arm_count = op_arms.len() as u32;
+                let effect_id_v = self.builder.ins().iconst(types::I32, effect_id as i64);
+                let arm_count_v = self.builder.ins().iconst(types::I32, arm_count as i64);
+                let frame_call = self
+                    .builder
+                    .ins()
+                    .call(self.handler_frame_new_ref, &[effect_id_v, arm_count_v]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, frame_call));
+                let frame_ptr = self.builder.inst_results(frame_call)[0];
+                let push_call = self.builder.ins().call(self.handle_push_ref, &[frame_ptr]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, push_call));
+                // Evaluate body in-place. The codegen-entry guard
+                // ensures the body has no non-IO perform, so it
+                // produces a value through normal native lowering
+                // without consulting the handler stack.
+                let body_val = self.lower_expr(body);
+                let pop_call = self.builder.ins().call(self.handle_pop_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, pop_call));
+                body_val
             }
         }
     }

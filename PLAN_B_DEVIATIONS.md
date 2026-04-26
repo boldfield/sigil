@@ -38,7 +38,17 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** This ships a real codegen path that exercises the full pipeline for handle expressions for the first time (parser + typecheck + monomorphize + color + closure_convert + codegen all touch handle now), without committing to the much larger CPS infrastructure. The cost is that handlers don't actually do anything useful yet — but the surface compiles, the test infrastructure works end-to-end, and Phase 3 can build incrementally on this base. The static walker in `unsupported_handle_construct` is intentionally conservative: it inspects only `Expr::Perform` nodes appearing directly in handle bodies, not transitive performs through called fns. A handle whose body calls a fn that itself performs a non-IO effect would slip through this guard and crash at runtime when `sigil_perform` walks an empty handler stack — acceptable for the Phase 2 test program (body is a literal) but a known footgun until Phase 3+ ships the proper handler-frame setup.
 
-**Implementing commit(s):** [HEAD]; replaced by Phase 3+ commits.
+**Implementing commit(s):** `2d69b52`; superseded by Phase 3a (HEAD) and Phase 3+ commits.
+
+## 2026-04-26 — [DEVIATION Task 55] Phase 3a wires frame ABI without arm dispatch (single-arm/single-effect/no-return handles only)
+
+**Context:** Phase 2 (`2d69b52`) shipped `Expr::Handle` codegen as a body-pass-through (no runtime FFI calls). Phase 3 needs to actually invoke the runtime handler ABI from Task 56 — but full arm-dispatch + `sigil_perform` lowering + per-arm CPS fn synthesis is too large for one commit.
+
+**Deviation:** Phase 3a wires `sigil_handler_frame_new(effect_id, arm_count)` + `sigil_handle_push(frame)` + `sigil_handle_pop()` around every `handle` body but does NOT yet set arm fn pointers (leaves them null). This is safe because the existing `unsupported_handle_construct` codegen-entry guard still rejects programs whose body would actually perform the handled effect — the runtime never reads an arm slot for these handles. Phase 3a additionally tightens the guard to reject multi-arm handles, return arms, and zero-arm handles (defensively) so the codegen path only takes single-arm/single-effect/no-return handles. Phase 3b adds per-arm CPS fn synthesis + `sigil_handler_frame_set_arm` calls + `sigil_perform` lowering for non-IO performs in handle bodies; Phase 4+ adds continuation-using arms (`k` actually invoked) + multi-shot + multi-arm/multi-effect handles + return arms.
+
+**Rationale:** Splitting at the frame-ABI / arm-dispatch boundary lets the runtime FFI plumbing get exercised end-to-end (real `sigil_handler_frame_new` + push + pop calls in compiled output, observable via `objdump`) without committing to the much larger CPS calling convention + synthetic fn synthesis. The Phase 2 e2e test `handle_with_no_perform_in_body_compiles_and_runs` continues to pass through Phase 3a, now exercising the frame ABI on the path Phase 3b builds on. The cost is a tiny runtime regression: the no-perform handle now allocates + pushes + pops a frame on every invocation (previously a no-op pass-through). For Phase 3a this is acceptable; Phase 3b makes the frame functional rather than just present.
+
+**Implementing commit(s):** [HEAD] (Phase 3a); follow-up commits TBD.
 
 ## 2026-04-25 — [Task 4.5.5 / A3-carryover] Tagged-vs-raw Int ABI decision
 
