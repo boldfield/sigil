@@ -26,11 +26,20 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Deviation:** Task 55 lands across multiple commits on a single branch (`plan-b-task-55`) rather than as one monolithic commit. The first commit (foundation phase) ships only the easy and safe pieces — E0133 lift + entry-walker update + e2e test for effect-decl-with-no-handler-use — while leaving the E0134 gate live so well-formed `handle` expressions still surface a clean diagnostic instead of tripping the still-`unreachable!` codegen arms in `lower_expr` / `type_of_expr`. The CPS calling convention, body transform, arm synthesis, frame setup, and counter wiring land in follow-up commits on the same branch. PR opens only when the full Task 55 path actually compiles and runs at least one real handler example end-to-end.
 
-**Rationale:** The all-or-nothing alternative (single commit landing every piece together) would require holding the entire ~2000-LOC change in working state across multiple sessions before any pod-verify or CI checkpoint. Splitting at the asymmetric-gate boundary gives a clean intermediate state where (1) effect-only programs gain a real codegen path immediately, (2) handle-using programs continue to surface E0134 with a clear "in-progress" message, and (3) each follow-up commit can be pod-verified independently. The **single-PR convention** from Tasks 49 / 53 / 54 / 56 still holds — only one PR opens for Task 55, and it includes the full chain of foundation + CPS commits. The squash-merged result will look identical to a one-shot landing.
+**Rationale:** The all-or-nothing alternative (single commit landing every piece together) would require holding the entire ~2000-LOC change in working state across multiple sessions before any pod-verify or CI checkpoint. Splitting at the asymmetric-gate boundary gives a clean intermediate state where (1) effect-only programs gain a real codegen path immediately, (2) handle-using programs continue to surface E0134 with a clear "in-progress" message, and (3) each follow-up commit can be pod-verified independently. The **single-PR convention** from Tasks 49 / 53 / 54 / 56 still holds *for the foundation → Phase 4a chunk* — that chunk landed as a single PR (#22). The post-Phase-4a Phase 4 sub-tasks (4b, 4c, 4d, 4e, 4f) each land as their own focused PR — see the cadence-pivot addendum below.
 
-**Implementing commit(s):** `b3af204` (foundation phase: E0133 lift + entry walker), `2d69b52` (Phase 2 minimum: E0134 lift + handle body-pass-through + effect/op IDs + e2e tests), `ef4be8d` (Phase 3a), `d0aa4c4` + `2e7c0de` (Phase 3b), `adcb897` (Phase 4a), [HEAD] (review-fixup batch).
+**Implementing commit(s):** `b3af204` (foundation phase: E0133 lift + entry walker), `2d69b52` (Phase 2 minimum: E0134 lift + handle body-pass-through + effect/op IDs + e2e tests), `ef4be8d` (Phase 3a), `d0aa4c4` + `2e7c0de` (Phase 3b), `adcb897` (Phase 4a), `54b4a60` + `95472ec` + `6057373` + `ca32659` (review-fixup batch). All squash-merged via PR #22 as `2f56e87` on 2026-04-26. Phase 4b lands separately on `plan-b-task-55-phase-4b` via PR #23 — see the cadence pivot below.
 
-**Closure point:** PR #22 squash-merge — at which point the multi-commit branch collapses to a single mainline commit. The `[DEVIATION]` entry stays as a permanent record of the split.
+**Closure point:** PR #22 squash-merge for the foundation → Phase 4a chunk (closed at `2f56e87`). For the rest of Task 55 (Phases 4b–4f), the closure point is "all six Phase 4 PRs squash-merged" — currently 1/5 (Phase 4b at PR #23, in flight at the time of this addendum).
+
+**Cadence pivot (added 2026-04-26 in Phase 4b):** the original Deviation text claimed *"only one PR opens for Task 55"* but **that turned out wrong in practice**. After PR #22 landed, the remaining Phase 4 sub-tasks (4b–4f) pivoted to one PR per phase against `main`, each on its own branch (`plan-b-task-55-phase-4b`, etc.) — not commits on a continuing `plan-b-task-55` branch. The pivot reasoning:
+
+- **Reviewability:** PR #22 was already 2,373/-272 lines (8 files) and required two review rounds with 4 fixup commits; bundling 4b–4f on the same branch would have produced a ~6,000+ line PR with even more review surface.
+- **Independent CI cycles:** each Phase 4 sub-task is an independent restriction-lift; its CI failure is unlikely to be related to a sibling phase's CI failure. Per-phase PRs let CI fail isolated, not as a single bisect-unfriendly red.
+- **Rollback granularity:** if Phase 4d turns out wrong (e.g., the colorer's handler-discharge refinement isn't ready), reverting one PR is cleaner than reverting one commit out of a bundle.
+- **Review checkpoint cadence:** Plan B says *"every change in this plan should be reviewed by a human before merging."* Per-phase PRs honor that more naturally — each phase gets its own review pass instead of bundling restriction-lifts that the reviewer has to mentally split apart.
+
+The original Deviation text's "single-PR convention" claim is preserved unchanged above for historical accuracy, with this addendum to record what actually happened. Future agents resuming Task 55 work after this point should expect the per-phase-PR cadence: branch `plan-b-task-55-phase-{4c,4d,4e,4f}` against `main`, one focused PR per phase.
 
 ## 2026-04-26 — [DEVIATION Task 55] Phase 2 ships handle as body-pass-through; full CPS path in Phase 3+
 
@@ -64,15 +73,46 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** The simplest meaningful test program — `handle (perform Raise.fail()) with { Raise.fail(k) => 42 }` — exercises the entire FFI surface end-to-end (`frame_new → set_arm → push → sigil_perform → sigil_run_loop dispatch → arm fn → next_step_done → run_loop returns u64 → pop`) without committing to the much larger CPS calling convention infrastructure. The Phase 3b fixup commit (`2e7c0de`) inserted the `sigil_run_loop` step between `sigil_perform` and the value extraction; codegen no longer reads the `NextStep` layout directly (it just consumes `run_loop`'s `u64` return). The simplifying restrictions can be lifted one at a time, each as its own focused commit. The single-shot one-shot-arm path is also the most common handler shape in practice (Raise-style early-exit), so it's not just a stepping stone — it covers a real use case.
 
-**Implementing commit(s):** `d0aa4c4` (Phase 3b initial), `2e7c0de` (Phase 3b fixup: route perform's NextStep::Call through `sigil_run_loop` instead of reading `(*ns).value` directly), `adcb897` (Phase 4a: multi-arm single-effect handlers).
+**Implementing commit(s):** `d0aa4c4` (Phase 3b initial), `2e7c0de` (Phase 3b fixup: route perform's NextStep::Call through `sigil_run_loop` instead of reading `(*ns).value` directly), `adcb897` (Phase 4a: multi-arm single-effect handlers), `[HEAD]` (Phase 4b: args-buffer packing on perform side).
 
 **Closure point** (per-restriction):
 - *Single arm* — closed in Phase 4a (`adcb897`).
-- *IntLit-only arm body* — pending Phase 4c (richer arm bodies via dedicated CPS-aware lowerer).
-- *Zero-arg ops* — pending Phase 4b (args-buffer packing on perform side, unpacking on arm side).
+- *IntLit-only arm body* — pending Phase 4c (richer arm bodies via dedicated CPS-aware lowerer; the arm side will read user-arg bindings from `args_ptr` once Phase 4b's perform-side packing lands).
+- *Zero-arg ops* — closed in Phase 4b (`[HEAD]`). Perform side packs user args into a stack-allocated `[u64; N]` buffer; the runtime copies them into the dispatched `NextStep::Call`'s args slots before invoking the arm fn. Arm bodies still ignore the buffer (Phase 4c lifts that — but the FFI plumbing is already end-to-end, so Phase 4c only needs to wire arm-side reads).
 - *No `k` use* — pending Phase 4d (continuation reification + lambda-lifting of perform's continuation).
 - *Single effect per handle* — pending Phase 4e (frame-per-effect).
 - *No return arm* — pending Phase 4f (synthetic return-fn registered via `sigil_handler_frame_set_return`).
+
+## 2026-04-26 — [DEVIATION Task 55] Phase 4b — args-buffer packing on perform side; stack-slot allocation; arm side still IntLit-only
+
+**Context:** Phase 3b (`d0aa4c4` + `2e7c0de`) and Phase 4a (`adcb897`) shipped the handler-arm dispatch path under five restrictions: single arm (closed in 4a), zero user op-args, IntLit-only arm body, no `k` use, single effect, no return arm. Phase 4b targets the second restriction: lifting the "non-IO perform must have zero user args" gate so handler-discharged effects can carry data.
+
+**Deviation:** The user-arg buffer is **stack-allocated** in the calling fn's frame via `FunctionBuilder::create_sized_stack_slot`, not arena-allocated through `sigil_arena_alloc`. The plan body specifies arena allocation only for `NextStep` records (Task 56's existing arena), not for the per-perform args buffer. The runtime's `sigil_perform` documentation (Task 56's `args_ptr` safety contract) treats the args buffer as caller-owned and copies values into the dispatched `NextStep::Call`'s slots before returning, so the buffer's lifetime only needs to outlive `sigil_perform`'s call site. A stack slot in the perform's enclosing function frame trivially satisfies that — no escape risk, no arena traffic on the hot path, no GC interaction (Boehm doesn't scan stack slots; the runtime conservatively scans the arena).
+
+The arm fn side stays untouched in Phase 4b: arm bodies remain `Expr::IntLit` (Phase 4c lifts that), so the synthetic arm fn that runs under the trampoline ignores the `args_ptr` parameter it receives. The end-to-end FFI plumbing now carries packed args through `lower_perform_non_io_to_value` → `sigil_perform` → `sigil_run_loop` → arm fn invocation, but the arm fn doesn't read from args_ptr until Phase 4c wires arm-body lowering. This split is deliberate: Phase 4b's risk is exclusively in the perform-side buffer-layout / widening / overflow path; bundling Phase 4c's arm-side reads would conflate the two failure modes.
+
+**Per-arg widening:** Cranelift values are widened to `u64` before the slot store. `I64` (Sigil `Int`) and `pointer_ty` (`String`, user-type heap pointers — pointer_ty is `I64` on every supported target: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`) store directly. `I8` (Bool, Byte, Unit) and `I32` (Char) are zero-extended via `uextend` because Sigil's surface integer types treat narrower payloads as unsigned and `sigil_perform` reads slots as `u64`. Cranelift's load-store width invariants would otherwise reject the slot store; alignment is `align_shift = 3` (8-byte) matching `sigil_perform`'s `args_ptr.add(i)` u64-stride read.
+
+**Bound check:** A defensive `debug_assert!` in `lower_perform_non_io_to_value` rejects `args.len() + 2 > MAX_INLINE_ARGS` in dev builds, mirroring (but deliberately weaker than) the runtime's `sigil_perform` overflow check. The runtime's check is the source of truth — it aborts with a named `effect_id` / `op_id` message that's strictly better than the codegen-side "internal compiler error" panic; the compiler-side `debug_assert!` exists to catch the bug pre-link in dev builds before the runtime guard fires. The `+2` accounts for the implicit `(k_closure, k_fn)` slots the runtime appends to every dispatched arg vector. v1's effect arities (Raise / State / Choose, all 0–2 user args) sit well below the cap. The constant lives in `sigil_abi::effect::MAX_INLINE_ARGS` (moved from `sigil_runtime::handlers` in this commit so compiler and runtime share one source); a future operation needing > 30 user args would require boxing — flagged in the Task 56 MAX_INLINE_ARGS deviation entry, not in scope for Plan B.
+
+**Float / 32-bit-target safety net:** The widening fallthrough (after the I64 / I8 / I32 branches) uses an `assert!` (not `debug_assert!`) so a future F32 / F64 surface type or a 32-bit target port that smuggles a non-pointer-width value through the args-buffer path panics in *both* dev and release builds rather than silently storing the bit-pattern as if it were a pointer-sized value. Cheap insurance until v2 either adds floats with an explicit branch or this assertion fires and forces the question.
+
+**Rationale:** Stack-slot allocation is the smallest meaningful change to the perform-side codegen path that lifts the zero-arg gate. It avoids arena-traffic regressions on a path that already touches the arena once per perform (via `sigil_next_step_call` → `sigil_arena_alloc` for the `NextStep::Call` record). It also keeps the per-perform allocation cost amortised into the frame-allocation Cranelift already performs at fn entry (no per-perform `malloc`-equivalent). Arm-side reads are deferred to Phase 4c so the perform-side change can be reviewed in isolation; bundling both would double the diff and conflate two distinct failure modes (perform-side packing vs arm-side unpacking).
+
+**Implementing commit(s):** `[HEAD]`.
+
+**Closure point:** the closure-point references in the original Phase-3b restrictions entry (above) update in lockstep — *Zero-arg ops* moves to closed at this commit; *IntLit-only arm body* gains the dependency note that Phase 4c only needs to wire the arm-side reads (the FFI plumbing is already end-to-end). Stack-slot allocation here ships under the synchronous `lower_perform_non_io_to_value` → `sigil_perform` → `sigil_run_loop` call pattern; **Phase 4d** migrates the args buffer from stack to arena (`sigil_arena_alloc`) when perform sites convert to returning `NextStep::Call` to the caller's trampoline rather than synchronously calling `sigil_run_loop` — at that point the stack slot dies before the trampoline reads it on the next dispatch. The dependency is also documented inline at the `create_sized_stack_slot` call site (`compiler/src/codegen.rs::lower_perform_non_io_to_value`) and cross-references the `[DEVIATION Task 55] Native callers drive sigil_run_loop synchronously` entry.
+
+**Acceptance precondition for Phase 4c — args-content verification (PR #23 review MF1).** The three e2e tests landed by Phase 4b (`handle_with_int_arg_op_packs_args_buffer`, `handle_with_three_int_args_packs_buffer`, `handle_with_mixed_type_args_widens_correctly`) only verify that the FFI plumbing compiles and runs without crashing — they do **not** verify that the widened values delivered to the runtime match the source values. The arm bodies are still `Expr::IntLit` (Phase 4c restriction), so the arm fn ignores `args_ptr` and returns its literal regardless of the buffer's contents. Off-by-one slot offsets, wrong-direction widening (`uextend` vs `sextend`), wrong endianness, and off-by-one `args_len` would all land green under Phase 4b's coverage.
+
+Phase 4c's PR is therefore **required to ship arg-content-verification e2e tests** as a precondition of merging — at minimum:
+
+1. **Int arg readback** — arm body returns the bound op-arg (or arithmetic on it); `perform Effect.op(N)` with a known `N` must observe `N` arrives at the arm.
+2. **Bool / Char arg readback** — exercises the `uextend` widening path. `perform Effect.op(true)` returning the bool from the arm must round-trip; same for a `Char` value via `int_to_string` of its codepoint.
+3. **String arg readback** — exercises the pointer-store path. `perform Effect.op("hi")` returning the bound name and printing it via `IO.println` must produce the source string.
+4. **Multi-arg readback in declared order** — `perform Effect.op(10, 20, 30)` with an arm that returns one of the three (e.g. `(a, b, c, k) => b`) must observe `20`, pinning that the offset arithmetic on the perform side matches the runtime's `args_ptr.add(i)` u64-stride read.
+
+These tests are **deferred from Phase 4b** because the arm side cannot read bound names until Phase 4c lifts the IntLit-only restriction; deferring them is the cheapest of the three options the reviewer offered (vs adding a runtime `#[cfg(test)]` verification path or a codegen-side direct-FFI test that reads back the stack slot). The trade-off: a Phase 4b regression in widening / offset arithmetic would land green now and only surface when Phase 4c lands. A bisecting agent investigating a wrong-args-value bug after Phase 4c lands should treat this entry as a pointer back to Phase 4b (`[HEAD]`) as the suspect — the args-packing path was added there.
 
 ## 2026-04-26 — [DEVIATION Task 55] `unsupported_handle_construct` walker does not follow call edges
 
@@ -82,9 +122,9 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** Following call edges in the codegen-entry walker would require fixed-point analysis over the call graph (intentional, since a fn could call another that performs) and would duplicate work the colorer already does. Leaving the walker syntactic keeps it simple and CI-fast. The standing precondition that programs reach codegen with all `Item::Effect` registered + all op IDs assigned + every reachable handle visible to the per-arm CPS-fn synthesis pre-pass holds regardless of transitive analysis — those passes walk every fn body, so a perform reached via a call edge gets its `effect_id` / `op_id` looked up correctly.
 
-**Implementing commit(s):** original walker `2d69b52`, recursion fix into nested handle bodies `54b4a60`.
+**Implementing commit(s):** original walker `2d69b52`, recursion fix into nested handle bodies `54b4a60`, op-arg gate lifted at `[HEAD]` (Phase 4b).
 
-**Closure point:** Phase 4b (op-arg packing) lifts the "non-IO perform with args" gate, at which point the walker's guard check becomes `if body_contains_unsupported_op_arg(body)` — still syntactic, still shallow, still serving the same Phase-4 ergonomic role. Phase 4c/4d may need a colorer-driven check (per-monomorph color variance under handler-context — the PR #18 reviewer's open ask) to decide which monomorphs sit at the native↔CPS boundary; that check is NOT a property of the walker, it's a property of color inference, and it lives in `compiler/src/color.rs`. The walker stays as-is.
+**Closure point:** Phase 4b (`[HEAD]`) lifted the "non-IO perform with args" gate. The walker's `arm.params.is_empty()` check and the `body_contains_non_io_perform_with_args` traversal were both removed; the now-dead `body_contains_non_io_perform_filtered` / `block_contains_non_io_perform_filtered` helpers were deleted with them. The walker still rejects multi-effect arms (Phase 4e), non-IntLit arm bodies (Phase 4c), and return arms (Phase 4f) — those gates remain syntactic + shallow + Phase-4 ergonomic. Phase 4c/4d may need a colorer-driven check (per-monomorph color variance under handler-context — the PR #18 reviewer's open ask) to decide which monomorphs sit at the native↔CPS boundary; that check is NOT a property of the walker, it's a property of color inference, and it lives in `compiler/src/color.rs`.
 
 ## 2026-04-26 — [DEVIATION Task 55] Handler frame leaks on body unwind; depends on Task 57 to surface
 
@@ -1158,10 +1198,18 @@ operations; the cap is a forward-compat boundary, not a current
 constraint.
 
 **Implementing commit:** [HEAD]
-**Closure point:** Task 55 (when codegen produces the first
-`sigil_perform` call site that needs to consult `MAX_INLINE_ARGS`).
-The cap can be raised in a future plan by changing one constant and
-re-checking call sites; v1 lacks any concrete need.
+**Closure point:** closed in Task 55 Phase 4b (`[HEAD]`). Codegen's
+`lower_perform_non_io_to_value` now packs user args into a stack-
+allocated `[u64; N]` buffer and reads `MAX_INLINE_ARGS` from
+`sigil_abi::effect` (moved from `sigil_runtime::handlers` so both the
+compiler and runtime read from one source); a defensive
+`debug_assert` at the perform-site catches any operation that exceeds
+`MAX_INLINE_ARGS - 2` user args before the runtime's matching check
+fires. v1's effect arities (Raise / State / Choose, all 0–2 user
+args) are well below the cap; the constant can be raised in a future
+plan by editing `sigil_abi::effect::MAX_INLINE_ARGS` and re-checking
+the runtime's matching constants in `sigil_run_loop`'s stack-resident
+args buffer.
 
 ---
 

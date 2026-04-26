@@ -520,25 +520,28 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
             op_arms,
             span,
         } => {
-            // Phase 3b constraints (lifted incrementally as the
+            // Phase 4b constraints (lifted incrementally as the
             // CPS path matures):
-            //   - exactly one op-arm (Phase 4+ lifts; runtime frame
-            //     supports up to MAX_HANDLER_ARMS=14)
-            //   - arm body is `Expr::IntLit` only (Phase 4+ lifts;
-            //     this avoids needing a CPS-aware lowerer for arm
-            //     bodies in this commit — the arm body gets its
-            //     value packed via `sigil_next_step_done(value)`)
-            //   - arm has no user op-args (zero-arity ops only)
-            //     (Phase 4+ lifts; would need args-buffer packing on
-            //     the perform side and unpacking on the arm side)
-            //   - no return arm (Phase 4+ lifts; needs a synthetic
+            //   - arm body is `Expr::IntLit` only (Phase 4c lifts
+            //     via a CPS-aware lowerer that handles op-arg
+            //     reads from `args_ptr`, `k` usage via
+            //     `sigil_next_step_call`, and outer-scope captures
+            //     through a closure record)
+            //   - arms cannot reference `k` (Phase 4d lifts via
+            //     continuation reification + lambda-lifting of the
+            //     perform's continuation)
+            //   - no return arm (Phase 4f lifts via a synthetic
             //     return-fn registered via
             //     sigil_handler_frame_set_return)
-            //   - body's non-IO performs only target the arm's effect
-            //     (typecheck enforces this; Phase 3b doesn't add an
-            //     extra check)
-            //   - body's non-IO perform must be zero-arg (Phase 4+
-            //     lifts; needs args-buffer packing)
+            //   - all arms reference the same effect (Phase 4e
+            //     lifts via frame-per-effect)
+            //   - body's non-IO performs only target the arm's
+            //     effect (typecheck enforces this; codegen doesn't
+            //     add an extra check)
+            // Phase 4b LIFTED: arms may declare user params; non-
+            // IO performs in the body may pass user args. Args are
+            // packed by `lower_perform_non_io_to_value` into a
+            // stack-allocated u64 buffer.
             if return_arm.is_some() {
                 return Some(format!(
                     "`handle` expression at {:?} has a `return` arm — `return` \
@@ -616,42 +619,22 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
                     }
                 }
             }
-            // Phase 3b restriction (still in force in 4a): each arm
-            // must have no user op-args (only the `k` continuation
-            // binding). Op-arg unpacking arrives in Phase 4b.
-            for arm in op_arms.iter() {
-                if !arm.params.is_empty() {
-                    return Some(format!(
-                        "`handle` expression at {:?} has arm `{}.{}` with {} \
-                         user param(s) — Phase 3b/4a only support zero-user-arg \
-                         arms (Plan B Task 55, in progress; op-arg passing \
-                         arrives in Phase 4b)",
-                        span,
-                        arm.effect,
-                        arm.op,
-                        arm.params.len()
-                    ));
-                }
-            }
-            // Phase 3b restriction (still in force in 4a): any
-            // non-IO perform in the body must be zero-arg. The
-            // perform args-buffer packing path lands in Phase 4b.
-            if let Some((eff, op)) = body_contains_non_io_perform_with_args(body) {
-                return Some(format!(
-                    "`handle` expression at {:?} has body whose non-IO \
-                     `perform {}.{}(...)` site passes user args — Phase 3b \
-                     minimum only supports zero-arg performs (Plan B Task \
-                     55, in progress; args-buffer packing arrives in \
-                     Phase 4+)",
-                    span, eff, op
-                ));
-            }
+            // Phase 4b lifts the previous "no user op-args" restriction.
+            // Arms may now declare user params and perform sites in the
+            // body may pass user args; they're packed by
+            // `lower_perform_non_io_to_value` into a stack-allocated u64
+            // buffer and read by `sigil_perform` (which copies them into
+            // the dispatched `NextStep::Call`'s args slots before the
+            // arm fn runs). The arm fn's body is still IntLit-only
+            // (Phase 4c lifts that), so the arm fn currently ignores
+            // the args_ptr it receives — but the FFI plumbing now
+            // carries the packed buffer end-to-end so Phase 4c can
+            // wire arg-binding consumption without re-touching the
+            // perform side.
             // Recurse into the body itself so a nested handle inside
             // the body (e.g. `handle (handle ... with { ... }) with
             // { ... }`) surfaces its own diagnostics. Without this,
-            // `body_contains_non_io_perform_filtered` short-circuits
-            // on `Expr::Handle { .. } => None` and the inner handle's
-            // multi-effect / non-IntLit / return-arm / multi-arg
+            // the inner handle's multi-effect / non-IntLit / return-arm
             // restrictions are never enforced — at runtime that can
             // register arms under the wrong effect_id and crash inside
             // `sigil_perform`'s handler-stack walk.
@@ -668,129 +651,6 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
             None
         }
     }
-}
-
-/// Returns `Some((effect_name, op_name))` of the first non-IO
-/// `Expr::Perform` site within `e` whose `args` is non-empty (i.e.
-/// the perform passes user args to the runtime, which Phase 3b
-/// minimum doesn't yet support — see the args-buffer packing TODO
-/// in `lower_perform_non_io_to_value`). Recurses through all
-/// sub-expressions and stmts.
-fn body_contains_non_io_perform_with_args(e: &crate::ast::Expr) -> Option<(String, String)> {
-    body_contains_non_io_perform_filtered(e, |p| !p.args.is_empty())
-}
-
-fn body_contains_non_io_perform_filtered(
-    e: &crate::ast::Expr,
-    pred: impl Fn(&crate::ast::PerformExpr) -> bool + Copy,
-) -> Option<(String, String)> {
-    use crate::ast::Expr;
-    match e {
-        Expr::IntLit(..)
-        | Expr::StringLit(..)
-        | Expr::BoolLit(..)
-        | Expr::CharLit(..)
-        | Expr::Ident(..)
-        | Expr::ClosureEnvLoad { .. } => None,
-        Expr::Binary { lhs, rhs, .. } => body_contains_non_io_perform_filtered(lhs, pred)
-            .or_else(|| body_contains_non_io_perform_filtered(rhs, pred)),
-        Expr::Unary { operand, .. } => body_contains_non_io_perform_filtered(operand, pred),
-        Expr::If {
-            cond,
-            then_block,
-            else_block,
-            ..
-        } => body_contains_non_io_perform_filtered(cond, pred)
-            .or_else(|| block_contains_non_io_perform_filtered(then_block, pred))
-            .or_else(|| block_contains_non_io_perform_filtered(else_block, pred)),
-        Expr::Block(b) => block_contains_non_io_perform_filtered(b, pred),
-        Expr::Match {
-            scrutinee, arms, ..
-        } => {
-            if let Some(p) = body_contains_non_io_perform_filtered(scrutinee, pred) {
-                return Some(p);
-            }
-            for a in arms {
-                if let Some(p) = body_contains_non_io_perform_filtered(&a.body, pred) {
-                    return Some(p);
-                }
-            }
-            None
-        }
-        Expr::Call { callee, args, .. } => {
-            if let Some(p) = body_contains_non_io_perform_filtered(callee, pred) {
-                return Some(p);
-            }
-            for a in args {
-                if let Some(p) = body_contains_non_io_perform_filtered(a, pred) {
-                    return Some(p);
-                }
-            }
-            None
-        }
-        Expr::Perform(p) => {
-            if p.effect != "IO" && pred(p) {
-                Some((p.effect.clone(), p.op.clone()))
-            } else {
-                None
-            }
-        }
-        Expr::Lambda { body, .. } => body_contains_non_io_perform_filtered(body, pred),
-        Expr::ClosureRecord { env_exprs, .. } => {
-            for ee in env_exprs {
-                if let Some(p) = body_contains_non_io_perform_filtered(ee, pred) {
-                    return Some(p);
-                }
-            }
-            None
-        }
-        Expr::RecordLit { fields, .. } => {
-            for f in fields {
-                if let Some(p) = body_contains_non_io_perform_filtered(&f.value, pred) {
-                    return Some(p);
-                }
-            }
-            None
-        }
-        Expr::Handle { .. } => None,
-    }
-}
-
-fn block_contains_non_io_perform_filtered(
-    b: &crate::ast::Block,
-    pred: impl Fn(&crate::ast::PerformExpr) -> bool + Copy,
-) -> Option<(String, String)> {
-    use crate::ast::Stmt;
-    for s in &b.stmts {
-        match s {
-            Stmt::Let(l) => {
-                if let Some(p) = body_contains_non_io_perform_filtered(&l.value, pred) {
-                    return Some(p);
-                }
-            }
-            Stmt::Expr(e) => {
-                if let Some(p) = body_contains_non_io_perform_filtered(e, pred) {
-                    return Some(p);
-                }
-            }
-            Stmt::Perform(p) => {
-                if p.effect != "IO" && pred(p) {
-                    return Some((p.effect.clone(), p.op.clone()));
-                }
-                for a in &p.args {
-                    if let Some(q) = body_contains_non_io_perform_filtered(a, pred) {
-                        return Some(q);
-                    }
-                }
-            }
-        }
-    }
-    if let Some(tail) = &b.tail {
-        if let Some(p) = body_contains_non_io_perform_filtered(tail, pred) {
-            return Some(p);
-        }
-    }
-    None
 }
 
 /// Plan B Task 55 (Phase 3b) — per-handler-arm synthetic CPS fn
@@ -2015,9 +1875,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .push_placeholder(function_code_offset(&self.builder, call));
     }
 
-    /// Plan B Task 55 (Phase 3b) — lower a non-IO `perform Effect.op(...)`
-    /// site. Phase 3b minimum: zero-arg op (`args_len == 0`,
-    /// `args_ptr == null`), null continuation (arms ignore `k`).
+    /// Plan B Task 55 (Phase 4b) — lower a non-IO `perform Effect.op(args...)`
+    /// site. Phase 4b adds args-buffer packing on the perform side: each
+    /// user arg is lowered, widened to `u64` if narrower, and stored at
+    /// offset `i*8` in a stack-allocated `[u64; args_len]` buffer. The
+    /// buffer's address + length are passed to `sigil_perform`, which
+    /// copies them into the dispatched `NextStep::Call`'s args slots
+    /// before the arm fn runs.
+    ///
+    /// The continuation pair `(k_closure_ptr, k_fn_ptr)` stays null in
+    /// Phase 4b — Phase 4d reifies the perform's continuation. The
+    /// codegen-entry guard still rejects arms that reference `k`.
+    ///
     /// `sigil_perform` returns a `NextStep::Call` that targets the
     /// matching arm fn; we hand that off to `sigil_run_loop`, which
     /// drives the CPS trampoline to a terminal `NextStep::Done` and
@@ -2025,13 +1894,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// (cast to i64 via the type system; for Int returns this is the
     /// raw untagged Int per the Plan B Int ABI).
     fn lower_perform_non_io_to_value(&mut self, p: &crate::ast::PerformExpr) -> Value {
-        // Phase 3b restriction: non-IO performs in handle bodies can
-        // only have zero user args (the `unsupported_handle_construct`
-        // walker enforces this). Asserted defensively here.
-        assert!(
-            p.args.is_empty(),
-            "codegen Phase 3b: non-IO perform must have zero user args; \
-             unsupported_handle_construct guard should have caught this"
+        // Bound check (defense-in-depth — runtime's `sigil_perform`
+        // is the source of truth and aborts with a named effect_id /
+        // op_id message on `args_len + 2 > MAX_INLINE_ARGS`). The
+        // compiler-side `debug_assert!` here catches the bug in dev
+        // builds before linking; release builds let the runtime's
+        // named guard fire so users get the better diagnostic. v1
+        // ops use 0–2 user args; the cap (30 user args after
+        // subtracting the two implicit `(k_closure, k_fn)` slots)
+        // is a forward-compat boundary documented in the Task 56
+        // MAX_INLINE_ARGS deviation.
+        debug_assert!(
+            (p.args.len() as u32).saturating_add(2) <= sigil_abi::effect::MAX_INLINE_ARGS,
+            "codegen: non-IO perform `{}.{}` has {} user args, exceeding \
+             MAX_INLINE_ARGS - 2 = {} (boxing path arrives in a future plan)",
+            p.effect,
+            p.op,
+            p.args.len(),
+            sigil_abi::effect::MAX_INLINE_ARGS - 2
         );
         let effect_id = match self.effect_ids.get(&p.effect) {
             Some(id) => *id,
@@ -2051,17 +1931,106 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         };
         let effect_id_v = self.builder.ins().iconst(types::I32, effect_id as i64);
         let op_id_v = self.builder.ins().iconst(types::I32, op_id as i64);
-        // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4b):
-        // `null_args_ptr` + `zero_len` here pin the zero-arg
-        // restriction. Phase 4b adds args-buffer packing on the
-        // perform side (alloca an `[u64; N]` of user-arg slots, store
-        // each arg's tagged representation, pass the buffer pointer
-        // and `args_len = N` here) and unpacking on the arm side.
-        // The codegen-entry guard's `body_contains_non_io_perform_with_args`
-        // check enforces that this site only runs on zero-arg ops
-        // today.
-        let null_args_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
-        let zero_len = self.builder.ins().iconst(types::I32, 0);
+
+        // Phase 4b — pack user args into a stack-allocated `[u64; N]`
+        // buffer. The buffer lives in this fn's frame, which outlives
+        // `sigil_perform` (the runtime copies args into the dispatched
+        // `NextStep::Call`'s slots before returning), so a stack slot
+        // is sound under Phase 4b's synchronous calling pattern. Each
+        // arg is widened to u64 via `uextend` if its Cranelift type
+        // is narrower than I64; pointer-typed args (already pointer-
+        // width on supported targets) store directly.
+        //
+        // Empty-args case: `args_ptr` stays null, `args_len == 0`. The
+        // runtime accepts a null `args_ptr` only when `args_len == 0`
+        // (per the safety contract on `sigil_perform`).
+        let (args_ptr, args_len_v) = if p.args.is_empty() {
+            (
+                self.builder.ins().iconst(self.pointer_ty, 0),
+                self.builder.ins().iconst(types::I32, 0),
+            )
+        } else {
+            // Lower each arg first so any side effects in the arg
+            // expressions sequence before the slot stores in source
+            // order. (This matches Cranelift's typical evaluation
+            // order; explicit ordering keeps the intent clear.)
+            let arg_values: Vec<Value> = p.args.iter().map(|a| self.lower_expr(a)).collect();
+
+            // 8-byte slots; align_shift = 3 means 2^3 = 8-byte aligned,
+            // matching the runtime's `args_ptr.add(i)` u64-stride
+            // reads in `sigil_perform`.
+            //
+            // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4d):
+            // stack-slot allocation here is sound *only* under the
+            // synchronous `lower_perform_non_io_to_value` →
+            // `sigil_perform` → `sigil_run_loop` chain that returns
+            // before this fn does (the runtime copies args into the
+            // dispatched `NextStep::Call`'s arena slots before
+            // returning, so the stack slot only needs to outlive the
+            // synchronous call). Phase 4d converts perform sites to
+            // return `NextStep::Call` to the caller's trampoline
+            // rather than synchronously calling `sigil_run_loop` from
+            // native code; at that point this stack slot dies before
+            // the trampoline reads it on the next dispatch and the
+            // args buffer must migrate to arena allocation via
+            // `sigil_arena_alloc`. Closure point cross-references the
+            // `[DEVIATION Task 55] Native callers drive sigil_run_loop
+            // synchronously` entry. See also the `[DEVIATION Task 55]
+            // Phase 4b — args-buffer packing on perform side` entry.
+            let slot_bytes = (p.args.len() * 8) as u32;
+            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                slot_bytes,
+                3,
+            ));
+
+            for (i, arg_v) in arg_values.into_iter().enumerate() {
+                let arg_ty = self.builder.func.dfg.value_type(arg_v);
+                let widened = if arg_ty == types::I64 {
+                    arg_v
+                } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                    // I8 (Bool/Byte/Unit) and I32 (Char) widen by
+                    // zero-extension. Sigil's surface Int type is
+                    // already I64; smaller integer types are all
+                    // unsigned-by-convention payload values, so
+                    // `uextend` preserves the value bit-pattern the
+                    // arm fn would observe under direct call.
+                    self.builder.ins().uextend(types::I64, arg_v)
+                } else {
+                    // pointer_ty is I64 on every supported target
+                    // (x86_64-linux, aarch64-darwin); v1 has no F32
+                    // / F64 surface type. A future floats addition
+                    // would silently miscompile through this fall-
+                    // through (storing the bit-pattern as if it
+                    // were a pointer-sized value), so we panic
+                    // here in *both* dev and release builds rather
+                    // than `debug_assert_eq!` — a cheap insurance
+                    // policy until v2 either adds floats with an
+                    // explicit branch or this assertion fires and
+                    // forces the question. A future 32-bit target
+                    // port would also need a uextend or bitcast
+                    // branch here for pointer args.
+                    assert_eq!(
+                        arg_ty, self.pointer_ty,
+                        "codegen: unexpected arg Cranelift type \
+                         {arg_ty:?} for non-IO perform args buffer \
+                         — Phase 4b only supports I64 (Int), I32 (Char), \
+                         I8 (Bool/Byte/Unit), and pointer_ty (String / \
+                         user-type pointers); floats and 32-bit-target \
+                         pointer types need a dedicated branch"
+                    );
+                    arg_v
+                };
+                self.builder
+                    .ins()
+                    .stack_store(widened, slot, (i * 8) as i32);
+            }
+            (
+                self.builder.ins().stack_addr(self.pointer_ty, slot, 0),
+                self.builder.ins().iconst(types::I32, p.args.len() as i64),
+            )
+        };
+
         // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4d):
         // `null_k_closure` + `null_k_fn` pin the no-k-usage
         // restriction. Phase 4d reifies the perform's continuation
@@ -2077,8 +2046,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             &[
                 effect_id_v,
                 op_id_v,
-                null_args_ptr,
-                zero_len,
+                args_ptr,
+                args_len_v,
                 null_k_closure,
                 null_k_fn,
             ],

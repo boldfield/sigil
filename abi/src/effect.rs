@@ -36,6 +36,20 @@ pub const NEXT_STEP_TAG_DONE: u32 = 0;
 /// closure with the carried argument list, then dispatch on the result.
 pub const NEXT_STEP_TAG_CALL: u32 = 1;
 
+/// Maximum user-arg count a `perform` site can pack into the inline args
+/// buffer (plus the implicit `(k_closure_ptr, k_fn_ptr)` pair the runtime
+/// appends, so the trampoline-side cap is `MAX_INLINE_ARGS + 2` total
+/// dispatched values). Sized to comfortably exceed v1 effect arities
+/// (Raise, State, Choose all use 0–2 user args) without growing the
+/// stack-resident `args_buf` in `sigil_run_loop`.
+///
+/// Cross-boundary constant: the compiler's args-buffer packing in
+/// `lower_perform_non_io_to_value` (Task 55 Phase 4b) and the runtime's
+/// `sigil_perform` / `sigil_next_step_call` / `sigil_run_loop` overflow
+/// checks all read from this single source. Bumping it requires
+/// auditing both sides.
+pub const MAX_INLINE_ARGS: u32 = 32;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +63,13 @@ mod tests {
         assert_eq!(NEXT_STEP_TAG_DONE, 0);
         assert_eq!(NEXT_STEP_TAG_CALL, 1);
         assert_ne!(NEXT_STEP_TAG_DONE, NEXT_STEP_TAG_CALL);
+    }
+
+    #[test]
+    fn max_inline_args_pinned_at_32() {
+        // Pinning the literal: codegen and runtime overflow checks
+        // both read this constant, so a bump requires auditing both
+        // sides + the GC test in `runtime/src/handlers.rs`.
+        assert_eq!(MAX_INLINE_ARGS, 32);
     }
 }
