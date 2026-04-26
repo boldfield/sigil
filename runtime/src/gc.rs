@@ -29,6 +29,42 @@ extern "C" {
     // payload) so Boehm can skip scanning them during mark phases. Safe on
     // all supported hosts.
     fn GC_malloc_atomic(size: usize) -> *mut c_void;
+    // Register `[start, end)` as a GC root. Boehm scans the range
+    // conservatively for pointer-shaped values on every mark phase.
+    // Plan B Task 56 uses this to root `HANDLER_STACK` (the thread-local
+    // handler-stack head) and the per-thread arena's backing storage,
+    // both of which would otherwise sit outside Boehm's automatic scan
+    // (TLS slots are not enumerated portably; the arena's `Vec<u8>`
+    // payload lives on the system allocator's heap, not Boehm's).
+    pub(crate) fn GC_add_roots(start: *mut c_void, end: *mut c_void);
+    // Symmetric counterpart to `GC_add_roots`. Used by
+    // `GcThreadEnrolment::drop` in tests to unregister a thread-local
+    // root range when the thread is about to exit (cargo test spawns
+    // a fresh thread per test under `--test-threads=N`; without
+    // unregistration, stale ranges from finished test threads pile up
+    // in Boehm's root list and segfault on the next collection).
+    #[cfg(test)]
+    pub(crate) fn GC_remove_roots(start: *mut c_void, end: *mut c_void);
+    // Force a full GC cycle. Used by GC stress tests to deterministically
+    // exercise reachability — without it, a passing test under low
+    // allocation pressure does not prove rootedness; with it, an unrooted
+    // pointer is reliably collected and the test trips. Not called by
+    // production code paths; gated to test builds so the extern linkage
+    // is not pulled into release binaries.
+    #[cfg(test)]
+    pub(crate) fn GC_gcollect();
+    // Boehm thread enrolment used by GC stress tests in this crate. A
+    // Rust test thread is not auto-registered with Boehm (see
+    // `test_support` module for the historical context); calling
+    // `GC_gcollect` from such a thread triggers Boehm's "Collecting
+    // from unknown thread" abort. Tests that need to force collection
+    // must enrol their thread first.
+    #[cfg(test)]
+    pub(crate) fn GC_allow_register_threads();
+    #[cfg(test)]
+    pub(crate) fn GC_register_my_thread(stack_base: *const c_void) -> i32;
+    #[cfg(test)]
+    pub(crate) fn GC_unregister_my_thread() -> i32;
 }
 
 // `atexit` from the C runtime. Used by `sigil --print-runtime-stats` to
@@ -72,6 +108,35 @@ pub extern "C" fn sigil_gc_init() {
             unsafe { atexit(counter_atexit_cb) };
         }
     });
+
+    // Plan B Task 56: register the calling thread's runtime roots with
+    // Boehm. Both `HANDLER_STACK` (the thread-local handler-stack head)
+    // and `ARENA` (the per-dispatch bump arena's backing storage) hold
+    // pointers to Boehm-allocated objects; without explicit rooting,
+    // Boehm's automatic stack/data-segment scan does not cover them in
+    // any portable way (`thread_local!` storage is not enumerated by
+    // `dl_iterate_phdr`, and the arena's `Vec<u8>` payload sits on the
+    // system allocator's heap, not Boehm's).
+    //
+    // Per-thread (NOT inside the `Once`): the calling thread may not
+    // be the same thread that won the `Once` race for `GC_init`, and
+    // every thread that uses these TLS slots must root them itself.
+    // The registration helpers are idempotent per thread.
+    //
+    // **Test-mode caveat:** under `cargo test`, the test runner
+    // spawns a fresh thread per test. Auto-registering each test
+    // thread's TLS ranges as Boehm roots leaks stale ranges when the
+    // thread exits, which segfaults the next collection. In test
+    // builds the auto-registration is suppressed; tests opt in via
+    // `GcThreadEnrolment::acquire` (in `test_support`), which
+    // registers AND unregisters symmetrically through Drop. Production
+    // builds run on a single long-lived main thread so leakage is
+    // not a concern.
+    #[cfg(not(test))]
+    {
+        crate::handlers::register_handler_stack_root_for_calling_thread();
+        crate::arena::register_arena_root_for_calling_thread();
+    }
 }
 
 /// Allocate `8 + payload_bytes` from Boehm, write the 8-byte header, and
@@ -97,6 +162,13 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
     counters::add(CounterId::BoehmAllocBytes, total as u64);
 
     let h = Header(header);
+    // The pointer bitmap selects between Boehm's atomic and conservative
+    // allocators. v1's bitmap is a binary signal (zero vs non-zero) at
+    // this layer — it does NOT inform precise per-slot scanning. The
+    // per-bit precision is v2-forward-compat metadata for a typed-walker
+    // GC; today, when `pointer_bitmap() != 0`, Boehm conservatively
+    // scans the entire allocated block and follows anything pointer-shaped.
+    // False-positive pinning is bounded by the block's size.
     let raw = if h.pointer_bitmap() == 0 {
         // No GC pointers in the payload — Boehm can skip scanning the
         // bytes (saves mark-phase cost). Atomic in Boehm's vocabulary.

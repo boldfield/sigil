@@ -27,5 +27,6 @@
 
 #![no_std]
 
+pub mod effect;
 pub mod stackmap;
 pub mod tag;

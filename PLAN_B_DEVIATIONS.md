@@ -111,8 +111,16 @@ accident — a developer writing `frame.args[0] = raw_int` instead of
 `frame.args[0] = tag(raw_int)` would compile and produce wrong-but-
 silent GC behavior under stress.
 
-**Closure point:** Task 56 (Stage 6 — `runtime/src/handlers.rs` and
-`runtime/src/arena.rs` ship the runtime-side data structures).
+**Closure point:** Task 55 (when codegen lowers the first Int-typed
+user arg into `args_buf`). Task 56 (this PR) ships the runtime-side
+data structures, but the `HandlerFrame` and `NextStep` slot types
+that would consume `TaggedInt` / `RawInt` newtypes are `*mut u8`
+pointers (closure_ptr, fn_ptr) and raw `u64` (args_buf entries). User
+`Int` args don't enter the frame layout until codegen lowers them via
+`args_buf` — that's the Task 55 boundary. Updated 2026-04-26 in this
+PR; the original "Task 56" label predicted the contract would land
+with the runtime structs, but the structs themselves don't carry
+typed Int slots in v1.
 
 **Picked mechanism:** **Newtype wrappers around `i64`.** Specifically:
 
@@ -801,3 +809,309 @@ rule using escape analysis without breaking source compatibility
 **Closure point:** open — refinements (escape analysis for
 lambda captures; `Linear[Bool]`-style use-count types) can land in
 a future plan without breaking the strict-pessimistic surface.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] Task 56 lands before Task 55
+
+**Plan body** numbers Task 55 (CPS transform on CPS-color
+monomorphs; arena-allocated `NextStep` records) before Task 56
+(runtime: `HandlerFrame`, arena, `sigil_perform`, `run_loop`,
+counters). The numerical order suggests codegen first, runtime
+second.
+
+**Implemented order:** Task 56 ships first in this PR; Task 55
+follows in the next PR.
+
+**Reasoning:** Task 55 lowers `Expr::Perform` and `Expr::Handle`
+to calls into `sigil_perform`, `sigil_handle_push`,
+`sigil_arena_alloc`, and `sigil_run_loop`. Those symbols are
+provided by Task 56. Implementing Task 55 first would require
+either:
+
+1. Stub runtime symbols that abort at runtime (the pre-Plan-B
+   state) — but then no e2e test can run, defeating the
+   acceptance signal.
+2. Inlining a temporary runtime in Task 55's PR that Task 56
+   later replaces — wastes review cycles on throw-away code.
+3. Combining 55 + 56 in a single mega-PR — the resulting diff
+   would be 3000+ LOC across both subsystems, against Plan B's
+   established cadence of one task per PR (PRs #15, #16, #17,
+   #19, #20). PR #18 was the only multi-task PR and combined the
+   2 LOC P16/P17 prompts with the 600+ LOC generic_map example.
+
+Order swapped because Task 56 is independently testable in
+isolation (Rust unit tests against the FFI symbols) and ships a
+clean, focused review surface. Task 55 lands as soon as the
+runtime is in main and reviewer-approved.
+
+**Plan order vs implementation order:**
+
+| Task | Plan body order | Ship order |
+|------|-----------------|------------|
+| 55   | first           | second     |
+| 56   | second          | first      |
+
+**`PLAN_B_PROGRESS.md` reflects this:** Task 55's entry stays
+`todo` after this PR; Task 56's entry flips to `done-pending-ci`.
+The Task 55 PR will flip Task 56 to `done` per the Plan A2
+PROGRESS-hygiene precedent (next PR closes the prior PR's
+done-pending-ci).
+
+**Implementing commit:** 9c6213e
+**Closure point:** closed at Task 55 PR merge (Task 55 is the
+direct consumer of Task 56's runtime surface; absent Task 55,
+Task 56's surface is dead code that the runtime ships but
+nothing calls).
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] Uniform CPS calling convention via packed args buffer
+
+**Plan body** (Stage 6 Task 55, paraphrased): "Handler arms
+become closures stored in the handler frame; the continuation
+`k` is passed to operation arms as an ordinary argument
+(post-CPS, continuations are values)." The plan implicitly
+assumes typed direct calls into CPS-color fns (e.g.
+`fn(closure_ptr, T1, T2, ...) -> NextStep` per fn).
+
+**Implemented form:** every CPS-color fn shares the uniform
+signature
+
+```text
+extern "C" fn cps_fn(
+    closure_ptr: *mut u8,
+    args_ptr:    *const u64,
+    args_len:    u32,
+) -> *mut NextStep
+```
+
+User arguments are widened to `u64` and packed into a
+caller-supplied buffer. Codegen emits an unpacking prologue per
+CPS-color fn that reads the args from the buffer according to
+the fn's known surface signature.
+
+**Reason for the deviation:** the trampoline (`sigil_run_loop`)
+dispatches `NextStep::Call` records by invoking the carried fn
+pointer. The fn's static signature varies per call site, but the
+trampoline only sees the dynamic `NextStep` payload. With typed
+direct calls, the trampoline would need either:
+
+1. **Per-arity dispatch** (`match arg_count { 0 => f0(...), 1 =>
+   f1(c, a0), 2 => f2(c, a0, a1), ... }`) capping the maximum
+   arity at compile-time and producing N transmute sites.
+2. **Hand-rolled assembly** to push `arg_count` u64 values onto
+   the calling-convention argument registers/stack and dispatch.
+   Non-portable across `x86_64-unknown-linux-gnu` /
+   `aarch64-apple-darwin`.
+3. **A per-fn thunk** emitted by codegen that reads args from a
+   buffer and tail-calls the typed body. Same total cost as the
+   uniform convention but with extra indirection.
+
+Option (1) caps effects to a fixed maximum arity and inflates
+code size with N variants. (2) is per-platform unsafe code. (3)
+is functionally equivalent to the uniform convention chosen
+here, just with a syntactic difference. The uniform convention
+keeps the trampoline portable, lets codegen emit a single CPS
+prologue shape per fn, and eliminates the arity dispatch
+problem entirely.
+
+**Cost:** every CPS-color fn pays a small per-call cost reading
+its args from the buffer (typically 1–3 64-bit loads). Cranelift
+inlines the load chain into the prologue; on benchmark
+workloads the overhead is dominated by the trampoline dispatch
+itself, not the unpack. Native-color fns (the common case for
+non-effect arithmetic like `fib`) keep the existing direct
+calling convention with no change.
+
+**Implementing commit:** 9c6213e
+**Closure point:** Task 55 ships the codegen prologue. If a
+performance-floor breach traces to the unpack overhead, the
+fallback is option (3) (per-fn thunk) which keeps the
+trampoline-side ABI unchanged.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] HandlerFrame reuses TAG_CLOSURE; Boehm-only GC tracking
+
+**Plan body** (Stage 6 Task 56) defines `HandlerFrame` with a
+specific shape but leaves the heap layout / object-tag question
+implicit.
+
+**Implemented form:** HandlerFrame heap objects are allocated
+via `sigil_alloc` with `TAG_CLOSURE` reused as the object tag.
+The 32-bit GC pointer bitmap explicitly marks the
+`return_closure`, `prev`, and per-arm `closure_ptr` slots so
+Boehm's mark phase walks them correctly. Function pointers
+(`return_fn`, `arms[i].fn_ptr`) are NOT marked — they reference
+`.text` not the GC heap.
+
+**Reason for tag reuse:** introducing `TAG_HANDLER_FRAME` would
+require extending `sigil-header-constants` (the workspace crate
+that owns the canonical 8-byte object header), which is shared
+across compiler and runtime and outside Task 56's scope. Boehm
+only consumes the pointer bitmap, not the tag, so the overload
+is functionally inert today. A future GC walker that
+introspects tags can add `TAG_HANDLER_FRAME` in a single line
+without touching this allocation site.
+
+**Capacity bound:** `MAX_HANDLER_ARMS = 13`. Bounded by the
+32-bit pointer bitmap: arm `i`'s closure_ptr lives at payload
+word `5 + 2*i`, so bit 31 corresponds to arm 13. v1 effects
+ship with 1–3 ops; the cap is comfortably above realistic v1
+needs. A future relaxation requires widening the bitmap field
+in the Sigil object header (out of scope for Plan B).
+
+**Implementing commit:** 9c6213e
+**Closure point:** open — TAG_HANDLER_FRAME slot can land in a
+future plan if a tag-aware GC walker arrives. The layout
+otherwise stable.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] Runtime TLS roots: register/unregister via Boehm `GC_add_roots`
+
+**Plan body** (Stage 6 Task 56) describes `HandlerFrame` and the
+trampoline arena without saying how either is reachable from Boehm's
+mark phase. PR #21 review (boldfield, 2026-04-26) flagged the gap as
+Critical #1 / M1: TLS storage holding the `HANDLER_STACK` head and the
+arena's `Vec<u64>` payload sits outside Boehm's automatic
+stack/data-segment scan, so a `HandlerFrame` reachable only through
+`HANDLER_STACK` (or a closure pointer reachable only through an arena
+slot) would be reclaimed mid-iteration on any nontrivial GC pressure.
+
+**Implemented form:** in `sigil_gc_init` after `GC_init`, the calling
+thread's `HANDLER_STACK` cell and `ARENA` storage range are registered
+with `GC_add_roots`, idempotent per thread via per-thread
+`HANDLER_STACK_ROOTED` and `ARENA_ROOTED` flags. The arena's
+`Vec<u64>` is non-reallocating after the first `try_reserve_exact` so
+the registered range stays valid for the thread's lifetime.
+
+**Test-mode caveat:** `cargo test` spawns a fresh thread per test;
+auto-registering each test thread's TLS would leak stale ranges in
+Boehm's root list when the thread exits, which segfaults the next
+collection. The auto-registration is therefore `cfg(not(test))`-only;
+test code opts in via `GcThreadEnrolment::acquire` (in
+`test_support`), an RAII guard that registers AND unregisters
+symmetrically on Drop (using `GC_remove_roots` + `GC_unregister_my_thread`).
+
+**Conservative-scan tradeoff:** Boehm scans the registered arena range
+`[start, start + capacity*8)` byte-by-byte and follows any
+pointer-shaped 8-byte value. The arena holds non-pointer u64 args
+alongside genuine `closure_ptr` slots; values that happen to alias
+Boehm-heap addresses pin those blocks until the next reset. The
+pinning is bounded by one trampoline iteration (every reset clears
+`len` to 0 AND zeros the just-cleared bytes so subsequent scans see
+only the active iteration's writes). Acceptable for v1; v2 may
+revisit by tracking precise pointer slots per `NextStep`.
+
+**Verification:** PR #21 ships three GC stress tests
+(`handler_frame_survives_forced_gc_while_pushed`,
+`closure_in_handler_arm_slot_survives_gc`,
+`closure_in_next_step_survives_gc_via_arena_root`) that allocate
+sentinel-bearing closures, push handlers, force `GC_gcollect`, and
+verify the survival contract. The tests run by default under `cargo
+test`. Each one's outer `#[test]` body re-execs the test binary with
+`--exact handlers::tests::<name> --nocapture` and a
+`SIGIL_GC_STRESS_INNER=1` env var; the inner subprocess runs only that
+single test, drops its `GcThreadEnrolment`, and exits. The OS reclaims
+all per-process state, so the Boehm thread enrolment / re-enrolment
+issue (cargo test thread teardown + Boehm thread re-registration on
+the next test in the same process) cannot accumulate stale ranges
+across tests.
+
+The subprocess pattern is the test-only counterpart to v1's
+single-threaded production model: every stress scenario runs on its
+own pristine thread that owns its registration for its lifetime. v2's
+multi-threaded trampoline will need a precise per-thread root
+lifecycle anyway; the production rooting contract is unchanged by
+this test-harness adaptation.
+
+**Implementing commit:** [HEAD]
+**Closure point:** closed at PR #21 merge.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] `MAX_INLINE_ARGS = 32` cap with bound-check at perform site
+
+**Plan body** doesn't specify a maximum effect arity. PR #21 review
+M5 / Important #7 / Important #8 flagged that `sigil_perform`'s
+trampoline-side check at `MAX_INLINE_ARGS = 32` (a) named the wrong
+layer in the error message (perform was the source, run_loop was the
+abort site), (b) wasted the arena allocation before discovering the
+overflow, and (c) hid a magic number Task 55's codegen will need to
+respect.
+
+**Implemented form:** `pub const MAX_INLINE_ARGS: u32 = 32` exported
+at the `handlers` module top, sized to comfortably exceed v1's effect
+arities (Raise, State, Choose all use 0–2 user args; the cap covers
+arbitrary one-shot effects with a hefty safety margin). Bound check
+moved up the stack:
+
+1. `sigil_perform` checks `args_len.saturating_add(2) > MAX_INLINE_ARGS`
+   first thing, naming the offending `effect_id` / `op_id` in the
+   abort message. The `+2` covers the implicit `(k_closure, k_fn)`
+   pair the runtime appends to the dispatched arg vector.
+2. `sigil_next_step_call` performs the same check on its own
+   `arg_count` argument so codegen sites that bypass `sigil_perform`
+   (direct CPS-color calls in Task 55) also fail fast.
+3. `sigil_run_loop` keeps the trampoline-side check as
+   defense-in-depth with a "bypassed perform/next_step_call?" message
+   so a future regression that constructs NextSteps without going
+   through the helpers is still caught.
+
+**Codegen impact for Task 55:** any user effect operation with more
+than 30 user args (`MAX_INLINE_ARGS - 2`) requires boxing — codegen
+must emit a heap-allocated args record with a single pointer in
+`args_buf` rather than packing the args inline. v1 has no such
+operations; the cap is a forward-compat boundary, not a current
+constraint.
+
+**Implementing commit:** [HEAD]
+**Closure point:** Task 55 (when codegen produces the first
+`sigil_perform` call site that needs to consult `MAX_INLINE_ARGS`).
+The cap can be raised in a future plan by changing one constant and
+re-checking call sites; v1 lacks any concrete need.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] `Vec::reserve` panic-on-OOM does NOT cross the FFI boundary
+
+**Plan body** doesn't specify allocation-failure behavior for the
+arena. PR #21 review Critical #3 flagged that the original
+implementation called `Vec::reserve`, which panics on OOM; panic
+unwinding across an `extern "C"` boundary (the surrounding
+`sigil_arena_alloc`) is undefined behavior under the workspace's
+default `panic = "unwind"` profile.
+
+**Implemented form:** the arena's first-time reserve uses
+`try_reserve_exact(INITIAL_CAPACITY_WORDS)`. On `Err`, the code
+prints a diagnostic to stderr and aborts via `std::process::abort()`
+— matching the existing abort-on-overflow pattern at the bump path.
+No panic, no unwind, no FFI-boundary UB.
+
+**Implementing commit:** [HEAD]
+**Closure point:** closed.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] Arena alignment via `Vec<u64>` backing storage
+
+**Plan body** says NextStep records hold word-aligned u64 fields. PR
+#21 review Important #5 flagged that the original `Vec<u8>` backing
+relied on the system allocator returning ≥8-byte-aligned blocks,
+which is true on every platform Sigil targets but is not a Rust
+guarantee.
+
+**Implemented form:** the arena's backing storage is `Vec<u64>`
+instead of `Vec<u8>`. `u64`'s natural alignment guarantees the
+`Vec`'s allocation base is 8-byte aligned regardless of allocator
+behavior. Byte-level pointer arithmetic on the returned `*mut u8`
+preserves alignment because every allocation rounds the byte size up
+to a multiple of `ALIGN = 8` and the underlying word count advances
+in u64 units. A test
+(`alloc_round_trips_and_aligns_to_eight`) asserts both
+relative offsets AND absolute alignment of every returned pointer.
+
+**Implementing commit:** [HEAD]
+**Closure point:** closed.
