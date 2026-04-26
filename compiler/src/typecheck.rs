@@ -4386,6 +4386,21 @@ fn collect_free_vars(
         locals: &mut std::collections::BTreeSet<String>,
         captures: &mut Vec<String>,
     ) {
+        // Snapshot/restore `locals` so a `let X` inside a nested
+        // block does NOT leak `X` into the parent block's locals.
+        // Pre-Phase-4d this leak was a no-op (capture analysis only
+        // ran for `Expr::Lambda`'s overall capture set, not for
+        // arm bodies); Phase 4d now consumes the captures list at
+        // codegen-time to size per-arm closure records, so a missed
+        // outer-scope capture (caused by a nested-block `let` shadow
+        // leaking into the outer `locals` set and hiding a later
+        // outer-scope reference from `captures`) is no longer a
+        // no-op — the arm body's `Ident("X")` reaches codegen
+        // without a `ClosureEnvLoad` rewrite and the synth-pass
+        // lowerer panics on the unbound name. Mirror the
+        // save/restore pattern the `Expr::Match` arm uses for
+        // `Pattern::Var` bindings.
+        let saved = locals.clone();
         for s in &b.stmts {
             match s {
                 Stmt::Let(l) => {
@@ -4403,6 +4418,7 @@ fn collect_free_vars(
         if let Some(tail) = &b.tail {
             walk(tail, outer_names, param_names, locals, captures);
         }
+        *locals = saved;
     }
 }
 

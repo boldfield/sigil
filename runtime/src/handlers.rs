@@ -977,6 +977,63 @@ mod tests {
     }
 
     #[test]
+    fn continuation_identity_returns_done_with_args_ptr_value() {
+        // Plan B Task 55 (Phase 4d) — direct invariant check on the
+        // identity continuation. Calling it with a single u64 in the
+        // args buffer must produce a `NextStep::Done(value)` from
+        // the arena. This is the unit invariant codegen's tail-`k`
+        // lowering depends on; the round-trip-through-run_loop test
+        // below exercises the integration path.
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let known: u64 = 0xFEEDFACE_DEADBEEF;
+        let args: [u64; 1] = [known];
+        // SAFETY: not an interior pointer (stack array, non-GC, outlives the call).
+        let ns = unsafe { sigil_continuation_identity(ptr::null(), args.as_ptr(), 1) };
+        unsafe {
+            assert_eq!((*ns).tag, NEXT_STEP_TAG_DONE);
+            assert_eq!((*ns).value, known);
+            assert_eq!((*ns).arg_count, 0);
+            assert!((*ns).closure_ptr.is_null());
+            assert!((*ns).fn_ptr.is_null());
+        }
+        reset_state();
+    }
+
+    #[test]
+    fn continuation_identity_round_trips_through_run_loop() {
+        // Plan B Task 55 (Phase 4d) — integration check matching the
+        // shape codegen's tail-`k` lowering produces:
+        //   NextStep::Call(closure_ptr=null, fn=identity, args=[42])
+        //     → run_loop dispatches identity → Done(42)
+        //     → run_loop returns 42 to native caller.
+        // This is the exact path the synth-pass arm-fn body traces
+        // when it lowers `k(42)` in tail position. A regression here
+        // would surface as a wrong perform-site value at the
+        // surrounding fn's `lower_perform_non_io_to_value` site.
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let ns = unsafe {
+            sigil_next_step_call(ptr::null_mut(), sigil_continuation_identity as *mut u8, 1)
+        };
+        let args = unsafe { sigil_next_step_args_ptr(ns) };
+        unsafe { args.write(42) };
+        let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
+        let v = unsafe { sigil_run_loop(ns) };
+        let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
+        assert_eq!(v, 42);
+        // 2 dispatches: one for the Call (loop dispatches identity,
+        // which returns Done), one more iteration to observe the
+        // Done tag and return — the counter increments at the top
+        // of every loop iteration including the terminal Done check.
+        // Matches `run_loop_dispatches_call_then_done` above.
+        assert_eq!(dispatches_after - dispatches_before, 2);
+        reset_state();
+    }
+
+    #[test]
     fn handler_frame_new_initialises_zero_arms_and_pointers() {
         let _guard = crate::test_support::gc_test_lock();
         ensure_gc();

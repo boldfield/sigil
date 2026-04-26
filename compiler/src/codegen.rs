@@ -62,7 +62,7 @@ use sigil_abi::stackmap::{
     STACKMAP_VERSION_PLACEHOLDER,
 };
 use sigil_abi::tag::TAG_INT_SHIFT;
-use sigil_header_constants::{header_word, TAG_CLOSURE};
+use sigil_header_constants::{header_word, MAX_CLOSURE_ENV_SLOTS, TAG_CLOSURE};
 
 use crate::ast::{EnvSlotKind, TypeExpr};
 use crate::closure_convert::ClosureConvertedProgram;
@@ -635,7 +635,7 @@ fn expr_unsupported_handle(
             // `ClosureRecord` shapes. The arm body is otherwise free
             // to use any expression over its op-args + globals.
             for arm in op_arms.iter() {
-                if let Some(msg) = arm_body_phase_4c_violations(arm, globals) {
+                if let Some(msg) = arm_body_unsupported_construct(arm, globals) {
                     return Some(format!(
                         "`handle` expression at {:?} has arm `{}.{}` body that {} \
                          (Plan B Task 55, in progress)",
@@ -686,7 +686,7 @@ fn expr_unsupported_handle(
 /// scopes (op-args at the bottom, let/match/handle bindings pushed/
 /// popped as scopes open/close) so let-bound and pattern-bound names
 /// inside the arm body don't trigger the capture check.
-fn arm_body_phase_4c_violations(
+fn arm_body_unsupported_construct(
     arm: &crate::ast::HandleOpArm,
     globals: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
@@ -786,8 +786,20 @@ fn arm_body_walk(
             else_block,
             ..
         } => arm_body_walk(cond, scopes, k_name, globals, false)
-            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, tail))
-            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, tail)),
+            // `If` then/else branches are NOT propagated as tail
+            // for `k`-call detection: `arm_body_tail_is_k_call`
+            // (which the synth pass uses to route tail-k vs done)
+            // only recurses through `Expr::Block` tails. If we
+            // accept `if c { k(x) } else { k(y) }` as tail-k here,
+            // the detector returns `None` and the synth-pass falls
+            // into the non-tail path; `lower_expr` then tries to
+            // resolve `k` as an indirect callee and panics with
+            // `unreachable!("indirect call …")`. The walker stays
+            // strictly aligned with the detector's recursion shape;
+            // multi-branch tail-`k` lowerings (join-block returning
+            // `*NextStep`) are deferred to a future phase.
+            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, false))
+            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, false)),
         Expr::Block(b) => arm_body_walk_block(b, scopes, k_name, globals, tail),
         Expr::Match {
             scrutinee, arms, ..
@@ -800,8 +812,15 @@ fn arm_body_walk(
                     std::collections::BTreeSet::new();
                 arm_body_collect_pattern_bindings(&a.pattern, &mut pat_scope);
                 scopes.push(pat_scope);
-                // Match arm body inherits the parent's tail position.
-                let r = arm_body_walk(&a.body, scopes, k_name, globals, tail);
+                // Match arm bodies are NOT in tail position for
+                // `k`-call detection — same rationale as `Expr::If`
+                // above (the synth-pass detector
+                // `arm_body_tail_is_k_call` recurses only through
+                // `Expr::Block` tails). Multi-branch tail-`k` shapes
+                // (`match s { Variant1 => k(x), Variant2 => k(y) }`)
+                // are walker-rejected as non-tail; lifting requires
+                // a join-block lowering deferred to a future phase.
+                let r = arm_body_walk(&a.body, scopes, k_name, globals, false);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -1346,10 +1365,20 @@ fn collect_handle_arms_in_expr(
                 // the arm body references nothing outside its op-args
                 // / `k_name` / globals — codegen passes `null` as
                 // this arm's `closure_ptr` (no closure record alloc).
+                //
+                // `arm_local_idx` is the per-arm declaration index
+                // *for this handle*, derived from `arm_indices.len()`
+                // BEFORE this arm gets pushed. Locking the side-table
+                // lookup index to the explicit name — rather than
+                // computing it inline at the `.get()` call — means a
+                // future refactor that flips push order surfaces as
+                // an immediate off-by-one rather than silently mis-
+                // reading captures from the wrong arm.
+                let arm_local_idx: usize = arm_indices.len();
                 let captures_typed: &[(String, crate::typecheck::Ty)] = ctx
                     .handle_arm_captures
                     .get(span)
-                    .and_then(|per_arm| per_arm.get(arm_indices.len()))
+                    .and_then(|per_arm| per_arm.get(arm_local_idx))
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
                 let captures: Vec<ArmCapture> = captures_typed
@@ -1725,13 +1754,23 @@ fn rewrite_block(
     scopes: &mut Vec<std::collections::BTreeSet<String>>,
 ) -> crate::ast::Block {
     use crate::ast::{Block, LetStmt, Stmt};
-    let mut block_scope: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Push a fresh scope frame for the block's own let-bindings, then
+    // pop on exit. Mirrors the Match-arm / Lambda-param / Handle-arm
+    // patterns used elsewhere in `rewrite_expr`. Earlier shapes (mutate
+    // top frame + roll-back-by-name on exit) corrupted the parent scope
+    // when a block-local `let X` shadowed a name X already present in
+    // the parent — the rollback removed X from the parent regardless
+    // of pre-block presence. Push/pop sidesteps that entirely:
+    // shadowing inner names live only inside the new frame and the
+    // parent frame is byte-identical before and after.
+    let block_scope: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    scopes.push(block_scope);
     let mut new_stmts: Vec<Stmt> = Vec::with_capacity(b.stmts.len());
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                // RHS evaluated under current scopes (let `name` not
-                // yet in scope when its initializer runs).
+                // RHS evaluated under current scopes (the let `name`
+                // is not yet in scope when its initializer runs).
                 let new_value = rewrite_expr(&l.value, captures, scopes);
                 new_stmts.push(Stmt::Let(LetStmt {
                     name: l.name.clone(),
@@ -1739,12 +1778,8 @@ fn rewrite_block(
                     value: new_value,
                     span: l.span.clone(),
                 }));
-                // Then introduce the binding into the block scope so
-                // subsequent stmts / tail see it.
-                block_scope.insert(l.name.clone());
-                // Update scopes in-place: we mutate the top scope to
-                // include the new let-binding rather than push/pop,
-                // since let-bindings persist for the rest of the block.
+                // Then add the binding to the top (block-local) scope
+                // frame so subsequent stmts and the block tail see it.
                 if let Some(top) = scopes.last_mut() {
                     let _ = top.insert(l.name.clone());
                 }
@@ -1768,13 +1803,7 @@ fn rewrite_block(
         }
     }
     let new_tail = b.tail.as_ref().map(|t| rewrite_expr(t, captures, scopes));
-    // Roll back the block-local additions to the top scope so the
-    // outer scope is unaffected by the block's lets.
-    if let Some(top) = scopes.last_mut() {
-        for n in &block_scope {
-            top.remove(n);
-        }
-    }
+    scopes.pop();
     Block {
         stmts: new_stmts,
         tail: new_tail,
@@ -2784,7 +2813,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 //     signature), build `NextStep::Done(value)`,
                 //     return the NextStep pointer.
                 //
-                // The walker (`arm_body_phase_4c_violations`)
+                // The walker (`arm_body_unsupported_construct`)
                 // enforces that any `k`-call inside the body is in
                 // the tail position recognised by
                 // `arm_body_tail_is_k_call`; non-tail `k` use is
@@ -3832,8 +3861,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             "alloc_arm_closure_record on empty captures — caller should pass null directly"
         );
         assert!(
-            env_len < 31,
-            "arm closure env >= 31 slots exceeds 6-bit header count field"
+            env_len < MAX_CLOSURE_ENV_SLOTS,
+            "arm closure env >= {MAX_CLOSURE_ENV_SLOTS} slots exceeds the bitmap layout"
         );
 
         let mut bitmap: u32 = 0;
@@ -3923,8 +3952,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         );
         let env_len = env_exprs.len();
         assert!(
-            env_len < 31,
-            "closure env >= 31 slots exceeds 6-bit header count field (tag 0xFF descriptor is v2)"
+            env_len < MAX_CLOSURE_ENV_SLOTS,
+            "closure env >= {MAX_CLOSURE_ENV_SLOTS} slots exceeds the bitmap layout (tag 0xFF descriptor is v2)"
         );
 
         // Header bitmap: bit 0 = code_ptr (not a pointer), bit k+1 set

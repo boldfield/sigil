@@ -220,59 +220,40 @@ Sigil is **under active construction**. Some language features compile
 and run, but with semantic gaps that have not yet been closed. Programs
 that depend on the gapped behavior may produce results that diverge
 from standard algebraic-effects semantics without any compile-time
-signal. The list below documents every known gap as of the current
-HEAD; each entry names the plan-tracker phase that closes it.
+signal. Each row in the table below names the plan-tracker phase that
+closes the gap; the discard-continuation entry has additional prose
+because the failure mode is silent (programs compile and run but
+produce algebraic-incorrect results) and is the load-bearing one for
+Stage 9 spec validation.
 
-- **Discard-continuation handlers (Raise-style early-exit) do not yet
-  propagate through function-call boundaries.** Behavior currently
-  matches the Phase 4c synchronous shape, where the arm's return value
-  flows to the perform site, not the handle expression. Programs
-  depending on this — e.g., `handle helper() with { Raise.fail(k) =>
-  default }` where `helper` performs `Raise.fail` and the surrounding
-  code expects the handle to return `default` — work as expected
-  **only when the perform is in tail position of the handle body** (no
-  function-call boundary between the handle and the perform). When the
-  perform reaches the arm via a function call, the discarded
-  continuation does not abort the helper fn: the arm's value is
-  returned to the helper's perform site as if `k` had been invoked
-  with that value, the helper continues executing, and the handle's
-  overall result reflects the helper's tail expression rather than
-  the arm's value. The fix is the colorer's handler-discharge
-  refinement, which reclassifies helper fns whose performs reach a
-  discharging handler as CPS-color so their performs return
-  `NextStep::Call` to the enclosing trampoline rather than
-  synchronously blocking on `sigil_run_loop`. **Closure point: Plan B
-  Task 55 Phase 4e** (tracked in `PLAN_B_PROGRESS.md`).
-- **Non-tail continuation use is rejected at codegen time.** Arm bodies
-  whose tail expression is not a single `k(arg)` call (e.g., `k(x) +
-  1`, `let r = k(x); r * 2`) currently produce a clean codegen-time
-  diagnostic pointing at Phase 4e. Programs that fit the
-  tail-position pattern compile and run correctly; programs that need
-  arm-body computation around a continuation invocation do not yet
-  compile.
-- **Multi-shot continuations are not yet implemented.** `effect E
-  resumes: many { ... }` parses and typechecks but multi-shot arm
-  bodies that invoke `k` more than once produce undefined behavior at
-  runtime under the current Phase 4d shape. The runtime data
-  structures (`HandlerFrame.arms[i].closure_ptr`, `(k_closure, k_fn)`
-  pairs) are pointer-shaped to support multi-shot; codegen does not
-  yet build the persistent re-invokable continuation closures.
-  **Closure point: Plan B Task 55 Phase 4e**.
-- **Multi-effect handlers are rejected at codegen time.** Handlers
-  whose arms target more than one effect produce a clean codegen-time
-  diagnostic. Single-effect handlers (one effect per `handle`) work.
-  **Closure point: Plan B Task 55 Phase 4f**.
-- **Return arms are rejected at codegen time.** `handle expr with {
-  return(v) => ..., Op(...) => ... }` parses and typechecks but the
-  `return` arm is rejected at codegen entry. Handlers without a
-  return arm work. **Closure point: Plan B Task 55 Phase 4g**.
-- **Stage 9 spec validation is gated on Phase 4e.** The fresh-Claude
-  validation script (`scripts/validate-spec.sh`, planned for Stage 9
-  in `boldfield/designs:docs/plans/2026-04-21-sigil-finish.md`)
-  cannot run until the discard-`k` correctness gap closes. The 20-prompt
-  validation bank includes patterns (`Raise[String]` safe parser,
-  `State[Int]` counter, multi-shot `Choose`) that depend on standard
-  algebraic semantics across function-call boundaries.
+| Gap | Behavior today | Closure point |
+|-----|----------------|---------------|
+| Discard-continuation handlers across function-call boundaries | Compiles + runs, **silently diverges** from algebraic semantics when the perform reaches the arm via a function call (see prose below) | Phase 4e |
+| Non-tail continuation use (`k(x) + 1`, `let r = k(x); …`) | Codegen-time rejection | Phase 4e |
+| Multi-shot continuations (`effect E resumes: many`) | Parses + typechecks; runtime UB if `k` invoked >1 times | Phase 4e |
+| Multi-effect handlers (arms targeting different effects) | Codegen-time rejection | Phase 4f |
+| Return arms (`handle … with { return(v) => …, … }`) | Codegen-time rejection | Phase 4g |
+| Captures from a surrounding lambda's closure record | Codegen-time rejection | Phase 4e |
+| Stage 9 spec validation | Cannot run — gated on Phase 4e (the discard-`k` correctness gap) | Phase 4e |
+
+**Discard-continuation handlers (Raise-style early-exit) do not yet
+propagate through function-call boundaries.** Behavior currently
+matches the Phase 4c synchronous shape, where the arm's return value
+flows to the perform site, not the handle expression. Programs
+depending on this — e.g., `handle helper() with { Raise.fail(k) =>
+default }` where `helper` performs `Raise.fail` and the surrounding
+code expects the handle to return `default` — work as expected **only
+when the perform is in tail position of the handle body** (no
+function-call boundary between the handle and the perform). When the
+perform reaches the arm via a function call, the discarded
+continuation does not abort the helper fn: the arm's value is returned
+to the helper's perform site as if `k` had been invoked with that
+value, the helper continues executing, and the handle's overall result
+reflects the helper's tail expression rather than the arm's value. The
+fix is the colorer's handler-discharge refinement, which reclassifies
+helper fns whose performs reach a discharging handler as CPS-color so
+their performs return `NextStep::Call` to the enclosing trampoline
+rather than synchronously blocking on `sigil_run_loop`.
 
 This list is a living section: each entry tracks an in-flight gap that
 will close in a specific tracked phase, and is updated alongside the

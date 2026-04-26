@@ -2049,3 +2049,165 @@ fn discard_k_handler_does_not_abort_helper_phase_4e_pending() {
          Phase 4e closes this gap. stderr={stderr:?}"
     );
 }
+
+#[test]
+fn arm_uses_k_inside_if_branch_is_rejected_pointing_at_phase_4e() {
+    // Phase 4d MVP — Phase 4e closure point: multi-branch tail-`k`
+    // shapes (`if c { k(x) } else { k(y) }`) require a join-block
+    // lowering returning `*NextStep`, beyond Phase 4d MVP scope.
+    // The walker (`arm_body_walk`) and the synth-pass detector
+    // (`arm_body_tail_is_k_call`) must agree on the recursion
+    // shape: both treat tail position as propagating only through
+    // `Expr::Block` tails (NOT `Expr::If` then/else, NOT `Expr::Match`
+    // arm bodies). A regression where the walker accepted these as
+    // tail-k while the detector rejected would manifest as a hard
+    // compiler crash at the synth pass's `lower_expr` (k as an
+    // indirect-call callee → `unreachable!`).
+    //
+    // This test pins the walker's rejection. Inverts to a positive
+    // test (asserting either branch's value flows correctly) when
+    // Phase 4e ships the join-block lowering.
+    let src = "effect E { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => if true { k(1) } else { k(2) },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4d_if_branch_k_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4d_if_branch_k_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail — k(arg) inside if-branch is non-tail under \
+         Phase 4d MVP detector; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-tail") || stderr.contains("Phase 4e"),
+        "error message should reference non-tail k / Phase 4e; got stderr={stderr:?}",
+    );
+}
+
+#[test]
+fn arm_uses_k_inside_match_arm_is_rejected_pointing_at_phase_4e() {
+    // Phase 4d MVP — Phase 4e closure point: same shape as the
+    // if-branch test above but via `match`. The walker's
+    // `Expr::Match` arm-body walk must align with
+    // `arm_body_tail_is_k_call`'s "Block tails only" recursion —
+    // accepting tail-k inside match arms would cause the same
+    // walker-vs-detector mismatch that crashes the synth pass.
+    //
+    // Test source matches on a `Bool` scrutinee with both arms
+    // calling `k`. Inverts to a positive test when Phase 4e ships
+    // the join-block lowering.
+    let src = "effect E { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => match true { true => k(1), false => k(2) },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4d_match_arm_k_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4d_match_arm_k_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail — k(arg) inside match arm body is non-tail under \
+         Phase 4d MVP detector; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-tail") || stderr.contains("Phase 4e"),
+        "error message should reference non-tail k / Phase 4e; got stderr={stderr:?}",
+    );
+}
+
+#[test]
+fn arm_body_with_inner_block_and_outer_capture_works() {
+    // Plan B Task 55 (Phase 4d) — regression test for review items
+    // 1 / 2 / MF3 (codegen `rewrite_block` scope rollback fragility
+    // + typecheck `walk_block` `locals` leak). Sigil's no-shadow
+    // contract (resolve E0020 / typecheck `env_insert` debug-assert)
+    // forbids the literal shadowing example the reviewer drafted, so
+    // the regression here is the structural one — push/pop scope
+    // discipline must keep capture rewriting and free-var collection
+    // honest across nested-block boundaries even when no name
+    // collisions exist.
+    //
+    // Test shape:
+    //   - `outer(local: Int)` brings `local` into scope.
+    //   - Arm body captures `local` (outer-scope reference).
+    //   - Arm body has a let `extra`, then a nested-block-bound let
+    //     `inner_result` whose RHS is itself a block with let `temp`.
+    //   - After the nested block, arm body's tail `local + inner_result`
+    //     references both the capture and the arm-body-scoped let.
+    //
+    // Pre-fix failure modes this test would have surfaced if
+    // shadowing had been allowed: the parent-scope rollback in
+    // `rewrite_block` would have dropped a same-named binding;
+    // `walk_block`'s leaked `locals` would have mis-classified an
+    // identically-named outer reference as local. Without shadowing,
+    // those bugs aren't reachable; this test pins the positive path
+    // — that arm bodies with nested blocks + arm-body lets + outer
+    // captures lower correctly through the new push/pop discipline.
+    //
+    // Expected output: 5 (outer.local) + (3 + 7) = 15.
+    let src = "effect E { op: () -> Int }\n\
+               fn outer(local: Int) -> Int ![IO, E] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => {\n      \
+                     let extra: Int = 7;\n      \
+                     let inner_result: Int = { let temp: Int = 3; temp + extra };\n      \
+                     local + inner_result\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 outer(5)\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "phase4d_arm_body_nested_block_outer_capture");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "15\n", "expected 5 + (3 + 7); stderr={stderr:?}");
+}
