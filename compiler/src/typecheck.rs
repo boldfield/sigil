@@ -3094,15 +3094,33 @@ impl Tc {
             arm_param_set.insert(arm.k_name.clone());
             let mut capture_names: Vec<String> = Vec::new();
             collect_free_vars(&arm.body, &outer_names, &arm_param_set, &mut capture_names);
+            // `collect_free_vars`'s `Expr::Lambda` arm widens
+            // `outer_names` to include the *enclosing* `param_names`
+            // (transitive-capture analysis: a nested lambda treats
+            // the arm's params + `k` as visible-from-above and may
+            // record them as captures). Filter those out here:
+            // legitimate arm captures are exactly the names in
+            // `saved_env` (the surrounding fn's lexical scope at
+            // the handle expression). Names not in `saved_env` —
+            // arm params, `k_name`, top-level fn names that were
+            // never in the local env — are not captures.
+            //
+            // This is the test surface for
+            // `linearity_lambda_capturing_k_is_e0220`: a lambda
+            // inside an arm body that calls `k(0)` must produce a
+            // clean `E0220` from the existing linearity check
+            // (`count_continuation_uses` saturates to 2 on lambda
+            // capture); the Phase 4d capture collection must NOT
+            // record `k` as a capture and crash with `unreachable!`
+            // before the linearity check has a chance to surface.
+            capture_names.retain(|n| saved_env.contains_key(n));
             let arm_captures: Vec<(String, Ty)> = capture_names
                 .into_iter()
                 .map(|name| {
                     let ty = saved_env.get(&name).cloned().unwrap_or_else(|| {
                         unreachable!(
-                            "typecheck Phase 4d: capture `{name}` collected by \
-                                 collect_free_vars (outer_names = saved_env.keys()) is \
-                                 missing from saved_env at lookup — this indicates a \
-                                 collect_free_vars / outer_names filter mismatch"
+                            "typecheck Phase 4d: retained capture `{name}` must be \
+                             in saved_env (filtered above by `saved_env.contains_key`)"
                         )
                     });
                     // Resolve type-vars through the current substitution
