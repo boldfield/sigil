@@ -364,6 +364,33 @@ pub struct CheckedProgram {
     /// `op_id` arg to `sigil_handler_frame_set_arm` and
     /// `sigil_perform`.
     pub op_ids: BTreeMap<(String, String), u32>,
+    /// Plan B Task 55 (Phase 4d) — per-handle, per-arm capture
+    /// signatures, keyed by the handle expression's span. The outer
+    /// `Vec` parallels `Expr::Handle::op_arms` in declaration order;
+    /// each inner `Vec<(String, Ty)>` is the arm body's free-variable
+    /// set with each name's outer-scope `Ty`, deduped and in
+    /// first-encounter order over the arm body's syntactic walk.
+    /// "Free" here means: not bound by the arm's user params, not the
+    /// arm's `k_name`, not a top-level fn / ctor / builtin. A name
+    /// captured by the arm body resolves to a value in the enclosing
+    /// fn's lexical scope — typically a let-binding or fn-param of the
+    /// surrounding fn, or (when the surrounding fn is a synthetic
+    /// lambda fn after closure conversion) a slot in the enclosing
+    /// closure's environment.
+    ///
+    /// Codegen's Phase 4d closure-record allocation reads this map at
+    /// each `Expr::Handle` site to size the per-arm closure record,
+    /// derive the GC pointer bitmap (via `slot_kind_for_ty`), and
+    /// produce env_exprs evaluated in the enclosing scope. The
+    /// synth-pass arm fn lowering uses the same captures list to
+    /// rewrite `Expr::Ident(name, ..)` references in the arm body
+    /// into `Expr::ClosureEnvLoad { index, kind, name, .. }` reading
+    /// from the arm's `closure_ptr` at the arm-local slot index.
+    ///
+    /// Empty inner vecs (arm body with no captures) are recorded
+    /// explicitly so codegen can pass `null` as the arm's closure_ptr
+    /// (no allocation needed) without re-deriving emptiness.
+    pub handle_arm_captures: BTreeMap<Span, Vec<Vec<(String, Ty)>>>,
 }
 
 /// Where a constructor is registered. Indexes a `TypeDecl` in the
@@ -528,6 +555,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         pending_ctor_instantiations: Vec::new(),
         effects,
         handler_scopes: Vec::new(),
+        handle_arm_captures: BTreeMap::new(),
     };
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
@@ -792,6 +820,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             effects: tc.effects,
             effect_ids,
             op_ids,
+            handle_arm_captures: tc.handle_arm_captures,
         },
         tc.errors,
     )
@@ -957,6 +986,17 @@ struct Tc {
     /// Empty during normal fn body walks (no enclosing handle); only
     /// non-empty inside `check_handle`'s body recursion.
     handler_scopes: Vec<HandlerScope>,
+    /// Plan B Task 55 (Phase 4d) — accumulator for the per-handle
+    /// per-arm capture signatures, moved into
+    /// `CheckedProgram::handle_arm_captures` at typecheck completion.
+    /// `check_handle` populates one entry per `Expr::Handle`'s span at
+    /// the end of arm-walking (after `saved_env` is restored from the
+    /// per-arm bindings); the recorded `Vec<(String, Ty)>` per arm is
+    /// the free-variable set computed against the saved enclosing-fn
+    /// env, so each free name's `Ty` is exactly the type the
+    /// surrounding fn would observe at the handle expression's
+    /// position.
+    handle_arm_captures: BTreeMap<Span, Vec<Vec<(String, Ty)>>>,
 }
 
 /// Plan B task 54 — one handler's effect-instantiation cache.
@@ -2398,8 +2438,8 @@ impl Tc {
                 body,
                 return_arm,
                 op_arms,
-                ..
-            } => self.check_handle(body, return_arm.as_deref(), op_arms, row),
+                span,
+            } => self.check_handle(body, return_arm.as_deref(), op_arms, row, span),
         }
     }
 
@@ -2786,6 +2826,9 @@ impl Tc {
         return_arm: Option<&HandleReturnArm>,
         op_arms: &[HandleOpArm],
         row: &[String],
+        // Plan B Task 55 (Phase 4d): handle span used to key the
+        // `handle_arm_captures` side-table populated below.
+        handle_span: &Span,
     ) -> Option<Ty> {
         // ---------- Phase 1: dispatch table ----------
         // Per-arm collected info that the arm walk consumes. Done
@@ -3012,6 +3055,12 @@ impl Tc {
             }
         }
 
+        // Plan B Task 55 (Phase 4d) — accumulator for per-arm
+        // captures, keyed at the end of the loop into
+        // `self.handle_arm_captures` under the handle's span. One
+        // entry per arm in declaration order.
+        let mut handle_arm_caps_accum: Vec<Vec<(String, Ty)>> = Vec::with_capacity(op_arms.len());
+
         // Op-arm walks. Every arm body is walked under bindings —
         // even arms whose registry lookup failed install Ty::Unit-
         // fallback bindings for their declared params + continuation
@@ -3023,6 +3072,66 @@ impl Tc {
         // signature).
         for (arm, typing) in op_arms.iter().zip(arm_typings.iter()) {
             let saved_env = self.env.clone();
+
+            // Plan B Task 55 (Phase 4d): collect this arm body's
+            // free-variable captures *before* installing arm
+            // bindings, so an `Ident` referencing one of the arm's
+            // own user-params or `k_name` doesn't get mis-classified
+            // as a capture. Each captured name's `Ty` is looked up in
+            // the saved env (the surrounding fn's lexical scope at
+            // the handle expression). Names that resolve to top-level
+            // fns / ctors / builtins (i.e., names not in `saved_env`)
+            // pass through `collect_free_vars` because its
+            // `outer_names` filter excludes them — codegen resolves
+            // those via the user-fn / ctor / builtin tables, not via
+            // closure env. Empty captures vec means the arm has no
+            // outer-scope references; codegen will pass `null` as the
+            // arm's `closure_ptr` (no allocation needed).
+            let outer_names: std::collections::BTreeSet<String> =
+                saved_env.keys().cloned().collect();
+            let mut arm_param_set: std::collections::BTreeSet<String> =
+                arm.params.iter().map(|p| p.name.clone()).collect();
+            arm_param_set.insert(arm.k_name.clone());
+            let mut capture_names: Vec<String> = Vec::new();
+            collect_free_vars(&arm.body, &outer_names, &arm_param_set, &mut capture_names);
+            // `collect_free_vars`'s `Expr::Lambda` arm widens
+            // `outer_names` to include the *enclosing* `param_names`
+            // (transitive-capture analysis: a nested lambda treats
+            // the arm's params + `k` as visible-from-above and may
+            // record them as captures). Filter those out here:
+            // legitimate arm captures are exactly the names in
+            // `saved_env` (the surrounding fn's lexical scope at
+            // the handle expression). Names not in `saved_env` —
+            // arm params, `k_name`, top-level fn names that were
+            // never in the local env — are not captures.
+            //
+            // This is the test surface for
+            // `linearity_lambda_capturing_k_is_e0220`: a lambda
+            // inside an arm body that calls `k(0)` must produce a
+            // clean `E0220` from the existing linearity check
+            // (`count_continuation_uses` saturates to 2 on lambda
+            // capture); the Phase 4d capture collection must NOT
+            // record `k` as a capture and crash with `unreachable!`
+            // before the linearity check has a chance to surface.
+            capture_names.retain(|n| saved_env.contains_key(n));
+            let arm_captures: Vec<(String, Ty)> = capture_names
+                .into_iter()
+                .map(|name| {
+                    let ty = saved_env.get(&name).cloned().unwrap_or_else(|| {
+                        unreachable!(
+                            "typecheck Phase 4d: retained capture `{name}` must be \
+                             in saved_env (filtered above by `saved_env.contains_key`)"
+                        )
+                    });
+                    // Resolve type-vars through the current substitution
+                    // so the side-table records a substitution-stable
+                    // `Ty` (codegen-time `slot_kind_for_ty` requires
+                    // resolved types to derive the GC bitmap).
+                    (name, self.deref(&ty))
+                })
+                .collect();
+            handle_arm_caps_accum.push(arm_captures);
+
             // Install user-param bindings; pad short user_param_tys
             // (registry lookup failed, or arity mismatched low) with
             // Ty::Unit so every declared name is bound.
@@ -3088,10 +3197,18 @@ impl Tc {
         // synthetic CPS arm fns; the codegen-entry guard
         // `unsupported_handle_construct` rejects shapes still outside
         // the supported subset (richer arm bodies, multi-effect, k
-        // usage, return arms, etc. — see Phase 4b–4f). Arm-body
+        // usage, return arms, etc. — see Phase 4b–4g). Arm-body
         // diagnostics (E0046, E0220, E0044) and registry diagnostics
         // (E0138, E0139, E0140, E0141) emitted above continue to
         // surface unchanged.
+
+        // Plan B Task 55 (Phase 4d): commit the per-arm captures
+        // accumulator to the side-table, keyed by handle span.
+        // Codegen reads this at each `Expr::Handle` site to build the
+        // per-arm closure record (env_exprs sourced from the
+        // surrounding fn's env at that capture's `Ty`).
+        self.handle_arm_captures
+            .insert(handle_span.clone(), handle_arm_caps_accum);
 
         Some(self.deref(&handler_overall))
     }
@@ -4269,6 +4386,21 @@ fn collect_free_vars(
         locals: &mut std::collections::BTreeSet<String>,
         captures: &mut Vec<String>,
     ) {
+        // Snapshot/restore `locals` so a `let X` inside a nested
+        // block does NOT leak `X` into the parent block's locals.
+        // Pre-Phase-4d this leak was a no-op (capture analysis only
+        // ran for `Expr::Lambda`'s overall capture set, not for
+        // arm bodies); Phase 4d now consumes the captures list at
+        // codegen-time to size per-arm closure records, so a missed
+        // outer-scope capture (caused by a nested-block `let` shadow
+        // leaking into the outer `locals` set and hiding a later
+        // outer-scope reference from `captures`) is no longer a
+        // no-op — the arm body's `Ident("X")` reaches codegen
+        // without a `ClosureEnvLoad` rewrite and the synth-pass
+        // lowerer panics on the unbound name. Mirror the
+        // save/restore pattern the `Expr::Match` arm uses for
+        // `Pattern::Var` bindings.
+        let saved = locals.clone();
         for s in &b.stmts {
             match s {
                 Stmt::Let(l) => {
@@ -4286,6 +4418,7 @@ fn collect_free_vars(
         if let Some(tail) = &b.tail {
             walk(tail, outer_names, param_names, locals, captures);
         }
+        *locals = saved;
     }
 }
 
@@ -6521,6 +6654,7 @@ mod tests {
             pending_ctor_instantiations: Vec::new(),
             effects: BTreeMap::new(),
             handler_scopes: Vec::new(),
+            handle_arm_captures: BTreeMap::new(),
         }
     }
 

@@ -538,6 +538,62 @@ pub unsafe extern "C" fn sigil_next_step_args_ptr(ns: *mut NextStep) -> *mut u64
     (ns as *mut u8).add(core::mem::size_of::<NextStep>()) as *mut u64
 }
 
+/// Plan B Task 55 (Phase 4d) — identity continuation intrinsic.
+///
+/// Codegen emits the address of this function as the `k_fn_ptr` arg
+/// to every non-IO `sigil_perform` site (with `k_closure_ptr` set to
+/// null). When a synthetic CPS arm fn invokes its captured `k(value)`
+/// in tail position, codegen lowers the call as
+/// `sigil_next_step_call(loaded_k_closure, loaded_k_fn, /*arg_count=*/1)`
+/// followed by a single u64 store of `value` at the args buffer's slot 0;
+/// the returned `NextStep::Call` is the arm fn's return value. The
+/// trampoline (`sigil_run_loop`) dispatches the `Call`, invoking
+/// `sigil_continuation_identity(null, args_ptr=&[value], args_len=1)`,
+/// which returns a `NextStep::Done(value)` from the arena. `run_loop`
+/// then returns `value` to the perform site.
+///
+/// The shape produces algebraic-correct results when:
+///   - `k(arg)` is invoked in tail position of the arm body, AND
+///   - the perform site is in tail position of the handle body (or
+///     anywhere within the handle body, since the surrounding native
+///     fn synchronously blocks on `sigil_run_loop` and feeds the
+///     result back to the perform site).
+///
+/// Both conditions are enforced by the `unsupported_handle_construct`
+/// codegen-entry walker. Non-tail `k` use, multi-shot `k` use, and
+/// the discard-`k` correctness gap across function-call boundaries
+/// require Plan B Task 55 Phase 4e (colorer's handler-discharge
+/// refinement + native↔CPS interop boundary). See
+/// `[DEVIATION Task 55] Phase 4d` in `PLAN_B_DEVIATIONS.md` and the
+/// "Verification limits (in-flight)" section in `README.md`.
+///
+/// # Safety
+///
+/// `args_ptr` must point to at least one readable u64 (`args_len >= 1`).
+/// `closure_ptr` is unused (this intrinsic is closure-less). The
+/// trampoline guarantees both invariants when dispatching from a
+/// `NextStep::Call` produced by codegen's tail-`k` lowering.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_continuation_identity(
+    _closure_ptr: *const u8,
+    args_ptr: *const u64,
+    args_len: u32,
+) -> *mut NextStep {
+    debug_assert_eq!(
+        args_len, 1,
+        "sigil_continuation_identity: arity 1 invariant — codegen always emits \
+         sigil_next_step_call with arg_count=1 for tail-k lowering"
+    );
+    debug_assert!(
+        !args_ptr.is_null(),
+        "sigil_continuation_identity: args_ptr must be non-null when args_len >= 1"
+    );
+    // SAFETY: caller (codegen tail-k lowering) guarantees args_ptr
+    // points to >= 1 readable u64 holding the captured arg.
+    let value = *args_ptr;
+    sigil_next_step_done(value)
+}
+
 // ---------------------------------------------------------------------
 // `sigil_perform` and `sigil_run_loop`
 // ---------------------------------------------------------------------
@@ -917,6 +973,63 @@ mod tests {
         // -> Done(15+1=16)
         assert_eq!(v, 16);
         assert_eq!(dispatches_after - dispatches_before, 3);
+        reset_state();
+    }
+
+    #[test]
+    fn continuation_identity_returns_done_with_args_ptr_value() {
+        // Plan B Task 55 (Phase 4d) — direct invariant check on the
+        // identity continuation. Calling it with a single u64 in the
+        // args buffer must produce a `NextStep::Done(value)` from
+        // the arena. This is the unit invariant codegen's tail-`k`
+        // lowering depends on; the round-trip-through-run_loop test
+        // below exercises the integration path.
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let known: u64 = 0xFEEDFACE_DEADBEEF;
+        let args: [u64; 1] = [known];
+        // SAFETY: not an interior pointer (stack array, non-GC, outlives the call).
+        let ns = unsafe { sigil_continuation_identity(ptr::null(), args.as_ptr(), 1) };
+        unsafe {
+            assert_eq!((*ns).tag, NEXT_STEP_TAG_DONE);
+            assert_eq!((*ns).value, known);
+            assert_eq!((*ns).arg_count, 0);
+            assert!((*ns).closure_ptr.is_null());
+            assert!((*ns).fn_ptr.is_null());
+        }
+        reset_state();
+    }
+
+    #[test]
+    fn continuation_identity_round_trips_through_run_loop() {
+        // Plan B Task 55 (Phase 4d) — integration check matching the
+        // shape codegen's tail-`k` lowering produces:
+        //   NextStep::Call(closure_ptr=null, fn=identity, args=[42])
+        //     → run_loop dispatches identity → Done(42)
+        //     → run_loop returns 42 to native caller.
+        // This is the exact path the synth-pass arm-fn body traces
+        // when it lowers `k(42)` in tail position. A regression here
+        // would surface as a wrong perform-site value at the
+        // surrounding fn's `lower_perform_non_io_to_value` site.
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let ns = unsafe {
+            sigil_next_step_call(ptr::null_mut(), sigil_continuation_identity as *mut u8, 1)
+        };
+        let args = unsafe { sigil_next_step_args_ptr(ns) };
+        unsafe { args.write(42) };
+        let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
+        let v = unsafe { sigil_run_loop(ns) };
+        let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
+        assert_eq!(v, 42);
+        // 2 dispatches: one for the Call (loop dispatches identity,
+        // which returns Done), one more iteration to observe the
+        // Done tag and return — the counter increments at the top
+        // of every loop iteration including the terminal Done check.
+        // Matches `run_loop_dispatches_call_then_done` above.
+        assert_eq!(dispatches_after - dispatches_before, 2);
         reset_state();
     }
 

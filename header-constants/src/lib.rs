@@ -38,6 +38,17 @@ pub const BITMAP_BITS: u32 = 32;
 pub const BITMAP_SHIFT: u32 = 14;
 pub const BITMAP_MASK: u64 = ((1u64 << BITMAP_BITS) - 1) << BITMAP_SHIFT;
 
+/// Maximum number of env slots a v1 closure record can carry, derived
+/// from the 32-bit pointer bitmap: bit 0 reserved for `code_ptr`
+/// (always not-a-pointer), bits 1..32 reserved for env-slot pointer
+/// indicators. Closure records with `env_len >= MAX_CLOSURE_ENV_SLOTS`
+/// would shift past bit 31 in the bitmap layout
+/// (`1u32 << (env_len + 1)`), requiring the v2 external-descriptor
+/// path (`TAG_EXTERNAL_DESCRIPTOR`). v1 closures fit comfortably; the
+/// codegen and runtime allocators both assert against this constant
+/// so the layout discipline cannot drift between sites.
+pub const MAX_CLOSURE_ENV_SLOTS: usize = 31;
+
 /// Construct a header word from its three logical fields.
 ///
 /// | Range  | Width | Field                                           |

@@ -1783,68 +1783,59 @@ fn arm_body_does_arithmetic_on_op_args() {
 }
 
 #[test]
-fn arm_uses_k_is_rejected_at_codegen() {
-    // Phase 4c restriction (still in force pending Phase 4d):
-    // arm bodies that reference the continuation `k` are rejected
-    // by the codegen-entry walker with a Phase-4d-pointing
-    // diagnostic. Without this gate, the arm would compile and at
-    // runtime `k` would resolve to a null fn pointer, segfaulting
-    // when the arm tried to invoke it.
+fn arm_uses_k_in_tail_position_returns_continuation_value() {
+    // Plan B Task 55 (Phase 4d MVP): tail-position `k(arg)` is
+    // accepted. The arm body's tail expression `k(0)` lowers to
+    // `sigil_next_step_call(k_closure_loaded, k_fn_loaded, 1)`
+    // followed by a u64 store of `0` into the returned NextStep's
+    // args buffer. The trampoline dispatches the Call into
+    // `sigil_continuation_identity`, which returns `Done(0)`, and
+    // `sigil_run_loop` returns `0` to the perform site.
     //
-    // Typecheck accepts `k(0)` because k has type Fn(Int)->Int (op
-    // returns Int → k_param_ty == Int → handler_overall == Int via
-    // unification with body type). The walker is what rejects,
-    // catching the Ident("k") reference inside the Call's callee
-    // position.
+    // Algebraic semantics under the synchronous shape: when the
+    // perform is in tail position of the handle body (here `(perform
+    // E.op())` IS the body), `k(arg)` produces `arg` as the handle's
+    // overall result — same observable behaviour as `arg`-flowing-
+    // through-identity. The README "Verification limits" section and
+    // the Phase 4d deviation entry document the cases where the
+    // synchronous shape diverges from algebraic semantics
+    // (discard-k across function-call boundaries, non-tail k use);
+    // tail-position k(arg) on a tail-position perform is correct.
     let src = "effect E { op: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform E.op()) with {\n    \
-                   E.op(k) => k(0),\n  \
+                   E.op(k) => k(99),\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4c_arm_k_reject_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4c_arm_k_reject_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail until Phase 4d ships; got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("continuation") || stderr.contains("Phase 4d"),
-        "error message should reference k / Phase 4d; got stderr={stderr:?}",
-    );
+    let (stdout, stderr, code) = compile_and_run(src, "phase4d_tail_k_returns_value");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "99\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]
-fn arm_captures_outer_scope_is_rejected_at_codegen() {
-    // Phase 4c restriction (still in force pending capture support
-    // alongside Phase 4d): arm bodies that reference an outer-scope
-    // binding (here `threshold`, a fn parameter) are rejected by
-    // the codegen-entry walker. Without the gate, the synthetic CPS
-    // arm fn (closure_ptr is null in Phase 4c) would call into the
-    // Lowerer with `threshold` unbound in env, panicking at
-    // `unreachable!("unknown ident")`.
+fn arm_captures_outer_scope_returns_value() {
+    // Plan B Task 55 (Phase 4d MVP): arm bodies that capture
+    // surrounding-fn locals (here `threshold`, a top-level fn
+    // parameter) are now supported. The codegen `Expr::Handle`
+    // path allocates a per-arm closure record holding `threshold`'s
+    // value at slot 0; the synthetic CPS arm fn's `closure_ptr`
+    // (passed via `sigil_handler_frame_set_arm`) points at that
+    // record. The arm body's reference to `threshold` lowers via
+    // `lower_closure_env_load` (offset 16, narrow per
+    // `EnvSlotKind::Int`).
+    //
+    // Note the arm discards `k` — under the Phase 4d MVP synchronous
+    // shape, when the perform is in tail position of the handle body
+    // (`(perform E.op())` IS the body) the discard-k arm value
+    // flows to the perform site → returned by `sigil_run_loop` →
+    // becomes the handle's overall value. This matches algebraic
+    // semantics for the in-tail-position case. The cross-function-
+    // call discard-k correctness gap is documented in the README's
+    // "Verification limits" section and pinned in
+    // `discard_k_handler_does_not_abort_helper_phase_4e_pending`
+    // below.
     let src = "effect E { op: () -> Int }\n\
                fn helper(threshold: Int) -> Int ![IO] {\n  \
                  let n: Int = handle (perform E.op()) with {\n    \
@@ -1856,66 +1847,35 @@ fn arm_captures_outer_scope_is_rejected_at_codegen() {
                  perform IO.println(int_to_string(helper(42)));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4c_arm_capture_reject_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4c_arm_capture_reject_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail — arm body captures outer-scope `threshold`; \
-         got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("captures outer-scope") || stderr.contains("Phase 4d"),
-        "error message should reference outer-scope capture; got stderr={stderr:?}",
-    );
+    let (stdout, stderr, code) = compile_and_run(src, "phase4d_arm_captures_outer_scope");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]
-fn arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen() {
-    // Phase 4c regression for the walker bug closed in PR #24
-    // review #1: when a `Handle` lives inside a `Lambda`,
-    // `closure_convert` recurses into op-arm bodies and rewrites
-    // captured-name `Ident` references into `Expr::ClosureEnvLoad
-    // { name, index, kind, .. }`. Before the fix the walker's
-    // `arm_body_walk` arm for `Expr::ClosureEnvLoad` returned
-    // `None` (treated as benign, alongside literals), so the
-    // rewritten capture slipped past the Phase 4c "no outer-scope
-    // captures" gate. At runtime the synthetic CPS arm fn (with
-    // `closure_ptr = null` in Phase 4c) would null-deref when
-    // lowering the ClosureEnvLoad to `load(closure_ptr + 16 +
-    // 8*index)`.
+fn arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen_phase_4e_pending() {
+    // Plan B Task 55 (Phase 4d MVP) — Phase 4e closure point:
+    // captures from the surrounding fn's *closure record* (handle
+    // inside a synthetic lambda fn) stay rejected. Phase 4d MVP's
+    // closure-record allocation reads values out of `Lowerer.env`
+    // by name; a name only present as a `ClosureEnvLoad` slot on
+    // the surrounding fn's closure_ptr is invisible to that lookup.
+    // Closing this requires extending closure_convert with a per-
+    // synthetic-fn (name, kind, index) side-table so codegen can
+    // emit a `lower_closure_env_load` against the surrounding fn's
+    // closure_ptr to source the env_expr. That extension lifts
+    // alongside Phase 4e's calling-convention shift (colorer's
+    // handler-discharge refinement) per the deviation entry.
     //
-    // The existing `arm_captures_outer_scope_is_rejected_at_codegen`
-    // test doesn't cover this path because it captures a top-
-    // level fn parameter (`fn helper(threshold: Int)`), which
-    // closure_convert leaves as a raw `Ident` (not a lambda
-    // capture). The walker sees the `Ident` and rejects via the
-    // `Ident` arm — correct, but the ClosureEnvLoad arm goes
-    // unexercised on that path.
+    // Test inverts to a positive test (returns 7) when Phase 4e
+    // ships. Walker diagnostic now points at Phase 4e (NOT 4d).
+    // This is `arm_captures_outer_scope_returns_value`'s sibling for
+    // the closure-of-surrounding-lambda case.
     //
-    // This test puts the `Handle` inside a `Lambda`, forcing
-    // closure_convert to rewrite the captured `x` into a
-    // `ClosureEnvLoad`. The walker must reject via the new
-    // `Expr::ClosureEnvLoad` arm.
+    // Sigil v1's `TypeExpr::Fn` surface syntax is deferred (see
+    // examples/higher_order.sigil's preamble note + the Plan A2 Task
+    // 30 carryover), so the lambda has to be invoked as an IIFE
+    // rather than let-bound and called by name.
     // Sigil v1's `TypeExpr::Fn` surface syntax is deferred (see
     // examples/higher_order.sigil's preamble note + the Plan A2 Task
     // 30 carryover), so the lambda has to be invoked as an IIFE
@@ -1960,9 +1920,295 @@ fn arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen(
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("ClosureEnvLoad")
-            || stderr.contains("captures outer-scope")
-            || stderr.contains("Phase 4d"),
-        "error message should reference closure-env-load / outer-scope capture; \
-         got stderr={stderr:?}",
+            || stderr.contains("surrounding fn's closure record")
+            || stderr.contains("Phase 4e"),
+        "error message should reference closure-env-load / surrounding-fn closure / \
+         Phase 4e; got stderr={stderr:?}",
     );
+}
+
+#[test]
+fn arm_uses_k_in_non_tail_position_is_rejected_pointing_at_phase_4e() {
+    // Plan B Task 55 (Phase 4d MVP) — Phase 4e closure point:
+    // non-tail-position `k(arg)` (where the result of `k(arg)`
+    // feeds into another expression) is rejected with a Phase-4e-
+    // pointing diagnostic. The synchronous shape can't yield from
+    // an arm fn mid-body and resume; lifting requires CPS-
+    // transforming the arm body itself, which forces the
+    // surrounding native fn to be CPS-color so the arm-body's
+    // continuation can return NextStep::Call to it. That's the
+    // calling-convention shift Phase 4e ships alongside the
+    // colorer's handler-discharge refinement.
+    //
+    // Test program: arm body is `k(0) + 1` — the `k(0)` is in
+    // arithmetic-binop-LHS position, not tail. The walker rejects.
+    let src = "effect E { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => k(0) + 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4d_non_tail_k_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4d_non_tail_k_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail — arm body uses k in non-tail position; got success \
+         with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-tail") || stderr.contains("Phase 4e"),
+        "error message should reference non-tail k / Phase 4e; got stderr={stderr:?}",
+    );
+}
+
+#[test]
+#[ignore = "Phase 4e pending: pins the discard-k correctness gap across function-call boundaries; inverts to a normal test (asserting stdout 42, code 0) when Phase 4e ships the colorer's handler-discharge refinement"]
+fn discard_k_handler_does_not_abort_helper_phase_4e_pending() {
+    // Plan B Task 55 (Phase 4d MVP) — pinning test for the
+    // discard-k correctness gap, slated to close in Phase 4e
+    // (colorer's handler-discharge refinement + native↔CPS interop
+    // boundary). See `[DEVIATION Task 55] Phase 4d` in
+    // PLAN_B_DEVIATIONS.md and the README "Verification limits
+    // (in-flight)" section.
+    //
+    // Algebraic semantics says: a discard-`k` arm (Raise.fail(k) =>
+    // 42) should produce the arm value as the handle's overall
+    // result and abort the rest of the handle body, even when the
+    // perform reaches the arm via a function-call boundary
+    // (helper() performs Raise.fail; main wraps helper in a
+    // handle).
+    //
+    // Phase 4d MVP synchronous shape: `sigil_run_loop` returns the
+    // arm value (42) to the perform site INSIDE helper. helper then
+    // continues executing the post-perform code (`+ 100`), returns
+    // 142 to main, and main's handle expression unwraps to 142
+    // (NOT 42).
+    //
+    // Expected (Phase 4e+): stdout "42\n", exit 0.
+    // Current (Phase 4d MVP): stdout "142\n", exit 0 (compiles +
+    // runs; produces wrong result vs. algebraic semantics).
+    //
+    // The `#[ignore]` keeps this test grep-findable in CI as a
+    // structural reminder of what Phase 4e closes. When Phase 4e
+    // ships, the test inverts to active by removing the `#[ignore]`
+    // attribute and the assertions below match algebraic semantics
+    // (stdout "42\n").
+    //
+    // To verify the current (broken) behaviour locally:
+    //   cargo test -p sigil-compiler --test e2e \
+    //     discard_k_handler_does_not_abort_helper_phase_4e_pending \
+    //     -- --ignored
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x + 100\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => 42,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4d_pending_discard_k_cross_call");
+    // Phase 4e EXPECTED behaviour (uncomment when 4e ships, remove
+    // the current-behaviour assertion below, and remove the
+    // `#[ignore]` attribute):
+    // assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // assert_eq!(stdout, "42\n", "Phase 4e algebraic-correct stdout; stderr={stderr:?}");
+
+    // Phase 4d MVP CURRENT (broken) behaviour: arm value 42 flows
+    // to perform site → helper computes 42 + 100 = 142 → handle
+    // overall = 142.
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "142\n",
+        "Phase 4d MVP synchronous shape produces 142 (helper continues post-perform); \
+         Phase 4e closes this gap. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn arm_uses_k_inside_if_branch_is_rejected_pointing_at_phase_4e() {
+    // Phase 4d MVP — Phase 4e closure point: multi-branch tail-`k`
+    // shapes (`if c { k(x) } else { k(y) }`) require a join-block
+    // lowering returning `*NextStep`, beyond Phase 4d MVP scope.
+    // The walker (`arm_body_walk`) and the synth-pass detector
+    // (`arm_body_tail_is_k_call`) must agree on the recursion
+    // shape: both treat tail position as propagating only through
+    // `Expr::Block` tails (NOT `Expr::If` then/else, NOT `Expr::Match`
+    // arm bodies). A regression where the walker accepted these as
+    // tail-k while the detector rejected would manifest as a hard
+    // compiler crash at the synth pass's `lower_expr` (k as an
+    // indirect-call callee → `unreachable!`).
+    //
+    // This test pins the walker's rejection. Inverts to a positive
+    // test (asserting either branch's value flows correctly) when
+    // Phase 4e ships the join-block lowering.
+    let src = "effect E { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => if true { k(1) } else { k(2) },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4d_if_branch_k_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4d_if_branch_k_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail — k(arg) inside if-branch is non-tail under \
+         Phase 4d MVP detector; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-tail") || stderr.contains("Phase 4e"),
+        "error message should reference non-tail k / Phase 4e; got stderr={stderr:?}",
+    );
+}
+
+#[test]
+fn arm_uses_k_inside_match_arm_is_rejected_pointing_at_phase_4e() {
+    // Phase 4d MVP — Phase 4e closure point: same shape as the
+    // if-branch test above but via `match`. The walker's
+    // `Expr::Match` arm-body walk must align with
+    // `arm_body_tail_is_k_call`'s "Block tails only" recursion —
+    // accepting tail-k inside match arms would cause the same
+    // walker-vs-detector mismatch that crashes the synth pass.
+    //
+    // Test source matches on a `Bool` scrutinee with both arms
+    // calling `k`. Inverts to a positive test when Phase 4e ships
+    // the join-block lowering.
+    let src = "effect E { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => match true { true => k(1), false => k(2) },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4d_match_arm_k_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4d_match_arm_k_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail — k(arg) inside match arm body is non-tail under \
+         Phase 4d MVP detector; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-tail") || stderr.contains("Phase 4e"),
+        "error message should reference non-tail k / Phase 4e; got stderr={stderr:?}",
+    );
+}
+
+#[test]
+fn arm_body_with_inner_block_and_outer_capture_works() {
+    // Plan B Task 55 (Phase 4d) — regression test for review items
+    // 1 / 2 / MF3 (codegen `rewrite_block` scope rollback fragility
+    // + typecheck `walk_block` `locals` leak). Sigil's no-shadow
+    // contract (resolve E0020 / typecheck `env_insert` debug-assert)
+    // forbids the literal shadowing example the reviewer drafted,
+    // and Sigil's arm-body grammar (`parse_handle_op_arm` calls
+    // `parse_expr`, not `parse_block`) means arm bodies can't be
+    // raw `{ … }` block expressions either. The regression here is
+    // structural: push/pop scope discipline must keep capture
+    // rewriting and free-var collection honest across nested-block
+    // boundaries even when no name collisions exist.
+    //
+    // Test shape uses an `if` whose then-block contains the
+    // multi-statement scoping (Sigil DOES allow blocks in if-branch
+    // bodies via `parse_block`); the else-block exists only to
+    // satisfy `if`'s typing rules and is unreachable at runtime
+    // (cond is `true`).
+    //
+    //   - `outer(local: Int)` brings `local` into scope.
+    //   - Arm body's tail is an `if true { … } else { 0 }`.
+    //   - Then-block has `let extra = 7;` then a tail
+    //     `local + extra` referencing both the capture and the
+    //     block-local let. The block exercises:
+    //         · rewrite_block push/pop scope frame (codegen)
+    //         · walk_block locals save/restore (typecheck)
+    //         · capture rewrite of `local` against the surrounding
+    //           closure record
+    //
+    // Expected output: 5 (outer.local) + 7 (block-local `extra`) = 12.
+    // Note: `outer`'s effect row is `![IO]` (NOT `![IO, E]`) — the
+    // handle discharges `E` inside the body, so `E` is not in
+    // outer's externally-observable effects. Same shape as existing
+    // `arm_captures_outer_scope_returns_value`.
+    let src = "effect E { op: () -> Int }\n\
+               fn outer(local: Int) -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => if true { let extra: Int = 7; local + extra } else { 0 },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 outer(5)\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "phase4d_arm_body_nested_block_outer_capture");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "12\n", "expected 5 + 7; stderr={stderr:?}");
 }

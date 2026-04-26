@@ -214,6 +214,53 @@ compiling any single Plan-A2 sigil program peaks at ~63 MiB;
 the Rust toolchain, not sigil itself. Reproduce with
 `scripts/peak-rss.sh`.
 
+## Verification limits (in-flight)
+
+Sigil is **under active construction**. Some language features compile
+and run, but with semantic gaps that have not yet been closed. Programs
+that depend on the gapped behavior may produce results that diverge
+from standard algebraic-effects semantics without any compile-time
+signal. Each row in the table below names the plan-tracker phase that
+closes the gap; the discard-continuation entry has additional prose
+because the failure mode is silent (programs compile and run but
+produce algebraic-incorrect results) and is the load-bearing one for
+Stage 9 spec validation.
+
+| Gap | Behavior today | Closure point |
+|-----|----------------|---------------|
+| Discard-continuation handlers across function-call boundaries | Compiles + runs, **silently diverges** from algebraic semantics when the perform reaches the arm via a function call (see prose below) | Phase 4e |
+| Non-tail continuation use (`k(x) + 1`, `let r = k(x); …`) | Codegen-time rejection | Phase 4e |
+| Multi-shot continuations (`effect E resumes: many`) | Parses + typechecks; runtime UB if `k` invoked >1 times | Phase 4e |
+| Multi-effect handlers (arms targeting different effects) | Codegen-time rejection | Phase 4f |
+| Return arms (`handle … with { return(v) => …, … }`) | Codegen-time rejection | Phase 4g |
+| Captures from a surrounding lambda's closure record | Codegen-time rejection | Phase 4e |
+| Stage 9 spec validation | Cannot run — gated on Phase 4e (the discard-`k` correctness gap) | Phase 4e |
+
+**Discard-continuation handlers (Raise-style early-exit) do not yet
+propagate through function-call boundaries.** Behavior currently
+matches the Phase 4c synchronous shape, where the arm's return value
+flows to the perform site, not the handle expression. Programs
+depending on this — e.g., `handle helper() with { Raise.fail(k) =>
+default }` where `helper` performs `Raise.fail` and the surrounding
+code expects the handle to return `default` — work as expected **only
+when the perform is in tail position of the handle body** (no
+function-call boundary between the handle and the perform). When the
+perform reaches the arm via a function call, the discarded
+continuation does not abort the helper fn: the arm's value is returned
+to the helper's perform site as if `k` had been invoked with that
+value, the helper continues executing, and the handle's overall result
+reflects the helper's tail expression rather than the arm's value. The
+fix is the colorer's handler-discharge refinement, which reclassifies
+helper fns whose performs reach a discharging handler as CPS-color so
+their performs return `NextStep::Call` to the enclosing trampoline
+rather than synchronously blocking on `sigil_run_loop`.
+
+This list is a living section: each entry tracks an in-flight gap that
+will close in a specific tracked phase, and is updated alongside the
+implementing PR. The authoritative source for current Plan B phase
+state is [`PLAN_B_PROGRESS.md`](PLAN_B_PROGRESS.md); architectural
+decisions are in [`PLAN_B_DEVIATIONS.md`](PLAN_B_DEVIATIONS.md).
+
 ## Status
 
 - **Plan A1** — Stage 0 scaffolding + Stage 1 hello-world vertical slice: **done**.
