@@ -755,7 +755,8 @@ fn handler_frame_pointer_bitmap(arm_count: usize) -> u32 {
     bitmap |= 1 << 3;
     for i in 0..arm_count {
         let closure_word_idx = 5 + 2 * i;
-        // The MAX_HANDLER_ARMS cap (13) keeps `closure_word_idx` ≤ 31.
+        // The MAX_HANDLER_ARMS cap (14) keeps `closure_word_idx` ≤ 31:
+        // i ranges over [0, arm_count) ⊆ [0, 14), so max idx = 5 + 2*13 = 31.
         debug_assert!(closure_word_idx < 32);
         bitmap |= 1u32 << closure_word_idx;
     }
