@@ -1895,11 +1895,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// raw untagged Int per the Plan B Int ABI).
     fn lower_perform_non_io_to_value(&mut self, p: &crate::ast::PerformExpr) -> Value {
         // Bound check (defense-in-depth — runtime's `sigil_perform`
-        // also asserts `args_len + 2 <= MAX_INLINE_ARGS`). v1 ops use
-        // 0–2 user args; the cap (30 user args after subtracting the
-        // two implicit `(k_closure, k_fn)` slots) is a forward-compat
-        // boundary documented in the Task 56 MAX_INLINE_ARGS deviation.
-        assert!(
+        // is the source of truth and aborts with a named effect_id /
+        // op_id message on `args_len + 2 > MAX_INLINE_ARGS`). The
+        // compiler-side `debug_assert!` here catches the bug in dev
+        // builds before linking; release builds let the runtime's
+        // named guard fire so users get the better diagnostic. v1
+        // ops use 0–2 user args; the cap (30 user args after
+        // subtracting the two implicit `(k_closure, k_fn)` slots)
+        // is a forward-compat boundary documented in the Task 56
+        // MAX_INLINE_ARGS deviation.
+        debug_assert!(
             (p.args.len() as u32).saturating_add(2) <= sigil_abi::effect::MAX_INLINE_ARGS,
             "codegen: non-IO perform `{}.{}` has {} user args, exceeding \
              MAX_INLINE_ARGS - 2 = {} (boxing path arrives in a future plan)",
@@ -1931,9 +1936,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // buffer. The buffer lives in this fn's frame, which outlives
         // `sigil_perform` (the runtime copies args into the dispatched
         // `NextStep::Call`'s slots before returning), so a stack slot
-        // is sound. Each arg is widened to u64 via `uextend` if its
-        // Cranelift type is narrower than I64; pointer-typed args
-        // (already pointer-width on supported targets) store directly.
+        // is sound under Phase 4b's synchronous calling pattern. Each
+        // arg is widened to u64 via `uextend` if its Cranelift type
+        // is narrower than I64; pointer-typed args (already pointer-
+        // width on supported targets) store directly.
         //
         // Empty-args case: `args_ptr` stays null, `args_len == 0`. The
         // runtime accepts a null `args_ptr` only when `args_len == 0`
@@ -1953,6 +1959,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             // 8-byte slots; align_shift = 3 means 2^3 = 8-byte aligned,
             // matching the runtime's `args_ptr.add(i)` u64-stride
             // reads in `sigil_perform`.
+            //
+            // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4d):
+            // stack-slot allocation here is sound *only* under the
+            // synchronous `lower_perform_non_io_to_value` →
+            // `sigil_perform` → `sigil_run_loop` chain that returns
+            // before this fn does (the runtime copies args into the
+            // dispatched `NextStep::Call`'s arena slots before
+            // returning, so the stack slot only needs to outlive the
+            // synchronous call). Phase 4d converts perform sites to
+            // return `NextStep::Call` to the caller's trampoline
+            // rather than synchronously calling `sigil_run_loop` from
+            // native code; at that point this stack slot dies before
+            // the trampoline reads it on the next dispatch and the
+            // args buffer must migrate to arena allocation via
+            // `sigil_arena_alloc`. Closure point cross-references the
+            // `[DEVIATION Task 55] Native callers drive sigil_run_loop
+            // synchronously` entry. See also the `[DEVIATION Task 55]
+            // Phase 4b — args-buffer packing on perform side` entry.
             let slot_bytes = (p.args.len() * 8) as u32;
             let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
@@ -1974,13 +1998,26 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.builder.ins().uextend(types::I64, arg_v)
                 } else {
                     // pointer_ty is I64 on every supported target
-                    // (x86_64-linux, aarch64-darwin); v1 has no F64
-                    // surface type. A future port to a 32-bit target
-                    // would need a uextend or bitcast branch here.
-                    debug_assert_eq!(
+                    // (x86_64-linux, aarch64-darwin); v1 has no F32
+                    // / F64 surface type. A future floats addition
+                    // would silently miscompile through this fall-
+                    // through (storing the bit-pattern as if it
+                    // were a pointer-sized value), so we panic
+                    // here in *both* dev and release builds rather
+                    // than `debug_assert_eq!` — a cheap insurance
+                    // policy until v2 either adds floats with an
+                    // explicit branch or this assertion fires and
+                    // forces the question. A future 32-bit target
+                    // port would also need a uextend or bitcast
+                    // branch here for pointer args.
+                    assert_eq!(
                         arg_ty, self.pointer_ty,
                         "codegen: unexpected arg Cranelift type \
-                         {arg_ty:?} for non-IO perform args buffer"
+                         {arg_ty:?} for non-IO perform args buffer \
+                         — Phase 4b only supports I64 (Int), I32 (Char), \
+                         I8 (Bool/Byte/Unit), and pointer_ty (String / \
+                         user-type pointers); floats and 32-bit-target \
+                         pointer types need a dedicated branch"
                     );
                     arg_v
                 };
