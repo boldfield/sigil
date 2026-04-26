@@ -1616,26 +1616,32 @@ fn arm_reads_bool_arg_branches_on_it() {
 fn arm_reads_string_arg_prints_via_io_println() {
     // Phase 4c — arg-content verification (3/4): String arg goes
     // through the pointer-store path (no widening — pointer_ty ==
-    // I64 on supported targets). The arm passes the bound `s`
-    // directly to `IO.println` from inside the arm body. This
-    // exercises:
+    // I64 on supported targets). The arm body returns the bound
+    // `s` directly (op declared `(String) -> String` so handle's
+    // overall is String); main then prints it via IO.println at
+    // the outer scope. This exercises:
     //   - perform-side: arg's heap-pointer Value stored at offset 0
     //   - runtime: copies pointer into NextStep::Call's args slot
     //   - arm-fn: loads u64 from args_ptr, binds as String pointer
     //     (no ireduce — declared_ty == pointer_ty)
-    //   - arm body: invokes IO.println via Lowerer's existing
-    //     perform path, which reads the string literal
+    //   - arm body: env lookup for `s` returns the bound pointer
+    //   - perform-side narrow: returns widened I64 (pointer_ty path,
+    //     no narrow needed since pointer_ty == I64)
     //
     // A wrong-arg-buffer-offset bug would print garbage or crash
     // inside sigil_println dereferencing a non-string pointer.
-    // The arm body returns 0 to satisfy the Int return type;
-    // the println side-effect is the observable.
-    let src = "effect E { op: (String) -> Int }\n\
+    //
+    // (Sigil v1's parser doesn't accept `{ stmt; expr }` as an
+    // expression — Block only appears in fn bodies / if branches —
+    // so the arm body has to be a single Ident expression rather
+    // than `{ perform IO.println(s); 0 }`.)
+    let src = "effect E { op: (String) -> String }\n\
                fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle (perform E.op(\"hello\")) with {\n    \
-                   E.op(s, k) => { perform IO.println(s); 0 },\n  \
+                 let s: String = handle (perform E.op(\"hello\")) with {\n    \
+                   E.op(arg, k) => arg,\n  \
                  };\n  \
-                 n\n\
+                 perform IO.println(s);\n  \
+                 0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_string");
     assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
