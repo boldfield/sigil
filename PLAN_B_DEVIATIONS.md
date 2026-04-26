@@ -801,3 +801,160 @@ rule using escape analysis without breaking source compatibility
 **Closure point:** open — refinements (escape analysis for
 lambda captures; `Linear[Bool]`-style use-count types) can land in
 a future plan without breaking the strict-pessimistic surface.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] Task 56 lands before Task 55
+
+**Plan body** numbers Task 55 (CPS transform on CPS-color
+monomorphs; arena-allocated `NextStep` records) before Task 56
+(runtime: `HandlerFrame`, arena, `sigil_perform`, `run_loop`,
+counters). The numerical order suggests codegen first, runtime
+second.
+
+**Implemented order:** Task 56 ships first in this PR; Task 55
+follows in the next PR.
+
+**Reasoning:** Task 55 lowers `Expr::Perform` and `Expr::Handle`
+to calls into `sigil_perform`, `sigil_handle_push`,
+`sigil_arena_alloc`, and `sigil_run_loop`. Those symbols are
+provided by Task 56. Implementing Task 55 first would require
+either:
+
+1. Stub runtime symbols that abort at runtime (the pre-Plan-B
+   state) — but then no e2e test can run, defeating the
+   acceptance signal.
+2. Inlining a temporary runtime in Task 55's PR that Task 56
+   later replaces — wastes review cycles on throw-away code.
+3. Combining 55 + 56 in a single mega-PR — the resulting diff
+   would be 3000+ LOC across both subsystems, against Plan B's
+   established cadence of one task per PR (PRs #15, #16, #17,
+   #19, #20). PR #18 was the only multi-task PR and combined the
+   2 LOC P16/P17 prompts with the 600+ LOC generic_map example.
+
+Order swapped because Task 56 is independently testable in
+isolation (Rust unit tests against the FFI symbols) and ships a
+clean, focused review surface. Task 55 lands as soon as the
+runtime is in main and reviewer-approved.
+
+**Plan order vs implementation order:**
+
+| Task | Plan body order | Ship order |
+|------|-----------------|------------|
+| 55   | first           | second     |
+| 56   | second          | first      |
+
+**`PLAN_B_PROGRESS.md` reflects this:** Task 55's entry stays
+`todo` after this PR; Task 56's entry flips to `done-pending-ci`.
+The Task 55 PR will flip Task 56 to `done` per the Plan A2
+PROGRESS-hygiene precedent (next PR closes the prior PR's
+done-pending-ci).
+
+**Implementing commit:** [HEAD]
+**Closure point:** closed at Task 55 PR merge (Task 55 is the
+direct consumer of Task 56's runtime surface; absent Task 55,
+Task 56's surface is dead code that the runtime ships but
+nothing calls).
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] Uniform CPS calling convention via packed args buffer
+
+**Plan body** (Stage 6 Task 55, paraphrased): "Handler arms
+become closures stored in the handler frame; the continuation
+`k` is passed to operation arms as an ordinary argument
+(post-CPS, continuations are values)." The plan implicitly
+assumes typed direct calls into CPS-color fns (e.g.
+`fn(closure_ptr, T1, T2, ...) -> NextStep` per fn).
+
+**Implemented form:** every CPS-color fn shares the uniform
+signature
+
+```text
+extern "C" fn cps_fn(
+    closure_ptr: *mut u8,
+    args_ptr:    *const u64,
+    args_len:    u32,
+) -> *mut NextStep
+```
+
+User arguments are widened to `u64` and packed into a
+caller-supplied buffer. Codegen emits an unpacking prologue per
+CPS-color fn that reads the args from the buffer according to
+the fn's known surface signature.
+
+**Reason for the deviation:** the trampoline (`sigil_run_loop`)
+dispatches `NextStep::Call` records by invoking the carried fn
+pointer. The fn's static signature varies per call site, but the
+trampoline only sees the dynamic `NextStep` payload. With typed
+direct calls, the trampoline would need either:
+
+1. **Per-arity dispatch** (`match arg_count { 0 => f0(...), 1 =>
+   f1(c, a0), 2 => f2(c, a0, a1), ... }`) capping the maximum
+   arity at compile-time and producing N transmute sites.
+2. **Hand-rolled assembly** to push `arg_count` u64 values onto
+   the calling-convention argument registers/stack and dispatch.
+   Non-portable across `x86_64-unknown-linux-gnu` /
+   `aarch64-apple-darwin`.
+3. **A per-fn thunk** emitted by codegen that reads args from a
+   buffer and tail-calls the typed body. Same total cost as the
+   uniform convention but with extra indirection.
+
+Option (1) caps effects to a fixed maximum arity and inflates
+code size with N variants. (2) is per-platform unsafe code. (3)
+is functionally equivalent to the uniform convention chosen
+here, just with a syntactic difference. The uniform convention
+keeps the trampoline portable, lets codegen emit a single CPS
+prologue shape per fn, and eliminates the arity dispatch
+problem entirely.
+
+**Cost:** every CPS-color fn pays a small per-call cost reading
+its args from the buffer (typically 1–3 64-bit loads). Cranelift
+inlines the load chain into the prologue; on benchmark
+workloads the overhead is dominated by the trampoline dispatch
+itself, not the unpack. Native-color fns (the common case for
+non-effect arithmetic like `fib`) keep the existing direct
+calling convention with no change.
+
+**Implementing commit:** [HEAD]
+**Closure point:** Task 55 ships the codegen prologue. If a
+performance-floor breach traces to the unpack overhead, the
+fallback is option (3) (per-fn thunk) which keeps the
+trampoline-side ABI unchanged.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] HandlerFrame reuses TAG_CLOSURE; Boehm-only GC tracking
+
+**Plan body** (Stage 6 Task 56) defines `HandlerFrame` with a
+specific shape but leaves the heap layout / object-tag question
+implicit.
+
+**Implemented form:** HandlerFrame heap objects are allocated
+via `sigil_alloc` with `TAG_CLOSURE` reused as the object tag.
+The 32-bit GC pointer bitmap explicitly marks the
+`return_closure`, `prev`, and per-arm `closure_ptr` slots so
+Boehm's mark phase walks them correctly. Function pointers
+(`return_fn`, `arms[i].fn_ptr`) are NOT marked — they reference
+`.text` not the GC heap.
+
+**Reason for tag reuse:** introducing `TAG_HANDLER_FRAME` would
+require extending `sigil-header-constants` (the workspace crate
+that owns the canonical 8-byte object header), which is shared
+across compiler and runtime and outside Task 56's scope. Boehm
+only consumes the pointer bitmap, not the tag, so the overload
+is functionally inert today. A future GC walker that
+introspects tags can add `TAG_HANDLER_FRAME` in a single line
+without touching this allocation site.
+
+**Capacity bound:** `MAX_HANDLER_ARMS = 13`. Bounded by the
+32-bit pointer bitmap: arm `i`'s closure_ptr lives at payload
+word `5 + 2*i`, so bit 31 corresponds to arm 13. v1 effects
+ship with 1–3 ops; the cap is comfortably above realistic v1
+needs. A future relaxation requires widening the bitmap field
+in the Sigil object header (out of scope for Plan B).
+
+**Implementing commit:** [HEAD]
+**Closure point:** open — TAG_HANDLER_FRAME slot can land in a
+future plan if a tag-aware GC walker arrives. The layout
+otherwise stable.
