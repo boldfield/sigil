@@ -1671,6 +1671,95 @@ fn arm_reads_multi_args_in_declared_order() {
     assert_eq!(stdout, "20\n", "stderr={stderr:?}");
 }
 
+#[test]
+fn arm_reads_char_arg_branches_on_codepoint() {
+    // Phase 4c — arg-content verification (2b/4): Char arg goes
+    // through `uextend(I64, _)` (perform side, I32 → I64) → u64
+    // slot → `ireduce(I32, _)` (arm side) → branch via `==`.
+    //
+    // Bool (test 2a above) exercises the I8 width of the widen/
+    // ireduce path; this test exercises the I32 (Char) width of
+    // the same path. They are distinct Cranelift instructions
+    // operating on distinct value widths, so the Bool test
+    // alone leaves the I32 leg verifier-checked but not value-
+    // checked. A wrong-direction extend (`sextend` vs `uextend`)
+    // or a width-swap regression on the Char path would land
+    // green under Bool-only coverage.
+    //
+    // Closes part of PR #24 review MF1 (Char arg-readback).
+    let src = "effect E { op: (Char) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op('Z')) with {\n    \
+                   E.op(c, k) => if c == 'Z' { 1 } else { 0 },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_char");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "1\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn perform_side_narrow_to_bool_value_checked() {
+    // Phase 4c — perform-side narrow value-check (closes PR #24
+    // review MF2). All the precondition-matrix tests above
+    // declare ops returning `Int` (or `String`), so the
+    // perform-side narrow at `compiler/src/codegen.rs::lower_perform_non_io_to_value`
+    // always takes the `return_ty == I64` no-op branch and the
+    // `ireduce(return_ty, widened)` instruction the PR ships
+    // is verifier-checked but not value-checked.
+    //
+    // Here the op is declared `(Int) -> Bool`. Arm body returns
+    // `true`; the arm fn widens to I64 via `uextend` (matching
+    // `sigil_next_step_done`'s I64 signature); `sigil_run_loop`
+    // returns I64; `lower_perform_non_io_to_value` narrows
+    // back via `ireduce(I8, widened)` so the surrounding
+    // code sees a Cranelift I8 Value (matching `type_of_expr`'s
+    // prediction for a Bool-returning perform). Without the
+    // narrow, the `if b` would consume an I64 where I8 is
+    // expected — Cranelift's verifier would reject. With a
+    // wrong-direction sign extend in the body widen, `if b`
+    // would observe `false` and return `99` instead of `7`.
+    let src = "effect E { op: (Int) -> Bool }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let b: Bool = handle (perform E.op(1)) with {\n    \
+                   E.op(n, k) => true,\n  \
+                 };\n  \
+                 let n: Int = if b { 7 } else { 99 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "phase4c_perform_narrow_bool");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn perform_side_narrow_to_char_value_checked() {
+    // Phase 4c — perform-side narrow value-check (closes PR #24
+    // review MF2 second leg). Mirror of `perform_side_narrow_to_bool_value_checked`
+    // for the I32 (Char) width. Op is declared `(Int) -> Char`;
+    // arm body returns the Char `'Y'`; perform-side narrow uses
+    // `ireduce(I32, widened)` to restore the Char Cranelift
+    // type so the subsequent `c == 'Y'` equality check operates
+    // on matching widths. Bool covers the I8 width, this covers
+    // the I32 width — symmetric to MF1's Bool-vs-Char split on
+    // the perform→arm widen leg.
+    let src = "effect E { op: (Int) -> Char }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let c: Char = handle (perform E.op(1)) with {\n    \
+                   E.op(n, k) => 'Y',\n  \
+                 };\n  \
+                 let n: Int = if c == 'Y' { 11 } else { 22 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "phase4c_perform_narrow_char");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "11\n", "stderr={stderr:?}");
+}
+
 // Phase 4c bonus tests — beyond the precondition matrix, exercise
 // richer arm-body shapes the Lowerer now supports.
 
@@ -1797,5 +1886,77 @@ fn arm_captures_outer_scope_is_rejected_at_codegen() {
     assert!(
         stderr.contains("captures outer-scope") || stderr.contains("Phase 4d"),
         "error message should reference outer-scope capture; got stderr={stderr:?}",
+    );
+}
+
+#[test]
+fn arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen() {
+    // Phase 4c regression for the walker bug closed in PR #24
+    // review #1: when a `Handle` lives inside a `Lambda`,
+    // `closure_convert` recurses into op-arm bodies and rewrites
+    // captured-name `Ident` references into `Expr::ClosureEnvLoad
+    // { name, index, kind, .. }`. Before the fix the walker's
+    // `arm_body_walk` arm for `Expr::ClosureEnvLoad` returned
+    // `None` (treated as benign, alongside literals), so the
+    // rewritten capture slipped past the Phase 4c "no outer-scope
+    // captures" gate. At runtime the synthetic CPS arm fn (with
+    // `closure_ptr = null` in Phase 4c) would null-deref when
+    // lowering the ClosureEnvLoad to `load(closure_ptr + 16 +
+    // 8*index)`.
+    //
+    // The existing `arm_captures_outer_scope_is_rejected_at_codegen`
+    // test doesn't cover this path because it captures a top-
+    // level fn parameter (`fn helper(threshold: Int)`), which
+    // closure_convert leaves as a raw `Ident` (not a lambda
+    // capture). The walker sees the `Ident` and rejects via the
+    // `Ident` arm — correct, but the ClosureEnvLoad arm goes
+    // unexercised on that path.
+    //
+    // This test puts the `Handle` inside a `Lambda`, forcing
+    // closure_convert to rewrite the captured `x` into a
+    // `ClosureEnvLoad`. The walker must reject via the new
+    // `Expr::ClosureEnvLoad` arm.
+    let src = "effect E { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let x: Int = 7;\n  \
+                 let f = fn (_d: Int) -> Int ![] => handle (perform E.op()) with {\n    \
+                   E.op(k) => x,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(f(0)));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4c_closure_env_load_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4c_closure_env_load_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail — arm body captures `x` via ClosureEnvLoad after \
+         closure_convert; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ClosureEnvLoad")
+            || stderr.contains("captures outer-scope")
+            || stderr.contains("Phase 4d"),
+        "error message should reference closure-env-load / outer-scope capture; \
+         got stderr={stderr:?}",
     );
 }

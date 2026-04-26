@@ -707,11 +707,26 @@ fn arm_body_walk(
 ) -> Option<String> {
     use crate::ast::Expr;
     match e {
-        Expr::IntLit(..)
-        | Expr::BoolLit(..)
-        | Expr::CharLit(..)
-        | Expr::StringLit(..)
-        | Expr::ClosureEnvLoad { .. } => None,
+        Expr::IntLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
+        Expr::ClosureEnvLoad { name, .. } => {
+            // The walker runs against the post-`closure_convert` AST,
+            // which rewrites captured names into `ClosureEnvLoad`
+            // (load from the enclosing fn's closure record). When a
+            // `Handle` lives inside a `Lambda`, closure_convert
+            // recurses into op-arm bodies and rewrites every
+            // captured-name `Ident` into a `ClosureEnvLoad` —
+            // without this rejection the rewritten capture would
+            // slip past the `Expr::Ident` capture check below, and
+            // at runtime would null-deref because the synthetic
+            // CPS arm fn has `closure_ptr = null` in Phase 4c.
+            // Same diagnostic as the `Expr::Ident` capture path
+            // (closes the same Phase 4d/onward closure point).
+            Some(format!(
+                "captures outer-scope binding `{name}` (rewritten by closure_convert \
+                 into a ClosureEnvLoad) — closure captures in arm bodies arrive \
+                 when k reification ships (Phase 4d/onward)"
+            ))
+        }
         Expr::Ident(name, _) => {
             if name == k_name {
                 return Some(format!(
@@ -2030,7 +2045,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // already I64 on every supported target. A
                         // future float / 32-bit-target port would
                         // need an ireduce or bitcast branch here.
-                        debug_assert_eq!(
+                        // `assert_eq!` (not `debug_assert_eq!`) so a
+                        // future floats addition or 32-bit-target
+                        // port that smuggles a non-pointer-width
+                        // value through this path panics in *both*
+                        // dev and release builds — symmetric with
+                        // `lower_perform_non_io_to_value`'s
+                        // perform-side widening fallthrough at
+                        // codegen.rs:2542 per the deviation entry's
+                        // "mirror" hardening discipline.
+                        assert_eq!(
                             *declared_ty, pointer_ty,
                             "codegen Phase 4c: unexpected op-arg Cranelift type \
                              {declared_ty:?} unpacking from args_ptr in arm fn"
@@ -2087,7 +2111,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // pointer_ty: store directly (already I64 on
                     // supported targets); see widening discipline
                     // in `lower_perform_non_io_to_value`.
-                    debug_assert_eq!(
+                    // `assert_eq!` (not `debug_assert_eq!`) for
+                    // symmetry with the perform-side widening
+                    // fallthrough at codegen.rs:2542 per the
+                    // deviation entry's "mirror" hardening
+                    // discipline — future floats / 32-bit-target
+                    // regressions panic in both dev and release.
+                    assert_eq!(
                         synth.body_ty, pointer_ty,
                         "codegen Phase 4c: unexpected arm-body Cranelift type \
                          {:?} for sigil_next_step_done wrap",
@@ -2606,15 +2636,27 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // (e.g. Bool I8, Char I32) would see an I64 Cranelift value
         // where `type_of_expr` predicts a narrower type, producing
         // a verifier failure or worse a silent type-mismatch.
-        let return_ty = if let Some(eff) = self.effects.get(&p.effect) {
-            eff.ops
-                .iter()
-                .find(|o| o.name == p.op)
-                .map(|op| cranelift_ty_for_type_expr(&op.return_type, self.pointer_ty))
-                .unwrap_or(types::I64)
-        } else {
-            types::I64
-        };
+        // Both registry lookups are typecheck invariants: E0042
+        // catches unknown effects, E0043 catches unknown ops. Falling
+        // back to `I64` here would silently emit wrong-typed Cranelift
+        // values for non-Int return types under any future typecheck
+        // regression that left the registry incomplete; `unreachable!`
+        // surfaces the regression at codegen time instead.
+        let eff = self.effects.get(&p.effect).unwrap_or_else(|| {
+            unreachable!(
+                "codegen: effect `{}` missing from effects registry; typecheck-time \
+                 E0042 should have caught this",
+                p.effect
+            )
+        });
+        let op_decl = eff.ops.iter().find(|o| o.name == p.op).unwrap_or_else(|| {
+            unreachable!(
+                "codegen: op `{}.{}` missing from EffectDecl.ops; typecheck-time \
+                 E0043 should have caught this",
+                p.effect, p.op
+            )
+        });
+        let return_ty = cranelift_ty_for_type_expr(&op_decl.return_type, self.pointer_ty);
         if return_ty == types::I64 {
             widened
         } else if return_ty.is_int() && return_ty.bits() < 64 {
