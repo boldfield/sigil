@@ -1359,12 +1359,8 @@ fn collect_handle_arms_in_expr(
                         kind: crate::closure_convert::slot_kind_for_ty(ty),
                     })
                     .collect();
-                let rewritten_body = rewrite_arm_body_with_captures(
-                    &arm.body,
-                    &captures,
-                    &arg_names,
-                    &arm.k_name,
-                );
+                let rewritten_body =
+                    rewrite_arm_body_with_captures(&arm.body, &captures, &arg_names, &arm.k_name);
                 synth.push(HandlerArmSynth {
                     func_id,
                     body: rewritten_body,
@@ -1435,7 +1431,10 @@ fn arm_body_tail_is_k_call<'a>(
             }
             None
         }
-        Expr::Block(b) => b.tail.as_ref().and_then(|t| arm_body_tail_is_k_call(t, k_name)),
+        Expr::Block(b) => b
+            .tail
+            .as_ref()
+            .and_then(|t| arm_body_tail_is_k_call(t, k_name)),
         _ => None,
     }
 }
@@ -1504,10 +1503,7 @@ fn rewrite_expr(
     use crate::ast::Expr;
     use std::collections::BTreeSet;
     match e {
-        Expr::IntLit(..)
-        | Expr::StringLit(..)
-        | Expr::BoolLit(..)
-        | Expr::CharLit(..) => e.clone(),
+        Expr::IntLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => e.clone(),
         Expr::Ident(name, span) => {
             if name_in_active_scope(name, scopes) {
                 e.clone()
@@ -1729,8 +1725,7 @@ fn rewrite_block(
     scopes: &mut Vec<std::collections::BTreeSet<String>>,
 ) -> crate::ast::Block {
     use crate::ast::{Block, LetStmt, Stmt};
-    let mut block_scope: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut block_scope: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut new_stmts: Vec<Stmt> = Vec::with_capacity(b.stmts.len());
     for s in &b.stmts {
         match s {
@@ -2136,19 +2131,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     next_step_call_sig.params.push(AbiParam::new(types::I32)); // arg_count
     next_step_call_sig.returns.push(AbiParam::new(pointer_ty));
     let next_step_call = module
-        .declare_function(
-            "sigil_next_step_call",
-            Linkage::Import,
-            &next_step_call_sig,
-        )
+        .declare_function("sigil_next_step_call", Linkage::Import, &next_step_call_sig)
         .map_err(|e| format!("declare sigil_next_step_call: {e}"))?;
 
     // sigil_next_step_args_ptr(ns: *mut NextStep) -> *mut u64.
     // Returns the args buffer pointer for a NextStep::Call (or null
     // for Done / zero-arg). Codegen writes args via this pointer.
     let mut next_step_args_ptr_sig = Signature::new(isa_call_conv(&module));
-    next_step_args_ptr_sig.params.push(AbiParam::new(pointer_ty));
-    next_step_args_ptr_sig.returns.push(AbiParam::new(pointer_ty));
+    next_step_args_ptr_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    next_step_args_ptr_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
     let next_step_args_ptr = module
         .declare_function(
             "sigil_next_step_args_ptr",
@@ -2164,10 +2159,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // notes: see runtime/src/handlers.rs and the
     // `[DEVIATION Task 55] Phase 4d` entry in PLAN_B_DEVIATIONS.md.
     let mut continuation_identity_sig = Signature::new(isa_call_conv(&module));
-    continuation_identity_sig.params.push(AbiParam::new(pointer_ty)); // closure_ptr
-    continuation_identity_sig.params.push(AbiParam::new(pointer_ty)); // args_ptr
-    continuation_identity_sig.params.push(AbiParam::new(types::I32)); // args_len
-    continuation_identity_sig.returns.push(AbiParam::new(pointer_ty));
+    continuation_identity_sig
+        .params
+        .push(AbiParam::new(pointer_ty)); // closure_ptr
+    continuation_identity_sig
+        .params
+        .push(AbiParam::new(pointer_ty)); // args_ptr
+    continuation_identity_sig
+        .params
+        .push(AbiParam::new(types::I32)); // args_len
+    continuation_identity_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
     let continuation_identity = module
         .declare_function(
             "sigil_continuation_identity",
@@ -2597,8 +2600,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
                 let next_step_done_ref = module.declare_func_in_func(next_step_done, builder.func);
                 // Plan B Task 55 (Phase 4d) — tail-k lowering refs.
-                let next_step_call_ref =
-                    module.declare_func_in_func(next_step_call, builder.func);
+                let next_step_call_ref = module.declare_func_in_func(next_step_call, builder.func);
                 let next_step_args_ptr_ref =
                     module.declare_func_in_func(next_step_args_ptr, builder.func);
                 let continuation_identity_ref =
@@ -2787,79 +2789,78 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // the tail position recognised by
                 // `arm_body_tail_is_k_call`; non-tail `k` use is
                 // rejected with a Phase-4e-pointing diagnostic.
-                let next_step_ptr = if let Some(arg_expr) =
-                    arm_body_tail_is_k_call(&synth.body, &synth.k_name)
-                {
-                    // --- Tail-`k(arg)` path ---
-                    lowerer.lower_arm_body_pre_tail_k_stmts(&synth.body);
-                    let arg_value = lowerer.lower_expr(arg_expr);
-                    let arg_ty = lowerer.builder.func.dfg.value_type(arg_value);
-                    let widened_arg = if arg_ty == types::I64 {
-                        arg_value
-                    } else if arg_ty.is_int() && arg_ty.bits() < 64 {
-                        lowerer.builder.ins().uextend(types::I64, arg_value)
-                    } else {
-                        assert_eq!(
-                            arg_ty, pointer_ty,
-                            "codegen Phase 4d: unexpected k-arg Cranelift type \
+                let next_step_ptr =
+                    if let Some(arg_expr) = arm_body_tail_is_k_call(&synth.body, &synth.k_name) {
+                        // --- Tail-`k(arg)` path ---
+                        lowerer.lower_arm_body_pre_tail_k_stmts(&synth.body);
+                        let arg_value = lowerer.lower_expr(arg_expr);
+                        let arg_ty = lowerer.builder.func.dfg.value_type(arg_value);
+                        let widened_arg = if arg_ty == types::I64 {
+                            arg_value
+                        } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                            lowerer.builder.ins().uextend(types::I64, arg_value)
+                        } else {
+                            assert_eq!(
+                                arg_ty, pointer_ty,
+                                "codegen Phase 4d: unexpected k-arg Cranelift type \
                              {arg_ty:?} for sigil_next_step_call slot widen — \
                              Phase 4d MVP supports I64 (Int), I32 (Char), I8 \
                              (Bool/Byte/Unit), and pointer_ty (String / \
                              user-type pointers); floats and 32-bit-target \
                              pointer types need a dedicated branch"
-                        );
-                        arg_value
-                    };
-                    let one_v = lowerer.builder.ins().iconst(types::I32, 1);
-                    let call_ns = lowerer
-                        .builder
-                        .ins()
-                        .call(next_step_call_ref, &[k_closure_v, k_fn_v, one_v]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
-                    let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
-                    let argp_call = lowerer
-                        .builder
-                        .ins()
-                        .call(next_step_args_ptr_ref, &[ns_ptr]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
-                    let argp_v = lowerer.builder.inst_results(argp_call)[0];
-                    lowerer
-                        .builder
-                        .ins()
-                        .store(MemFlags::trusted(), widened_arg, argp_v, 0);
-                    ns_ptr
-                } else {
-                    // --- Non-tail / no-`k` path (Phase 4c shape) ---
-                    let body_value = lowerer.lower_expr(&synth.body);
-                    let widened_body = if synth.body_ty == types::I64 {
-                        body_value
-                    } else if synth.body_ty.is_int() && synth.body_ty.bits() < 64 {
-                        lowerer.builder.ins().uextend(types::I64, body_value)
+                            );
+                            arg_value
+                        };
+                        let one_v = lowerer.builder.ins().iconst(types::I32, 1);
+                        let call_ns = lowerer
+                            .builder
+                            .ins()
+                            .call(next_step_call_ref, &[k_closure_v, k_fn_v, one_v]);
+                        lowerer
+                            .stackmap
+                            .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                        let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                        let argp_call = lowerer
+                            .builder
+                            .ins()
+                            .call(next_step_args_ptr_ref, &[ns_ptr]);
+                        lowerer
+                            .stackmap
+                            .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
+                        let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                        lowerer
+                            .builder
+                            .ins()
+                            .store(MemFlags::trusted(), widened_arg, argp_v, 0);
+                        ns_ptr
                     } else {
-                        assert_eq!(
-                            synth.body_ty, pointer_ty,
-                            "codegen Phase 4c: unexpected arm-body Cranelift type \
+                        // --- Non-tail / no-`k` path (Phase 4c shape) ---
+                        let body_value = lowerer.lower_expr(&synth.body);
+                        let widened_body = if synth.body_ty == types::I64 {
+                            body_value
+                        } else if synth.body_ty.is_int() && synth.body_ty.bits() < 64 {
+                            lowerer.builder.ins().uextend(types::I64, body_value)
+                        } else {
+                            assert_eq!(
+                                synth.body_ty, pointer_ty,
+                                "codegen Phase 4c: unexpected arm-body Cranelift type \
                              {:?} for sigil_next_step_done wrap",
-                            synth.body_ty
-                        );
-                        body_value
+                                synth.body_ty
+                            );
+                            body_value
+                        };
+                        let done_call = lowerer
+                            .builder
+                            .ins()
+                            .call(next_step_done_ref, &[widened_body]);
+                        // Stackmap entry: any pointer-typed op-args bound in
+                        // env (String / user-type) are GC roots live across
+                        // this `sigil_next_step_done` arena allocation.
+                        lowerer
+                            .stackmap
+                            .push_placeholder(function_code_offset(&lowerer.builder, done_call));
+                        lowerer.builder.inst_results(done_call)[0]
                     };
-                    let done_call = lowerer
-                        .builder
-                        .ins()
-                        .call(next_step_done_ref, &[widened_body]);
-                    // Stackmap entry: any pointer-typed op-args bound in
-                    // env (String / user-type) are GC roots live across
-                    // this `sigil_next_step_done` arena allocation.
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, done_call));
-                    lowerer.builder.inst_results(done_call)[0]
-                };
                 lowerer.builder.ins().return_(&[next_step_ptr]);
                 lowerer.builder.finalize();
             }
@@ -3826,7 +3827,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// bitmap shape.
     fn alloc_arm_closure_record(&mut self, captures: &[ArmCapture]) -> Value {
         let env_len = captures.len();
-        assert!(env_len > 0, "alloc_arm_closure_record on empty captures — caller should pass null directly");
+        assert!(
+            env_len > 0,
+            "alloc_arm_closure_record on empty captures — caller should pass null directly"
+        );
         assert!(
             env_len < 31,
             "arm closure env >= 31 slots exceeds 6-bit header count field"

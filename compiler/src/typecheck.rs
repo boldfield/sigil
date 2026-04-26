@@ -3059,8 +3059,7 @@ impl Tc {
         // captures, keyed at the end of the loop into
         // `self.handle_arm_captures` under the handle's span. One
         // entry per arm in declaration order.
-        let mut handle_arm_caps_accum: Vec<Vec<(String, Ty)>> =
-            Vec::with_capacity(op_arms.len());
+        let mut handle_arm_caps_accum: Vec<Vec<(String, Ty)>> = Vec::with_capacity(op_arms.len());
 
         // Op-arm walks. Every arm body is walked under bindings —
         // even arms whose registry lookup failed install Ty::Unit-
@@ -3098,17 +3097,14 @@ impl Tc {
             let arm_captures: Vec<(String, Ty)> = capture_names
                 .into_iter()
                 .map(|name| {
-                    let ty = saved_env
-                        .get(&name)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            unreachable!(
-                                "typecheck Phase 4d: capture `{name}` collected by \
+                    let ty = saved_env.get(&name).cloned().unwrap_or_else(|| {
+                        unreachable!(
+                            "typecheck Phase 4d: capture `{name}` collected by \
                                  collect_free_vars (outer_names = saved_env.keys()) is \
                                  missing from saved_env at lookup — this indicates a \
                                  collect_free_vars / outer_names filter mismatch"
-                            )
-                        });
+                        )
+                    });
                     // Resolve type-vars through the current substitution
                     // so the side-table records a substitution-stable
                     // `Ty` (codegen-time `slot_kind_for_ty` requires
