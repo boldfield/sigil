@@ -285,10 +285,31 @@ impl Elaborator {
             }
 
             Expr::Call { callee, args, span } => {
-                // Task 23 scope: no flattening for call sites. Stage 3
-                // (task 29+) introduces user function calls; call-arg
-                // ANF can land there.
-                (Expr::Call { callee, args, span }, Vec::new())
+                // Recurse into callee + args without trivializing
+                // (call-arg ANF flattening is still deferred to a
+                // future task; the recursion only handles desugars
+                // like `Expr::If` → `Expr::Match` so they don't
+                // reach codegen unelaborated). Hoisted bindings
+                // bubble up to the caller — they cannot leak across
+                // a lambda/handle boundary, but a Call is not such a
+                // boundary, so this is safe.
+                let (callee_e, mut hoisted) = self.elab_expr(*callee, false);
+                let new_args = args
+                    .into_iter()
+                    .map(|a| {
+                        let (a_e, h) = self.elab_expr(a, false);
+                        hoisted.extend(h);
+                        a_e
+                    })
+                    .collect();
+                (
+                    Expr::Call {
+                        callee: Box::new(callee_e),
+                        args: new_args,
+                        span,
+                    },
+                    hoisted,
+                )
             }
 
             Expr::Perform(p) => {
@@ -353,40 +374,124 @@ impl Elaborator {
             Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => {
                 unreachable!("elaborate: closure-conversion nodes should not appear pre-CC")
             }
-            // Plan A3 task 37: record literal passes through elaborate
-            // unchanged at this scope. Record fields are not ANF-
-            // flattened in task 37 — the constructor allocator in
-            // task 41's codegen accepts compound field values and
-            // evaluates them in order. If later tasks want ANF
-            // flattening for record-literal field values, they can
-            // extend this arm.
+            // Plan A3 task 37: record literal. Field values are not
+            // ANF-flattened (the codegen allocator in task 41
+            // accepts compound field values), but they DO need to
+            // be elaborated so desugars like `Expr::If` →
+            // `Expr::Match` reach codegen. Hoisted bindings from
+            // field values bubble up to the caller.
             Expr::RecordLit { name, fields, span } => {
-                (Expr::RecordLit { name, fields, span }, Vec::new())
+                let mut hoisted: Vec<Stmt> = Vec::new();
+                let new_fields = fields
+                    .into_iter()
+                    .map(|f| {
+                        let (v, h) = self.elab_expr(f.value, false);
+                        hoisted.extend(h);
+                        RecordFieldLit {
+                            name: f.name,
+                            value: v,
+                            span: f.span,
+                        }
+                    })
+                    .collect();
+                (
+                    Expr::RecordLit {
+                        name,
+                        fields: new_fields,
+                        span,
+                    },
+                    hoisted,
+                )
             }
-            // Plan B task 53 — `handle <body> with { ... }` passes
-            // through elaborate unchanged. The CPS transform that
-            // expands handlers into runtime calls and arena-allocates
-            // `NextStep` records lands in Task 55; elaborate keeps the
-            // shape intact so Task 55 sees a structurally clean handle
-            // node. We do NOT recurse into children here — typecheck
-            // already emitted `E0134`, and the rest of the pipeline
-            // is short-circuited by the resulting compile abort, but
-            // the constructor preserves enough for unit tests of
-            // elaborate's own behaviour to round-trip the form.
+            // Plan B task 53 — `handle <body> with { ... }` shape
+            // is preserved (Task 55's codegen consumes it directly),
+            // but the body, the optional `return` arm body, and each
+            // op-arm's body must be elaborated so desugars like
+            // `Expr::If` → `Expr::Match` reach codegen. Each of those
+            // sub-expressions is its own scope: hoisted bindings from
+            // them MUST NOT leak past the handle (the body is inside
+            // the handle's effect-discharge boundary; arm bodies are
+            // inside their own arm scope). Wrap each in `Expr::Block`
+            // when its elaboration produced hoisted bindings, mirroring
+            // the lambda-body / match-arm pattern above.
+            //
+            // E0134 was lifted in Task 55 Phase 2 (`2d69b52`), so a
+            // handle reaching this code is now a well-formed shape
+            // and the recursion is load-bearing for downstream
+            // codegen correctness.
             Expr::Handle {
                 body,
                 return_arm,
                 op_arms,
                 span,
-            } => (
-                Expr::Handle {
-                    body,
-                    return_arm,
-                    op_arms,
-                    span,
-                },
-                Vec::new(),
-            ),
+            } => {
+                let body_span = body.span();
+                let (body_e, body_hoisted) = self.elab_expr(*body, false);
+                let body_final = if body_hoisted.is_empty() {
+                    body_e
+                } else {
+                    Expr::Block(Box::new(Block {
+                        stmts: body_hoisted,
+                        tail: Some(body_e),
+                        span: body_span,
+                    }))
+                };
+                let return_arm_e = return_arm.map(|ra| {
+                    let arm_span = ra.span.clone();
+                    let (b, h) = self.elab_expr(ra.body, false);
+                    let final_body = if h.is_empty() {
+                        b
+                    } else {
+                        Expr::Block(Box::new(Block {
+                            stmts: h,
+                            tail: Some(b),
+                            span: arm_span.clone(),
+                        }))
+                    };
+                    Box::new(HandleReturnArm {
+                        binding: ra.binding,
+                        binding_span: ra.binding_span,
+                        body: final_body,
+                        span: ra.span,
+                    })
+                });
+                let new_op_arms = op_arms
+                    .into_iter()
+                    .map(|arm| {
+                        let arm_span = arm.span.clone();
+                        let (b, h) = self.elab_expr(arm.body, false);
+                        let final_body = if h.is_empty() {
+                            b
+                        } else {
+                            Expr::Block(Box::new(Block {
+                                stmts: h,
+                                tail: Some(b),
+                                span: arm_span,
+                            }))
+                        };
+                        HandleOpArm {
+                            effect: arm.effect,
+                            effect_span: arm.effect_span,
+                            op: arm.op,
+                            op_span: arm.op_span,
+                            params: arm.params,
+                            k_name: arm.k_name,
+                            k_span: arm.k_span,
+                            body: final_body,
+                            span: arm.span,
+                        }
+                    })
+                    .collect();
+                (
+                    Expr::Handle {
+                        body: Box::new(body_final),
+                        return_arm: return_arm_e,
+                        op_arms: new_op_arms,
+                        span,
+                    },
+                    Vec::new(),
+                )
+            }
         }
     }
 
@@ -700,5 +805,75 @@ mod tests {
         // The two RHS binaries each hoist their inner `*`, so 2 names.
         assert_eq!(names.len(), 2, "names={names:?}");
         assert_ne!(names[0], names[1]);
+    }
+
+    #[test]
+    fn if_inside_call_args_is_desugared_to_match() {
+        // Regression for the elaborate-doesn't-recurse-into-Call-args
+        // bug exposed by Plan B Task 55's MF2 property test. Before
+        // the fix, `Expr::If` nested inside a Call's args reached
+        // codegen un-desugared and tripped the
+        // `unreachable!("Expr::If should have been desugared by elaborate")`
+        // arm in `lower_expr`.
+        let src = "fn main() -> Int ![IO] {\n\
+                     perform IO.println(int_to_string(if true { 1 } else { 2 }));\n  \
+                     0\n\
+                   }\n";
+        let p = elab(src);
+        let body = main_body(&p);
+        let mut found_match = false;
+        for s in &body.stmts {
+            if let Stmt::Perform(p) = s {
+                for a in &p.args {
+                    if let Expr::Call { args, .. } = a {
+                        for inner in args {
+                            if matches!(inner, Expr::Match { .. }) {
+                                found_match = true;
+                            }
+                            assert!(
+                                !matches!(inner, Expr::If { .. }),
+                                "Expr::If under Call args must be desugared",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_match, "expected Expr::Match inside the call's args");
+    }
+
+    #[test]
+    fn if_inside_handle_body_is_desugared_to_match() {
+        // Regression for the elaborate-doesn't-recurse-into-Handle-children
+        // bug. Before E0134 lifted, `Expr::Handle` short-circuited in
+        // elaborate; with the gate lifted in Phase 2, body+arm bodies
+        // need real elaboration.
+        let src = "effect E_eff { op: () -> Int }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let n: Int = handle (if true { 1 } else { 2 }) with { E_eff.op(k) => 0 };\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let p = elab(src);
+        let body = main_body(&p);
+        // Find the let n: ... = handle ... binding and check that the
+        // handle body is now an Expr::Match (post-desugar) rather
+        // than an Expr::If.
+        match &body.stmts[0] {
+            Stmt::Let(l) => match &l.value {
+                Expr::Handle { body, .. } => {
+                    assert!(
+                        !matches!(**body, Expr::If { .. }),
+                        "handle body should not contain Expr::If post-elaborate",
+                    );
+                    assert!(
+                        matches!(**body, Expr::Match { .. }),
+                        "handle body should be desugared to Expr::Match",
+                    );
+                }
+                other => panic!("expected Expr::Handle, got {other:?}"),
+            },
+            other => panic!("expected Let, got {other:?}"),
+        }
     }
 }
