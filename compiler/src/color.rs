@@ -386,12 +386,19 @@ fn find_non_io_perform_in_expr(e: &Expr) -> Option<(String, String)> {
         // (an arm body that itself performs an unhandled non-IO
         // effect would taint the enclosing fn).
         //
-        // Color inference runs after typecheck E0134 has already
-        // fired, so reaching this arm is fine — Task 55 will replace
-        // this stub with the proper handler-context color rule the
-        // PR #18 reviewer flagged for Stage 6. For now: just walk
-        // arm bodies (and the optional return arm), skip the wrapped
-        // body itself.
+        // **Phase coverage** (Task 55 in flight): this rule is
+        // correct for the codegen-entry guard's currently-supported
+        // subset — synchronous, single-shot, `IntLit`-only arm
+        // bodies, no `k` usage. Phase 4d (k-using arms +
+        // continuation reification) makes the rule load-bearing in
+        // a stronger sense: an arm that reifies `k` represents the
+        // remainder of computation after the perform, and the
+        // colorer must agree with codegen on which monomorphs sit
+        // at the native↔CPS boundary. Replacing this stub with the
+        // proper handler-context color rule (PR #18 reviewer's
+        // Stage 6 ask) is the closing dependency of Phase 4d. Until
+        // then: walk arm bodies (and the optional return arm), skip
+        // the wrapped body itself.
         Expr::Handle {
             return_arm,
             op_arms,

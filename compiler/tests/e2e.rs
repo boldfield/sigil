@@ -1052,26 +1052,68 @@ fn handle_with_mixed_effect_arms_is_rejected_at_codegen() {
 }
 
 #[test]
-fn handle_with_arm_that_uses_k_is_rejected_at_codegen() {
-    // Plan B Task 55 (Phase 3b restriction): arm bodies must be
-    // literal `Int` expressions (Phase 4+ adds richer arm bodies +
-    // `k`-using arms via continuation reification + the trampoline).
-    // Until then, an arm body referencing `k` (or any non-literal
-    // shape) is rejected at codegen entry by
-    // `unsupported_handle_construct`.
-    let src = "effect Raise { fail: () -> Int }\n\
+fn statement_form_non_io_perform_inside_handle_compiles_and_runs() {
+    // Plan B Task 55 (Phase 3b) — regression for the `Stmt::Perform`
+    // crash. Before the fix, `lower_stmt` unconditionally called
+    // `lower_perform`, which asserts `effect == "IO"`. Statement-form
+    // non-IO performs (e.g. `perform Raise.fail();` followed by more
+    // code) hit the assertion and crashed the compiler. The fix
+    // dispatches the same way `Expr::Perform` does: IO → side-effect
+    // path; non-IO → `lower_perform_non_io_to_value` with the value
+    // discarded.
+    //
+    // Phase 3b semantics note: the arm value flows back to the
+    // perform site (via `sigil_perform` → `sigil_run_loop`), not to
+    // the handle site. So in this test, helper's `perform E.op();`
+    // returns 99 (the arm value) which is discarded by the Stmt;
+    // helper continues to its tail `42` and returns 42. The handle
+    // expression therefore evaluates to 42, NOT to 99. Phase 4d's
+    // continuation reification will revise this so a `k`-ignoring
+    // arm aborts helper's continuation back to the handle site.
+    let src = "effect E { op: () -> Int }\n\
+               fn helper() -> Int ![E] {\n  \
+                 perform E.op();\n  \
+                 42\n\
+               }\n\
                fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle 42 with { Raise.fail(k) => k(0) };\n  \
+                 let n: Int = handle helper() with { E.op(k) => 99 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "stmt_perform_non_io_in_handle");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
+    // Plan B Task 55 — regression for the walker recursion bug: a
+    // nested `handle` appearing in another handle's body must surface
+    // its own Phase-4 restrictions. Before the fix, the outer
+    // walker only recursed into arm bodies, so the inner handle's
+    // multi-effect restriction (Phase 4e) was missed and the program
+    // would have reached codegen with arms registered under the wrong
+    // `effect_id` — at runtime that crashes inside `sigil_perform`'s
+    // handler-stack walk.
+    let src = "effect A { op1: () -> Int }\n\
+               effect B { op2: () -> Int }\n\
+               effect Outer { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle\n    \
+                   (handle 0 with { A.op1(k) => 1, B.op2(k) => 2 })\n  \
+                 with { Outer.op(k) => 0 };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_handle_k_reject_{}.sigil",
+        "sigil_e2e_nested_handle_walker_{}.sigil",
         std::process::id()
     ));
     std::fs::write(&tmp, src).expect("write source");
-    let bin_path =
-        std::env::temp_dir().join(format!("sigil_e2e_handle_k_reject_{}", std::process::id()));
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_nested_handle_walker_{}",
+        std::process::id()
+    ));
     let sigil_bin = sigil_binary();
     let out = Command::new(&sigil_bin)
         .arg(&tmp)
@@ -1084,15 +1126,76 @@ fn handle_with_arm_that_uses_k_is_rejected_at_codegen() {
     let _ = std::fs::remove_file(&bin_path);
     assert!(
         !out.status.success(),
-        "compile must fail until Phase 4+ lands; got success with stdout={:?} stderr={:?}",
+        "compile must fail — inner nested handle is multi-effect; got success with stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("Task 55") || stderr.contains("Phase 4") || stderr.contains("IntLit"),
-        "error message should reference Plan B Task 55 / Phase 4 / arm-body restriction; got stderr={stderr:?}",
+        stderr.contains("multi-effect") || stderr.contains("Phase 4"),
+        "error message should reference the inner handle's multi-effect restriction; got stderr={stderr:?}",
     );
+}
+
+#[test]
+fn handle_with_non_intlit_arm_body_is_rejected_at_codegen() {
+    // Plan B Task 55 (Phase 3b restriction): arm bodies must be
+    // literal `Int` expressions (Phase 4+ adds richer arm bodies +
+    // `k`-using arms via continuation reification + the trampoline).
+    // Until then, any non-`IntLit` arm body — `k(0)` (a Call), `1 +
+    // 1` (a Binary) — is rejected at codegen entry by
+    // `unsupported_handle_construct`. The IntLit guard fires before
+    // any "k usage" check, so this test pins the IntLit-only check
+    // itself rather than k-specific handling. A real "k is referenced
+    // inside an IntLit context" test will land alongside Phase 4c
+    // when richer arm bodies + k-usage analysis ship.
+    fn assert_rejects_arm_body(arm_body_src: &str, marker: &str) {
+        let src = format!(
+            "effect Raise {{ fail: () -> Int }}\n\
+             fn main() -> Int ![IO] {{\n  \
+               let n: Int = handle 42 with {{ Raise.fail(k) => {arm_body_src} }};\n  \
+               perform IO.println(int_to_string(n));\n  \
+               0\n\
+             }}\n"
+        );
+        let tmp = std::env::temp_dir().join(format!(
+            "sigil_e2e_handle_non_intlit_{}_{}.sigil",
+            marker,
+            std::process::id()
+        ));
+        std::fs::write(&tmp, src).expect("write source");
+        let bin_path = std::env::temp_dir().join(format!(
+            "sigil_e2e_handle_non_intlit_{}_{}",
+            marker,
+            std::process::id()
+        ));
+        let sigil_bin = sigil_binary();
+        let out = Command::new(&sigil_bin)
+            .arg(&tmp)
+            .arg("-o")
+            .arg(&bin_path)
+            .arg("--human-errors")
+            .output()
+            .expect("invoke sigil");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bin_path);
+        assert!(
+            !out.status.success(),
+            "{marker}: compile must fail until Phase 4+ lands; got success with stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Task 55") || stderr.contains("Phase 4") || stderr.contains("IntLit"),
+            "{marker}: error message should reference Plan B Task 55 / Phase 4 / IntLit; got stderr={stderr:?}",
+        );
+    }
+    // Call shape — original case.
+    assert_rejects_arm_body("k(0)", "k_call");
+    // Binary shape — exercises the same IntLit-only guard from a
+    // different arm-body shape.
+    assert_rejects_arm_body("1 + 1", "binary");
 }
 
 #[test]

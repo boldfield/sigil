@@ -28,7 +28,9 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** The all-or-nothing alternative (single commit landing every piece together) would require holding the entire ~2000-LOC change in working state across multiple sessions before any pod-verify or CI checkpoint. Splitting at the asymmetric-gate boundary gives a clean intermediate state where (1) effect-only programs gain a real codegen path immediately, (2) handle-using programs continue to surface E0134 with a clear "in-progress" message, and (3) each follow-up commit can be pod-verified independently. The **single-PR convention** from Tasks 49 / 53 / 54 / 56 still holds — only one PR opens for Task 55, and it includes the full chain of foundation + CPS commits. The squash-merged result will look identical to a one-shot landing.
 
-**Implementing commit(s):** `b3af204` (foundation phase: E0133 lift + entry walker), [HEAD] (Phase 2 minimum: E0134 lift + handle body-pass-through + effect/op IDs + e2e tests). Phase 3+ commits TBD.
+**Implementing commit(s):** `b3af204` (foundation phase: E0133 lift + entry walker), `2d69b52` (Phase 2 minimum: E0134 lift + handle body-pass-through + effect/op IDs + e2e tests), `ef4be8d` (Phase 3a), `d0aa4c4` + `2e7c0de` (Phase 3b), `adcb897` (Phase 4a), [HEAD] (review-fixup batch).
+
+**Closure point:** PR #22 squash-merge — at which point the multi-commit branch collapses to a single mainline commit. The `[DEVIATION]` entry stays as a permanent record of the split.
 
 ## 2026-04-26 — [DEVIATION Task 55] Phase 2 ships handle as body-pass-through; full CPS path in Phase 3+
 
@@ -38,7 +40,9 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** This ships a real codegen path that exercises the full pipeline for handle expressions for the first time (parser + typecheck + monomorphize + color + closure_convert + codegen all touch handle now), without committing to the much larger CPS infrastructure. The cost is that handlers don't actually do anything useful yet — but the surface compiles, the test infrastructure works end-to-end, and Phase 3 can build incrementally on this base. The static walker in `unsupported_handle_construct` is intentionally conservative: it inspects only `Expr::Perform` nodes appearing directly in handle bodies, not transitive performs through called fns. A handle whose body calls a fn that itself performs a non-IO effect would slip through this guard and crash at runtime when `sigil_perform` walks an empty handler stack — acceptable for the Phase 2 test program (body is a literal) but a known footgun until Phase 3+ ships the proper handler-frame setup.
 
-**Implementing commit(s):** `2d69b52`; superseded by Phase 3a (HEAD) and Phase 3+ commits.
+**Implementing commit(s):** `2d69b52`; superseded by Phase 3a (`ef4be8d`), Phase 3b (`d0aa4c4` + `2e7c0de`), and Phase 4a (`adcb897`).
+
+**Closure point:** Phase 3b (`d0aa4c4`) replaced the body-pass-through with real handler-frame setup + per-arm CPS fn dispatch + `sigil_perform` lowering. The Phase 2 codegen-entry guard's "no non-IO perform in body" rejection was lifted in Phase 3b for the supported subset; Phase 4b lifts the zero-arg-perform restriction.
 
 ## 2026-04-26 — [DEVIATION Task 55] Phase 3a wires frame ABI without arm dispatch (single-arm/single-effect/no-return handles only)
 
@@ -48,7 +52,9 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** Splitting at the frame-ABI / arm-dispatch boundary lets the runtime FFI plumbing get exercised end-to-end (real `sigil_handler_frame_new` + push + pop calls in compiled output, observable via `objdump`) without committing to the much larger CPS calling convention + synthetic fn synthesis. The Phase 2 e2e test `handle_with_no_perform_in_body_compiles_and_runs` continues to pass through Phase 3a, now exercising the frame ABI on the path Phase 3b builds on. The cost is a tiny runtime regression: the no-perform handle now allocates + pushes + pops a frame on every invocation (previously a no-op pass-through). For Phase 3a this is acceptable; Phase 3b makes the frame functional rather than just present.
 
-**Implementing commit(s):** `ef4be8d` (Phase 3a); superseded by Phase 3b (HEAD) and Phase 4+ commits.
+**Implementing commit(s):** `ef4be8d` (Phase 3a); superseded by Phase 3b (`d0aa4c4` + `2e7c0de`) and Phase 4a (`adcb897`).
+
+**Closure point:** Phase 3b (`d0aa4c4`) wired arm fn pointers via `sigil_handler_frame_set_arm` between `frame_new` and `push`; the Phase 3a "arms are null" stub no longer exists in the codegen path. Single-arm restriction was lifted in Phase 4a (`adcb897`); single-effect remains pending Phase 4e; return arms remain pending Phase 4f.
 
 ## 2026-04-26 — [DEVIATION Task 55] Phase 3b Phase-3b restrictions: literal arm bodies, zero-arg ops, no `k` use, single arm, single effect
 
@@ -58,7 +64,15 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** The simplest meaningful test program — `handle (perform Raise.fail()) with { Raise.fail(k) => 42 }` — exercises the entire FFI surface end-to-end (frame_new → set_arm → push → sigil_perform → arm dispatch → next_step_done → NextStep value extraction → pop) without committing to the much larger CPS calling convention infrastructure. The simplifying restrictions can be lifted one at a time, each as its own focused commit. The single-shot one-shot-arm path is also the most common handler shape in practice (Raise-style early-exit), so it's not just a stepping stone — it covers a real use case.
 
-**Implementing commit(s):** [HEAD] (Phase 3b); follow-up Phase 4+ commits TBD.
+**Implementing commit(s):** `d0aa4c4` (Phase 3b initial), `2e7c0de` (Phase 3b fixup: route perform's NextStep::Call through `sigil_run_loop` instead of reading `(*ns).value` directly), `adcb897` (Phase 4a: multi-arm single-effect handlers).
+
+**Closure point** (per-restriction):
+- *Single arm* — closed in Phase 4a (`adcb897`).
+- *IntLit-only arm body* — pending Phase 4c (richer arm bodies via dedicated CPS-aware lowerer).
+- *Zero-arg ops* — pending Phase 4b (args-buffer packing on perform side, unpacking on arm side).
+- *No `k` use* — pending Phase 4d (continuation reification + lambda-lifting of perform's continuation).
+- *Single effect per handle* — pending Phase 4e (frame-per-effect).
+- *No return arm* — pending Phase 4f (synthetic return-fn registered via `sigil_handler_frame_set_return`).
 
 ## 2026-04-25 — [Task 4.5.5 / A3-carryover] Tagged-vs-raw Int ABI decision
 

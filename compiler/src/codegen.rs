@@ -646,6 +646,18 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
                     span, eff, op
                 ));
             }
+            // Recurse into the body itself so a nested handle inside
+            // the body (e.g. `handle (handle ... with { ... }) with
+            // { ... }`) surfaces its own diagnostics. Without this,
+            // `body_contains_non_io_perform_filtered` short-circuits
+            // on `Expr::Handle { .. } => None` and the inner handle's
+            // multi-effect / non-IntLit / return-arm / multi-arg
+            // restrictions are never enforced — at runtime that can
+            // register arms under the wrong effect_id and crash inside
+            // `sigil_perform`'s handler-stack walk.
+            if let Some(msg) = expr_unsupported_handle(body) {
+                return Some(msg);
+            }
             // Recurse into arm bodies so nested handles deeper in
             // the AST surface their own diagnostics.
             for arm in op_arms {
@@ -663,8 +675,7 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
 /// the perform passes user args to the runtime, which Phase 3b
 /// minimum doesn't yet support — see the args-buffer packing TODO
 /// in `lower_perform_non_io_to_value`). Recurses through all
-/// sub-expressions and stmts. Wraps the legacy
-/// `body_contains_non_io_perform` walker.
+/// sub-expressions and stmts.
 fn body_contains_non_io_perform_with_args(e: &crate::ast::Expr) -> Option<(String, String)> {
     body_contains_non_io_perform_filtered(e, |p| !p.args.is_empty())
 }
@@ -776,124 +787,6 @@ fn block_contains_non_io_perform_filtered(
     }
     if let Some(tail) = &b.tail {
         if let Some(p) = body_contains_non_io_perform_filtered(tail, pred) {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Returns `Some((effect_name, op_name))` of the first non-IO
-/// `Expr::Perform` site found within `e`, or `None` if no non-IO
-/// perform exists. Recurses into all sub-expressions and stmts.
-#[allow(dead_code)]
-fn body_contains_non_io_perform(e: &crate::ast::Expr) -> Option<(String, String)> {
-    use crate::ast::Expr;
-    match e {
-        Expr::IntLit(..)
-        | Expr::StringLit(..)
-        | Expr::BoolLit(..)
-        | Expr::CharLit(..)
-        | Expr::Ident(..)
-        | Expr::ClosureEnvLoad { .. } => None,
-        Expr::Binary { lhs, rhs, .. } => {
-            body_contains_non_io_perform(lhs).or_else(|| body_contains_non_io_perform(rhs))
-        }
-        Expr::Unary { operand, .. } => body_contains_non_io_perform(operand),
-        Expr::If {
-            cond,
-            then_block,
-            else_block,
-            ..
-        } => body_contains_non_io_perform(cond)
-            .or_else(|| block_contains_non_io_perform(then_block))
-            .or_else(|| block_contains_non_io_perform(else_block)),
-        Expr::Block(b) => block_contains_non_io_perform(b),
-        Expr::Match {
-            scrutinee, arms, ..
-        } => {
-            if let Some(p) = body_contains_non_io_perform(scrutinee) {
-                return Some(p);
-            }
-            for a in arms {
-                if let Some(p) = body_contains_non_io_perform(&a.body) {
-                    return Some(p);
-                }
-            }
-            None
-        }
-        Expr::Call { callee, args, .. } => {
-            if let Some(p) = body_contains_non_io_perform(callee) {
-                return Some(p);
-            }
-            for a in args {
-                if let Some(p) = body_contains_non_io_perform(a) {
-                    return Some(p);
-                }
-            }
-            None
-        }
-        Expr::Perform(p) => {
-            if p.effect == "IO" {
-                None
-            } else {
-                Some((p.effect.clone(), p.op.clone()))
-            }
-        }
-        Expr::Lambda { body, .. } => body_contains_non_io_perform(body),
-        Expr::ClosureRecord { env_exprs, .. } => {
-            for ee in env_exprs {
-                if let Some(p) = body_contains_non_io_perform(ee) {
-                    return Some(p);
-                }
-            }
-            None
-        }
-        Expr::RecordLit { fields, .. } => {
-            for f in fields {
-                if let Some(p) = body_contains_non_io_perform(&f.value) {
-                    return Some(p);
-                }
-            }
-            None
-        }
-        // Nested handle: its own body's performs are scoped to its
-        // own handler arms. For Phase 2 conservatism, treat nested
-        // handles as opaque — they're either supported (no non-IO
-        // perform in their body) or already flagged by the outer
-        // walker. From the outer body's perspective the nested
-        // handle doesn't itself perform.
-        Expr::Handle { .. } => None,
-    }
-}
-
-fn block_contains_non_io_perform(b: &crate::ast::Block) -> Option<(String, String)> {
-    use crate::ast::Stmt;
-    for s in &b.stmts {
-        match s {
-            Stmt::Let(l) => {
-                if let Some(p) = body_contains_non_io_perform(&l.value) {
-                    return Some(p);
-                }
-            }
-            Stmt::Expr(e) => {
-                if let Some(p) = body_contains_non_io_perform(e) {
-                    return Some(p);
-                }
-            }
-            Stmt::Perform(p) => {
-                if p.effect != "IO" {
-                    return Some((p.effect.clone(), p.op.clone()));
-                }
-                for a in &p.args {
-                    if let Some(p) = body_contains_non_io_perform(a) {
-                        return Some(p);
-                    }
-                }
-            }
-        }
-    }
-    if let Some(tail) = &b.tail {
-        if let Some(p) = body_contains_non_io_perform(tail) {
             return Some(p);
         }
     }
@@ -1797,6 +1690,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let value_v = builder.ins().iconst(types::I64, value);
                 let next_step_done_ref = module.declare_func_in_func(next_step_done, builder.func);
                 let done_call = builder.ins().call(next_step_done_ref, &[value_v]);
+                // TODO(Plan B Task 55, Phase 4c): no stackmap entry
+                // for this `sigil_next_step_done` call. Safe today
+                // only because (a) `closure_ptr` arg is null and (b)
+                // an `IntLit` arm body has no GC roots. Once Phase 4c
+                // lands richer arm bodies with captures, `closure_ptr`
+                // becomes a live GC root across this call site and
+                // any roots in scope must be threaded into the
+                // stackmap (mirroring the `Lowerer::stackmap.push_*`
+                // pattern at every other arena-allocating call). At
+                // that point this synthetic-fn path needs to use the
+                // full Lowerer machinery rather than the hand-rolled
+                // sequence below.
                 let next_step_ptr = builder.inst_results(done_call)[0];
                 builder.ins().return_(&[next_step_ptr]);
                 builder.finalize();
@@ -2051,7 +1956,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let _ = self.lower_expr(e);
             }
             Stmt::Perform(p) => {
-                self.lower_perform(p);
+                // IO performs go through the side-effect-only path
+                // (`lower_perform` returns no value); non-IO performs
+                // route through `sigil_perform` and discard the
+                // returned value, mirroring the dispatch in
+                // `Expr::Perform`. Without this dispatch, statement-
+                // form non-IO performs (`perform Raise.fail();`) hit
+                // the IO assertion in `lower_perform` and crash the
+                // compiler.
+                if p.effect == "IO" {
+                    self.lower_perform(p);
+                } else {
+                    let _ = self.lower_perform_non_io_to_value(p);
+                }
             }
         }
     }
@@ -2201,10 +2118,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.builder.ins().iconst(types::I8, 0)
                 } else {
                     // Plan B Task 55 (Phase 3b) — non-IO perform
-                    // routes through `sigil_perform`. The runtime
-                    // dispatches the matching handler arm and
-                    // returns a `*mut NextStep`; we extract the
-                    // arm's value from `(*ns).value` at offset 24.
+                    // routes through `sigil_perform`. `sigil_perform`
+                    // builds a `NextStep::Call` to the matching arm;
+                    // `lower_perform_non_io_to_value` then hands that
+                    // off to `sigil_run_loop`, which dispatches the
+                    // call (and any further calls the arm returns)
+                    // until a terminal `Done(value)` and returns the
+                    // value as u64. Codegen never reads the
+                    // `NextStep` layout directly.
                     self.lower_perform_non_io_to_value(p)
                 }
             }
@@ -2305,6 +2226,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         )
                     })
                     .clone();
+                // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4b/4c):
+                // null `closure_ptr` for every arm slot. Correct
+                // today because Phase 3b restricts arm bodies to
+                // `IntLit` only — no captures, no op-arg use, no `k`
+                // use, so the synthetic arm fn doesn't read its
+                // closure pointer. Phase 4b adds op-arg unpacking,
+                // 4c adds richer arm bodies (which may reference
+                // outer-scope captures), and 4d adds `k`-reifying
+                // arms — each requires a real closure record
+                // threaded through here so the synthetic fn can
+                // recover its environment. The codegen-entry guard
+                // currently rejects all three shapes; lifting the
+                // guard MUST land alongside changes to this slot.
                 let null_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
                 for (arm, fn_ref) in op_arms.iter().zip(arm_refs.iter()) {
                     let op_id = match self.op_ids.get(&(arm.effect.clone(), arm.op.clone())) {

@@ -342,11 +342,12 @@ pub struct CheckedProgram {
     /// op's name span; the first op wins inside the registered
     /// `EffectDecl::ops`.
     ///
-    /// Effect declarations remain user-visible-staged via E0133 in
-    /// Task 54 (the registry is populated even when E0133 fires, so
-    /// internal handler typing and op-arm binding extension work
-    /// regardless of whether the program would compile end-to-end);
-    /// the gate lifts in Task 55.
+    /// E0133 was lifted in the Task 55 foundation phase (`b3af204`);
+    /// effect declarations now compile end-to-end through codegen.
+    /// The registry is populated by the typecheck pre-pass and
+    /// consulted by `check_perform`'s non-IO dispatch and by the
+    /// effect/op ID assignment in `typecheck()` that codegen reads
+    /// for the runtime handler-stack ABI.
     pub effects: BTreeMap<String, EffectDecl>,
     /// Plan B Task 55 — stable per-effect ID (u32) for the runtime
     /// handler-stack ABI. Assigned alphabetically over `effects` keys
@@ -470,10 +471,10 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // (`Item::Effect`'s typecheck arm, `Expr::Handle`'s op-arm env
     // extension, `check_perform`'s non-IO dispatch) consult the
     // canonical EffectDecl rather than re-scanning the program.
-    // E0133 still fires per `Item::Effect` to keep partial Plan B
-    // programs from reaching codegen until Task 55 lands the CPS
-    // expansion — see [DEVIATION Task 54] entry on the staged-
-    // gate strategy.
+    // E0133 was lifted in the Task 55 foundation phase (`b3af204`);
+    // the registry-population walk continues unchanged. Codegen
+    // reads `effect_ids` / `op_ids` (assigned at the end of
+    // `typecheck()`) for the runtime handler-stack ABI.
     let mut effects: BTreeMap<String, EffectDecl> = BTreeMap::new();
     for item in &program.items {
         if let Item::Effect(ed) = item {
@@ -765,7 +766,14 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         effect_ids.insert(eff_name.clone(), eff_idx as u32);
         let mut op_names: Vec<&str> = eff_decl.ops.iter().map(|o| o.name.as_str()).collect();
         op_names.sort();
-        op_names.dedup();
+        // E0137 fires upstream for duplicate op names within an
+        // effect; reaching this point with dups would indicate the
+        // typecheck pre-pass dropped the diagnostic. Assert rather
+        // than dedup so any future regression is loud.
+        debug_assert!(
+            op_names.windows(2).all(|w| w[0] != w[1]),
+            "op_names must be deduplicated by E0137 in the effects pre-pass"
+        );
         for (op_idx, op_name) in op_names.iter().enumerate() {
             op_ids.insert((eff_name.clone(), (*op_name).to_string()), op_idx as u32);
         }
@@ -2383,16 +2391,15 @@ impl Tc {
             // discharged effects, residual row equal to caller's
             // row, cross-arm unification through a single
             // handler-overall type, one-shot linearity check via
-            // E0220). The staged-feature gate `E0134` still fires
-            // so that no well-formed `handle` reaches the CPS-pending
-            // codegen path until Task 55 lands the lowering — see
-            // [DEVIATION Task 54] entry on the staged-gate strategy.
+            // E0220). E0134 was lifted in Task 55 Phase 2 (`2d69b52`);
+            // well-formed handle expressions now reach the codegen
+            // path that wires the runtime handler-frame ABI.
             Expr::Handle {
                 body,
                 return_arm,
                 op_arms,
-                span,
-            } => self.check_handle(body, return_arm.as_deref(), op_arms, span.clone(), row),
+                ..
+            } => self.check_handle(body, return_arm.as_deref(), op_arms, row),
         }
     }
 
@@ -2767,17 +2774,17 @@ impl Tc {
     ///    along any path through the arm body, or anywhere inside a
     ///    lambda body (the conservative-capture rule).
     ///
-    /// After the three phases, `E0134` fires to keep the program from
-    /// reaching CPS-pending codegen. The internally computed handler
-    /// type is still returned so the surrounding context does not
-    /// double-report on a `let n: Int = handle ...` mismatch — only
-    /// the single staged-gate diagnostic per `handle` expression.
+    /// E0134 was lifted in Task 55 Phase 2 (`2d69b52`); well-formed
+    /// handle expressions return the computed handler-overall type
+    /// and flow into codegen. The codegen-entry guard
+    /// `unsupported_handle_construct` rejects shapes still outside
+    /// the supported subset (richer arm bodies, multi-effect, k
+    /// usage, return arms — see Phase 4b–4f).
     fn check_handle(
         &mut self,
         body: &Expr,
         return_arm: Option<&HandleReturnArm>,
         op_arms: &[HandleOpArm],
-        span: Span,
         row: &[String],
     ) -> Option<Ty> {
         // ---------- Phase 1: dispatch table ----------
@@ -2952,16 +2959,23 @@ impl Tc {
         // overall type just stays as a `?N` in displays. Diagnostics
         // upstream will have fired before that ever surfaces.
         //
-        // **TODO(Plan B Task 55):** when the E0134 staged-feature
-        // gate is lifted, well-formed programs whose body is a fresh
+        // **TODO(Plan B Task 55, Phase 4c+):** with both staged-
+        // feature gates lifted (E0133 in the foundation phase, E0134
+        // in Phase 2), well-formed programs whose body is a fresh
         // var (e.g., `handle perform E.op() with { E.op(k) => k(0) }`
         // where the body's only typing constraint comes through the
-        // op-arm via k) could leave the handler-overall var
-        // unsolved. Decide before merge: pin via the body's
-        // perform-call return type's constraint chain, or surface a
-        // clearer "cannot infer handler return type" diagnostic
-        // (E0132-style ambiguous polymorphism). Today the gate fires
-        // first so this case is unreachable in user-visible output.
+        // op-arm via k) could in principle leave the handler-overall
+        // var unsolved. Phase 3b/4a's codegen-entry restrictions
+        // (`unsupported_handle_construct` requires `IntLit`-only arm
+        // bodies + zero-arg ops) keep this case unreachable in
+        // user-visible output for now: every `IntLit` arm pins
+        // `handler_overall` to `Int` in Phase 3 of `check_handle`.
+        // Phase 4c lifts the IntLit restriction; at that point this
+        // path becomes reachable and needs a decision: pin via the
+        // body's perform-call return-type constraint chain, or
+        // surface a "cannot infer handler return type" diagnostic
+        // (E0132-style ambiguous polymorphism). Track on the Phase 4c
+        // task list.
         let handler_overall_id = self.fresh_ty_var();
         let handler_overall = Ty::Var(handler_overall_id);
 
@@ -3067,17 +3081,16 @@ impl Tc {
             }
         }
 
-        // Plan B Task 55 (Phase 2) — staged `E0134` gate lifted.
-        // Codegen now lowers `handle BODY with { arms }` as a
-        // pass-through to BODY when the body contains no non-IO
-        // perform; the codegen-entry guard `unsupported_handle_construct`
-        // rejects programs whose body would actually perform a non-
-        // IO effect, surfacing a clear in-progress message until the
-        // full CPS calling convention + handler-frame setup lands.
-        // Arm-body diagnostics (E0046, E0220, E0044) and registry
-        // diagnostics (E0138, E0139, E0140, E0141) emitted above
-        // this point continue to surface unchanged.
-        let _ = span;
+        // Plan B Task 55 (Phase 2 → 3b → 4a) — both staged gates
+        // (`E0133`, `E0134`) lifted. Codegen lowers `handle BODY with
+        // { arms }` through the runtime handler-frame ABI plus
+        // synthetic CPS arm fns; the codegen-entry guard
+        // `unsupported_handle_construct` rejects shapes still outside
+        // the supported subset (richer arm bodies, multi-effect, k
+        // usage, return arms, etc. — see Phase 4b–4f). Arm-body
+        // diagnostics (E0046, E0220, E0044) and registry diagnostics
+        // (E0138, E0139, E0140, E0141) emitted above continue to
+        // surface unchanged.
 
         Some(self.deref(&handler_overall))
     }
@@ -4216,10 +4229,12 @@ fn collect_free_vars(
             // arm boundary so the bindings don't leak out into peer
             // arms or the surrounding scope.
             //
-            // Capture analysis runs strictly before closure conversion;
-            // a `handle` reaching this code is fine — the typecheck
-            // E0134 flag at `Expr::Handle` is non-fatal and downstream
-            // passes still need a structurally correct walk.
+            // Capture analysis runs strictly before closure conversion.
+            // E0134 was lifted in Task 55 Phase 2 (`2d69b52`); a
+            // `handle` reaching this code is now a well-formed
+            // shape, and downstream passes need a structurally
+            // correct walk regardless of which Phase-4 restrictions
+            // the codegen-entry guard later rejects.
             Expr::Handle {
                 body,
                 return_arm,
