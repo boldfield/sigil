@@ -1073,6 +1073,14 @@ struct HandlerArmSynth {
     /// for zero-arg ops; trailing `k` is tracked separately via
     /// `k_name`.
     arg_names: Vec<String>,
+    /// Plan B Task 55 (Phase 4d) — the arm's continuation binding
+    /// name (the trailing `k` of `Effect.op(arg1, arg2, ..., k) =>
+    /// body`). Used by the synth-pass tail-k detector to recognise
+    /// `Expr::Call { callee: Ident(k_name), .. }` shapes in the arm
+    /// body's tail position and lower them as `sigil_next_step_call`
+    /// against `(k_closure_loaded, k_fn_loaded, 1)` instead of
+    /// `sigil_next_step_done(value)`.
+    k_name: String,
     /// Plan B Task 55 (Phase 4c) — Cranelift type per op-arg, parallel
     /// to `arg_names`. Resolved from the matching `EffectOp`'s declared
     /// `params` via `cranelift_ty_for_type_expr`. Used by the synthetic-
@@ -1364,6 +1372,7 @@ fn collect_handle_arms_in_expr(
                     arg_types,
                     body_ty,
                     captures,
+                    k_name: arm.k_name.clone(),
                 });
                 arm_indices.push(global_idx);
             }
@@ -1390,6 +1399,44 @@ fn collect_handle_arms_in_expr(
             );
             Ok(())
         }
+    }
+}
+
+/// Plan B Task 55 (Phase 4d) — detect whether an arm body's tail
+/// expression is a `k(arg)` call. Returns `Some(arg_expr)` when the
+/// body has the shape:
+///
+///   * `k(arg)` — direct call, OR
+///   * `block { stmts...; tail: k(arg) }` — block-wrapped, OR
+///   * recursively, blocks all the way down to a final `k(arg)` tail.
+///
+/// Returns `None` for shapes where the tail is anything else (a value,
+/// an `if`/`match` expression, a non-`k` call, etc.). The walker's
+/// `tail` parameter aligns with this detection: only positions reached
+/// here would have been allowed as tail-`k` callees by the walker.
+///
+/// `If`/`Match` branch tails are deliberately NOT propagated through —
+/// Phase 4d MVP doesn't support multi-branch tail-`k` shapes (e.g.,
+/// `if c { k(x) } else { k(y) }`); those would need a join-block
+/// lowering with both branches producing `*NextStep` values, deferred
+/// to a later phase. The walker rejects k-calls inside If/Match
+/// branches as non-tail.
+fn arm_body_tail_is_k_call<'a>(
+    body: &'a crate::ast::Expr,
+    k_name: &str,
+) -> Option<&'a crate::ast::Expr> {
+    use crate::ast::Expr;
+    match body {
+        Expr::Call { callee, args, .. } if args.len() == 1 => {
+            if let Expr::Ident(n, _) = callee.as_ref() {
+                if n == k_name {
+                    return Some(&args[0]);
+                }
+            }
+            None
+        }
+        Expr::Block(b) => b.tail.as_ref().and_then(|t| arm_body_tail_is_k_call(t, k_name)),
+        _ => None,
     }
 }
 
@@ -2076,6 +2123,59 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_run_loop", Linkage::Import, &run_loop_sig)
         .map_err(|e| format!("declare sigil_run_loop: {e}"))?;
 
+    // Plan B Task 55 (Phase 4d) — sigil_next_step_call(closure_ptr,
+    // fn_ptr, arg_count) -> *mut NextStep. Allocates a NextStep::Call
+    // record from the per-dispatch arena. Codegen emits this for
+    // tail-position `k(arg)` lowering inside synthetic arm fns: the
+    // returned NextStep is what the arm fn returns, the trampoline
+    // dispatches the Call, the args buffer (written via
+    // sigil_next_step_args_ptr) carries the single u64 arg.
+    let mut next_step_call_sig = Signature::new(isa_call_conv(&module));
+    next_step_call_sig.params.push(AbiParam::new(pointer_ty)); // closure_ptr
+    next_step_call_sig.params.push(AbiParam::new(pointer_ty)); // fn_ptr
+    next_step_call_sig.params.push(AbiParam::new(types::I32)); // arg_count
+    next_step_call_sig.returns.push(AbiParam::new(pointer_ty));
+    let next_step_call = module
+        .declare_function(
+            "sigil_next_step_call",
+            Linkage::Import,
+            &next_step_call_sig,
+        )
+        .map_err(|e| format!("declare sigil_next_step_call: {e}"))?;
+
+    // sigil_next_step_args_ptr(ns: *mut NextStep) -> *mut u64.
+    // Returns the args buffer pointer for a NextStep::Call (or null
+    // for Done / zero-arg). Codegen writes args via this pointer.
+    let mut next_step_args_ptr_sig = Signature::new(isa_call_conv(&module));
+    next_step_args_ptr_sig.params.push(AbiParam::new(pointer_ty));
+    next_step_args_ptr_sig.returns.push(AbiParam::new(pointer_ty));
+    let next_step_args_ptr = module
+        .declare_function(
+            "sigil_next_step_args_ptr",
+            Linkage::Import,
+            &next_step_args_ptr_sig,
+        )
+        .map_err(|e| format!("declare sigil_next_step_args_ptr: {e}"))?;
+
+    // Plan B Task 55 (Phase 4d) — sigil_continuation_identity, the
+    // CPS-arm-fn-ABI runtime intrinsic that codegen emits as `k_fn`
+    // at every non-IO perform site. When dispatched via
+    // sigil_run_loop, returns Done(args_ptr[0]). Rationale + hardening
+    // notes: see runtime/src/handlers.rs and the
+    // `[DEVIATION Task 55] Phase 4d` entry in PLAN_B_DEVIATIONS.md.
+    let mut continuation_identity_sig = Signature::new(isa_call_conv(&module));
+    continuation_identity_sig.params.push(AbiParam::new(pointer_ty)); // closure_ptr
+    continuation_identity_sig.params.push(AbiParam::new(pointer_ty)); // args_ptr
+    continuation_identity_sig.params.push(AbiParam::new(types::I32)); // args_len
+    continuation_identity_sig.returns.push(AbiParam::new(pointer_ty));
+    let continuation_identity = module
+        .declare_function(
+            "sigil_continuation_identity",
+            Linkage::Import,
+            &continuation_identity_sig,
+        )
+        .map_err(|e| format!("declare sigil_continuation_identity: {e}"))?;
+
     // C-callable main: int main(int argc, char **argv). Stage 1 ignores argv.
     let mut main_sig = Signature::new(isa_call_conv(&module));
     main_sig.params.push(AbiParam::new(types::I32));
@@ -2261,6 +2361,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 module.declare_func_in_func(handler_frame_set_arm, builder.func);
             let perform_ref = module.declare_func_in_func(perform_func, builder.func);
             let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
+            // Plan B Task 55 (Phase 4d) — `sigil_continuation_identity`
+            // ref. User-fn-side perform sites pass this as the
+            // `k_fn_ptr` arg; arm-fn-side tail-k lowering uses
+            // `next_step_call` / `next_step_args_ptr` (declared at
+            // the synth-pass site in the loop below; user fns don't
+            // emit those calls themselves).
+            let continuation_identity_ref =
+                module.declare_func_in_func(continuation_identity, builder.func);
             // Per-handle synthetic arm fn refs, keyed by handle span.
             // Each entry maps a handle's span to the per-arm FuncRefs
             // used for `func_addr` when populating the runtime
@@ -2340,6 +2448,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_arm_refs_per_handle,
                 handler_arm_synth: &handler_arm_synth,
                 handler_arm_indices: &handler_arm_indices,
+                continuation_identity_ref,
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
@@ -2487,6 +2596,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let perform_ref = module.declare_func_in_func(perform_func, builder.func);
                 let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
                 let next_step_done_ref = module.declare_func_in_func(next_step_done, builder.func);
+                // Plan B Task 55 (Phase 4d) — tail-k lowering refs.
+                let next_step_call_ref =
+                    module.declare_func_in_func(next_step_call, builder.func);
+                let next_step_args_ptr_ref =
+                    module.declare_func_in_func(next_step_args_ptr, builder.func);
+                let continuation_identity_ref =
+                    module.declare_func_in_func(continuation_identity, builder.func);
 
                 // Per-handle synthetic arm-fn refs, keyed by handle
                 // span. Phase 4c walker rejects nested Handle inside
@@ -2587,6 +2703,29 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env.insert(name.clone(), value);
                 }
 
+                // Plan B Task 55 (Phase 4d): load `k_closure` and
+                // `k_fn` from the args buffer at positions [N], [N+1]
+                // where N = arg_names.len(). The runtime appends
+                // these two pointer-width slots after the user args
+                // (per the `[DEVIATION Task 56]` uniform CPS calling
+                // convention entry). The synth-pass tail-`k` lowering
+                // below uses these as the `closure_ptr` / `fn_ptr`
+                // args to `sigil_next_step_call` when the arm body's
+                // tail expression is `k(arg)`.
+                let n_user_args = synth.arg_names.len();
+                let k_closure_v = builder.ins().load(
+                    pointer_ty,
+                    MemFlags::trusted(),
+                    args_ptr,
+                    (n_user_args * 8) as i32,
+                );
+                let k_fn_v = builder.ins().load(
+                    pointer_ty,
+                    MemFlags::trusted(),
+                    args_ptr,
+                    ((n_user_args + 1) * 8) as i32,
+                );
+
                 let mut lowerer = Lowerer {
                     builder,
                     stackmap: &mut stackmap,
@@ -2610,6 +2749,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_arm_refs_per_handle,
                     handler_arm_synth: &handler_arm_synth,
                     handler_arm_indices: &handler_arm_indices,
+                    continuation_identity_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
@@ -2620,53 +2760,106 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     match_scrut_tys: &checked.match_scrut_tys,
                 };
 
-                let body_value = lowerer.lower_expr(&synth.body);
-
-                // Widen the body value to I64 for `sigil_next_step_done`.
-                // Mirrors the perform-side widening in
-                // `lower_perform_non_io_to_value`. The corresponding
-                // narrowing on the perform side (added in Phase 4c)
-                // restores the op's declared return type so callers
-                // see the right Cranelift type.
-                let widened_body = if synth.body_ty == types::I64 {
-                    body_value
-                } else if synth.body_ty.is_int() && synth.body_ty.bits() < 64 {
-                    lowerer.builder.ins().uextend(types::I64, body_value)
+                // Plan B Task 55 (Phase 4d): route between the two
+                // arm-body lowering paths based on the body's tail
+                // shape:
+                //
+                //   - **Tail-`k(arg)` path**: lower any pre-tail
+                //     stmts, lower the arg in non-tail position,
+                //     widen to I64, build `NextStep::Call(k_closure,
+                //     k_fn=identity-by-default, /*arg_count=*/1)`,
+                //     write the widened arg into the args buffer at
+                //     slot 0, return the NextStep pointer. The
+                //     surrounding native fn's `sigil_run_loop`
+                //     dispatches the Call into
+                //     `sigil_continuation_identity`, which returns
+                //     `Done(arg)`; `run_loop` returns the value to
+                //     the perform site.
+                //
+                //   - **Non-tail / no-`k` path**: existing Phase 4c
+                //     flow — lower body via `lower_expr`, widen to
+                //     I64 (matching `sigil_next_step_done`'s
+                //     signature), build `NextStep::Done(value)`,
+                //     return the NextStep pointer.
+                //
+                // The walker (`arm_body_phase_4c_violations`)
+                // enforces that any `k`-call inside the body is in
+                // the tail position recognised by
+                // `arm_body_tail_is_k_call`; non-tail `k` use is
+                // rejected with a Phase-4e-pointing diagnostic.
+                let next_step_ptr = if let Some(arg_expr) =
+                    arm_body_tail_is_k_call(&synth.body, &synth.k_name)
+                {
+                    // --- Tail-`k(arg)` path ---
+                    lowerer.lower_arm_body_pre_tail_k_stmts(&synth.body);
+                    let arg_value = lowerer.lower_expr(arg_expr);
+                    let arg_ty = lowerer.builder.func.dfg.value_type(arg_value);
+                    let widened_arg = if arg_ty == types::I64 {
+                        arg_value
+                    } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                        lowerer.builder.ins().uextend(types::I64, arg_value)
+                    } else {
+                        assert_eq!(
+                            arg_ty, pointer_ty,
+                            "codegen Phase 4d: unexpected k-arg Cranelift type \
+                             {arg_ty:?} for sigil_next_step_call slot widen — \
+                             Phase 4d MVP supports I64 (Int), I32 (Char), I8 \
+                             (Bool/Byte/Unit), and pointer_ty (String / \
+                             user-type pointers); floats and 32-bit-target \
+                             pointer types need a dedicated branch"
+                        );
+                        arg_value
+                    };
+                    let one_v = lowerer.builder.ins().iconst(types::I32, 1);
+                    let call_ns = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_call_ref, &[k_closure_v, k_fn_v, one_v]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                    let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                    let argp_call = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_args_ptr_ref, &[ns_ptr]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
+                    let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                    lowerer
+                        .builder
+                        .ins()
+                        .store(MemFlags::trusted(), widened_arg, argp_v, 0);
+                    ns_ptr
                 } else {
-                    // pointer_ty: store directly (already I64 on
-                    // supported targets); see widening discipline
-                    // in `lower_perform_non_io_to_value`.
-                    // `assert_eq!` (not `debug_assert_eq!`) for
-                    // symmetry with the perform-side widening
-                    // fallthrough at codegen.rs:2542 per the
-                    // deviation entry's "mirror" hardening
-                    // discipline — future floats / 32-bit-target
-                    // regressions panic in both dev and release.
-                    assert_eq!(
-                        synth.body_ty, pointer_ty,
-                        "codegen Phase 4c: unexpected arm-body Cranelift type \
-                         {:?} for sigil_next_step_done wrap",
-                        synth.body_ty
-                    );
-                    body_value
+                    // --- Non-tail / no-`k` path (Phase 4c shape) ---
+                    let body_value = lowerer.lower_expr(&synth.body);
+                    let widened_body = if synth.body_ty == types::I64 {
+                        body_value
+                    } else if synth.body_ty.is_int() && synth.body_ty.bits() < 64 {
+                        lowerer.builder.ins().uextend(types::I64, body_value)
+                    } else {
+                        assert_eq!(
+                            synth.body_ty, pointer_ty,
+                            "codegen Phase 4c: unexpected arm-body Cranelift type \
+                             {:?} for sigil_next_step_done wrap",
+                            synth.body_ty
+                        );
+                        body_value
+                    };
+                    let done_call = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_done_ref, &[widened_body]);
+                    // Stackmap entry: any pointer-typed op-args bound in
+                    // env (String / user-type) are GC roots live across
+                    // this `sigil_next_step_done` arena allocation.
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, done_call));
+                    lowerer.builder.inst_results(done_call)[0]
                 };
-
-                let done_call = lowerer
-                    .builder
-                    .ins()
-                    .call(next_step_done_ref, &[widened_body]);
-                // Stackmap entry: any pointer-typed op-args bound in
-                // env (String / user-type) are GC roots live across
-                // this `sigil_next_step_done` arena allocation.
-                // Placeholder records keep the stackmap section
-                // honest (Plan A1 STACKMAP_FLAG_PLACEHOLDER); a real
-                // safepoint with live-value list arrives with the
-                // v1 stackmap format upgrade noted in the
-                // StackMapBuilder doc comment.
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, done_call));
-                let next_step_ptr = lowerer.builder.inst_results(done_call)[0];
                 lowerer.builder.ins().return_(&[next_step_ptr]);
                 lowerer.builder.finalize();
             }
@@ -2856,6 +3049,13 @@ struct Lowerer<'a, 'b> {
     /// `handler_arm_refs_per_handle`. Used to walk an
     /// `Expr::Handle`'s arms without re-walking the AST.
     handler_arm_indices: &'b BTreeMap<Span, Vec<usize>>,
+    /// Plan B Task 55 (Phase 4d) — `sigil_continuation_identity`
+    /// runtime intrinsic. `lower_perform_non_io_to_value` emits
+    /// `func_addr(continuation_identity_ref)` as the `k_fn_ptr` arg
+    /// to every non-IO `sigil_perform` call site so a tail-`k(arg)`
+    /// arm body's `sigil_next_step_call` dispatches into the
+    /// identity continuation, producing a terminal `Done(arg)`.
+    continuation_identity_ref: FuncRef,
     /// Plan B Task 55 (Phase 3a) — effect-name → effect_id (u32) map
     /// from typecheck. `Expr::Handle` codegen looks up the handle's
     /// declared effect (the unique effect name in its arms; Phase 3a
@@ -2918,6 +3118,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.lower_stmt(s);
         }
         b.tail.as_ref().map(|t| self.lower_expr(t))
+    }
+
+    /// Plan B Task 55 (Phase 4d) — lower the prefix statements of a
+    /// tail-`k` arm body. Walks `Expr::Block`-wrapped layers, lowering
+    /// each block's stmts, recursing through the tail. Stops at the
+    /// non-Block leaf (the `k(arg)` call) — the synth pass lowers the
+    /// arg explicitly afterward and emits `sigil_next_step_call`.
+    /// Mirrors `arm_body_tail_is_k_call`'s recursion shape so the two
+    /// stay in lockstep.
+    fn lower_arm_body_pre_tail_k_stmts(&mut self, body: &crate::ast::Expr) {
+        use crate::ast::Expr;
+        if let Expr::Block(b) = body {
+            for s in &b.stmts {
+                self.lower_stmt(s);
+            }
+            if let Some(t) = &b.tail {
+                self.lower_arm_body_pre_tail_k_stmts(t);
+            }
+        }
     }
 
     fn lower_stmt(&mut self, s: &crate::ast::Stmt) {
@@ -3126,16 +3345,32 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             )
         };
 
-        // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4d):
-        // `null_k_closure` + `null_k_fn` pin the no-k-usage
-        // restriction. Phase 4d reifies the perform's continuation
-        // (the rest of computation after the perform site) into a
-        // CPS-color closure-fn pair and passes it here so the arm can
-        // invoke `k(value)` to resume. Until then arms ignore `k`
-        // (single-shot Raise-style early-exit), and the codegen-entry
-        // guard's IntLit-only-arm-body check enforces that.
+        // Plan B Task 55 (Phase 4d): `k_fn_ptr` is the address of the
+        // runtime intrinsic `sigil_continuation_identity`. When a
+        // synthetic CPS arm fn invokes its captured `k(arg)` in tail
+        // position, codegen lowers the call as
+        // `sigil_next_step_call(loaded_k_closure, loaded_k_fn,
+        // /*arg_count=*/1)` and writes `arg` to the args buffer's
+        // slot 0; the trampoline dispatches the resulting Call into
+        // `sigil_continuation_identity(null, args_ptr=&[arg],
+        // args_len=1)`, which returns `Done(arg)` from the arena. The
+        // surrounding native fn's `sigil_run_loop` invocation
+        // observes the Done and returns `arg` to the perform site.
+        //
+        // `k_closure_ptr` is null because the identity continuation
+        // is closure-less; future Phase 4e replaces this constant
+        // with a real lambda-lifted continuation closure when arm
+        // bodies invoke `k` non-tail or for multi-shot semantics.
+        //
+        // Bisecting hint: a regression that produces a tail-`k(arg)`
+        // returning the wrong value should treat this site (and the
+        // arm-fn tail-k lowering at the synth pass) as the prime
+        // suspect — see the `[DEVIATION Task 55] Phase 4d` entry.
         let null_k_closure = self.builder.ins().iconst(self.pointer_ty, 0);
-        let null_k_fn = self.builder.ins().iconst(self.pointer_ty, 0);
+        let k_fn = self
+            .builder
+            .ins()
+            .func_addr(self.pointer_ty, self.continuation_identity_ref);
         let perform_call = self.builder.ins().call(
             self.perform_ref,
             &[
@@ -3144,7 +3379,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 args_ptr,
                 args_len_v,
                 null_k_closure,
-                null_k_fn,
+                k_fn,
             ],
         );
         self.stackmap

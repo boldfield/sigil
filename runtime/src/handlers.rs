@@ -538,6 +538,62 @@ pub unsafe extern "C" fn sigil_next_step_args_ptr(ns: *mut NextStep) -> *mut u64
     (ns as *mut u8).add(core::mem::size_of::<NextStep>()) as *mut u64
 }
 
+/// Plan B Task 55 (Phase 4d) — identity continuation intrinsic.
+///
+/// Codegen emits the address of this function as the `k_fn_ptr` arg
+/// to every non-IO `sigil_perform` site (with `k_closure_ptr` set to
+/// null). When a synthetic CPS arm fn invokes its captured `k(value)`
+/// in tail position, codegen lowers the call as
+/// `sigil_next_step_call(loaded_k_closure, loaded_k_fn, /*arg_count=*/1)`
+/// followed by a single u64 store of `value` at the args buffer's slot 0;
+/// the returned `NextStep::Call` is the arm fn's return value. The
+/// trampoline (`sigil_run_loop`) dispatches the `Call`, invoking
+/// `sigil_continuation_identity(null, args_ptr=&[value], args_len=1)`,
+/// which returns a `NextStep::Done(value)` from the arena. `run_loop`
+/// then returns `value` to the perform site.
+///
+/// The shape produces algebraic-correct results when:
+///   - `k(arg)` is invoked in tail position of the arm body, AND
+///   - the perform site is in tail position of the handle body (or
+///     anywhere within the handle body, since the surrounding native
+///     fn synchronously blocks on `sigil_run_loop` and feeds the
+///     result back to the perform site).
+///
+/// Both conditions are enforced by the `unsupported_handle_construct`
+/// codegen-entry walker. Non-tail `k` use, multi-shot `k` use, and
+/// the discard-`k` correctness gap across function-call boundaries
+/// require Plan B Task 55 Phase 4e (colorer's handler-discharge
+/// refinement + native↔CPS interop boundary). See
+/// `[DEVIATION Task 55] Phase 4d` in `PLAN_B_DEVIATIONS.md` and the
+/// "Verification limits (in-flight)" section in `README.md`.
+///
+/// # Safety
+///
+/// `args_ptr` must point to at least one readable u64 (`args_len >= 1`).
+/// `closure_ptr` is unused (this intrinsic is closure-less). The
+/// trampoline guarantees both invariants when dispatching from a
+/// `NextStep::Call` produced by codegen's tail-`k` lowering.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_continuation_identity(
+    _closure_ptr: *const u8,
+    args_ptr: *const u64,
+    args_len: u32,
+) -> *mut NextStep {
+    debug_assert_eq!(
+        args_len, 1,
+        "sigil_continuation_identity: arity 1 invariant — codegen always emits \
+         sigil_next_step_call with arg_count=1 for tail-k lowering"
+    );
+    debug_assert!(
+        !args_ptr.is_null(),
+        "sigil_continuation_identity: args_ptr must be non-null when args_len >= 1"
+    );
+    // SAFETY: caller (codegen tail-k lowering) guarantees args_ptr
+    // points to >= 1 readable u64 holding the captured arg.
+    let value = *args_ptr;
+    sigil_next_step_done(value)
+}
+
 // ---------------------------------------------------------------------
 // `sigil_perform` and `sigil_run_loop`
 // ---------------------------------------------------------------------
