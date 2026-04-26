@@ -74,6 +74,42 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 - *Single effect per handle* — pending Phase 4e (frame-per-effect).
 - *No return arm* — pending Phase 4f (synthetic return-fn registered via `sigil_handler_frame_set_return`).
 
+## 2026-04-26 — [DEVIATION Task 55] `unsupported_handle_construct` walker does not follow call edges
+
+**Context:** Phase 3b's codegen-entry guard `unsupported_handle_construct` walks every handle expression's body looking for direct `Expr::Perform` sites. It does NOT follow `Expr::Call` edges into called fns. A handle whose body is `helper()` where `helper` itself performs the handled effect therefore slips past the guard's "non-IO perform with args" check.
+
+**Deviation:** The walker stays syntactic and shallow. Once MF1's `Stmt::Perform` dispatch fix landed (review-fixup commit `54b4a60`), this is **no longer a soundness concern** — there is no longer any `unreachable!` or IO-only assertion that a transitive perform would crash into. A non-IO perform reached through a call edge now lowers correctly via `sigil_perform` → `sigil_run_loop` against whatever handler frame is on the runtime stack at call time. The walker's role is reduced to a *Phase-4 ergonomic gate*: it surfaces a friendly "this shape isn't supported yet" diagnostic for shapes Phase 3b/4a's codegen can't handle. Transitive performs through call edges are not in that set today; they work because the called fn's own Stmt/Expr Perform sites lower through the runtime ABI like any other.
+
+**Rationale:** Following call edges in the codegen-entry walker would require fixed-point analysis over the call graph (intentional, since a fn could call another that performs) and would duplicate work the colorer already does. Leaving the walker syntactic keeps it simple and CI-fast. The standing precondition that programs reach codegen with all `Item::Effect` registered + all op IDs assigned + every reachable handle visible to the per-arm CPS-fn synthesis pre-pass holds regardless of transitive analysis — those passes walk every fn body, so a perform reached via a call edge gets its `effect_id` / `op_id` looked up correctly.
+
+**Implementing commit(s):** original walker `2d69b52`, recursion fix into nested handle bodies `54b4a60`.
+
+**Closure point:** Phase 4b (op-arg packing) lifts the "non-IO perform with args" gate, at which point the walker's guard check becomes `if body_contains_unsupported_op_arg(body)` — still syntactic, still shallow, still serving the same Phase-4 ergonomic role. Phase 4c/4d may need a colorer-driven check (per-monomorph color variance under handler-context — the PR #18 reviewer's open ask) to decide which monomorphs sit at the native↔CPS boundary; that check is NOT a property of the walker, it's a property of color inference, and it lives in `compiler/src/color.rs`. The walker stays as-is.
+
+## 2026-04-26 — [DEVIATION Task 55] Handler frame leaks on body unwind; depends on Task 57 to surface
+
+**Context:** `Expr::Handle` codegen lowers to `frame_new → set_arm* → push → body → pop`. If the body aborts mid-execution, the frame stays on the runtime handler stack until the process dies. Today the only way to abort mid-body is `sigil_panic_arith_error` (div/mod by zero, integer overflow), which kills the process — so the leak never matters because there is no surviving program state to observe it.
+
+**Deviation:** No frame-pop-on-unwind path is wired in Phase 3b/4a. The codegen sequence is straight-line; there is no scope-guard / drop-glue / unwind-resumption mechanism for the handler frame. Programs that compile under Phase 3b/4a today never observe this leak because no recoverable abort path exists.
+
+**Rationale:** Adding scope-guard machinery now requires designing the unwind contract before there's a recoverable abort path to test it against. The contract would have to be revised when Task 57 replaces `sigil_panic_arith_error` with `Raise[ArithError]` (the ArithError handler would itself pop frames). Building the contract once, against the real ArithError path, is cheaper than building it twice.
+
+**Implementing commit(s):** `d0aa4c4` (Phase 3b — straight-line frame_new/push/pop, no unwind path).
+
+**Closure point:** **Task 57.** When `sigil_panic_arith_error` is replaced with `perform ArithError.divide_by_zero(...)`, the recovery path (the surrounding `handle ArithError` arm) becomes a real observation point for any leaked frames. Task 57's PR must either (a) add a scope guard at every `Expr::Handle` codegen site that pops the frame on every exit edge from the body (success or unwind), or (b) make `sigil_handle_pop` idempotent + tear down the leaked frames on the unwind path before the next `sigil_perform` walks the stack. The arithmetic-overflow recoverable-abort case is what makes this load-bearing; until Task 57 lands, the dependency is documented but the bug is not user-observable.
+
+## 2026-04-26 — [DEVIATION Task 55] Native callers drive `sigil_run_loop` synchronously; tail-call discipline lifts in Phase 4d
+
+**Context:** Phase 3b's `lower_perform_non_io_to_value` lowers a non-IO `perform Effect.op(...)` site as `sigil_perform(...) → sigil_run_loop(call_ns)`. The native caller blocks on `sigil_run_loop` until it returns a terminal `Done(value)`. This works for Phase 3b/4a's restricted shape (synchronous, single-shot, `IntLit` arm body, no `k` use) because `run_loop` completes in one or two trampoline dispatches and returns promptly.
+
+**Deviation:** Native callers issue `sigil_run_loop` calls synchronously rather than handing the perform's `NextStep::Call` to a containing trampoline as a tail position. For Phase 3b/4a this is fine — there's no enclosing trampoline yet because `main` and helper fns are both Native-color. The synchronous-blocking shape would defeat the trampoline's stack-amortisation guarantee if a deep chain of CPS calls landed on it (each one pushing a native stack frame), but Phase 3b's restrictions cap chain depth at 1–2 dispatches.
+
+**Rationale:** Wiring a real native↔CPS interop boundary (color-driven CC, native fns that detect they're inside a handler-discharge context and emit `NextStep::Call` instead of synchronous `run_loop`) requires the colorer to refine handler-discharge — which is exactly the MF3 / PR #18-reviewer Stage-6 ask. Phase 3b/4a ship the synchronous shape because it's correct under their narrow restrictions and because designing the interop boundary alongside the color refinement gives us one design pass instead of two.
+
+**Implementing commit(s):** `d0aa4c4` (Phase 3b — synchronous `sigil_perform` + `sigil_run_loop` from `lower_perform_non_io_to_value`).
+
+**Closure point:** **Phase 4d** (k-using arms via continuation reification). Phase 4d makes arm bodies that invoke `k(value)` work end-to-end, which means the body's "rest of computation after the perform" gets lambda-lifted into a CPS-color synthetic closure. At that point native-color fns that contain a perform site under a handle MUST be recoloured CPS (or wrapped in a per-call trampoline) so the perform's `NextStep::Call` goes to the enclosing trampoline rather than to a synchronous `sigil_run_loop` invocation. The colorer's handler-discharge refinement (the PR #18 reviewer's ask, `compiler/src/color.rs::find_non_io_perform_in_expr` Phase 4d closure point) is what enables this — a fn whose only non-IO performs are discharged by enclosing handlers stays Native, but a fn whose performs reach a `k`-reifying handler arm becomes CPS. Until Phase 4d, the synchronous-blocking shape is the correct lowering.
+
 ## 2026-04-25 — [Task 4.5.5 / A3-carryover] Tagged-vs-raw Int ABI decision
 
 **Context:** Plan A3's `QUESTIONS.md` entry `[PLAN-A3] main-return-tagging`

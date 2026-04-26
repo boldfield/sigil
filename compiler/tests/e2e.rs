@@ -1233,3 +1233,198 @@ fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+// ----- Plan B Task 55 (MF2) — differential identity property test -----
+//
+// **What this pins.** For any "Native-eligible" Sigil expression
+// (one that produces an `Int` and contains no non-IO `perform` site,
+// so it could in principle be lowered without any handler-frame
+// machinery), wrapping the expression in a vacuous handler must NOT
+// change its observed value. The wrapper installs the handler-frame
+// ABI (`sigil_handler_frame_new` + `sigil_handle_push` +
+// `sigil_handle_pop`) plus a synthetic CPS arm fn that never gets
+// dispatched (the body never `perform`s the handled effect). If the
+// wrapper changes the answer, the codegen-side handler-frame setup
+// has corrupted some piece of state on the path Phase 4+ will build
+// on (caller's stack, register save/restore, GC roots, etc.).
+//
+// **Why a property test rather than hand-rolled cases.** The shape
+// of the bug we're guarding against ("CPS lowering breaks native
+// semantics") generalises across every native-color expression
+// shape; a fuzz of expression shapes catches accidental
+// shape-specific corruption that hand-rolled tests would miss.
+//
+// **Determinism.** A fixed seed + xorshift PRNG produces the same
+// 24 expressions on every run. CI failures pin a single expression
+// reproducibly and the seed/index can be inverted for triage.
+//
+// **Scope.** Phase 3b/4a's codegen-entry guard rejects arm bodies
+// that aren't `IntLit` and ops with user args, so the wrapper
+// stays inside the supported subset by using `effect E { op: () ->
+// Int }` with arm body `999`. The body expression itself contains
+// no `perform` (the generator never emits one), so all Phase 3b
+// restrictions on the body are trivially satisfied. As Phase 4b/4c
+// lift restrictions, this test continues to pin the wrapper's
+// identity property — and stays load-bearing precisely because the
+// shape of the bug it guards against doesn't shrink.
+
+/// Tiny deterministic PRNG. The differential-identity test runs in
+/// CI on every commit and we want bit-exact reproducibility — using
+/// `rand` would pull in a transitive dep tree just for one test.
+/// Xorshift64 is a 25-line state machine with adequate quality for
+/// this scale (24 expressions, ~5 random choices per expression).
+struct Xorshift64 {
+    state: u64,
+}
+
+impl Xorshift64 {
+    fn new(seed: u64) -> Self {
+        // Avoid the all-zero state which xorshift cannot escape;
+        // 0xdeadbeef is an acceptable substitute.
+        Self {
+            state: if seed == 0 { 0xdeadbeef } else { seed },
+        }
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    /// Inclusive range. `lo <= hi` required.
+    fn range(&mut self, lo: i64, hi: i64) -> i64 {
+        debug_assert!(lo <= hi);
+        let span = (hi - lo + 1) as u64;
+        lo + (self.next() % span) as i64
+    }
+
+    fn bool(&mut self) -> bool {
+        (self.next() & 1) == 1
+    }
+}
+
+/// Generate a Sigil source-level expression that evaluates to an
+/// `Int`. Bounded by `depth_remaining` to keep pathological growth
+/// in check. Contains no `perform` (Native-eligible by construction)
+/// and no division/modulo (avoids div-by-zero traps that would mask
+/// the real signal). Operand magnitudes are kept small enough that
+/// chained `*`s don't overflow i64.
+fn gen_int_expr(rng: &mut Xorshift64, depth_remaining: u32) -> String {
+    if depth_remaining == 0 || rng.bool() {
+        // Leaf — small int, occasionally negated via unary `-`.
+        let n = rng.range(0, 9);
+        if rng.bool() {
+            format!("(-{n})")
+        } else {
+            format!("{n}")
+        }
+    } else {
+        match rng.range(0, 3) {
+            0 => format!(
+                "({} + {})",
+                gen_int_expr(rng, depth_remaining - 1),
+                gen_int_expr(rng, depth_remaining - 1),
+            ),
+            1 => format!(
+                "({} - {})",
+                gen_int_expr(rng, depth_remaining - 1),
+                gen_int_expr(rng, depth_remaining - 1),
+            ),
+            2 => format!(
+                "({} * {})",
+                gen_int_expr(rng, depth_remaining - 1),
+                gen_int_expr(rng, depth_remaining - 1),
+            ),
+            // if-else branch — bool literal cond keeps the test
+            // deterministic without risking unrelated comparison-
+            // op coverage gaps in our shape sample.
+            _ => format!(
+                "(if {} {{ {} }} else {{ {} }})",
+                if rng.bool() { "true" } else { "false" },
+                gen_int_expr(rng, depth_remaining - 1),
+                gen_int_expr(rng, depth_remaining - 1),
+            ),
+        }
+    }
+}
+
+#[test]
+fn cps_wrapped_identity_matches_native_on_native_eligible_programs() {
+    // Plan B Task 55 (MF2 / standing precondition [P1]): for every
+    // generated Native-eligible expression `E`, the program
+    //
+    //   fn main() -> Int ![IO] {
+    //     perform IO.println(int_to_string(E));
+    //     0
+    //   }
+    //
+    // and the program
+    //
+    //   effect E_eff { op: () -> Int }
+    //   fn main() -> Int ![IO] {
+    //     let n: Int = handle E with { E_eff.op(k) => 999 };
+    //     perform IO.println(int_to_string(n));
+    //     0
+    //   }
+    //
+    // must produce identical stdout. The wrapper installs the
+    // handler-frame ABI + synthetic CPS arm fn around `E`; if the
+    // wrapper changes the answer, codegen has corrupted state on
+    // the path that Phase 4b/4c/4d builds on. See block comment
+    // above for full rationale.
+    //
+    // Iteration count is intentionally modest (24 trials) — each
+    // trial is two `sigil` compile+run cycles, and CI time is
+    // billable. Increase if/when the failure rate stays at zero
+    // across a stable window of phases.
+    const SEED: u64 = 0x55_2055_2055_2055; // "Task 55, MF2".
+    const TRIALS: u32 = 24;
+    const MAX_DEPTH: u32 = 3;
+
+    let mut rng = Xorshift64::new(SEED);
+    for trial in 0..TRIALS {
+        let expr = gen_int_expr(&mut rng, MAX_DEPTH);
+
+        let native_src = format!(
+            "fn main() -> Int ![IO] {{\n  \
+               perform IO.println(int_to_string({expr}));\n  \
+               0\n\
+             }}\n"
+        );
+        let wrapped_src = format!(
+            "effect E_eff {{ op: () -> Int }}\n\
+             fn main() -> Int ![IO] {{\n  \
+               let n: Int = handle {expr} with {{ E_eff.op(k) => 999 }};\n  \
+               perform IO.println(int_to_string(n));\n  \
+               0\n\
+             }}\n"
+        );
+
+        let (native_stdout, native_stderr, native_exit) =
+            compile_and_run(&native_src, &format!("mf2_native_{trial}"));
+        let (wrapped_stdout, wrapped_stderr, wrapped_exit) =
+            compile_and_run(&wrapped_src, &format!("mf2_wrapped_{trial}"));
+
+        assert_eq!(
+            native_exit, 0,
+            "trial {trial}: native compile/run failed.\nexpr: {expr}\nstderr: {native_stderr}",
+        );
+        assert_eq!(
+            wrapped_exit, 0,
+            "trial {trial}: wrapped compile/run failed.\nexpr: {expr}\nstderr: {wrapped_stderr}",
+        );
+        assert_eq!(
+            native_stdout, wrapped_stdout,
+            "trial {trial}: CPS-wrapped output diverged from native.\n\
+             expr: {expr}\n\
+             native stdout: {native_stdout:?}\n\
+             wrapped stdout: {wrapped_stdout:?}\n\
+             native stderr: {native_stderr}\n\
+             wrapped stderr: {wrapped_stderr}",
+        );
+    }
+}
