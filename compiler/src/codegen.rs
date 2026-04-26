@@ -190,14 +190,14 @@ pub(crate) fn contains_apply_or_generic_ref(program: &crate::ast::Program) -> bo
                 }
             }
             Item::Import(_) => {}
-            // Plan B task 53 — `effect` declarations never reach
-            // codegen on a successful compile (typecheck E0133 stops
-            // them). Returning `true` here is a defensive guard: if a
-            // future refactor accidentally lets one through, the
-            // codegen-entry walker rejects with a hard assertion
-            // rather than silently producing a binary that ignores
-            // the declaration. Plan B Task 54 lifts this guard.
-            Item::Effect(_) => return true,
+            // Plan B Task 55 — `effect Name { op: ... }` declarations
+            // emit no codegen output (they only populate the
+            // typecheck-time effect registry consulted by `perform`
+            // dispatch and the runtime handler-stack ABI from Task
+            // 56). Op signatures are checked under their own generic-
+            // param substitution at typecheck time, so walking them
+            // here is unnecessary; skip silently.
+            Item::Effect(_) => {}
         }
     }
     false
@@ -2291,6 +2291,56 @@ mod tests {
         assert!(
             !contains_apply_or_generic_ref(&prog),
             "walker must accept fully-concrete program"
+        );
+    }
+
+    #[test]
+    fn walker_accepts_program_with_effect_decl() {
+        // Plan B Task 55 — `Item::Effect` produces no codegen output
+        // and the entry walker no longer short-circuits on it. This
+        // test pins the new behavior: a program containing an
+        // `effect` declaration alongside a concrete `main` walks
+        // cleanly past the entry guard.
+        use crate::ast::{Block, EffectDecl, EffectOp, FnDecl, Item, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![
+                Item::Effect(Box::new(EffectDecl {
+                    name: "Raise".to_string(),
+                    name_span: span.clone(),
+                    generic_params: Vec::new(),
+                    resumes_many: false,
+                    ops: vec![EffectOp {
+                        name: "fail".to_string(),
+                        name_span: span.clone(),
+                        params: vec![TypeExpr::Named("String".to_string(), span.clone())],
+                        return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                        span: span.clone(),
+                    }],
+                    span: span.clone(),
+                })),
+                Item::Fn(Box::new(FnDecl {
+                    name: "main".to_string(),
+                    name_span: span.clone(),
+                    generic_params: Vec::new(),
+                    params: Vec::new(),
+                    return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                    effects: Vec::new(),
+                    effect_row_var: None,
+                    body: Block {
+                        stmts: Vec::new(),
+                        tail: None,
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                })),
+            ],
+        };
+        assert!(
+            !contains_apply_or_generic_ref(&prog),
+            "walker must accept program with effect decl + concrete main"
         );
     }
 }

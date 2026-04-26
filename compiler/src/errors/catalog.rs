@@ -681,65 +681,41 @@ pub const CATALOG: &[ErrorEntry] = &[
                       //   fn id[A](x: A) -> A ![] { x }\n\
                       //   let v: Int = id(42);  // pins A := Int",
     },
-    ErrorEntry {
-        code: "E0133",
-        short: "effect declaration is recognised but not yet semantically processed",
-        long: "Plan B task 53 ships the parser surface for `effect Name[T] \
-               { op: (T) -> R, ... }` (and the `resumes: many` opt-in \
-               variant), but the typechecker's effect registry, \
-               row-polymorphic effect checking, and handler typing rules \
-               land in Task 54. Until Task 54 merges, the typechecker \
-               emits `E0133` for every `effect` declaration so that no \
-               well-formed effect can flow through to monomorphization, \
-               CPS transform, or codegen — those passes would either \
-               silently lose the declaration or reach an `unreachable!` \
-               arm that would surface as `E0001`.\n\n\
-               This is a staged-feature gate, not a real semantic error. \
-               When Task 54 lands, the catalog entry is removed and \
-               every emission site replaced by the real registry-build \
-               + row-unification path. Programs that fail with `E0133` \
-               today are usually well-formed under Plan B's surface; the \
-               fix is to wait for Task 54 (or to drop the effect \
-               declaration if the program does not yet need handlers).",
-        fix_example: "// Surface form (parses cleanly under Plan B Task 53):\n\
-                      //   effect Raise { fail: (String) -> Int }\n\n\
-                      // Use site (the `effect` decl emits E0133 today):\n\
-                      //   fn parse(s: String) -> Int ![Raise] { perform Raise.fail(s) }\n\n\
-                      // Workaround until Task 54 lands: remove the\n\
-                      // `effect Raise` declaration and rely on the\n\
-                      // current Stage 1 IO-only effect surface.",
-    },
+    // E0133 (staged effect-declaration gate) was introduced in Plan
+    // B Task 53 and lifted in Task 55 — `Item::Effect` declarations
+    // now flow through to codegen as a no-op (they only populate the
+    // typecheck-time effect registry consulted by `perform`
+    // dispatch). The code number stays retired; the catalog entry
+    // is removed but the number is never reused.
     ErrorEntry {
         code: "E0134",
-        short: "handler expression is recognised but not yet semantically processed",
-        long: "Plan B task 53 ships the parser surface for `handle <body> \
-               with { return(v) => arm, Effect.op(args, k) => arm, ... }`, \
-               but the typechecker's handler typing rules, one-shot \
-               linearity check, and CPS transform for handler arms land \
-               in Tasks 54 and 55. Until those tasks merge, the \
-               typechecker emits `E0134` for every `handle` expression \
-               so that no well-formed handler can flow through to \
-               monomorphization, CPS transform, or codegen — those \
-               passes either silently drop the handler or reach an \
-               `unreachable!` arm that would surface as `E0001`.\n\n\
-               This is a staged-feature gate, not a real semantic \
-               error. Tasks 54 / 55 land the real handler-typing path \
-               and the CPS transform; this catalog entry then goes \
-               away and every emission site is replaced.\n\n\
-               If you see `E0134` on a program you expected to compile, \
-               either the program references handler syntax that Plan B \
-               has not finished yet, or you need to remove the `handle` \
-               wrapper and rely on the current Stage 1 surface (which \
-               handles `IO` via a hard-wired top-level shim).",
-        fix_example: "// Surface form (parses cleanly under Plan B Task 53):\n\
+        short: "handle expression's codegen lowering is not yet complete",
+        long: "Plan B Task 53 shipped the parser surface for `handle <body> \
+               with { return(v) => arm, Effect.op(args, k) => arm, ... }` \
+               and Task 54 shipped the typechecker's handler typing rules, \
+               registry dispatch (E0136-E0141), and one-shot linearity \
+               check (E0220). Task 55 (the in-progress task that wires the \
+               CPS transform and runtime handler-stack ABI from Task 56) \
+               replaces this gate with full codegen lowering. Until Task \
+               55's codegen path lands, the typechecker emits `E0134` for \
+               every `handle` expression so well-formed handler programs \
+               cannot reach the still-`unreachable!` codegen arms.\n\n\
+               This is a staged-feature gate, not a real semantic error. \
+               The handler-typing diagnostics (E0136-E0141, E0220, E0044, \
+               E0046, E0065) above the gate fire as if the gate were \
+               already lifted, so structural problems in handler-using \
+               code surface during current development. When Task 55's \
+               CPS codegen ships, the gate goes away and well-formed \
+               `handle` expressions compile end-to-end.",
+        fix_example: "// Surface form (parses + typechecks cleanly):\n\
                       //   handle parse(s) with {\n\
                       //     return(v) => v,\n\
                       //     Raise.fail(msg, k) => 0,\n\
                       //   }\n\n\
-                      // Workaround until Tasks 54 / 55 land: remove the\n\
-                      // `handle ... with { ... }` wrapper and let the\n\
-                      // body run unhandled (programs that don't catch\n\
-                      // a non-IO effect aren't expressible until Task 54).",
+                      // Workaround until Task 55's codegen path lands:\n\
+                      // remove the `handle ... with { ... }` wrapper and\n\
+                      // let the body run unhandled. Programs that don't\n\
+                      // catch a non-IO effect are not yet expressible.",
     },
     ErrorEntry {
         code: "E0136",

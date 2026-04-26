@@ -910,6 +910,29 @@ fn p16_generic_id_at_int_and_string_oracle() {
 /// it. Once `TypeExpr::Fn` ships, the test should be inverted to assert
 /// success against the prompt's stdout oracle.
 #[test]
+fn effect_decl_with_no_handler_use_compiles_and_runs() {
+    // Plan B Task 55 (foundation phase): an `effect` declaration that
+    // is never used by `handle` or `perform` flows through the
+    // pipeline as a no-op. The codegen-entry walker no longer
+    // short-circuits on `Item::Effect`, monomorphize/color/closure-
+    // convert pass it through unchanged, and codegen emits no
+    // additional symbols for it. The program below should compile
+    // cleanly and behave identically to the IO-only program (`hello,
+    // world\n` to stdout, exit 0).
+    let src = "effect Raise { fail: (String) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(\"hello, world\");\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "effect_decl_no_use");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "hello, world\n",
+        "stdout mismatch; stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
     let src = "fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] {\n  \
                  fn (x: A) -> C ![] => f(g(x))\n\

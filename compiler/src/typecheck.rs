@@ -602,22 +602,14 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 }
                 tc.current_generic_subst = saved_generic_subst;
             }
-            // Plan B task 54 — `effect Name[T] { op: ... }` has been
-            // pre-passed into `tc.effects`; this arm emits the staged
-            // `E0133` gate (kept live until Task 55 lifts it together
-            // with E0134, so well-formed programs cannot reach the
-            // CPS-pending codegen path) and walks the op-decl types
-            // so any unrelated type error in an op signature surfaces
-            // in the same pass.
+            // Plan B Task 55 — `effect Name[T] { op: ... }` has been
+            // pre-passed into `tc.effects`; the staged `E0133` gate
+            // is lifted now that codegen lowers `perform` through
+            // `sigil_perform` and the runtime handler-stack ABI from
+            // Task 56. We still walk the op-decl types so any
+            // unrelated type error in an op signature surfaces in
+            // this pass.
             Item::Effect(ed) => {
-                tc.push_error(
-                    "E0133",
-                    ed.span.clone(),
-                    format!(
-                        "`effect {}` is recognised but not yet runnable (Plan B Task 55)",
-                        ed.name
-                    ),
-                );
                 let saved_generic_subst = std::mem::take(&mut tc.current_generic_subst);
                 let (gs, _) = tc.fresh_generic_subst(&ed.generic_params);
                 tc.current_generic_subst = gs;
@@ -3039,16 +3031,19 @@ impl Tc {
         }
 
         // ---------- Staged-feature gate ----------
-        // E0134 fires once per `handle` expression so partial Plan B
-        // programs cannot reach the CPS-pending codegen path until
-        // Task 55 lands. The internal typing above still ran so
-        // arm-body diagnostics (E0046, E0220, E0044) and registry
-        // diagnostics (E0138, E0139, E0140, E0141) surface alongside
-        // the gate.
+        // Plan B Task 55 — `Item::Effect` decls now flow through to
+        // codegen as a no-op (E0133 lifted), but `Expr::Handle`
+        // codegen wiring still pends until the CPS calling
+        // convention lands later in this same task. E0134 stays
+        // live so well-formed `handle` programs surface a clean
+        // diagnostic instead of tripping `unreachable!` arms in
+        // codegen. Arm-body diagnostics (E0046, E0220, E0044) and
+        // registry diagnostics (E0138, E0139, E0140, E0141) emitted
+        // above this point continue to surface alongside the gate.
         self.push_error(
             "E0134",
             span,
-            "`handle` expression is recognised but not yet runnable (Plan B Task 55)",
+            "`handle` expression is recognised but its codegen lowering is not yet complete (Plan B Task 55, in progress)",
         );
 
         Some(self.deref(&handler_overall))
@@ -4617,12 +4612,11 @@ mod tests {
             // E0001. Review of PR #12 flagged the original E0001
             // regression for this surface form.
             "type Point = { x: Int, y: Int }\nfn main() -> Int ![] { let p: Int = Point { x: 1, y: 2 }; 0 }\n",
-            // Plan B task 53: every new staged-feature surface form
-            // must emit a real catalog code rather than E0001. These
-            // programs are well-formed in Plan B's surface but fire
-            // E0133 / E0134 until Tasks 54+55 land — the discipline
-            // sweep proves the staged diagnostic fires cleanly without
-            // a fall-through to the internal-only code.
+            // Plan B Task 55: asymmetric gate state. E0133 lifted (the
+            // first program below typechecks cleanly), but E0134 stays
+            // live until the CPS codegen lands (the second program
+            // surfaces E0134 plus E0138 for the unknown effect arm).
+            // The "no E0001" discipline rule still holds for both.
             "effect Raise { fail: (String) -> Int }\nfn main() -> Int ![] { 0 }\n",
             "fn main() -> Int ![] { handle 0 with { E.op(k) => 0 } }\n",
             // Plan B task 54: each new code added by handler typing
@@ -6891,41 +6885,55 @@ mod tests {
         );
     }
 
-    // ===== Plan B task 53 — staged-feature stubs ===========================
+    // ===== Plan B Task 55 — asymmetric gate state =========================
+    //
+    // Task 53 introduced E0133 (effect decl) and E0134 (handle expr) as
+    // staged-feature gates so partial Plan B programs could not reach
+    // the CPS-pending codegen path. Task 55 (in progress) lifts the
+    // E0133 gate first: `Item::Effect` declarations have no codegen
+    // output beyond the typecheck-time effect registry, so they flow
+    // through cleanly. The E0134 gate stays live until Task 55's CPS
+    // codegen lands; well-formed `handle` expressions still surface a
+    // staged-feature diagnostic so they don't trip the still-
+    // `unreachable!` codegen arms. Tests below pin both halves of
+    // this asymmetric state.
 
     #[test]
-    fn effect_decl_emits_e0133() {
+    fn well_formed_effect_decl_typechecks_cleanly() {
         let src = "effect Raise { fail: (String) -> Int }\nfn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
         assert!(
-            has_code(&errs, "E0133"),
-            "effect declaration should emit E0133 (Plan B Task 53 staged stub); got: {errs:?}"
-        );
-        assert!(
-            !has_code(&errs, "E0001"),
-            "must not surface E0001: {errs:?}"
+            errs.is_empty(),
+            "effect decl + main should typecheck with no errors; got: {errs:?}"
         );
     }
 
     #[test]
-    fn effect_decl_with_invalid_op_type_still_emits_e0133() {
-        // The invalid op return type `Bogus` would normally fire E0112
-        // for an unknown type; the staged E0133 is independent from
-        // that. Both errors appear so the user can fix the type
-        // problem in parallel with waiting for Task 54.
+    fn effect_decl_with_invalid_op_type_emits_e0112() {
+        // Op signatures are still walked even though E0133 is gone, so
+        // an unknown type in an op return position still fires E0112.
         let src = "effect E { fail: () -> Bogus }\nfn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0133"), "expected E0133: {errs:?}");
-        assert!(has_code(&errs, "E0112"), "expected E0112 too: {errs:?}");
+        assert!(has_code(&errs, "E0112"), "expected E0112: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0133"),
+            "E0133 was lifted in Task 55 but still firing: {errs:?}"
+        );
     }
 
     #[test]
-    fn handle_expr_emits_e0134() {
-        let src = "fn main() -> Int ![] { handle 0 with { E.op(k) => 0 } }\n";
+    fn handle_expr_still_emits_e0134_until_codegen_lands() {
+        // E0134 stays live until Task 55's CPS codegen ships. A well-
+        // formed `handle` expression must surface the staged gate so
+        // the program doesn't reach the still-`unreachable!` codegen
+        // arm in `lower_expr`.
+        let src = "effect E { op: () -> Int }\n\
+                   fn main() -> Int ![] { handle 0 with { E.op(k) => 0 } }\n";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0134"),
-            "handle expression should emit E0134 (Plan B Task 53 staged stub); got: {errs:?}"
+            "E0134 should still fire on well-formed `handle` until Task 55 \
+             codegen lands; got: {errs:?}"
         );
         assert!(
             !has_code(&errs, "E0001"),
@@ -6934,44 +6942,43 @@ mod tests {
     }
 
     #[test]
-    fn handle_expr_with_nested_type_error_surfaces_both() {
-        // Recursing into the body during the E0134 path lets a nested
-        // type error in the body fire alongside the staged-feature
-        // diagnostic. Confirms the E0134 arm walks children rather
-        // than short-circuiting after one error.
-        let src = "fn main() -> Int ![] {\n\
-                   let n: Int = handle (true && 1) with { E.op(k) => 0 };\n\
-                   n\n\
+    fn handle_expr_with_nested_body_type_error_surfaces_alongside_e0134() {
+        // Confirms `check_handle` walks the body so a nested binop
+        // type error surfaces alongside the staged E0134 gate. `true
+        // && 1` mismatches at the binop's RHS.
+        let src = "effect E { op: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     let n: Int = handle (true && 1) with { E.op(k) => 0 };\n\
+                     n\n\
                    }\n";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
-        // `true && 1` mismatches at the binop's right-hand side.
         assert!(
             errs.iter()
                 .any(|e| e.code.as_str().starts_with("E006")
                     || e.code.as_str().starts_with("E004")),
-            "expected nested binop type error: {errs:?}"
+            "expected nested binop type error alongside E0134: {errs:?}"
         );
     }
 
     #[test]
-    fn handle_arm_bodies_walked_during_e0134_emission() {
-        // Arm bodies are also walked so an arm-body type error
-        // surfaces alongside E0134. Same rationale as the body walk.
-        let src = "fn main() -> Int ![] {\n\
-                   let n: Int = handle 0 with { E.op(k) => true };\n\
-                   n\n\
+    fn handle_arm_body_type_mismatch_surfaces_alongside_e0134() {
+        // Arm bodies are walked; an arm-body type that doesn't match
+        // the cross-arm overall type fires E0044 or E0065 alongside
+        // the staged E0134 gate. Here the handle body is `0: Int`
+        // (taken as the implicit return arm) and the op-arm body is
+        // `true: Bool` — cross-arm unify fails.
+        let src = "effect E { op: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     let n: Int = handle 0 with { E.op(k) => true };\n\
+                     n\n\
                    }\n";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
-        // `let n: Int = ... where the handle's E0134 returns None for
-        // its type, the let-binding's expected/got mismatch may not
-        // fire because we returned `None`. The point of this test is
-        // just that the arm body's `true` doesn't trigger an internal
-        // panic and doesn't bypass E0134.
         assert!(
-            !has_code(&errs, "E0001"),
-            "must not surface E0001: {errs:?}"
+            errs.iter()
+                .any(|e| e.code.as_str() == "E0044" || e.code.as_str() == "E0065"),
+            "expected arm-body mismatch (E0044/E0065): {errs:?}"
         );
     }
 
@@ -7063,7 +7070,6 @@ mod tests {
                      handle 0 with { Raise.fail(msg, k) => use_msg(msg) }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !has_code(&errs, "E0046"),
             "arm-param binding `msg` must not fire E0046; got: {errs:?}"
@@ -7079,7 +7085,6 @@ mod tests {
                      handle 0 with { Raise.fail(msg, k) => k(0) }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !has_code(&errs, "E0046"),
             "continuation `k` binding must not fire E0046; got: {errs:?}"
@@ -7097,7 +7102,6 @@ mod tests {
                      }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !has_code(&errs, "E0046"),
             "return-arm binding `v` must not fire E0046; got: {errs:?}"
@@ -7116,7 +7120,6 @@ mod tests {
                      handle 0 with { Raise.fail(msg, k) => double(msg) }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         // E0044 (or E0065 depending on path) for String passed where
         // Int expected.
         assert!(
@@ -7140,7 +7143,6 @@ mod tests {
         let errs = pipeline(src);
         // E0134 still fires (gate), but no E0042 should fire for the
         // body's perform.
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !has_code(&errs, "E0042"),
             "handle body's perform of discharged effect must not E0042: {errs:?}"
@@ -7161,7 +7163,6 @@ mod tests {
                      }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             has_code(&errs, "E0042"),
             "arm-body perform of discharged effect must E0042 (caller's row only): {errs:?}"
@@ -7180,7 +7181,6 @@ mod tests {
                      0\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0133"), "expected E0133: {errs:?}");
         assert!(
             !has_code(&errs, "E0042"),
             "registered effect's perform must not E0042: {errs:?}"
@@ -7221,7 +7221,6 @@ mod tests {
                      handle 0 with { Raise.fail(msg, k) => 0 }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !has_code(&errs, "E0220"),
             "zero uses of k is fine, must not E0220: {errs:?}"
@@ -7236,7 +7235,6 @@ mod tests {
                      handle 0 with { Raise.fail(msg, k) => k(0) }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !has_code(&errs, "E0220"),
             "single use of k is fine, must not E0220: {errs:?}"
@@ -7266,7 +7264,6 @@ mod tests {
                      }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !has_code(&errs, "E0220"),
             "branch-disjoint uses of k are fine, must not E0220: {errs:?}"
@@ -7314,7 +7311,6 @@ mod tests {
                      handle 0 with { Choose.pick(k) => k(1) + k(2) }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !has_code(&errs, "E0220"),
             "multi-shot effect must skip linearity check: {errs:?}"
@@ -7331,7 +7327,6 @@ mod tests {
                      }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !has_code(&errs, "E0220"),
             "branches that don't use k are fine: {errs:?}"
@@ -7416,7 +7411,6 @@ mod tests {
                      n\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         // Internally the handler-overall type *should* be Int. The
         // let-binding diagnostic only fires when types disagree —
         // this assertion is the absence of a mismatch.
@@ -7440,7 +7434,6 @@ mod tests {
                      0\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !errs.iter().any(|e| e.code.as_str() == "E0045"),
             "let s: String = handle ... with return arm returning String must not E0045: {errs:?}"
@@ -7460,7 +7453,6 @@ mod tests {
                      n\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             errs.iter().any(|e| e.code.as_str() == "E0044"),
             "arm body String must not unify with body Int (handler-overall): {errs:?}"
@@ -7537,7 +7529,6 @@ mod tests {
                      }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             !has_code(&errs, "E0220"),
             "inner-arm rebinding of `k` must shadow outer `k` for linearity: {errs:?}"
@@ -7571,7 +7562,6 @@ mod tests {
                      }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             has_code(&errs, "E0044"),
             "State[A] cross-arm cache must propagate A=Int from get to set so use_str(v) fires E0044: {errs:?}"
@@ -7592,7 +7582,6 @@ mod tests {
                      }\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             has_code(&errs, "E0044"),
             "k call with wrong arg type must E0044 (k has Fn(op_ret_ty) -> handler_overall): {errs:?}"

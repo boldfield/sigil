@@ -20,6 +20,16 @@ Format:
 
 Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
+## 2026-04-26 — [DEVIATION Task 55] Foundation phase ships separately from CPS codegen on the same branch
+
+**Context:** Task 55 spans (a) the typecheck-side gate lifts for E0133 + E0134, (b) wiring `Item::Effect` and `Expr::Handle` through the codegen entry walker, (c) the full CPS transform for CPS-color monomorphs, (d) per-handler-arm closure synthesis, (e) `sigil_perform` call emission for non-IO `Expr::Perform`, (f) handler-frame setup + `sigil_handle_push`/`sigil_handle_pop` at `Expr::Handle` sites, (g) native↔CPS interop wrappers, (h) trampoline integration for CPS-color `main`, and (i) `CpsCallCount` / `NativeCallCount` counter wiring. Implementation scope is comparable to Task 56 (~1500 LOC + 34 unit tests + 4 review rounds).
+
+**Deviation:** Task 55 lands across multiple commits on a single branch (`plan-b-task-55`) rather than as one monolithic commit. The first commit (foundation phase) ships only the easy and safe pieces — E0133 lift + entry-walker update + e2e test for effect-decl-with-no-handler-use — while leaving the E0134 gate live so well-formed `handle` expressions still surface a clean diagnostic instead of tripping the still-`unreachable!` codegen arms in `lower_expr` / `type_of_expr`. The CPS calling convention, body transform, arm synthesis, frame setup, and counter wiring land in follow-up commits on the same branch. PR opens only when the full Task 55 path actually compiles and runs at least one real handler example end-to-end.
+
+**Rationale:** The all-or-nothing alternative (single commit landing every piece together) would require holding the entire ~2000-LOC change in working state across multiple sessions before any pod-verify or CI checkpoint. Splitting at the asymmetric-gate boundary gives a clean intermediate state where (1) effect-only programs gain a real codegen path immediately, (2) handle-using programs continue to surface E0134 with a clear "in-progress" message, and (3) each follow-up commit can be pod-verified independently. The **single-PR convention** from Tasks 49 / 53 / 54 / 56 still holds — only one PR opens for Task 55, and it includes the full chain of foundation + CPS commits. The squash-merged result will look identical to a one-shot landing.
+
+**Implementing commit(s):** [HEAD] (foundation phase); follow-up commits TBD.
+
 ## 2026-04-25 — [Task 4.5.5 / A3-carryover] Tagged-vs-raw Int ABI decision
 
 **Context:** Plan A3's `QUESTIONS.md` entry `[PLAN-A3] main-return-tagging`
