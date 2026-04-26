@@ -2167,38 +2167,35 @@ fn arm_body_with_inner_block_and_outer_capture_works() {
     // 1 / 2 / MF3 (codegen `rewrite_block` scope rollback fragility
     // + typecheck `walk_block` `locals` leak). Sigil's no-shadow
     // contract (resolve E0020 / typecheck `env_insert` debug-assert)
-    // forbids the literal shadowing example the reviewer drafted, so
-    // the regression here is the structural one — push/pop scope
-    // discipline must keep capture rewriting and free-var collection
-    // honest across nested-block boundaries even when no name
-    // collisions exist.
+    // forbids the literal shadowing example the reviewer drafted,
+    // and Sigil's arm-body grammar (`parse_handle_op_arm` calls
+    // `parse_expr`, not `parse_block`) means arm bodies can't be
+    // raw `{ … }` block expressions either. The regression here is
+    // structural: push/pop scope discipline must keep capture
+    // rewriting and free-var collection honest across nested-block
+    // boundaries even when no name collisions exist.
     //
-    // Test shape:
+    // Test shape uses an `if` whose then-block contains the
+    // multi-statement scoping (Sigil DOES allow blocks in if-branch
+    // bodies via `parse_block`); the else-block exists only to
+    // satisfy `if`'s typing rules and is unreachable at runtime
+    // (cond is `true`).
+    //
     //   - `outer(local: Int)` brings `local` into scope.
-    //   - Arm body captures `local` (outer-scope reference).
-    //   - Arm body has a let `extra`, then a nested-block-bound let
-    //     `inner_result` whose RHS is itself a block with let `temp`.
-    //   - After the nested block, arm body's tail `local + inner_result`
-    //     references both the capture and the arm-body-scoped let.
+    //   - Arm body's tail is an `if true { … } else { 0 }`.
+    //   - Then-block has `let extra = 7;` then a tail
+    //     `local + extra` referencing both the capture and the
+    //     block-local let. The block exercises:
+    //         · rewrite_block push/pop scope frame (codegen)
+    //         · walk_block locals save/restore (typecheck)
+    //         · capture rewrite of `local` against the surrounding
+    //           closure record
     //
-    // Pre-fix failure modes this test would have surfaced if
-    // shadowing had been allowed: the parent-scope rollback in
-    // `rewrite_block` would have dropped a same-named binding;
-    // `walk_block`'s leaked `locals` would have mis-classified an
-    // identically-named outer reference as local. Without shadowing,
-    // those bugs aren't reachable; this test pins the positive path
-    // — that arm bodies with nested blocks + arm-body lets + outer
-    // captures lower correctly through the new push/pop discipline.
-    //
-    // Expected output: 5 (outer.local) + (3 + 7) = 15.
+    // Expected output: 5 (outer.local) + 7 (block-local `extra`) = 12.
     let src = "effect E { op: () -> Int }\n\
                fn outer(local: Int) -> Int ![IO, E] {\n  \
                  let n: Int = handle (perform E.op()) with {\n    \
-                   E.op(k) => {\n      \
-                     let extra: Int = 7;\n      \
-                     let inner_result: Int = { let temp: Int = 3; temp + extra };\n      \
-                     local + inner_result\n    \
-                   },\n  \
+                   E.op(k) => if true { let extra: Int = 7; local + extra } else { 0 },\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
@@ -2209,5 +2206,5 @@ fn arm_body_with_inner_block_and_outer_capture_works() {
     let (stdout, stderr, code) =
         compile_and_run(src, "phase4d_arm_body_nested_block_outer_capture");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "15\n", "expected 5 + (3 + 7); stderr={stderr:?}");
+    assert_eq!(stdout, "12\n", "expected 5 + 7; stderr={stderr:?}");
 }
