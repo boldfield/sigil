@@ -978,6 +978,80 @@ fn handle_with_non_io_perform_runs_arm_and_returns_value() {
 }
 
 #[test]
+fn handle_with_two_arms_dispatches_correct_arm_by_op_id() {
+    // Plan B Task 55 (Phase 4a): multi-arm handlers are now
+    // supported when all arms target the same effect. The runtime's
+    // `sigil_perform` looks up the arm by op_id within the matched
+    // frame; codegen registers each arm via a separate
+    // `sigil_handler_frame_set_arm` call. Test program performs
+    // `Choose.right()` and expects the `right` arm (not the `left`
+    // arm) to fire. Op IDs are assigned alphabetically per effect:
+    // `left` → 0, `right` → 1, so this exercises the non-zero op_id
+    // path through the runtime arm-slot table.
+    let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Choose.right()) with {\n    \
+                   Choose.left(k) => 10,\n    \
+                   Choose.right(k) => 20,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_two_arms_dispatches");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "20\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_mixed_effect_arms_is_rejected_at_codegen() {
+    // Plan B Task 55 (Phase 4a restriction): multi-arm handlers
+    // must reference a single effect (the runtime
+    // `HandlerFrame.effect_id` is a single u32). Mixed-effect
+    // handlers need a frame-per-effect approach that lands in
+    // Phase 4e+. Until then, the codegen-entry guard rejects.
+    let src = "effect Raise { fail: () -> Int }\n\
+               effect Other { other: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 42 with {\n    \
+                   Raise.fail(k) => 0,\n    \
+                   Other.other(k) => 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_handle_mixed_effect_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_handle_mixed_effect_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail until Phase 4e ships; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Task 55") || stderr.contains("Phase 4") || stderr.contains("multi-effect"),
+        "error message should reference Plan B Task 55 / Phase 4 / multi-effect; got stderr={stderr:?}",
+    );
+}
+
+#[test]
 fn handle_with_arm_that_uses_k_is_rejected_at_codegen() {
     // Plan B Task 55 (Phase 3b restriction): arm bodies must be
     // literal `Int` expressions (Phase 4+ adds richer arm bodies +

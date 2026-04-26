@@ -557,54 +557,85 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
                     span
                 ));
             }
-            if op_arms.len() > 1 {
-                return Some(format!(
-                    "`handle` expression at {:?} has {} op-arms — multi-arm \
-                     handlers are not yet supported in codegen (Plan B Task \
-                     55, in progress; arrives in Phase 4+)",
-                    span,
-                    op_arms.len()
-                ));
-            }
-            // Phase 3b restriction: arm body must be `Expr::IntLit`
-            // (no captures, no `k` use, no op-arg use). The
-            // synthetic-fn definition pass at the bottom of
-            // `emit_object` lowers IntLit-only bodies via a small
-            // hand-rolled Cranelift sequence; richer bodies need a
-            // CPS-aware lowerer that arrives in Phase 4+.
-            let arm = &op_arms[0];
-            match &arm.body {
-                crate::ast::Expr::IntLit(..) => {}
-                _ => {
+            // Phase 4a: multi-arm handles are now supported, but
+            // all arms must reference the same effect (the runtime
+            // `HandlerFrame`'s `effect_id` is a single u32 — multi-
+            // effect handles need a frame-per-effect approach that
+            // lands in Phase 4e). Reject mixed-effect handles
+            // here with a clean diagnostic.
+            let first_effect = &op_arms[0].effect;
+            for arm in op_arms.iter().skip(1) {
+                if &arm.effect != first_effect {
                     return Some(format!(
-                        "`handle` expression at {:?} has arm body that is not \
-                         a literal `Int` — Phase 3b minimum only supports \
-                         arms whose body is an `IntLit` (Plan B Task 55, in \
-                         progress; richer arm bodies arrive in Phase 4+)",
-                        span
+                        "`handle` expression at {:?} has arms targeting different \
+                         effects (`{}` and `{}`) — multi-effect handlers are \
+                         not yet supported in codegen (Plan B Task 55, in \
+                         progress; arrives in Phase 4e via frame-per-effect)",
+                        span, first_effect, arm.effect
                     ));
                 }
             }
-            // Phase 3b restriction: arm must have no user op-args
-            // (only the `k` continuation binding). Op-arg unpacking
-            // from the runtime args buffer arrives in Phase 4+.
-            if !arm.params.is_empty() {
-                return Some(format!(
-                    "`handle` expression at {:?} has arm `{}.{}` with {} \
-                     user param(s) — Phase 3b minimum only supports \
-                     zero-user-arg arms (Plan B Task 55, in progress; \
-                     op-arg passing arrives in Phase 4+)",
-                    span,
-                    arm.effect,
-                    arm.op,
-                    arm.params.len()
-                ));
+            // Phase 4a: also reject duplicate (effect, op) arm pairs
+            // — the runtime frame's per-op slot is single-valued, so
+            // two arms for the same op would race. Typecheck E0140
+            // catches this earlier (before the staged-feature gates
+            // were lifted), but the codegen-entry guard double-
+            // checks defensively. Phase 4+ will share state with
+            // typecheck if the redundancy bites.
+            for (i, a) in op_arms.iter().enumerate() {
+                for b in op_arms.iter().skip(i + 1) {
+                    if a.effect == b.effect && a.op == b.op {
+                        return Some(format!(
+                            "`handle` expression at {:?} has duplicate arms for \
+                             `{}.{}` — typecheck E0140 should have caught this; \
+                             reaching codegen indicates an upstream invariant \
+                             broke (Plan B Task 55)",
+                            span, a.effect, a.op
+                        ));
+                    }
+                }
             }
-            // Phase 3b restriction: any non-IO perform in the body
-            // must be zero-arg. The perform args-buffer packing
-            // path lands in Phase 4+; for now the perform-side
-            // codegen passes `args_ptr=null, args_len=0` to the
-            // runtime.
+            // Phase 3b restriction (still in force in 4a): each arm
+            // body must be `Expr::IntLit` (no captures, no `k` use,
+            // no op-arg use). The synthetic-fn definition pass
+            // lowers IntLit-only bodies via a hand-rolled Cranelift
+            // sequence; richer bodies need a CPS-aware lowerer
+            // arriving in Phase 4c.
+            for arm in op_arms.iter() {
+                match &arm.body {
+                    crate::ast::Expr::IntLit(..) => {}
+                    _ => {
+                        return Some(format!(
+                            "`handle` expression at {:?} has arm `{}.{}` body \
+                             that is not a literal `Int` — Phase 3b/4a only \
+                             support arms whose body is an `IntLit` (Plan B \
+                             Task 55, in progress; richer arm bodies arrive \
+                             in Phase 4c)",
+                            span, arm.effect, arm.op
+                        ));
+                    }
+                }
+            }
+            // Phase 3b restriction (still in force in 4a): each arm
+            // must have no user op-args (only the `k` continuation
+            // binding). Op-arg unpacking arrives in Phase 4b.
+            for arm in op_arms.iter() {
+                if !arm.params.is_empty() {
+                    return Some(format!(
+                        "`handle` expression at {:?} has arm `{}.{}` with {} \
+                         user param(s) — Phase 3b/4a only support zero-user-arg \
+                         arms (Plan B Task 55, in progress; op-arg passing \
+                         arrives in Phase 4b)",
+                        span,
+                        arm.effect,
+                        arm.op,
+                        arm.params.len()
+                    ));
+                }
+            }
+            // Phase 3b restriction (still in force in 4a): any
+            // non-IO perform in the body must be zero-arg. The
+            // perform args-buffer packing path lands in Phase 4b.
             if let Some((eff, op)) = body_contains_non_io_perform_with_args(body) {
                 return Some(format!(
                     "`handle` expression at {:?} has body whose non-IO \
