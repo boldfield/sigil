@@ -48,7 +48,17 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** Splitting at the frame-ABI / arm-dispatch boundary lets the runtime FFI plumbing get exercised end-to-end (real `sigil_handler_frame_new` + push + pop calls in compiled output, observable via `objdump`) without committing to the much larger CPS calling convention + synthetic fn synthesis. The Phase 2 e2e test `handle_with_no_perform_in_body_compiles_and_runs` continues to pass through Phase 3a, now exercising the frame ABI on the path Phase 3b builds on. The cost is a tiny runtime regression: the no-perform handle now allocates + pushes + pops a frame on every invocation (previously a no-op pass-through). For Phase 3a this is acceptable; Phase 3b makes the frame functional rather than just present.
 
-**Implementing commit(s):** [HEAD] (Phase 3a); follow-up commits TBD.
+**Implementing commit(s):** `ef4be8d` (Phase 3a); superseded by Phase 3b (HEAD) and Phase 4+ commits.
+
+## 2026-04-26 — [DEVIATION Task 55] Phase 3b Phase-3b restrictions: literal arm bodies, zero-arg ops, no `k` use, single arm, single effect
+
+**Context:** Phase 3a (`ef4be8d`) wired the runtime handler-frame ABI but kept arm fn pointers null. Phase 3b makes arms actually dispatch — handlers now do real work at runtime. To keep this commit tractable, Phase 3b ships the simplest meaningful subset: arm bodies are literal `Expr::IntLit` only, ops have zero user args, arms can't reference the continuation `k`, single arm per handle, single effect per handle, no `return` arm. Phase 4+ lifts each restriction.
+
+**Deviation:** The synthetic arm fn definition pass at the bottom of `emit_object` lowers arm bodies via a small hand-rolled Cranelift sequence (`iconst(value)` → `call sigil_next_step_done(value)` → `return result`) instead of routing through a full `Lowerer`. This is sufficient for `IntLit`-only arm bodies; richer bodies need a CPS-aware lowerer that handles op-arg unpacking from `args_ptr`, `k` usage via `sigil_next_step_call`, and outer-scope captures via a closure record. Phase 4+ ships that lowerer. The `lower_perform_non_io_to_value` helper similarly assumes zero user args (`args_ptr=null, args_len=0`); args-buffer packing on the perform side and unpacking on the arm side ship together in Phase 4+. The `unsupported_handle_construct` codegen-entry guard enforces every Phase 3b restriction so handlers that escape the supported subset get a clear in-progress diagnostic instead of an obscure runtime crash.
+
+**Rationale:** The simplest meaningful test program — `handle (perform Raise.fail()) with { Raise.fail(k) => 42 }` — exercises the entire FFI surface end-to-end (frame_new → set_arm → push → sigil_perform → arm dispatch → next_step_done → NextStep value extraction → pop) without committing to the much larger CPS calling convention infrastructure. The simplifying restrictions can be lifted one at a time, each as its own focused commit. The single-shot one-shot-arm path is also the most common handler shape in practice (Raise-style early-exit), so it's not just a stepping stone — it covers a real use case.
+
+**Implementing commit(s):** [HEAD] (Phase 3b); follow-up Phase 4+ commits TBD.
 
 ## 2026-04-25 — [Task 4.5.5 / A3-carryover] Tagged-vs-raw Int ABI decision
 

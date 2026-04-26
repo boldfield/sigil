@@ -954,31 +954,50 @@ fn handle_with_no_perform_in_body_compiles_and_runs() {
 }
 
 #[test]
-fn handle_with_non_io_perform_in_body_is_rejected_at_codegen() {
-    // Plan B Task 55 (Phase 2 minimum): a handle expression whose
-    // body actually performs the handled effect requires the full
-    // CPS calling convention + handler-frame setup, which lands in
-    // a follow-up commit. Until then, the codegen-entry guard
-    // `unsupported_handle_construct` rejects such programs with a
-    // clean compile-time error pointing at the in-progress task.
-    // This test pins that the rejection happens cleanly (non-zero
-    // exit, no compiler crash) and that the error message references
-    // Plan B Task 55.
+fn handle_with_non_io_perform_runs_arm_and_returns_value() {
+    // Plan B Task 55 (Phase 3b): handle expression whose body
+    // performs the handled effect now compiles and runs end-to-end.
+    // The body's `perform Raise.fail()` calls `sigil_perform`, which
+    // walks the handler stack, finds the frame's `Raise.fail` arm
+    // (a synthetic CPS fn registered via `sigil_handler_frame_set_arm`),
+    // invokes it with packed `(k_closure, k_fn)` args (both null —
+    // the arm ignores `k`), and the arm returns
+    // `sigil_next_step_done(42)`. The native code reads the value
+    // from the returned `*mut NextStep` and treats it as the
+    // perform's value, which is the handle's value. Final stdout:
+    // `42\n`, exit 0.
     let src = "effect Raise { fail: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle (perform Raise.fail()) with { Raise.fail(k) => 0 };\n  \
+                 let n: Int = handle (perform Raise.fail()) with { Raise.fail(k) => 42 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_perform_arm_value");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_arm_that_uses_k_is_rejected_at_codegen() {
+    // Plan B Task 55 (Phase 3b restriction): arm bodies must be
+    // literal `Int` expressions (Phase 4+ adds richer arm bodies +
+    // `k`-using arms via continuation reification + the trampoline).
+    // Until then, an arm body referencing `k` (or any non-literal
+    // shape) is rejected at codegen entry by
+    // `unsupported_handle_construct`.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 42 with { Raise.fail(k) => k(0) };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_handle_perform_reject_{}.sigil",
+        "sigil_e2e_handle_k_reject_{}.sigil",
         std::process::id()
     ));
     std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_handle_perform_reject_{}",
-        std::process::id()
-    ));
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_handle_k_reject_{}", std::process::id()));
     let sigil_bin = sigil_binary();
     let out = Command::new(&sigil_bin)
         .arg(&tmp)
@@ -991,14 +1010,14 @@ fn handle_with_non_io_perform_in_body_is_rejected_at_codegen() {
     let _ = std::fs::remove_file(&bin_path);
     assert!(
         !out.status.success(),
-        "compile must fail until Plan B Task 55 Phase 3+ lands; got success with stdout={:?} stderr={:?}",
+        "compile must fail until Phase 4+ lands; got success with stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("Task 55") || stderr.contains("CPS"),
-        "error message should reference Plan B Task 55 / CPS work; got stderr={stderr:?}",
+        stderr.contains("Task 55") || stderr.contains("Phase 4") || stderr.contains("IntLit"),
+        "error message should reference Plan B Task 55 / Phase 4 / arm-body restriction; got stderr={stderr:?}",
     );
 }
 
