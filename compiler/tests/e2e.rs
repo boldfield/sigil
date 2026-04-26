@@ -1528,3 +1528,77 @@ fn handle_with_three_arms_dispatches_op_id_two() {
     assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
     assert_eq!(stdout, "2\n", "stderr={stderr:?}");
 }
+
+#[test]
+fn handle_with_int_arg_op_packs_args_buffer() {
+    // Plan B Task 55 (Phase 4b): non-IO `perform Effect.op(args...)`
+    // sites now pack user args into a stack-allocated `[u64; N]`
+    // buffer that `sigil_perform` reads. Phase 4b ships the perform-
+    // side packing; arm fns still ignore the args buffer (their
+    // bodies are still IntLit-only — Phase 4c lifts that). The
+    // observable contract here is that the program compiles + runs
+    // (no codegen-entry rejection of the user-arg-bearing perform,
+    // no runtime crash from a malformed args buffer or `sigil_perform`
+    // overflow check) and returns the arm's IntLit value.
+    let src = "effect Raise { fail: (Int) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Raise.fail(99)) with {\n    \
+                   Raise.fail(msg, k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "handle_int_arg_packs");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_three_int_args_packs_buffer() {
+    // Plan B Task 55 (Phase 4b): exercises multi-arg packing — three
+    // user args + the implicit `(k_closure, k_fn)` pair = 5
+    // dispatched values, well under MAX_INLINE_ARGS = 32. The args
+    // get stored at slot offsets 0, 8, 16 on the perform side and
+    // copied verbatim by `sigil_perform` into the dispatched
+    // NextStep::Call's args slots. Arm body is still IntLit-only
+    // (Phase 4c will read the bound names); this test pins the
+    // buffer-packing path doesn't off-by-one or misalign across
+    // arg count > 1.
+    let src = "effect Triple { do: (Int, Int, Int) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Triple.do(10, 20, 30)) with {\n    \
+                   Triple.do(a, b, c, k) => 7,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "handle_three_int_args_packs");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_mixed_type_args_widens_correctly() {
+    // Plan B Task 55 (Phase 4b): exercises the per-arg widening path
+    // in `lower_perform_non_io_to_value`. The args buffer is `[u64;
+    // N]`; narrower Cranelift types (I8 for Bool, I32 for Char) get
+    // `uextend`'d to I64 before the slot store; pointer-typed args
+    // (String) store directly because pointer_ty == I64 on every
+    // supported target. A signed-overflow / narrow-store regression
+    // would surface as either a Cranelift verifier failure at
+    // `cargo build`-of-compiled-binary time (mismatched store width)
+    // or a runtime crash inside `sigil_perform`'s `args_ptr.add(i)`
+    // u64-stride read. Without this test, the widen branch sits dead
+    // until Phase 4c ships an arm body that reads the bound name.
+    let src = "effect Mix { it: (Int, Bool, String) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Mix.it(42, true, \"hi\")) with {\n    \
+                   Mix.it(n, b, s, k) => 11,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "handle_mixed_type_args_widen");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "11\n", "stderr={stderr:?}");
+}

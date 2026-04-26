@@ -116,11 +116,11 @@ pub const MAX_HANDLER_ARMS: u32 = 14;
 /// Maximum user-arg count `sigil_perform` can carry through to a
 /// handler arm (plus the implicit `(k_closure_ptr, k_fn_ptr)` pair the
 /// runtime appends, so the trampoline-side cap is `MAX_INLINE_ARGS + 2`
-/// total). Sized to comfortably exceed v1's effect arities (Raise,
-/// State, Choose all use 0–2 user args) without growing the
-/// stack-resident `args_buf` in `sigil_run_loop`. Codegen (Task 55)
-/// must box arities exceeding this — flagged in `PLAN_B_DEVIATIONS.md`.
-pub const MAX_INLINE_ARGS: u32 = 32;
+/// total). Re-exported from `sigil_abi::effect` (Plan B Task 55 Phase 4b)
+/// so codegen and runtime read from the same source. Codegen (Task 55
+/// Phase 4b) must box arities exceeding this — flagged in
+/// `PLAN_B_DEVIATIONS.md`.
+pub use sigil_abi::effect::MAX_INLINE_ARGS;
 
 /// Discriminated `NextStep` record. Arena-allocated; pointer is invalid
 /// after the next `sigil_arena_reset`. The trampoline reads the

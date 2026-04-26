@@ -64,15 +64,33 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** The simplest meaningful test program — `handle (perform Raise.fail()) with { Raise.fail(k) => 42 }` — exercises the entire FFI surface end-to-end (`frame_new → set_arm → push → sigil_perform → sigil_run_loop dispatch → arm fn → next_step_done → run_loop returns u64 → pop`) without committing to the much larger CPS calling convention infrastructure. The Phase 3b fixup commit (`2e7c0de`) inserted the `sigil_run_loop` step between `sigil_perform` and the value extraction; codegen no longer reads the `NextStep` layout directly (it just consumes `run_loop`'s `u64` return). The simplifying restrictions can be lifted one at a time, each as its own focused commit. The single-shot one-shot-arm path is also the most common handler shape in practice (Raise-style early-exit), so it's not just a stepping stone — it covers a real use case.
 
-**Implementing commit(s):** `d0aa4c4` (Phase 3b initial), `2e7c0de` (Phase 3b fixup: route perform's NextStep::Call through `sigil_run_loop` instead of reading `(*ns).value` directly), `adcb897` (Phase 4a: multi-arm single-effect handlers).
+**Implementing commit(s):** `d0aa4c4` (Phase 3b initial), `2e7c0de` (Phase 3b fixup: route perform's NextStep::Call through `sigil_run_loop` instead of reading `(*ns).value` directly), `adcb897` (Phase 4a: multi-arm single-effect handlers), `[HEAD]` (Phase 4b: args-buffer packing on perform side).
 
 **Closure point** (per-restriction):
 - *Single arm* — closed in Phase 4a (`adcb897`).
-- *IntLit-only arm body* — pending Phase 4c (richer arm bodies via dedicated CPS-aware lowerer).
-- *Zero-arg ops* — pending Phase 4b (args-buffer packing on perform side, unpacking on arm side).
+- *IntLit-only arm body* — pending Phase 4c (richer arm bodies via dedicated CPS-aware lowerer; the arm side will read user-arg bindings from `args_ptr` once Phase 4b's perform-side packing lands).
+- *Zero-arg ops* — closed in Phase 4b (`[HEAD]`). Perform side packs user args into a stack-allocated `[u64; N]` buffer; the runtime copies them into the dispatched `NextStep::Call`'s args slots before invoking the arm fn. Arm bodies still ignore the buffer (Phase 4c lifts that — but the FFI plumbing is already end-to-end, so Phase 4c only needs to wire arm-side reads).
 - *No `k` use* — pending Phase 4d (continuation reification + lambda-lifting of perform's continuation).
 - *Single effect per handle* — pending Phase 4e (frame-per-effect).
 - *No return arm* — pending Phase 4f (synthetic return-fn registered via `sigil_handler_frame_set_return`).
+
+## 2026-04-26 — [DEVIATION Task 55] Phase 4b — args-buffer packing on perform side; stack-slot allocation; arm side still IntLit-only
+
+**Context:** Phase 3b (`d0aa4c4` + `2e7c0de`) and Phase 4a (`adcb897`) shipped the handler-arm dispatch path under five restrictions: single arm (closed in 4a), zero user op-args, IntLit-only arm body, no `k` use, single effect, no return arm. Phase 4b targets the second restriction: lifting the "non-IO perform must have zero user args" gate so handler-discharged effects can carry data.
+
+**Deviation:** The user-arg buffer is **stack-allocated** in the calling fn's frame via `FunctionBuilder::create_sized_stack_slot`, not arena-allocated through `sigil_arena_alloc`. The plan body specifies arena allocation only for `NextStep` records (Task 56's existing arena), not for the per-perform args buffer. The runtime's `sigil_perform` documentation (Task 56's `args_ptr` safety contract) treats the args buffer as caller-owned and copies values into the dispatched `NextStep::Call`'s slots before returning, so the buffer's lifetime only needs to outlive `sigil_perform`'s call site. A stack slot in the perform's enclosing function frame trivially satisfies that — no escape risk, no arena traffic on the hot path, no GC interaction (Boehm doesn't scan stack slots; the runtime conservatively scans the arena).
+
+The arm fn side stays untouched in Phase 4b: arm bodies remain `Expr::IntLit` (Phase 4c lifts that), so the synthetic arm fn that runs under the trampoline ignores the `args_ptr` parameter it receives. The end-to-end FFI plumbing now carries packed args through `lower_perform_non_io_to_value` → `sigil_perform` → `sigil_run_loop` → arm fn invocation, but the arm fn doesn't read from args_ptr until Phase 4c wires arm-body lowering. This split is deliberate: Phase 4b's risk is exclusively in the perform-side buffer-layout / widening / overflow path; bundling Phase 4c's arm-side reads would conflate the two failure modes.
+
+**Per-arg widening:** Cranelift values are widened to `u64` before the slot store. `I64` (Sigil `Int`) and `pointer_ty` (`String`, user-type heap pointers — pointer_ty is `I64` on every supported target: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`) store directly. `I8` (Bool, Byte, Unit) and `I32` (Char) are zero-extended via `uextend` because Sigil's surface integer types treat narrower payloads as unsigned and `sigil_perform` reads slots as `u64`. Cranelift's load-store width invariants would otherwise reject the slot store; alignment is `align_shift = 3` (8-byte) matching `sigil_perform`'s `args_ptr.add(i)` u64-stride read.
+
+**Bound check:** A defensive `assert!` in `lower_perform_non_io_to_value` rejects `args.len() + 2 > MAX_INLINE_ARGS` at compile time, mirroring the runtime's `sigil_perform` overflow check (the `+2` accounts for the implicit `(k_closure, k_fn)` slots the runtime appends). v1's effect arities (Raise / State / Choose, all 0–2 user args) sit well below the cap. The constant lives in `sigil_abi::effect::MAX_INLINE_ARGS` (moved from `sigil_runtime::handlers` in this commit so compiler and runtime share one source); a future operation needing > 30 user args would require boxing — flagged in the Task 56 MAX_INLINE_ARGS deviation entry, not in scope for Plan B.
+
+**Rationale:** Stack-slot allocation is the smallest meaningful change to the perform-side codegen path that lifts the zero-arg gate. It avoids arena-traffic regressions on a path that already touches the arena once per perform (via `sigil_next_step_call` → `sigil_arena_alloc` for the `NextStep::Call` record). It also keeps the per-perform allocation cost amortised into the frame-allocation Cranelift already performs at fn entry (no per-perform `malloc`-equivalent). Arm-side reads are deferred to Phase 4c so the perform-side change can be reviewed in isolation; bundling both would double the diff and conflate two distinct failure modes (perform-side packing vs arm-side unpacking).
+
+**Implementing commit(s):** `[HEAD]`.
+
+**Closure point:** the closure-point references in the original Phase-3b restrictions entry (above) update in lockstep — *Zero-arg ops* moves to closed at this commit; *IntLit-only arm body* gains the dependency note that Phase 4c only needs to wire the arm-side reads (the FFI plumbing is already end-to-end).
 
 ## 2026-04-26 — [DEVIATION Task 55] `unsupported_handle_construct` walker does not follow call edges
 
@@ -82,9 +100,9 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** Following call edges in the codegen-entry walker would require fixed-point analysis over the call graph (intentional, since a fn could call another that performs) and would duplicate work the colorer already does. Leaving the walker syntactic keeps it simple and CI-fast. The standing precondition that programs reach codegen with all `Item::Effect` registered + all op IDs assigned + every reachable handle visible to the per-arm CPS-fn synthesis pre-pass holds regardless of transitive analysis — those passes walk every fn body, so a perform reached via a call edge gets its `effect_id` / `op_id` looked up correctly.
 
-**Implementing commit(s):** original walker `2d69b52`, recursion fix into nested handle bodies `54b4a60`.
+**Implementing commit(s):** original walker `2d69b52`, recursion fix into nested handle bodies `54b4a60`, op-arg gate lifted at `[HEAD]` (Phase 4b).
 
-**Closure point:** Phase 4b (op-arg packing) lifts the "non-IO perform with args" gate, at which point the walker's guard check becomes `if body_contains_unsupported_op_arg(body)` — still syntactic, still shallow, still serving the same Phase-4 ergonomic role. Phase 4c/4d may need a colorer-driven check (per-monomorph color variance under handler-context — the PR #18 reviewer's open ask) to decide which monomorphs sit at the native↔CPS boundary; that check is NOT a property of the walker, it's a property of color inference, and it lives in `compiler/src/color.rs`. The walker stays as-is.
+**Closure point:** Phase 4b (`[HEAD]`) lifted the "non-IO perform with args" gate. The walker's `arm.params.is_empty()` check and the `body_contains_non_io_perform_with_args` traversal were both removed; the now-dead `body_contains_non_io_perform_filtered` / `block_contains_non_io_perform_filtered` helpers were deleted with them. The walker still rejects multi-effect arms (Phase 4e), non-IntLit arm bodies (Phase 4c), and return arms (Phase 4f) — those gates remain syntactic + shallow + Phase-4 ergonomic. Phase 4c/4d may need a colorer-driven check (per-monomorph color variance under handler-context — the PR #18 reviewer's open ask) to decide which monomorphs sit at the native↔CPS boundary; that check is NOT a property of the walker, it's a property of color inference, and it lives in `compiler/src/color.rs`.
 
 ## 2026-04-26 — [DEVIATION Task 55] Handler frame leaks on body unwind; depends on Task 57 to surface
 
@@ -1158,10 +1176,18 @@ operations; the cap is a forward-compat boundary, not a current
 constraint.
 
 **Implementing commit:** [HEAD]
-**Closure point:** Task 55 (when codegen produces the first
-`sigil_perform` call site that needs to consult `MAX_INLINE_ARGS`).
-The cap can be raised in a future plan by changing one constant and
-re-checking call sites; v1 lacks any concrete need.
+**Closure point:** closed in Task 55 Phase 4b (`[HEAD]`). Codegen's
+`lower_perform_non_io_to_value` now packs user args into a stack-
+allocated `[u64; N]` buffer and reads `MAX_INLINE_ARGS` from
+`sigil_abi::effect` (moved from `sigil_runtime::handlers` so both the
+compiler and runtime read from one source); a defensive
+`debug_assert` at the perform-site catches any operation that exceeds
+`MAX_INLINE_ARGS - 2` user args before the runtime's matching check
+fires. v1's effect arities (Raise / State / Choose, all 0–2 user
+args) are well below the cap; the constant can be raised in a future
+plan by editing `sigil_abi::effect::MAX_INLINE_ARGS` and re-checking
+the runtime's matching constants in `sigil_run_loop`'s stack-resident
+args buffer.
 
 ---
 
