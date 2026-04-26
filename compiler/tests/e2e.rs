@@ -933,6 +933,76 @@ fn effect_decl_with_no_handler_use_compiles_and_runs() {
 }
 
 #[test]
+fn handle_with_no_perform_in_body_compiles_and_runs() {
+    // Plan B Task 55 (Phase 2 minimum): a `handle <body> with { ...
+    // }` expression where the body contains no non-IO `perform`
+    // compiles to just the body's value (the handler is statically
+    // optimised away — its arms are dead code at runtime). The
+    // program below uses an effect declaration AND a handle
+    // expression for the first time end-to-end. The handle's body is
+    // the literal `42`; the `Raise.fail` arm is never invoked. Final
+    // stdout: `42\n` (via int_to_string + IO.println), exit 0.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 42 with { Raise.fail(k) => 0 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_no_perform");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_non_io_perform_in_body_is_rejected_at_codegen() {
+    // Plan B Task 55 (Phase 2 minimum): a handle expression whose
+    // body actually performs the handled effect requires the full
+    // CPS calling convention + handler-frame setup, which lands in
+    // a follow-up commit. Until then, the codegen-entry guard
+    // `unsupported_handle_construct` rejects such programs with a
+    // clean compile-time error pointing at the in-progress task.
+    // This test pins that the rejection happens cleanly (non-zero
+    // exit, no compiler crash) and that the error message references
+    // Plan B Task 55.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Raise.fail()) with { Raise.fail(k) => 0 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_handle_perform_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_handle_perform_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail until Plan B Task 55 Phase 3+ lands; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Task 55") || stderr.contains("CPS"),
+        "error message should reference Plan B Task 55 / CPS work; got stderr={stderr:?}",
+    );
+}
+
+#[test]
 fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
     let src = "fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] {\n  \
                  fn (x: A) -> C ![] => f(g(x))\n\

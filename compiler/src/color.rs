@@ -1040,6 +1040,8 @@ mod tests {
             call_site_instantiations: calls,
             ctor_site_instantiations: BTreeMap::new(),
             effects: BTreeMap::new(),
+            effect_ids: BTreeMap::new(),
+            op_ids: BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
         MonoProgram { anf }

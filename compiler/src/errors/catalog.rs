@@ -681,42 +681,18 @@ pub const CATALOG: &[ErrorEntry] = &[
                       //   fn id[A](x: A) -> A ![] { x }\n\
                       //   let v: Int = id(42);  // pins A := Int",
     },
-    // E0133 (staged effect-declaration gate) was introduced in Plan
-    // B Task 53 and lifted in Task 55 — `Item::Effect` declarations
-    // now flow through to codegen as a no-op (they only populate the
-    // typecheck-time effect registry consulted by `perform`
-    // dispatch). The code number stays retired; the catalog entry
-    // is removed but the number is never reused.
-    ErrorEntry {
-        code: "E0134",
-        short: "handle expression's codegen lowering is not yet complete",
-        long: "Plan B Task 53 shipped the parser surface for `handle <body> \
-               with { return(v) => arm, Effect.op(args, k) => arm, ... }` \
-               and Task 54 shipped the typechecker's handler typing rules, \
-               registry dispatch (E0136-E0141), and one-shot linearity \
-               check (E0220). Task 55 (the in-progress task that wires the \
-               CPS transform and runtime handler-stack ABI from Task 56) \
-               replaces this gate with full codegen lowering. Until Task \
-               55's codegen path lands, the typechecker emits `E0134` for \
-               every `handle` expression so well-formed handler programs \
-               cannot reach the still-`unreachable!` codegen arms.\n\n\
-               This is a staged-feature gate, not a real semantic error. \
-               The handler-typing diagnostics (E0136-E0141, E0220, E0044, \
-               E0046, E0065) above the gate fire as if the gate were \
-               already lifted, so structural problems in handler-using \
-               code surface during current development. When Task 55's \
-               CPS codegen ships, the gate goes away and well-formed \
-               `handle` expressions compile end-to-end.",
-        fix_example: "// Surface form (parses + typechecks cleanly):\n\
-                      //   handle parse(s) with {\n\
-                      //     return(v) => v,\n\
-                      //     Raise.fail(msg, k) => 0,\n\
-                      //   }\n\n\
-                      // Workaround until Task 55's codegen path lands:\n\
-                      // remove the `handle ... with { ... }` wrapper and\n\
-                      // let the body run unhandled. Programs that don't\n\
-                      // catch a non-IO effect are not yet expressible.",
-    },
+    // E0133 (staged effect-declaration gate) and E0134 (staged
+    // handle-expression gate) were introduced in Plan B Task 53 to
+    // keep partial Plan B programs out of the CPS-pending codegen
+    // path. Plan B Task 55 lifts both gates: codegen now lowers
+    // `Item::Effect` (no codegen output, registered for perform
+    // dispatch at typecheck time) and `Expr::Handle` (Phase 2:
+    // body-pass-through when the body has no non-IO perform; Phase
+    // 3+: full handler-frame setup + CPS calling convention). Both
+    // catalog entries removed accordingly. Code numbers E0133 and
+    // E0134 stay retired (per the
+    // `seed_entries_are_unique_and_non_empty` discipline rule, never
+    // renumber a once-shipped code).
     ErrorEntry {
         code: "E0136",
         short: "duplicate effect declaration",

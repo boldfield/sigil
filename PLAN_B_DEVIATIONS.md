@@ -28,7 +28,17 @@ Untagged sweep / chore entries use `[CHORE]` instead of `[DEVIATION Task N]`.
 
 **Rationale:** The all-or-nothing alternative (single commit landing every piece together) would require holding the entire ~2000-LOC change in working state across multiple sessions before any pod-verify or CI checkpoint. Splitting at the asymmetric-gate boundary gives a clean intermediate state where (1) effect-only programs gain a real codegen path immediately, (2) handle-using programs continue to surface E0134 with a clear "in-progress" message, and (3) each follow-up commit can be pod-verified independently. The **single-PR convention** from Tasks 49 / 53 / 54 / 56 still holds — only one PR opens for Task 55, and it includes the full chain of foundation + CPS commits. The squash-merged result will look identical to a one-shot landing.
 
-**Implementing commit(s):** [HEAD] (foundation phase); follow-up commits TBD.
+**Implementing commit(s):** `b3af204` (foundation phase: E0133 lift + entry walker), [HEAD] (Phase 2 minimum: E0134 lift + handle body-pass-through + effect/op IDs + e2e tests). Phase 3+ commits TBD.
+
+## 2026-04-26 — [DEVIATION Task 55] Phase 2 ships handle as body-pass-through; full CPS path in Phase 3+
+
+**Context:** With E0134 lifted, well-formed `handle` expressions reach codegen. The full plan (CPS calling convention + handler-frame setup + per-arm CPS fn synthesis + trampoline integration) is too large for one commit.
+
+**Deviation:** Phase 2 implements the simplest meaningful codegen path: `handle BODY with { arms }` lowers to just `BODY` when the body contains no non-IO `perform` (statically optimised away — handler arms are dead code at runtime). Programs whose body actually performs a non-IO effect are rejected at codegen entry by the new `unsupported_handle_construct` walker, with a clear in-progress message. Phase 3+ replaces this pass-through with the full handler-frame setup + CPS calling convention + arm synthesis + `sigil_perform` wiring.
+
+**Rationale:** This ships a real codegen path that exercises the full pipeline for handle expressions for the first time (parser + typecheck + monomorphize + color + closure_convert + codegen all touch handle now), without committing to the much larger CPS infrastructure. The cost is that handlers don't actually do anything useful yet — but the surface compiles, the test infrastructure works end-to-end, and Phase 3 can build incrementally on this base. The static walker in `unsupported_handle_construct` is intentionally conservative: it inspects only `Expr::Perform` nodes appearing directly in handle bodies, not transitive performs through called fns. A handle whose body calls a fn that itself performs a non-IO effect would slip through this guard and crash at runtime when `sigil_perform` walks an empty handler stack — acceptable for the Phase 2 test program (body is a literal) but a known footgun until Phase 3+ ships the proper handler-frame setup.
+
+**Implementing commit(s):** [HEAD]; replaced by Phase 3+ commits.
 
 ## 2026-04-25 — [Task 4.5.5 / A3-carryover] Tagged-vs-raw Int ABI decision
 

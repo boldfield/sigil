@@ -348,6 +348,21 @@ pub struct CheckedProgram {
     /// regardless of whether the program would compile end-to-end);
     /// the gate lifts in Task 55.
     pub effects: BTreeMap<String, EffectDecl>,
+    /// Plan B Task 55 — stable per-effect ID (u32) for the runtime
+    /// handler-stack ABI. Assigned alphabetically over `effects` keys
+    /// so the same source program produces the same IDs across builds
+    /// (deterministic; no order dependence on declaration order).
+    /// Codegen uses these as the `effect_id` arg to
+    /// `sigil_handler_frame_new` and `sigil_perform`.
+    pub effect_ids: BTreeMap<String, u32>,
+    /// Plan B Task 55 — stable per-op ID (u32) within an effect for
+    /// the runtime handler-stack ABI. Keyed by `(effect_name,
+    /// op_name)`. Op IDs are assigned alphabetically within each
+    /// effect, starting at 0 per effect; `(effect_name, op_name)` is
+    /// the tuple used as the lookup key. Codegen uses these as the
+    /// `op_id` arg to `sigil_handler_frame_set_arm` and
+    /// `sigil_perform`.
+    pub op_ids: BTreeMap<(String, String), u32>,
 }
 
 /// Where a constructor is registered. Indexes a `TypeDecl` in the
@@ -736,6 +751,26 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         resolved_ctors.insert(span, GenericInstantiation { name, type_args });
     }
 
+    // Plan B Task 55 — assign stable effect_id / op_id integers
+    // for the runtime handler-stack ABI. Effect IDs are assigned
+    // alphabetically over `tc.effects` keys (BTreeMap iteration is
+    // already sorted, so no extra sort needed); op IDs are assigned
+    // alphabetically within each effect over its declared `ops` Vec
+    // (sorted into a temporary because EffectDecl::ops preserves
+    // declaration order, not lex order). Same source program → same
+    // IDs across builds.
+    let mut effect_ids: BTreeMap<String, u32> = BTreeMap::new();
+    let mut op_ids: BTreeMap<(String, String), u32> = BTreeMap::new();
+    for (eff_idx, (eff_name, eff_decl)) in tc.effects.iter().enumerate() {
+        effect_ids.insert(eff_name.clone(), eff_idx as u32);
+        let mut op_names: Vec<&str> = eff_decl.ops.iter().map(|o| o.name.as_str()).collect();
+        op_names.sort();
+        op_names.dedup();
+        for (op_idx, op_name) in op_names.iter().enumerate() {
+            op_ids.insert((eff_name.clone(), (*op_name).to_string()), op_idx as u32);
+        }
+    }
+
     (
         CheckedProgram {
             program,
@@ -747,6 +782,8 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             call_site_instantiations: resolved_calls,
             ctor_site_instantiations: resolved_ctors,
             effects: tc.effects,
+            effect_ids,
+            op_ids,
         },
         tc.errors,
     )
@@ -3030,21 +3067,17 @@ impl Tc {
             }
         }
 
-        // ---------- Staged-feature gate ----------
-        // Plan B Task 55 — `Item::Effect` decls now flow through to
-        // codegen as a no-op (E0133 lifted), but `Expr::Handle`
-        // codegen wiring still pends until the CPS calling
-        // convention lands later in this same task. E0134 stays
-        // live so well-formed `handle` programs surface a clean
-        // diagnostic instead of tripping `unreachable!` arms in
-        // codegen. Arm-body diagnostics (E0046, E0220, E0044) and
-        // registry diagnostics (E0138, E0139, E0140, E0141) emitted
-        // above this point continue to surface alongside the gate.
-        self.push_error(
-            "E0134",
-            span,
-            "`handle` expression is recognised but its codegen lowering is not yet complete (Plan B Task 55, in progress)",
-        );
+        // Plan B Task 55 (Phase 2) — staged `E0134` gate lifted.
+        // Codegen now lowers `handle BODY with { arms }` as a
+        // pass-through to BODY when the body contains no non-IO
+        // perform; the codegen-entry guard `unsupported_handle_construct`
+        // rejects programs whose body would actually perform a non-
+        // IO effect, surfacing a clear in-progress message until the
+        // full CPS calling convention + handler-frame setup lands.
+        // Arm-body diagnostics (E0046, E0220, E0044) and registry
+        // diagnostics (E0138, E0139, E0140, E0141) emitted above
+        // this point continue to surface unchanged.
+        let _ = span;
 
         Some(self.deref(&handler_overall))
     }
@@ -4612,11 +4645,11 @@ mod tests {
             // E0001. Review of PR #12 flagged the original E0001
             // regression for this surface form.
             "type Point = { x: Int, y: Int }\nfn main() -> Int ![] { let p: Int = Point { x: 1, y: 2 }; 0 }\n",
-            // Plan B Task 55: asymmetric gate state. E0133 lifted (the
-            // first program below typechecks cleanly), but E0134 stays
-            // live until the CPS codegen lands (the second program
-            // surfaces E0134 plus E0138 for the unknown effect arm).
-            // The "no E0001" discipline rule still holds for both.
+            // Plan B Task 55: both staged gates lifted. The first
+            // program typechecks cleanly. The second program
+            // surfaces E0138 (unknown effect arm `E`); typecheck no
+            // longer fires E0134 for it. The "no E0001" discipline
+            // rule still holds for both.
             "effect Raise { fail: (String) -> Int }\nfn main() -> Int ![] { 0 }\n",
             "fn main() -> Int ![] { handle 0 with { E.op(k) => 0 } }\n",
             // Plan B task 54: each new code added by handler typing
@@ -6909,6 +6942,68 @@ mod tests {
     }
 
     #[test]
+    fn effect_ids_assigned_alphabetically_per_program() {
+        // Plan B Task 55 — effect_ids are assigned in alphabetical
+        // order over the program's effects, regardless of declaration
+        // order. This pins the deterministic ABI guarantee codegen
+        // relies on.
+        let src = "effect Zeta { z: () -> Int }\n\
+                   effect Alpha { a: () -> Int }\n\
+                   effect Mu { m: () -> Int }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
+        assert_eq!(cp.effect_ids.get("Alpha"), Some(&0));
+        assert_eq!(cp.effect_ids.get("Mu"), Some(&1));
+        assert_eq!(cp.effect_ids.get("Zeta"), Some(&2));
+    }
+
+    #[test]
+    fn op_ids_assigned_alphabetically_per_effect() {
+        // Plan B Task 55 — op_ids are assigned alphabetically within
+        // each effect, regardless of source order. Declaration order
+        // (`get` before `put` here, but `get` < `put` alphabetically
+        // either way) does not affect IDs; the State effect's `set`
+        // and `get` are picked deliberately so source order would
+        // disagree with sorted order.
+        let src = "effect State { set: (Int) -> Int, get: () -> Int }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
+        // `get` < `set` alphabetically.
+        assert_eq!(
+            cp.op_ids.get(&("State".to_string(), "get".to_string())),
+            Some(&0)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("State".to_string(), "set".to_string())),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn op_ids_namespaced_per_effect() {
+        // Plan B Task 55 — `(effect_name, op_name)` is the lookup key,
+        // so two effects can each have an op named `fail` and they
+        // both get op_id 0 within their own effect.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   effect Catch { fail: () -> Int }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
+        assert_eq!(
+            cp.op_ids.get(&("Raise".to_string(), "fail".to_string())),
+            Some(&0)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("Catch".to_string(), "fail".to_string())),
+            Some(&0)
+        );
+        // Effect IDs are still distinct.
+        assert_ne!(cp.effect_ids.get("Raise"), cp.effect_ids.get("Catch"));
+    }
+
+    #[test]
     fn effect_decl_with_invalid_op_type_emits_e0112() {
         // Op signatures are still walked even though E0133 is gone, so
         // an unknown type in an op return position still fires E0112.
@@ -6922,59 +7017,52 @@ mod tests {
     }
 
     #[test]
-    fn handle_expr_still_emits_e0134_until_codegen_lands() {
-        // E0134 stays live until Task 55's CPS codegen ships. A well-
-        // formed `handle` expression must surface the staged gate so
-        // the program doesn't reach the still-`unreachable!` codegen
-        // arm in `lower_expr`.
+    fn well_formed_handle_expr_typechecks_cleanly() {
+        // E0134 lifted in Task 55 (Phase 2). A well-formed `handle`
+        // expression typechecks cleanly; codegen then either lowers
+        // it as a body-pass-through (when the body has no non-IO
+        // perform) or reports a clear codegen-time error pointing at
+        // the in-progress task.
         let src = "effect E { op: () -> Int }\n\
                    fn main() -> Int ![] { handle 0 with { E.op(k) => 0 } }\n";
         let errs = pipeline(src);
         assert!(
-            has_code(&errs, "E0134"),
-            "E0134 should still fire on well-formed `handle` until Task 55 \
-             codegen lands; got: {errs:?}"
-        );
-        assert!(
-            !has_code(&errs, "E0001"),
-            "must not surface E0001: {errs:?}"
+            errs.is_empty(),
+            "well-formed handle should typecheck cleanly; got: {errs:?}"
         );
     }
 
     #[test]
-    fn handle_expr_with_nested_body_type_error_surfaces_alongside_e0134() {
+    fn handle_expr_with_nested_body_type_error_surfaces() {
         // Confirms `check_handle` walks the body so a nested binop
-        // type error surfaces alongside the staged E0134 gate. `true
-        // && 1` mismatches at the binop's RHS.
+        // type error surfaces independently of any handler-specific
+        // diagnostic. `true && 1` mismatches at the binop's RHS.
         let src = "effect E { op: () -> Int }\n\
                    fn main() -> Int ![] {\n\
                      let n: Int = handle (true && 1) with { E.op(k) => 0 };\n\
                      n\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             errs.iter()
                 .any(|e| e.code.as_str().starts_with("E006")
                     || e.code.as_str().starts_with("E004")),
-            "expected nested binop type error alongside E0134: {errs:?}"
+            "expected nested binop type error: {errs:?}"
         );
     }
 
     #[test]
-    fn handle_arm_body_type_mismatch_surfaces_alongside_e0134() {
+    fn handle_arm_body_type_mismatch_surfaces_e0044_or_e0065() {
         // Arm bodies are walked; an arm-body type that doesn't match
-        // the cross-arm overall type fires E0044 or E0065 alongside
-        // the staged E0134 gate. Here the handle body is `0: Int`
-        // (taken as the implicit return arm) and the op-arm body is
-        // `true: Bool` — cross-arm unify fails.
+        // the cross-arm overall type fires E0044 or E0065. Here the
+        // handle body is `0: Int` (taken as the implicit return arm)
+        // and the op-arm body is `true: Bool` — cross-arm unify fails.
         let src = "effect E { op: () -> Int }\n\
                    fn main() -> Int ![] {\n\
                      let n: Int = handle 0 with { E.op(k) => true };\n\
                      n\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
         assert!(
             errs.iter()
                 .any(|e| e.code.as_str() == "E0044" || e.code.as_str() == "E0065"),
