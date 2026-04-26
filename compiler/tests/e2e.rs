@@ -2192,8 +2192,12 @@ fn arm_body_with_inner_block_and_outer_capture_works() {
     //           closure record
     //
     // Expected output: 5 (outer.local) + 7 (block-local `extra`) = 12.
+    // Note: `outer`'s effect row is `![IO]` (NOT `![IO, E]`) — the
+    // handle discharges `E` inside the body, so `E` is not in
+    // outer's externally-observable effects. Same shape as existing
+    // `arm_captures_outer_scope_returns_value`.
     let src = "effect E { op: () -> Int }\n\
-               fn outer(local: Int) -> Int ![IO, E] {\n  \
+               fn outer(local: Int) -> Int ![IO] {\n  \
                  let n: Int = handle (perform E.op()) with {\n    \
                    E.op(k) => if true { let extra: Int = 7; local + extra } else { 0 },\n  \
                  };\n  \
