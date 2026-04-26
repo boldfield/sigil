@@ -111,8 +111,16 @@ accident — a developer writing `frame.args[0] = raw_int` instead of
 `frame.args[0] = tag(raw_int)` would compile and produce wrong-but-
 silent GC behavior under stress.
 
-**Closure point:** Task 56 (Stage 6 — `runtime/src/handlers.rs` and
-`runtime/src/arena.rs` ship the runtime-side data structures).
+**Closure point:** Task 55 (when codegen lowers the first Int-typed
+user arg into `args_buf`). Task 56 (this PR) ships the runtime-side
+data structures, but the `HandlerFrame` and `NextStep` slot types
+that would consume `TaggedInt` / `RawInt` newtypes are `*mut u8`
+pointers (closure_ptr, fn_ptr) and raw `u64` (args_buf entries). User
+`Int` args don't enter the frame layout until codegen lowers them via
+`args_buf` — that's the Task 55 boundary. Updated 2026-04-26 in this
+PR; the original "Task 56" label predicted the contract would land
+with the runtime structs, but the structs themselves don't carry
+typed Int slots in v1.
 
 **Picked mechanism:** **Newtype wrappers around `i64`.** Specifically:
 
@@ -958,3 +966,145 @@ in the Sigil object header (out of scope for Plan B).
 **Closure point:** open — TAG_HANDLER_FRAME slot can land in a
 future plan if a tag-aware GC walker arrives. The layout
 otherwise stable.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] Runtime TLS roots: register/unregister via Boehm `GC_add_roots`
+
+**Plan body** (Stage 6 Task 56) describes `HandlerFrame` and the
+trampoline arena without saying how either is reachable from Boehm's
+mark phase. PR #21 review (boldfield, 2026-04-26) flagged the gap as
+Critical #1 / M1: TLS storage holding the `HANDLER_STACK` head and the
+arena's `Vec<u64>` payload sits outside Boehm's automatic
+stack/data-segment scan, so a `HandlerFrame` reachable only through
+`HANDLER_STACK` (or a closure pointer reachable only through an arena
+slot) would be reclaimed mid-iteration on any nontrivial GC pressure.
+
+**Implemented form:** in `sigil_gc_init` after `GC_init`, the calling
+thread's `HANDLER_STACK` cell and `ARENA` storage range are registered
+with `GC_add_roots`, idempotent per thread via per-thread
+`HANDLER_STACK_ROOTED` and `ARENA_ROOTED` flags. The arena's
+`Vec<u64>` is non-reallocating after the first `try_reserve_exact` so
+the registered range stays valid for the thread's lifetime.
+
+**Test-mode caveat:** `cargo test` spawns a fresh thread per test;
+auto-registering each test thread's TLS would leak stale ranges in
+Boehm's root list when the thread exits, which segfaults the next
+collection. The auto-registration is therefore `cfg(not(test))`-only;
+test code opts in via `GcThreadEnrolment::acquire` (in
+`test_support`), an RAII guard that registers AND unregisters
+symmetrically on Drop (using `GC_remove_roots` + `GC_unregister_my_thread`).
+
+**Conservative-scan tradeoff:** Boehm scans the registered arena range
+`[start, start + capacity*8)` byte-by-byte and follows any
+pointer-shaped 8-byte value. The arena holds non-pointer u64 args
+alongside genuine `closure_ptr` slots; values that happen to alias
+Boehm-heap addresses pin those blocks until the next reset. The
+pinning is bounded by one trampoline iteration (every reset clears
+`len` to 0 AND zeros the just-cleared bytes so subsequent scans see
+only the active iteration's writes). Acceptable for v1; v2 may
+revisit by tracking precise pointer slots per `NextStep`.
+
+**Verification:** PR #21 ships three GC stress tests
+(`handler_frame_survives_forced_gc_while_pushed`,
+`closure_in_handler_arm_slot_survives_gc`,
+`closure_in_next_step_survives_gc_via_arena_root`) that allocate
+sentinel-bearing closures, push handlers, force `GC_gcollect`, and
+verify the survival contract. The tests are `#[ignore]`-gated because
+Boehm thread enrolment / re-enrolment doesn't compose cleanly with
+cargo test's per-test thread teardowns even with explicit
+`GC_unregister_my_thread`; manual verification via
+`cargo test -- --ignored survives_gc` runs them. Each passes in
+isolation; rooting correctness in production is unaffected by the
+test-harness limitation.
+
+**Implementing commit:** [HEAD]
+**Closure point:** open for the test-harness composition issue
+(cargo test thread teardown + Boehm thread re-registration); production
+rooting contract is closed by the `GC_add_roots` registration here.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] `MAX_INLINE_ARGS = 32` cap with bound-check at perform site
+
+**Plan body** doesn't specify a maximum effect arity. PR #21 review
+M5 / Important #7 / Important #8 flagged that `sigil_perform`'s
+trampoline-side check at `MAX_INLINE_ARGS = 32` (a) named the wrong
+layer in the error message (perform was the source, run_loop was the
+abort site), (b) wasted the arena allocation before discovering the
+overflow, and (c) hid a magic number Task 55's codegen will need to
+respect.
+
+**Implemented form:** `pub const MAX_INLINE_ARGS: u32 = 32` exported
+at the `handlers` module top, sized to comfortably exceed v1's effect
+arities (Raise, State, Choose all use 0–2 user args; the cap covers
+arbitrary one-shot effects with a hefty safety margin). Bound check
+moved up the stack:
+
+1. `sigil_perform` checks `args_len.saturating_add(2) > MAX_INLINE_ARGS`
+   first thing, naming the offending `effect_id` / `op_id` in the
+   abort message. The `+2` covers the implicit `(k_closure, k_fn)`
+   pair the runtime appends to the dispatched arg vector.
+2. `sigil_next_step_call` performs the same check on its own
+   `arg_count` argument so codegen sites that bypass `sigil_perform`
+   (direct CPS-color calls in Task 55) also fail fast.
+3. `sigil_run_loop` keeps the trampoline-side check as
+   defense-in-depth with a "bypassed perform/next_step_call?" message
+   so a future regression that constructs NextSteps without going
+   through the helpers is still caught.
+
+**Codegen impact for Task 55:** any user effect operation with more
+than 30 user args (`MAX_INLINE_ARGS - 2`) requires boxing — codegen
+must emit a heap-allocated args record with a single pointer in
+`args_buf` rather than packing the args inline. v1 has no such
+operations; the cap is a forward-compat boundary, not a current
+constraint.
+
+**Implementing commit:** [HEAD]
+**Closure point:** Task 55 (when codegen produces the first
+`sigil_perform` call site that needs to consult `MAX_INLINE_ARGS`).
+The cap can be raised in a future plan by changing one constant and
+re-checking call sites; v1 lacks any concrete need.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] `Vec::reserve` panic-on-OOM does NOT cross the FFI boundary
+
+**Plan body** doesn't specify allocation-failure behavior for the
+arena. PR #21 review Critical #3 flagged that the original
+implementation called `Vec::reserve`, which panics on OOM; panic
+unwinding across an `extern "C"` boundary (the surrounding
+`sigil_arena_alloc`) is undefined behavior under the workspace's
+default `panic = "unwind"` profile.
+
+**Implemented form:** the arena's first-time reserve uses
+`try_reserve_exact(INITIAL_CAPACITY_WORDS)`. On `Err`, the code
+prints a diagnostic to stderr and aborts via `std::process::abort()`
+— matching the existing abort-on-overflow pattern at the bump path.
+No panic, no unwind, no FFI-boundary UB.
+
+**Implementing commit:** [HEAD]
+**Closure point:** closed.
+
+---
+
+## 2026-04-26 — [DEVIATION Task 56] Arena alignment via `Vec<u64>` backing storage
+
+**Plan body** says NextStep records hold word-aligned u64 fields. PR
+#21 review Important #5 flagged that the original `Vec<u8>` backing
+relied on the system allocator returning ≥8-byte-aligned blocks,
+which is true on every platform Sigil targets but is not a Rust
+guarantee.
+
+**Implemented form:** the arena's backing storage is `Vec<u64>`
+instead of `Vec<u8>`. `u64`'s natural alignment guarantees the
+`Vec`'s allocation base is 8-byte aligned regardless of allocator
+behavior. Byte-level pointer arithmetic on the returned `*mut u8`
+preserves alignment because every allocation rounds the byte size up
+to a multiple of `ALIGN = 8` and the underlying word count advances
+in u64 units. A test
+(`alloc_round_trips_and_aligns_to_eight`) asserts both
+relative offsets AND absolute alignment of every returned pointer.
+
+**Implementing commit:** [HEAD]
+**Closure point:** closed.

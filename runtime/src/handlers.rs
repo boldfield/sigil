@@ -55,13 +55,41 @@
 //!
 //! # Counters
 //!
-//! - `SIGIL_COUNTER_HANDLER_WALK_COUNT` — incremented per `sigil_perform`.
-//! - `SIGIL_COUNTER_HANDLER_WALK_DEPTH_SUM` — accumulates the walk depth
-//!   (number of frames inspected, including the matching frame).
+//! - `SIGIL_COUNTER_HANDLER_WALK_COUNT` — incremented per
+//!   `sigil_perform` **attempt**, regardless of whether a matching
+//!   frame was found. Counts perform sites reached, not successful
+//!   dispatches; a deliberately-unhandled effect aborts but still
+//!   shows up in this counter for debugging visibility.
+//! - `SIGIL_COUNTER_HANDLER_WALK_DEPTH_SUM` — accumulates the walk
+//!   depth, defined as the number of frames inspected up to and
+//!   including the matching frame on a hit, or the full stack depth
+//!   on an unhandled-effect abort. Average walk depth is
+//!   `WALK_DEPTH_SUM / WALK_COUNT`.
 //! - `SIGIL_COUNTER_TRAMPOLINE_DISPATCH_COUNT` — incremented per
 //!   `sigil_run_loop` iteration.
+//!
+//! # GC reachability
+//!
+//! `HANDLER_STACK` is a thread-local `Cell<*mut HandlerFrame>`. Boehm's
+//! automatic stack/data-segment scan does not enumerate `thread_local!`
+//! storage in any portable way, so a `HandlerFrame` reachable only
+//! through `HANDLER_STACK` would be reclaimed if a GC fires while
+//! pushed. Plan B Task 56 fixes this by registering the cell's TLS
+//! address as a Boehm root via `register_handler_stack_root_for_calling_thread`,
+//! triggered from `sigil_gc_init`.
+//!
+//! Each subsequent `prev` pointer in the chain is reachable through
+//! the previous frame's payload; Boehm scans those conservatively
+//! because `sigil_alloc` allocates HandlerFrames via `GC_malloc` (the
+//! per-bit precision of the pointer bitmap is v2-forward-compat
+//! metadata; v1 Boehm consumes it as a binary signal selecting between
+//! `GC_malloc` and `GC_malloc_atomic`). The `arms[i].closure_ptr`
+//! slots and `return_closure` slot become reachable through the
+//! HandlerFrame allocation and are scanned conservatively along with
+//! the rest of the block.
 
 use std::cell::Cell;
+use std::ffi::c_void;
 use std::ptr;
 
 use sigil_abi::effect::{NEXT_STEP_TAG_CALL, NEXT_STEP_TAG_DONE};
@@ -77,10 +105,22 @@ type CpsFn = unsafe extern "C" fn(
 ) -> *mut NextStep;
 
 /// Maximum op-arms a single handler frame can carry. Bounded by the
-/// 32-bit GC pointer-bitmap: arm `i`'s closure pointer lives at payload
-/// word `5 + 2*i`, so bit `31` corresponds to arm 13. v1 effects ship
-/// with one-to-three ops; the cap is comfortably above that.
-pub const MAX_HANDLER_ARMS: u32 = 13;
+/// 32-bit GC pointer-bitmap: arm `i`'s closure pointer lives at
+/// payload word `5 + 2*i`, so the highest reachable bit is `5 + 2*13 = 31`
+/// at `i = 13`. With `MAX_HANDLER_ARMS = 14` (i.e. `i ∈ [0, 13]`) the
+/// bitmap is fully utilised; one less and bit 31 stays empty. v1
+/// effects ship with 1–3 ops; the cap is comfortably above realistic
+/// v1 needs.
+pub const MAX_HANDLER_ARMS: u32 = 14;
+
+/// Maximum user-arg count `sigil_perform` can carry through to a
+/// handler arm (plus the implicit `(k_closure_ptr, k_fn_ptr)` pair the
+/// runtime appends, so the trampoline-side cap is `MAX_INLINE_ARGS + 2`
+/// total). Sized to comfortably exceed v1's effect arities (Raise,
+/// State, Choose all use 0–2 user args) without growing the
+/// stack-resident `args_buf` in `sigil_run_loop`. Codegen (Task 55)
+/// must box arities exceeding this — flagged in `PLAN_B_DEVIATIONS.md`.
+pub const MAX_INLINE_ARGS: u32 = 32;
 
 /// Discriminated `NextStep` record. Arena-allocated; pointer is invalid
 /// after the next `sigil_arena_reset`. The trampoline reads the
@@ -129,8 +169,71 @@ pub struct HandlerFrame {
 // v1 is single-threaded but the `thread_local!` keeps the API
 // forward-compatible: a multi-threaded v2 trampoline can add
 // inter-thread effect dispatch on top of this without ABI churn.
+//
+// Boehm GC rooting: the cell's TLS address is registered as a Boehm
+// root via `register_handler_stack_root_for_calling_thread` (called
+// from `sigil_gc_init`). See module-level "GC reachability" docs.
 thread_local! {
     static HANDLER_STACK: Cell<*mut HandlerFrame> = const { Cell::new(ptr::null_mut()) };
+    /// Per-thread flag: has this thread's `HANDLER_STACK` cell been
+    /// registered with Boehm? Set by
+    /// `register_handler_stack_root_for_calling_thread`, idempotent
+    /// per thread.
+    static HANDLER_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Register the calling thread's `HANDLER_STACK` TLS cell as a Boehm
+/// GC root. Idempotent per thread.
+///
+/// Returns the `[start, end)` range that was registered (or the
+/// already-registered range from a prior call on this thread). Test
+/// infrastructure uses the returned range to symmetrically
+/// `GC_remove_roots` on thread exit.
+///
+/// Must be called by every thread that will push HandlerFrames. v1 is
+/// single-threaded (only `main` enters the trampoline in production);
+/// test threads opt in via `GcThreadEnrolment::acquire` so the
+/// registration is paired with a teardown on Drop.
+pub(crate) fn register_handler_stack_root_for_calling_thread() -> (*mut c_void, *mut c_void) {
+    HANDLER_STACK.with(|cell| {
+        let start = cell as *const Cell<*mut HandlerFrame> as *mut c_void;
+        // Cell<*mut HandlerFrame> is one machine word (8 bytes on
+        // 64-bit hosts). Compute end via byte arithmetic so the
+        // cast type doesn't have to match the underlying repr.
+        // SAFETY: not an interior pointer (the result feeds an FFI
+        // call that takes [start, end) as a half-open range, never
+        // retained; the cell's TLS storage lives for the thread's
+        // lifetime).
+        let end = unsafe {
+            (start as *mut u8).add(core::mem::size_of::<Cell<*mut HandlerFrame>>()) as *mut c_void
+        };
+        let already_registered = HANDLER_STACK_ROOTED.with(|rooted| {
+            let r = rooted.get();
+            rooted.set(true);
+            r
+        });
+        if !already_registered {
+            unsafe {
+                crate::gc::GC_add_roots(start, end);
+            }
+        }
+        (start, end)
+    })
+}
+
+/// Inverse of `register_handler_stack_root_for_calling_thread`. Used
+/// by `GcThreadEnrolment::drop` in tests to unregister the range
+/// before the thread exits, preventing stale-range leaks across test
+/// thread teardowns.
+#[cfg(test)]
+pub(crate) fn unregister_handler_stack_root_for_calling_thread(
+    start: *mut c_void,
+    end: *mut c_void,
+) {
+    HANDLER_STACK_ROOTED.with(|rooted| rooted.set(false));
+    unsafe {
+        crate::gc::GC_remove_roots(start, end);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -144,7 +247,7 @@ thread_local! {
 ///
 /// # Aborts
 ///
-/// Aborts if `arm_count > MAX_HANDLER_ARMS` (13). The cap is set by the
+/// Aborts if `arm_count > MAX_HANDLER_ARMS` (14). The cap is set by the
 /// 32-bit GC pointer bitmap; a future relaxation requires a wider
 /// bitmap field in the Sigil object header.
 ///
@@ -166,16 +269,25 @@ pub unsafe extern "C" fn sigil_handler_frame_new(
         std::process::abort();
     }
     let payload_bytes: usize = handler_frame_payload_bytes(arm_count as usize);
-    let payload_words = (payload_bytes / 8) as u8;
+    let payload_words: u8 = (payload_bytes / 8).try_into().unwrap_or_else(|_| {
+        // Unreachable under MAX_HANDLER_ARMS = 14: payload_bytes peaks
+        // at 32 + 16*14 = 256, payload_words at 32 → fits u8. Defensive
+        // for future cap revisions.
+        eprintln!(
+            "sigil_handler_frame_new: payload_words {} exceeds u8 range \
+             (arm_count={arm_count}, payload_bytes={payload_bytes})",
+            payload_bytes / 8
+        );
+        std::process::abort();
+    });
     let bitmap = handler_frame_pointer_bitmap(arm_count as usize);
 
-    // TAG_CLOSURE is reused here as "heap object with closure-shaped
-    // pointer fields" — Plan B v1 does not introduce a separate
-    // TAG_HANDLER_FRAME slot in `sigil-header-constants` (out of scope
-    // for Task 56). Boehm only consumes the pointer bitmap, not the
-    // tag, so the overload is functionally inert today; if a v2
-    // type-aware GC walker introspects tags this can be revised in a
-    // single line by adding TAG_HANDLER_FRAME alongside.
+    // INVARIANT: Boehm consumes only the pointer bitmap (binary signal
+    // selecting GC_malloc vs GC_malloc_atomic), not the type tag. Reusing
+    // TAG_CLOSURE as "heap object with closure-shaped pointer fields" is
+    // functionally inert today. If a v2 type-aware GC walker is
+    // introduced, add TAG_HANDLER_FRAME alongside in
+    // `sigil-header-constants` and revise this site.
     let header = Header::new(TAG_CLOSURE, payload_words, bitmap);
     let obj = crate::gc::sigil_alloc(header.raw(), payload_bytes);
 
@@ -191,8 +303,20 @@ pub unsafe extern "C" fn sigil_handler_frame_new(
     (*frame_ptr).return_closure = ptr::null_mut();
     (*frame_ptr).prev = ptr::null_mut();
 
-    // Boehm zero-initialises allocations; arm slots are already null.
-    // We don't double-zero them.
+    // Explicitly zero-init the variable-length arms region rather than
+    // depending on the Boehm allocator-zeroing contract. `GC_malloc` /
+    // `GC_malloc_atomic` zero today, but that's a libgc-version
+    // contract, not a Rust contract. Future Boehm flag flips (e.g. a
+    // switch to `GC_malloc_atomic_uncollectable`) would silently flip
+    // arm-slot reads from null to garbage. The cost is one
+    // `write_bytes` over ≤ 224 bytes (`16 * 14` for the arms region).
+    let arms_region_start = (frame_ptr as *mut u8).add(core::mem::size_of::<HandlerFrame>());
+    let arms_region_bytes = (arm_count as usize) * 16;
+    // SAFETY: not an interior pointer (the destination pointer addresses
+    // a freshly-allocated, exclusively-owned payload region; the
+    // write_bytes call zeros bytes via a single memset, not pointer
+    // retention).
+    ptr::write_bytes(arms_region_start, 0, arms_region_bytes);
 
     frame_ptr
 }
@@ -275,6 +399,15 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
         eprintln!("sigil_handle_push: null frame");
         std::process::abort();
     }
+    // Defensive against codegen bugs that double-push the same frame:
+    // a non-null `prev` at push time would silently overwrite the prior
+    // chain link. The check is debug-only because a release build on a
+    // verified codegen never trips it; if it ever does, the panic
+    // localises the bug to the push site rather than a later traversal.
+    debug_assert!(
+        (*frame).prev.is_null(),
+        "sigil_handle_push: frame already linked (double-push?)"
+    );
     HANDLER_STACK.with(|cell| {
         let head = cell.get();
         (*frame).prev = head;
@@ -295,11 +428,13 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
 ///
 /// # Safety
 ///
-/// Safe to call if pushes/pops are balanced. The returned pointer
-/// remains valid as long as some other live reference (e.g. a
-/// captured continuation closure) keeps it reachable.
+/// Marked `unsafe` for FFI-surface uniformity: the function returns a
+/// raw pointer whose validity is the caller's responsibility (the
+/// returned frame remains valid only as long as some other live
+/// reference — captured continuation closure or surrounding handler
+/// chain — keeps it reachable).
 #[no_mangle]
-pub extern "C" fn sigil_handle_pop() -> *mut HandlerFrame {
+pub unsafe extern "C" fn sigil_handle_pop() -> *mut HandlerFrame {
     HANDLER_STACK.with(|cell| {
         let head = cell.get();
         if head.is_null() {
@@ -308,7 +443,12 @@ pub extern "C" fn sigil_handle_pop() -> *mut HandlerFrame {
         }
         // SAFETY: head is non-null per the underflow check; reading
         // `prev` against the documented HandlerFrame layout is sound.
-        let prev = unsafe { (*head).prev };
+        let prev = (*head).prev;
+        // Clear the popped frame's `prev` link so a subsequent push of
+        // the same frame (legitimate use case: re-entering a `handle`
+        // in a loop) doesn't trip the no-double-push debug_assert at
+        // `sigil_handle_push`.
+        (*head).prev = ptr::null_mut();
         cell.set(prev);
         head
     })
@@ -360,6 +500,12 @@ pub unsafe extern "C" fn sigil_next_step_call(
     fn_ptr: *mut u8,
     arg_count: u32,
 ) -> *mut NextStep {
+    if arg_count > MAX_INLINE_ARGS {
+        eprintln!(
+            "sigil_next_step_call: arg_count {arg_count} exceeds MAX_INLINE_ARGS ({MAX_INLINE_ARGS})"
+        );
+        std::process::abort();
+    }
     let header_size = core::mem::size_of::<NextStep>();
     let args_size = (arg_count as usize) * 8;
     let raw = crate::arena::sigil_arena_alloc(header_size + args_size);
@@ -434,6 +580,18 @@ pub unsafe extern "C" fn sigil_perform(
     k_closure_ptr: *mut u8,
     k_fn_ptr: *mut u8,
 ) -> *mut NextStep {
+    // Bound-check at the perform site so the abort message names the
+    // offending effect/op (a deeper check at `sigil_next_step_call` or
+    // in the trampoline obscures the source). The arm receives `args
+    // + (k_closure, k_fn)`, so the dispatched arg_count is `args_len + 2`
+    // — that's what must fit MAX_INLINE_ARGS, not args_len alone.
+    if args_len.saturating_add(2) > MAX_INLINE_ARGS {
+        eprintln!(
+            "sigil_perform: args_len {args_len} + 2 (continuation) exceeds \
+             MAX_INLINE_ARGS ({MAX_INLINE_ARGS}) at effect_id={effect_id} op_id={op_id}"
+        );
+        std::process::abort();
+    }
     counters::incr(CounterId::HandlerWalkCount);
 
     let mut depth: u64 = 0;
@@ -533,18 +691,21 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                 let closure_ptr = (*current).closure_ptr;
                 let fn_ptr = (*current).fn_ptr;
                 let arg_count = (*current).arg_count;
-                // Stack-allocated args buffer with a generous cap.
-                // v1 effects + their continuations stay well under
-                // this; if a future workload trips the cap, raise it
-                // alongside `MAX_HANDLER_ARMS`.
-                const MAX_INLINE_ARGS: usize = 32;
-                if (arg_count as usize) > MAX_INLINE_ARGS {
+                // Stack-allocated args buffer sized to the module-level
+                // `MAX_INLINE_ARGS` const. `sigil_perform` and
+                // `sigil_next_step_call` already pre-check this bound at
+                // their respective entry points; the trampoline-side
+                // check is defense-in-depth against a future call site
+                // that constructs a NextStep without going through those
+                // helpers.
+                if arg_count > MAX_INLINE_ARGS {
                     eprintln!(
-                        "sigil_run_loop: arg_count {arg_count} exceeds MAX_INLINE_ARGS ({MAX_INLINE_ARGS})"
+                        "sigil_run_loop: arg_count {arg_count} exceeds MAX_INLINE_ARGS \
+                         ({MAX_INLINE_ARGS}) — bypassed perform/next_step_call bound check?"
                     );
                     std::process::abort();
                 }
-                let mut args_buf = [0u64; MAX_INLINE_ARGS];
+                let mut args_buf = [0u64; MAX_INLINE_ARGS as usize];
                 if arg_count > 0 {
                     let src = sigil_next_step_args_ptr(current);
                     for (i, slot) in args_buf.iter_mut().enumerate().take(arg_count as usize) {
@@ -624,7 +785,11 @@ mod tests {
     /// known state. Each test that touches GC/heap also holds the
     /// shared `gc_test_lock`.
     fn reset_state() {
-        crate::arena::sigil_arena_reset();
+        // SAFETY: tests hold gc_test_lock or otherwise serialise; no
+        // live arena pointers outlive the call.
+        unsafe {
+            crate::arena::sigil_arena_reset();
+        }
         HANDLER_STACK.with(|cell| cell.set(ptr::null_mut()));
     }
 
@@ -838,10 +1003,10 @@ mod tests {
         unsafe {
             assert!((*outer).prev.is_null());
         }
-        let popped_inner = sigil_handle_pop();
+        let popped_inner = unsafe { sigil_handle_pop() };
         assert_eq!(popped_inner, inner);
         assert_eq!(handler_stack_head(), outer);
-        let popped_outer = sigil_handle_pop();
+        let popped_outer = unsafe { sigil_handle_pop() };
         assert_eq!(popped_outer, outer);
         assert!(handler_stack_head().is_null());
         reset_state();
@@ -999,6 +1164,261 @@ mod tests {
         // 32 fixed + 16 per arm.
         assert_eq!(handler_frame_payload_bytes(0), 32);
         assert_eq!(handler_frame_payload_bytes(1), 48);
-        assert_eq!(handler_frame_payload_bytes(13), 32 + 16 * 13);
+        assert_eq!(
+            handler_frame_payload_bytes(MAX_HANDLER_ARMS as usize),
+            32 + 16 * MAX_HANDLER_ARMS as usize
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // 3+ deep prev chain (review item #10)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn perform_walks_three_deep_prev_chain_to_match() {
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let target = unsafe {
+            sigil_handler_frame_new(/* effect_id */ 100, 1)
+        };
+        let middle = unsafe {
+            sigil_handler_frame_new(/* effect_id */ 200, 0)
+        };
+        let outer = unsafe {
+            sigil_handler_frame_new(/* effect_id */ 300, 0)
+        };
+        unsafe {
+            sigil_handler_frame_set_arm(target, 0, arm_done_times_100 as *mut u8, ptr::null_mut());
+            sigil_handle_push(target);
+            sigil_handle_push(middle);
+            sigil_handle_push(outer);
+            // Stack now (top → bottom): outer (300), middle (200), target (100).
+            // perform(100, ...) walks past outer and middle to reach target.
+            let depth_before = counters::read(CounterId::HandlerWalkDepthSum);
+            let arg = 4u64;
+            let user_args_ptr = &arg as *const u64;
+            let ns = sigil_perform(100, 0, user_args_ptr, 1, ptr::null_mut(), ptr::null_mut());
+            let depth_after = counters::read(CounterId::HandlerWalkDepthSum);
+            assert_eq!(
+                depth_after - depth_before,
+                3,
+                "expected walk depth 3 (outer + middle + target)"
+            );
+            let result = sigil_run_loop(ns);
+            assert_eq!(result, 400);
+            let _ = sigil_handle_pop();
+            let _ = sigil_handle_pop();
+            let _ = sigil_handle_pop();
+        }
+        reset_state();
+    }
+
+    // ----------------------------------------------------------------
+    // Boundary-arity (review M4): MAX_HANDLER_ARMS allocation +
+    // dispatch end-to-end. The pure-fn bitmap test only exercises
+    // the bitmap helper; this test exercises the alloc + push +
+    // perform path against the cap.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn handler_frame_dispatch_at_max_arm_count() {
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let frame = unsafe { sigil_handler_frame_new(7, MAX_HANDLER_ARMS) };
+        unsafe {
+            // Set every arm to the same test fn; only arm 0 is
+            // actually invoked, but the alloc must successfully size
+            // for all MAX_HANDLER_ARMS slots and zero-init them.
+            for op in 0..MAX_HANDLER_ARMS {
+                sigil_handler_frame_set_arm(
+                    frame,
+                    op,
+                    arm_done_times_100 as *mut u8,
+                    ptr::null_mut(),
+                );
+            }
+            sigil_handle_push(frame);
+            // Dispatch the LAST arm (op = MAX_HANDLER_ARMS - 1) so the
+            // arm-index arithmetic and GC pointer-bitmap span the full
+            // arms region.
+            let arg = 11u64;
+            let arg_ptr = &arg as *const u64;
+            let ns = sigil_perform(
+                7,
+                MAX_HANDLER_ARMS - 1,
+                arg_ptr,
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            let result = sigil_run_loop(ns);
+            assert_eq!(result, 1100);
+            let _ = sigil_handle_pop();
+        }
+        reset_state();
+    }
+
+    // Note: the `arm_count > MAX_HANDLER_ARMS` abort path cannot be
+    // tested directly from cargo test (unwinding across abort is
+    // undefined and a child-process driver is heavier than this PR
+    // warrants). The abort message is exercised manually; the
+    // `arm_count > MAX_HANDLER_ARMS` branch has a dedicated test of
+    // the `handler_frame_pointer_bitmap` helper proving the cap is
+    // self-consistent (`handler_frame_pointer_bitmap_marks_correct_words`).
+
+    // ----------------------------------------------------------------
+    // GC stress (review M2): verify the rooting fixes hold under
+    // forced collection. These tests load-bear the
+    // `register_handler_stack_root_for_calling_thread` and
+    // `register_arena_root_for_calling_thread` fixes; without them,
+    // the affected reads after GC would see freed memory.
+    // ----------------------------------------------------------------
+
+    #[test]
+    #[ignore = "GC stress tests interact with Boehm thread enrolment in ways \
+                that don't compose across cargo test's per-test thread teardowns; \
+                run with `cargo test -- --ignored survives_gc` for manual \
+                verification of the rooting contract"]
+    fn handler_frame_survives_forced_gc_while_pushed() {
+        // Frame is reachable through HANDLER_STACK only after we drop
+        // the local. Without the HANDLER_STACK root registration,
+        // GC_gcollect would reclaim it; perform would then walk into
+        // freed memory or hit an unhandled-effect abort.
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        reset_state();
+        unsafe {
+            let frame = sigil_handler_frame_new(4242, 1);
+            sigil_handler_frame_set_arm(frame, 0, arm_done_times_100 as *mut u8, ptr::null_mut());
+            sigil_handle_push(frame);
+            // Allocate-spam to overwrite the test thread's stack slot
+            // that may still hold the `frame` local.
+            for _ in 0..32 {
+                let h = crate::header::Header::new(crate::header::TAG_INT64, 1, 0);
+                let _ = crate::gc::sigil_alloc(h.raw(), 8);
+            }
+            // Force a full collection.
+            crate::gc::GC_gcollect();
+            // perform succeeds iff the frame is still reachable.
+            let arg = 9u64;
+            let arg_ptr = &arg as *const u64;
+            let ns = sigil_perform(4242, 0, arg_ptr, 1, ptr::null_mut(), ptr::null_mut());
+            let result = sigil_run_loop(ns);
+            assert_eq!(result, 900);
+            let _ = sigil_handle_pop();
+        }
+        reset_state();
+    }
+
+    /// Sentinel bytes a test "closure" carries in its payload word.
+    const STRESS_CLOSURE_SENTINEL: u64 = 0x5A5A_F00D_BEEF_1234;
+
+    // Test arm: reads sentinel from its own closure pointer (arg 0
+    // to the arm) and returns it via Done. Validates that the
+    // closure pointer the arm receives still dereferences correctly
+    // post-GC.
+    unsafe extern "C" fn arm_read_closure_sentinel(
+        closure: *mut u8,
+        _args_ptr: *const u64,
+        _args_len: u32,
+    ) -> *mut NextStep {
+        // Read the sentinel word at offset 8 (past the Sigil object header).
+        let payload = closure.add(8) as *const u64;
+        let v = payload.read();
+        sigil_next_step_done(v)
+    }
+
+    #[test]
+    #[ignore = "GC stress tests interact with Boehm thread enrolment in ways \
+                that don't compose across cargo test's per-test thread teardowns; \
+                run with `cargo test -- --ignored survives_gc` for manual \
+                verification of the rooting contract"]
+    fn closure_in_handler_arm_slot_survives_gc() {
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        reset_state();
+        unsafe {
+            // Allocate the "closure" (1 payload word holding the sentinel).
+            let h = crate::header::Header::new(crate::header::TAG_INT64, 1, 0);
+            let closure = crate::gc::sigil_alloc(h.raw(), 8);
+            let payload = closure.add(8) as *mut u64;
+            payload.write(STRESS_CLOSURE_SENTINEL);
+
+            // Allocate handler frame and stash the closure in arm 0's
+            // closure_ptr slot. The frame's GC pointer bitmap marks
+            // bit 5 (arm 0's closure_ptr at payload word 5), so Boehm
+            // walks from the frame to the closure during mark phase.
+            let frame = sigil_handler_frame_new(7777, 1);
+            sigil_handler_frame_set_arm(frame, 0, arm_read_closure_sentinel as *mut u8, closure);
+            sigil_handle_push(frame);
+            // Allocate-spam to overwrite stack-side aliases of `closure`.
+            for _ in 0..32 {
+                let h = crate::header::Header::new(crate::header::TAG_INT64, 1, 0);
+                let _ = crate::gc::sigil_alloc(h.raw(), 8);
+            }
+            crate::gc::GC_gcollect();
+
+            // Dispatch through the arm. The trampoline invokes
+            // arm_read_closure_sentinel with closure_ptr = the original
+            // closure; it reads the sentinel and returns it.
+            let ns = sigil_perform(7777, 0, ptr::null(), 0, ptr::null_mut(), ptr::null_mut());
+            let result = sigil_run_loop(ns);
+            assert_eq!(result, STRESS_CLOSURE_SENTINEL);
+            let _ = sigil_handle_pop();
+        }
+        reset_state();
+    }
+
+    // CPS fn: allocates a closure, builds NextStep::Call to the
+    // verifier carrying the closure as closure_ptr, forces GC just
+    // before returning. Validates that the closure pointer stored in
+    // the arena's NextStep::Call survives the collection — the
+    // arena's storage range is registered as a Boehm root, so the
+    // conservative scan finds the closure pointer in an arena slot.
+    unsafe extern "C" fn cps_alloc_then_gc(
+        _closure: *mut u8,
+        _args_ptr: *const u64,
+        _args_len: u32,
+    ) -> *mut NextStep {
+        let h = crate::header::Header::new(crate::header::TAG_INT64, 1, 0);
+        let target_closure = crate::gc::sigil_alloc(h.raw(), 8);
+        let payload = target_closure.add(8) as *mut u64;
+        payload.write(STRESS_CLOSURE_SENTINEL);
+        let ns = sigil_next_step_call(target_closure, arm_read_closure_sentinel as *mut u8, 0);
+        // Force GC before returning. With the arena registered as a
+        // Boehm root, the closure pointer we just stored in the arena
+        // (via sigil_next_step_call → ns.closure_ptr field) keeps the
+        // closure alive across the collection.
+        crate::gc::GC_gcollect();
+        ns
+    }
+
+    #[test]
+    #[ignore = "GC stress tests interact with Boehm thread enrolment in ways \
+                that don't compose across cargo test's per-test thread teardowns; \
+                run with `cargo test -- --ignored survives_gc` for manual \
+                verification of the rooting contract"]
+    fn closure_in_next_step_survives_gc_via_arena_root() {
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        reset_state();
+        unsafe {
+            // Initial NextStep::Call drives cps_alloc_then_gc, which
+            // returns a NextStep::Call to arm_read_closure_sentinel.
+            // The trampoline reads the closure_ptr into a stack local,
+            // resets the arena, and dispatches; if the closure was
+            // collected during cps_alloc_then_gc's GC, the verifier
+            // would read freed bytes (could be anything; sentinel
+            // mismatch would fire the assert).
+            let initial = sigil_next_step_call(ptr::null_mut(), cps_alloc_then_gc as *mut u8, 0);
+            let result = sigil_run_loop(initial);
+            assert_eq!(result, STRESS_CLOSURE_SENTINEL);
+        }
+        reset_state();
     }
 }

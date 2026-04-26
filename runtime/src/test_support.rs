@@ -59,3 +59,74 @@ pub(crate) fn gc_test_lock() -> MutexGuard<'static, ()> {
     let m = GC_TEST_LOCK.get_or_init(|| Mutex::new(()));
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// One-shot global for `GC_allow_register_threads`. Plan B Task 56's
+/// GC stress tests need to call `GC_gcollect` from Rust test threads;
+/// Boehm aborts that with "Collecting from unknown thread" unless the
+/// thread is registered, and registration requires
+/// `GC_allow_register_threads` to have been called once on the program
+/// at large.
+static ALLOW_REGISTER_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// RAII guard: enrols the calling Rust thread with Boehm GC for the
+/// guard's lifetime, allowing `GC_gcollect` and other thread-aware
+/// Boehm calls to succeed without aborting; ALSO registers this
+/// thread's `HANDLER_STACK` and `ARENA` TLS ranges as Boehm roots so
+/// the GC stress tests' allocations are reachable through the same
+/// rooting paths the production runtime uses. Drop symmetrically
+/// removes the roots and unregisters the thread, preventing stale
+/// ranges from accumulating across `--test-threads=N` test thread
+/// teardowns.
+///
+/// Tests that force collection must hold this guard for the duration.
+/// Tests that only allocate (no explicit `GC_gcollect`) do not need
+/// it — the existing `gc_test_lock` is sufficient.
+pub(crate) struct GcThreadEnrolment {
+    handler_stack_root: (*mut std::ffi::c_void, *mut std::ffi::c_void),
+    arena_root: (*mut std::ffi::c_void, *mut std::ffi::c_void),
+}
+
+impl GcThreadEnrolment {
+    pub(crate) fn acquire() -> Self {
+        // Idempotent global enable. Must precede any
+        // GC_register_my_thread call.
+        ALLOW_REGISTER_ONCE.call_once(|| {
+            // SAFETY: `Once::call_once` guarantees at most one call.
+            unsafe { crate::gc::GC_allow_register_threads() };
+        });
+        // Register this thread. `stack_base = null` lets Boehm
+        // discover the bottom of the calling thread's stack itself
+        // (per libgc 7.x: passing a NULL stack base requests
+        // auto-detection on platforms that support it). The return
+        // code is GC_SUCCESS (0) on first registration,
+        // GC_DUPLICATE on a thread already registered — both fine.
+        let _rc = unsafe { crate::gc::GC_register_my_thread(std::ptr::null()) };
+        // Now register this thread's HANDLER_STACK and ARENA ranges
+        // as Boehm roots. These are paired with the GC_remove_roots
+        // calls in Drop so test thread teardown leaves Boehm's root
+        // list clean.
+        let handler_stack_root = crate::handlers::register_handler_stack_root_for_calling_thread();
+        let arena_root = crate::arena::register_arena_root_for_calling_thread();
+        Self {
+            handler_stack_root,
+            arena_root,
+        }
+    }
+}
+
+impl Drop for GcThreadEnrolment {
+    fn drop(&mut self) {
+        crate::handlers::unregister_handler_stack_root_for_calling_thread(
+            self.handler_stack_root.0,
+            self.handler_stack_root.1,
+        );
+        crate::arena::unregister_arena_root_for_calling_thread(
+            self.arena_root.0,
+            self.arena_root.1,
+        );
+        // SAFETY: every test that constructs `GcThreadEnrolment`
+        // enrolls before dropping, so the unregister has a matched
+        // register. Return code is informational; we ignore it.
+        let _rc = unsafe { crate::gc::GC_unregister_my_thread() };
+    }
+}
