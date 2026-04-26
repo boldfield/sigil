@@ -1366,6 +1366,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_next_step_done", Linkage::Import, &next_step_done_sig)
         .map_err(|e| format!("declare sigil_next_step_done: {e}"))?;
 
+    // sigil_run_loop(initial: *mut NextStep) -> u64. Drives the CPS
+    // trampoline to a terminal NextStep::Done and returns its value.
+    // Phase 3b uses this to dispatch the NextStep::Call that
+    // `sigil_perform` returns: perform never returns a Done directly
+    // — it builds a Call to the matching arm + (k_closure, k_fn);
+    // the arm runs and returns Done(value). `sigil_run_loop` does
+    // the dispatch and returns the final Done's value as u64.
+    let mut run_loop_sig = Signature::new(isa_call_conv(&module));
+    run_loop_sig.params.push(AbiParam::new(pointer_ty));
+    run_loop_sig.returns.push(AbiParam::new(types::I64));
+    let run_loop = module
+        .declare_function("sigil_run_loop", Linkage::Import, &run_loop_sig)
+        .map_err(|e| format!("declare sigil_run_loop: {e}"))?;
+
     // C-callable main: int main(int argc, char **argv). Stage 1 ignores argv.
     let mut main_sig = Signature::new(isa_call_conv(&module));
     main_sig.params.push(AbiParam::new(types::I32));
@@ -1540,10 +1554,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 module.declare_func_in_func(handler_frame_new, builder.func);
             let handle_push_ref = module.declare_func_in_func(handle_push, builder.func);
             let handle_pop_ref = module.declare_func_in_func(handle_pop, builder.func);
-            // Plan B Task 55 (Phase 3b) — frame_set_arm + perform.
+            // Plan B Task 55 (Phase 3b) — frame_set_arm + perform + run_loop.
             let handler_frame_set_arm_ref =
                 module.declare_func_in_func(handler_frame_set_arm, builder.func);
             let perform_ref = module.declare_func_in_func(perform_func, builder.func);
+            let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
             // Per-handle synthetic arm fn refs, keyed by handle span.
             // Each entry maps a handle's span to the per-arm FuncRefs
             // used for `func_addr` when populating the runtime
@@ -1619,6 +1634,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handle_pop_ref,
                 handler_frame_set_arm_ref,
                 perform_ref,
+                run_loop_ref,
                 handler_arm_refs_per_handle,
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
@@ -1910,12 +1926,19 @@ struct Lowerer<'a, 'b> {
     /// lowering with `(frame, op_id, fn_ptr, null_closure_ptr)`.
     handler_frame_set_arm_ref: FuncRef,
     /// Plan B Task 55 (Phase 3b) — `sigil_perform` runtime ref.
-    /// `lower_perform` calls this for non-IO effects; the result is
-    /// a `*mut NextStep`, and the calling native code reads
-    /// `(*ns).value` (offset 24) for the perform's value when the
-    /// arm returns `NextStep::Done` (which is always the case in
-    /// Phase 3b — arms ignore `k` and just compute a value).
+    /// `lower_perform_non_io_to_value` calls this for non-IO
+    /// effects; the result is a `*mut NextStep` of tag `CALL`
+    /// pointing at the matching arm fn. The Call NextStep is then
+    /// passed to `sigil_run_loop` (`run_loop_ref`) which dispatches
+    /// it (invokes the arm fn with packed args) and returns the
+    /// final `Done` value as u64.
     perform_ref: FuncRef,
+    /// Plan B Task 55 (Phase 3b) — `sigil_run_loop` runtime ref.
+    /// Called by `lower_perform_non_io_to_value` to drive the CPS
+    /// trampoline from the `NextStep::Call` returned by
+    /// `sigil_perform`. Returns the final `NextStep::Done`'s value
+    /// as u64; native code uses this directly.
+    run_loop_ref: FuncRef,
     /// Plan B Task 55 (Phase 3b) — per-handle-span synthetic arm fn
     /// refs. Used by `Expr::Handle` codegen to emit `func_addr`
     /// pointers for `sigil_handler_frame_set_arm`. Keyed by the
@@ -2026,11 +2049,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
     /// Plan B Task 55 (Phase 3b) — lower a non-IO `perform Effect.op(...)`
     /// site. Phase 3b minimum: zero-arg op (`args_len == 0`,
-    /// `args_ptr == null`), null continuation (arms ignore `k`), and
-    /// the arm always returns `NextStep::Done` — so the perform's
-    /// value is `(*next_step).value` at offset 24, read as i64.
-    /// The op's declared return type determines the Cranelift type
-    /// of the resulting value (looked up from `self.effects`).
+    /// `args_ptr == null`), null continuation (arms ignore `k`).
+    /// `sigil_perform` returns a `NextStep::Call` that targets the
+    /// matching arm fn; we hand that off to `sigil_run_loop`, which
+    /// drives the CPS trampoline to a terminal `NextStep::Done` and
+    /// returns the value as u64. Native code uses the u64 directly
+    /// (cast to i64 via the type system; for Int returns this is the
+    /// raw untagged Int per the Plan B Int ABI).
     fn lower_perform_non_io_to_value(&mut self, p: &crate::ast::PerformExpr) -> Value {
         // Phase 3b restriction: non-IO performs in handle bodies can
         // only have zero user args (the `unsupported_handle_construct`
@@ -2075,14 +2100,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         );
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, perform_call));
-        let next_step_ptr = self.builder.inst_results(perform_call)[0];
-        // NextStep layout: tag(4) + arg_count(4) + closure_ptr(8) +
-        // fn_ptr(8) + value(8) = value at offset 24. Phase 3b
-        // assumes arms always return Done; tag check is omitted.
-        // Phase 4+ adds tag dispatch when arms can return Call.
-        self.builder
+        let call_next_step = self.builder.inst_results(perform_call)[0];
+        // `sigil_perform` returns a `NextStep::Call` (it builds the
+        // Call to the arm + (k_closure, k_fn); it does not invoke
+        // the arm itself). Hand off to `sigil_run_loop` which
+        // dispatches the Call (invokes the arm), then any further
+        // Calls the arm returns, until a terminal `Done(value)`.
+        // Returns u64 — cast to i64 for native consumption.
+        let run_loop_call = self
+            .builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), next_step_ptr, 24)
+            .call(self.run_loop_ref, &[call_next_step]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
+        self.builder.inst_results(run_loop_call)[0]
     }
 
     /// Lower an expression to an SSA value. The value's Cranelift
