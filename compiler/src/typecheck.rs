@@ -330,6 +330,24 @@ pub struct CheckedProgram {
     /// `List`), not the ctor name, since the type's generic parameters
     /// are what got instantiated.
     pub ctor_site_instantiations: BTreeMap<Span, GenericInstantiation>,
+    /// Plan B task 54 — effect declaration registry. Built in the
+    /// top-level pre-pass; keyed by effect name. Stored on the
+    /// `CheckedProgram` so Task 55's CPS transform can look up
+    /// operation signatures for each `perform` and `handle` site
+    /// without re-scanning the program.
+    ///
+    /// Duplicate effect names emit E0136 at the second declaration's
+    /// name span; the first declaration wins in this map. Within an
+    /// effect, duplicate operation names emit E0137 at the second
+    /// op's name span; the first op wins inside the registered
+    /// `EffectDecl::ops`.
+    ///
+    /// Effect declarations remain user-visible-staged via E0133 in
+    /// Task 54 (the registry is populated even when E0133 fires, so
+    /// internal handler typing and op-arm binding extension work
+    /// regardless of whether the program would compile end-to-end);
+    /// the gate lifts in Task 55.
+    pub effects: BTreeMap<String, EffectDecl>,
 }
 
 /// Where a constructor is registered. Indexes a `TypeDecl` in the
@@ -423,6 +441,57 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // `use_id` (when `id` is declared further down the file) now
     // hits the polymorphic scheme rather than a stale Unit-fallback
     // `fn_env` entry.
+    // Pre-pass 1c (Plan B task 54): build the effect registry.
+    // Effect names share a single flat namespace; duplicates surface
+    // as E0136 against the second offender's name span (first wins
+    // in the registry so downstream typing always picks a single
+    // canonical operation set per effect name). Within an effect
+    // body, operation names share a single namespace; duplicates
+    // surface as E0137 against the second op's name span (first
+    // wins inside the registered `EffectDecl::ops`).
+    //
+    // Building the registry here (in the same Vec<CompilerError>
+    // slot the types pre-pass uses) lets later effect-decl walks
+    // (`Item::Effect`'s typecheck arm, `Expr::Handle`'s op-arm env
+    // extension, `check_perform`'s non-IO dispatch) consult the
+    // canonical EffectDecl rather than re-scanning the program.
+    // E0133 still fires per `Item::Effect` to keep partial Plan B
+    // programs from reaching codegen until Task 55 lands the CPS
+    // expansion — see [DEVIATION Task 54] entry on the staged-
+    // gate strategy.
+    let mut effects: BTreeMap<String, EffectDecl> = BTreeMap::new();
+    for item in &program.items {
+        if let Item::Effect(ed) = item {
+            if effects.contains_key(&ed.name) {
+                errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0136"),
+                    ed.name_span.clone(),
+                    format!("duplicate effect declaration `{}`", ed.name),
+                ));
+            } else {
+                let mut canonical = (**ed).clone();
+                let mut seen_ops: BTreeMap<String, Span> = BTreeMap::new();
+                let mut deduped_ops: Vec<EffectOp> = Vec::with_capacity(canonical.ops.len());
+                for op in canonical.ops.drain(..) {
+                    if let Some(_first) = seen_ops.get(&op.name) {
+                        errors.push(CompilerError::new(
+                            Severity::Error,
+                            errors::code("E0137"),
+                            op.name_span.clone(),
+                            format!("duplicate operation `{}` on effect `{}`", op.name, ed.name),
+                        ));
+                    } else {
+                        seen_ops.insert(op.name.clone(), op.name_span.clone());
+                        deduped_ops.push(op);
+                    }
+                }
+                canonical.ops = deduped_ops;
+                effects.insert(ed.name.clone(), canonical);
+            }
+        }
+    }
+
     let fn_env: BTreeMap<String, Ty> = builtin_fn_env();
     let mut tc = Tc {
         errors,
@@ -441,6 +510,8 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         current_row_var_subst: BTreeMap::new(),
         pending_call_instantiations: Vec::new(),
         pending_ctor_instantiations: Vec::new(),
+        effects,
+        handler_scopes: Vec::new(),
     };
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
@@ -531,18 +602,21 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 }
                 tc.current_generic_subst = saved_generic_subst;
             }
-            // Plan B task 53 — `effect Name[T] { op: ... }` is parsed
-            // but the registry build, row-polymorphic effect typing,
-            // and the linearity check all land in Task 54. Emit
-            // `E0133` once per effect declaration so partial Plan B
-            // programs cannot reach downstream passes; still walk the
-            // op-decl types so an unrelated type error in an op's
-            // signature surfaces in the same pass.
+            // Plan B task 54 — `effect Name[T] { op: ... }` has been
+            // pre-passed into `tc.effects`; this arm emits the staged
+            // `E0133` gate (kept live until Task 55 lifts it together
+            // with E0134, so well-formed programs cannot reach the
+            // CPS-pending codegen path) and walks the op-decl types
+            // so any unrelated type error in an op signature surfaces
+            // in the same pass.
             Item::Effect(ed) => {
                 tc.push_error(
                     "E0133",
                     ed.span.clone(),
-                    format!("`effect {}` is not yet supported (Plan B Task 54)", ed.name),
+                    format!(
+                        "`effect {}` is recognised but not yet runnable (Plan B Task 55)",
+                        ed.name
+                    ),
                 );
                 let saved_generic_subst = std::mem::take(&mut tc.current_generic_subst);
                 let (gs, _) = tc.fresh_generic_subst(&ed.generic_params);
@@ -680,6 +754,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             fn_schemes: tc.fn_schemes,
             call_site_instantiations: resolved_calls,
             ctor_site_instantiations: resolved_ctors,
+            effects: tc.effects,
         },
         tc.errors,
     )
@@ -821,6 +896,42 @@ struct Tc {
     /// `subst` at end of typecheck to produce
     /// `CheckedProgram::ctor_site_instantiations`.
     pending_ctor_instantiations: Vec<(Span, String, Vec<u32>)>,
+    /// Plan B task 54 — effect declaration registry. Mirror of
+    /// `CheckedProgram.effects`, moved into the checked program at
+    /// typecheck completion. Populated by the top-level pre-pass; the
+    /// `Item::Effect` walk consults this rather than rebuilding it.
+    /// `check_perform` and `check_handle` look operations up here.
+    effects: BTreeMap<String, EffectDecl>,
+    /// Plan B task 54 — stack of in-flight handler scopes. Each scope
+    /// records, per discharged effect name, the generic-parameter
+    /// substitution allocated *once* at handle-expr entry. Pushed
+    /// when the handler body is checked, popped when the body walk
+    /// completes; arm bodies and the optional return-arm body run
+    /// after the pop, so they do not see the discharged effects in
+    /// scope.
+    ///
+    /// Within a body walk, `check_perform` consults this stack (top-
+    /// down) to find an existing substitution for the performed
+    /// effect — keeping cross-perform / cross-arm generic-parameter
+    /// instantiation consistent within a single handle. A `perform`
+    /// of an effect not on the stack falls through to a fresh
+    /// allocation, matching pre-Task-54 behaviour.
+    ///
+    /// Empty during normal fn body walks (no enclosing handle); only
+    /// non-empty inside `check_handle`'s body recursion.
+    handler_scopes: Vec<HandlerScope>,
+}
+
+/// Plan B task 54 — one handler's effect-instantiation cache.
+/// Allocated at `check_handle` entry; consumed by `check_perform`
+/// inside the handler body via the `Tc.handler_scopes` stack.
+#[derive(Clone, Debug, Default)]
+struct HandlerScope {
+    /// `effect_name -> (effect's generic-param name -> fresh Ty::Var)`.
+    /// The inner map carries the same shape as `Tc.current_generic_subst`,
+    /// so it plugs directly into `ty_from_type_expr` when resolving
+    /// op param / return types.
+    effect_substs: BTreeMap<String, BTreeMap<String, Ty>>,
 }
 
 impl Tc {
@@ -1860,7 +1971,7 @@ impl Tc {
                     let _ = self.check_expr(e, row);
                 }
                 Stmt::Perform(p) => {
-                    self.check_perform(p, row);
+                    let _ = self.check_perform(p, row);
                 }
                 Stmt::Let(l) => {
                     // Plan B task 48: let-binding annotation may now
@@ -1909,7 +2020,7 @@ impl Tc {
         }
     }
 
-    fn check_perform(&mut self, p: &PerformExpr, row: &[String]) {
+    fn check_perform(&mut self, p: &PerformExpr, row: &[String]) -> Option<Ty> {
         if !row.iter().any(|e| e == &p.effect) {
             self.push_error(
                 "E0042",
@@ -1920,7 +2031,9 @@ impl Tc {
                 ),
             );
         }
-        // Stage 1 only understands IO.println(String).
+        // Stage 1 only understands IO.println(String); IO is still
+        // hard-wired here. Plan B Task 57 will refactor IO into a
+        // registry-driven effect alongside the other ones below.
         if p.effect == "IO" && p.op == "println" {
             if p.args.len() != 1 {
                 self.push_error(
@@ -1931,7 +2044,14 @@ impl Tc {
                         p.args.len()
                     ),
                 );
-                return;
+                // Recovery returns `Some(Ty::Unit)` here — `IO.println`
+                // is hard-coded as `String -> Unit` and `Unit` is the
+                // op's actual declared return type, so the recovery
+                // shape matches what the registry path returns for a
+                // non-IO op (its `op_ret_ty.deref(...)`). When Task 57
+                // moves IO into the registry, both branches collapse
+                // into the same `op_ret_ty`-driven recovery.
+                return Some(Ty::Unit);
             }
             match self.check_expr(&p.args[0], row) {
                 Some(Ty::String) => {}
@@ -1947,26 +2067,120 @@ impl Tc {
                 }
                 None => {}
             }
-        } else if p.effect == "IO" {
-            // Plan A1 only recognises IO.println. Other IO ops arrive with
-            // Plan B's effect-handler dispatch. Reuse E0042 — the user-facing
-            // message is about an effect-surface shape the checker does not
-            // know how to dispatch, which is the same category as "effect not
-            // in row".
+            return Some(Ty::Unit);
+        }
+        if p.effect == "IO" {
+            // Plan A1 only recognises IO.println. Other IO ops arrive
+            // with Task 57's IO refactor; Stage 1 still rejects them.
+            // Walk the args so any nested type errors surface.
+            for a in &p.args {
+                let _ = self.check_expr(a, row);
+            }
             self.push_error(
                 "E0042",
                 p.span.clone(),
                 format!("`IO.{}` is not a Plan A1 operation", p.op),
             );
-        } else {
-            // Non-IO perform sites arrive in later plans; Stage 1 treats
-            // them as unknown and recovers.
-            self.push_error(
-                "E0042",
-                p.span.clone(),
-                format!("`perform {}.{}` is not a Plan A1 operation", p.effect, p.op),
-            );
+            return Some(Ty::Unit);
         }
+        // Plan B task 54 — non-IO effects dispatch through the
+        // typechecker's effect registry built in the top-level
+        // pre-pass. The lookup needs to clone the operation out of
+        // the registry to avoid borrowing `self.effects` while the
+        // arg-typing recursion immutably borrows `self`.
+        let eff_decl = match self.effects.get(&p.effect).cloned() {
+            Some(d) => d,
+            None => {
+                // Unknown effect. Mirror the existing IO-unknown-op
+                // branch: emit E0042 specifically for the "not in
+                // registry" case so a user who writes
+                // `fn f() -> Int ![Foo] { perform Foo.bar() }`
+                // (Foo listed in row but never declared) sees a
+                // diagnostic pointing at the missing declaration
+                // even though the row-membership check above
+                // accepted Foo. Walk args for nested errors, then
+                // recover.
+                self.push_error(
+                    "E0042",
+                    p.span.clone(),
+                    format!(
+                        "unknown effect `{eff}` — declare it via `effect {eff} {{ ... }}` or remove the `perform`",
+                        eff = p.effect,
+                    ),
+                );
+                for a in &p.args {
+                    let _ = self.check_expr(a, row);
+                }
+                return None;
+            }
+        };
+        let op = match eff_decl.ops.iter().find(|o| o.name == p.op) {
+            Some(o) => o.clone(),
+            None => {
+                self.push_error(
+                    "E0042",
+                    p.span.clone(),
+                    format!(
+                        "operation `{op}` is not declared on effect `{eff}`",
+                        op = p.op,
+                        eff = p.effect,
+                    ),
+                );
+                for a in &p.args {
+                    let _ = self.check_expr(a, row);
+                }
+                return None;
+            }
+        };
+        // Compute op param types and return type under the effect's
+        // own generic substitution. If we're inside a `handle ...
+        // with { ... }` block whose body discharges this effect,
+        // reuse the substitution allocated at handle-expr entry —
+        // that's what keeps cross-perform / cross-arm generic-
+        // parameter instantiation consistent for a single handler.
+        // Otherwise allocate fresh, matching the per-call HM
+        // pattern. Restore the caller's `current_generic_subst`
+        // before walking arg expressions so the args use the
+        // surrounding fn's generic scope, not the effect's.
+        let saved_subst = std::mem::take(&mut self.current_generic_subst);
+        let eff_subst = self
+            .handler_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.effect_substs.get(&p.effect).cloned())
+            .unwrap_or_else(|| self.fresh_generic_subst(&eff_decl.generic_params).0);
+        self.current_generic_subst = eff_subst;
+        let param_tys: Vec<Option<Ty>> = op
+            .params
+            .iter()
+            .map(|t| self.ty_from_type_expr_here(t))
+            .collect();
+        let op_ret_ty = self.ty_from_type_expr_here(&op.return_type);
+        self.current_generic_subst = saved_subst;
+        if p.args.len() != op.params.len() {
+            self.push_error(
+                "E0043",
+                p.span.clone(),
+                format!(
+                    "`{eff}.{op}` takes {expected} argument(s); got {actual}",
+                    eff = p.effect,
+                    op = p.op,
+                    expected = op.params.len(),
+                    actual = p.args.len(),
+                ),
+            );
+            for a in &p.args {
+                let _ = self.check_expr(a, row);
+            }
+            return op_ret_ty.map(|t| self.deref(&t));
+        }
+        for (i, arg) in p.args.iter().enumerate() {
+            let arg_ty = self.check_expr(arg, row);
+            if let (Some(at), Some(pt)) = (arg_ty, param_tys.get(i).and_then(|x| x.clone())) {
+                let _ = self.unify_ty(&pt, &at, &arg.span());
+            }
+        }
+        op_ret_ty.map(|t| self.deref(&t))
     }
 
     fn check_expr(&mut self, e: &Expr, row: &[String]) -> Option<Ty> {
@@ -2040,10 +2254,7 @@ impl Tc {
                 }
                 self.check_call(callee, args, span.clone(), row)
             }
-            Expr::Perform(p) => {
-                self.check_perform(p, row);
-                Some(Ty::Unit)
-            }
+            Expr::Perform(p) => self.check_perform(p, row),
             Expr::BoolLit(_, _) => Some(Ty::Bool),
             Expr::CharLit(_, _) => Some(Ty::Char),
             Expr::Binary { op, lhs, rhs, .. } => {
@@ -2137,35 +2348,22 @@ impl Tc {
             Expr::RecordLit { name, fields, span } => {
                 self.resolve_ctor_record_use(name, fields, span, row)
             }
-            // Plan B task 53 — `handle <body> with { ... }` is parsed
-            // but its typing rules (handler signature, effect-row
-            // discharge, one-shot linearity check) land in Task 54.
-            // Emit `E0134` to keep partial Plan B programs from
-            // reaching downstream passes, then walk the children so
-            // any nested type errors still surface in the same compile
-            // pass (the user can fix them in parallel with waiting
-            // for Task 54). Returns `None` so the surrounding context
-            // does not double-report on the resulting type.
+            // Plan B task 54 — `handle <body> with { ... }` runs
+            // proper handler typing (env extension for op-arm params
+            // and continuation `k`, body-row extension with
+            // discharged effects, residual row equal to caller's
+            // row, cross-arm unification through a single
+            // handler-overall type, one-shot linearity check via
+            // E0220). The staged-feature gate `E0134` still fires
+            // so that no well-formed `handle` reaches the CPS-pending
+            // codegen path until Task 55 lands the lowering — see
+            // [DEVIATION Task 54] entry on the staged-gate strategy.
             Expr::Handle {
                 body,
                 return_arm,
                 op_arms,
                 span,
-            } => {
-                self.push_error(
-                    "E0134",
-                    span.clone(),
-                    "`handle` expression is not yet supported (Plan B Task 54)",
-                );
-                let _ = self.check_expr(body, row);
-                if let Some(ra) = return_arm {
-                    let _ = self.check_expr(&ra.body, row);
-                }
-                for arm in op_arms {
-                    let _ = self.check_expr(&arm.body, row);
-                }
-                None
-            }
+            } => self.check_handle(body, return_arm.as_deref(), op_arms, span.clone(), row),
         }
     }
 
@@ -2498,6 +2696,362 @@ impl Tc {
         }
 
         Some(Ty::Fn(Box::new(sig)))
+    }
+
+    /// Plan B task 54 — full handler typing for `handle <body> with
+    /// { return(v) => ..., Effect.op(p1, ..., k) => ..., ... }`.
+    ///
+    /// Walks the handler in three phases:
+    ///
+    /// 1. **Effect dispatch table.** Each op_arm names `Effect.op`; we
+    ///    look the effect up in `self.effects`, look the operation up
+    ///    in the effect's declared op list, and gather them into a
+    ///    deduplicated `(effect, op) -> arm-info` index. Diagnostics
+    ///    along the way: `E0138` (unknown effect), `E0139` (op not
+    ///    declared on a known effect), `E0140` (two arms target the
+    ///    same op). `E0141` fires when an arm's user-parameter count
+    ///    disagrees with the operation's declared parameter count
+    ///    (the trailing continuation `k` is implicit and always
+    ///    present in the AST, so the comparison is `arm.params.len()
+    ///    == op.params.len()`).
+    ///
+    /// 2. **Body walk.** The body is checked under a row that
+    ///    includes the surrounding fn's row plus every discharged
+    ///    effect (deduped). The handler-effect substitution stack is
+    ///    pushed before the recursion so any `perform Effect.op(...)`
+    ///    sites inside the body share the same fresh substitution
+    ///    that the matching op-arm will install — this is what keeps
+    ///    cross-arm / cross-perform generic-parameter instantiation
+    ///    consistent inside a single handler.
+    ///
+    /// 3. **Arm walks + linearity check.** The handler's overall type
+    ///    is allocated as a fresh type variable; the body's type
+    ///    (or the return-arm's body type, when a `return` arm is
+    ///    present) unifies into it. Each op-arm's bindings (user
+    ///    params + the continuation `k`) are installed into a
+    ///    snapshot/restore env scope; the arm body is checked under
+    ///    the *caller's* row and unified against the handler's
+    ///    overall type. Finally, one-shot linearity: arms for
+    ///    effects declared **without** `resumes: many` walk a
+    ///    syntactic-occurrence counter (`count_continuation_uses`)
+    ///    that emits `E0220` when `k` is referenced more than once
+    ///    along any path through the arm body, or anywhere inside a
+    ///    lambda body (the conservative-capture rule).
+    ///
+    /// After the three phases, `E0134` fires to keep the program from
+    /// reaching CPS-pending codegen. The internally computed handler
+    /// type is still returned so the surrounding context does not
+    /// double-report on a `let n: Int = handle ...` mismatch — only
+    /// the single staged-gate diagnostic per `handle` expression.
+    fn check_handle(
+        &mut self,
+        body: &Expr,
+        return_arm: Option<&HandleReturnArm>,
+        op_arms: &[HandleOpArm],
+        span: Span,
+        row: &[String],
+    ) -> Option<Ty> {
+        // ---------- Phase 1: dispatch table ----------
+        // Per-arm collected info that the arm walk consumes. Done
+        // outside the arm loop so we see the full picture before
+        // typing arm bodies (and so duplicates / arity mismatches
+        // surface even when later analysis short-circuits).
+        //
+        // `have_op` distinguishes "effect+op resolved cleanly" (full
+        // typing applies, linearity check runs) from "registry lookup
+        // failed" (we still install Ty::Unit-fallback bindings + walk
+        // the arm body so structural diagnostics inside the arm
+        // surface alongside the registry diagnostic). The split keeps
+        // Task 53's "walk all arm bodies" contract intact even when
+        // E0138 / E0139 fire.
+        struct ArmTyping {
+            user_param_tys: Vec<Option<Ty>>,
+            op_ret_ty: Option<Ty>,
+            resumes_many: bool,
+            have_op: bool,
+        }
+        let mut effect_substs: BTreeMap<String, BTreeMap<String, Ty>> = BTreeMap::new();
+        let mut seen_arms: BTreeMap<(String, String), Span> = BTreeMap::new();
+        let mut arm_typings: Vec<ArmTyping> = Vec::with_capacity(op_arms.len());
+        let mut discharged: Vec<String> = Vec::new();
+        for arm in op_arms {
+            let mut user_param_tys: Vec<Option<Ty>> = Vec::new();
+            let mut op_ret_ty: Option<Ty> = None;
+            let mut resumes_many = false;
+            let mut have_op = false;
+            // Effect + op lookup (E0138 / E0139). Both diagnostics
+            // run before the duplicate-arm check so a typo'd effect
+            // surfaces both errors — the user should see the spelling
+            // problem and the redundancy in one compile pass.
+            match self.effects.get(&arm.effect).cloned() {
+                None => {
+                    self.push_error(
+                        "E0138",
+                        arm.effect_span.clone(),
+                        format!(
+                            "handler arm references unknown effect `{eff}` — declare it via `effect {eff} {{ ... }}`",
+                            eff = arm.effect,
+                        ),
+                    );
+                }
+                Some(eff_decl) => {
+                    resumes_many = eff_decl.resumes_many;
+                    match eff_decl.ops.iter().find(|o| o.name == arm.op).cloned() {
+                        None => {
+                            self.push_error(
+                                "E0139",
+                                arm.op_span.clone(),
+                                format!(
+                                    "operation `{op}` is not declared on effect `{eff}`",
+                                    op = arm.op,
+                                    eff = arm.effect,
+                                ),
+                            );
+                        }
+                        Some(op) => {
+                            have_op = true;
+                            // Track discharged effect for body-row
+                            // extension (dedupe by name; the seen_arms
+                            // map below dedupes by (effect, op)).
+                            if !discharged.contains(&arm.effect) {
+                                discharged.push(arm.effect.clone());
+                            }
+                            // Allocate the effect's generic subst
+                            // once across all arms in this handle and
+                            // across `perform` sites in the body.
+                            if !effect_substs.contains_key(&arm.effect) {
+                                let (subst, _) = self.fresh_generic_subst(&eff_decl.generic_params);
+                                effect_substs.insert(arm.effect.clone(), subst);
+                            }
+                            let eff_subst =
+                                effect_substs.get(&arm.effect).cloned().unwrap_or_default();
+                            // Compute op param tys + ret ty under the
+                            // effect's subst. Save/restore so arm body
+                            // checking (which runs with caller's
+                            // subst) sees the surrounding fn's
+                            // generics, not the effect's.
+                            let saved = std::mem::take(&mut self.current_generic_subst);
+                            self.current_generic_subst = eff_subst;
+                            user_param_tys = op
+                                .params
+                                .iter()
+                                .map(|t| self.ty_from_type_expr_here(t))
+                                .collect();
+                            op_ret_ty = self.ty_from_type_expr_here(&op.return_type);
+                            self.current_generic_subst = saved;
+                            // Arity check between arm's user-binding
+                            // count and op's declared param count.
+                            // The continuation `k` is implicit and the
+                            // parser guarantees it's always present,
+                            // so we only compare user-side counts.
+                            if arm.params.len() != op.params.len() {
+                                self.push_error(
+                                    "E0141",
+                                    arm.span.clone(),
+                                    format!(
+                                        "handler arm for `{eff}.{op}` has {actual} parameter(s) before `{k}`, but `{op}` declares {expected}",
+                                        eff = arm.effect,
+                                        op = arm.op,
+                                        k = arm.k_name,
+                                        actual = arm.params.len(),
+                                        expected = op.params.len(),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // Duplicate-arm check (E0140). Always runs; even arms
+            // whose effect+op didn't resolve still get duplicate-
+            // checked so a typo that *coincidentally* matches an
+            // earlier typo surfaces both diagnostics.
+            let key = (arm.effect.clone(), arm.op.clone());
+            match seen_arms.entry(key) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(arm.span.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    self.push_error(
+                        "E0140",
+                        arm.span.clone(),
+                        format!(
+                            "duplicate handler arm for `{eff}.{op}` — the first arm above wins; this one is unreachable",
+                            eff = arm.effect,
+                            op = arm.op,
+                        ),
+                    );
+                }
+            }
+            arm_typings.push(ArmTyping {
+                user_param_tys,
+                op_ret_ty,
+                resumes_many,
+                have_op,
+            });
+        }
+
+        // ---------- Phase 2: body walk ----------
+        // body_row = caller's literal effects ∪ discharged effects.
+        // The contains check above already prevents duplicates from
+        // appearing in the new tail entries; the surface row from
+        // `parse_effect_row` is itself dedup'd by the parser, so no
+        // post-loop sort/dedup is required. We don't thread a row
+        // variable through this list either: the typechecker's per-
+        // call row check is literal-membership only; the active row
+        // variable on `self.current_row_var_subst` continues to
+        // apply for downstream call-site subsumption.
+        let mut body_row: Vec<String> = row.to_vec();
+        for e in &discharged {
+            if !body_row.contains(e) {
+                body_row.push(e.clone());
+            }
+        }
+        // Push handler scope for this body's `perform` sites.
+        self.handler_scopes.push(HandlerScope {
+            effect_substs: effect_substs.clone(),
+        });
+        let body_ty = self.check_expr(body, &body_row);
+        self.handler_scopes.pop();
+
+        // ---------- Phase 3: handler-overall type + arm walks ----------
+        // Allocate a fresh handler-overall var; cross-arm unification
+        // collapses it to a concrete type whenever any branch pins
+        // it. If the program is malformed enough that nothing pins
+        // the var, `E0132` would fire upstream — but `handle` doesn't
+        // have a generic-instantiation pending list, so an unpinned
+        // overall type just stays as a `?N` in displays. Diagnostics
+        // upstream will have fired before that ever surfaces.
+        //
+        // **TODO(Plan B Task 55):** when the E0134 staged-feature
+        // gate is lifted, well-formed programs whose body is a fresh
+        // var (e.g., `handle perform E.op() with { E.op(k) => k(0) }`
+        // where the body's only typing constraint comes through the
+        // op-arm via k) could leave the handler-overall var
+        // unsolved. Decide before merge: pin via the body's
+        // perform-call return type's constraint chain, or surface a
+        // clearer "cannot infer handler return type" diagnostic
+        // (E0132-style ambiguous polymorphism). Today the gate fires
+        // first so this case is unreachable in user-visible output.
+        let handler_overall_id = self.fresh_ty_var();
+        let handler_overall = Ty::Var(handler_overall_id);
+
+        // Body's type flows into the handler. With a `return` arm,
+        // the body's value is bound to `v` and the return arm's body
+        // is what unifies with the handler-overall; without a
+        // `return` arm, the body's value flows directly through.
+        match return_arm {
+            Some(ra) => {
+                // Bind v: body_ty (or a fresh var if body_ty is
+                // unknown). The return arm body runs at caller's
+                // row; install the binding into the env via a
+                // snapshot/restore so it doesn't leak.
+                let v_ty = body_ty
+                    .clone()
+                    .unwrap_or_else(|| Ty::Var(self.fresh_ty_var()));
+                let saved_env = self.env.clone();
+                // Direct insert (not env_insert): the return-arm
+                // binding is a fresh inner scope and may shadow an
+                // outer name. The env_insert debug-assert exists for
+                // the *function-level* no-shadowing contract.
+                self.env.insert(ra.binding.clone(), v_ty);
+                let ra_ty = self.check_expr(&ra.body, row);
+                self.env = saved_env;
+                if let Some(rt) = ra_ty {
+                    let _ = self.unify_ty(&handler_overall, &rt, &ra.span);
+                }
+            }
+            None => {
+                if let Some(bt) = body_ty {
+                    let _ = self.unify_ty(&handler_overall, &bt, &body.span());
+                }
+            }
+        }
+
+        // Op-arm walks. Every arm body is walked under bindings —
+        // even arms whose registry lookup failed install Ty::Unit-
+        // fallback bindings for their declared params + continuation
+        // so structural diagnostics inside the arm body surface
+        // alongside the registry diagnostic instead of cascading into
+        // E0046s on the params/k references. The unify-with-overall
+        // step and the one-shot linearity check are gated on
+        // `have_op` (they only make sense once we know the op
+        // signature).
+        for (arm, typing) in op_arms.iter().zip(arm_typings.iter()) {
+            let saved_env = self.env.clone();
+            // Install user-param bindings; pad short user_param_tys
+            // (registry lookup failed, or arity mismatched low) with
+            // Ty::Unit so every declared name is bound.
+            for (i, p) in arm.params.iter().enumerate() {
+                let pty = typing
+                    .user_param_tys
+                    .get(i)
+                    .and_then(|x| x.clone())
+                    .unwrap_or(Ty::Unit);
+                self.env.insert(p.name.clone(), pty);
+            }
+            // Continuation `k`: typed as `Fn(op_ret_ty) ->
+            // handler_overall ![caller_row]`. Effect row is the
+            // caller's row literally — `k` runs the remainder of the
+            // surrounding fn's computation, so it sees that fn's
+            // effects. When op_ret_ty couldn't be resolved (E0138 /
+            // E0139 path), default to Ty::Unit; the binding still
+            // lets references to `k` inside the arm body resolve
+            // without firing spurious E0046.
+            let k_param_ty = typing.op_ret_ty.clone().unwrap_or(Ty::Unit);
+            let k_ty = Ty::Fn(Box::new(FnSig {
+                params: vec![k_param_ty],
+                ret: handler_overall.clone(),
+                effects: row.to_vec(),
+                effect_row_var: self.lookup_active_row_var(),
+            }));
+            self.env.insert(arm.k_name.clone(), k_ty);
+            // Arm body runs at caller's row (the discharged effect is
+            // *not* in scope here — we are servicing it).
+            let arm_ty = self.check_expr(&arm.body, row);
+            self.env = saved_env;
+            // Unify arm body type with handler-overall only when the
+            // op resolved cleanly; an arm whose registry lookup
+            // failed has nothing meaningful to unify against (and
+            // forcing the unification can produce cascade errors
+            // against the fresh handler-overall var).
+            if typing.have_op {
+                if let Some(at) = arm_ty {
+                    let _ = self.unify_ty(&handler_overall, &at, &arm.body.span());
+                }
+                // One-shot linearity: only meaningful for cleanly-
+                // resolved arms. Multi-shot effects skip the check.
+                if !typing.resumes_many {
+                    let uses = count_continuation_uses(&arm.body, &arm.k_name);
+                    if uses > 1 {
+                        self.push_error(
+                            "E0220",
+                            arm.body.span(),
+                            format!(
+                                "one-shot continuation `{k}` used more than once along a path in this arm — `{eff}` is one-shot (default); declare `effect {eff} resumes: many {{ ... }}` to opt in to multi-shot semantics",
+                                k = arm.k_name,
+                                eff = arm.effect,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        // ---------- Staged-feature gate ----------
+        // E0134 fires once per `handle` expression so partial Plan B
+        // programs cannot reach the CPS-pending codegen path until
+        // Task 55 lands. The internal typing above still ran so
+        // arm-body diagnostics (E0046, E0220, E0044) and registry
+        // diagnostics (E0138, E0139, E0140, E0141) surface alongside
+        // the gate.
+        self.push_error(
+            "E0134",
+            span,
+            "`handle` expression is recognised but not yet runnable (Plan B Task 55)",
+        );
+
+        Some(self.deref(&handler_overall))
     }
 
     /// Typing rule for `match` expressions.
@@ -3731,6 +4285,183 @@ fn is_exhaustive(scrut: &Ty, arms: &[MatchArm]) -> bool {
     }
 }
 
+/// Plan B task 54 — count syntactic occurrences of `k_name` along
+/// the maximal-use path through `expr`, used by the one-shot
+/// linearity check (E0220).
+///
+/// Branching constructs (`if`, `match` arms, nested `handle` arm
+/// bodies) take the **max** of branch counts; sequential composition
+/// (block statements, binary/call argument lists, etc.) takes the
+/// **sum**. Counts saturate at 2 — the linearity check only needs
+/// the > 1 vs <= 1 distinction.
+///
+/// Lambdas: any reference to `k_name` from inside a lambda body
+/// saturates the count to 2 (the conservative-capture rule). A
+/// lambda's call frequency is not statically known — capturing `k`
+/// into a closure could invoke `k` repeatedly even if the lambda
+/// body has only a single syntactic `k(...)` call.
+///
+/// Shadowing: lexical bindings in patterns, arm-binding names,
+/// nested handle arms' own `k_name`, and `let` statements all
+/// suspend counting for their scope. The implementation keys on
+/// the surface name only; resolve.rs's no-shadowing pass keeps
+/// pattern-vs-let collisions out of the picture for ordinary
+/// programs, and the inner-scope `Stmt::Let` shadowing here is the
+/// stop-counting trigger for the rare deliberate-shadow case.
+pub(crate) fn count_continuation_uses(e: &Expr, k_name: &str) -> usize {
+    count_in_expr(e, k_name).min(2)
+}
+
+fn count_in_expr(e: &Expr, k_name: &str) -> usize {
+    match e {
+        Expr::IntLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => 0,
+        Expr::Ident(name, _) => {
+            if name == k_name {
+                1
+            } else {
+                0
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            let mut n = count_in_expr(callee, k_name);
+            for a in args {
+                n = saturating_add(n, count_in_expr(a, k_name));
+            }
+            n
+        }
+        Expr::Perform(p) => {
+            let mut n = 0usize;
+            for a in &p.args {
+                n = saturating_add(n, count_in_expr(a, k_name));
+            }
+            n
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            saturating_add(count_in_expr(lhs, k_name), count_in_expr(rhs, k_name))
+        }
+        Expr::Unary { operand, .. } => count_in_expr(operand, k_name),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            let nc = count_in_expr(cond, k_name);
+            let nt = count_in_block(then_block, k_name);
+            let ne = count_in_block(else_block, k_name);
+            saturating_add(nc, nt.max(ne))
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            let ns = count_in_expr(scrutinee, k_name);
+            let mut max_arm = 0usize;
+            for arm in arms {
+                let mut bindings = std::collections::BTreeSet::new();
+                pattern_bindings(&arm.pattern, &mut bindings);
+                if bindings.contains(k_name) {
+                    // The pattern shadows `k_name`; uses inside the
+                    // arm body resolve to the inner binding, not the
+                    // outer continuation. Skip counting.
+                    continue;
+                }
+                let n = count_in_expr(&arm.body, k_name);
+                if n > max_arm {
+                    max_arm = n;
+                }
+            }
+            saturating_add(ns, max_arm)
+        }
+        Expr::Block(b) => count_in_block(b, k_name),
+        Expr::Lambda { body, .. } => {
+            // Any reference inside a lambda body saturates to 2 —
+            // closure capture would let the surrounding code invoke
+            // `k` an unknown number of times. See [DEVIATION Task 54]
+            // entry "One-shot linearity check uses path-max
+            // syntactic counting; lambda capture is conservative".
+            if count_in_expr(body, k_name) > 0 {
+                2
+            } else {
+                0
+            }
+        }
+        // Post-CC nodes — typecheck runs strictly before closure
+        // conversion, so these never appear here.
+        Expr::ClosureRecord { .. } | Expr::ClosureEnvLoad { .. } => 0,
+        Expr::RecordLit { fields, .. } => {
+            let mut n = 0usize;
+            for f in fields {
+                n = saturating_add(n, count_in_expr(&f.value, k_name));
+            }
+            n
+        }
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            ..
+        } => {
+            // Body is its own scope but still references our k_name
+            // (the inner handle's body and the outer arm's body are
+            // both at the outer arm's caller-row level, so the outer
+            // k flows through). Inner arms' bindings can shadow our
+            // k_name — skip those.
+            let nb = count_in_expr(body, k_name);
+            let nra = match return_arm.as_ref() {
+                Some(ra) if ra.binding != k_name => count_in_expr(&ra.body, k_name),
+                _ => 0,
+            };
+            let mut max_arm = 0usize;
+            for arm in op_arms {
+                if arm.k_name == k_name || arm.params.iter().any(|p| p.name == k_name) {
+                    continue;
+                }
+                let n = count_in_expr(&arm.body, k_name);
+                if n > max_arm {
+                    max_arm = n;
+                }
+            }
+            saturating_add(nb, nra.max(max_arm))
+        }
+    }
+}
+
+fn count_in_block(b: &Block, k_name: &str) -> usize {
+    let mut n = 0usize;
+    let mut shadowed = false;
+    for s in &b.stmts {
+        if shadowed {
+            continue;
+        }
+        match s {
+            Stmt::Let(l) => {
+                n = saturating_add(n, count_in_expr(&l.value, k_name));
+                if l.name == k_name {
+                    shadowed = true;
+                }
+            }
+            Stmt::Expr(e) => {
+                n = saturating_add(n, count_in_expr(e, k_name));
+            }
+            Stmt::Perform(p) => {
+                for a in &p.args {
+                    n = saturating_add(n, count_in_expr(a, k_name));
+                }
+            }
+        }
+    }
+    if !shadowed {
+        if let Some(tail) = &b.tail {
+            n = saturating_add(n, count_in_expr(tail, k_name));
+        }
+    }
+    n
+}
+
+fn saturating_add(a: usize, b: usize) -> usize {
+    a.saturating_add(b).min(2)
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -3894,6 +4625,31 @@ mod tests {
             // a fall-through to the internal-only code.
             "effect Raise { fail: (String) -> Int }\nfn main() -> Int ![] { 0 }\n",
             "fn main() -> Int ![] { handle 0 with { E.op(k) => 0 } }\n",
+            // Plan B task 54: each new code added by handler typing
+            // gets its own user-reachable program in this sweep so the
+            // "no user-facing diagnostic uses E0001" discipline rule
+            // actually covers all reachable codes from this PR.
+            // E0136 — duplicate effect declaration:
+            "effect Raise { fail: () -> Int }\n\
+             effect Raise { other: () -> Int }\n\
+             fn main() -> Int ![] { 0 }\n",
+            // E0137 — duplicate operation in effect:
+            "effect Choose { pick: () -> Int, pick: (Int) -> Int }\n\
+             fn main() -> Int ![] { 0 }\n",
+            // E0138 — handler arm references unknown effect:
+            "fn main() -> Int ![] { handle 0 with { Raise.fail(msg, k) => 0 } }\n",
+            // E0139 — unknown op on declared effect:
+            "effect Raise { fail: (String) -> Int }\n\
+             fn main() -> Int ![] { handle 0 with { Raise.panic(msg, k) => 0 } }\n",
+            // E0140 — duplicate handler arm for same Effect.op:
+            "effect Raise { fail: (String) -> Int }\n\
+             fn main() -> Int ![] { handle 0 with { Raise.fail(m, k) => 0, Raise.fail(m2, k2) => 1 } }\n",
+            // E0141 — handler arm parameter arity mismatch:
+            "effect Raise { fail: (String) -> Int }\n\
+             fn main() -> Int ![] { handle 0 with { Raise.fail(msg, extra, k) => 0 } }\n",
+            // E0220 — one-shot continuation used more than once:
+            "effect Raise { fail: (String) -> Int }\n\
+             fn main() -> Int ![] { handle 0 with { Raise.fail(msg, k) => k(0) + k(1) } }\n",
         ];
         for src in programs {
             let errs = pipeline(src);
@@ -5720,6 +6476,8 @@ mod tests {
             current_row_var_subst: BTreeMap::new(),
             pending_call_instantiations: Vec::new(),
             pending_ctor_instantiations: Vec::new(),
+            effects: BTreeMap::new(),
+            handler_scopes: Vec::new(),
         }
     }
 
@@ -6214,6 +6972,630 @@ mod tests {
         assert!(
             !has_code(&errs, "E0001"),
             "must not surface E0001: {errs:?}"
+        );
+    }
+
+    // ===== Plan B task 54 — effect registry / handler typing / E0220 =====
+
+    #[test]
+    fn duplicate_effect_decl_is_e0136() {
+        // Two `effect Raise { ... }` declarations in one program. The
+        // second offender's name span gets E0136; the first declaration
+        // wins in the registry.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   effect Raise { other: () -> Int }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0136"), "expected E0136: {errs:?}");
+    }
+
+    #[test]
+    fn duplicate_op_in_effect_decl_is_e0137() {
+        // Two `pick` ops on `effect Choose { ... }`. The second
+        // occurrence's name span gets E0137; the first op wins inside
+        // the canonical EffectDecl.
+        let src = "effect Choose {\n\
+                     pick: () -> Int,\n\
+                     pick: (Int) -> Int,\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0137"), "expected E0137: {errs:?}");
+    }
+
+    #[test]
+    fn handle_unknown_effect_arm_is_e0138() {
+        // `Raise` is not declared anywhere; the arm's effect span
+        // gets E0138.
+        let src = "fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.fail(msg, k) => 0 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0138"), "expected E0138: {errs:?}");
+    }
+
+    #[test]
+    fn handle_unknown_op_on_known_effect_is_e0139() {
+        // `Raise` is declared with `fail` only; `panic` is unknown.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.panic(msg, k) => 0 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0139"), "expected E0139: {errs:?}");
+    }
+
+    #[test]
+    fn duplicate_handle_arm_is_e0140() {
+        // Two arms for the same `Raise.fail`; second is unreachable.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(msg, k) => 0,\n\
+                       Raise.fail(msg2, k2) => 1,\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0140"), "expected E0140: {errs:?}");
+    }
+
+    #[test]
+    fn handle_arm_arity_mismatch_is_e0141() {
+        // `fail: (String) -> Int` declares 1 user param; arm binds 2
+        // user params before `k`.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.fail(msg, extra, k) => 0 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0141"), "expected E0141: {errs:?}");
+    }
+
+    #[test]
+    fn handle_arm_param_bindings_no_spurious_e0046() {
+        // Task 53 review item 10: the arm body's references to op-
+        // declared params (`msg`) must resolve to a binding installed
+        // by the handler-typing walk. Without item 10, this would
+        // fire spurious E0046 alongside E0134.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn use_msg(s: String) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.fail(msg, k) => use_msg(msg) }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0046"),
+            "arm-param binding `msg` must not fire E0046; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_arm_k_binding_no_spurious_e0046() {
+        // Task 53 review item 10: arm body references to `k` must
+        // resolve to the continuation binding installed by check_handle.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.fail(msg, k) => k(0) }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0046"),
+            "continuation `k` binding must not fire E0046; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_return_arm_v_binding_no_spurious_e0046() {
+        // Task 53 review item 10 for the return-arm side: `v` must be
+        // bound in the return-arm body's env.
+        let src = "fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       return(v) => v,\n\
+                       E.op(k) => 0,\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0046"),
+            "return-arm binding `v` must not fire E0046; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_arm_param_typed_from_op_decl() {
+        // The arm's `msg` param is bound to `String` (from `fail`'s
+        // signature). Calling a `(Int) -> Int` fn with `msg` fires
+        // E0044 because msg is String, not Int — confirming the
+        // binding carries the op-declared type, not just `Unit`.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn double(n: Int) -> Int ![] { n + n }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.fail(msg, k) => double(msg) }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        // E0044 (or E0065 depending on path) for String passed where
+        // Int expected.
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0044"),
+            "expected E0044 for String→Int mismatch: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_body_can_perform_discharged_effect() {
+        // The handle body sees the discharged effect in its row, so
+        // `perform Raise.fail(...)` inside the body does not fire
+        // E0042 (effect-not-in-row) even though `Raise` is not in the
+        // surrounding fn's row.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle (perform Raise.fail(\"x\")) with {\n\
+                       Raise.fail(msg, k) => 0,\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        // E0134 still fires (gate), but no E0042 should fire for the
+        // body's perform.
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0042"),
+            "handle body's perform of discharged effect must not E0042: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_arm_body_perform_of_discharged_effect_fires_e0042() {
+        // Arm bodies run at caller's row level — the discharged
+        // effect is *not* in scope inside an arm body. This test
+        // pins that contract: a perform of `Raise.fail` inside the
+        // arm body fires E0042 because Raise is not in the
+        // surrounding fn's row (only the body sees it).
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(msg, k) => perform Raise.fail(\"loop\"),\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            has_code(&errs, "E0042"),
+            "arm-body perform of discharged effect must E0042 (caller's row only): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn perform_via_registry_typechecks() {
+        // A user-declared non-IO effect can be performed from a fn
+        // whose row lists it. The E0042 / IO special case do not
+        // apply; the registry route handles it. E0133 still fires
+        // because effect declarations stay gated until Task 55.
+        let src = "effect Log { write: (String) -> Unit }\n\
+                   fn main() -> Int ![Log] {\n\
+                     perform Log.write(\"hi\");\n\
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0133"), "expected E0133: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0042"),
+            "registered effect's perform must not E0042: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn perform_via_registry_arity_mismatch_is_e0043() {
+        // `Log.write: (String) -> Unit` declares 1 arg; calling with
+        // 2 args fires E0043.
+        let src = "effect Log { write: (String) -> Unit }\n\
+                   fn main() -> Int ![Log] {\n\
+                     perform Log.write(\"hi\", \"extra\");\n\
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0043"), "expected E0043: {errs:?}");
+    }
+
+    #[test]
+    fn perform_via_registry_arg_type_mismatch_is_e0044() {
+        // `Log.write: (String) -> Unit` declares String; calling
+        // with Int fires E0044 via unify_ty.
+        let src = "effect Log { write: (String) -> Unit }\n\
+                   fn main() -> Int ![Log] {\n\
+                     perform Log.write(42);\n\
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0044"), "expected E0044: {errs:?}");
+    }
+
+    #[test]
+    fn linearity_zero_uses_is_fine() {
+        // Early-exit handler (no `k` reference) is fine: zero uses.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.fail(msg, k) => 0 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0220"),
+            "zero uses of k is fine, must not E0220: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn linearity_one_use_is_fine() {
+        // Single `k` invocation is fine.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.fail(msg, k) => k(0) }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0220"),
+            "single use of k is fine, must not E0220: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn linearity_two_uses_in_sequence_is_e0220() {
+        // Sequential composition (block stmt + tail; binary op) sums
+        // counts. Two uses on the same path: E0220.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.fail(msg, k) => k(0) + k(1) }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0220"), "expected E0220: {errs:?}");
+    }
+
+    #[test]
+    fn linearity_branches_use_k_independently_is_fine() {
+        // if-then-else: max across branches. Each branch uses k once
+        // (max=1). No E0220.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(msg, k) => if true { k(0) } else { k(1) },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0220"),
+            "branch-disjoint uses of k are fine, must not E0220: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn linearity_branch_then_extra_use_is_e0220() {
+        // if-then-else where one branch uses k AND a sequential `k`
+        // follows the if: max(branch)=1 + 1 outside = 2. E0220.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(msg, k) => if true { k(0) } else { 0 } + k(1),\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0220"), "expected E0220: {errs:?}");
+    }
+
+    #[test]
+    fn linearity_lambda_capturing_k_is_e0220() {
+        // Conservative-capture rule: any reference to k inside a
+        // lambda body saturates to 2. E0220 fires regardless of how
+        // many syntactic occurrences appear inside the lambda.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(msg, k) => (fn () -> Int ![] => k(0))(),\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0220"),
+            "lambda capturing k must E0220 (conservative rule): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn linearity_multi_shot_skips_check() {
+        // `effect Choose resumes: many` opts in to multi-shot; the
+        // linearity check is skipped so k(0) + k(1) is fine.
+        let src = "effect Choose resumes: many { pick: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Choose.pick(k) => k(1) + k(2) }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0220"),
+            "multi-shot effect must skip linearity check: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn linearity_zero_uses_with_branches_is_fine() {
+        // Both branches return 0; neither uses k. Max=0, no E0220.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(msg, k) => if true { 0 } else { 1 },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0220"),
+            "branches that don't use k are fine: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn linearity_count_in_expr_zero_in_lit() {
+        // Direct unit test of the counter on a literal — no `k` ref.
+        let span = Span::synthetic("x.sigil");
+        let e = Expr::IntLit(0, span);
+        assert_eq!(count_continuation_uses(&e, "k"), 0);
+    }
+
+    #[test]
+    fn linearity_count_in_expr_saturates_at_two() {
+        // Direct test that sequential composition saturates at 2.
+        // `(k + k) + k` has 3 syntactic uses but the saturating-add
+        // collapses early; the helper returns at most 2 so the
+        // > 1 vs <= 1 caller distinction is preserved with no overflow.
+        let span = Span::synthetic("x.sigil");
+        let k = || Expr::Ident("k".to_string(), span.clone());
+        let lhs = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(k()),
+            rhs: Box::new(k()),
+            span: span.clone(),
+        };
+        let three = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(lhs),
+            rhs: Box::new(k()),
+            span,
+        };
+        assert_eq!(count_continuation_uses(&three, "k"), 2);
+    }
+
+    #[test]
+    fn linearity_count_in_expr_lambda_capture_returns_two() {
+        // Direct test: a lambda body containing `k` returns 2 even
+        // for a single syntactic occurrence inside the lambda.
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Ident("k".to_string(), span.clone());
+        let lambda = Expr::Lambda {
+            params: Vec::new(),
+            return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            body: Box::new(body),
+            span,
+        };
+        assert_eq!(count_continuation_uses(&lambda, "k"), 2);
+    }
+
+    #[test]
+    fn linearity_count_in_expr_branches_take_max() {
+        // Direct test: if-then-else of single-`k`-each branches takes
+        // max, which is 1. The cond also contributes 0 here.
+        let span = Span::synthetic("x.sigil");
+        let k_block = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::Ident("k".to_string(), span.clone())),
+            span: span.clone(),
+        };
+        let if_expr = Expr::If {
+            cond: Box::new(Expr::BoolLit(true, span.clone())),
+            then_block: Box::new(k_block.clone()),
+            else_block: Box::new(k_block),
+            span,
+        };
+        assert_eq!(count_continuation_uses(&if_expr, "k"), 1);
+    }
+
+    #[test]
+    fn handle_overall_type_is_body_type_without_return_arm() {
+        // Without a return arm, the handler returns the body's type.
+        // Here body is Int (literal 0); handle's overall type is Int.
+        // The let-binding accepts Int with no E0044/E0045.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     let n: Int = handle 0 with { Raise.fail(msg, k) => 0 };\n\
+                     n\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        // Internally the handler-overall type *should* be Int. The
+        // let-binding diagnostic only fires when types disagree —
+        // this assertion is the absence of a mismatch.
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0045"),
+            "let n: Int = ... where handle returns Int must not E0045: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_overall_type_uses_return_arm_when_present() {
+        // With a return arm `return(v) => "x"`, the handler returns
+        // String regardless of the body's Int. The let-binding
+        // declared as `String` is consistent with this.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     let s: String = handle 0 with {\n\
+                       return(v) => \"x\",\n\
+                       Raise.fail(msg, k) => \"err\",\n\
+                     };\n\
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0045"),
+            "let s: String = handle ... with return arm returning String must not E0045: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_arm_body_unifies_with_handler_overall() {
+        // Two arms must produce the same handler-overall type. Here
+        // body is Int (from `0`) and arm returns String — unify_ty
+        // fails and emits E0044 against the arm's body span.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     let n: Int = handle 0 with {\n\
+                       Raise.fail(msg, k) => \"err\",\n\
+                     };\n\
+                     n\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0044"),
+            "arm body String must not unify with body Int (handler-overall): {errs:?}"
+        );
+    }
+
+    // ===== Plan B task 54 — review-fixup follow-ups (PR #20) =============
+
+    #[test]
+    fn linearity_shadowed_k_does_not_count() {
+        // Direct unit test on `count_continuation_uses` for the
+        // `Stmt::Let` shadow-suspension logic in `count_in_block`.
+        // Block: `let k: Int = 1; k + k` — the let shadows `k_name`
+        // so the post-let `k + k` uses don't count toward the outer
+        // continuation. Final count = 0.
+        //
+        // The full-pipeline equivalent (a `let k = 5` inside a
+        // handler arm body whose arm declares `k`) would trip
+        // `env_insert`'s debug-assert against shadowing — that's a
+        // *typecheck-side* invariant unrelated to the linearity
+        // counter's own shadow handling. Direct unit test on the
+        // helper avoids the env_insert path.
+        let span = Span::synthetic("x.sigil");
+        let block = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "k".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::IntLit(1, span.clone()),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            span,
+        };
+        let block_expr = Expr::Block(Box::new(block));
+        assert_eq!(count_continuation_uses(&block_expr, "k"), 0);
+    }
+
+    #[test]
+    fn linearity_count_in_block_sums_uses() {
+        // Direct unit test pinning sequential composition: a Block
+        // with two `Stmt::Expr(Ident("k"))` returns 2 (each stmt
+        // contributes 1; `count_in_block` sums them).
+        let span = Span::synthetic("x.sigil");
+        let k = || Expr::Ident("k".to_string(), span.clone());
+        let block = Block {
+            stmts: vec![Stmt::Expr(k()), Stmt::Expr(k())],
+            tail: None,
+            span,
+        };
+        let block_expr = Expr::Block(Box::new(block));
+        assert_eq!(count_continuation_uses(&block_expr, "k"), 2);
+    }
+
+    #[test]
+    fn linearity_nested_handle_inner_arm_shadow_does_not_count_outer_k() {
+        // Direct linearity-pipeline test for the `Expr::Handle` case
+        // in `count_in_expr`: an inner handle's op-arm rebinds
+        // `k_name`, so syntactic `k` references inside the inner arm
+        // body resolve to the inner k, not the outer continuation.
+        // Outer count for `Raise.fail`'s k stays at 0 even though
+        // there is a syntactic `k(...)` inside the nested arm tree.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   effect Other { ping: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(msg, k) => handle 0 with {\n\
+                         Other.ping(k) => k(0),\n\
+                       },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            !has_code(&errs, "E0220"),
+            "inner-arm rebinding of `k` must shadow outer `k` for linearity: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn cross_arm_state_generic_param_consistency_fires_e0044() {
+        // The `effect_substs` cache is the load-bearing mechanism
+        // for keeping `effect State[A]`'s `A` consistent across
+        // `get` and `set` arms in a single handle. Without it, each
+        // arm would allocate its own fresh `Ty::Var` for `A` and
+        // the program below would silently typecheck.
+        //
+        // Discriminating shape: `State.get(k) => k(42)` pins
+        // `A = Int` via `k`'s param-type unification; `State.set(v, k)`
+        // therefore binds `v: A = Int`, so `use_str(v)` fires E0044
+        // (Int passed where String expected). If the cache were
+        // broken, `v: A_fresh` would unify cleanly with String at
+        // the `use_str` call site and no E0044 would surface — that
+        // would be a soundness regression.
+        let src = "effect State[A] {\n\
+                     get: () -> A,\n\
+                     set: (A) -> Unit,\n\
+                   }\n\
+                   fn use_str(s: String) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       State.get(k) => k(42),\n\
+                       State.set(v, k) => use_str(v),\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            has_code(&errs, "E0044"),
+            "State[A] cross-arm cache must propagate A=Int from get to set so use_str(v) fires E0044: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_arm_k_call_with_wrong_arg_is_e0044() {
+        // `k`'s type is `Fn(op_ret_ty) -> handler_overall ![caller_row]`.
+        // For `Raise.fail: (String) -> Int`, op_ret_ty is Int. Calling
+        // k with a String argument fires E0044 via the call-site arg
+        // check, locking down the binding-type contract at the arm's
+        // env-extension site.
+        let src = "effect Raise { fail: (String) -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(msg, k) => k(\"not_int\"),\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0134"), "expected E0134: {errs:?}");
+        assert!(
+            has_code(&errs, "E0044"),
+            "k call with wrong arg type must E0044 (k has Fn(op_ret_ty) -> handler_overall): {errs:?}"
         );
     }
 }

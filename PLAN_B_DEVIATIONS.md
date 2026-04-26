@@ -630,3 +630,174 @@ context fill it in).
 
 **Implementing commit:** Task 53 parser scaffolding (this PR).
 **Closure point:** closed — context-sensitive matching is the chosen long-term form. If Task 54+ ergonomic data argues for adding `resumes` to the keyword set later, the change is a strict reservation: any program that broke under it would have used a now-reserved word as an identifier. The lexer test serves as the regression guard.
+
+---
+
+## 2026-04-25 — [DEVIATION Task 54] E0133 / E0134 staged-feature gates remain live through Task 54
+
+**Plan body says** (Stage 6 Task 54, paraphrased): the typechecker
+gains row-polymorphic effect checking, handler typing rules
+(consumes effect from body's row, produces residual row), partial
+handling, and the one-shot linearity check (E0220). The body of
+the task reads as if `effect` declarations and `handle` expressions
+should be fully accepted by typecheck after this task.
+
+**Implemented form** (this PR): the typechecker now does the full
+handler-typing work *internally* — effect declarations are
+registered into a real registry; `Expr::Handle` extends the
+environment with op-arm parameters and the continuation `k`; the
+body is checked under an extended row that includes the discharged
+effects; arm bodies are checked under the caller's row with their
+op's parameter and continuation types installed; arm bodies unify
+with a single handler-overall type; E0220 fires when the linearity
+check rejects a path. **But E0133 still fires once per
+`Item::Effect` and E0134 still fires once per `Expr::Handle`** as
+the user-facing staged-feature gate.
+
+**Why the deviation:**
+
+1. **Codegen-gate alignment with Task 55.** Lifting E0134 in this
+   PR would let well-formed handler programs flow into the
+   monomorphizer, color inference, closure conversion, and codegen
+   — all of which still treat `Expr::Handle` as `unreachable!` (the
+   CPS transform that lowers `handle ... with { ... }` into
+   `sigil_perform` calls plus a trampoline frame is Task 55's
+   scope). A program that types cleanly under Task 54 but trips
+   `unreachable!` at codegen would surface as an internal-compiler
+   bug (`E0001`) instead of a staged-feature notice. Keeping E0134
+   live preserves the user-visible contract: until Task 55 lands,
+   `handle` is "recognised but not yet runnable".
+2. **Internal infrastructure ships now, gate lifts later.** The
+   typecheck work *cannot* wait for Task 55 — Task 55 needs the
+   effect registry and the handler-typed AST to drive its CPS
+   expansion. Doing the typechecking work behind the gate means
+   Task 55's PR is a single focused change ("lift E0134 + wire CPS
+   transform") rather than an entangled "type-check + lower"
+   cross-cutting change.
+3. **E0220 still surfaces alongside E0134.** The linearity check
+   runs even though the gate fires; users get the supplementary
+   diagnostic so when Task 55 lifts the gate, the linearity rules
+   are already enforced and tested. Task 53's
+   `handle_arm_bodies_walked_during_e0134_emission` test
+   established the precedent that E0134 emission does not suppress
+   per-arm-body diagnostics.
+4. **Task 53 review item 11 prefers this approach.** PR #19's
+   review explicitly recommended "keep E0134 live until Task 55
+   lands" as the preferred option for codegen-gate alignment, with
+   "extend the codegen walker to short-circuit Expr::Handle" as
+   the alternative. We follow the preferred option.
+
+**Cost of the deviation:**
+
+- **User-visible:** programs that use `effect` / `handle` syntax
+  still cannot compile under Task 54 — same surface as Task 53
+  shipped. Users wait one more task (Task 55) before handlers
+  execute.
+- **Catalog hygiene:** E0133 and E0134 stay in the catalog one
+  task longer than the catalog text suggested ("Until Task 54
+  merges" / "Tasks 54 and 55"). Updated the long-form text on both
+  entries to make the joint-ownership explicit.
+- **Internal complexity:** the typechecker walks handle/effect
+  shapes twice — once for E0133/E0134 emission, once for proper
+  registration / typing. The two walks are interleaved (the proper
+  walk runs first, the gate emission runs at the end) so cost is
+  one structural traversal, not two.
+
+**Test coverage for the deviation:**
+
+- `effect_decl_emits_e0133` regression — Task 53's existing test;
+  still passes after the registry pre-pass lands.
+- `handle_expr_emits_e0134` regression — Task 53's existing test.
+- `handle_arm_bodies_walked_during_e0134_emission` — Task 53's
+  existing test pins that arm-body diagnostics fire alongside
+  E0134; Task 54 keeps this contract.
+- New tests for op-arm-binding env extension (item 10): a handler
+  arm body referring to `Effect.op`'s declared param names no
+  longer fires spurious E0046 alongside E0134.
+- New tests for E0220 firing alongside E0134.
+
+**Implementing commit:** [HEAD]
+**Closure point:** Task 55 lifts E0134 and wires the CPS expansion;
+this deviation entry stays as the rationale trail. E0133 lifts at
+the same time (effects-in-codegen need Task 55's `sigil_perform`
+machinery before `Item::Effect` can usefully reach codegen).
+
+---
+
+## 2026-04-25 — [DEVIATION Task 54] One-shot linearity check uses path-max syntactic counting; lambda capture is conservative
+
+**Plan body says** (Stage 6 Task 54, paraphrased): "Zero uses
+(early exit) is fine; one use is fine; any path that uses `k`
+twice, or splits and uses it on both branches, is an error
+(E0220). [...] branches must agree on its fate."
+
+**Implemented form** (this PR): the check counts syntactic
+occurrences of `Ident(k_name)` in an op-arm body, with branching
+constructs (`if` / `match`) using the **maximum** count across
+branches and sequential composition (`block` statements,
+`Binary` / `Call` argument lists, etc.) using the **sum** count.
+A count greater than 1 along any path emits E0220. Bindings in
+the arm body that lexically shadow `k` (a nested `let k = ...` or
+a nested `handle` whose op-arm rebinds `k` with the same name)
+suspend counting for that subtree.
+
+**One additional rule:** any reference to `k` from inside an
+`Expr::Lambda` body emits E0220 immediately, regardless of count
+along paths inside the lambda. Lambdas can be invoked any number
+of times by the surrounding code; capturing `k` into a closure
+means the closure could call `k` repeatedly even if its body
+references `k` exactly once syntactically. The conservative rule
+rejects all such captures up-front.
+
+**Interpretation choice on "branches must agree on its fate":** the
+plan's wording admits two readings:
+
+- **(a) path-max:** each path through the arm body uses `k` at
+  most once. Branches that disagree (one uses `k`, the other
+  doesn't) are still valid — each path independently respects
+  the linearity bound. *This is what the implementation does.*
+- **(b) path-uniform:** all paths through the arm body must use
+  `k` exactly the same number of times — either all use it
+  exactly once, or none use it at all.
+
+**Reason for choosing (a):** the explicit "Zero uses (early exit)
+is fine" sentence in the plan body endorses early-exit handlers,
+which trivially break path-uniformity (the early-exit path uses
+`k` zero times; the normal path uses it once). Reading the plan
+as (b) would make the example sentence and the rule contradict.
+Reading (a) as the rule is consistent with both halves of the plan
+text. Linear-logic literature (Linear Haskell, Frank, Eff) also
+uses path-max counting for one-shot continuations.
+
+**Cost of the deviation:** users who write a closure-captured `k`
+get a strict-pessimistic rejection rather than a more nuanced
+analysis. Workarounds: invoke `k` directly from the arm body
+(common case for one-shot effects); or annotate the effect with
+`resumes: many` if multi-shot semantics are intended. If real
+programs surface false-positives, a future plan can refine the
+rule using escape analysis without breaking source compatibility
+(strict-pessimistic acceptances remain valid).
+
+**Test coverage:**
+
+- `linearity_zero_uses_is_fine` — early-exit handler with no `k`
+  reference passes.
+- `linearity_one_use_is_fine` — single `k` invocation passes.
+- `linearity_two_uses_in_sequence_is_e0220` — `k(0); k(1)` (or
+  any sequential pattern) fails.
+- `linearity_branches_use_k_independently_is_fine` — `if cond { k(0) } else { k(1) }`
+  passes (each path uses `k` once).
+- `linearity_branch_then_extra_use_is_e0220` — `if cond { k(0) } else { 0 }; k(1)`
+  fails (one path uses `k` twice).
+- `linearity_lambda_captures_k_is_e0220` — `let f = fn () -> Int ![] => k(0); f()`
+  fails (conservative lambda rule).
+- `linearity_multi_shot_skips_check` — `effect E resumes: many`
+  arms can use `k` any number of times.
+- `linearity_shadowed_k_does_not_count` — a nested binding that
+  shadows `k`'s name does not contribute to the outer linearity
+  count.
+
+**Implementing commit:** [HEAD]
+**Closure point:** open — refinements (escape analysis for
+lambda captures; `Linear[Bool]`-style use-count types) can land in
+a future plan without breaking the strict-pessimistic surface.
