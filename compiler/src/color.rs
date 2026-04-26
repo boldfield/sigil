@@ -394,11 +394,23 @@ fn find_non_io_perform_in_expr(e: &Expr) -> Option<(String, String)> {
         // a stronger sense: an arm that reifies `k` represents the
         // remainder of computation after the perform, and the
         // colorer must agree with codegen on which monomorphs sit
-        // at the native↔CPS boundary. Replacing this stub with the
-        // proper handler-context color rule (PR #18 reviewer's
-        // Stage 6 ask) is the closing dependency of Phase 4d. Until
-        // then: walk arm bodies (and the optional return arm), skip
-        // the wrapped body itself.
+        // at the native↔CPS boundary.
+        //
+        // See `PLAN_B_DEVIATIONS.md` entries:
+        //   - `[DEVIATION Task 55] Native callers drive sigil_run_loop
+        //     synchronously` (PB4) — names Phase 4d as the closure
+        //     point for the colorer's handler-discharge refinement.
+        //     Today's synchronous `lower_perform_non_io_to_value`
+        //     path works precisely because this stub treats handle
+        //     bodies as inert from the parent fn's color
+        //     perspective; lifting the synchronous-blocking shape
+        //     in Phase 4d requires this stub to refine at the same
+        //     time.
+        //
+        // Replacing this stub with the proper handler-context color
+        // rule (PR #18 reviewer's Stage 6 ask) is the closing
+        // dependency of Phase 4d. Until then: walk arm bodies (and
+        // the optional return arm), skip the wrapped body itself.
         Expr::Handle {
             return_arm,
             op_arms,

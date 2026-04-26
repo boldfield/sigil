@@ -1267,6 +1267,17 @@ fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
 // lift restrictions, this test continues to pin the wrapper's
 // identity property — and stays load-bearing precisely because the
 // shape of the bug it guards against doesn't shrink.
+//
+// **What this test does NOT exercise.** The body never performs
+// the handled effect, so the synthetic CPS arm fn is dead code at
+// runtime — the test pins only the Phase 3a frame plumbing
+// (`frame_new` + `set_arm` + `push` + `pop`) against the wrapped
+// expression's native semantics. The Phase 3b/4a dispatch path
+// (`sigil_perform` → `sigil_run_loop` → arm → `next_step_done`
+// → value extraction) is exercised instead by the paired test
+// `cps_dispatch_returns_arm_value_across_op_id_shape_space`
+// below, which uses a body of `(perform E_eff.op())` so every
+// trial drives the dispatch loop end-to-end.
 
 /// Tiny deterministic PRNG. The differential-identity test runs in
 /// CI on every commit and we want bit-exact reproducibility — using
@@ -1302,7 +1313,7 @@ impl Xorshift64 {
         lo + (self.next() % span) as i64
     }
 
-    fn bool(&mut self) -> bool {
+    fn next_bool(&mut self) -> bool {
         (self.next() & 1) == 1
     }
 }
@@ -1314,10 +1325,10 @@ impl Xorshift64 {
 /// the real signal). Operand magnitudes are kept small enough that
 /// chained `*`s don't overflow i64.
 fn gen_int_expr(rng: &mut Xorshift64, depth_remaining: u32) -> String {
-    if depth_remaining == 0 || rng.bool() {
+    if depth_remaining == 0 || rng.next_bool() {
         // Leaf — small int, occasionally negated via unary `-`.
         let n = rng.range(0, 9);
-        if rng.bool() {
+        if rng.next_bool() {
             format!("(-{n})")
         } else {
             format!("{n}")
@@ -1344,7 +1355,7 @@ fn gen_int_expr(rng: &mut Xorshift64, depth_remaining: u32) -> String {
             // op coverage gaps in our shape sample.
             _ => format!(
                 "(if {} {{ {} }} else {{ {} }})",
-                if rng.bool() { "true" } else { "false" },
+                if rng.next_bool() { "true" } else { "false" },
                 gen_int_expr(rng, depth_remaining - 1),
                 gen_int_expr(rng, depth_remaining - 1),
             ),
@@ -1427,4 +1438,93 @@ fn cps_wrapped_identity_matches_native_on_native_eligible_programs() {
              wrapped stderr: {wrapped_stderr}",
         );
     }
+}
+
+#[test]
+fn cps_dispatch_returns_arm_value_across_op_id_shape_space() {
+    // Plan B Task 55 (paired MF2 — perform-dispatch coverage):
+    // exercises the full Phase 3b/4a dispatch path
+    //
+    //   sigil_perform → sigil_run_loop → arm fn → sigil_next_step_done
+    //   → run_loop returns u64 → caller reads value
+    //
+    // on every trial. The body is `(perform E_eff.op())`, so the
+    // arm runs end-to-end on every iteration; the arm body is the
+    // generated `IntLit` (Phase 4a's IntLit-only restriction
+    // satisfied), and the program prints the arm's value.
+    //
+    // The "shape space" sampled here is small — Phase 4a restricts
+    // arm bodies to `Expr::IntLit` so the only variation per trial
+    // is the integer constant. That is sufficient to catch
+    // dispatch-path regressions: any miscompile of `sigil_perform`
+    // arg-passing, run_loop dispatch, or `next_step_done` → value
+    // extraction surfaces as a wrong constant on stdout.
+    //
+    // Phase 4b/4c will widen the "shape space" once arm bodies and
+    // op-args grow. The xorshift PRNG is reused with a different
+    // seed so the two property tests don't overlap.
+    const SEED: u64 = 0x4D_46_32_44_49_53_50_00; // "MF2DISP\0"
+    const TRIALS: u32 = 12;
+
+    let mut rng = Xorshift64::new(SEED);
+    for trial in 0..TRIALS {
+        // Arm value sampled from a wider range than MF2's leaf
+        // generator: this is the full thing being checked, so we
+        // want both small positives, negatives, and "unusual"
+        // values like 0.
+        let arm_value: i64 = rng.range(-99, 99);
+
+        let src = format!(
+            "effect E_eff {{ op: () -> Int }}\n\
+             fn main() -> Int ![IO] {{\n  \
+               let n: Int = handle (perform E_eff.op()) with {{ E_eff.op(k) => {arm_value} }};\n  \
+               perform IO.println(int_to_string(n));\n  \
+               0\n\
+             }}\n"
+        );
+        let (stdout, stderr, exit) = compile_and_run(&src, &format!("mf2_dispatch_{trial}"));
+        assert_eq!(
+            exit, 0,
+            "trial {trial}: compile/run failed for arm_value={arm_value}.\nstderr: {stderr}",
+        );
+        assert_eq!(
+            stdout,
+            format!("{arm_value}\n"),
+            "trial {trial}: dispatch returned wrong value for arm_value={arm_value}.\nstderr: {stderr}",
+        );
+    }
+}
+
+#[test]
+fn handle_with_three_arms_dispatches_op_id_two() {
+    // Plan B Task 55 (Phase 4a — substantive #3): the existing 1-arm
+    // and 2-arm e2e tests cover op_id ∈ {0, 1}. This test extends
+    // coverage to op_id = 2, validating that
+    //   - effect/op ID assignment is alphabetical and stable
+    //     (`a=0, b=1, c=2`)
+    //   - `sigil_handler_frame_set_arm` indexes the arm slot bitmap
+    //     correctly at index 2
+    //   - `sigil_perform`'s linear walk dispatches to op_id=2 even
+    //     when arms 0 and 1 are present and unmatched
+    //
+    // Without this test, off-by-one in op_id arithmetic would
+    // surface only at MAX_HANDLER_ARMS=14 (covered by runtime unit
+    // tests) — never at the small index where most user code lives.
+    let src = "effect Pick {\n  \
+                 a: () -> Int,\n  \
+                 b: () -> Int,\n  \
+                 c: () -> Int,\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Pick.c()) with {\n    \
+                   Pick.a(k) => 0,\n    \
+                   Pick.b(k) => 1,\n    \
+                   Pick.c(k) => 2,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "handle_three_arms_op_id_two");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "2\n", "stderr={stderr:?}");
 }

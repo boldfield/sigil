@@ -2959,23 +2959,24 @@ impl Tc {
         // overall type just stays as a `?N` in displays. Diagnostics
         // upstream will have fired before that ever surfaces.
         //
-        // **TODO(Plan B Task 55, Phase 4c+):** with both staged-
-        // feature gates lifted (E0133 in the foundation phase, E0134
-        // in Phase 2), well-formed programs whose body is a fresh
-        // var (e.g., `handle perform E.op() with { E.op(k) => k(0) }`
-        // where the body's only typing constraint comes through the
-        // op-arm via k) could in principle leave the handler-overall
-        // var unsolved. Phase 3b/4a's codegen-entry restrictions
-        // (`unsupported_handle_construct` requires `IntLit`-only arm
-        // bodies + zero-arg ops) keep this case unreachable in
-        // user-visible output for now: every `IntLit` arm pins
-        // `handler_overall` to `Int` in Phase 3 of `check_handle`.
-        // Phase 4c lifts the IntLit restriction; at that point this
-        // path becomes reachable and needs a decision: pin via the
-        // body's perform-call return-type constraint chain, or
-        // surface a "cannot infer handler return type" diagnostic
-        // (E0132-style ambiguous polymorphism). Track on the Phase 4c
-        // task list.
+        // **Closure point (Plan B Task 55, Phase 4c):** the
+        // unsolved-handler-overall edge case is **closed today** by
+        // codegen, not typecheck — the codegen-entry guard
+        // `unsupported_handle_construct` requires `IntLit`-only arm
+        // bodies, which forces every arm to pin `handler_overall`
+        // to `Int` in Phase 3 of this fn (the unification on every
+        // arm's `Expr::IntLit` body solves the var). A program that
+        // typechecks today and would otherwise leave
+        // `handler_overall` unsolved (e.g.
+        // `handle perform E.op() with { E.op(k) => k(0) }`) is
+        // rejected at codegen entry by the IntLit-only check
+        // before the `?N` could ever surface. Phase 4c lifts the
+        // IntLit restriction in codegen; at that point this
+        // typecheck path becomes reachable for non-IntLit arm
+        // bodies and the choice is: pin via the body's perform-call
+        // return-type constraint chain, or surface a "cannot infer
+        // handler return type" diagnostic (E0132-style ambiguous
+        // polymorphism). Tracked on the Phase 4c task list.
         let handler_overall_id = self.fresh_ty_var();
         let handler_overall = Ty::Var(handler_overall_id);
 
@@ -6933,18 +6934,19 @@ mod tests {
         );
     }
 
-    // ===== Plan B Task 55 — asymmetric gate state =========================
+    // ===== Plan B Task 55 — both staged-feature gates lifted ==============
     //
     // Task 53 introduced E0133 (effect decl) and E0134 (handle expr) as
     // staged-feature gates so partial Plan B programs could not reach
-    // the CPS-pending codegen path. Task 55 (in progress) lifts the
-    // E0133 gate first: `Item::Effect` declarations have no codegen
-    // output beyond the typecheck-time effect registry, so they flow
-    // through cleanly. The E0134 gate stays live until Task 55's CPS
-    // codegen lands; well-formed `handle` expressions still surface a
-    // staged-feature diagnostic so they don't trip the still-
-    // `unreachable!` codegen arms. Tests below pin both halves of
-    // this asymmetric state.
+    // the CPS-pending codegen path. Task 55's foundation phase
+    // (`b3af204`) lifted E0133; Phase 2 (`2d69b52`) lifted E0134; both
+    // gate diagnostics no longer fire. The historic "asymmetric" tests
+    // below remain as positive coverage of the now-lifted state — each
+    // exercises a well-formed effect decl + handle program and asserts
+    // neither gate fires. The codegen-entry guard
+    // `unsupported_handle_construct` rejects shapes still outside the
+    // Phase 3b/4a supported subset (richer arm bodies, multi-effect,
+    // k usage, return arms — see Phase 4b–4f).
 
     #[test]
     fn well_formed_effect_decl_typechecks_cleanly() {
@@ -7244,8 +7246,10 @@ mod tests {
                      }\n\
                    }\n";
         let errs = pipeline(src);
-        // E0134 still fires (gate), but no E0042 should fire for the
-        // body's perform.
+        // E0134 was lifted in Phase 2 (`2d69b52`) so it doesn't fire
+        // here. No E0042 should fire for the body's perform — Raise
+        // is in the body's row (caller's row plus discharged effects)
+        // even though it isn't in the surrounding fn's row.
         assert!(
             !has_code(&errs, "E0042"),
             "handle body's perform of discharged effect must not E0042: {errs:?}"
@@ -7276,8 +7280,8 @@ mod tests {
     fn perform_via_registry_typechecks() {
         // A user-declared non-IO effect can be performed from a fn
         // whose row lists it. The E0042 / IO special case do not
-        // apply; the registry route handles it. E0133 still fires
-        // because effect declarations stay gated until Task 55.
+        // apply; the registry route handles it. E0133 was lifted in
+        // the Task 55 foundation phase (`b3af204`).
         let src = "effect Log { write: (String) -> Unit }\n\
                    fn main() -> Int ![Log] {\n\
                      perform Log.write(\"hi\");\n\

@@ -962,7 +962,27 @@ fn collect_handle_arms_in_expr(
                 });
                 arm_indices.push(global_idx);
             }
-            indices.insert(span.clone(), arm_indices);
+            // The pre-pass walks each fn body exactly once and is
+            // the only writer to `indices`. A duplicate span here
+            // means the AST contains two `Expr::Handle` nodes that
+            // share a span — either a future monomorphisation pass
+            // that clones a handle-bearing fn body (the per-monomorph
+            // color variance question — see PB4 deviation entry),
+            // closure conversion that lifts a lambda whose body
+            // contains a handle, or any other AST-cloning transform.
+            // Today that doesn't happen; assert it loudly so any
+            // future regression surfaces here rather than as a
+            // silent overwrite that ships wrong `FuncRef`s to one of
+            // the aliased handles. Same shape as the `op_names`
+            // dedup → `debug_assert!` swap from review-fixup
+            // commit `54b4a60`. The `insert` lives outside the
+            // assert so the side effect runs in release builds too.
+            let prev = indices.insert(span.clone(), arm_indices);
+            debug_assert!(
+                prev.is_none(),
+                "codegen pre-pass: duplicate handle span {span:?} — \
+                 pre-pass invariant violated"
+            );
             Ok(())
         }
     }
@@ -2031,8 +2051,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         };
         let effect_id_v = self.builder.ins().iconst(types::I32, effect_id as i64);
         let op_id_v = self.builder.ins().iconst(types::I32, op_id as i64);
+        // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4b):
+        // `null_args_ptr` + `zero_len` here pin the zero-arg
+        // restriction. Phase 4b adds args-buffer packing on the
+        // perform side (alloca an `[u64; N]` of user-arg slots, store
+        // each arg's tagged representation, pass the buffer pointer
+        // and `args_len = N` here) and unpacking on the arm side.
+        // The codegen-entry guard's `body_contains_non_io_perform_with_args`
+        // check enforces that this site only runs on zero-arg ops
+        // today.
         let null_args_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
         let zero_len = self.builder.ins().iconst(types::I32, 0);
+        // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4d):
+        // `null_k_closure` + `null_k_fn` pin the no-k-usage
+        // restriction. Phase 4d reifies the perform's continuation
+        // (the rest of computation after the perform site) into a
+        // CPS-color closure-fn pair and passes it here so the arm can
+        // invoke `k(value)` to resume. Until then arms ignore `k`
+        // (single-shot Raise-style early-exit), and the codegen-entry
+        // guard's IntLit-only-arm-body check enforces that.
         let null_k_closure = self.builder.ins().iconst(self.pointer_ty, 0);
         let null_k_fn = self.builder.ins().iconst(self.pointer_ty, 0);
         let perform_call = self.builder.ins().call(
