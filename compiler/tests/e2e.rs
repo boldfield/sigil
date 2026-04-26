@@ -1602,3 +1602,246 @@ fn handle_with_mixed_type_args_widens_correctly() {
     assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
     assert_eq!(stdout, "11\n", "stderr={stderr:?}");
 }
+
+// =====================================================================
+// Plan B Task 55 — Phase 4c acceptance precondition tests
+// =====================================================================
+//
+// The 4 tests below are the **pre-registered acceptance precondition**
+// for Phase 4c per the `[DEVIATION Task 55] Phase 4b — args-buffer
+// packing on perform side` entry in PLAN_B_DEVIATIONS.md (added during
+// PR #23 review-fixup). They close the args-content verification gap
+// from Phase 4b: the Phase 4b e2e tests pin only that the FFI plumbing
+// compiles + runs (arms ignored args_ptr there). Phase 4c reads bound
+// names from args_ptr in the synthetic arm fn, so a misalignment, off-
+// by-one, or wrong-direction widening that landed green under Phase 4b
+// would fail here.
+//
+// Coverage matrix (all required by the deviation entry):
+//   1. Int arg readback — pins source value reaches arm
+//   2. Bool / Char arg readback — exercises uextend/ireduce widening
+//   3. String arg readback — exercises pointer-store path
+//   4. Multi-arg readback in declared order — pins offset arithmetic
+
+#[test]
+fn arm_reads_int_arg_returns_it() {
+    // Phase 4c — arg-content verification (1/4): pass an Int arg
+    // through perform, bind it in the arm body, return it. Pins
+    // that the perform-side widen → slot-store → sigil_perform copy
+    // → arm-fn ireduce-back chain preserves Int values bit-for-bit.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op(42)) with {\n    \
+                   E.op(x, k) => x,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_int");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn arm_reads_bool_arg_branches_on_it() {
+    // Phase 4c — arg-content verification (2a/4): Bool arg goes
+    // through uextend (perform side) → u64 slot → ireduce(I8) (arm
+    // side) → branch. The arm uses `if b { 1 } else { 0 }` to
+    // observe the bound bool through a value-distinguishing branch.
+    // Without correct widen-truncate roundtrip, the bool would
+    // either always be true (any non-zero u64 → true under naive
+    // reduction) or always be false.
+    let src = "effect E { op: (Bool) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op(true)) with {\n    \
+                   E.op(b, k) => if b { 7 } else { 99 },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_bool");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn arm_reads_string_arg_prints_via_io_println() {
+    // Phase 4c — arg-content verification (3/4): String arg goes
+    // through the pointer-store path (no widening — pointer_ty ==
+    // I64 on supported targets). The arm passes the bound `s`
+    // directly to `IO.println` from inside the arm body. This
+    // exercises:
+    //   - perform-side: arg's heap-pointer Value stored at offset 0
+    //   - runtime: copies pointer into NextStep::Call's args slot
+    //   - arm-fn: loads u64 from args_ptr, binds as String pointer
+    //     (no ireduce — declared_ty == pointer_ty)
+    //   - arm body: invokes IO.println via Lowerer's existing
+    //     perform path, which reads the string literal
+    //
+    // A wrong-arg-buffer-offset bug would print garbage or crash
+    // inside sigil_println dereferencing a non-string pointer.
+    // The arm body returns 0 to satisfy the Int return type;
+    // the println side-effect is the observable.
+    let src = "effect E { op: (String) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _ = handle (perform E.op(\"hello\")) with {\n    \
+                   E.op(s, k) => { perform IO.println(s); 0 },\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_string");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "hello\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn arm_reads_multi_args_in_declared_order() {
+    // Phase 4c — arg-content verification (4/4): three Int args at
+    // perform site `(10, 20, 30)`, arm `(a, b, c, k) => b` returns
+    // the middle one. Pins offset arithmetic on the perform side
+    // (slot offsets 0, 8, 16) matches the runtime's `args_ptr.add(i)`
+    // u64-stride read. An off-by-one in either direction would
+    // surface as 10 or 30 instead of 20; a swapped order would
+    // surface as the wrong end. None of the Phase 4b tests would
+    // have caught any of these.
+    let src = "effect E { op: (Int, Int, Int) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op(10, 20, 30)) with {\n    \
+                   E.op(a, b, c, k) => b,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_multi_arg_order");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "20\n", "stderr={stderr:?}");
+}
+
+// Phase 4c bonus tests — beyond the precondition matrix, exercise
+// richer arm-body shapes the Lowerer now supports.
+
+#[test]
+fn arm_body_does_arithmetic_on_op_args() {
+    // Phase 4c bonus: arm body uses both op-args in an arithmetic
+    // expression. Pins that the Lowerer-driven path correctly
+    // resolves multiple bound names + lowers binary ops in the
+    // synthetic-fn context.
+    let src = "effect E { op: (Int, Int) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op(5, 7)) with {\n    \
+                   E.op(a, b, k) => a * b + 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_arithmetic");
+    assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "36\n", "stderr={stderr:?}"); // 5*7+1
+}
+
+#[test]
+fn arm_uses_k_is_rejected_at_codegen() {
+    // Phase 4c restriction (still in force pending Phase 4d):
+    // arm bodies that reference the continuation `k` are rejected
+    // by the codegen-entry walker with a Phase-4d-pointing
+    // diagnostic. Without this gate, the arm would compile and at
+    // runtime `k` would resolve to a null fn pointer, segfaulting
+    // when the arm tried to invoke it.
+    //
+    // Typecheck accepts `k(0)` because k has type Fn(Int)->Int (op
+    // returns Int → k_param_ty == Int → handler_overall == Int via
+    // unification with body type). The walker is what rejects,
+    // catching the Ident("k") reference inside the Call's callee
+    // position.
+    let src = "effect E { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => k(0),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4c_arm_k_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4c_arm_k_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail until Phase 4d ships; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("continuation") || stderr.contains("Phase 4d"),
+        "error message should reference k / Phase 4d; got stderr={stderr:?}",
+    );
+}
+
+#[test]
+fn arm_captures_outer_scope_is_rejected_at_codegen() {
+    // Phase 4c restriction (still in force pending capture support
+    // alongside Phase 4d): arm bodies that reference an outer-scope
+    // binding (here `threshold`, a fn parameter) are rejected by
+    // the codegen-entry walker. Without the gate, the synthetic CPS
+    // arm fn (closure_ptr is null in Phase 4c) would call into the
+    // Lowerer with `threshold` unbound in env, panicking at
+    // `unreachable!("unknown ident")`.
+    let src = "effect E { op: () -> Int }\n\
+               fn helper(threshold: Int) -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => threshold,\n  \
+                 };\n  \
+                 n\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(helper(42)));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4c_arm_capture_reject_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase4c_arm_capture_reject_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail — arm body captures outer-scope `threshold`; \
+         got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("captures outer-scope") || stderr.contains("Phase 4d"),
+        "error message should reference outer-scope capture; got stderr={stderr:?}",
+    );
+}
