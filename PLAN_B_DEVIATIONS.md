@@ -850,7 +850,7 @@ The Task 55 PR will flip Task 56 to `done` per the Plan A2
 PROGRESS-hygiene precedent (next PR closes the prior PR's
 done-pending-ci).
 
-**Implementing commit:** [HEAD]
+**Implementing commit:** 9c6213e
 **Closure point:** closed at Task 55 PR merge (Task 55 is the
 direct consumer of Task 56's runtime surface; absent Task 55,
 Task 56's surface is dead code that the runtime ships but
@@ -916,7 +916,7 @@ itself, not the unpack. Native-color fns (the common case for
 non-effect arithmetic like `fib`) keep the existing direct
 calling convention with no change.
 
-**Implementing commit:** [HEAD]
+**Implementing commit:** 9c6213e
 **Closure point:** Task 55 ships the codegen prologue. If a
 performance-floor breach traces to the unpack overhead, the
 fallback is option (3) (per-fn thunk) which keeps the
@@ -954,7 +954,7 @@ ship with 1–3 ops; the cap is comfortably above realistic v1
 needs. A future relaxation requires widening the bitmap field
 in the Sigil object header (out of scope for Plan B).
 
-**Implementing commit:** [HEAD]
+**Implementing commit:** 9c6213e
 **Closure point:** open — TAG_HANDLER_FRAME slot can land in a
 future plan if a tag-aware GC walker arrives. The layout
 otherwise stable.
