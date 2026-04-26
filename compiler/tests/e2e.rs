@@ -1137,66 +1137,14 @@ fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
     );
 }
 
-#[test]
-fn handle_with_non_intlit_arm_body_is_rejected_at_codegen() {
-    // Plan B Task 55 (Phase 3b restriction): arm bodies must be
-    // literal `Int` expressions (Phase 4+ adds richer arm bodies +
-    // `k`-using arms via continuation reification + the trampoline).
-    // Until then, any non-`IntLit` arm body — `k(0)` (a Call), `1 +
-    // 1` (a Binary) — is rejected at codegen entry by
-    // `unsupported_handle_construct`. The IntLit guard fires before
-    // any "k usage" check, so this test pins the IntLit-only check
-    // itself rather than k-specific handling. A real "k is referenced
-    // inside an IntLit context" test will land alongside Phase 4c
-    // when richer arm bodies + k-usage analysis ship.
-    fn assert_rejects_arm_body(arm_body_src: &str, marker: &str) {
-        let src = format!(
-            "effect Raise {{ fail: () -> Int }}\n\
-             fn main() -> Int ![IO] {{\n  \
-               let n: Int = handle 42 with {{ Raise.fail(k) => {arm_body_src} }};\n  \
-               perform IO.println(int_to_string(n));\n  \
-               0\n\
-             }}\n"
-        );
-        let tmp = std::env::temp_dir().join(format!(
-            "sigil_e2e_handle_non_intlit_{}_{}.sigil",
-            marker,
-            std::process::id()
-        ));
-        std::fs::write(&tmp, src).expect("write source");
-        let bin_path = std::env::temp_dir().join(format!(
-            "sigil_e2e_handle_non_intlit_{}_{}",
-            marker,
-            std::process::id()
-        ));
-        let sigil_bin = sigil_binary();
-        let out = Command::new(&sigil_bin)
-            .arg(&tmp)
-            .arg("-o")
-            .arg(&bin_path)
-            .arg("--human-errors")
-            .output()
-            .expect("invoke sigil");
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(&bin_path);
-        assert!(
-            !out.status.success(),
-            "{marker}: compile must fail until Phase 4+ lands; got success with stdout={:?} stderr={:?}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("Task 55") || stderr.contains("Phase 4") || stderr.contains("IntLit"),
-            "{marker}: error message should reference Plan B Task 55 / Phase 4 / IntLit; got stderr={stderr:?}",
-        );
-    }
-    // Call shape — original case.
-    assert_rejects_arm_body("k(0)", "k_call");
-    // Binary shape — exercises the same IntLit-only guard from a
-    // different arm-body shape.
-    assert_rejects_arm_body("1 + 1", "binary");
-}
+// Phase 4c lifted the Phase 3b "IntLit-only arm body" restriction; the
+// old `handle_with_non_intlit_arm_body_is_rejected_at_codegen` test is
+// gone with it. Coverage of what Phase 4c still rejects lives in
+// `arm_uses_k_is_rejected_at_codegen` (k-usage gate) and
+// `arm_captures_outer_scope_is_rejected_at_codegen` (capture gate);
+// arithmetic / call / block arm bodies are now supported and exercised
+// by `arm_body_does_arithmetic_on_op_args` and the Phase 4c acceptance
+// precondition tests below.
 
 #[test]
 fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
@@ -1684,10 +1632,10 @@ fn arm_reads_string_arg_prints_via_io_println() {
     // the println side-effect is the observable.
     let src = "effect E { op: (String) -> Int }\n\
                fn main() -> Int ![IO] {\n  \
-                 let _ = handle (perform E.op(\"hello\")) with {\n    \
+                 let n: Int = handle (perform E.op(\"hello\")) with {\n    \
                    E.op(s, k) => { perform IO.println(s); 0 },\n  \
                  };\n  \
-                 0\n\
+                 n\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_string");
     assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
