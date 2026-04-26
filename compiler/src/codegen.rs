@@ -409,9 +409,29 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
 /// a literal; widening the guard to follow call edges lands with
 /// Phase 3+ when the proper handler-frame setup ships.
 pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Option<String> {
+    use std::collections::BTreeSet;
+    // Globals reachable as bare `Expr::Ident` from anywhere — used by
+    // Phase 4c's arm-body capture check to distinguish "global ref"
+    // from "outer-scope capture". Top-level fn names + ctor names +
+    // hardcoded builtins (`int_to_string`).
+    let mut globals: BTreeSet<String> = BTreeSet::new();
+    for item in &program.items {
+        match item {
+            crate::ast::Item::Fn(f) => {
+                globals.insert(f.name.clone());
+            }
+            crate::ast::Item::Type(t) => {
+                for v in &t.variants {
+                    globals.insert(v.name.clone());
+                }
+            }
+            crate::ast::Item::Effect(_) | crate::ast::Item::Import(_) => {}
+        }
+    }
+    globals.insert("int_to_string".to_string());
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
-            if let Some(msg) = block_unsupported_handle(&f.body) {
+            if let Some(msg) = block_unsupported_handle(&f.body, &globals) {
                 return Some(format!("in fn `{}`: {}", f.name, msg));
             }
         }
@@ -419,23 +439,26 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     None
 }
 
-fn block_unsupported_handle(b: &crate::ast::Block) -> Option<String> {
+fn block_unsupported_handle(
+    b: &crate::ast::Block,
+    globals: &std::collections::BTreeSet<String>,
+) -> Option<String> {
     use crate::ast::Stmt;
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                if let Some(msg) = expr_unsupported_handle(&l.value) {
+                if let Some(msg) = expr_unsupported_handle(&l.value, globals) {
                     return Some(msg);
                 }
             }
             Stmt::Expr(e) => {
-                if let Some(msg) = expr_unsupported_handle(e) {
+                if let Some(msg) = expr_unsupported_handle(e, globals) {
                     return Some(msg);
                 }
             }
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    if let Some(msg) = expr_unsupported_handle(a) {
+                    if let Some(msg) = expr_unsupported_handle(a, globals) {
                         return Some(msg);
                     }
                 }
@@ -443,14 +466,17 @@ fn block_unsupported_handle(b: &crate::ast::Block) -> Option<String> {
         }
     }
     if let Some(tail) = &b.tail {
-        if let Some(msg) = expr_unsupported_handle(tail) {
+        if let Some(msg) = expr_unsupported_handle(tail, globals) {
             return Some(msg);
         }
     }
     None
 }
 
-fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
+fn expr_unsupported_handle(
+    e: &crate::ast::Expr,
+    globals: &std::collections::BTreeSet<String>,
+) -> Option<String> {
     use crate::ast::Expr;
     match e {
         Expr::IntLit(..)
@@ -460,47 +486,47 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => None,
         Expr::Binary { lhs, rhs, .. } => {
-            expr_unsupported_handle(lhs).or_else(|| expr_unsupported_handle(rhs))
+            expr_unsupported_handle(lhs, globals).or_else(|| expr_unsupported_handle(rhs, globals))
         }
-        Expr::Unary { operand, .. } => expr_unsupported_handle(operand),
+        Expr::Unary { operand, .. } => expr_unsupported_handle(operand, globals),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => expr_unsupported_handle(cond)
-            .or_else(|| block_unsupported_handle(then_block))
-            .or_else(|| block_unsupported_handle(else_block)),
-        Expr::Block(b) => block_unsupported_handle(b),
+        } => expr_unsupported_handle(cond, globals)
+            .or_else(|| block_unsupported_handle(then_block, globals))
+            .or_else(|| block_unsupported_handle(else_block, globals)),
+        Expr::Block(b) => block_unsupported_handle(b, globals),
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            if let Some(msg) = expr_unsupported_handle(scrutinee) {
+            if let Some(msg) = expr_unsupported_handle(scrutinee, globals) {
                 return Some(msg);
             }
             for a in arms {
-                if let Some(msg) = expr_unsupported_handle(&a.body) {
+                if let Some(msg) = expr_unsupported_handle(&a.body, globals) {
                     return Some(msg);
                 }
             }
             None
         }
         Expr::Call { callee, args, .. } => {
-            if let Some(msg) = expr_unsupported_handle(callee) {
+            if let Some(msg) = expr_unsupported_handle(callee, globals) {
                 return Some(msg);
             }
             for a in args {
-                if let Some(msg) = expr_unsupported_handle(a) {
+                if let Some(msg) = expr_unsupported_handle(a, globals) {
                     return Some(msg);
                 }
             }
             None
         }
         Expr::Perform(_) => None,
-        Expr::Lambda { body, .. } => expr_unsupported_handle(body),
+        Expr::Lambda { body, .. } => expr_unsupported_handle(body, globals),
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
-                if let Some(msg) = expr_unsupported_handle(ee) {
+                if let Some(msg) = expr_unsupported_handle(ee, globals) {
                     return Some(msg);
                 }
             }
@@ -508,7 +534,7 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                if let Some(msg) = expr_unsupported_handle(&f.value) {
+                if let Some(msg) = expr_unsupported_handle(&f.value, globals) {
                     return Some(msg);
                 }
             }
@@ -520,16 +546,22 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
             op_arms,
             span,
         } => {
-            // Phase 4b constraints (lifted incrementally as the
+            // Phase 4c constraints (lifted incrementally as the
             // CPS path matures):
-            //   - arm body is `Expr::IntLit` only (Phase 4c lifts
-            //     via a CPS-aware lowerer that handles op-arg
-            //     reads from `args_ptr`, `k` usage via
-            //     `sigil_next_step_call`, and outer-scope captures
-            //     through a closure record)
             //   - arms cannot reference `k` (Phase 4d lifts via
             //     continuation reification + lambda-lifting of the
             //     perform's continuation)
+            //   - arm bodies cannot capture outer-scope free
+            //     variables (the synthetic CPS arm fn's closure_ptr
+            //     is null in Phase 4c — closure captures need
+            //     closure-record allocation at handler-frame setup
+            //     time, deferred until Phase 4d/onward when k
+            //     reification needs the same machinery)
+            //   - arm bodies cannot contain nested `Expr::Lambda` /
+            //     `Expr::ClosureRecord` (closure_convert lifts
+            //     lambdas to ClosureRecords; both shapes need
+            //     captures support to lower correctly inside an
+            //     arm fn — same closure point as the capture gate)
             //   - no return arm (Phase 4f lifts via a synthetic
             //     return-fn registered via
             //     sigil_handler_frame_set_return)
@@ -538,10 +570,10 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
             //   - body's non-IO performs only target the arm's
             //     effect (typecheck enforces this; codegen doesn't
             //     add an extra check)
-            // Phase 4b LIFTED: arms may declare user params; non-
-            // IO performs in the body may pass user args. Args are
-            // packed by `lower_perform_non_io_to_value` into a
-            // stack-allocated u64 buffer.
+            // Phase 4c LIFTED: arm bodies may be any expression
+            // over op-args and globals (top-level fns, ctors,
+            // builtins) — lowered through the regular `Lowerer`
+            // with op-args bound from `args_ptr` at fn entry.
             if return_arm.is_some() {
                 return Some(format!(
                     "`handle` expression at {:?} has a `return` arm — `return` \
@@ -598,58 +630,332 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
                     }
                 }
             }
-            // Phase 3b restriction (still in force in 4a): each arm
-            // body must be `Expr::IntLit` (no captures, no `k` use,
-            // no op-arg use). The synthetic-fn definition pass
-            // lowers IntLit-only bodies via a hand-rolled Cranelift
-            // sequence; richer bodies need a CPS-aware lowerer
-            // arriving in Phase 4c.
+            // Phase 4c: per-arm validation — no `k` references, no
+            // outer-scope captures, no nested `Lambda` /
+            // `ClosureRecord` shapes. The arm body is otherwise free
+            // to use any expression over its op-args + globals.
             for arm in op_arms.iter() {
-                match &arm.body {
-                    crate::ast::Expr::IntLit(..) => {}
-                    _ => {
-                        return Some(format!(
-                            "`handle` expression at {:?} has arm `{}.{}` body \
-                             that is not a literal `Int` — Phase 3b/4a only \
-                             support arms whose body is an `IntLit` (Plan B \
-                             Task 55, in progress; richer arm bodies arrive \
-                             in Phase 4c)",
-                            span, arm.effect, arm.op
-                        ));
-                    }
+                if let Some(msg) = arm_body_phase_4c_violations(arm, globals) {
+                    return Some(format!(
+                        "`handle` expression at {:?} has arm `{}.{}` body that {} \
+                         (Plan B Task 55, in progress)",
+                        span, arm.effect, arm.op, msg
+                    ));
                 }
             }
-            // Phase 4b lifts the previous "no user op-args" restriction.
-            // Arms may now declare user params and perform sites in the
-            // body may pass user args; they're packed by
-            // `lower_perform_non_io_to_value` into a stack-allocated u64
-            // buffer and read by `sigil_perform` (which copies them into
-            // the dispatched `NextStep::Call`'s args slots before the
-            // arm fn runs). The arm fn's body is still IntLit-only
-            // (Phase 4c lifts that), so the arm fn currently ignores
-            // the args_ptr it receives — but the FFI plumbing now
-            // carries the packed buffer end-to-end so Phase 4c can
-            // wire arg-binding consumption without re-touching the
-            // perform side.
             // Recurse into the body itself so a nested handle inside
             // the body (e.g. `handle (handle ... with { ... }) with
             // { ... }`) surfaces its own diagnostics. Without this,
-            // the inner handle's multi-effect / non-IntLit / return-arm
-            // restrictions are never enforced — at runtime that can
-            // register arms under the wrong effect_id and crash inside
-            // `sigil_perform`'s handler-stack walk.
-            if let Some(msg) = expr_unsupported_handle(body) {
+            // the inner handle's multi-effect / return-arm restrictions
+            // are never enforced — at runtime that can register arms
+            // under the wrong effect_id and crash inside `sigil_perform`'s
+            // handler-stack walk.
+            if let Some(msg) = expr_unsupported_handle(body, globals) {
                 return Some(msg);
             }
             // Recurse into arm bodies so nested handles deeper in
             // the AST surface their own diagnostics.
             for arm in op_arms {
-                if let Some(msg) = expr_unsupported_handle(&arm.body) {
+                if let Some(msg) = expr_unsupported_handle(&arm.body, globals) {
                     return Some(msg);
                 }
             }
             None
         }
+    }
+}
+
+/// Plan B Task 55 (Phase 4c) — checks an arm body for the three Phase
+/// 4c violations that the synthetic-fn lowerer can't yet handle:
+///
+///   1. **References to `k`** — Phase 4d reifies the perform's
+///      continuation; until then any `k` reference would dispatch to
+///      a null fn pointer at runtime.
+///   2. **Captures from outer scope** — the synthetic CPS arm fn's
+///      `closure_ptr` is null; an Ident referring to a binding outside
+///      the arm's op-args / a top-level fn / a ctor / a builtin
+///      (`int_to_string`) would resolve to nothing in the Lowerer's
+///      env and panic.
+///   3. **Nested `Lambda` / `ClosureRecord`** — these need the same
+///      closure-record allocation machinery as #2; rejecting them
+///      here keeps the diagnostic surface small in Phase 4c.
+///
+/// Returns `Some(reason_fragment)` on first violation; the caller
+/// wraps it with `format!("... body that {} ...")` context. Scope
+/// tracking: the walker maintains a stack of `BTreeSet<String>`
+/// scopes (op-args at the bottom, let/match/handle bindings pushed/
+/// popped as scopes open/close) so let-bound and pattern-bound names
+/// inside the arm body don't trigger the capture check.
+fn arm_body_phase_4c_violations(
+    arm: &crate::ast::HandleOpArm,
+    globals: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    use std::collections::BTreeSet;
+    let mut op_arg_scope: BTreeSet<String> = BTreeSet::new();
+    for p in &arm.params {
+        op_arg_scope.insert(p.name.clone());
+    }
+    let mut scopes: Vec<BTreeSet<String>> = vec![op_arg_scope];
+    arm_body_walk(&arm.body, &mut scopes, &arm.k_name, globals)
+}
+
+fn arm_body_walk(
+    e: &crate::ast::Expr,
+    scopes: &mut Vec<std::collections::BTreeSet<String>>,
+    k_name: &str,
+    globals: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
+        Expr::ClosureEnvLoad { name, .. } => {
+            // The walker runs against the post-`closure_convert` AST,
+            // which rewrites captured names into `ClosureEnvLoad`
+            // (load from the enclosing fn's closure record). When a
+            // `Handle` lives inside a `Lambda`, closure_convert
+            // recurses into op-arm bodies and rewrites every
+            // captured-name `Ident` into a `ClosureEnvLoad` —
+            // without this rejection the rewritten capture would
+            // slip past the `Expr::Ident` capture check below, and
+            // at runtime would null-deref because the synthetic
+            // CPS arm fn has `closure_ptr = null` in Phase 4c.
+            // Same diagnostic as the `Expr::Ident` capture path
+            // (closes the same Phase 4d/onward closure point).
+            Some(format!(
+                "captures outer-scope binding `{name}` (rewritten by closure_convert \
+                 into a ClosureEnvLoad) — closure captures in arm bodies arrive \
+                 when k reification ships (Phase 4d/onward)"
+            ))
+        }
+        Expr::Ident(name, _) => {
+            if name == k_name {
+                return Some(format!(
+                    "references continuation `{name}` — k-using arms arrive in \
+                     Phase 4d via continuation reification"
+                ));
+            }
+            if globals.contains(name) {
+                return None;
+            }
+            for scope in scopes.iter() {
+                if scope.contains(name) {
+                    return None;
+                }
+            }
+            Some(format!(
+                "captures outer-scope binding `{name}` — closure captures in \
+                 arm bodies arrive when k reification ships (Phase 4d/onward)"
+            ))
+        }
+        Expr::Binary { lhs, rhs, .. } => arm_body_walk(lhs, scopes, k_name, globals)
+            .or_else(|| arm_body_walk(rhs, scopes, k_name, globals)),
+        Expr::Unary { operand, .. } => arm_body_walk(operand, scopes, k_name, globals),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => arm_body_walk(cond, scopes, k_name, globals)
+            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals))
+            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals)),
+        Expr::Block(b) => arm_body_walk_block(b, scopes, k_name, globals),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            if let Some(r) = arm_body_walk(scrutinee, scopes, k_name, globals) {
+                return Some(r);
+            }
+            for a in arms {
+                let mut pat_scope: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                arm_body_collect_pattern_bindings(&a.pattern, &mut pat_scope);
+                scopes.push(pat_scope);
+                let r = arm_body_walk(&a.body, scopes, k_name, globals);
+                scopes.pop();
+                if r.is_some() {
+                    return r;
+                }
+            }
+            None
+        }
+        Expr::Call { callee, args, .. } => {
+            if let Some(r) = arm_body_walk(callee, scopes, k_name, globals) {
+                return Some(r);
+            }
+            for a in args {
+                if let Some(r) = arm_body_walk(a, scopes, k_name, globals) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        Expr::Perform(p) => {
+            for a in &p.args {
+                if let Some(r) = arm_body_walk(a, scopes, k_name, globals) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        Expr::Lambda { .. } => Some(
+            "contains a nested lambda — lambdas in arm bodies need closure-record \
+             allocation that arrives when k reification ships (Phase 4d/onward)"
+                .to_string(),
+        ),
+        Expr::ClosureRecord { .. } => Some(
+            "contains a nested ClosureRecord (lambda lifted by closure_convert) — \
+             closures in arm bodies need closure-record allocation that arrives \
+             when k reification ships (Phase 4d/onward)"
+                .to_string(),
+        ),
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                if let Some(r) = arm_body_walk(&f.value, scopes, k_name, globals) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        Expr::Handle {
+            body: inner_body,
+            return_arm: inner_return,
+            op_arms: inner_op_arms,
+            ..
+        } => {
+            // Nested handle inside an arm body. Walk inner shapes
+            // with their own scope frames so inner op-args / inner
+            // return-arm binding don't escape the inner scope. The
+            // outer walker (`expr_unsupported_handle`) will have
+            // already validated the inner handle's structural
+            // constraints (multi-effect, return-arm, etc.) — we just
+            // need to keep the capture check honest for the inner
+            // arm bodies and the outer body's continuation.
+            if let Some(r) = arm_body_walk(inner_body, scopes, k_name, globals) {
+                return Some(r);
+            }
+            for inner_arm in inner_op_arms {
+                let mut inner_scope: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                for p in &inner_arm.params {
+                    inner_scope.insert(p.name.clone());
+                }
+                scopes.push(inner_scope);
+                // Inner arm has its own k_name; the outer arm's k
+                // is shadowed inside the inner arm body per Sigil's
+                // lexical scoping rules (the inner k is a fresh
+                // binding). Pass the inner k_name to the recursive
+                // walk so the violation message names the right one.
+                let r = arm_body_walk(&inner_arm.body, scopes, &inner_arm.k_name, globals);
+                scopes.pop();
+                if r.is_some() {
+                    return r;
+                }
+            }
+            if let Some(ra) = inner_return {
+                let mut ra_scope: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                ra_scope.insert(ra.binding.clone());
+                scopes.push(ra_scope);
+                let r = arm_body_walk(&ra.body, scopes, k_name, globals);
+                scopes.pop();
+                if r.is_some() {
+                    return r;
+                }
+            }
+            None
+        }
+    }
+}
+
+fn arm_body_walk_block(
+    b: &crate::ast::Block,
+    scopes: &mut Vec<std::collections::BTreeSet<String>>,
+    k_name: &str,
+    globals: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    use crate::ast::Stmt;
+    // Sequential let/expr/perform statements. Names introduced by
+    // `Stmt::Let` are visible to subsequent stmts and the tail; we
+    // accumulate them into a single scope frame that grows as we
+    // walk. The walk pushes the (initially empty) scope before
+    // walking the let value's RHS so the let name itself is NOT in
+    // scope of its own RHS.
+    let mut local: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                scopes.push(local.clone());
+                let r = arm_body_walk(&l.value, scopes, k_name, globals);
+                scopes.pop();
+                if r.is_some() {
+                    return r;
+                }
+                local.insert(l.name.clone());
+            }
+            Stmt::Expr(e) => {
+                scopes.push(local.clone());
+                let r = arm_body_walk(e, scopes, k_name, globals);
+                scopes.pop();
+                if r.is_some() {
+                    return r;
+                }
+            }
+            Stmt::Perform(p) => {
+                scopes.push(local.clone());
+                let mut found = None;
+                for a in &p.args {
+                    if let Some(r) = arm_body_walk(a, scopes, k_name, globals) {
+                        found = Some(r);
+                        break;
+                    }
+                }
+                scopes.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+    }
+    if let Some(tail) = &b.tail {
+        scopes.push(local);
+        let r = arm_body_walk(tail, scopes, k_name, globals);
+        scopes.pop();
+        return r;
+    }
+    None
+}
+
+fn arm_body_collect_pattern_bindings(
+    p: &crate::ast::Pattern,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    use crate::ast::{CtorPatternFields, Pattern};
+    match p {
+        Pattern::Var(name, _) => {
+            out.insert(name.clone());
+        }
+        Pattern::Wildcard(_)
+        | Pattern::IntLit(..)
+        | Pattern::BoolLit(..)
+        | Pattern::CharLit(..) => {}
+        Pattern::Tuple(ps, _) => {
+            for sub in ps {
+                arm_body_collect_pattern_bindings(sub, out);
+            }
+        }
+        Pattern::Ctor { fields, .. } => match fields {
+            CtorPatternFields::Unit => {}
+            CtorPatternFields::Positional(ps) => {
+                for sub in ps {
+                    arm_body_collect_pattern_bindings(sub, out);
+                }
+            }
+            CtorPatternFields::Record(fs) => {
+                for f in fs {
+                    arm_body_collect_pattern_bindings(&f.pattern, out);
+                }
+            }
+        },
     }
 }
 
@@ -664,6 +970,28 @@ fn expr_unsupported_handle(e: &crate::ast::Expr) -> Option<String> {
 struct HandlerArmSynth {
     func_id: cranelift_module::FuncId,
     body: crate::ast::Expr,
+    /// Plan B Task 55 (Phase 4c) — declared op-arg names from the arm
+    /// header (`Effect.op(name1, name2, ..., k)`). Used by the
+    /// synthetic-fn definition pass to bind the unpacked op-args into
+    /// the Lowerer's env so the arm body can reference them. Empty
+    /// for zero-arg ops; trailing `k` is excluded (tracked separately
+    /// via `k_name` and rejected by the Phase 4c walker until Phase 4d).
+    arg_names: Vec<String>,
+    /// Plan B Task 55 (Phase 4c) — Cranelift type per op-arg, parallel
+    /// to `arg_names`. Resolved from the matching `EffectOp`'s declared
+    /// `params` via `cranelift_ty_for_type_expr`. Used by the synthetic-
+    /// fn entry to truncate the I64-widened slot value back to the
+    /// original Cranelift type (`I8` for Bool/Byte/Unit via `ireduce`,
+    /// `I32` for Char via `ireduce`, `I64` and pointer-typed values
+    /// stay as-is).
+    arg_types: Vec<Type>,
+    /// Plan B Task 55 (Phase 4c) — Cranelift type of the arm body's
+    /// result. The body's lowered `Value` is widened to `I64` (matching
+    /// `sigil_next_step_done`'s signature) before the wrap call;
+    /// `lower_perform_non_io_to_value` mirror-narrows on the perform
+    /// side so the perform's `type_of_expr` (the op's declared return
+    /// type) and the actual lowered Cranelift `Value` agree.
+    body_ty: Type,
 }
 
 /// Walk a block looking for `Expr::Handle` sites and allocating
@@ -674,11 +1002,26 @@ struct HandlerArmSynth {
 /// arms whose `Expr::Handle` site might end up dead-code-eliminated
 /// by some future optimisation. Codegen never optimises handles
 /// today, so over-allocation here is harmless.
+/// Bundle of pre-pass context threaded through the recursive walk.
+/// Avoids 7+ positional args; assembled once at `emit_object` entry.
+struct ArmSynthCtx<'a> {
+    cps_arm_sig: &'a Signature,
+    op_ids: &'a BTreeMap<(String, String), u32>,
+    /// Plan B Task 55 (Phase 4c): the EffectDecl registry, used to
+    /// resolve each arm's op-arg `TypeExpr`s into Cranelift `Type`s
+    /// stored on the resulting `HandlerArmSynth`.
+    effects: &'a BTreeMap<String, crate::ast::EffectDecl>,
+    /// Plan B Task 55 (Phase 4c): pointer width for resolving
+    /// `String` / user-type `TypeExpr`s. Constant per `emit_object`
+    /// call; threaded so the Cranelift type computation lives in one
+    /// place.
+    pointer_ty: Type,
+}
+
 fn collect_handle_arms_in_block(
     b: &crate::ast::Block,
     module: &mut ObjectModule,
-    cps_arm_sig: &Signature,
-    op_ids: &BTreeMap<(String, String), u32>,
+    ctx: &ArmSynthCtx<'_>,
     synth: &mut Vec<HandlerArmSynth>,
     indices: &mut BTreeMap<Span, Vec<usize>>,
 ) -> Result<(), String> {
@@ -686,20 +1029,20 @@ fn collect_handle_arms_in_block(
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                collect_handle_arms_in_expr(&l.value, module, cps_arm_sig, op_ids, synth, indices)?;
+                collect_handle_arms_in_expr(&l.value, module, ctx, synth, indices)?;
             }
             Stmt::Expr(e) => {
-                collect_handle_arms_in_expr(e, module, cps_arm_sig, op_ids, synth, indices)?;
+                collect_handle_arms_in_expr(e, module, ctx, synth, indices)?;
             }
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    collect_handle_arms_in_expr(a, module, cps_arm_sig, op_ids, synth, indices)?;
+                    collect_handle_arms_in_expr(a, module, ctx, synth, indices)?;
                 }
             }
         }
     }
     if let Some(tail) = &b.tail {
-        collect_handle_arms_in_expr(tail, module, cps_arm_sig, op_ids, synth, indices)?;
+        collect_handle_arms_in_expr(tail, module, ctx, synth, indices)?;
     }
     Ok(())
 }
@@ -707,8 +1050,7 @@ fn collect_handle_arms_in_block(
 fn collect_handle_arms_in_expr(
     e: &crate::ast::Expr,
     module: &mut ObjectModule,
-    cps_arm_sig: &Signature,
-    op_ids: &BTreeMap<(String, String), u32>,
+    ctx: &ArmSynthCtx<'_>,
     synth: &mut Vec<HandlerArmSynth>,
     indices: &mut BTreeMap<Span, Vec<usize>>,
 ) -> Result<(), String> {
@@ -722,11 +1064,11 @@ fn collect_handle_arms_in_expr(
         | Expr::ClosureEnvLoad { .. }
         | Expr::Perform(_) => Ok(()),
         Expr::Binary { lhs, rhs, .. } => {
-            collect_handle_arms_in_expr(lhs, module, cps_arm_sig, op_ids, synth, indices)?;
-            collect_handle_arms_in_expr(rhs, module, cps_arm_sig, op_ids, synth, indices)
+            collect_handle_arms_in_expr(lhs, module, ctx, synth, indices)?;
+            collect_handle_arms_in_expr(rhs, module, ctx, synth, indices)
         }
         Expr::Unary { operand, .. } => {
-            collect_handle_arms_in_expr(operand, module, cps_arm_sig, op_ids, synth, indices)
+            collect_handle_arms_in_expr(operand, module, ctx, synth, indices)
         }
         Expr::If {
             cond,
@@ -734,41 +1076,37 @@ fn collect_handle_arms_in_expr(
             else_block,
             ..
         } => {
-            collect_handle_arms_in_expr(cond, module, cps_arm_sig, op_ids, synth, indices)?;
-            collect_handle_arms_in_block(then_block, module, cps_arm_sig, op_ids, synth, indices)?;
-            collect_handle_arms_in_block(else_block, module, cps_arm_sig, op_ids, synth, indices)
+            collect_handle_arms_in_expr(cond, module, ctx, synth, indices)?;
+            collect_handle_arms_in_block(then_block, module, ctx, synth, indices)?;
+            collect_handle_arms_in_block(else_block, module, ctx, synth, indices)
         }
-        Expr::Block(b) => {
-            collect_handle_arms_in_block(b, module, cps_arm_sig, op_ids, synth, indices)
-        }
+        Expr::Block(b) => collect_handle_arms_in_block(b, module, ctx, synth, indices),
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            collect_handle_arms_in_expr(scrutinee, module, cps_arm_sig, op_ids, synth, indices)?;
+            collect_handle_arms_in_expr(scrutinee, module, ctx, synth, indices)?;
             for a in arms {
-                collect_handle_arms_in_expr(&a.body, module, cps_arm_sig, op_ids, synth, indices)?;
+                collect_handle_arms_in_expr(&a.body, module, ctx, synth, indices)?;
             }
             Ok(())
         }
         Expr::Call { callee, args, .. } => {
-            collect_handle_arms_in_expr(callee, module, cps_arm_sig, op_ids, synth, indices)?;
+            collect_handle_arms_in_expr(callee, module, ctx, synth, indices)?;
             for a in args {
-                collect_handle_arms_in_expr(a, module, cps_arm_sig, op_ids, synth, indices)?;
+                collect_handle_arms_in_expr(a, module, ctx, synth, indices)?;
             }
             Ok(())
         }
-        Expr::Lambda { body, .. } => {
-            collect_handle_arms_in_expr(body, module, cps_arm_sig, op_ids, synth, indices)
-        }
+        Expr::Lambda { body, .. } => collect_handle_arms_in_expr(body, module, ctx, synth, indices),
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
-                collect_handle_arms_in_expr(ee, module, cps_arm_sig, op_ids, synth, indices)?;
+                collect_handle_arms_in_expr(ee, module, ctx, synth, indices)?;
             }
             Ok(())
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                collect_handle_arms_in_expr(&f.value, module, cps_arm_sig, op_ids, synth, indices)?;
+                collect_handle_arms_in_expr(&f.value, module, ctx, synth, indices)?;
             }
             Ok(())
         }
@@ -780,16 +1118,9 @@ fn collect_handle_arms_in_expr(
         } => {
             // Recurse into body + arm bodies so nested handles also
             // surface. Then allocate FuncIds for this handle's arms.
-            collect_handle_arms_in_expr(body, module, cps_arm_sig, op_ids, synth, indices)?;
+            collect_handle_arms_in_expr(body, module, ctx, synth, indices)?;
             for arm in op_arms {
-                collect_handle_arms_in_expr(
-                    &arm.body,
-                    module,
-                    cps_arm_sig,
-                    op_ids,
-                    synth,
-                    indices,
-                )?;
+                collect_handle_arms_in_expr(&arm.body, module, ctx, synth, indices)?;
             }
             // Allocate one synthetic CPS fn per arm. Linker symbol
             // is `sigil_handler_arm_<global_index>` to keep names
@@ -799,7 +1130,7 @@ fn collect_handle_arms_in_expr(
                 let global_idx = synth.len();
                 let mangled = format!("sigil_handler_arm_{global_idx}");
                 let func_id = module
-                    .declare_function(&mangled, Linkage::Local, cps_arm_sig)
+                    .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
                     .map_err(|e| format!("declare {mangled}: {e}"))?;
                 // Validate that the op_id is registered (op_ids
                 // populated at end of typecheck for every effect's
@@ -807,7 +1138,8 @@ fn collect_handle_arms_in_expr(
                 // looked up again at the Expr::Handle codegen site
                 // — but failing fast here gives a clearer error
                 // message than a unwrap deep inside lowering.
-                let _ = op_ids
+                let _ = ctx
+                    .op_ids
                     .get(&(arm.effect.clone(), arm.op.clone()))
                     .ok_or_else(|| {
                         format!(
@@ -816,9 +1148,49 @@ fn collect_handle_arms_in_expr(
                             arm.effect, arm.op
                         )
                     })?;
+                // Plan B Task 55 (Phase 4c): resolve op-arg names +
+                // Cranelift types from the EffectDecl. Typecheck
+                // E0141 enforces arity so the zip is well-defined;
+                // E0138 / E0139 ensure the registry lookup succeeds.
+                let eff_decl = ctx.effects.get(&arm.effect).ok_or_else(|| {
+                    format!(
+                        "codegen pre-pass: effect `{}` missing from registry — \
+                         typecheck-time E0138 should have caught this",
+                        arm.effect
+                    )
+                })?;
+                let op_decl = eff_decl
+                    .ops
+                    .iter()
+                    .find(|o| o.name == arm.op)
+                    .ok_or_else(|| {
+                        format!(
+                            "codegen pre-pass: op `{}.{}` missing from EffectDecl — \
+                             typecheck-time E0139 should have caught this",
+                            arm.effect, arm.op
+                        )
+                    })?;
+                debug_assert_eq!(
+                    arm.params.len(),
+                    op_decl.params.len(),
+                    "codegen pre-pass: arm `{}.{}` arity mismatch (typecheck E0141 \
+                     should have caught this)",
+                    arm.effect,
+                    arm.op
+                );
+                let arg_names: Vec<String> = arm.params.iter().map(|p| p.name.clone()).collect();
+                let arg_types: Vec<Type> = op_decl
+                    .params
+                    .iter()
+                    .map(|te| cranelift_ty_for_type_expr(te, ctx.pointer_ty))
+                    .collect();
+                let body_ty = cranelift_ty_for_type_expr(&op_decl.return_type, ctx.pointer_ty);
                 synth.push(HandlerArmSynth {
                     func_id,
                     body: arm.body.clone(),
+                    arg_names,
+                    arg_types,
+                    body_ty,
                 });
                 arm_indices.push(global_idx);
             }
@@ -1268,13 +1640,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         cps_arm_sig.params.push(AbiParam::new(pointer_ty)); // args_ptr
         cps_arm_sig.params.push(AbiParam::new(types::I32)); // args_len
         cps_arm_sig.returns.push(AbiParam::new(pointer_ty)); // *mut NextStep
+        let arm_synth_ctx = ArmSynthCtx {
+            cps_arm_sig: &cps_arm_sig,
+            op_ids: &checked.op_ids,
+            effects: &checked.effects,
+            pointer_ty,
+        };
         for item in &checked.program.items {
             if let crate::ast::Item::Fn(f) = item {
                 collect_handle_arms_in_block(
                     &f.body,
                     &mut module,
-                    &cps_arm_sig,
-                    &checked.op_ids,
+                    &arm_synth_ctx,
                     &mut handler_arm_synth,
                     &mut handler_arm_indices,
                 )?;
@@ -1527,17 +1904,28 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .map_err(|e| format!("define main: {e}"))?;
     module.clear_context(&mut ctx);
 
-    // --- Plan B Task 55 (Phase 3b): synthetic handler-arm CPS fns ------
+    // --- Plan B Task 55 (Phase 4c): synthetic handler-arm CPS fns ------
     //
     // Each entry in `handler_arm_synth` was allocated a `FuncId` by
     // the pre-pass; here we define each fn's body. Every arm fn has
     // the uniform CPS calling convention `extern "C" fn(closure_ptr,
-    // args_ptr, args_len) -> *mut NextStep`. Phase 3b restricts arm
-    // bodies to literal `Expr::IntLit` (the `unsupported_handle_construct`
-    // walker enforces this); the body computes the literal value,
-    // wraps it via `sigil_next_step_done(value)`, and returns the
-    // resulting NextStep pointer. Phase 4+ will lower richer arm
-    // bodies through a dedicated CPS-aware lowerer.
+    // args_ptr, args_len) -> *mut NextStep`.
+    //
+    // Phase 4c lifts the Phase 3b "IntLit-only arm body" restriction:
+    // bodies are now lowered through a real `Lowerer` instance with
+    // op-args bound from `args_ptr` at fn entry. The walker
+    // (`unsupported_handle_construct`) still enforces the remaining
+    // Phase 4c restrictions (no `k` use, no outer-scope captures, no
+    // nested `Lambda` / `ClosureRecord`) so the synthetic fn never
+    // needs a non-null `closure_ptr` and the env stays bounded by the
+    // op-args.
+    //
+    // The body's lowered Cranelift `Value` is widened to I64 via
+    // `uextend` if narrower (matching `sigil_next_step_done`'s I64
+    // signature) before the wrap call; `lower_perform_non_io_to_value`
+    // mirror-narrows on the perform side so the perform's
+    // `type_of_expr` (the op's declared return type) and the actual
+    // lowered Cranelift `Value` agree.
     {
         let cps_arm_sig = {
             let mut s = Signature::new(isa_call_conv(&module));
@@ -1557,34 +1945,205 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 builder.switch_to_block(block);
                 builder.seal_block(block);
 
-                // Phase 3b restriction: arm body must be IntLit. The
-                // codegen-entry guard rejects everything else, so this
-                // is a build-time invariant.
-                let value: i64 = match &synth.body {
-                    crate::ast::Expr::IntLit(n, _) => *n,
-                    other => unreachable!(
-                        "codegen Phase 3b: arm body should be IntLit per \
-                         unsupported_handle_construct guard; got {other:?}"
-                    ),
-                };
-                let value_v = builder.ins().iconst(types::I64, value);
+                // Per-arm-fn FFI refs. Same shape as the user-fn
+                // loop above — each `module.declare_func_in_func`
+                // returns a `FuncRef` scoped to this fn's builder,
+                // so we have to redeclare per-fn (cannot reuse the
+                // user-fn loop's FuncRefs across function bodies).
+                let string_new_ref = module.declare_func_in_func(string_new, builder.func);
+                let println_ref = module.declare_func_in_func(println, builder.func);
+                let panic_arith_ref = module.declare_func_in_func(panic_arith, builder.func);
+                let alloc_ref = module.declare_func_in_func(alloc, builder.func);
+                let int_to_string_ref = module.declare_func_in_func(int_to_string, builder.func);
+                let handler_frame_new_ref =
+                    module.declare_func_in_func(handler_frame_new, builder.func);
+                let handle_push_ref = module.declare_func_in_func(handle_push, builder.func);
+                let handle_pop_ref = module.declare_func_in_func(handle_pop, builder.func);
+                let handler_frame_set_arm_ref =
+                    module.declare_func_in_func(handler_frame_set_arm, builder.func);
+                let perform_ref = module.declare_func_in_func(perform_func, builder.func);
+                let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
                 let next_step_done_ref = module.declare_func_in_func(next_step_done, builder.func);
-                let done_call = builder.ins().call(next_step_done_ref, &[value_v]);
-                // TODO(Plan B Task 55, Phase 4c): no stackmap entry
-                // for this `sigil_next_step_done` call. Safe today
-                // only because (a) `closure_ptr` arg is null and (b)
-                // an `IntLit` arm body has no GC roots. Once Phase 4c
-                // lands richer arm bodies with captures, `closure_ptr`
-                // becomes a live GC root across this call site and
-                // any roots in scope must be threaded into the
-                // stackmap (mirroring the `Lowerer::stackmap.push_*`
-                // pattern at every other arena-allocating call). At
-                // that point this synthetic-fn path needs to use the
-                // full Lowerer machinery rather than the hand-rolled
-                // sequence below.
-                let next_step_ptr = builder.inst_results(done_call)[0];
-                builder.ins().return_(&[next_step_ptr]);
-                builder.finalize();
+
+                // Per-handle synthetic arm-fn refs, keyed by handle
+                // span. Phase 4c walker rejects nested Handle inside
+                // arm bodies via the capture / lambda gates (a nested
+                // handle's body would generally need access to the
+                // outer arm's bindings to be useful), but we still
+                // build the map defensively so a simple constant-
+                // bodied nested handle doesn't accidentally crash if
+                // the walker's gates are loosened in a future phase.
+                let handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>> = handler_arm_indices
+                    .iter()
+                    .map(|(span, idx_vec)| {
+                        let refs: Vec<FuncRef> = idx_vec
+                            .iter()
+                            .map(|&i| {
+                                module.declare_func_in_func(
+                                    handler_arm_synth[i].func_id,
+                                    builder.func,
+                                )
+                            })
+                            .collect();
+                        (span.clone(), refs)
+                    })
+                    .collect();
+
+                let user_fn_refs: BTreeMap<String, FuncRef> = user_fns
+                    .iter()
+                    .map(|(name, uf)| {
+                        (
+                            name.clone(),
+                            module.declare_func_in_func(uf.func_id, builder.func),
+                        )
+                    })
+                    .collect();
+
+                let lit_gvs: Vec<(Span, GlobalValue, usize)> = string_literals
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (span, s))| {
+                        let gv = module.declare_data_in_func(lit_ids[idx], builder.func);
+                        (span.clone(), gv, s.len())
+                    })
+                    .collect();
+                let div_zero_gv = module.declare_data_in_func(div_zero_msg_id, builder.func);
+                let mod_zero_gv = module.declare_data_in_func(mod_zero_msg_id, builder.func);
+
+                // Block params: 0 = closure_ptr (null in Phase 4c),
+                // 1 = args_ptr, 2 = args_len (unused — walker
+                // enforces arity through typecheck E0141).
+                let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                let closure_ptr = block_params[0];
+                let args_ptr = block_params[1];
+                let _args_len = block_params[2];
+
+                // Unpack op-args from `args_ptr` and bind them in
+                // the env. Each slot is a u64; narrower declared
+                // types (I8 Bool/Byte/Unit, I32 Char) get `ireduce`'d
+                // back, mirroring the `uextend` widening in
+                // `lower_perform_non_io_to_value`.
+                let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                for (i, (name, declared_ty)) in synth
+                    .arg_names
+                    .iter()
+                    .zip(synth.arg_types.iter())
+                    .enumerate()
+                {
+                    let widened = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        args_ptr,
+                        (i * 8) as i32,
+                    );
+                    let value = if *declared_ty == types::I64 {
+                        widened
+                    } else if declared_ty.is_int() && declared_ty.bits() < 64 {
+                        builder.ins().ireduce(*declared_ty, widened)
+                    } else {
+                        // pointer_ty (String, user-type pointers):
+                        // already I64 on every supported target. A
+                        // future float / 32-bit-target port would
+                        // need an ireduce or bitcast branch here.
+                        // `assert_eq!` (not `debug_assert_eq!`) so a
+                        // future floats addition or 32-bit-target
+                        // port that smuggles a non-pointer-width
+                        // value through this path panics in *both*
+                        // dev and release builds — symmetric with
+                        // `lower_perform_non_io_to_value`'s
+                        // perform-side widening fallthrough at
+                        // codegen.rs:2542 per the deviation entry's
+                        // "mirror" hardening discipline.
+                        assert_eq!(
+                            *declared_ty, pointer_ty,
+                            "codegen Phase 4c: unexpected op-arg Cranelift type \
+                             {declared_ty:?} unpacking from args_ptr in arm fn"
+                        );
+                        widened
+                    };
+                    env.insert(name.clone(), value);
+                }
+
+                let mut lowerer = Lowerer {
+                    builder,
+                    stackmap: &mut stackmap,
+                    env,
+                    pointer_ty,
+                    closure_ptr,
+                    lit_gvs,
+                    div_zero_gv,
+                    mod_zero_gv,
+                    string_new_ref,
+                    println_ref,
+                    panic_arith_ref,
+                    alloc_ref,
+                    int_to_string_ref,
+                    handler_frame_new_ref,
+                    handle_push_ref,
+                    handle_pop_ref,
+                    handler_frame_set_arm_ref,
+                    perform_ref,
+                    run_loop_ref,
+                    handler_arm_refs_per_handle,
+                    effect_ids: &checked.effect_ids,
+                    op_ids: &checked.op_ids,
+                    effects: &checked.effects,
+                    user_fn_refs,
+                    user_fns: &user_fns,
+                    type_layouts: &type_layouts,
+                    ctor_index: &ctor_index,
+                    match_scrut_tys: &checked.match_scrut_tys,
+                };
+
+                let body_value = lowerer.lower_expr(&synth.body);
+
+                // Widen the body value to I64 for `sigil_next_step_done`.
+                // Mirrors the perform-side widening in
+                // `lower_perform_non_io_to_value`. The corresponding
+                // narrowing on the perform side (added in Phase 4c)
+                // restores the op's declared return type so callers
+                // see the right Cranelift type.
+                let widened_body = if synth.body_ty == types::I64 {
+                    body_value
+                } else if synth.body_ty.is_int() && synth.body_ty.bits() < 64 {
+                    lowerer.builder.ins().uextend(types::I64, body_value)
+                } else {
+                    // pointer_ty: store directly (already I64 on
+                    // supported targets); see widening discipline
+                    // in `lower_perform_non_io_to_value`.
+                    // `assert_eq!` (not `debug_assert_eq!`) for
+                    // symmetry with the perform-side widening
+                    // fallthrough at codegen.rs:2542 per the
+                    // deviation entry's "mirror" hardening
+                    // discipline — future floats / 32-bit-target
+                    // regressions panic in both dev and release.
+                    assert_eq!(
+                        synth.body_ty, pointer_ty,
+                        "codegen Phase 4c: unexpected arm-body Cranelift type \
+                         {:?} for sigil_next_step_done wrap",
+                        synth.body_ty
+                    );
+                    body_value
+                };
+
+                let done_call = lowerer
+                    .builder
+                    .ins()
+                    .call(next_step_done_ref, &[widened_body]);
+                // Stackmap entry: any pointer-typed op-args bound in
+                // env (String / user-type) are GC roots live across
+                // this `sigil_next_step_done` arena allocation.
+                // Placeholder records keep the stackmap section
+                // honest (Plan A1 STACKMAP_FLAG_PLACEHOLDER); a real
+                // safepoint with live-value list arrives with the
+                // v1 stackmap format upgrade noted in the
+                // StackMapBuilder doc comment.
+                lowerer
+                    .stackmap
+                    .push_placeholder(function_code_offset(&lowerer.builder, done_call));
+                let next_step_ptr = lowerer.builder.inst_results(done_call)[0];
+                lowerer.builder.ins().return_(&[next_step_ptr]);
+                lowerer.builder.finalize();
             }
             module
                 .define_function(synth.func_id, &mut ctx)
@@ -2060,14 +2619,67 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // the arm itself). Hand off to `sigil_run_loop` which
         // dispatches the Call (invokes the arm), then any further
         // Calls the arm returns, until a terminal `Done(value)`.
-        // Returns u64 — cast to i64 for native consumption.
+        // Returns u64.
         let run_loop_call = self
             .builder
             .ins()
             .call(self.run_loop_ref, &[call_next_step]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-        self.builder.inst_results(run_loop_call)[0]
+        let widened = self.builder.inst_results(run_loop_call)[0];
+
+        // Phase 4c: narrow the run_loop result back to the op's
+        // declared return type. The arm fn widens its body value to
+        // I64 before `sigil_next_step_done` (matching the FFI
+        // signature); without this mirror narrow on the perform side,
+        // surrounding code that consumes a non-Int perform result
+        // (e.g. Bool I8, Char I32) would see an I64 Cranelift value
+        // where `type_of_expr` predicts a narrower type, producing
+        // a verifier failure or worse a silent type-mismatch.
+        // Both registry lookups are typecheck invariants: E0042
+        // catches unknown effects, E0043 catches unknown ops. Falling
+        // back to `I64` here would silently emit wrong-typed Cranelift
+        // values for non-Int return types under any future typecheck
+        // regression that left the registry incomplete; `unreachable!`
+        // surfaces the regression at codegen time instead.
+        let eff = self.effects.get(&p.effect).unwrap_or_else(|| {
+            unreachable!(
+                "codegen: effect `{}` missing from effects registry; typecheck-time \
+                 E0042 should have caught this",
+                p.effect
+            )
+        });
+        let op_decl = eff.ops.iter().find(|o| o.name == p.op).unwrap_or_else(|| {
+            unreachable!(
+                "codegen: op `{}.{}` missing from EffectDecl.ops; typecheck-time \
+                 E0043 should have caught this",
+                p.effect, p.op
+            )
+        });
+        let return_ty = cranelift_ty_for_type_expr(&op_decl.return_type, self.pointer_ty);
+        if return_ty == types::I64 {
+            widened
+        } else if return_ty.is_int() && return_ty.bits() < 64 {
+            self.builder.ins().ireduce(return_ty, widened)
+        } else {
+            // pointer_ty (String, user-type pointers): on supported
+            // targets pointer_ty == I64, so the value is already the
+            // right width. A future float / 32-bit-target port would
+            // need an ireduce or bitcast branch here. Hardened to
+            // `assert!` (mirrors the perform-side widening fallthrough
+            // in this same fn) so a future regression panics in dev
+            // and release rather than silently producing a wrong-
+            // typed Cranelift Value.
+            assert_eq!(
+                return_ty, self.pointer_ty,
+                "codegen Phase 4c: unexpected op return type {return_ty:?} \
+                 narrowing run_loop result for `{}.{}` — Phase 4c only \
+                 supports I64 (Int), I32 (Char), I8 (Bool/Byte/Unit), \
+                 and pointer_ty (String / user-type pointers)",
+                p.effect, p.op
+            );
+            widened
+        }
     }
 
     /// Lower an expression to an SSA value. The value's Cranelift
