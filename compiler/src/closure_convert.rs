@@ -475,7 +475,7 @@ impl Converter {
     }
 }
 
-fn slot_kind_for_ty(ty: &Ty) -> EnvSlotKind {
+pub(crate) fn slot_kind_for_ty(ty: &Ty) -> EnvSlotKind {
     match ty {
         Ty::Int => EnvSlotKind::Int,
         Ty::Bool => EnvSlotKind::Bool,
