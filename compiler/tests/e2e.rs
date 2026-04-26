@@ -1916,13 +1916,19 @@ fn arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen(
     // closure_convert to rewrite the captured `x` into a
     // `ClosureEnvLoad`. The walker must reject via the new
     // `Expr::ClosureEnvLoad` arm.
+    // Sigil v1's `TypeExpr::Fn` surface syntax is deferred (see
+    // examples/higher_order.sigil's preamble note + the Plan A2 Task
+    // 30 carryover), so the lambda has to be invoked as an IIFE
+    // rather than let-bound and called by name. The closure_convert
+    // rewrite of the captured `x` → `ClosureEnvLoad` happens the
+    // same way for an IIFE'd lambda as for a let-bound one.
     let src = "effect E { op: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let x: Int = 7;\n  \
-                 let f = fn (_d: Int) -> Int ![] => handle (perform E.op()) with {\n    \
+                 let n: Int = (fn (_d: Int) -> Int ![IO] => handle (perform E.op()) with {\n    \
                    E.op(k) => x,\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(f(0)));\n  \
+                 })(0);\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let tmp = std::env::temp_dir().join(format!(
