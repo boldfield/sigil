@@ -1172,6 +1172,49 @@ mod tests {
         }
     }
 
+    /// Plan B Task 55 Phase 4e — pins the colorer's classification for
+    /// the same source as the e2e regression test
+    /// `statement_form_non_io_perform_inside_handle_compiles_and_runs`
+    /// (compiler/tests/e2e.rs around line 1054). The e2e test currently
+    /// asserts stdout `42` — the Phase 4d MVP synchronous-broken
+    /// behaviour where helper's stmt-form perform of E.op() returns the
+    /// arm value 99 (discarded by Stmt) and helper continues to its
+    /// tail `42`. Algebraic semantics gives `99` (the discard-k arm
+    /// fires; helper aborts; the handle's overall is the arm value).
+    /// Phase 4e's codegen-consumes-color commit must invert the e2e
+    /// test from `42` → `99` alongside un-`#[ignore]`'ing
+    /// `discard_k_handler_does_not_abort_helper_phase_4e_pending`.
+    ///
+    /// This colorer test pins the *classification* (main is CPS via
+    /// bridge to helper) so the e2e test's correctness gap can be
+    /// attributed to codegen, not to a colorer regression. If a future
+    /// refactor breaks this classification (e.g., dropping the
+    /// call-graph edges out of `Expr::Handle::body`), this test fires
+    /// before the e2e test does — the failure points at color.rs not
+    /// at codegen.
+    #[test]
+    fn statement_form_non_io_perform_inside_handle_classifies_main_cps_via_bridge() {
+        let src = "effect E { op: () -> Int }\n\
+                   fn helper() -> Int ![E] {\n  \
+                     perform E.op();\n  \
+                     42\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let n: Int = handle helper() with { E.op(k) => 99 };\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let cp = color_from_src(src);
+        assert_eq!(color_of(&cp, "helper"), Color::Cps);
+        assert_eq!(reason_of(&cp, "helper"), "cps: row contains effect `E`");
+        assert_eq!(color_of(&cp, "main"), Color::Cps);
+        let main_reason = reason_of(&cp, "main");
+        assert!(
+            main_reason.contains("transitively calls `helper`"),
+            "got: {main_reason}"
+        );
+    }
+
     #[test]
     fn handle_body_calling_cps_helper_makes_caller_cps_via_bridge() {
         // helper() -> Int ![Raise] { 0 }     -- intrinsically CPS
