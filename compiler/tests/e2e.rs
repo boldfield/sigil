@@ -3068,35 +3068,57 @@ fn slice_b_post_arm_k_synth_fn_lowered_tail_type_differs_from_op_return_type() {
     // arm's tail expression type differs from the op's return type.
     //
     // Slice B's original e2e tests all used `Raise.fail: () -> Int`
-    // with arm tail also Int — body_ty matched tail_ty so the
-    // bug never surfaced. Slice C's `Choose.flip: () -> Bool` with
-    // arm tail Int incidentally exposed it.
+    // with arm tail also Int — `body_ty` (= op return type) matched
+    // the tail's lowered type so the bug never surfaced. Slice C's
+    // `Choose.flip: () -> Bool` incidentally exposed it.
     //
-    // This test uses Slice B's single-let shape but with op return
-    // type `Bool` and arm tail type `Int` to force the divergence
-    // at the Slice B path specifically:
+    // To force the divergence at Slice B's path specifically, we
+    // need:
+    //   - Op return type: Bool (=> body_ty = I8 in the pre-pass).
+    //   - Arm tail type: Int (=> actual lowered Cranelift type = I64).
     //
-    //   effect Raise { fail: () -> Bool }     // op returns Bool
-    //   helper returns Bool ![Raise]
-    //   arm: Raise.fail(k) => { let r: Bool = k(true); if r { 1 } else { 0 } }
-    //                                          // tail returns Int
+    // The continuation `k`'s type is `T_op_ret -> T_helper_ret`, so
+    // we want `T_op_ret = Bool` (the perform's value passed to k)
+    // and `T_helper_ret = Int` (what the handle expression produces,
+    // = `r`'s declared type in the arm body).
     //
-    // Pre-fix: post_arm_k synth fn would attempt
-    //   uextend.i64 v_int   (where v_int is already I64)
-    // and Cranelift's verifier would reject the invalid widen.
+    //   effect Raise { fail: () -> Bool }     // T_op_ret = Bool
+    //   fn helper() -> Int ![Raise, IO] {     // T_helper_ret = Int
+    //     let b: Bool = perform Raise.fail();
+    //     if b { 1 } else { 0 }
+    //   }
+    //   arm: Raise.fail(k) => {
+    //     let r: Int = k(true);               // r: Int (= T_helper_ret)
+    //     r + 1                               // tail returns Int
+    //   }
     //
-    // Post-fix: the synth fn reads `dfg.value_type(tail_value) ==
-    // I64`, takes the no-widen branch, ships terminal `Done(1)`.
+    // Pre-fix: post_arm_k synth fn compared the pre-stored
+    // `tail_ty == body_ty == I8` against I64, took the `< 64`
+    // branch, and emitted `uextend.i64 v_i64` — Cranelift's
+    // verifier rejects (uextend requires source < target).
+    //
+    // Post-fix: synth fn reads `dfg.value_type(tail_value) == I64`,
+    // skips the widen, ships terminal `Done(2)`.
+    //
+    // Runtime trace:
+    // - main calls helper.
+    // - helper performs Raise.fail() with k_fn = helper's synth-cont.
+    // - arm fires: k(true) → Call(helper_synth_cont, [true_widened_to_I64,
+    //   null, post_arm_k_addr]).
+    // - helper synth-cont reads b=true (narrows I64 → I8), lowers tail
+    //   `if b { 1 } else { 0 }` → 1, dispatches Call(post_arm_k_addr, [1]).
+    // - post_arm_k synth fn reads r=1 from args_ptr[0], lowers `r + 1`
+    //   → 2, returns Done(2).
     let src = "effect Raise { fail: () -> Bool }\n\
-               fn helper() -> Bool ![Raise, IO] {\n  \
+               fn helper() -> Int ![Raise, IO] {\n  \
                  let b: Bool = perform Raise.fail();\n  \
-                 b\n\
+                 if b { 1 } else { 0 }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle helper() with {\n    \
                    Raise.fail(k) => {\n      \
-                     let r: Bool = k(true);\n      \
-                     if r { 1 } else { 0 }\n    \
+                     let r: Int = k(true);\n      \
+                     r + 1\n    \
                    },\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
@@ -3105,9 +3127,10 @@ fn slice_b_post_arm_k_synth_fn_lowered_tail_type_differs_from_op_return_type() {
     let (stdout, stderr, code) = compile_and_run(src, "slice_b_post_arm_k_body_ty_neq_tail_ty");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "1\n",
-        "Slice B body_ty != tail_ty: helper returns Bool, post_arm_k tail \
-         returns Int. r=true → if r {{ 1 }} else {{ 0 }} = 1. stderr={stderr:?}"
+        stdout, "2\n",
+        "Slice B body_ty != tail_ty: op returns Bool, helper/handle/arm \
+         returns Int. k(true) → helper continues with b=true → tail = 1 \
+         → r = 1 → r + 1 = 2. stderr={stderr:?}"
     );
 }
 
