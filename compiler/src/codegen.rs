@@ -6699,6 +6699,201 @@ mod tests {
         assert!(!is_simple_yield_then_constant_tail_body(&body));
     }
 
+    // ---------------- Plan B Task 55, Phase 4e — let-yield-then-
+    // pure-tail classifier (lambda-lifting captures-free slice).
+
+    #[test]
+    fn let_yield_then_pure_tail_body_recognised() {
+        // `let x: Int = perform Raise.fail(); 42` — happy path with
+        // a literal tail. Even though a constant tail also matches
+        // `is_simple_yield_then_constant_tail_body` for the
+        // Stmt::Perform form, the let-form here goes through the
+        // let-yield classifier.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::IntLit(42, span.clone())),
+            span,
+        };
+        assert!(is_simple_let_yield_then_pure_tail_body(&body));
+    }
+
+    #[test]
+    fn let_yield_then_binary_using_binding_recognised() {
+        // `let x: Int = perform Raise.fail(); x + 100` — the
+        // `discard_k_handler_does_abort_helper_across_call_boundary`
+        // e2e test's helper shape. Tail is a pure Binary referencing
+        // the let-binding.
+        use crate::ast::{BinOp, Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("x".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(100, span.clone())),
+                span: span.clone(),
+            }),
+            span,
+        };
+        assert!(is_simple_let_yield_then_pure_tail_body(&body));
+    }
+
+    #[test]
+    fn let_yield_then_call_in_tail_is_not_let_yield_then_pure() {
+        // `let x: Int = perform Raise.fail(); helper(x)` — tail
+        // contains a Call (impure per `expr_is_pure`). Classifier
+        // rejects; helper falls through to Sync ABI cleanly.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("helper".to_string(), span.clone())),
+                args: vec![Expr::Ident("x".to_string(), span.clone())],
+                span: span.clone(),
+            }),
+            span,
+        };
+        assert!(!is_simple_let_yield_then_pure_tail_body(&body));
+    }
+
+    #[test]
+    fn let_yield_with_io_perform_value_is_not_let_yield_then_pure() {
+        // `let s: String = perform IO.println("hi"); ...` — IO
+        // performs use the synchronous lower_perform path
+        // regardless of color; the let-yield classifier rejects.
+        // Mirrors the IO rejection from
+        // `is_simple_yield_then_constant_tail_body`.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "s".to_string(),
+                ty: TypeExpr::Named("Unit".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "IO".to_string(),
+                    op: "println".to_string(),
+                    args: vec![Expr::StringLit("hi".to_string(), span.clone())],
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::IntLit(0, span.clone())),
+            span,
+        };
+        assert!(!is_simple_let_yield_then_pure_tail_body(&body));
+    }
+
+    #[test]
+    fn multi_stmt_body_with_let_yield_first_is_not_let_yield_then_pure() {
+        // Classifier requires exactly one stmt. Multi-stmt bodies
+        // with a let-yield as stmts[0] (followed by other stmts)
+        // need full lambda-lifting (chained synth-conts) — future
+        // commit.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![
+                Stmt::Let(LetStmt {
+                    name: "x".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::Perform(PerformExpr {
+                        effect: "Raise".to_string(),
+                        op: "fail".to_string(),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    }),
+                    span: span.clone(),
+                }),
+                // Second stmt — disqualifies the body from this
+                // classifier's exactly-one-stmt requirement.
+                Stmt::Expr(Expr::IntLit(1, span.clone())),
+            ],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert!(!is_simple_let_yield_then_pure_tail_body(&body));
+    }
+
+    #[test]
+    fn let_yield_with_match_tail_using_binding_recognised() {
+        // Recursive purity: a Match expression over a pure scrutinee
+        // (the binding) with pure arm bodies (literals) is pure.
+        // The synth-cont's Lowerer handles Match correctly via
+        // `lower_expr` → `lower_match`. Pin acceptance.
+        use crate::ast::{Block, Expr, LetStmt, MatchArm, Pattern, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Bool".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Match {
+                scrutinee: Box::new(Expr::Ident("x".to_string(), span.clone())),
+                arms: vec![
+                    MatchArm {
+                        pattern: Pattern::BoolLit(true, span.clone()),
+                        body: Expr::IntLit(1, span.clone()),
+                        span: span.clone(),
+                    },
+                    MatchArm {
+                        pattern: Pattern::BoolLit(false, span.clone()),
+                        body: Expr::IntLit(0, span.clone()),
+                        span: span.clone(),
+                    },
+                ],
+                span: span.clone(),
+            }),
+            span,
+        };
+        assert!(is_simple_let_yield_then_pure_tail_body(&body));
+    }
+
     #[test]
     fn multi_stmt_body_is_not_yield_then_constant() {
         // Classifier requires exactly one stmt. Multi-stmt bodies
