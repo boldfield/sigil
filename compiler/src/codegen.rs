@@ -1292,6 +1292,41 @@ struct ArmCapture {
 ///     the closure-convert side-table extension, future commit).
 ///   - The constant is restricted to [`crate::ast::Expr::IntLit`]
 ///     in this slice; future commits widen to other literals.
+///
+/// **Forward concerns (PR #26 mid-flight at `b818fc3`)** for the
+/// captures-bearing slice (next major commit):
+///
+/// 1. **Synth-cont's binding-behavior shift.** The current
+///    "k_arg discarded" semantics are correct for `Stmt::Perform;
+///    constant_tail` because the source has nowhere to bind the
+///    perform's result. Future shapes need different binding —
+///    for `let x = perform E.op(); rest_using_x` the synth-cont
+///    binds `args_ptr[0]` (the k_arg) as `x` in its env, then
+///    runs `rest_using_x` with `x` in scope; for `perform E.op();
+///    rest_using_no_binding` the synth-cont ignores `args_ptr[0]`
+///    and runs `rest_using_no_binding` (with captures for any
+///    referenced names if `rest_using_no_binding` isn't
+///    constant). Per the reviewer: "the synth-cont's binding
+///    behavior must shift from 'discard k's arg' to 'bind k's
+///    arg as the perform's result name' depending on whether the
+///    source has a `let x = perform ...` form."
+///
+/// 2. **Lowerer-driven body emission.** The current synth-cont
+///    body is hand-rolled (just iconst + sigil_next_step_done +
+///    return). Future shapes need a Lowerer with env populated
+///    from captures + the k_arg binding (for the let-form case).
+///    Per the reviewer: "Does the constrained-context Lowerer
+///    reuse extend cleanly to that, or does the lambda-lifting
+///    commit need a full Lowerer construction with the standard
+///    pipeline?" Verify in the captures-slice's review.
+///
+/// 3. **Closure-convert side-table extension.** Synth-conts
+///    capturing user params or let-bindings from the parent fn
+///    need closure records. Closure_convert ran before codegen,
+///    so synth-conts bypass that pipeline — they need their own
+///    capture-record allocation alongside the FuncId pre-pass.
+///    Mirrors the `HandlerArmSynth.captures` pattern from Phase
+///    4d MVP.
 #[derive(Clone, Debug)]
 struct CpsContinuationSynth {
     /// Cranelift FuncId for this synthesised continuation. Allocated
@@ -2841,6 +2876,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 //     and the trampoline unwinds to the wrapper's
                 //     `sigil_run_loop` driver which observes the
                 //     Done.
+                //
+                // **Forward concern (PR #26 mid-flight at b818fc3):**
+                // null k_closure is correct for the constant-tail
+                // shape because the synth-cont has no captures.
+                // The captures-bearing slice (next major commit)
+                // needs to allocate a closure record per yield
+                // point capturing helper's user params + helper's
+                // own k_closure / k_fn (for forwarding non-discard-k
+                // arm values to helper's caller's continuation).
+                // At that point this branch's null becomes
+                // `alloc_synth_cont_closure_record(captures)` —
+                // see `CpsContinuationSynth`'s docstring for the
+                // full forward-concern enumeration.
                 let (k_closure_loaded, k_fn_loaded) =
                     if let Some(synth_cont_func_id) = synth_cont_func_id_opt {
                         let synth_cont_ref =
