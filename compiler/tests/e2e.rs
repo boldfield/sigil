@@ -2836,3 +2836,65 @@ fn arm_body_with_inner_block_and_outer_capture_works() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "12\n", "expected 5 + 7; stderr={stderr:?}");
 }
+
+#[test]
+fn slice_b_arm_body_let_then_pure_tail_post_arm_k_synth_fn_fires() {
+    // Plan B Task 55, Phase 4e captures+ Slice B — non-tail `k` use
+    // in arm bodies via lambda-lifted post-arm-k synth fn.
+    //
+    // The arm body `Raise.fail(k) => let r: Int = k(99); r + 1`
+    // matches `arm_body_let_then_pure_tail_shape` and the pre-pass
+    // allocates a separate FuncId for the post-arm-k synth fn. The
+    // post-arm-k synth fn body lowers `r + 1`, returning `Done(r+1)`.
+    //
+    // Runtime trace:
+    //   - main calls helper() via the native↔CPS interop wrapper.
+    //   - helper performs Raise.fail with k_fn = its own synth-cont.
+    //   - Arm fires `let r = k(99); r + 1`:
+    //       Call(helper_synth_cont, [99, null, post_arm_k_addr])
+    //   - Trampoline dispatches helper_synth_cont:
+    //       reads x=99 from args_ptr[0],
+    //       reads post_arm_k pair from args_ptr[1..3],
+    //       lowers helper's tail `x` → 99,
+    //       dispatches Call(null, post_arm_k_addr, [99]).
+    //   - Trampoline dispatches post-arm-k synth fn:
+    //       reads r=99 from args_ptr[0],
+    //       lowers `r + 1` → 100,
+    //       returns Done(100).
+    //   - run_loop returns 100 to main.
+    //
+    // Expected stdout: "100\n".
+    //
+    // A regression here would surface as:
+    //   - `99` printed: post-arm-k synth fn never fired (helper's
+    //     synth-cont didn't dispatch the trailing pair, OR the arm
+    //     fn packed args_len=1 instead of 3, OR identity was reached
+    //     with args_len=1 directly).
+    //   - Crash inside post-arm-k synth fn: bad binding read (wrong
+    //     offset / wrong type narrow) OR tail expression lowering
+    //     mismatch.
+    //   - Crash on `args_len == 1 || args_len == 3` assert: codegen
+    //     emitted an unexpected args shape.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let r: Int = k(99);\n      \
+                     r + 1\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_b_post_arm_k_let_then_pure");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "100\n",
+        "Slice B let-then-pure-tail: post-arm-k synth fn fires after \
+         helper's synth-cont, computes r + 1 = 99 + 1 = 100. stderr={stderr:?}"
+    );
+}

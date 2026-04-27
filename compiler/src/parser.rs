@@ -1014,6 +1014,21 @@ impl<'a> Parser<'a> {
             TokenKind::Match => self.parse_match_expr(),
             TokenKind::Fn => self.parse_lambda_expr(),
             TokenKind::Handle => self.parse_handle_expr(),
+            // Plan B Task 55, Phase 4e captures+ Slice B — a brace-
+            // delimited block at expression position parses as
+            // `Expr::Block(parse_block())`. Required for arm bodies
+            // of shape `Effect.op(k) => { let r: Ty = k(arg);
+            // pure_tail }` where the lambda-lifted post-arm-k
+            // continuation needs the `let` form to bind the k-call's
+            // result. Block expressions also parse cleanly in any
+            // other expression position (let-binding RHS, match-arm
+            // body, lambda body, parenthesised contexts) because
+            // `parse_expr` consistently dispatches through here.
+            // Fn bodies and if/else branches continue to call
+            // `parse_block` directly via dedicated parsers
+            // (`parse_fn_decl` / `parse_if_expr`), unaffected by
+            // this addition.
+            TokenKind::LBrace => self.parse_block().map(|b| Expr::Block(Box::new(b))),
             _ => {
                 self.err(tok.span.clone(), "expected an expression");
                 None

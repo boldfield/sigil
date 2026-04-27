@@ -822,6 +822,39 @@ fn arm_body_unsupported_construct(
     globals: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     use std::collections::BTreeSet;
+    // Plan B Task 55, Phase 4e captures+ Slice B — non-tail-`k` arm
+    // body of shape `{ let r: Ty = k(arg); pure_tail }` is allowed
+    // when:
+    //   - `arg` satisfies `expr_is_pure` (no nested calls / yields).
+    //   - `pure_tail` satisfies `expr_is_pure`.
+    //   - `pure_tail` references only `r` and globals (no op-args,
+    //     no outer-scope captures, no `k` reference).
+    //
+    // The pre-pass allocates a post-arm-k synth fn for matching arms
+    // and the synth-arm-fn body emit takes the non-tail-`k` path
+    // emitting `Call(k_closure, k_fn, [arg, null,
+    // post_arm_k_fn_addr])`.
+    if let Some(shape) = arm_body_let_then_pure_tail_shape(&arm.body, &arm.k_name) {
+        if !expr_is_pure(shape.arg_expr) {
+            // Fall through to the regular walker so the diagnostic
+            // it emits points at the specific yield-able sub-shape
+            // in `arg`. Not an early return.
+        } else if !expr_is_pure(shape.tail_expr) {
+            // Same: let the regular walker surface the specific
+            // yield-able sub-shape in `tail`.
+        } else if let Some(diag) = arm_body_post_arm_k_tail_free_vars_ok(
+            shape.tail_expr,
+            shape.binding_name,
+            &arm.k_name,
+            globals,
+        ) {
+            return Some(diag);
+        } else {
+            // Slice B accepted shape: `arg` pure, `tail` pure,
+            // `tail` free vars ⊆ `{r} ∪ globals`. Allow.
+            return None;
+        }
+    }
     let mut op_arg_scope: BTreeSet<String> = BTreeSet::new();
     for p in &arm.params {
         op_arg_scope.insert(p.name.clone());
@@ -1226,6 +1259,65 @@ struct HandlerArmSynth {
     /// scope references; codegen passes `null` as the arm slot's
     /// `closure_ptr` in that case (no allocation needed).
     captures: Vec<ArmCapture>,
+    /// Plan B Task 55, Phase 4e captures+ Slice B — set when the arm
+    /// body matches the `{ let r: Ty = k(arg); pure_tail }` shape
+    /// recognised by [`arm_body_let_then_pure_tail_shape`]. The pre-
+    /// pass allocates a separate `FuncId` for the post-arm-k synth
+    /// fn (the lambda-lifted `pure_tail` continuation); the synth-
+    /// arm-fn body emit takes a non-tail-`k` path that emits
+    /// `Call(k_closure, k_fn, [arg, null_post_arm_k_closure,
+    /// post_arm_k_fn_addr])`; the post-arm-k synth fn's body, defined
+    /// in its own definition pass at the bottom of `emit_object`,
+    /// reads `r` from `args_ptr[0]` and lowers `pure_tail` to
+    /// `Done(result)`. `None` for tail-`k` arms or for arms whose
+    /// body doesn't match the let-then-pure-tail shape.
+    post_arm_k: Option<PostArmKSynth>,
+}
+
+/// Plan B Task 55, Phase 4e captures+ Slice B — synthetic post-arm-k
+/// continuation for an arm body of shape `{ let r: Ty = k(arg);
+/// pure_tail }`. Built by the pre-pass when
+/// [`arm_body_let_then_pure_tail_shape`] matches; consumed by the
+/// post-arm-k synth fn definition pass at the bottom of `emit_object`.
+///
+/// Slice B first-commit restrictions:
+///   - `pure_tail` must reference only `r` and globals (no op-args
+///     and no outer-scope captures yet — those need a closure-record
+///     allocation site at the arm-fn that mirrors the helper-side
+///     captures-bearing slice from PR #26's `a5ee4c6`).
+///   - `arg_expr` must be pure (no nested `k(arg)`-of-`k(arg)`,
+///     no Call, no Perform).
+///
+/// The `func_id` is the post-arm-k synth fn's FuncId. The arm-fn body
+/// emit emits `Call(k_closure, k_fn, [arg_value, null_pointer,
+/// func_addr(func_id)])` so the helper's synth-cont (Slice A) reads
+/// args_ptr[1..3] and dispatches into this fn with `[result]`.
+#[derive(Clone, Debug)]
+struct PostArmKSynth {
+    /// Linker symbol name `sigil_handler_post_arm_k_<global_index>`;
+    /// allocated in the pre-pass alongside the arm-fn's `FuncId`.
+    func_id: cranelift_module::FuncId,
+    /// Source-level binding name (the `r` in `let r = k(arg);
+    /// pure_tail`). Bound in the post-arm-k synth fn's env at fn
+    /// entry from `args_ptr[0]`, narrowed per [`Self::binding_ty`].
+    binding_name: String,
+    /// Cranelift type the binding is narrowed to at fn entry. Derived
+    /// from the `LetStmt::ty` via [`cranelift_ty_for_type_expr`].
+    binding_ty: Type,
+    /// The `arg` expression in `k(arg)`. Lowered in the arm-fn body
+    /// emit's non-tail-`k` path. Must satisfy [`expr_is_pure`].
+    arg_expr: crate::ast::Expr,
+    /// The `pure_tail` expression that the post-arm-k synth fn
+    /// lowers. Must satisfy [`expr_is_pure`] and reference only
+    /// `binding_name` plus globals. The post-arm-k synth fn returns
+    /// `Done(widen(tail_value, I64))`.
+    tail_expr: crate::ast::Expr,
+    /// Cranelift type of `tail_expr`'s lowered value, used to widen
+    /// to I64 before `sigil_next_step_done`. Equals the arm body's
+    /// overall result type (since the let-binding shadows the
+    /// perform's value into the tail), which for Slice B equals the
+    /// arm's `body_ty` (the op's declared return type).
+    tail_ty: Type,
 }
 
 /// Plan B Task 55 (Phase 4d) — one captured outer-scope binding for a
@@ -1858,6 +1950,50 @@ fn collect_handle_arms_in_expr(
                     .collect();
                 let rewritten_body =
                     rewrite_arm_body_with_captures(&arm.body, &captures, &arg_names, &arm.k_name);
+
+                // Plan B Task 55, Phase 4e captures+ Slice B —
+                // detect the non-tail-`k` arm body shape `{ let r:
+                // Ty = k(arg); pure_tail }` and allocate a separate
+                // FuncId for the post-arm-k synth fn. The detector
+                // runs against the rewritten body (post-captures
+                // rewrite); for Slice B's first commit, captures
+                // are restricted to the empty set when the shape
+                // matches (the post-arm-k tail-free-vars walker
+                // rejects op-arg / outer-scope references). A
+                // future captures-bearing extension will allow
+                // captures into the post-arm-k synth fn by
+                // allocating a closure record at the arm-fn body
+                // emit site mirroring PR #26's `a5ee4c6` slice for
+                // helper synth-conts.
+                let post_arm_k = if let Some(shape) =
+                    arm_body_let_then_pure_tail_shape(&rewritten_body, &arm.k_name)
+                {
+                    let post_arm_k_idx = synth.len();
+                    let post_arm_k_mangled = format!("sigil_handler_post_arm_k_{post_arm_k_idx}");
+                    let post_arm_k_func_id = module
+                        .declare_function(&post_arm_k_mangled, Linkage::Local, ctx.cps_arm_sig)
+                        .map_err(|e| format!("declare {post_arm_k_mangled}: {e}"))?;
+                    let binding_ty = cranelift_ty_for_type_expr(shape.binding_te, ctx.pointer_ty);
+                    Some(PostArmKSynth {
+                        func_id: post_arm_k_func_id,
+                        binding_name: shape.binding_name.to_string(),
+                        binding_ty,
+                        arg_expr: shape.arg_expr.clone(),
+                        tail_expr: shape.tail_expr.clone(),
+                        // For Slice B's accepted shape, the arm
+                        // body's overall type IS the tail's type
+                        // (the let-binding's value flows into the
+                        // synth-cont; the synth-cont's result flows
+                        // back as `r`; tail produces the arm's
+                        // overall result), and the arm's overall
+                        // type equals the op's declared return type
+                        // (already resolved into `body_ty`).
+                        tail_ty: body_ty,
+                    })
+                } else {
+                    None
+                };
+
                 synth.push(HandlerArmSynth {
                     func_id,
                     body: rewritten_body,
@@ -1866,6 +2002,7 @@ fn collect_handle_arms_in_expr(
                     body_ty,
                     captures,
                     k_name: arm.k_name.clone(),
+                    post_arm_k,
                 });
                 arm_indices.push(global_idx);
             }
@@ -1934,6 +2071,246 @@ fn arm_body_tail_is_k_call<'a>(
             .and_then(|t| arm_body_tail_is_k_call(t, k_name)),
         _ => None,
     }
+}
+
+/// Plan B Task 55, Phase 4e captures+ Slice B — recognise the
+/// non-tail-`k` arm body shape `{ let r: Ty = k(arg); pure_tail }`.
+///
+/// Returns the matched components when the arm body's structure is
+/// exactly:
+/// ```text
+///     Expr::Block {
+///         stmts: [Stmt::Let { name, ty, value: Expr::Call {
+///             callee: Expr::Ident(k_name, _),
+///             args: [arg_expr],
+///         } }],
+///         tail: Some(tail_expr),
+///     }
+/// ```
+///
+/// Slice B first-commit restrictions enforced by the caller (the
+/// pre-pass + walker pair), NOT this detector:
+///   - `arg_expr` must satisfy [`expr_is_pure`] (no nested calls,
+///     performs, lambdas, closure records).
+///   - `tail_expr` must satisfy [`expr_is_pure`] and reference only
+///     `name` (the let-binding) plus globals — no op-args, no outer-
+///     scope captures, no `k_name` references. The pre-pass'
+///     `arm_body_post_arm_k_tail_free_vars_only_in` helper enforces
+///     this.
+///
+/// This is the arm-side analogue of the helper-body's
+/// [`is_simple_let_yield_then_pure_tail_body`] from PR #26's `a5ee4c6`
+/// captures-bearing slice. The post-arm-k synth fn's role for the
+/// arm body parallels what the helper's `LetBindThenTail`
+/// `CpsContinuationKind` synth-cont does for the helper body.
+///
+/// Returned references all borrow from `body`'s sub-tree.
+fn arm_body_let_then_pure_tail_shape<'a>(
+    body: &'a crate::ast::Expr,
+    k_name: &str,
+) -> Option<ArmBodyLetThenPureTailMatch<'a>> {
+    use crate::ast::{Expr, Stmt};
+    let block = match body {
+        Expr::Block(b) => b,
+        _ => return None,
+    };
+    if block.stmts.len() != 1 {
+        return None;
+    }
+    let let_stmt = match &block.stmts[0] {
+        Stmt::Let(l) => l,
+        _ => return None,
+    };
+    let (callee, args) = match &let_stmt.value {
+        Expr::Call { callee, args, .. } => (callee.as_ref(), args),
+        _ => return None,
+    };
+    let callee_is_k = matches!(callee, Expr::Ident(n, _) if n == k_name);
+    if !callee_is_k || args.len() != 1 {
+        return None;
+    }
+    let tail = block.tail.as_ref()?;
+    Some(ArmBodyLetThenPureTailMatch {
+        binding_name: &let_stmt.name,
+        binding_te: &let_stmt.ty,
+        arg_expr: &args[0],
+        tail_expr: tail,
+    })
+}
+
+/// Plan B Task 55, Phase 4e captures+ Slice B — borrowed view of a
+/// matched [`arm_body_let_then_pure_tail_shape`] result. All
+/// references live for `'a` (the arm body's lifetime).
+struct ArmBodyLetThenPureTailMatch<'a> {
+    binding_name: &'a str,
+    binding_te: &'a crate::ast::TypeExpr,
+    arg_expr: &'a crate::ast::Expr,
+    tail_expr: &'a crate::ast::Expr,
+}
+
+/// Plan B Task 55, Phase 4e captures+ Slice B — verify the post-arm-k
+/// synth fn's tail expression references only the let-binding name
+/// plus globals.
+///
+/// Walks `tail_expr` collecting every [`crate::ast::Expr::Ident`]
+/// it encounters and rejecting if any name is outside the allowed
+/// set `{binding_name} ∪ globals`. Used by the pre-pass to enforce
+/// Slice B's "no op-args / no outer-scope captures in `tail`"
+/// restriction. Also rejects `tail_expr` if it references the
+/// continuation `k` (multi-shot / non-tail-of-non-tail handling
+/// requires Slice C/B-extensions).
+///
+/// Returns `None` on success; `Some(diagnostic)` to surface the
+/// rejection reason. The walker's recursion shape matches
+/// [`expr_is_pure`]'s — so a future `Expr` variant added to one
+/// must be added to the other.
+fn arm_body_post_arm_k_tail_free_vars_ok(
+    tail_expr: &crate::ast::Expr,
+    binding_name: &str,
+    k_name: &str,
+    globals: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    use crate::ast::Expr;
+    match tail_expr {
+        Expr::IntLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
+        Expr::Ident(name, _) => {
+            if name == binding_name || globals.contains(name) {
+                None
+            } else if name == k_name {
+                Some(format!(
+                    "Slice B: post-`k` tail of arm body references continuation \
+                     `{k_name}` — multi-shot / further-non-tail uses require Slice C \
+                     (heap-reified continuation)"
+                ))
+            } else {
+                Some(format!(
+                    "Slice B: post-`k` tail of arm body references `{name}`, which is \
+                     neither the let-binding (`{binding_name}`) nor a global; op-arg / \
+                     outer-scope captures into the post-arm-k synth fn require a future \
+                     captures-bearing extension of Slice B (parallel to PR #26's `a5ee4c6` \
+                     captures-bearing slice for the helper synth-cont)"
+                ))
+            }
+        }
+        Expr::ClosureEnvLoad { name, .. } => Some(format!(
+            "Slice B: post-`k` tail of arm body reads `{name}` via a \
+             surrounding-lambda closure record (closure_convert rewrote it into a \
+             ClosureEnvLoad) — closure-of-surrounding-lambda captures into the \
+             post-arm-k synth fn arrive in Slice D"
+        )),
+        Expr::Binary { lhs, rhs, .. } => {
+            arm_body_post_arm_k_tail_free_vars_ok(lhs, binding_name, k_name, globals).or_else(
+                || arm_body_post_arm_k_tail_free_vars_ok(rhs, binding_name, k_name, globals),
+            )
+        }
+        Expr::Unary { operand, .. } => {
+            arm_body_post_arm_k_tail_free_vars_ok(operand, binding_name, k_name, globals)
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => arm_body_post_arm_k_tail_free_vars_ok(cond, binding_name, k_name, globals)
+            .or_else(|| {
+                arm_body_post_arm_k_tail_free_vars_ok_block(
+                    then_block,
+                    binding_name,
+                    k_name,
+                    globals,
+                )
+            })
+            .or_else(|| {
+                arm_body_post_arm_k_tail_free_vars_ok_block(
+                    else_block,
+                    binding_name,
+                    k_name,
+                    globals,
+                )
+            }),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => arm_body_post_arm_k_tail_free_vars_ok(scrutinee, binding_name, k_name, globals)
+            .or_else(|| {
+                arms.iter().find_map(|a| {
+                    arm_body_post_arm_k_tail_free_vars_ok(&a.body, binding_name, k_name, globals)
+                })
+            }),
+        Expr::Block(b) => {
+            arm_body_post_arm_k_tail_free_vars_ok_block(b, binding_name, k_name, globals)
+        }
+        Expr::RecordLit { fields, .. } => fields.iter().find_map(|f| {
+            arm_body_post_arm_k_tail_free_vars_ok(&f.value, binding_name, k_name, globals)
+        }),
+        // Yield-able shapes: `expr_is_pure` already rejected these
+        // before this fn was called, so this is unreachable in
+        // current callers. Defensive: surface the regression
+        // immediately if a future caller drops the purity gate.
+        Expr::Call { .. }
+        | Expr::Perform(_)
+        | Expr::Handle { .. }
+        | Expr::Lambda { .. }
+        | Expr::ClosureRecord { .. } => Some(format!(
+            "Slice B internal invariant: post-`k` tail of arm body contains a \
+             yield-able shape ({}) that the purity gate should have rejected — \
+             a caller bypassed `expr_is_pure`",
+            std::any::type_name::<Expr>()
+        )),
+    }
+}
+
+/// Helper for [`arm_body_post_arm_k_tail_free_vars_ok`]: walk a
+/// [`crate::ast::Block`]'s stmts + tail with the same free-var
+/// restriction. `Stmt::Let` extends the allowed set with its name
+/// for the rest of the block (mirrors normal lexical scoping);
+/// `Stmt::Perform` is rejected (already excluded by purity gate).
+fn arm_body_post_arm_k_tail_free_vars_ok_block(
+    b: &crate::ast::Block,
+    binding_name: &str,
+    k_name: &str,
+    globals: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    use crate::ast::Stmt;
+    // For Slice B's first commit, we restrict to one binding name
+    // (the outer `let r`) — extending the allowed set to include
+    // inner `let`s would require threading a mutable set through
+    // the recursion. Inner `let`s in the tail are pure (per
+    // `expr_is_pure`'s `block_is_pure`), so the inner-let value's
+    // free vars are still subject to the outer `{r, globals}`
+    // restriction; an inner-let-bound name then appears as a free
+    // Ident in the inner-let's continuation, which we'd want to
+    // permit. Defer the multi-let-in-tail support until a future
+    // slice; for Slice B's surface, reject any inner Stmt::Let.
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                return Some(format!(
+                    "Slice B: post-`k` tail of arm body contains an inner \
+                     `let {}` — multi-binding tails arrive in a future captures-bearing \
+                     extension; today's surface is one outer let with a pure tail",
+                    l.name
+                ));
+            }
+            Stmt::Expr(e) => {
+                if let Some(d) =
+                    arm_body_post_arm_k_tail_free_vars_ok(e, binding_name, k_name, globals)
+                {
+                    return Some(d);
+                }
+            }
+            Stmt::Perform(_) => {
+                return Some(
+                    "Slice B internal invariant: post-`k` tail of arm body contains a \
+                     `Stmt::Perform` that the purity gate should have rejected"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    if let Some(t) = &b.tail {
+        return arm_body_post_arm_k_tail_free_vars_ok(t, binding_name, k_name, globals);
+    }
+    None
 }
 
 /// Plan B Task 55 (Phase 4d) — rewrite an arm body so every captured-
@@ -3818,136 +4195,402 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // the tail position recognised by
                 // `arm_body_tail_is_k_call`; non-tail `k` use is
                 // rejected with a Phase-4e-pointing diagnostic.
-                let next_step_ptr =
-                    if let Some(arg_expr) = arm_body_tail_is_k_call(&synth.body, &synth.k_name) {
-                        // --- Tail-`k(arg)` path ---
-                        //
-                        // Plan B Task 55, Phase 4e captures+ Slice A —
-                        // trailing-pair convention. The arm fn's
-                        // `Call(k_closure, k_fn, ...)` now packs THREE
-                        // slots: [arg, post_arm_k_closure, post_arm_k_fn].
-                        // For tail-`k` arms (no post-`k` arm-body
-                        // computation), `post_arm_k_closure` is null and
-                        // `post_arm_k_fn` is the address of
-                        // `sigil_continuation_identity`. The helper synth-
-                        // cont (k_fn) reads the trailing pair from
-                        // args_ptr[1..3] and dispatches its result to
-                        // identity, which returns `Done(result)` — same
-                        // observable behaviour as the prior `Done`-shaped
-                        // synth-cont path, with one extra trampoline hop.
-                        //
-                        // Slice B (non-tail `k`) replaces this null/identity
-                        // pair with the lambda-lifted post-arm-k synth fn
-                        // when the arm body has post-`k` computation.
-                        //
-                        // Bisecting hint (per `[DEVIATION Task 55] Phase 4e
-                        // captures+`): a regression that produces wrong
-                        // values from any PR #26 captures-bearing test
-                        // here means the trailing-pair convention is
-                        // wrong — verify args_ptr[0..3] stores match the
-                        // synth-cont's reads at offsets 0/8/16 and that
-                        // identity's arity-1 invariant is still preserved
-                        // (identity sees [result] of args_len=1, NOT the
-                        // arm fn's args_len=3).
-                        lowerer.lower_arm_body_pre_tail_k_stmts(&synth.body);
-                        let arg_value = lowerer.lower_expr(arg_expr);
-                        let arg_ty = lowerer.builder.func.dfg.value_type(arg_value);
-                        let widened_arg = if arg_ty == types::I64 {
-                            arg_value
-                        } else if arg_ty.is_int() && arg_ty.bits() < 64 {
-                            lowerer.builder.ins().uextend(types::I64, arg_value)
-                        } else {
-                            assert_eq!(
-                                arg_ty, pointer_ty,
-                                "codegen Phase 4d: unexpected k-arg Cranelift type \
+                let next_step_ptr = if let Some(post_arm_k) = &synth.post_arm_k {
+                    // --- Slice B: non-tail `k(arg); pure_tail` path ---
+                    //
+                    // The arm body is `{ let r = k(arg); pure_tail }`.
+                    // The post-arm-k synth fn (already FuncId-allocated
+                    // at the pre-pass) lowers `pure_tail` taking `r`
+                    // from `args_ptr[0]`. The arm fn here lowers `arg`
+                    // and emits `Call(k_closure, k_fn, [arg, null,
+                    // post_arm_k_fn_addr])`:
+                    //   - The trampoline dispatches into the helper's
+                    //     synth-cont k_fn with `args_ptr=[arg, null,
+                    //     post_arm_k_fn_addr]`, `args_len=3`.
+                    //   - The helper synth-cont (Slice A) reads the
+                    //     trailing pair from `args_ptr[1..3]`, computes
+                    //     the helper's post-perform body, dispatches
+                    //     `Call(post_arm_k_*, [synth_cont_result])`.
+                    //   - The trampoline dispatches into our post-arm-k
+                    //     synth fn with `args_ptr=[synth_cont_result]`,
+                    //     `args_len=1` — which the post-arm-k synth fn
+                    //     reads as `r`, lowers `pure_tail`, returns
+                    //     `Done(tail_value)`.
+                    //
+                    // Slice B first commit: `post_arm_k_closure` is
+                    // null (no captures from arm-fn into post-arm-k).
+                    // A future captures-bearing extension will
+                    // allocate a closure record here mirroring PR #26
+                    // `a5ee4c6`'s helper-synth-cont captures slice.
+                    //
+                    // Bisecting hint (per `[DEVIATION Task 55] Phase
+                    // 4e captures+`): wrong values from non-tail-`k`
+                    // arm-body e2e tests after Slice B mean either
+                    // (a) the post-arm-k synth fn's body-emit reads
+                    // `r` from the wrong offset / wrong type, (b) the
+                    // arm fn's args_ptr stores at offsets 0/8/16
+                    // don't match the helper synth-cont's reads at
+                    // the same offsets (Slice A invariant), or (c)
+                    // the post-arm-k synth fn's tail expression
+                    // contains an unexpected free var that escaped
+                    // the `arm_body_post_arm_k_tail_free_vars_ok`
+                    // walker.
+                    let arg_value = lowerer.lower_expr(&post_arm_k.arg_expr);
+                    let arg_ty = lowerer.builder.func.dfg.value_type(arg_value);
+                    let widened_arg = if arg_ty == types::I64 {
+                        arg_value
+                    } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                        lowerer.builder.ins().uextend(types::I64, arg_value)
+                    } else {
+                        assert_eq!(
+                            arg_ty, pointer_ty,
+                            "codegen Phase 4e captures+ Slice B: unexpected k-arg \
+                             Cranelift type {arg_ty:?} for non-tail-k arg widen"
+                        );
+                        arg_value
+                    };
+                    let post_arm_k_fn_ref =
+                        module.declare_func_in_func(post_arm_k.func_id, lowerer.builder.func);
+                    let post_arm_k_fn_addr = lowerer
+                        .builder
+                        .ins()
+                        .func_addr(pointer_ty, post_arm_k_fn_ref);
+                    let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                    let call_ns = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                    let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                    let argp_call = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_args_ptr_ref, &[ns_ptr]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
+                    let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        widened_arg,
+                        argp_v,
+                        POST_ARM_K_ARG_OFF,
+                    );
+                    let null_post_arm_k_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        null_post_arm_k_closure,
+                        argp_v,
+                        POST_ARM_K_CLOSURE_OFF,
+                    );
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        post_arm_k_fn_addr,
+                        argp_v,
+                        POST_ARM_K_FN_OFF,
+                    );
+                    ns_ptr
+                } else if let Some(arg_expr) = arm_body_tail_is_k_call(&synth.body, &synth.k_name) {
+                    // --- Tail-`k(arg)` path ---
+                    //
+                    // Plan B Task 55, Phase 4e captures+ Slice A —
+                    // trailing-pair convention. The arm fn's
+                    // `Call(k_closure, k_fn, ...)` now packs THREE
+                    // slots: [arg, post_arm_k_closure, post_arm_k_fn].
+                    // For tail-`k` arms (no post-`k` arm-body
+                    // computation), `post_arm_k_closure` is null and
+                    // `post_arm_k_fn` is the address of
+                    // `sigil_continuation_identity`. The helper synth-
+                    // cont (k_fn) reads the trailing pair from
+                    // args_ptr[1..3] and dispatches its result to
+                    // identity, which returns `Done(result)` — same
+                    // observable behaviour as the prior `Done`-shaped
+                    // synth-cont path, with one extra trampoline hop.
+                    //
+                    // Slice B (non-tail `k`) replaces this null/identity
+                    // pair with the lambda-lifted post-arm-k synth fn
+                    // when the arm body has post-`k` computation.
+                    //
+                    // Bisecting hint (per `[DEVIATION Task 55] Phase 4e
+                    // captures+`): a regression that produces wrong
+                    // values from any PR #26 captures-bearing test
+                    // here means the trailing-pair convention is
+                    // wrong — verify args_ptr[0..3] stores match the
+                    // synth-cont's reads at offsets 0/8/16 and that
+                    // identity's arity-1 invariant is still preserved
+                    // (identity sees [result] of args_len=1, NOT the
+                    // arm fn's args_len=3).
+                    lowerer.lower_arm_body_pre_tail_k_stmts(&synth.body);
+                    let arg_value = lowerer.lower_expr(arg_expr);
+                    let arg_ty = lowerer.builder.func.dfg.value_type(arg_value);
+                    let widened_arg = if arg_ty == types::I64 {
+                        arg_value
+                    } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                        lowerer.builder.ins().uextend(types::I64, arg_value)
+                    } else {
+                        assert_eq!(
+                            arg_ty, pointer_ty,
+                            "codegen Phase 4d: unexpected k-arg Cranelift type \
                              {arg_ty:?} for sigil_next_step_call slot widen — \
                              Phase 4d MVP supports I64 (Int), I32 (Char), I8 \
                              (Bool/Byte/Unit), and pointer_ty (String / \
                              user-type pointers); floats and 32-bit-target \
                              pointer types need a dedicated branch"
-                            );
-                            arg_value
-                        };
-                        let three_v = lowerer.builder.ins().iconst(types::I32, 3);
-                        let call_ns = lowerer
-                            .builder
-                            .ins()
-                            .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-                        lowerer
-                            .stackmap
-                            .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
-                        let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
-                        let argp_call = lowerer
-                            .builder
-                            .ins()
-                            .call(next_step_args_ptr_ref, &[ns_ptr]);
-                        lowerer
-                            .stackmap
-                            .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
-                        let argp_v = lowerer.builder.inst_results(argp_call)[0];
-                        // Trailing-pair convention: [arg,
-                        // post_arm_k_closure, post_arm_k_fn] at offsets
-                        // POST_ARM_K_ARG_OFF / POST_ARM_K_CLOSURE_OFF /
-                        // POST_ARM_K_FN_OFF. For tail-`k` arms, the
-                        // closure is null and the fn is identity.
-                        lowerer.builder.ins().store(
-                            MemFlags::trusted(),
-                            widened_arg,
-                            argp_v,
-                            POST_ARM_K_ARG_OFF,
                         );
-                        let null_post_arm_k_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
-                        lowerer.builder.ins().store(
-                            MemFlags::trusted(),
-                            null_post_arm_k_closure,
-                            argp_v,
-                            POST_ARM_K_CLOSURE_OFF,
-                        );
-                        let identity_fn_addr = lowerer
-                            .builder
-                            .ins()
-                            .func_addr(pointer_ty, lowerer.continuation_identity_ref);
-                        lowerer.builder.ins().store(
-                            MemFlags::trusted(),
-                            identity_fn_addr,
-                            argp_v,
-                            POST_ARM_K_FN_OFF,
-                        );
-                        ns_ptr
-                    } else {
-                        // --- Non-tail / no-`k` path (Phase 4c shape) ---
-                        let body_value = lowerer.lower_expr(&synth.body);
-                        let widened_body = if synth.body_ty == types::I64 {
-                            body_value
-                        } else if synth.body_ty.is_int() && synth.body_ty.bits() < 64 {
-                            lowerer.builder.ins().uextend(types::I64, body_value)
-                        } else {
-                            assert_eq!(
-                                synth.body_ty, pointer_ty,
-                                "codegen Phase 4c: unexpected arm-body Cranelift type \
-                             {:?} for sigil_next_step_done wrap",
-                                synth.body_ty
-                            );
-                            body_value
-                        };
-                        let done_call = lowerer
-                            .builder
-                            .ins()
-                            .call(next_step_done_ref, &[widened_body]);
-                        // Stackmap entry: any pointer-typed op-args bound in
-                        // env (String / user-type) are GC roots live across
-                        // this `sigil_next_step_done` arena allocation.
-                        lowerer
-                            .stackmap
-                            .push_placeholder(function_code_offset(&lowerer.builder, done_call));
-                        lowerer.builder.inst_results(done_call)[0]
+                        arg_value
                     };
+                    let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                    let call_ns = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                    let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                    let argp_call = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_args_ptr_ref, &[ns_ptr]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
+                    let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                    // Trailing-pair convention: [arg,
+                    // post_arm_k_closure, post_arm_k_fn] at offsets
+                    // POST_ARM_K_ARG_OFF / POST_ARM_K_CLOSURE_OFF /
+                    // POST_ARM_K_FN_OFF. For tail-`k` arms, the
+                    // closure is null and the fn is identity.
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        widened_arg,
+                        argp_v,
+                        POST_ARM_K_ARG_OFF,
+                    );
+                    let null_post_arm_k_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        null_post_arm_k_closure,
+                        argp_v,
+                        POST_ARM_K_CLOSURE_OFF,
+                    );
+                    let identity_fn_addr = lowerer
+                        .builder
+                        .ins()
+                        .func_addr(pointer_ty, lowerer.continuation_identity_ref);
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        identity_fn_addr,
+                        argp_v,
+                        POST_ARM_K_FN_OFF,
+                    );
+                    ns_ptr
+                } else {
+                    // --- Non-tail / no-`k` path (Phase 4c shape) ---
+                    let body_value = lowerer.lower_expr(&synth.body);
+                    let widened_body = if synth.body_ty == types::I64 {
+                        body_value
+                    } else if synth.body_ty.is_int() && synth.body_ty.bits() < 64 {
+                        lowerer.builder.ins().uextend(types::I64, body_value)
+                    } else {
+                        assert_eq!(
+                            synth.body_ty, pointer_ty,
+                            "codegen Phase 4c: unexpected arm-body Cranelift type \
+                             {:?} for sigil_next_step_done wrap",
+                            synth.body_ty
+                        );
+                        body_value
+                    };
+                    let done_call = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_done_ref, &[widened_body]);
+                    // Stackmap entry: any pointer-typed op-args bound in
+                    // env (String / user-type) are GC roots live across
+                    // this `sigil_next_step_done` arena allocation.
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, done_call));
+                    lowerer.builder.inst_results(done_call)[0]
+                };
                 lowerer.builder.ins().return_(&[next_step_ptr]);
                 lowerer.builder.finalize();
             }
             module
                 .define_function(synth.func_id, &mut ctx)
                 .map_err(|e| format!("define handler arm fn: {e}"))?;
+            module.clear_context(&mut ctx);
+        }
+    }
+
+    // Plan B Task 55, Phase 4e captures+ Slice B — post-arm-k synth
+    // fn definition pass. For each `HandlerArmSynth` whose pre-pass
+    // detected the non-tail-`k(arg); pure_tail` shape via
+    // `arm_body_let_then_pure_tail_shape`, emit the post-arm-k synth
+    // fn body. The fn signature is the standard CPS-ABI shape (same
+    // as arm fns + helper synth-conts):
+    //
+    //     fn(closure_ptr, args_ptr, args_len) -> *mut NextStep
+    //
+    // Body:
+    //   - Read `r` from `args_ptr[0]` as I64 (the helper's synth-
+    //     cont dispatched `Call(post_arm_k_*, [synth_cont_result])`).
+    //   - Narrow per `post_arm_k.binding_ty`.
+    //   - Bind in env under `post_arm_k.binding_name`.
+    //   - Lower `post_arm_k.tail_expr` via Lowerer.
+    //   - Widen to I64 (matching `sigil_next_step_done`'s signature).
+    //   - Return `Done(widened)` to the trampoline.
+    //
+    // First-commit restrictions:
+    //   - `closure_ptr` is null at runtime (no captures) — the
+    //     pre-pass' `arm_body_post_arm_k_tail_free_vars_ok` walker
+    //     restricts `tail_expr` to free vars in `{r} ∪ globals`. A
+    //     future captures-bearing extension would allocate a closure
+    //     record at the arm-fn body emit and read it here.
+    //   - `tail_expr` is pure (per `expr_is_pure`); no nested
+    //     yields, no further `k` invocations. Multi-shot / chained
+    //     non-tail-`k` use arrives in Slice C.
+    //
+    // The pass mirrors the synth-arm-fn body emit's general shape;
+    // it's structurally simpler because the post-arm-k synth fn has
+    // no op-args to unpack (just `r`) and no tail-`k` branching
+    // (the tail is always pure).
+    {
+        let post_arm_k_sig = cps_signature(pointer_ty, &module);
+        for synth in &handler_arm_synth {
+            let post_arm_k = match &synth.post_arm_k {
+                Some(p) => p,
+                None => continue,
+            };
+            ctx.func.signature = post_arm_k_sig.clone();
+            ctx.func.name = UserFuncName::user(0, post_arm_k.func_id.as_u32());
+
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+            let mut stackmap = StackMapBuilder::new();
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            builder.seal_block(block);
+
+            let block_params: Vec<Value> = builder.block_params(block).to_vec();
+            // block_params[0] = closure_ptr (Slice B first-commit:
+            // null at runtime since post-arm-k has no captures);
+            // block_params[1] = args_ptr (= [r] from helper synth-
+            // cont's `Call(post_arm_k_*, [synth_cont_result])`);
+            // block_params[2] = args_len (== 1 from the helper
+            // synth-cont's `Call(post_arm_k_*, [...])` which always
+            // emits arg_count=1).
+            let _args_len = block_params[2];
+
+            let args_ptr = block_params[1];
+            let r_widened = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), args_ptr, 0);
+            let r_value = if post_arm_k.binding_ty == types::I64 {
+                r_widened
+            } else if post_arm_k.binding_ty.is_int() && post_arm_k.binding_ty.bits() < 64 {
+                builder.ins().ireduce(post_arm_k.binding_ty, r_widened)
+            } else {
+                assert_eq!(
+                    post_arm_k.binding_ty, pointer_ty,
+                    "codegen Phase 4e captures+ Slice B: unexpected post-arm-k binding \
+                     Cranelift type {:?} for fn `{}`'s post-arm-k synth fn",
+                    post_arm_k.binding_ty, synth.k_name
+                );
+                r_widened
+            };
+
+            let mut env: BTreeMap<String, Value> = BTreeMap::new();
+            env.insert(post_arm_k.binding_name.clone(), r_value);
+
+            let PerFnRefs {
+                string_new_ref,
+                println_ref,
+                panic_arith_ref,
+                alloc_ref,
+                int_to_string_ref,
+                handler_frame_new_ref,
+                handle_push_ref,
+                handle_pop_ref,
+                handler_frame_set_arm_ref,
+                perform_ref,
+                run_loop_ref,
+                next_step_done_ref,
+                next_step_call_ref: _,
+                next_step_args_ptr_ref: _,
+                continuation_identity_ref,
+                handler_arm_refs_per_handle,
+                user_fn_refs,
+                lit_gvs,
+                div_zero_gv,
+                mod_zero_gv,
+            } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
+
+            let closure_ptr = block_params[0];
+            let mut lowerer = Lowerer {
+                builder,
+                stackmap: &mut stackmap,
+                env,
+                pointer_ty,
+                closure_ptr,
+                lit_gvs,
+                div_zero_gv,
+                mod_zero_gv,
+                string_new_ref,
+                println_ref,
+                panic_arith_ref,
+                alloc_ref,
+                int_to_string_ref,
+                handler_frame_new_ref,
+                handle_push_ref,
+                handle_pop_ref,
+                handler_frame_set_arm_ref,
+                perform_ref,
+                run_loop_ref,
+                handler_arm_refs_per_handle,
+                handler_arm_synth: &handler_arm_synth,
+                handler_arm_indices: &handler_arm_indices,
+                continuation_identity_ref,
+                effect_ids: &checked.effect_ids,
+                op_ids: &checked.op_ids,
+                effects: &checked.effects,
+                user_fn_refs,
+                user_fns: &user_fns,
+                type_layouts: &type_layouts,
+                ctor_index: &ctor_index,
+                match_scrut_tys: &checked.match_scrut_tys,
+            };
+
+            let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
+            let widened_tail = if post_arm_k.tail_ty == types::I64 {
+                tail_value
+            } else if post_arm_k.tail_ty.is_int() && post_arm_k.tail_ty.bits() < 64 {
+                lowerer.builder.ins().uextend(types::I64, tail_value)
+            } else {
+                assert_eq!(
+                    post_arm_k.tail_ty, pointer_ty,
+                    "codegen Phase 4e captures+ Slice B: unexpected post-arm-k tail \
+                     Cranelift type {:?} for fn `{}`'s post-arm-k synth fn",
+                    post_arm_k.tail_ty, synth.k_name
+                );
+                tail_value
+            };
+            let done_call = lowerer
+                .builder
+                .ins()
+                .call(next_step_done_ref, &[widened_tail]);
+            lowerer
+                .stackmap
+                .push_placeholder(function_code_offset(&lowerer.builder, done_call));
+            let next_step = lowerer.builder.inst_results(done_call)[0];
+            lowerer.builder.ins().return_(&[next_step]);
+            lowerer.builder.finalize();
+
+            module
+                .define_function(post_arm_k.func_id, &mut ctx)
+                .map_err(|e| format!("define post-arm-k synth fn: {e}"))?;
             module.clear_context(&mut ctx);
         }
     }
