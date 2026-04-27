@@ -1877,35 +1877,51 @@ fn arm_captures_outer_scope_returns_value() {
 }
 
 #[test]
-fn arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen_phase_4e_pending() {
-    // Plan B Task 55 (Phase 4d MVP) — Phase 4e closure point:
-    // captures from the surrounding fn's *closure record* (handle
-    // inside a synthetic lambda fn) stay rejected. Phase 4d MVP's
-    // closure-record allocation reads values out of `Lowerer.env`
-    // by name; a name only present as a `ClosureEnvLoad` slot on
-    // the surrounding fn's closure_ptr is invisible to that lookup.
-    // Closing this requires extending closure_convert with a per-
-    // synthetic-fn (name, kind, index) side-table so codegen can
-    // emit a `lower_closure_env_load` against the surrounding fn's
-    // closure_ptr to source the env_expr. That extension lifts
-    // alongside Phase 4e's calling-convention shift (colorer's
-    // handler-discharge refinement) per the deviation entry.
+fn arm_inside_lambda_captures_outer_via_closure_env_load_returns_value() {
+    // Plan B Task 55, Phase 4e captures+ Slice D — `Expr::Handle`
+    // inside a `Lambda` whose body captures outer-scope names.
     //
-    // Test inverts to a positive test (returns 7) when Phase 4e
-    // ships. Walker diagnostic now points at Phase 4e (NOT 4d).
-    // This is `arm_captures_outer_scope_returns_value`'s sibling for
-    // the closure-of-surrounding-lambda case.
+    // This is the inversion of the Phase 4d MVP `#[ignore]`'d test
+    // `arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen_phase_4e_pending`.
+    // Pre-Slice-D the walker rejected `Expr::ClosureEnvLoad` in
+    // arm bodies with a "Phase 4e captures-of-surrounding-lambda"
+    // diagnostic; post-Slice-D the walker accepts the shape and
+    // codegen sources the capture's value via
+    // `lower_closure_env_load(idx, kind)` against the lambda's
+    // `closure_ptr` (in scope at handle codegen time because the
+    // surrounding fn IS the lifted lambda).
+    //
+    // Trace:
+    // - `let x: Int = 7;` in main.
+    // - The lambda `fn (_d: Int) -> Int ![IO] => handle ...` captures
+    //   `x` from main's scope. closure_convert lifts it into a
+    //   synthetic top-level fn with a closure record holding `x`.
+    //   References to `x` inside the lambda body get rewritten to
+    //   `Expr::ClosureEnvLoad { name: "x", index: <lambda_slot>, .. }`.
+    // - The arm body `E.op(k) => x` becomes `E.op(k) =>
+    //   ClosureEnvLoad { name: "x", index: <lambda_slot>, .. }` after
+    //   closure_convert. Slice D pre-pass scans this for matching
+    //   names per arm capture and populates `ArmCapture::lambda_source =
+    //   Some((<lambda_slot>, <kind>))`.
+    // - The IIFE invocation `(fn ... => ...)(0)` triggers the
+    //   handle expression. The arm fires (E.op is performed in the
+    //   handle body); at handle codegen time inside the lifted
+    //   lambda, the ARM's closure record alloc sources `x`'s value
+    //   via `lower_closure_env_load(<lambda_slot>, Int)` against the
+    //   lambda's `closure_ptr` (which holds `[7]` at runtime). The
+    //   value 7 is stored at the arm's closure-record slot 0.
+    // - The arm fn at runtime reads `x` from the arm's closure_ptr
+    //   slot 0 (via `rewrite_arm_body_with_captures`'s ARM-LOCAL
+    //   re-indexing) and returns it.
+    //
+    // Expected stdout: `"7\n"`.
     //
     // Sigil v1's `TypeExpr::Fn` surface syntax is deferred (see
     // examples/higher_order.sigil's preamble note + the Plan A2 Task
-    // 30 carryover), so the lambda has to be invoked as an IIFE
-    // rather than let-bound and called by name.
-    // Sigil v1's `TypeExpr::Fn` surface syntax is deferred (see
-    // examples/higher_order.sigil's preamble note + the Plan A2 Task
-    // 30 carryover), so the lambda has to be invoked as an IIFE
-    // rather than let-bound and called by name. The closure_convert
-    // rewrite of the captured `x` → `ClosureEnvLoad` happens the
-    // same way for an IIFE'd lambda as for a let-bound one.
+    // 30 carryover), so the lambda is invoked as an IIFE rather
+    // than let-bound and called by name. The closure_convert rewrite
+    // of the captured `x` → `ClosureEnvLoad` happens the same way
+    // for an IIFE'd lambda as for a let-bound one.
     let src = "effect E { op: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let x: Int = 7;\n  \
@@ -1915,39 +1931,13 @@ fn arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen_
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4c_closure_env_load_reject_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4c_closure_env_load_reject_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail — arm body captures `x` via ClosureEnvLoad after \
-         closure_convert; got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("ClosureEnvLoad")
-            || stderr.contains("surrounding fn's closure record")
-            || stderr.contains("Phase 4e"),
-        "error message should reference closure-env-load / surrounding-fn closure / \
-         Phase 4e; got stderr={stderr:?}",
+    let (stdout, stderr, code) = compile_and_run(src, "slice_d_arm_inside_lambda_captures_outer");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "Slice D: arm body inside a synthetic lambda fn captures `x` from \
+         the lambda's closure record via `lower_closure_env_load`. Arm fires \
+         on `perform E.op()`, returns `x = 7`. stderr={stderr:?}"
     );
 }
 

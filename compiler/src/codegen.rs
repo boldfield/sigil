@@ -982,22 +982,21 @@ fn arm_body_walk(
     match e {
         Expr::IntLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
         Expr::ClosureEnvLoad { name, .. } => {
-            // Phase 4d MVP doesn't support arm-body captures whose
-            // origin is the surrounding fn's closure record (handle
-            // inside a synthetic lambda fn). The Phase 4d closure
-            // allocation reads values out of `Lowerer.env` by name —
-            // a name only present as a `ClosureEnvLoad` slot on the
-            // surrounding fn's closure_ptr is invisible to that
-            // lookup. Phase 4e ships the closure-convert side-table
-            // extension that surfaces these to codegen via per-fn
-            // (name, kind, index) lookup.
-            Some(format!(
-                "captures outer-scope binding `{name}` via the surrounding fn's \
-                 closure record (handle inside a lambda; closure_convert rewrote \
-                 the reference into a ClosureEnvLoad) — Phase 4d MVP supports \
-                 captures from the surrounding fn's local env only; closure-of- \
-                 surrounding-lambda captures arrive in Phase 4e"
-            ))
+            // Plan B Task 55, Phase 4e captures+ Slice D — `Expr::
+            // ClosureEnvLoad` in arm bodies is now allowed. The arm
+            // body's surrounding fn is a synthetic lambda fn
+            // (closure_convert lifted a user lambda whose body
+            // contained the `Expr::Handle`); the lambda's closure_ptr
+            // is in scope at handle codegen time and sources the
+            // capture's value via `lower_closure_env_load(idx, kind)`.
+            //
+            // The `name` is informational; we don't reject based on
+            // it. The pre-pass populates `ArmCapture::lambda_source`
+            // by scanning the arm body for matching ClosureEnvLoad
+            // nodes; `alloc_arm_closure_record` consumes that field
+            // to decide between env-source and closure_ptr-source.
+            let _ = name;
+            None
         }
         Expr::Ident(name, _) => {
             if name == k_name {
@@ -1518,6 +1517,30 @@ struct ArmCapture {
     /// the `CheckedProgram::handle_arm_captures` side-table at codegen
     /// pre-pass time.
     kind: crate::ast::EnvSlotKind,
+    /// Plan B Task 55, Phase 4e captures+ Slice D — when the
+    /// surrounding fn is a synthetic lambda fn (closure_convert
+    /// lifted a user lambda whose body contained the `Expr::Handle`),
+    /// references to outer-scope names inside the arm body have been
+    /// rewritten by closure_convert into `Expr::ClosureEnvLoad {
+    /// name, index, kind, .. }` reading from the lambda's
+    /// closure_ptr at the lambda-side slot index.
+    ///
+    /// `Some((idx, kind))` when this capture's name appears as a
+    /// `ClosureEnvLoad` inside the arm body — sourcing the value at
+    /// `Expr::Handle` codegen time goes through
+    /// `lower_closure_env_load(idx, kind)` against the lambda's
+    /// `closure_ptr` (in scope as `Lowerer.closure_ptr` because the
+    /// surrounding fn IS the lifted lambda). `None` for captures
+    /// sourced from the surrounding fn's local env (Phase 4d MVP
+    /// path: let-bindings, fn-params).
+    ///
+    /// Populated by the pre-pass via
+    /// [`find_closure_env_load_lambda_source`] which scans the arm
+    /// body's `Expr::ClosureEnvLoad` nodes for matching names.
+    /// closure_convert rewrites every reference to an outer name
+    /// uniformly, so the first matching node's `(index, kind)` is
+    /// the lambda-slot info for that name.
+    lambda_source: Option<(usize, crate::ast::EnvSlotKind)>,
 }
 
 /// Plan B Task 55, Phase 4e — synthetic continuation closure for a
@@ -2118,9 +2141,21 @@ fn collect_handle_arms_in_expr(
                     .unwrap_or(&[]);
                 let captures: Vec<ArmCapture> = captures_typed
                     .iter()
-                    .map(|(name, ty)| ArmCapture {
-                        name: name.clone(),
-                        kind: crate::closure_convert::slot_kind_for_ty(ty),
+                    .map(|(name, ty)| {
+                        // Slice D: scan the (post-closure_convert) arm
+                        // body for an Expr::ClosureEnvLoad matching this
+                        // capture's name. If found, the surrounding fn
+                        // is a synthetic lambda fn whose closure_ptr
+                        // sources this capture's value at handle codegen
+                        // time. None ⇒ surrounding fn's local env (let-
+                        // binding / fn-param) sources the value (Phase
+                        // 4d MVP path).
+                        let lambda_source = find_closure_env_load_lambda_source(&arm.body, name);
+                        ArmCapture {
+                            name: name.clone(),
+                            kind: crate::closure_convert::slot_kind_for_ty(ty),
+                            lambda_source,
+                        }
                     })
                     .collect();
                 let rewritten_body =
@@ -2753,6 +2788,86 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
 /// Idempotent: applying the rewrite twice produces the same AST
 /// (the second pass sees the rewritten ClosureEnvLoad indices and
 /// just re-emits them — same name → same slot index).
+/// Plan B Task 55, Phase 4e captures+ Slice D — scan an arm body
+/// (post-closure_convert) for the first `Expr::ClosureEnvLoad`
+/// matching the given capture `name`. Returns the lambda's
+/// `(slot_index, slot_kind)` for that name, or `None` if no
+/// matching ClosureEnvLoad appears (capture is sourced from the
+/// surrounding fn's local env, the Phase 4d MVP path).
+///
+/// closure_convert rewrites ALL outer-scope name references inside
+/// a lifted lambda's body uniformly to `Expr::ClosureEnvLoad` with
+/// the same `(index, kind)`, so the first match's metadata is the
+/// authoritative lambda-slot info for that name. We don't need to
+/// walk every occurrence — picking one is enough.
+///
+/// Used by the codegen pre-pass to populate
+/// [`ArmCapture::lambda_source`]; consumed at the `Expr::Handle`
+/// codegen site to decide whether to source the capture's value
+/// from `self.env` (None) or via `lower_closure_env_load` (Some).
+fn find_closure_env_load_lambda_source(
+    body: &crate::ast::Expr,
+    name: &str,
+) -> Option<(usize, crate::ast::EnvSlotKind)> {
+    use crate::ast::{Block, Expr, Stmt};
+    fn scan_expr(e: &Expr, name: &str) -> Option<(usize, crate::ast::EnvSlotKind)> {
+        match e {
+            Expr::ClosureEnvLoad {
+                name: n,
+                index,
+                kind,
+                ..
+            } if n == name => Some((*index, *kind)),
+            Expr::ClosureEnvLoad { .. }
+            | Expr::IntLit(..)
+            | Expr::BoolLit(..)
+            | Expr::CharLit(..)
+            | Expr::StringLit(..)
+            | Expr::Ident(..) => None,
+            Expr::Binary { lhs, rhs, .. } => scan_expr(lhs, name).or_else(|| scan_expr(rhs, name)),
+            Expr::Unary { operand, .. } => scan_expr(operand, name),
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+                ..
+            } => scan_expr(cond, name)
+                .or_else(|| scan_block(then_block, name))
+                .or_else(|| scan_block(else_block, name)),
+            Expr::Match {
+                scrutinee, arms, ..
+            } => scan_expr(scrutinee, name)
+                .or_else(|| arms.iter().find_map(|a| scan_expr(&a.body, name))),
+            Expr::Block(b) => scan_block(b, name),
+            Expr::Call { callee, args, .. } => {
+                scan_expr(callee, name).or_else(|| args.iter().find_map(|a| scan_expr(a, name)))
+            }
+            Expr::Perform(p) => p.args.iter().find_map(|a| scan_expr(a, name)),
+            Expr::Lambda { body, .. } => scan_expr(body, name),
+            Expr::ClosureRecord { env_exprs, .. } => {
+                env_exprs.iter().find_map(|e| scan_expr(e, name))
+            }
+            Expr::RecordLit { fields, .. } => fields.iter().find_map(|f| scan_expr(&f.value, name)),
+            Expr::Handle { body, op_arms, .. } => scan_expr(body, name)
+                .or_else(|| op_arms.iter().find_map(|a| scan_expr(&a.body, name))),
+        }
+    }
+    fn scan_block(b: &Block, name: &str) -> Option<(usize, crate::ast::EnvSlotKind)> {
+        for s in &b.stmts {
+            let hit = match s {
+                Stmt::Let(l) => scan_expr(&l.value, name),
+                Stmt::Expr(e) => scan_expr(e, name),
+                Stmt::Perform(p) => p.args.iter().find_map(|a| scan_expr(a, name)),
+            };
+            if hit.is_some() {
+                return hit;
+            }
+        }
+        b.tail.as_ref().and_then(|t| scan_expr(t, name))
+    }
+    scan_expr(body, name)
+}
+
 fn rewrite_arm_body_with_captures(
     body: &crate::ast::Expr,
     captures: &[ArmCapture],
@@ -7046,28 +7161,43 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let payload_bytes: i64 = 8 + 8 * env_len as i64;
 
         // Lower env values FIRST, in source order — same discipline
-        // as `lower_closure_record`. Each value is read out of
-        // `self.env` by name; absent names indicate the surrounding-fn-
-        // capture case (synthetic lambda fn), unsupported by the MVP.
+        // as `lower_closure_record`. Two source paths:
+        //
+        //   - **Phase 4d MVP path** (`c.lambda_source.is_none()`):
+        //     read from `self.env` by name. The capture is a let-
+        //     binding or fn-param of the surrounding fn.
+        //
+        //   - **Phase 4e captures+ Slice D path**
+        //     (`c.lambda_source.is_some()`): the surrounding fn is a
+        //     synthetic lambda fn (closure_convert lifted a user
+        //     lambda whose body contained the `Expr::Handle`).
+        //     Sourcing the capture's value goes through
+        //     `lower_closure_env_load(idx, kind)` against the
+        //     lambda's closure_ptr (in scope as `self.closure_ptr`
+        //     because the surrounding fn IS the lifted lambda).
         let env_vals: Vec<Value> = captures
             .iter()
-            .map(|c| {
-                self.env.get(&c.name).copied().unwrap_or_else(|| {
+            .map(|c| match c.lambda_source {
+                Some((idx, kind)) => self.lower_closure_env_load(idx, kind),
+                None => self.env.get(&c.name).copied().unwrap_or_else(|| {
                     unreachable!(
-                        "codegen Phase 4d: arm capture `{}` not found in surrounding \
-                         fn's lexical env at handle codegen time. This indicates \
-                         the surrounding fn is a synthetic lambda fn whose own \
-                         captures appear in the arm body — a case the Phase 4d \
-                         MVP does not support and the codegen-entry walker should \
-                         have rejected (closure point: Plan B Task 55, Phase 4e — \
-                         see the `[DEVIATION Task 55] Phase 4d` entry in \
-                         PLAN_B_DEVIATIONS.md). Reaching this `unreachable!` \
-                         indicates the walker's `Expr::ClosureEnvLoad` rejection \
-                         path was incorrectly relaxed alongside the Phase 4d \
-                         `Expr::Ident`-capture lift.",
+                        "codegen Phase 4e captures+ Slice D: arm capture `{}` not \
+                         found in surrounding fn's lexical env at handle codegen \
+                         time, AND no `Expr::ClosureEnvLoad` for this name was \
+                         found in the arm body during the pre-pass scan. The \
+                         `lambda_source` field should have been populated if the \
+                         capture were sourced from a surrounding lambda's closure \
+                         record. Reaching this `unreachable!` indicates either: \
+                         (a) the typecheck `handle_arm_captures` side-table \
+                         contains a name that's neither in env nor in the arm \
+                         body's ClosureEnvLoad nodes — a typecheck/closure_convert \
+                         contract violation; or (b) the Slice D scan in \
+                         `find_closure_env_load_lambda_source` missed a \
+                         ClosureEnvLoad shape (e.g., a new Expr variant arrived \
+                         but the scanner wasn't updated).",
                         c.name
                     )
-                })
+                }),
             })
             .collect();
 
@@ -10534,5 +10664,102 @@ mod tests {
         }));
         // Detector with k_name = "k": 2nd let invokes "j", not "k", reject.
         assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Plan B Task 55, Phase 4e captures+ Slice D — `find_closure_env_load_lambda_source`
+    // unit tests. Pin the scanner's match/no-match behaviour so a
+    // future regression in the lambda-source detection fires
+    // precisely instead of waiting for the e2e test to surface.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn find_closure_env_load_lambda_source_matches_direct_closure_env_load() {
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::ClosureEnvLoad {
+            kind: EnvSlotKind::Int,
+            index: 3,
+            name: "x".to_string(),
+            span: span.clone(),
+        };
+        let result = find_closure_env_load_lambda_source(&body, "x");
+        assert_eq!(result, Some((3, EnvSlotKind::Int)));
+    }
+
+    #[test]
+    fn find_closure_env_load_lambda_source_returns_none_for_plain_ident() {
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // Plain `Ident("x")` — closure_convert hasn't run, OR the
+        // surrounding fn isn't a synthetic lambda. No lambda_source.
+        let body = Expr::Ident("x".to_string(), span.clone());
+        assert!(find_closure_env_load_lambda_source(&body, "x").is_none());
+    }
+
+    #[test]
+    fn find_closure_env_load_lambda_source_finds_match_inside_binary() {
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::ClosureEnvLoad {
+                kind: EnvSlotKind::Int,
+                index: 0,
+                name: "x".to_string(),
+                span: span.clone(),
+            }),
+            rhs: Box::new(Expr::IntLit(1, span.clone())),
+            span: span.clone(),
+        };
+        let result = find_closure_env_load_lambda_source(&body, "x");
+        assert_eq!(result, Some((0, EnvSlotKind::Int)));
+    }
+
+    #[test]
+    fn find_closure_env_load_lambda_source_returns_none_for_different_name() {
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::ClosureEnvLoad {
+            kind: EnvSlotKind::Int,
+            index: 3,
+            name: "y".to_string(),
+            span: span.clone(),
+        };
+        // Looking for "x" but body has "y". No match.
+        assert!(find_closure_env_load_lambda_source(&body, "x").is_none());
+    }
+
+    #[test]
+    fn find_closure_env_load_lambda_source_first_match_wins() {
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        // closure_convert rewrites all references uniformly, so each
+        // occurrence of the same name has the same `(index, kind)`.
+        // The scanner returns the first match in tree-traversal order
+        // regardless. This test pins that behaviour defensively.
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::ClosureEnvLoad {
+                kind: EnvSlotKind::Int,
+                index: 5,
+                name: "x".to_string(),
+                span: span.clone(),
+            }),
+            rhs: Box::new(Expr::ClosureEnvLoad {
+                kind: EnvSlotKind::Bool,
+                index: 99,
+                name: "x".to_string(),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let result = find_closure_env_load_lambda_source(&body, "x");
+        assert_eq!(result, Some((5, EnvSlotKind::Int)));
     }
 }
