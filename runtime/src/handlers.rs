@@ -1104,6 +1104,23 @@ mod tests {
         reset_state();
     }
 
+    // Plan B Task 55, Phase 4e captures+ Slice B polish — the
+    // tightened arity assert from Slice A polish (`0dce45f`) cannot
+    // be unit-tested via `#[should_panic]`: `sigil_continuation_identity`
+    // is `extern "C"` and Rust aborts (non-unwinding) on panics
+    // across the C ABI boundary, so the test framework's panic
+    // catch never fires. The assert's contract — accept exactly
+    // `args_len == 1` or `args_len == 3`, panic on any other shape
+    // in debug builds — is documented at the assert site (search
+    // `args_len must be exactly 1`); the codegen-side test surface
+    // for "no other args_len is reachable" is the existing
+    // `continuation_identity_returns_done_with_args_ptr_value`
+    // (args_len=1) and
+    // `continuation_identity_tolerates_args_len_3_trailing_pair_convention`
+    // (args_len=3) tests, plus the e2e suite which exercises both
+    // paths via PR #26 captures-bearing tests + Slice B's
+    // `slice_b_arm_body_let_then_pure_tail_post_arm_k_synth_fn_fires`.
+
     #[test]
     fn handler_frame_new_initialises_zero_arms_and_pointers() {
         let _guard = crate::test_support::gc_test_lock();

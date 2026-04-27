@@ -2898,3 +2898,162 @@ fn slice_b_arm_body_let_then_pure_tail_post_arm_k_synth_fn_fires() {
          helper's synth-cont, computes r + 1 = 99 + 1 = 100. stderr={stderr:?}"
     );
 }
+
+#[test]
+fn slice_b_arm_body_let_then_pure_tail_with_non_trivial_pure_arg() {
+    // Slice B coverage variation (PR #27 mid-flight at e5991a9
+    // review item 7): `arg_expr` is a pure compound expression
+    // (`99 + 1`), not just a literal. Exercises the arg lowerer's
+    // widen path under a Binary expression. Expected stdout: "101"
+    // (= (99 + 1) + 1).
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => { let r: Int = k(99 + 1); r + 1 },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_b_post_arm_k_non_trivial_arg");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "101\n",
+        "Slice B non-trivial arg: arg = 99 + 1 = 100; r = 100; r + 1 = 101. \
+         stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_b_arm_body_let_then_pure_tail_with_global_in_tail() {
+    // Slice B coverage variation: `tail_expr` references the
+    // `int_to_string` global (along with `r`). Exercises the
+    // free-var walker's `globals.contains` branch beyond the
+    // `r`-only path. The tail's overall result type is String,
+    // exercising the binding_ty=Int but tail_ty=String code paths
+    // (per the post-arm-k synth fn's I64 widen).
+    //
+    // Note: `int_to_string` is an Int->String fn; helper's tail
+    // type is Int, so `r` is bound as Int; the post-arm-k tail
+    // calls `int_to_string(r)` which is a Call expression — not
+    // pure per `expr_is_pure`. So this shape is NOT directly
+    // accepted by Slice B's classifier today (Calls are rejected
+    // by purity). This rejection is correct: a future captures-
+    // bearing or purity-relaxing extension would lift it.
+    //
+    // The variation we CAN test today is a tail computation that
+    // uses a global as a value, e.g. an Ident reference. Sigil
+    // doesn't currently have global Int constants, so we approximate
+    // by using a top-level fn name as a value (also a global) — but
+    // that's not a useful runtime computation. Instead, defer this
+    // coverage variation to the captures-bearing extension that
+    // permits Calls in tails. The unit test
+    // `arm_body_post_arm_k_tail_free_vars_accepts_binding_plus_globals`
+    // pins the walker's globals-membership branch directly.
+    //
+    // No e2e test is added here because no parseable shape exercises
+    // it under Slice B's purity restriction. Documenting the gap.
+}
+
+#[test]
+fn slice_b_arm_body_post_arm_k_tail_referencing_op_arg_is_rejected_at_codegen() {
+    // Slice B negative coverage (PR #27 mid-flight at e5991a9
+    // review item 6): tail references an op-arg, which is outside
+    // `{r} ∪ globals`. Walker rejects with the captures-bearing-
+    // extension-pointing diagnostic.
+    //
+    // Op `Raise.fail(n: Int)` takes one arg `n`; arm body
+    // `Raise.fail(n, k) => { let r: Int = k(99); r + n }` references
+    // `n` (op-arg) in the post-arm-k tail. Future captures-bearing
+    // extension would alloc a closure record at the arm-fn body
+    // emit and read it in the post-arm-k synth fn.
+    let src = "effect Raise { fail: (Int) -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail(7);\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(arg, k) => { let r: Int = k(99); r + arg },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "slice_b_reject_op_arg_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_b_reject_op_arg_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: post-arm-k tail references op-arg `arg`. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("captures-bearing extension") || stderr.contains("`arg`"),
+        "diagnostic should point at the captures-bearing extension or name `arg`; \
+         got stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_b_arm_body_post_arm_k_tail_referencing_k_is_rejected_at_codegen() {
+    // Slice B negative coverage: tail references the continuation
+    // `k` directly. Walker rejects with the Slice-C-pointing
+    // diagnostic (multi-shot / further-non-tail uses).
+    //
+    // arm body `Raise.fail(k) => { let r: Int = k(99); k }` would
+    // try to use `k` as a value in tail position. Slice B rejects.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => { let r: Int = k(99); k },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp =
+        std::env::temp_dir().join(format!("slice_b_reject_k_ref_{}.sigil", std::process::id()));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_b_reject_k_ref_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: post-arm-k tail references `k`. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}

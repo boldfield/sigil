@@ -847,11 +847,14 @@ fn arm_body_unsupported_construct(
             shape.binding_name,
             &arm.k_name,
             globals,
+            &BTreeSet::new(),
         ) {
             return Some(diag);
         } else {
             // Slice B accepted shape: `arg` pure, `tail` pure,
-            // `tail` free vars ⊆ `{r} ∪ globals`. Allow.
+            // `tail` free vars ⊆ `{r} ∪ globals` (with Match-arm
+            // bodies extending that set with their pattern bindings).
+            // Allow.
             return None;
         }
     }
@@ -1968,8 +1971,18 @@ fn collect_handle_arms_in_expr(
                 let post_arm_k = if let Some(shape) =
                     arm_body_let_then_pure_tail_shape(&rewritten_body, &arm.k_name)
                 {
-                    let post_arm_k_idx = synth.len();
-                    let post_arm_k_mangled = format!("sigil_handler_post_arm_k_{post_arm_k_idx}");
+                    // The mangled symbol uses the parent arm fn's
+                    // global index (== `synth.len()` at the moment of
+                    // the corresponding `synth.push(HandlerArmSynth)`
+                    // below). Each arm has at most one post-arm-k
+                    // synth fn, so this is collision-free without
+                    // needing a separate post-arm-k counter — but the
+                    // name is the ARM-FN's index, not a sequential
+                    // post-arm-k index. Naming the binding makes that
+                    // explicit.
+                    let post_arm_k_arm_fn_idx = synth.len();
+                    let post_arm_k_mangled =
+                        format!("sigil_handler_post_arm_k_{post_arm_k_arm_fn_idx}");
                     let post_arm_k_func_id = module
                         .declare_function(&post_arm_k_mangled, Linkage::Local, ctx.cps_arm_sig)
                         .map_err(|e| format!("declare {post_arm_k_mangled}: {e}"))?;
@@ -2095,7 +2108,7 @@ fn arm_body_tail_is_k_call<'a>(
 ///   - `tail_expr` must satisfy [`expr_is_pure`] and reference only
 ///     `name` (the let-binding) plus globals — no op-args, no outer-
 ///     scope captures, no `k_name` references. The pre-pass'
-///     `arm_body_post_arm_k_tail_free_vars_only_in` helper enforces
+///     `arm_body_post_arm_k_tail_free_vars_ok` helper enforces
 ///     this.
 ///
 /// This is the arm-side analogue of the helper-body's
@@ -2169,12 +2182,13 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
     binding_name: &str,
     k_name: &str,
     globals: &std::collections::BTreeSet<String>,
+    extra_bindings: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     use crate::ast::Expr;
     match tail_expr {
         Expr::IntLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
         Expr::Ident(name, _) => {
-            if name == binding_name || globals.contains(name) {
+            if name == binding_name || globals.contains(name) || extra_bindings.contains(name) {
                 None
             } else if name == k_name {
                 Some(format!(
@@ -2198,49 +2212,103 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
              ClosureEnvLoad) — closure-of-surrounding-lambda captures into the \
              post-arm-k synth fn arrive in Slice D"
         )),
-        Expr::Binary { lhs, rhs, .. } => {
-            arm_body_post_arm_k_tail_free_vars_ok(lhs, binding_name, k_name, globals).or_else(
-                || arm_body_post_arm_k_tail_free_vars_ok(rhs, binding_name, k_name, globals),
+        Expr::Binary { lhs, rhs, .. } => arm_body_post_arm_k_tail_free_vars_ok(
+            lhs,
+            binding_name,
+            k_name,
+            globals,
+            extra_bindings,
+        )
+        .or_else(|| {
+            arm_body_post_arm_k_tail_free_vars_ok(
+                rhs,
+                binding_name,
+                k_name,
+                globals,
+                extra_bindings,
             )
-        }
-        Expr::Unary { operand, .. } => {
-            arm_body_post_arm_k_tail_free_vars_ok(operand, binding_name, k_name, globals)
-        }
+        }),
+        Expr::Unary { operand, .. } => arm_body_post_arm_k_tail_free_vars_ok(
+            operand,
+            binding_name,
+            k_name,
+            globals,
+            extra_bindings,
+        ),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => arm_body_post_arm_k_tail_free_vars_ok(cond, binding_name, k_name, globals)
-            .or_else(|| {
-                arm_body_post_arm_k_tail_free_vars_ok_block(
-                    then_block,
-                    binding_name,
-                    k_name,
-                    globals,
-                )
-            })
-            .or_else(|| {
-                arm_body_post_arm_k_tail_free_vars_ok_block(
-                    else_block,
-                    binding_name,
-                    k_name,
-                    globals,
-                )
-            }),
+        } => arm_body_post_arm_k_tail_free_vars_ok(
+            cond,
+            binding_name,
+            k_name,
+            globals,
+            extra_bindings,
+        )
+        .or_else(|| {
+            arm_body_post_arm_k_tail_free_vars_ok_block(
+                then_block,
+                binding_name,
+                k_name,
+                globals,
+                extra_bindings,
+            )
+        })
+        .or_else(|| {
+            arm_body_post_arm_k_tail_free_vars_ok_block(
+                else_block,
+                binding_name,
+                k_name,
+                globals,
+                extra_bindings,
+            )
+        }),
         Expr::Match {
             scrutinee, arms, ..
-        } => arm_body_post_arm_k_tail_free_vars_ok(scrutinee, binding_name, k_name, globals)
-            .or_else(|| {
-                arms.iter().find_map(|a| {
-                    arm_body_post_arm_k_tail_free_vars_ok(&a.body, binding_name, k_name, globals)
-                })
-            }),
-        Expr::Block(b) => {
-            arm_body_post_arm_k_tail_free_vars_ok_block(b, binding_name, k_name, globals)
-        }
+        } => arm_body_post_arm_k_tail_free_vars_ok(
+            scrutinee,
+            binding_name,
+            k_name,
+            globals,
+            extra_bindings,
+        )
+        .or_else(|| {
+            // Per-arm clone of `extra_bindings`, extended with the
+            // arm's pattern-bound names (mirrors the helper-side
+            // captures slice's Match-pattern walker fix from
+            // PR #26's `2be70ce`). Without this, a tail like
+            // `match r { Some(y) => y, None => 0 }` would reject `y`
+            // as "neither the let-binding nor a global" — misleading
+            // because `y` IS a valid pattern-bound name.
+            arms.iter().find_map(|a| {
+                let mut arm_extra = extra_bindings.clone();
+                collect_pattern_bindings(&a.pattern, &mut arm_extra);
+                arm_body_post_arm_k_tail_free_vars_ok(
+                    &a.body,
+                    binding_name,
+                    k_name,
+                    globals,
+                    &arm_extra,
+                )
+            })
+        }),
+        Expr::Block(b) => arm_body_post_arm_k_tail_free_vars_ok_block(
+            b,
+            binding_name,
+            k_name,
+            globals,
+            extra_bindings,
+        ),
         Expr::RecordLit { fields, .. } => fields.iter().find_map(|f| {
-            arm_body_post_arm_k_tail_free_vars_ok(&f.value, binding_name, k_name, globals)
+            arm_body_post_arm_k_tail_free_vars_ok(
+                &f.value,
+                binding_name,
+                k_name,
+                globals,
+                extra_bindings,
+            )
         }),
         // Yield-able shapes: `expr_is_pure` already rejected these
         // before this fn was called, so this is unreachable in
@@ -2269,6 +2337,7 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
     binding_name: &str,
     k_name: &str,
     globals: &std::collections::BTreeSet<String>,
+    extra_bindings: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     use crate::ast::Stmt;
     // For Slice B's first commit, we restrict to one binding name
@@ -2292,9 +2361,13 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
                 ));
             }
             Stmt::Expr(e) => {
-                if let Some(d) =
-                    arm_body_post_arm_k_tail_free_vars_ok(e, binding_name, k_name, globals)
-                {
+                if let Some(d) = arm_body_post_arm_k_tail_free_vars_ok(
+                    e,
+                    binding_name,
+                    k_name,
+                    globals,
+                    extra_bindings,
+                ) {
                     return Some(d);
                 }
             }
@@ -2308,7 +2381,13 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
         }
     }
     if let Some(t) = &b.tail {
-        return arm_body_post_arm_k_tail_free_vars_ok(t, binding_name, k_name, globals);
+        return arm_body_post_arm_k_tail_free_vars_ok(
+            t,
+            binding_name,
+            k_name,
+            globals,
+            extra_bindings,
+        );
     }
     None
 }
@@ -4481,8 +4560,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // cont's `Call(post_arm_k_*, [synth_cont_result])`);
             // block_params[2] = args_len (== 1 from the helper
             // synth-cont's `Call(post_arm_k_*, [...])` which always
-            // emits arg_count=1).
-            let _args_len = block_params[2];
+            // emits arg_count=1; not bound here — the invariant is
+            // documented and enforced at the synth-cont's dispatch
+            // site, not re-checked here).
 
             let args_ptr = block_params[1];
             let r_widened = builder
@@ -7500,6 +7580,16 @@ fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
 ///      cont closure record captures helper's params.
 ///   2. Multi-yield bodies (`perform; perform; tail`) — chained
 ///      synth-conts.
+///
+/// Cross-link: [`arm_body_let_then_pure_tail_shape`] is the arm-
+/// side analogue of this helper-side classifier (Phase 4e captures+
+/// Slice B). The two walkers' recursion shapes are deliberately
+/// parallel — when a future `Expr` variant arrives, both must be
+/// updated in lockstep. The arm-side detector additionally enforces
+/// a free-var restriction via `arm_body_post_arm_k_tail_free_vars_ok`
+/// because the post-arm-k synth fn's closure_ptr is null in
+/// Slice B's first commit (no captures); the helper-side
+/// `LetBindThenTail` synth-cont already ships captures.
 fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
     use crate::ast::{Expr, Stmt};
     if body.stmts.len() != 1 {
@@ -8984,5 +9074,296 @@ mod tests {
         // a yield-able shape and doesn't recurse (defensive — the
         // classifier already rejects Call in tail).
         assert_eq!(captures.len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Plan B Task 55, Phase 4e captures+ Slice B — `arm_body_let_then_
+    // pure_tail_shape` + `arm_body_post_arm_k_tail_free_vars_ok` unit
+    // tests, addressing PR #27 mid-flight at `e5991a9` review item 2
+    // (no-context). Pin the shape detector's match/no-match boundary
+    // and the free-var walker's accept/reject behaviour at the
+    // diagnostic layer so a future regression in either fires
+    // precisely instead of waiting for an e2e to surface.
+    // -----------------------------------------------------------------
+
+    fn slice_b_block_let_k_call_tail(
+        binding_name: &str,
+        binding_ty: crate::ast::TypeExpr,
+        k_arg: crate::ast::Expr,
+        tail: crate::ast::Expr,
+    ) -> crate::ast::Expr {
+        use crate::ast::{Block, Expr, LetStmt, Stmt};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        Expr::Block(Box::new(Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: binding_name.to_string(),
+                ty: binding_ty,
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![k_arg],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })],
+            tail: Some(tail),
+            span: span.clone(),
+        }))
+    }
+
+    #[test]
+    fn arm_body_let_then_pure_tail_shape_matches_simple_int_shape() {
+        use crate::ast::{BinOp, Expr, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = slice_b_block_let_k_call_tail(
+            "r",
+            TypeExpr::Named("Int".to_string(), span.clone()),
+            Expr::IntLit(99, span.clone()),
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(1, span.clone())),
+                span: span.clone(),
+            },
+        );
+        let m = arm_body_let_then_pure_tail_shape(&body, "k").expect("shape matches");
+        assert_eq!(m.binding_name, "r");
+    }
+
+    #[test]
+    fn arm_body_let_then_pure_tail_shape_rejects_non_block_arm_body() {
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::IntLit(1, span.clone())),
+            rhs: Box::new(Expr::IntLit(2, span.clone())),
+            span: span.clone(),
+        };
+        assert!(arm_body_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_let_then_pure_tail_shape_rejects_block_with_non_let_stmt() {
+        use crate::ast::{Block, Expr, Stmt};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // Block with `Stmt::Expr(IntLit 1); IntLit 2` — not a Let.
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![Stmt::Expr(Expr::IntLit(1, span.clone()))],
+            tail: Some(Expr::IntLit(2, span.clone())),
+            span: span.clone(),
+        }));
+        assert!(arm_body_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_let_then_pure_tail_shape_rejects_let_with_non_k_call_value() {
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // `let r: Int = 99; r + 1` — the Let value is not a `k(arg)` call.
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "r".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::IntLit(99, span.clone()),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Ident("r".to_string(), span.clone())),
+            span: span.clone(),
+        }));
+        assert!(arm_body_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_let_then_pure_tail_shape_rejects_block_without_tail() {
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // `let r: Int = k(99);` — block has no tail. Slice B requires
+        // a tail expression for the post-arm-k synth fn to lower.
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "r".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::IntLit(99, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })],
+            tail: None,
+            span: span.clone(),
+        }));
+        assert!(arm_body_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_post_arm_k_tail_free_vars_accepts_binding_plus_globals() {
+        // Tail `r + int_to_string_global` (where `int_to_string_global`
+        // is in `globals`) — both names allowed.
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("x.sigil");
+        let mut globals: BTreeSet<String> = BTreeSet::new();
+        globals.insert("int_to_string".to_string());
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("r".to_string(), span.clone())),
+            // Use Ident for a global name (the actual int_to_string is
+            // a fn call, but for the free-var walker we just need to
+            // verify the name passes the membership check).
+            rhs: Box::new(Expr::Ident("int_to_string".to_string(), span.clone())),
+            span: span.clone(),
+        };
+        assert!(
+            arm_body_post_arm_k_tail_free_vars_ok(&tail, "r", "k", &globals, &BTreeSet::new(),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn arm_body_post_arm_k_tail_free_vars_rejects_op_arg() {
+        // Tail `r + n` where `n` is an op-arg (NOT in `{r} ∪ globals`
+        // ∪ extras) — Slice B rejects with op-arg-pointing diagnostic.
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("r".to_string(), span.clone())),
+            rhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+            span: span.clone(),
+        };
+        let diag = arm_body_post_arm_k_tail_free_vars_ok(
+            &tail,
+            "r",
+            "k",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("rejected");
+        assert!(
+            diag.contains("`n`"),
+            "diagnostic mentions the offending name: {diag}"
+        );
+        assert!(
+            diag.contains("captures-bearing extension"),
+            "diagnostic points at captures-bearing extension: {diag}"
+        );
+    }
+
+    #[test]
+    fn arm_body_post_arm_k_tail_free_vars_rejects_k_reference() {
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Ident("k".to_string(), span.clone());
+        let diag = arm_body_post_arm_k_tail_free_vars_ok(
+            &tail,
+            "r",
+            "k",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("rejected");
+        assert!(
+            diag.contains("Slice C"),
+            "diagnostic points at Slice C: {diag}"
+        );
+    }
+
+    #[test]
+    fn arm_body_post_arm_k_tail_free_vars_rejects_closure_env_load() {
+        use crate::ast::{EnvSlotKind, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::ClosureEnvLoad {
+            index: 0,
+            kind: EnvSlotKind::Int,
+            name: "outer".to_string(),
+            span: span.clone(),
+        };
+        let diag = arm_body_post_arm_k_tail_free_vars_ok(
+            &tail,
+            "r",
+            "k",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("rejected");
+        assert!(
+            diag.contains("Slice D"),
+            "diagnostic points at Slice D: {diag}"
+        );
+    }
+
+    #[test]
+    fn arm_body_post_arm_k_tail_free_vars_accepts_match_with_pattern_binding() {
+        // Match arm pattern binds `y`; tail body references `y`.
+        // Walker must extend the allowed set per-arm with the
+        // pattern's bindings (mirrors the helper-side captures
+        // slice's Match-pattern walker fix from PR #26's `2be70ce`).
+        // Pre-fix, the walker rejected `y` with the misleading
+        // "neither the let-binding nor a global" diagnostic.
+        use crate::ast::{Expr, MatchArm, Pattern};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Match {
+            scrutinee: Box::new(Expr::Ident("r".to_string(), span.clone())),
+            arms: vec![MatchArm {
+                pattern: Pattern::Var("y".to_string(), span.clone()),
+                body: Expr::Ident("y".to_string(), span.clone()),
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        assert!(arm_body_post_arm_k_tail_free_vars_ok(
+            &tail,
+            "r",
+            "k",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn arm_body_post_arm_k_tail_free_vars_rejects_inner_let_in_block_tail() {
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Block(Box::new(Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "y".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Ident("r".to_string(), span.clone()),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Ident("y".to_string(), span.clone())),
+            span: span.clone(),
+        }));
+        let diag = arm_body_post_arm_k_tail_free_vars_ok(
+            &tail,
+            "r",
+            "k",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("rejected");
+        assert!(
+            diag.contains("inner") && diag.contains("let"),
+            "diagnostic points at inner-let restriction: {diag}"
+        );
     }
 }
