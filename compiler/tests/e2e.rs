@@ -248,8 +248,7 @@ fn hello() {
 #[test]
 fn stackmap_section_parses_v0_placeholder() {
     use sigil_compiler::{
-        closure_convert, codegen, color, cps, elaborate, lexer, monomorphize, parser, resolve,
-        typecheck,
+        closure_convert, codegen, color, elaborate, lexer, monomorphize, parser, resolve, typecheck,
     };
     use sigil_runtime::stackmap::{
         parse_section, ParseError, STACKMAP_FLAG_PLACEHOLDER, STACKMAP_VERSION_PLACEHOLDER,
@@ -275,8 +274,7 @@ fn stackmap_section_parses_v0_placeholder() {
     let anf = elaborate::elaborate(checked);
     let mono = monomorphize::monomorphize(anf);
     let colored = color::infer_colors(mono);
-    let cps_ir = cps::transform(colored);
-    let cc = closure_convert::convert(cps_ir);
+    let cc = closure_convert::convert(colored);
 
     let obj_path =
         std::env::temp_dir().join(format!("sigil_e2e_stackmap_{}.o", std::process::id()));
@@ -1062,14 +1060,36 @@ fn statement_form_non_io_perform_inside_handle_compiles_and_runs() {
     // path; non-IO → `lower_perform_non_io_to_value` with the value
     // discarded.
     //
-    // Phase 3b semantics note: the arm value flows back to the
-    // perform site (via `sigil_perform` → `sigil_run_loop`), not to
-    // the handle site. So in this test, helper's `perform E.op();`
-    // returns 99 (the arm value) which is discarded by the Stmt;
-    // helper continues to its tail `42` and returns 42. The handle
-    // expression therefore evaluates to 42, NOT to 99. Phase 4d's
-    // continuation reification will revise this so a `k`-ignoring
-    // arm aborts helper's continuation back to the handle site.
+    // **Phase 4e (this commit) — assertion inverted from `42` to
+    // `99`.** Helper now matches the stmt-then-constant-tail body
+    // shape (`is_simple_yield_then_constant_tail_body`), so
+    // `compute_user_fn_abi` returns `Cps`. Codegen synthesises a
+    // continuation closure that returns `Done(42)` (helper's tail)
+    // and emits helper's body as `sigil_perform(eff, op, ..., null,
+    // &synth_cont)` — yielding to the trampoline with the synth-
+    // cont as the perform's k.
+    //
+    // Algebraic semantics under the Phase 4e shape:
+    //
+    //   - The arm `E.op(k) => 99` discards `k` (no reference to k
+    //     in the arm body). It returns Done(99) directly.
+    //   - The trampoline observes Done(99) and unwinds to the
+    //     wrapper that called helper. The synth-cont — which would
+    //     have returned Done(42) if the arm called k(any_value) —
+    //     never runs.
+    //   - main's `let n = ...` binds n = 99. main prints "99\n".
+    //
+    // This is the **discard-k correctness fix for stmt-form
+    // perform yields** — the algebraic-semantics-correct behavior
+    // that was the load-bearing piece for inverting this test
+    // alongside (eventually) the `discard_k_handler_does_not_
+    // abort_helper_phase_4e_pending` test.
+    //
+    // The previously-asserted `42` was the Phase 4d MVP synchronous
+    // shape: helper's perform synchronously called sigil_run_loop
+    // which dispatched the arm; arm returned 99 to the perform
+    // site (where the Stmt::Perform discarded it); helper then
+    // continued to its tail `42`. Pre-Phase-4e behavior.
     let src = "effect E { op: () -> Int }\n\
                fn helper() -> Int ![E] {\n  \
                  perform E.op();\n  \
@@ -1082,7 +1102,11 @@ fn statement_form_non_io_perform_inside_handle_compiles_and_runs() {
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "stmt_perform_non_io_in_handle");
     assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
-    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n",
+        "Phase 4e: discard-k arm fires; arm value flows to handle site, \
+         not to perform site. stderr={stderr:?}"
+    );
 }
 
 #[test]
@@ -1984,14 +2008,207 @@ fn arm_uses_k_in_non_tail_position_is_rejected_pointing_at_phase_4e() {
 }
 
 #[test]
-#[ignore = "Phase 4e pending: pins the discard-k correctness gap across function-call boundaries; inverts to a normal test (asserting stdout 42, code 0) when Phase 4e ships the colorer's handler-discharge refinement"]
-fn discard_k_handler_does_not_abort_helper_phase_4e_pending() {
-    // Plan B Task 55 (Phase 4d MVP) — pinning test for the
-    // discard-k correctness gap, slated to close in Phase 4e
-    // (colorer's handler-discharge refinement + native↔CPS interop
-    // boundary). See `[DEVIATION Task 55] Phase 4d` in
-    // PLAN_B_DEVIATIONS.md and the README "Verification limits
-    // (in-flight)" section.
+fn cps_abi_helper_with_simple_tail_perform_called_from_native_main_returns_arm_value() {
+    // Plan B Task 55, Phase 4e — the first slice of CPS-ABI
+    // user-fn emission. `raise_e` has an empty stmts list and tail
+    // = `perform E.op()`; it matches `is_simple_tail_perform_with
+    // _pure_args_body` and is intrinsically CPS-color (row contains
+    // `E`). `compute_user_fn_abi` returns `UserFnAbi::Cps`, so
+    // `raise_e` is declared with the CPS calling convention
+    // `(closure_ptr, args_ptr, args_len) -> *mut NextStep` (per
+    // `cps_signature`).
+    //
+    // `main` is CPS-color via the SCC bridge to `raise_e`, but its
+    // body is multi-stmt — `compute_user_fn_abi` returns
+    // `UserFnAbi::Sync`, so `main` keeps the existing closure-
+    // convention signature and the synchronous body lowering. The
+    // call to `raise_e` from `main` routes through the inlined
+    // native↔CPS interop wrapper at `lower_call`: pack
+    // `(k_closure=null, k_fn=sigil_continuation_identity)` into a
+    // 16-byte stack slot, call `raise_e(closure_ptr=null, args_ptr,
+    // args_len=2)` → `*mut NextStep`, drive `sigil_run_loop` →
+    // u64, narrow back to `Int`.
+    //
+    // **Architectural shift**: today's `lower_perform_non_io_to_
+    // value` (Phase 4d MVP) inlines the perform site inside `raise
+    // _e`'s native-ABI body. This test exercises the same
+    // observable behaviour (stdout `42`, the arm value) but
+    // through the CPS-ABI path: `raise_e`'s body emits a tail
+    // `sigil_perform(...)` returning `*mut NextStep` directly, and
+    // the synchronous run_loop driver moves to the call site.
+    // Under tail-position perform semantics the two shapes are
+    // observationally equivalent; the architectural difference
+    // only matters for cross-function-call discard-k correctness
+    // (the `discard_k_handler_does_not_abort_helper_phase_4e_
+    // pending` test, which inverts in a later commit when both
+    // `main` and `raise_e` become CPS-ABI via the lambda-lifting
+    // machinery).
+    //
+    // What this test pins: signature selection routes the right
+    // fn through the CPS-ABI path; the body emit branch produces
+    // a valid Cranelift function with the right shape; the call-
+    // site wrapper packs args correctly and drives the trampoline;
+    // the ret-type narrow returns the right value.
+    let src = "effect E { op: () -> Int }\n\
+               fn raise_e() -> Int ![E] { perform E.op() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle raise_e() with { E.op(k) => 42 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "cps_abi_helper_with_simple_tail_perform_called_from_native_main",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn cps_abi_helper_called_twice_from_one_caller_uses_independent_stack_slots() {
+    // Plan B Task 55, Phase 4e — S3 from PR #26 mid-flight at
+    // 33f2231. The native↔CPS interop wrapper at `lower_call`
+    // creates a fresh stack slot per CPS-callee call site (see
+    // `Lowerer::lower_call` Cps arm — `create_sized_stack_slot`
+    // runs inside the match). This test pins that two calls to
+    // the same CPS callee from one caller don't accidentally
+    // share or alias the slot. Aliasing would manifest as one
+    // call's `[null, identity]` being clobbered by the other's,
+    // which (because both write the same values) wouldn't be
+    // observable at runtime — but the slot-allocation count is
+    // a structural property the test pins.
+    //
+    // Two handle expressions, each calling raise_e and discharging
+    // E with different arm values. Expected stdout: each handle's
+    // arm value, both correctly returned.
+    let src = "effect E { op: () -> Int }\n\
+               fn raise_e() -> Int ![E] { perform E.op() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle raise_e() with { E.op(k) => 10 };\n  \
+                 let b: Int = handle raise_e() with { E.op(k) => 20 };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "cps_abi_helper_called_twice_independent_slots");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "10\n20\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn cps_abi_helper_with_bool_return_exercises_ireduce_narrow() {
+    // Plan B Task 55, Phase 4e — S3 from PR #26 mid-flight at
+    // 33f2231. The wrapper's narrow step (`Lowerer::lower_call`
+    // Cps arm at the ret_ty branch) chooses between identity-on-
+    // I64, `ireduce` for narrower-than-I64 ints, and a
+    // `debug_assert_eq!(ret_ty, pointer_ty)` for pointer-typed
+    // returns. The ireduce path wasn't covered by the prior happy-
+    // path test (Int → I64). Bool exercises the I8 narrow.
+    //
+    // helper returns Bool; arm returns `true`. main asserts the
+    // value via an if-expression that prints accordingly.
+    let src = "effect B { op: () -> Bool }\n\
+               fn raise_b() -> Bool ![B] { perform B.op() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Bool = handle raise_b() with { B.op(k) => true };\n  \
+                 if result {\n    \
+                   perform IO.println(\"yes\")\n  \
+                 } else {\n    \
+                   perform IO.println(\"no\")\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "cps_abi_helper_bool_return_ireduce");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "yes\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn cps_abi_helper_with_arity_n_user_args_and_perform_args_returns_arm_value() {
+    // Plan B Task 55, Phase 4e — widened arity slice. Helper
+    // takes one user param `x: Int` and forwards it as the
+    // perform's argument. Arm receives `x` as the op-arg and
+    // returns it doubled. End-to-end:
+    //
+    //   1. main calls `helper(7)` via the native↔CPS interop
+    //      wrapper at lower_call (Cps arm). The wrapper allocates
+    //      a 24-byte stack slot for `[user_arg=7, k_closure=null,
+    //      k_fn=identity]` and calls helper(closure_ptr=null,
+    //      args_ptr=slot, args_len=1).
+    //   2. helper's CPS body emission unpacks `x` from
+    //      `args_ptr[0]`, loads (k_closure, k_fn) from
+    //      `args_ptr[1]`/`args_ptr[2]`, packs `x` into a fresh
+    //      stack slot for the perform's args buffer, and
+    //      calls `sigil_perform(...)` returning its NextStep.
+    //   3. Trampoline dispatches the arm with `x=7` + the
+    //      identity continuation. Arm body `arg * 2` returns
+    //      `Done(14)`.
+    //   4. Trampoline returns 14 to the wrapper; wrapper narrows
+    //      to Int. main's `let n: Int = ...` binds 14.
+    //
+    // What this test pins:
+    //   - User-arg unpacking from args_ptr[0..N*8] in the CPS
+    //     body emission, with type narrow (here Int → I64
+    //     identity, so no ireduce).
+    //   - Perform-arg lowering via Lowerer (the Ident `x` lookup
+    //     hits the env populated from args_ptr unpack).
+    //   - Perform-arg packing into a fresh stack slot, with
+    //     widening discipline.
+    //   - User-arg packing in the wrapper at the call site, with
+    //     widening discipline.
+    //   - `args_len = user_arg_count` per the cps_signature
+    //     convention (D2 fix from PR #26 mid-flight at 33f2231).
+    //   - `k_closure_offset(N)` / `k_fn_offset(N)` keeping write
+    //     and read sites in lockstep across arity widening (S1).
+    //
+    // The two existing Phase 4e tests previously excluded this
+    // path via the D1 arity gate; this commit removes the gate
+    // and the new test exercises the now-supported shape.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(x: Int) -> Int ![E] { perform E.op(x) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(7) with { E.op(arg, k) => arg + arg };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "cps_abi_helper_arity_n_user_args_perform_args");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "14\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn cps_abi_helper_with_string_return_exercises_pointer_ret_path() {
+    // Plan B Task 55, Phase 4e — S3 from PR #26 mid-flight at
+    // 33f2231. The wrapper's narrow step takes the
+    // `debug_assert_eq!(ret_ty, pointer_ty)` branch when the
+    // callee returns a pointer-typed value (String, user-type
+    // heap pointer). The trampoline's u64 result is bit-identical
+    // to the pointer value on supported targets (pointer_ty == I64
+    // on x86_64-linux + aarch64-darwin). Pins this branch.
+    //
+    // helper returns String; arm returns a literal. main prints it.
+    let src = "effect S { op: () -> String }\n\
+               fn raise_s() -> String ![S] { perform S.op() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = handle raise_s() with { S.op(k) => \"phase4e\" };\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "cps_abi_helper_string_return_pointer_ret");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "phase4e\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn discard_k_handler_does_abort_helper_across_call_boundary() {
+    // Plan B Task 55, Phase 4e — **inverted from the previously
+    // `#[ignore]`'d `discard_k_handler_does_not_abort_helper_phase
+    // _4e_pending`**. The captures-free let-yield-then-pure-tail
+    // synth-cont slice closes the discard-k correctness gap across
+    // function-call boundaries. See `[DEVIATION Task 55] Phase 4e`
+    // in PLAN_B_DEVIATIONS.md.
     //
     // Algebraic semantics says: a discard-`k` arm (Raise.fail(k) =>
     // 42) should produce the arm value as the handle's overall
@@ -2000,26 +2217,42 @@ fn discard_k_handler_does_not_abort_helper_phase_4e_pending() {
     // (helper() performs Raise.fail; main wraps helper in a
     // handle).
     //
-    // Phase 4d MVP synchronous shape: `sigil_run_loop` returns the
-    // arm value (42) to the perform site INSIDE helper. helper then
-    // continues executing the post-perform code (`+ 100`), returns
-    // 142 to main, and main's handle expression unwraps to 142
-    // (NOT 42).
+    // **Phase 4e correctness chain:**
     //
-    // Expected (Phase 4e+): stdout "42\n", exit 0.
-    // Current (Phase 4d MVP): stdout "142\n", exit 0 (compiles +
-    // runs; produces wrong result vs. algebraic semantics).
+    //   1. helper has body `let x: Int = perform Raise.fail(); x +
+    //      100`. The classifier `is_simple_let_yield_then_pure_
+    //      tail_body` matches; `compute_user_fn_abi` returns Cps
+    //      (helper has 0 user params — captures-free constraint
+    //      satisfied).
     //
-    // The `#[ignore]` keeps this test grep-findable in CI as a
-    // structural reminder of what Phase 4e closes. When Phase 4e
-    // ships, the test inverts to active by removing the `#[ignore]`
-    // attribute and the assertions below match algebraic semantics
-    // (stdout "42\n").
+    //   2. Codegen pre-pass allocates a `CpsContinuationSynth`
+    //      with `kind = LetBindThenTail { binding_name = "x",
+    //      binding_ty = I64, tail_expr = x + 100, tail_ty = I64 }`.
     //
-    // To verify the current (broken) behaviour locally:
-    //   cargo test -p sigil-compiler --test e2e \
-    //     discard_k_handler_does_not_abort_helper_phase_4e_pending \
-    //     -- --ignored
+    //   3. helper's CPS body emit builds `sigil_perform(eff, op,
+    //      ..., k_closure=null, k_fn=&synth_cont)` and returns its
+    //      NextStep up to main's wrapper.
+    //
+    //   4. main's wrapper drives sigil_run_loop on helper's
+    //      NextStep. Trampoline dispatches the arm.
+    //
+    //   5. Arm body: `42` (no reference to k → discards). Returns
+    //      Done(42). **The synth-cont never runs.** helper's rest-
+    //      of-body (`x + 100`) is dropped.
+    //
+    //   6. Trampoline observes Done(42) and returns 42 up to the
+    //      wrapper. main: n = 42. Prints "42\n".
+    //
+    // The previously-pinned `142` was the Phase 4d MVP synchronous
+    // shape: helper's perform synchronously called sigil_run_loop;
+    // run_loop returned arm value 42; helper bound x = 42;
+    // helper computed 42 + 100 = 142; main's handle overall = 142.
+    //
+    // **This is the second of hard condition #2's two enumerated
+    // test inversions** (the first being `statement_form_non_io_
+    // perform_inside_handle_compiles_and_runs`, inverted at
+    // `b818fc3`). With this test inverted, hard condition #2
+    // closes.
     let src = "effect Raise { fail: () -> Int }\n\
                fn helper() -> Int ![Raise, IO] {\n  \
                  let x: Int = perform Raise.fail();\n  \
@@ -2032,21 +2265,412 @@ fn discard_k_handler_does_not_abort_helper_phase_4e_pending() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase4d_pending_discard_k_cross_call");
-    // Phase 4e EXPECTED behaviour (uncomment when 4e ships, remove
-    // the current-behaviour assertion below, and remove the
-    // `#[ignore]` attribute):
-    // assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    // assert_eq!(stdout, "42\n", "Phase 4e algebraic-correct stdout; stderr={stderr:?}");
-
-    // Phase 4d MVP CURRENT (broken) behaviour: arm value 42 flows
-    // to perform site → helper computes 42 + 100 = 142 → handle
-    // overall = 142.
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_discard_k_cross_call");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "142\n",
-        "Phase 4d MVP synchronous shape produces 142 (helper continues post-perform); \
-         Phase 4e closes this gap. stderr={stderr:?}"
+        stdout, "42\n",
+        "Phase 4e algebraic-correct: discard-k arm aborts helper's \
+         rest-of-body across the call boundary. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn captures_bearing_synth_cont_arity_n_helper_discard_k() {
+    // Plan B Task 55, Phase 4e — captures-bearing slice. helper
+    // takes `threshold: Int` user param and references it in the
+    // tail expression `x + threshold`. The synth-cont captures
+    // `threshold` via closure record at the perform site; when
+    // the trampoline dispatches the arm `Raise.fail(k) => 42`
+    // (discards k), the synth-cont never runs and the arm's
+    // value flows directly to main's let-binding.
+    //
+    // Phase 4d MVP synchronous shape would have:
+    //   - helper synchronously runs sigil_run_loop
+    //   - arm returns 42; helper x = 42
+    //   - helper computes 42 + threshold = 42 + 10 = 52
+    //   - main: n = 52
+    //
+    // Phase 4e captures-bearing shape:
+    //   - helper allocates closure record with threshold = 10
+    //   - helper builds NextStep::Call(arm, [..., k_closure=record,
+    //     k_fn=&synth_cont]) and returns it
+    //   - main's wrapper drives sigil_run_loop
+    //   - arm `=> 42` discards k → returns Done(42); synth-cont
+    //     never runs (record never read)
+    //   - sigil_run_loop returns 42 to wrapper
+    //   - main: n = 42
+    //
+    // **The captures-bearing slice extends the discard-k
+    // correctness fix to arity-N helpers** — the constant-tail
+    // and arity-0 let-yield slices unblocked discard-k for
+    // simpler shapes; this commit closes the remaining gap for
+    // helpers that use their user params in the post-yield
+    // expression.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(threshold: Int) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x + threshold\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   Raise.fail(k) => 42,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_arity_n_discard_k");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "Phase 4e captures-bearing slice: arity-N helper with captured \
+         user param + discard-k arm produces algebraic-correct value (42, \
+         not 52). stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cps_abi_arity_n_helper_with_constant_done_synth_cont() {
+    // PR #26 mid-flight at a5ee4c6 item #2 (prior-gap follow-up):
+    // arity-N helper whose body matches the ConstantDone shape
+    // (Stmt::Perform with arg, then constant tail). The synth-
+    // cont ignores k_arg (Stmt::Perform discards) and returns
+    // Done(constant); helper has user param `x` referenced in
+    // the perform's args (not the tail). Pins that:
+    //   - compute_user_fn_abi accepts arity-N helpers with
+    //     ConstantDone shape (no captures needed because the
+    //     constant tail doesn't reference user params)
+    //   - helper's body emit unpacks `x` from args_ptr[0],
+    //     packs it into the perform's args buffer, dispatches
+    //     to the arm
+    //   - arm `=> 99` discards k → returns Done(99); synth-cont
+    //     never runs
+    //   - main: n = 99
+    //
+    // Adjacent shape to the captures-bearing tests but exercises
+    // the ConstantDone path, not LetBindThenTail. Pre-this-test,
+    // this body shape's arity-N variant was untested.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(x: Int) -> Int ![E] {\n  \
+                 perform E.op(x);\n  \
+                 99\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(7) with { E.op(arg, k) => arg + 35 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_arity_n_constant_done");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Arm `E.op(arg, k) => arg + 35` uses k? No — `arg + 35` is
+    // pure expression not referencing k. So arm DISCARDS k. Arm
+    // returns Done(arg + 35) = Done(7 + 35) = Done(42). Trampoline
+    // returns 42 to wrapper. main: n = 42.
+    assert_eq!(
+        stdout, "42\n",
+        "arity-N helper with ConstantDone shape; arm discards k → \
+         arg value flows directly. arg=7 + 35 = 42. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cps_abi_arity_n_helper_with_constant_done_synth_cont_use_k() {
+    // PR #26 mid-flight at 2be70ce review item #2: companion to
+    // `cps_abi_arity_n_helper_with_constant_done_synth_cont`
+    // — that test pinned the BUILD path (helper unpacks user
+    // param, packs into perform args, dispatches arm) but left
+    // the synth-cont's RUN path under the ConstantDone shape
+    // unexercised.
+    //
+    // This test uses `=> k(arg)` arm to force the synth-cont to
+    // fire. arm builds Call(synth_cont, [arg]) → trampoline
+    // dispatches synth_cont → synth_cont returns Done(99)
+    // (ignoring k_arg per ConstantDone semantics). Result `99`
+    // (NOT `arg + 35` since the synth-cont always returns the
+    // constant tail).
+    //
+    // Closes the coverage symmetry with the LetBindThenTail
+    // `discard_k` + `use_k` test pair.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(x: Int) -> Int ![E] {\n  \
+                 perform E.op(x);\n  \
+                 99\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(7) with { E.op(arg, k) => k(arg) };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_arity_n_constant_done_use_k");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Arm `=> k(arg)` calls k → trampoline runs synth_cont with
+    // args_ptr[0] = arg = 7. synth_cont (ConstantDone) returns
+    // Done(99) ignoring args_ptr. Trampoline returns 99 to
+    // wrapper. main: n = 99.
+    assert_eq!(
+        stdout, "99\n",
+        "ConstantDone synth-cont's RUN path: arm calls k(arg) → \
+         synth-cont fires → ignores k_arg, returns Done(99). stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cps_abi_let_yield_helper_with_bool_binding_exercises_ireduce_narrow() {
+    // PR #26 mid-flight at 2be70ce review item #3 (prior-gap
+    // follow-up): non-Int binding in LetBindThenTail. The
+    // synth-cont's binding-load narrows from I64 (the args_ptr
+    // u64 slot) to the binding's declared Cranelift type via
+    // `ireduce` — for Bool, that's I64 → I8. This path was
+    // unexercised in the e2e suite.
+    //
+    // helper: `let b: Bool = perform B.op(); if b then 1 else 0`.
+    // Use-k arm `=> k(true)` — synth-cont reads args_ptr[0] =
+    // 1 (widened bool true), narrows to I8 = 1, binds `b: Bool
+    // = true`, lowers `if b then 1 else 0` = 1. Result `1`.
+    let src = "effect B { op: () -> Bool }\n\
+               fn helper() -> Int ![B, IO] {\n  \
+                 let b: Bool = perform B.op();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with { B.op(k) => k(true) };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_let_yield_bool_binding");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1\n",
+        "Bool binding in LetBindThenTail: synth-cont ireduce I64 → I8 \
+         on args_ptr load; `if b then 1 else 0` with b=true → 1. \
+         stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cps_abi_let_yield_helper_with_string_binding_exercises_pointer_path() {
+    // PR #26 mid-flight at 2be70ce review item #3 (prior-gap
+    // follow-up): pointer-typed binding in LetBindThenTail. The
+    // synth-cont's binding-load takes the pointer-pass-through
+    // arm of the narrow switch (no ireduce on pointer_ty == I64
+    // targets). This path was unexercised in the e2e suite.
+    //
+    // helper: `let s: String = perform S.op(); s` — tail just
+    // returns the binding. Use-k arm `=> k("hello")` — synth-
+    // cont reads args_ptr[0] (String pointer), passes through,
+    // binds `s`, lowers tail `s`. Result is the string "hello".
+    let src = "effect S { op: () -> String }\n\
+               fn helper() -> String ![S, IO] {\n  \
+                 let s: String = perform S.op();\n  \
+                 s\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = handle helper() with { S.op(k) => k(\"hello\") };\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_let_yield_string_binding");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "hello\n",
+        "String binding in LetBindThenTail: synth-cont pointer-path \
+         on args_ptr load; tail returns binding directly. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cps_abi_captures_bearing_with_bool_capture_exercises_widen_narrow_symmetry() {
+    // PR #26 mid-flight at 2be70ce review item #3 (prior-gap
+    // follow-up): non-Int capture type. The closure record's
+    // slot encoding for non-Int captures requires:
+    //   - On the WRITE side (helper's body emit alloc): widen
+    //     to I64 via uextend (Bool I8 → I64).
+    //   - On the READ side (synth-cont's capture-load): narrow
+    //     back to the declared kind via ireduce (I64 → I8).
+    // A regression in either side would silently produce
+    // garbage in the upper bits.
+    //
+    // helper takes `flag: Bool` user param, captures it; tail
+    // `if flag then x else 0`. use-k arm `=> k(99)` →
+    // synth-cont loads flag from closure record (offset 16,
+    // narrows I64→I8), binds x=99, lowers `if flag then x
+    // else 0` with flag=true → 99.
+    //
+    // For flag=false: the test inverts (n = 0). Both paths
+    // exercise the widen/narrow symmetry.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(flag: Bool) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 if flag { x } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle helper(true) with { Raise.fail(k) => k(99) };\n  \
+                 let b: Int = handle helper(false) with { Raise.fail(k) => k(99) };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_bearing_bool");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n0\n",
+        "Bool capture's widen/narrow symmetry: helper(true) k(99) → \
+         flag=true so x=99 returned; helper(false) k(99) → flag=false \
+         so 0 returned. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cps_abi_captures_bearing_with_char_capture_exercises_widen_narrow_symmetry() {
+    // PR #26 mid-flight at 73c7e53 (no-context) review item #4:
+    // parallel coverage to the Bool capture test for the other
+    // sub-I64 width-discrepant kind. Char captures store as I32 in
+    // the closure record's slot:
+    //   - On the WRITE side (helper's body emit alloc): widen
+    //     I32 → I64 via uextend.
+    //   - On the READ side (synth-cont's capture-load): narrow
+    //     I64 → I32 via ireduce.
+    // A regression in either side would surface as wrong upper
+    // bits leaking into the Char comparison at runtime.
+    //
+    // helper takes `marker: Char` user param, captures it; tail
+    // `if marker == 'A' then x else 0`. use-k arm `=> k(99)` →
+    // synth-cont loads marker from closure record (offset 16,
+    // narrows I64→I32), binds x=99, lowers the conditional with
+    // marker='A' → 99 / marker='B' → 0.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(marker: Char) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 if marker == 'A' { x } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle helper('A') with { Raise.fail(k) => k(99) };\n  \
+                 let b: Int = handle helper('B') with { Raise.fail(k) => k(99) };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_bearing_char");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n0\n",
+        "Char capture's widen/narrow symmetry: helper('A') k(99) → \
+         marker=='A' so x=99 returned; helper('B') k(99) → marker=='B' \
+         is false so 0 returned. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn captures_bearing_synth_cont_with_two_user_params_captured() {
+    // PR #26 mid-flight at a5ee4c6 item #2 (prior-gap follow-up):
+    // multi-capture e2e — pins the closure record's slot ordering
+    // (`captures[0]` at offset 16, `captures[1]` at offset 24).
+    // Pre-this-test, only single-capture (`threshold`) was
+    // exercised.
+    //
+    // helper takes two user params (threshold, multiplier); tail
+    // references both. The synth-cont's closure record holds
+    // [threshold, multiplier] at offsets 16, 24. Synth-cont reads
+    // both at fn entry, binds both in env, lowers `(x + threshold)
+    // * multiplier`.
+    //
+    // Use-k arm `=> k(7)`: synth-cont fires, x=7, threshold=10,
+    // multiplier=3, result = (7 + 10) * 3 = 51. main: n = 51.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(threshold: Int, multiplier: Int) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 (x + threshold) * multiplier\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10, 3) with {\n    \
+                   Raise.fail(k) => k(7),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_multi_capture_use_k");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "51\n",
+        "multi-capture synth-cont: threshold=10 + multiplier=3 captured; \
+         use-k binds x=7; (7+10)*3 = 51. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn captures_bearing_synth_cont_arity_n_helper_use_k() {
+    // Companion to captures_bearing_synth_cont_arity_n_helper_
+    // discard_k — pins the use-k path.
+    //
+    // Arm `Raise.fail(k) => k(7)`:
+    //   - arm builds Call(synth_cont, [k_closure=record, 7])
+    //   - trampoline runs synth_cont(closure_ptr=record,
+    //     args_ptr=[7], args_len=1)
+    //   - synth-cont loads x=7 from args_ptr[0]
+    //   - synth-cont loads threshold=10 from
+    //     closure_ptr + 16 (capture slot 0)
+    //   - synth-cont lowers `x + threshold` = 7 + 10 = 17 via
+    //     Lowerer (env={x: 7, threshold: 10})
+    //   - synth-cont returns Done(17)
+    //   - trampoline returns 17 to wrapper
+    //   - main: n = 17
+    //
+    // This is the load-bearing test for the captures-load path
+    // — the synth-cont's `closure_ptr + 16 + 8*i` reads + the
+    // env-bind chain.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(threshold: Int) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x + threshold\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   Raise.fail(k) => k(7),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_arity_n_use_k");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "17\n",
+        "Phase 4e captures-bearing use-k path: arm calls k(7) → \
+         synth_cont reads threshold=10 from closure record + binds \
+         x=7 → x + threshold = 17. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn discard_k_handler_use_k_arm_runs_synth_cont_with_bound_value() {
+    // Companion to `discard_k_handler_does_abort_helper_across_
+    // call_boundary` — pins the use-k arm path. When the arm calls
+    // `k(value)`, the synth-cont runs with `args_ptr[0] = value`,
+    // binds `x = value` in the env, lowers `x + 100`, returns
+    // `Done(value + 100)`. Main: n = value + 100.
+    //
+    // For arm `Raise.fail(k) => k(7)`: synth-cont runs with x=7;
+    // returns Done(107). main prints "107\n".
+    //
+    // This pins the synth-cont's Lowerer-driven body emission
+    // (binding lookup + Binary lowering) — the alternative to the
+    // ConstantDone shape's hand-rolled iconst-only path.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x + 100\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => k(7),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_use_k_arm_synth_cont");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "107\n",
+        "Phase 4e use-k path: arm calls k(7) → synth-cont binds x=7 → \
+         x + 100 = 107. stderr={stderr:?}"
     );
 }
 

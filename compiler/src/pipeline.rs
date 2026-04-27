@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use crate::closure_convert;
 use crate::codegen;
 use crate::color;
-use crate::cps;
 use crate::elaborate;
 use crate::errors::{CompilerError, DiagnosticEmitter, ErrorFormat};
 use crate::lexer;
@@ -63,8 +62,7 @@ pub fn compile(input: &str, output: &str, format: ErrorFormat) -> Result<usize, 
     let anf = elaborate::elaborate(checked);
     let mono = monomorphize::monomorphize(anf);
     let colored = color::infer_colors(mono);
-    let cps_ir = cps::transform(colored);
-    let cc = closure_convert::convert(cps_ir);
+    let cc = closure_convert::convert(colored);
 
     // Emit object file to a temp location alongside the output.
     let obj_path = PathBuf::from(format!("{output}.o"));
