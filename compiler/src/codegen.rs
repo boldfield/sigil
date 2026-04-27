@@ -2973,6 +2973,43 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // (`user_fns`) and the per-fn FuncRefs are rebuilt for each
     // FunctionBuilder because `declare_func_in_func` returns a FuncRef
     // scoped to the function being defined.
+    //
+    // Plan B Task 55, Phase 4e — `prepare_per_fn_refs(...)` extraction.
+    // The `per_fn_refs_ctx` below holds the cross-fn FuncIds +
+    // side-tables that `prepare_per_fn_refs` consumes to produce
+    // the per-fn FuncRef set. Constructed once here; reused at the
+    // three call sites that need a full per-fn FuncRef set:
+    // user-fn body emit (this loop), synth-arm-fn body emit, and
+    // synth-cont definition pass for `LetBindThenTail`. Closes the
+    // FFI-ref dedup deferred-must-fix flagged in PR #26 mid-flight
+    // reviews at `33f2231`, `a5ee4c6`, and `2be70ce`. The
+    // `TODO(plan-b-task-55-phase-4e/ffi-ref-extraction)` marker
+    // added in `f7d4a64` is removed at this commit.
+    let per_fn_refs_ctx = PerFnRefsCtx {
+        string_new,
+        println,
+        panic_arith,
+        alloc,
+        int_to_string,
+        handler_frame_new,
+        handle_push,
+        handle_pop,
+        handler_frame_set_arm,
+        perform_func,
+        run_loop,
+        next_step_done,
+        next_step_call,
+        next_step_args_ptr,
+        continuation_identity,
+        handler_arm_indices: &handler_arm_indices,
+        handler_arm_synth: &handler_arm_synth,
+        user_fns: &user_fns,
+        string_literals,
+        lit_ids: &lit_ids,
+        div_zero_msg_id,
+        mod_zero_msg_id,
+    };
+
     let mut ctx = module.make_context();
     let mut fb_ctx = FunctionBuilderContext::new();
     for item in &checked.program.items {
@@ -2991,91 +3028,36 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             builder.switch_to_block(block);
             builder.seal_block(block);
 
-            // Runtime FuncRefs for this fn's definition.
-            //
-            // TODO(plan-b-task-55-phase-4e/ffi-ref-extraction):
-            // The ~50 lines of FFI ref + lit_gv + handler_arm_refs
-            // setup below are duplicated at three sites: this
-            // user-fn body emit, the synth-arm-fn body emit
-            // (search for "Per-arm-fn FFI refs"), and the
-            // synth-cont definition pass for LetBindThenTail
-            // (search for "Per-fn FFI refs"). PR #26 mid-flight
-            // reviews at 33f2231, a5ee4c6, and 2be70ce all flagged
-            // the duplication. The agent committed at 2be70ce to
-            // extracting `prepare_lowerer_refs(...)` in the next
-            // commit on this branch before any further slice
-            // expansion. This grep-able marker tracks the
-            // commitment so it can't slip if slice ordering
-            // shifts. Remove the marker when the extraction
-            // lands.
-            let string_new_ref = module.declare_func_in_func(string_new, builder.func);
-            let println_ref = module.declare_func_in_func(println, builder.func);
-            let panic_arith_ref = module.declare_func_in_func(panic_arith, builder.func);
-            let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-            let int_to_string_ref = module.declare_func_in_func(int_to_string, builder.func);
-            // Plan B Task 55 (Phase 3a) — handler-frame ABI refs.
-            let handler_frame_new_ref =
-                module.declare_func_in_func(handler_frame_new, builder.func);
-            let handle_push_ref = module.declare_func_in_func(handle_push, builder.func);
-            let handle_pop_ref = module.declare_func_in_func(handle_pop, builder.func);
-            // Plan B Task 55 (Phase 3b) — frame_set_arm + perform + run_loop.
-            let handler_frame_set_arm_ref =
-                module.declare_func_in_func(handler_frame_set_arm, builder.func);
-            let perform_ref = module.declare_func_in_func(perform_func, builder.func);
-            let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
-            // Plan B Task 55 (Phase 4d) — `sigil_continuation_identity`
-            // ref. User-fn-side perform sites pass this as the
-            // `k_fn_ptr` arg; arm-fn-side tail-k lowering uses
-            // `next_step_call` / `next_step_args_ptr` (declared at
-            // the synth-pass site in the loop below; user fns don't
-            // emit those calls themselves).
-            let continuation_identity_ref =
-                module.declare_func_in_func(continuation_identity, builder.func);
-            // Per-handle synthetic arm fn refs, keyed by handle span.
-            // Each entry maps a handle's span to the per-arm FuncRefs
-            // used for `func_addr` when populating the runtime
-            // `HandlerFrame`'s arm slot.
-            let handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>> = handler_arm_indices
-                .iter()
-                .map(|(span, idx_vec)| {
-                    let refs: Vec<FuncRef> = idx_vec
-                        .iter()
-                        .map(|&i| {
-                            module.declare_func_in_func(handler_arm_synth[i].func_id, builder.func)
-                        })
-                        .collect();
-                    (span.clone(), refs)
-                })
-                .collect();
-
-            // FuncRefs for every user fn — needed for direct calls
-            // (`Expr::Call` with `Ident` callee) and for `func_addr`
-            // when a `ClosureRecord` stores the synthetic fn's address.
-            let user_fn_refs: BTreeMap<String, FuncRef> = user_fns
-                .iter()
-                .map(|(name, uf)| {
-                    (
-                        name.clone(),
-                        module.declare_func_in_func(uf.func_id, builder.func),
-                    )
-                })
-                .collect();
-
-            // String-literal GVs + lengths keyed by source span. Closure
-            // conversion can reorder the walk relative to typecheck's
-            // source-order list, so positional cursoring is unsafe once
-            // multiple fns are compiled. Span-keyed linear-search is
-            // O(small) and robust.
-            let lit_gvs: Vec<(Span, GlobalValue, usize)> = string_literals
-                .iter()
-                .enumerate()
-                .map(|(idx, (span, s))| {
-                    let gv = module.declare_data_in_func(lit_ids[idx], builder.func);
-                    (span.clone(), gv, s.len())
-                })
-                .collect();
-            let div_zero_gv = module.declare_data_in_func(div_zero_msg_id, builder.func);
-            let mod_zero_gv = module.declare_data_in_func(mod_zero_msg_id, builder.func);
+            // Plan B Task 55, Phase 4e — per-fn FuncRefs + DataRefs +
+            // side-table reflections. See `prepare_per_fn_refs` for
+            // the layout. Some refs (`next_step_done_ref`,
+            // `next_step_call_ref`, `next_step_args_ptr_ref`) aren't
+            // used directly by the user-fn body lowering (only
+            // synth-arm-fn body emit needs them); Cranelift prunes
+            // unused FuncRefs from the emitted function so the over-
+            // declaration cost is structural-only.
+            let PerFnRefs {
+                string_new_ref,
+                println_ref,
+                panic_arith_ref,
+                alloc_ref,
+                int_to_string_ref,
+                handler_frame_new_ref,
+                handle_push_ref,
+                handle_pop_ref,
+                handler_frame_set_arm_ref,
+                perform_ref,
+                run_loop_ref,
+                next_step_done_ref: _,
+                next_step_call_ref: _,
+                next_step_args_ptr_ref: _,
+                continuation_identity_ref,
+                handler_arm_refs_per_handle,
+                user_fn_refs,
+                lit_gvs,
+                div_zero_gv,
+                mod_zero_gv,
+            } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
             // Plan B Task 55, Phase 4e — branch on the per-fn ABI
             // selected at the pre-pass.
@@ -3704,76 +3686,33 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 builder.switch_to_block(block);
                 builder.seal_block(block);
 
-                // Per-arm-fn FFI refs. Same shape as the user-fn
-                // loop above — each `module.declare_func_in_func`
-                // returns a `FuncRef` scoped to this fn's builder,
-                // so we have to redeclare per-fn (cannot reuse the
-                // user-fn loop's FuncRefs across function bodies).
-                let string_new_ref = module.declare_func_in_func(string_new, builder.func);
-                let println_ref = module.declare_func_in_func(println, builder.func);
-                let panic_arith_ref = module.declare_func_in_func(panic_arith, builder.func);
-                let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-                let int_to_string_ref = module.declare_func_in_func(int_to_string, builder.func);
-                let handler_frame_new_ref =
-                    module.declare_func_in_func(handler_frame_new, builder.func);
-                let handle_push_ref = module.declare_func_in_func(handle_push, builder.func);
-                let handle_pop_ref = module.declare_func_in_func(handle_pop, builder.func);
-                let handler_frame_set_arm_ref =
-                    module.declare_func_in_func(handler_frame_set_arm, builder.func);
-                let perform_ref = module.declare_func_in_func(perform_func, builder.func);
-                let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
-                let next_step_done_ref = module.declare_func_in_func(next_step_done, builder.func);
-                // Plan B Task 55 (Phase 4d) — tail-k lowering refs.
-                let next_step_call_ref = module.declare_func_in_func(next_step_call, builder.func);
-                let next_step_args_ptr_ref =
-                    module.declare_func_in_func(next_step_args_ptr, builder.func);
-                let continuation_identity_ref =
-                    module.declare_func_in_func(continuation_identity, builder.func);
-
-                // Per-handle synthetic arm-fn refs, keyed by handle
-                // span. Phase 4c walker rejects nested Handle inside
-                // arm bodies via the capture / lambda gates (a nested
-                // handle's body would generally need access to the
-                // outer arm's bindings to be useful), but we still
-                // build the map defensively so a simple constant-
-                // bodied nested handle doesn't accidentally crash if
-                // the walker's gates are loosened in a future phase.
-                let handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>> = handler_arm_indices
-                    .iter()
-                    .map(|(span, idx_vec)| {
-                        let refs: Vec<FuncRef> = idx_vec
-                            .iter()
-                            .map(|&i| {
-                                module.declare_func_in_func(
-                                    handler_arm_synth[i].func_id,
-                                    builder.func,
-                                )
-                            })
-                            .collect();
-                        (span.clone(), refs)
-                    })
-                    .collect();
-
-                let user_fn_refs: BTreeMap<String, FuncRef> = user_fns
-                    .iter()
-                    .map(|(name, uf)| {
-                        (
-                            name.clone(),
-                            module.declare_func_in_func(uf.func_id, builder.func),
-                        )
-                    })
-                    .collect();
-
-                let lit_gvs: Vec<(Span, GlobalValue, usize)> = string_literals
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, (span, s))| {
-                        let gv = module.declare_data_in_func(lit_ids[idx], builder.func);
-                        (span.clone(), gv, s.len())
-                    })
-                    .collect();
-                let div_zero_gv = module.declare_data_in_func(div_zero_msg_id, builder.func);
-                let mod_zero_gv = module.declare_data_in_func(mod_zero_msg_id, builder.func);
+                // Plan B Task 55, Phase 4e — per-fn FuncRefs via
+                // shared `prepare_per_fn_refs` helper. The synth-
+                // arm-fn body emit uses ALL refs (including the
+                // tail-`k` lowering refs `next_step_call_ref` and
+                // `next_step_args_ptr_ref`).
+                let PerFnRefs {
+                    string_new_ref,
+                    println_ref,
+                    panic_arith_ref,
+                    alloc_ref,
+                    int_to_string_ref,
+                    handler_frame_new_ref,
+                    handle_push_ref,
+                    handle_pop_ref,
+                    handler_frame_set_arm_ref,
+                    perform_ref,
+                    run_loop_ref,
+                    next_step_done_ref,
+                    next_step_call_ref,
+                    next_step_args_ptr_ref,
+                    continuation_identity_ref,
+                    handler_arm_refs_per_handle,
+                    user_fn_refs,
+                    lit_gvs,
+                    div_zero_gv,
+                    mod_zero_gv,
+                } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 // Block params: 0 = closure_ptr (null in Phase 4c),
                 // 1 = args_ptr, 2 = args_len (unused — walker
@@ -4118,66 +4057,34 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             env.insert(capture.name.clone(), val);
                         }
 
-                        // Per-fn FFI refs — same shape as the user-
-                        // fn body emit + synth-arm-fn body emit.
-                        let string_new_ref = module.declare_func_in_func(string_new, builder.func);
-                        let println_ref = module.declare_func_in_func(println, builder.func);
-                        let panic_arith_ref =
-                            module.declare_func_in_func(panic_arith, builder.func);
-                        let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-                        let int_to_string_ref =
-                            module.declare_func_in_func(int_to_string, builder.func);
-                        let handler_frame_new_ref =
-                            module.declare_func_in_func(handler_frame_new, builder.func);
-                        let handle_push_ref =
-                            module.declare_func_in_func(handle_push, builder.func);
-                        let handle_pop_ref = module.declare_func_in_func(handle_pop, builder.func);
-                        let handler_frame_set_arm_ref =
-                            module.declare_func_in_func(handler_frame_set_arm, builder.func);
-                        let perform_ref = module.declare_func_in_func(perform_func, builder.func);
-                        let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
-                        let continuation_identity_ref =
-                            module.declare_func_in_func(continuation_identity, builder.func);
-
-                        let handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>> =
-                            handler_arm_indices
-                                .iter()
-                                .map(|(span, idx_vec)| {
-                                    let refs: Vec<FuncRef> = idx_vec
-                                        .iter()
-                                        .map(|&i| {
-                                            module.declare_func_in_func(
-                                                handler_arm_synth[i].func_id,
-                                                builder.func,
-                                            )
-                                        })
-                                        .collect();
-                                    (span.clone(), refs)
-                                })
-                                .collect();
-
-                        let user_fn_refs: BTreeMap<String, FuncRef> = user_fns
-                            .iter()
-                            .map(|(name, uf)| {
-                                (
-                                    name.clone(),
-                                    module.declare_func_in_func(uf.func_id, builder.func),
-                                )
-                            })
-                            .collect();
-
-                        let lit_gvs: Vec<(Span, GlobalValue, usize)> = string_literals
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, (span, s))| {
-                                let gv = module.declare_data_in_func(lit_ids[idx], builder.func);
-                                (span.clone(), gv, s.len())
-                            })
-                            .collect();
-                        let div_zero_gv =
-                            module.declare_data_in_func(div_zero_msg_id, builder.func);
-                        let mod_zero_gv =
-                            module.declare_data_in_func(mod_zero_msg_id, builder.func);
+                        // Plan B Task 55, Phase 4e — per-fn FuncRefs
+                        // via shared `prepare_per_fn_refs` helper.
+                        // The synth-cont (LetBindThenTail) body
+                        // doesn't use the tail-`k` lowering refs
+                        // (those are arm-fn-only); Cranelift prunes
+                        // unused FuncRefs.
+                        let PerFnRefs {
+                            string_new_ref,
+                            println_ref,
+                            panic_arith_ref,
+                            alloc_ref,
+                            int_to_string_ref,
+                            handler_frame_new_ref,
+                            handle_push_ref,
+                            handle_pop_ref,
+                            handler_frame_set_arm_ref,
+                            perform_ref,
+                            run_loop_ref,
+                            next_step_done_ref: _,
+                            next_step_call_ref: _,
+                            next_step_args_ptr_ref: _,
+                            continuation_identity_ref,
+                            handler_arm_refs_per_handle,
+                            user_fn_refs,
+                            lit_gvs,
+                            div_zero_gv,
+                            mod_zero_gv,
+                        } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                         let closure_ptr = block_params[0];
                         let mut lowerer = Lowerer {
@@ -6343,6 +6250,188 @@ fn k_closure_offset(user_arg_count: usize) -> i32 {
 /// [`k_closure_offset`].
 fn k_fn_offset(user_arg_count: usize) -> i32 {
     k_closure_offset(user_arg_count) + 8
+}
+
+/// Plan B Task 55, Phase 4e — input context for [`prepare_per_fn_refs`].
+///
+/// Holds the cross-fn FuncIds (declared once at `emit_object`'s top)
+/// and the side-tables that drive per-fn FuncRef + DataRef
+/// construction. Used at the three sites that need a full per-fn
+/// FuncRef set: the user-fn body emit loop, the synth-arm-fn body
+/// emit loop, and the synth-cont definition pass for
+/// [`CpsContinuationKind::LetBindThenTail`]. Borrows are `'a`-bound
+/// to the `emit_object` stack frame; the context is constructed
+/// once and re-used for each fn.
+///
+/// Closes the FFI-ref dedup deferred-must-fix flagged in PR #26
+/// mid-flight reviews at `33f2231`, `a5ee4c6`, and `2be70ce`. The
+/// `TODO(plan-b-task-55-phase-4e/ffi-ref-extraction)` marker at
+/// the user-fn body emit site (added in `f7d4a64`) is removed at
+/// the same commit as this helper lands.
+struct PerFnRefsCtx<'a> {
+    string_new: cranelift_module::FuncId,
+    println: cranelift_module::FuncId,
+    panic_arith: cranelift_module::FuncId,
+    alloc: cranelift_module::FuncId,
+    int_to_string: cranelift_module::FuncId,
+    handler_frame_new: cranelift_module::FuncId,
+    handle_push: cranelift_module::FuncId,
+    handle_pop: cranelift_module::FuncId,
+    handler_frame_set_arm: cranelift_module::FuncId,
+    perform_func: cranelift_module::FuncId,
+    run_loop: cranelift_module::FuncId,
+    next_step_done: cranelift_module::FuncId,
+    next_step_call: cranelift_module::FuncId,
+    next_step_args_ptr: cranelift_module::FuncId,
+    continuation_identity: cranelift_module::FuncId,
+    handler_arm_indices: &'a BTreeMap<Span, Vec<usize>>,
+    handler_arm_synth: &'a [HandlerArmSynth],
+    user_fns: &'a BTreeMap<String, UserFnEntry>,
+    string_literals: &'a [(Span, String)],
+    lit_ids: &'a [cranelift_module::DataId],
+    div_zero_msg_id: cranelift_module::DataId,
+    mod_zero_msg_id: cranelift_module::DataId,
+}
+
+/// Plan B Task 55, Phase 4e — per-fn FuncRefs / DataRefs / side-table
+/// reflections produced by [`prepare_per_fn_refs`].
+///
+/// All fields are `module.declare_func_in_func` / `declare_data_in_func`
+/// outputs scoped to the fn currently being built. Cranelift's
+/// FuncRefs are per-Function; reusing across fn bodies is unsafe,
+/// so each fn body emit calls [`prepare_per_fn_refs`] fresh.
+///
+/// Some fields are unused at certain call sites (e.g.,
+/// `next_step_call_ref` and `next_step_args_ptr_ref` are only used
+/// at the synth-arm-fn body emit's tail-`k` lowering path).
+/// Cranelift prunes unused FuncRefs from the emitted function, so
+/// the over-declaration cost is structural-only.
+struct PerFnRefs {
+    string_new_ref: FuncRef,
+    println_ref: FuncRef,
+    panic_arith_ref: FuncRef,
+    alloc_ref: FuncRef,
+    int_to_string_ref: FuncRef,
+    handler_frame_new_ref: FuncRef,
+    handle_push_ref: FuncRef,
+    handle_pop_ref: FuncRef,
+    handler_frame_set_arm_ref: FuncRef,
+    perform_ref: FuncRef,
+    run_loop_ref: FuncRef,
+    next_step_done_ref: FuncRef,
+    next_step_call_ref: FuncRef,
+    next_step_args_ptr_ref: FuncRef,
+    continuation_identity_ref: FuncRef,
+    handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>>,
+    user_fn_refs: BTreeMap<String, FuncRef>,
+    lit_gvs: Vec<(Span, GlobalValue, usize)>,
+    div_zero_gv: GlobalValue,
+    mod_zero_gv: GlobalValue,
+}
+
+/// Plan B Task 55, Phase 4e — declare per-fn FuncRefs + DataRefs +
+/// side-table reflections needed to lower a fn body.
+///
+/// Replaces ~70 LOC of duplicated FFI-ref + lit_gv + handler_arm_refs +
+/// user_fn_refs setup at three sites in `emit_object`. The three sites
+/// have slightly different needs — the user-fn site doesn't use the
+/// `next_step_done_ref` / `next_step_call_ref` / `next_step_args_ptr_ref`
+/// trio, and the synth-cont site doesn't use the tail-`k` refs — but
+/// over-declaring here is cheap because Cranelift prunes unused FuncRefs
+/// from the emitted function.
+fn prepare_per_fn_refs(
+    module: &mut ObjectModule,
+    builder: &mut FunctionBuilder<'_>,
+    ctx: &PerFnRefsCtx<'_>,
+) -> PerFnRefs {
+    let string_new_ref = module.declare_func_in_func(ctx.string_new, builder.func);
+    let println_ref = module.declare_func_in_func(ctx.println, builder.func);
+    let panic_arith_ref = module.declare_func_in_func(ctx.panic_arith, builder.func);
+    let alloc_ref = module.declare_func_in_func(ctx.alloc, builder.func);
+    let int_to_string_ref = module.declare_func_in_func(ctx.int_to_string, builder.func);
+    let handler_frame_new_ref = module.declare_func_in_func(ctx.handler_frame_new, builder.func);
+    let handle_push_ref = module.declare_func_in_func(ctx.handle_push, builder.func);
+    let handle_pop_ref = module.declare_func_in_func(ctx.handle_pop, builder.func);
+    let handler_frame_set_arm_ref =
+        module.declare_func_in_func(ctx.handler_frame_set_arm, builder.func);
+    let perform_ref = module.declare_func_in_func(ctx.perform_func, builder.func);
+    let run_loop_ref = module.declare_func_in_func(ctx.run_loop, builder.func);
+    let next_step_done_ref = module.declare_func_in_func(ctx.next_step_done, builder.func);
+    let next_step_call_ref = module.declare_func_in_func(ctx.next_step_call, builder.func);
+    let next_step_args_ptr_ref = module.declare_func_in_func(ctx.next_step_args_ptr, builder.func);
+    let continuation_identity_ref =
+        module.declare_func_in_func(ctx.continuation_identity, builder.func);
+
+    // Per-handle synth-arm-fn FuncRefs, keyed by handle span. Built
+    // from the `handler_arm_indices` side-table (one entry per
+    // handle expression in the program; each entry's Vec maps to
+    // the arms in source declaration order).
+    let handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>> = ctx
+        .handler_arm_indices
+        .iter()
+        .map(|(span, idx_vec)| {
+            let refs: Vec<FuncRef> = idx_vec
+                .iter()
+                .map(|&i| {
+                    module.declare_func_in_func(ctx.handler_arm_synth[i].func_id, builder.func)
+                })
+                .collect();
+            (span.clone(), refs)
+        })
+        .collect();
+
+    // Per-user-fn FuncRefs, keyed by fn name. Used for direct calls
+    // and for `func_addr` when a `ClosureRecord` stores a synthetic
+    // fn's address.
+    let user_fn_refs: BTreeMap<String, FuncRef> = ctx
+        .user_fns
+        .iter()
+        .map(|(name, uf)| {
+            (
+                name.clone(),
+                module.declare_func_in_func(uf.func_id, builder.func),
+            )
+        })
+        .collect();
+
+    // String-literal GVs + lengths keyed by source span. Closure
+    // conversion can reorder the walk relative to typecheck's
+    // source-order list; span-keyed linear-search is O(small) and
+    // robust.
+    let lit_gvs: Vec<(Span, GlobalValue, usize)> = ctx
+        .string_literals
+        .iter()
+        .enumerate()
+        .map(|(idx, (span, s))| {
+            let gv = module.declare_data_in_func(ctx.lit_ids[idx], builder.func);
+            (span.clone(), gv, s.len())
+        })
+        .collect();
+    let div_zero_gv = module.declare_data_in_func(ctx.div_zero_msg_id, builder.func);
+    let mod_zero_gv = module.declare_data_in_func(ctx.mod_zero_msg_id, builder.func);
+
+    PerFnRefs {
+        string_new_ref,
+        println_ref,
+        panic_arith_ref,
+        alloc_ref,
+        int_to_string_ref,
+        handler_frame_new_ref,
+        handle_push_ref,
+        handle_pop_ref,
+        handler_frame_set_arm_ref,
+        perform_ref,
+        run_loop_ref,
+        next_step_done_ref,
+        next_step_call_ref,
+        next_step_args_ptr_ref,
+        continuation_identity_ref,
+        handler_arm_refs_per_handle,
+        user_fn_refs,
+        lit_gvs,
+        div_zero_gv,
+        mod_zero_gv,
+    }
 }
 
 /// Plan B Task 55, Phase 4e — does this fn body match the **simple
