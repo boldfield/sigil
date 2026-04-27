@@ -1000,14 +1000,18 @@ fn arm_body_walk(
         }
         Expr::Ident(name, _) => {
             if name == k_name {
-                // `k` as a value (not in callee position). Multi-shot
-                // / higher-order continuation manipulation requires
-                // Phase 4e (heap-allocated re-invokable continuation).
+                // `k` as a value (not in callee position). Phase 4e
+                // captures+ shipped multi-shot `k` invocation via
+                // Slice C's chained post-arm-k synth fns (bool-Choose
+                // arms with two `k(arg)` calls), but `k`-as-a-value
+                // (passing `k` to another fn, storing it in a record,
+                // etc.) remains out-of-scope: that surface needs
+                // first-class continuations, which is a v2 feature.
                 return Some(format!(
                     "references continuation `{name}` as a value (not as the \
-                     callee of a tail-position call) — Phase 4d MVP supports \
-                     `{name}(arg)` in tail position only; multi-shot or \
-                     higher-order use of `k` arrives in Phase 4e"
+                     callee of a call) — Sigil v1 supports invoking `{name}` \
+                     as a callee but not passing it as a first-class value; \
+                     first-class continuations are deferred to v2"
                 ));
             }
             if globals.contains(name) {
@@ -1082,15 +1086,17 @@ fn arm_body_walk(
                 if callee_name == k_name {
                     if !tail {
                         return Some(format!(
-                            "uses continuation `{k_name}` in non-tail position — \
-                             Phase 4d MVP supports `{k_name}(arg)` only as the \
-                             tail expression of an arm body (the synchronous \
-                             `sigil_run_loop` shape produces algebraic-correct \
-                             results when k is invoked in tail position with \
-                             k_fn = sigil_continuation_identity); arm bodies \
-                             that compute around a continuation invocation \
-                             require the colorer's handler-discharge refinement \
-                             that ships in Phase 4e"
+                            "uses continuation `{k_name}` in non-tail position \
+                             outside the supported shapes. Sigil v1 supports \
+                             non-tail `{k_name}(arg)` in two specific arm-body \
+                             shapes: (a) `{{ let r: Ty = {k_name}(arg); pure_tail }}` \
+                             (single-let lambda-lift); (b) `{{ let r1: T1 = \
+                             {k_name}(arg1); let r2: T2 = {k_name}(arg2); pure_tail }}` \
+                             for `resumes: many` effects (multi-shot). Other \
+                             non-tail `{k_name}` shapes (3+ invocations, \
+                             Binary-of-`{k_name}`-calls, computed conditional \
+                             {k_name}-use) require future captures-bearing \
+                             extensions and are not yet supported"
                         ));
                     }
                     if args.len() != 1 {
@@ -2571,10 +2577,14 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
             }
         }
         Expr::ClosureEnvLoad { name, .. } => Some(format!(
-            "Slice B: post-`k` tail of arm body reads `{name}` via a \
-             surrounding-lambda closure record (closure_convert rewrote it into a \
-             ClosureEnvLoad) — closure-of-surrounding-lambda captures into the \
-             post-arm-k synth fn arrive in Slice D"
+            "post-`k` tail of arm body reads `{name}` via a surrounding-lambda \
+             closure record (closure_convert rewrote it into a ClosureEnvLoad). \
+             Phase 4e captures+ Slice D shipped surrounding-lambda captures \
+             for ARM BODIES (e.g., a lambda-wrapped handle whose arm body \
+             references outer-scope `x`); the analogous support for the \
+             post-arm-k synth fn body's tail is deferred to a future captures-\
+             bearing extension that mirrors Slice D's pattern at the post-arm-k \
+             closure record's allocation site"
         )),
         Expr::Binary { lhs, rhs, .. } => arm_body_post_arm_k_tail_free_vars_ok(
             lhs,

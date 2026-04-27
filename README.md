@@ -228,37 +228,29 @@ Stage 9 spec validation.
 
 | Gap | Behavior today | Closure point |
 |-----|----------------|---------------|
-| Discard-continuation handlers across function-call boundaries | **Closed at PR #26** — the colorer-driven dispatch now reclassifies helper fns whose performs reach a discharging handler as CPS-color, so their performs return `NextStep::Call` to the enclosing trampoline rather than synchronously blocking on `sigil_run_loop`. | Phase 4e (PR #26) |
-| Non-tail continuation use (`k(x) + 1`, `let r = k(x); …`) | Codegen-time rejection | Phase 4e captures+ (follow-up PR) |
-| Multi-shot continuations (`effect E resumes: many`) | Parses + typechecks; runtime UB if `k` invoked >1 times | Phase 4e captures+ |
+| Discard-continuation handlers across function-call boundaries | **Closed at PR #26** — the colorer-driven dispatch reclassifies helper fns whose performs reach a discharging handler as CPS-color; their performs return `NextStep::Call` to the enclosing trampoline rather than synchronously blocking on `sigil_run_loop`. | Phase 4e (PR #26) |
+| Non-tail continuation use (`let r = k(x); pure_tail`) | **Closed at PR #27 Slice B** for the let-then-pure-tail shape; the arm body's post-`k` rest is lambda-lifted into a synthetic post-arm-k fn dispatched via the trailing-pair convention. Other non-tail `k` shapes (3+ invocations, Binary-of-`k`-calls, computed conditional `k`-use) require future captures-bearing extensions and remain rejected. | Phase 4e captures+ (PR #27) |
+| Multi-shot continuations (`effect E resumes: many`) | **Closed at PR #27 Slice C** for the explicit two-let arm body shape `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }`. The k_closure (helper synth-cont's TAG_CLOSURE record) is heap-reified and the trampoline dispatches into it twice with different args. N-let chains (3+ invocations) and Binary-of-`k`-calls remain in future captures-bearing extension territory. | Phase 4e captures+ (PR #27) |
+| Captures from a surrounding lambda's closure record | **Closed at PR #27 Slice D** — when an `Expr::Handle` lives inside a `Lambda`, closure_convert rewrites outer-scope references inside the arm body to `Expr::ClosureEnvLoad`; codegen sources the captured value via `lower_closure_env_load` against the lifted lambda's closure_ptr at handle codegen time. The post-arm-k synth fn body (Slice B/C path) does NOT yet support these captures — that surface is deferred to a future captures-bearing extension that mirrors Slice D's pattern at the post-arm-k closure-record allocation site. | Phase 4e captures+ Slice D (PR #27) for arm bodies; future extension for post-arm-k synth fns |
 | Multi-effect handlers (arms targeting different effects) | Codegen-time rejection | Phase 4f |
 | Return arms (`handle … with { return(v) => …, … }`) | Codegen-time rejection | Phase 4g |
-| Captures from a surrounding lambda's closure record | Codegen-time rejection | Phase 4e captures+ |
-| Stage 9 spec validation | Cannot run — was gated on Phase 4e's full closure; now gated on Phase 4e captures+ (multi-shot `k` is a P20 prerequisite) | Phase 4e captures+ |
+| Stage 9 spec validation | **Unblocks when PR #27 squash-merges.** Phase 4e's algebraic-semantics gates all close at this PR; the prompt-bank's effects entries (P6 Raise parser; future P19 State counter and P20 multi-shot Choose) become measurable. | Phase 4e captures+ (PR #27) |
 
-**Phase 4e cadence pivot.** The original Phase 4e deviation entry
-committed to a single-PR comprehensive scope covering all four
-remaining lifts (discard-`k` correctness, non-tail `k`, multi-shot
-`k`, surrounding-lambda captures). PR #26 (`plan-b-task-55-phase-4e`)
-ships the architectural foundation (CPS-color user-fn calling
-convention, native↔CPS interop wrappers, codegen-consumes-color, the
-colorer regression-pinning) plus the helper-side lambda-lifting first
-slices (constant-tail synth-cont, captures-free / captures-bearing
-let-bind-then-tail synth-conts), closing hard condition #2 (both
-discard-`k` test inversions). The remaining three lifts — non-tail
-`k` use in arm bodies, multi-shot `k`, surrounding-lambda captures —
-split off into a `plan-b-task-55-phase-4e-captures` follow-up PR
-(branched against `main` after PR #26 lands). See the
-[Phase 4e cadence-pivot addendum in `PLAN_B_DEVIATIONS.md`](PLAN_B_DEVIATIONS.md)
-for full reasoning.
-
-The cadence pivot is the same shape as Phase 4b's per-phase-PR
-pivot from the foundation entry: a single-PR commitment was reached
-mid-implementation, and split for reviewability without changing
-the underlying architecture. The lambda-lifting + trailing-pair
-convention that sections 5 and 6 of the Phase 4e deviation entry
-commit to remains the standing architecture; the captures+ PR
-implements it as written.
+**Phase 4e cadence pivot — closed.** The original Phase 4e
+deviation entry committed to a single-PR comprehensive scope
+covering all four remaining lifts (discard-`k` correctness, non-
+tail `k`, multi-shot `k`, surrounding-lambda captures). PR #26
+(`plan-b-task-55-phase-4e`) shipped the architectural foundation
+plus the helper-side lambda-lifting first slices, closing hard
+condition #2 (both discard-`k` test inversions). PR #27
+(`plan-b-task-55-phase-4e-captures`) shipped the residual three
+lifts as four slices (Slice A foundation refactor; Slice B
+non-tail `k`; Slice C multi-shot `k`; Slice D surrounding-lambda
+captures) plus a closeout commit. Both PRs preserved the
+lambda-lifting + trailing-pair architecture from sections 5 and
+6 of the comprehensive deviation entry; see the
+[cadence-pivot addendum and the captures+ entry in `PLAN_B_DEVIATIONS.md`](PLAN_B_DEVIATIONS.md)
+for the full record.
 
 This list is a living section: each entry tracks an in-flight gap that
 will close in a specific tracked phase, and is updated alongside the
