@@ -4799,6 +4799,70 @@ fn cps_signature(pointer_ty: Type, module: &ObjectModule) -> Signature {
     sig
 }
 
+/// Plan B Task 55, Phase 4e — does this fn body match the **simple
+/// tail perform** shape that the first slice of CPS body lowering
+/// supports?
+///
+/// A body is "simple tail perform" iff its statement list is empty
+/// AND its tail is a non-IO [`crate::ast::Expr::Perform`]. This is
+/// the strictest CPS-color body shape: lowering emits a single
+/// `sigil_perform(effect_id, op_id, args_ptr, args_len,
+/// k_closure_loaded, k_fn_loaded)` and returns the resulting
+/// `*mut NextStep` directly. No continuation closures, no lambda-
+/// lifting, no synthetic post-yield fn IDs needed — the
+/// caller-supplied `(k_closure, k_fn)` pair (loaded from the fn's
+/// `args_ptr` slots) becomes the continuation for the perform site.
+///
+/// **Why this carve-out exists.** The full Phase 4e roadmap needs
+/// lambda-lifting machinery (closure-convert side-table extension
+/// for synthetic continuation closures) to handle bodies with
+/// stmts before the tail or with non-tail yield points. That
+/// machinery is its own commit. This classifier identifies the
+/// strictest body subset that does NOT need lambda-lifting, so the
+/// first codegen-consumes-color slice can land a working CPS-ABI
+/// path end-to-end without dragging in the larger machinery. Future
+/// Phase 4e commits relax this classifier to cover:
+///
+/// 1. Pure stmts (let-bindings of pure expressions) followed by a
+///    tail perform — still no lambda-lifting because the bindings
+///    flow into the perform's args without crossing a yield.
+/// 2. Conditional / match in tail position whose every branch is
+///    itself a simple-tail-perform body.
+/// 3. Arbitrary CPS-color bodies via the synthetic-continuation
+///    closure pre-pass.
+///
+/// The classifier returns `false` for any body that has stmts, for
+/// IO performs (which use the synchronous `lower_perform` path
+/// regardless of color), and for non-perform tail expressions
+/// (which need the lambda-lifting pipeline). It is conservative —
+/// false negatives are acceptable (force the body through the
+/// existing native-ABI path), false positives are not (would cause
+/// codegen to emit incomplete CPS-form output).
+///
+/// Used by the codegen-consumes-color commit's user-fn pre-pass to
+/// decide whether to declare the fn with the [`cps_signature`] CPS
+/// ABI or with the existing native ABI. Pure analysis at HEAD; no
+/// codegen change yet — the call site lands in a follow-up commit
+/// alongside the matching CPS body lowering path.
+//
+// The `#[allow(dead_code)]` is intentional and transitional: this
+// classifier is wired into codegen in the next commit on this branch
+// (the user-fn pre-pass ABI selection commit). Splitting the
+// classifier into its own commit lands the analysis surface with
+// dedicated unit-test coverage before the consumer commit's larger
+// diff bundles classifier + ABI selection + body lowering together.
+// When the next commit lands, the `#[allow(dead_code)]` is removed.
+#[allow(dead_code)]
+fn is_simple_tail_perform_body(body: &crate::ast::Block) -> bool {
+    if !body.stmts.is_empty() {
+        return false;
+    }
+    match &body.tail {
+        Some(crate::ast::Expr::Perform(p)) => p.effect != "IO",
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -5040,5 +5104,130 @@ mod tests {
             !contains_apply_or_generic_ref(&prog),
             "walker must accept program with effect decl + concrete main"
         );
+    }
+
+    // ---------------- Plan B Task 55, Phase 4e — body-shape classifier
+    //
+    // Pins `is_simple_tail_perform_body` for the body shapes the
+    // first slice of CPS body lowering supports vs. rejects. The
+    // classifier identifies bodies that don't need lambda-lifting:
+    // empty stmts + tail = non-IO `Expr::Perform`. Pure analysis at
+    // HEAD; the next commit consumes it for ABI selection.
+
+    #[test]
+    fn simple_tail_perform_body_recognised() {
+        use crate::ast::{Block, Expr, PerformExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            })),
+            span,
+        };
+        assert!(is_simple_tail_perform_body(&body));
+    }
+
+    #[test]
+    fn simple_tail_perform_with_args_recognised() {
+        // The classifier doesn't inspect args — they may be arbitrary
+        // pure expressions that get lowered alongside the perform's
+        // own lowering. What matters is that the tail is the
+        // `Expr::Perform` and there are no preceding stmts.
+        use crate::ast::{Block, Expr, PerformExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: vec![Expr::IntLit(42, span.clone())],
+                span: span.clone(),
+            })),
+            span,
+        };
+        assert!(is_simple_tail_perform_body(&body));
+    }
+
+    #[test]
+    fn io_perform_in_tail_is_not_simple_tail_perform() {
+        // IO performs use the synchronous `lower_perform` path
+        // regardless of color (special-cased; doesn't route through
+        // `sigil_perform`). The classifier returns false so codegen
+        // doesn't try to declare an IO-only fn with the CPS ABI.
+        use crate::ast::{Block, Expr, PerformExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::Perform(PerformExpr {
+                effect: "IO".to_string(),
+                op: "println".to_string(),
+                args: vec![Expr::StringLit("hi".to_string(), span.clone())],
+                span: span.clone(),
+            })),
+            span,
+        };
+        assert!(!is_simple_tail_perform_body(&body));
+    }
+
+    #[test]
+    fn body_with_stmt_before_tail_perform_is_not_simple() {
+        // `{ let x: Int = 1; perform Raise.fail() }` — the let stmt
+        // is pure but the classifier rejects it because lowering it
+        // requires binding `x` in the env before the perform.
+        // Subsequent commits widen to cover this shape (it doesn't
+        // need lambda-lifting, just stmt prologue lowering); the
+        // first slice keeps the strictest definition.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::IntLit(1, span.clone()),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            })),
+            span,
+        };
+        assert!(!is_simple_tail_perform_body(&body));
+    }
+
+    #[test]
+    fn pure_tail_value_is_not_simple_tail_perform() {
+        use crate::ast::{Block, Expr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::IntLit(42, span.clone())),
+            span,
+        };
+        assert!(!is_simple_tail_perform_body(&body));
+    }
+
+    #[test]
+    fn empty_body_is_not_simple_tail_perform() {
+        use crate::ast::Block;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: Vec::new(),
+            tail: None,
+            span,
+        };
+        assert!(!is_simple_tail_perform_body(&body));
     }
 }
