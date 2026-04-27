@@ -591,22 +591,30 @@ pub unsafe extern "C" fn sigil_continuation_identity(
     args_ptr: *const u64,
     args_len: u32,
 ) -> *mut NextStep {
-    // Plan B Task 55, Phase 4e captures+ Slice A — identity tolerates
-    // `args_len >= 1`. Tail-`k` arm-fn emissions now uniformly pack
-    // `[arg, post_arm_k_closure, post_arm_k_fn]` at args_len=3 (the
-    // trailing-pair convention). When the arm dispatches into a
-    // helper synth-cont k_fn, the synth-cont reads the post-arm-k
-    // pair from args_ptr[1..3] and forwards its result to it; when
-    // the arm dispatches into identity directly (perform in tail
-    // position of handle body, no helper synth-cont), the trailing
-    // pair is irrelevant — identity reads only args_ptr[0] and
-    // returns terminal Done.
+    // Plan B Task 55, Phase 4e captures+ Slice A — identity has
+    // exactly two legitimate calling sources, both pinned by unit
+    // tests in this module:
+    //   - `args_len == 1`: synth-cont's terminal `Call(post_arm_k_*,
+    //     [result])` dispatch lands here when post_arm_k_fn is
+    //     identity (`continuation_identity_returns_done_with_args_ptr_value`
+    //     and `continuation_identity_round_trips_through_run_loop`).
+    //   - `args_len == 3`: arm-fn tail-`k` direct emit lands here
+    //     when the arm calls `k(arg)` and there's no helper synth-
+    //     cont in scope (perform in tail position of the handle body)
+    //     — the trailing pair `[null, &identity]` is irrelevant since
+    //     identity is the terminal continuation
+    //     (`continuation_identity_tolerates_args_len_3_trailing_pair_convention`).
+    // No other args_len is reachable from current codegen. Asserting
+    // exactly `{1, 3}` keeps a future codegen bug producing an
+    // unexpected args_len shape catchable here instead of silently
+    // absorbed by a permissive `>= 1` pass-through.
     debug_assert!(
-        args_len >= 1,
-        "sigil_continuation_identity: args_len must be >= 1 (codegen \
-         emits arg_count=1 from synth-cont's `Call(post_arm_k_*, [result])` \
-         dispatch and arg_count=3 from arm-fn tail-`k` direct emit per \
-         the Phase 4e captures+ Slice A trailing-pair convention)"
+        args_len == 1 || args_len == 3,
+        "sigil_continuation_identity: args_len must be exactly 1 \
+         (synth-cont's terminal `Call(post_arm_k_*, [result])` dispatch) \
+         or 3 (arm-fn tail-`k` direct emit per the Phase 4e captures+ \
+         Slice A trailing-pair convention `[arg, post_arm_k_closure, \
+         post_arm_k_fn]`); got {args_len}"
     );
     debug_assert!(
         !args_ptr.is_null(),

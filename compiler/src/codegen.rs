@@ -3818,125 +3818,130 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // the tail position recognised by
                 // `arm_body_tail_is_k_call`; non-tail `k` use is
                 // rejected with a Phase-4e-pointing diagnostic.
-                let next_step_ptr = if let Some(arg_expr) =
-                    arm_body_tail_is_k_call(&synth.body, &synth.k_name)
-                {
-                    // --- Tail-`k(arg)` path ---
-                    //
-                    // Plan B Task 55, Phase 4e captures+ Slice A —
-                    // trailing-pair convention. The arm fn's
-                    // `Call(k_closure, k_fn, ...)` now packs THREE
-                    // slots: [arg, post_arm_k_closure, post_arm_k_fn].
-                    // For tail-`k` arms (no post-`k` arm-body
-                    // computation), `post_arm_k_closure` is null and
-                    // `post_arm_k_fn` is the address of
-                    // `sigil_continuation_identity`. The helper synth-
-                    // cont (k_fn) reads the trailing pair from
-                    // args_ptr[1..3] and dispatches its result to
-                    // identity, which returns `Done(result)` — same
-                    // observable behaviour as the prior `Done`-shaped
-                    // synth-cont path, with one extra trampoline hop.
-                    //
-                    // Slice B (non-tail `k`) replaces this null/identity
-                    // pair with the lambda-lifted post-arm-k synth fn
-                    // when the arm body has post-`k` computation.
-                    //
-                    // Bisecting hint (per `[DEVIATION Task 55] Phase 4e
-                    // captures+`): a regression that produces wrong
-                    // values from any PR #26 captures-bearing test
-                    // here means the trailing-pair convention is
-                    // wrong — verify args_ptr[0..3] stores match the
-                    // synth-cont's reads at offsets 0/8/16 and that
-                    // identity's arity-1 invariant is still preserved
-                    // (identity sees [result] of args_len=1, NOT the
-                    // arm fn's args_len=3).
-                    lowerer.lower_arm_body_pre_tail_k_stmts(&synth.body);
-                    let arg_value = lowerer.lower_expr(arg_expr);
-                    let arg_ty = lowerer.builder.func.dfg.value_type(arg_value);
-                    let widened_arg = if arg_ty == types::I64 {
-                        arg_value
-                    } else if arg_ty.is_int() && arg_ty.bits() < 64 {
-                        lowerer.builder.ins().uextend(types::I64, arg_value)
-                    } else {
-                        assert_eq!(
-                            arg_ty, pointer_ty,
-                            "codegen Phase 4d: unexpected k-arg Cranelift type \
+                let next_step_ptr =
+                    if let Some(arg_expr) = arm_body_tail_is_k_call(&synth.body, &synth.k_name) {
+                        // --- Tail-`k(arg)` path ---
+                        //
+                        // Plan B Task 55, Phase 4e captures+ Slice A —
+                        // trailing-pair convention. The arm fn's
+                        // `Call(k_closure, k_fn, ...)` now packs THREE
+                        // slots: [arg, post_arm_k_closure, post_arm_k_fn].
+                        // For tail-`k` arms (no post-`k` arm-body
+                        // computation), `post_arm_k_closure` is null and
+                        // `post_arm_k_fn` is the address of
+                        // `sigil_continuation_identity`. The helper synth-
+                        // cont (k_fn) reads the trailing pair from
+                        // args_ptr[1..3] and dispatches its result to
+                        // identity, which returns `Done(result)` — same
+                        // observable behaviour as the prior `Done`-shaped
+                        // synth-cont path, with one extra trampoline hop.
+                        //
+                        // Slice B (non-tail `k`) replaces this null/identity
+                        // pair with the lambda-lifted post-arm-k synth fn
+                        // when the arm body has post-`k` computation.
+                        //
+                        // Bisecting hint (per `[DEVIATION Task 55] Phase 4e
+                        // captures+`): a regression that produces wrong
+                        // values from any PR #26 captures-bearing test
+                        // here means the trailing-pair convention is
+                        // wrong — verify args_ptr[0..3] stores match the
+                        // synth-cont's reads at offsets 0/8/16 and that
+                        // identity's arity-1 invariant is still preserved
+                        // (identity sees [result] of args_len=1, NOT the
+                        // arm fn's args_len=3).
+                        lowerer.lower_arm_body_pre_tail_k_stmts(&synth.body);
+                        let arg_value = lowerer.lower_expr(arg_expr);
+                        let arg_ty = lowerer.builder.func.dfg.value_type(arg_value);
+                        let widened_arg = if arg_ty == types::I64 {
+                            arg_value
+                        } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                            lowerer.builder.ins().uextend(types::I64, arg_value)
+                        } else {
+                            assert_eq!(
+                                arg_ty, pointer_ty,
+                                "codegen Phase 4d: unexpected k-arg Cranelift type \
                              {arg_ty:?} for sigil_next_step_call slot widen — \
                              Phase 4d MVP supports I64 (Int), I32 (Char), I8 \
                              (Bool/Byte/Unit), and pointer_ty (String / \
                              user-type pointers); floats and 32-bit-target \
                              pointer types need a dedicated branch"
+                            );
+                            arg_value
+                        };
+                        let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                        let call_ns = lowerer
+                            .builder
+                            .ins()
+                            .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
+                        lowerer
+                            .stackmap
+                            .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                        let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                        let argp_call = lowerer
+                            .builder
+                            .ins()
+                            .call(next_step_args_ptr_ref, &[ns_ptr]);
+                        lowerer
+                            .stackmap
+                            .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
+                        let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                        // Trailing-pair convention: [arg,
+                        // post_arm_k_closure, post_arm_k_fn] at offsets
+                        // POST_ARM_K_ARG_OFF / POST_ARM_K_CLOSURE_OFF /
+                        // POST_ARM_K_FN_OFF. For tail-`k` arms, the
+                        // closure is null and the fn is identity.
+                        lowerer.builder.ins().store(
+                            MemFlags::trusted(),
+                            widened_arg,
+                            argp_v,
+                            POST_ARM_K_ARG_OFF,
                         );
-                        arg_value
-                    };
-                    let three_v = lowerer.builder.ins().iconst(types::I32, 3);
-                    let call_ns = lowerer
-                        .builder
-                        .ins()
-                        .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
-                    let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
-                    let argp_call = lowerer
-                        .builder
-                        .ins()
-                        .call(next_step_args_ptr_ref, &[ns_ptr]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
-                    let argp_v = lowerer.builder.inst_results(argp_call)[0];
-                    // [0] = arg
-                    lowerer
-                        .builder
-                        .ins()
-                        .store(MemFlags::trusted(), widened_arg, argp_v, 0);
-                    // [1] = null_post_arm_k_closure
-                    let null_post_arm_k_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
-                    lowerer.builder.ins().store(
-                        MemFlags::trusted(),
-                        null_post_arm_k_closure,
-                        argp_v,
-                        8,
-                    );
-                    // [2] = &sigil_continuation_identity
-                    let identity_fn_addr = lowerer
-                        .builder
-                        .ins()
-                        .func_addr(pointer_ty, lowerer.continuation_identity_ref);
-                    lowerer
-                        .builder
-                        .ins()
-                        .store(MemFlags::trusted(), identity_fn_addr, argp_v, 16);
-                    ns_ptr
-                } else {
-                    // --- Non-tail / no-`k` path (Phase 4c shape) ---
-                    let body_value = lowerer.lower_expr(&synth.body);
-                    let widened_body = if synth.body_ty == types::I64 {
-                        body_value
-                    } else if synth.body_ty.is_int() && synth.body_ty.bits() < 64 {
-                        lowerer.builder.ins().uextend(types::I64, body_value)
+                        let null_post_arm_k_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
+                        lowerer.builder.ins().store(
+                            MemFlags::trusted(),
+                            null_post_arm_k_closure,
+                            argp_v,
+                            POST_ARM_K_CLOSURE_OFF,
+                        );
+                        let identity_fn_addr = lowerer
+                            .builder
+                            .ins()
+                            .func_addr(pointer_ty, lowerer.continuation_identity_ref);
+                        lowerer.builder.ins().store(
+                            MemFlags::trusted(),
+                            identity_fn_addr,
+                            argp_v,
+                            POST_ARM_K_FN_OFF,
+                        );
+                        ns_ptr
                     } else {
-                        assert_eq!(
-                            synth.body_ty, pointer_ty,
-                            "codegen Phase 4c: unexpected arm-body Cranelift type \
+                        // --- Non-tail / no-`k` path (Phase 4c shape) ---
+                        let body_value = lowerer.lower_expr(&synth.body);
+                        let widened_body = if synth.body_ty == types::I64 {
+                            body_value
+                        } else if synth.body_ty.is_int() && synth.body_ty.bits() < 64 {
+                            lowerer.builder.ins().uextend(types::I64, body_value)
+                        } else {
+                            assert_eq!(
+                                synth.body_ty, pointer_ty,
+                                "codegen Phase 4c: unexpected arm-body Cranelift type \
                              {:?} for sigil_next_step_done wrap",
-                            synth.body_ty
-                        );
-                        body_value
+                                synth.body_ty
+                            );
+                            body_value
+                        };
+                        let done_call = lowerer
+                            .builder
+                            .ins()
+                            .call(next_step_done_ref, &[widened_body]);
+                        // Stackmap entry: any pointer-typed op-args bound in
+                        // env (String / user-type) are GC roots live across
+                        // this `sigil_next_step_done` arena allocation.
+                        lowerer
+                            .stackmap
+                            .push_placeholder(function_code_offset(&lowerer.builder, done_call));
+                        lowerer.builder.inst_results(done_call)[0]
                     };
-                    let done_call = lowerer
-                        .builder
-                        .ins()
-                        .call(next_step_done_ref, &[widened_body]);
-                    // Stackmap entry: any pointer-typed op-args bound in
-                    // env (String / user-type) are GC roots live across
-                    // this `sigil_next_step_done` arena allocation.
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, done_call));
-                    lowerer.builder.inst_results(done_call)[0]
-                };
                 lowerer.builder.ins().return_(&[next_step_ptr]);
                 lowerer.builder.finalize();
             }
@@ -3991,30 +3996,53 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // synth fn.
                 let _args_len = block_params[2];
 
-                let next_step_done_ref = module.declare_func_in_func(next_step_done, builder.func);
                 let next_step_call_ref = module.declare_func_in_func(next_step_call, builder.func);
                 let next_step_args_ptr_ref =
                     module.declare_func_in_func(next_step_args_ptr, builder.func);
 
-                // Slice A: load post-arm-k pair from args_ptr[1..3].
-                // Used by both ConstantDone and LetBindThenTail arms
-                // to dispatch their result through the post-arm-k
-                // continuation.
+                // Slice A: load post-arm-k pair from args_ptr at the
+                // trailing-pair offsets defined by the convention
+                // (closure at +8, fn at +16; arg at +0). Used by both
+                // ConstantDone and LetBindThenTail arms to dispatch
+                // their result through the post-arm-k continuation.
+                //
+                // TODO(plan-b-task-55-phase-4e-captures/slice-b-stackmap-root):
+                // For Slice A, `post_arm_k_closure` is always null
+                // (the arm-fn tail-`k` direct emit packs `[arg, null,
+                // &identity]`), so no GC root is needed across
+                // `emit_dispatch_to_post_arm_k`'s arena allocations.
+                // For Slice B (non-tail `k` lift), the arm-fn will
+                // pack `[arg, post_arm_k_closure_ptr,
+                // post_arm_k_fn_ptr]` where `post_arm_k_closure_ptr`
+                // is a real heap-allocated TAG_CLOSURE record. The
+                // SSA value loaded here lives across
+                // `next_step_call`'s arena allocation inside
+                // `emit_dispatch_to_post_arm_k`; Slice B must add a
+                // stackmap entry on the load (or on the arena alloc
+                // call) so Boehm-precise GC roots
+                // `post_arm_k_closure` across the allocation.
+                // Failure mode if missed: `post_arm_k_closure` is a
+                // dangling pointer when the synth-cont returns its
+                // `Call(post_arm_k_*, [result])`, the trampoline
+                // dispatches into freed memory.
                 let synth_cont_args_ptr = block_params[1];
-                let post_arm_k_closure =
-                    builder
-                        .ins()
-                        .load(pointer_ty, MemFlags::trusted(), synth_cont_args_ptr, 8);
-                let post_arm_k_fn =
-                    builder
-                        .ins()
-                        .load(pointer_ty, MemFlags::trusted(), synth_cont_args_ptr, 16);
+                let post_arm_k_closure = builder.ins().load(
+                    pointer_ty,
+                    MemFlags::trusted(),
+                    synth_cont_args_ptr,
+                    POST_ARM_K_CLOSURE_OFF,
+                );
+                let post_arm_k_fn = builder.ins().load(
+                    pointer_ty,
+                    MemFlags::trusted(),
+                    synth_cont_args_ptr,
+                    POST_ARM_K_FN_OFF,
+                );
 
                 // Helper: emit the trailing `Call(post_arm_k_*,
                 // [result])` dispatch. Used by both branches of the
                 // match below. Returns the NextStep pointer to be
                 // returned by the synth-cont fn.
-                #[allow(clippy::too_many_arguments)]
                 let emit_dispatch_to_post_arm_k = |builder: &mut FunctionBuilder<'_>,
                                                    stackmap: &mut StackMapBuilder,
                                                    result_value: Value|
@@ -4045,13 +4073,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let constant_v = builder.ins().iconst(types::I64, *constant_value);
                         let next_step =
                             emit_dispatch_to_post_arm_k(&mut builder, &mut stackmap, constant_v);
-                        // `next_step_done_ref` is no longer used at
-                        // this branch under Slice A. The declared
-                        // FuncRef sits in `dfg.ext_funcs` without
-                        // emitting relocations (mirroring the
-                        // pattern from `prepare_per_fn_refs`'s
-                        // helper docs).
-                        let _ = next_step_done_ref;
                         builder.ins().return_(&[next_step]);
                         builder.finalize();
                     }
@@ -4221,11 +4242,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             lowerer.stackmap,
                             widened_tail,
                         );
-                        // `next_step_done_ref` is no longer used at
-                        // this branch under Slice A; FuncRef sits in
-                        // `dfg.ext_funcs` without producing a
-                        // relocation.
-                        let _ = next_step_done_ref;
                         lowerer.builder.ins().return_(&[next_step]);
                         lowerer.builder.finalize();
                     }
@@ -6334,6 +6350,30 @@ fn k_closure_offset(user_arg_count: usize) -> i32 {
 fn k_fn_offset(user_arg_count: usize) -> i32 {
     k_closure_offset(user_arg_count) + 8
 }
+
+/// Plan B Task 55, Phase 4e captures+ Slice A — trailing-pair
+/// convention offsets within the synth-cont's incoming `args_ptr`.
+///
+/// The arm-fn tail-`k` body emit packs `Call(k_closure, k_fn,
+/// /*arg_count=*/3)` with three slots:
+///   - `args_ptr[POST_ARM_K_ARG_OFF]` (= 0): the `k(arg)` value the
+///     arm passes to its captured continuation.
+///   - `args_ptr[POST_ARM_K_CLOSURE_OFF]` (= 8): the post-arm-k
+///     closure (null for tail-`k` arms; a real heap-allocated
+///     TAG_CLOSURE record under Slice B's non-tail-`k` lift).
+///   - `args_ptr[POST_ARM_K_FN_OFF]` (= 16): the post-arm-k fn ptr
+///     (`&sigil_continuation_identity` for tail-`k` arms; a lambda-
+///     lifted post-arm-k synth fn's `func_addr` under Slice B).
+///
+/// These offsets are FIXED (independent of any user-arg count) —
+/// distinct from [`k_closure_offset`] / [`k_fn_offset`] which apply
+/// to the user-fn-side `args_ptr` shape `[user_arg_0, ...,
+/// user_arg_{N-1}, k_closure, k_fn]` whose trailing-pair offsets
+/// shift by `N * 8`. The synth-cont always sees exactly the
+/// 3-slot trailing-pair shape because the arm-fn always packs it.
+const POST_ARM_K_ARG_OFF: i32 = 0;
+const POST_ARM_K_CLOSURE_OFF: i32 = 8;
+const POST_ARM_K_FN_OFF: i32 = 16;
 
 /// Plan B Task 55, Phase 4e — input context for [`prepare_per_fn_refs`].
 ///
