@@ -941,7 +941,7 @@ fn arm_body_walk(
             for a in arms {
                 let mut pat_scope: std::collections::BTreeSet<String> =
                     std::collections::BTreeSet::new();
-                arm_body_collect_pattern_bindings(&a.pattern, &mut pat_scope);
+                collect_pattern_bindings(&a.pattern, &mut pat_scope);
                 scopes.push(pat_scope);
                 // Match arm bodies are NOT in tail position for
                 // `k`-call detection — same rationale as `Expr::If`
@@ -1157,40 +1157,6 @@ fn arm_body_walk_block(
         return r;
     }
     None
-}
-
-fn arm_body_collect_pattern_bindings(
-    p: &crate::ast::Pattern,
-    out: &mut std::collections::BTreeSet<String>,
-) {
-    use crate::ast::{CtorPatternFields, Pattern};
-    match p {
-        Pattern::Var(name, _) => {
-            out.insert(name.clone());
-        }
-        Pattern::Wildcard(_)
-        | Pattern::IntLit(..)
-        | Pattern::BoolLit(..)
-        | Pattern::CharLit(..) => {}
-        Pattern::Tuple(ps, _) => {
-            for sub in ps {
-                arm_body_collect_pattern_bindings(sub, out);
-            }
-        }
-        Pattern::Ctor { fields, .. } => match fields {
-            CtorPatternFields::Unit => {}
-            CtorPatternFields::Positional(ps) => {
-                for sub in ps {
-                    arm_body_collect_pattern_bindings(sub, out);
-                }
-            }
-            CtorPatternFields::Record(fs) => {
-                for f in fs {
-                    arm_body_collect_pattern_bindings(&f.pattern, out);
-                }
-            }
-        },
-    }
 }
 
 /// Plan B Task 55 (Phase 3b) — per-handler-arm synthetic CPS fn
@@ -3033,9 +2999,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // the layout. Some refs (`next_step_done_ref`,
             // `next_step_call_ref`, `next_step_args_ptr_ref`) aren't
             // used directly by the user-fn body lowering (only
-            // synth-arm-fn body emit needs them); Cranelift prunes
-            // unused FuncRefs from the emitted function so the over-
-            // declaration cost is structural-only.
+            // synth-arm-fn body emit needs them); unreferenced FuncRefs
+            // sit in `dfg.ext_funcs` without producing relocations, so
+            // the emitted object code is unaffected.
             let PerFnRefs {
                 string_new_ref,
                 println_ref,
@@ -4061,8 +4027,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // via shared `prepare_per_fn_refs` helper.
                         // The synth-cont (LetBindThenTail) body
                         // doesn't use the tail-`k` lowering refs
-                        // (those are arm-fn-only); Cranelift prunes
-                        // unused FuncRefs.
+                        // (those are arm-fn-only); unreferenced
+                        // FuncRefs sit in `dfg.ext_funcs` without
+                        // emitting relocations.
                         let PerFnRefs {
                             string_new_ref,
                             println_ref,
@@ -6303,9 +6270,14 @@ struct PerFnRefsCtx<'a> {
 ///
 /// Some fields are unused at certain call sites (e.g.,
 /// `next_step_call_ref` and `next_step_args_ptr_ref` are only used
-/// at the synth-arm-fn body emit's tail-`k` lowering path).
-/// Cranelift prunes unused FuncRefs from the emitted function, so
-/// the over-declaration cost is structural-only.
+/// at the synth-arm-fn body emit's tail-`k` lowering path). The
+/// unused FuncRefs *are* registered in the Function's `dfg.ext_funcs`
+/// table — strictly speaking, Cranelift doesn't prune them. What's
+/// true: no relocations are emitted for FuncRefs not referenced by
+/// `Call` / `FuncAddr` instructions, so the *emitted object code* is
+/// unaffected. The over-declaration cost is structural-only (a few
+/// entries in the function's external-funcs table) — there is no IR
+/// or emitted-binary impact at the three call sites.
 struct PerFnRefs {
     string_new_ref: FuncRef,
     println_ref: FuncRef,
@@ -6337,8 +6309,9 @@ struct PerFnRefs {
 /// have slightly different needs — the user-fn site doesn't use the
 /// `next_step_done_ref` / `next_step_call_ref` / `next_step_args_ptr_ref`
 /// trio, and the synth-cont site doesn't use the tail-`k` refs — but
-/// over-declaring here is cheap because Cranelift prunes unused FuncRefs
-/// from the emitted function.
+/// over-declaring here is cheap: unreferenced FuncRefs sit in the
+/// function's `dfg.ext_funcs` table without producing relocations, so
+/// the emitted object code is unaffected.
 fn prepare_per_fn_refs(
     module: &mut ObjectModule,
     builder: &mut FunctionBuilder<'_>,

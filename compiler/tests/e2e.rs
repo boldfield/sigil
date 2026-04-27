@@ -2520,6 +2520,46 @@ fn cps_abi_captures_bearing_with_bool_capture_exercises_widen_narrow_symmetry() 
 }
 
 #[test]
+fn cps_abi_captures_bearing_with_char_capture_exercises_widen_narrow_symmetry() {
+    // PR #26 mid-flight at 73c7e53 (no-context) review item #4:
+    // parallel coverage to the Bool capture test for the other
+    // sub-I64 width-discrepant kind. Char captures store as I32 in
+    // the closure record's slot:
+    //   - On the WRITE side (helper's body emit alloc): widen
+    //     I32 → I64 via uextend.
+    //   - On the READ side (synth-cont's capture-load): narrow
+    //     I64 → I32 via ireduce.
+    // A regression in either side would surface as wrong upper
+    // bits leaking into the Char comparison at runtime.
+    //
+    // helper takes `marker: Char` user param, captures it; tail
+    // `if marker == 'A' then x else 0`. use-k arm `=> k(99)` →
+    // synth-cont loads marker from closure record (offset 16,
+    // narrows I64→I32), binds x=99, lowers the conditional with
+    // marker='A' → 99 / marker='B' → 0.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(marker: Char) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 if marker == 'A' { x } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle helper('A') with { Raise.fail(k) => k(99) };\n  \
+                 let b: Int = handle helper('B') with { Raise.fail(k) => k(99) };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_bearing_char");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n0\n",
+        "Char capture's widen/narrow symmetry: helper('A') k(99) → \
+         marker=='A' so x=99 returned; helper('B') k(99) → marker=='B' \
+         is false so 0 returned. stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn captures_bearing_synth_cont_with_two_user_params_captured() {
     // PR #26 mid-flight at a5ee4c6 item #2 (prior-gap follow-up):
     // multi-capture e2e — pins the closure record's slot ordering
