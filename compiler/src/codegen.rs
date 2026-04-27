@@ -540,12 +540,18 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
 /// a literal; widening the guard to follow call edges lands with
 /// Phase 3+ when the proper handler-frame setup ships.
 pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Option<String> {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     // Globals reachable as bare `Expr::Ident` from anywhere — used by
     // Phase 4c's arm-body capture check to distinguish "global ref"
     // from "outer-scope capture". Top-level fn names + ctor names +
     // hardcoded builtins (`int_to_string`).
     let mut globals: BTreeSet<String> = BTreeSet::new();
+    // Plan B Task 55, Phase 4e captures+ Slice C — effects map keyed
+    // by effect name. Used by the arm-body walker to gate Slice C's
+    // multi-let shape on `resumes_many`. Indirection through name
+    // (rather than a direct `&EffectDecl` reference) lets the walker
+    // ignore the registry layout and just consult one bool per arm.
+    let mut effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
     for item in &program.items {
         match item {
             crate::ast::Item::Fn(f) => {
@@ -556,13 +562,16 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
                     globals.insert(v.name.clone());
                 }
             }
-            crate::ast::Item::Effect(_) | crate::ast::Item::Import(_) => {}
+            crate::ast::Item::Effect(e) => {
+                effects_resumes_many.insert(e.name.clone(), e.resumes_many);
+            }
+            crate::ast::Item::Import(_) => {}
         }
     }
     globals.insert("int_to_string".to_string());
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
-            if let Some(msg) = block_unsupported_handle(&f.body, &globals) {
+            if let Some(msg) = block_unsupported_handle(&f.body, &globals, &effects_resumes_many) {
                 return Some(format!("in fn `{}`: {}", f.name, msg));
             }
         }
@@ -573,23 +582,25 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
 fn block_unsupported_handle(
     b: &crate::ast::Block,
     globals: &std::collections::BTreeSet<String>,
+    effects_resumes_many: &std::collections::BTreeMap<String, bool>,
 ) -> Option<String> {
     use crate::ast::Stmt;
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                if let Some(msg) = expr_unsupported_handle(&l.value, globals) {
+                if let Some(msg) = expr_unsupported_handle(&l.value, globals, effects_resumes_many)
+                {
                     return Some(msg);
                 }
             }
             Stmt::Expr(e) => {
-                if let Some(msg) = expr_unsupported_handle(e, globals) {
+                if let Some(msg) = expr_unsupported_handle(e, globals, effects_resumes_many) {
                     return Some(msg);
                 }
             }
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    if let Some(msg) = expr_unsupported_handle(a, globals) {
+                    if let Some(msg) = expr_unsupported_handle(a, globals, effects_resumes_many) {
                         return Some(msg);
                     }
                 }
@@ -597,7 +608,7 @@ fn block_unsupported_handle(
         }
     }
     if let Some(tail) = &b.tail {
-        if let Some(msg) = expr_unsupported_handle(tail, globals) {
+        if let Some(msg) = expr_unsupported_handle(tail, globals, effects_resumes_many) {
             return Some(msg);
         }
     }
@@ -607,6 +618,7 @@ fn block_unsupported_handle(
 fn expr_unsupported_handle(
     e: &crate::ast::Expr,
     globals: &std::collections::BTreeSet<String>,
+    effects_resumes_many: &std::collections::BTreeMap<String, bool>,
 ) -> Option<String> {
     use crate::ast::Expr;
     match e {
@@ -617,47 +629,50 @@ fn expr_unsupported_handle(
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => None,
         Expr::Binary { lhs, rhs, .. } => {
-            expr_unsupported_handle(lhs, globals).or_else(|| expr_unsupported_handle(rhs, globals))
+            expr_unsupported_handle(lhs, globals, effects_resumes_many)
+                .or_else(|| expr_unsupported_handle(rhs, globals, effects_resumes_many))
         }
-        Expr::Unary { operand, .. } => expr_unsupported_handle(operand, globals),
+        Expr::Unary { operand, .. } => {
+            expr_unsupported_handle(operand, globals, effects_resumes_many)
+        }
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => expr_unsupported_handle(cond, globals)
-            .or_else(|| block_unsupported_handle(then_block, globals))
-            .or_else(|| block_unsupported_handle(else_block, globals)),
-        Expr::Block(b) => block_unsupported_handle(b, globals),
+        } => expr_unsupported_handle(cond, globals, effects_resumes_many)
+            .or_else(|| block_unsupported_handle(then_block, globals, effects_resumes_many))
+            .or_else(|| block_unsupported_handle(else_block, globals, effects_resumes_many)),
+        Expr::Block(b) => block_unsupported_handle(b, globals, effects_resumes_many),
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            if let Some(msg) = expr_unsupported_handle(scrutinee, globals) {
+            if let Some(msg) = expr_unsupported_handle(scrutinee, globals, effects_resumes_many) {
                 return Some(msg);
             }
             for a in arms {
-                if let Some(msg) = expr_unsupported_handle(&a.body, globals) {
+                if let Some(msg) = expr_unsupported_handle(&a.body, globals, effects_resumes_many) {
                     return Some(msg);
                 }
             }
             None
         }
         Expr::Call { callee, args, .. } => {
-            if let Some(msg) = expr_unsupported_handle(callee, globals) {
+            if let Some(msg) = expr_unsupported_handle(callee, globals, effects_resumes_many) {
                 return Some(msg);
             }
             for a in args {
-                if let Some(msg) = expr_unsupported_handle(a, globals) {
+                if let Some(msg) = expr_unsupported_handle(a, globals, effects_resumes_many) {
                     return Some(msg);
                 }
             }
             None
         }
         Expr::Perform(_) => None,
-        Expr::Lambda { body, .. } => expr_unsupported_handle(body, globals),
+        Expr::Lambda { body, .. } => expr_unsupported_handle(body, globals, effects_resumes_many),
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
-                if let Some(msg) = expr_unsupported_handle(ee, globals) {
+                if let Some(msg) = expr_unsupported_handle(ee, globals, effects_resumes_many) {
                     return Some(msg);
                 }
             }
@@ -665,7 +680,8 @@ fn expr_unsupported_handle(
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                if let Some(msg) = expr_unsupported_handle(&f.value, globals) {
+                if let Some(msg) = expr_unsupported_handle(&f.value, globals, effects_resumes_many)
+                {
                     return Some(msg);
                 }
             }
@@ -766,7 +782,9 @@ fn expr_unsupported_handle(
             // `ClosureRecord` shapes. The arm body is otherwise free
             // to use any expression over its op-args + globals.
             for arm in op_arms.iter() {
-                if let Some(msg) = arm_body_unsupported_construct(arm, globals) {
+                if let Some(msg) =
+                    arm_body_unsupported_construct(arm, globals, effects_resumes_many)
+                {
                     return Some(format!(
                         "`handle` expression at {:?} has arm `{}.{}` body that {} \
                          (Plan B Task 55, in progress)",
@@ -781,13 +799,14 @@ fn expr_unsupported_handle(
             // are never enforced — at runtime that can register arms
             // under the wrong effect_id and crash inside `sigil_perform`'s
             // handler-stack walk.
-            if let Some(msg) = expr_unsupported_handle(body, globals) {
+            if let Some(msg) = expr_unsupported_handle(body, globals, effects_resumes_many) {
                 return Some(msg);
             }
             // Recurse into arm bodies so nested handles deeper in
             // the AST surface their own diagnostics.
             for arm in op_arms {
-                if let Some(msg) = expr_unsupported_handle(&arm.body, globals) {
+                if let Some(msg) = expr_unsupported_handle(&arm.body, globals, effects_resumes_many)
+                {
                     return Some(msg);
                 }
             }
@@ -820,8 +839,68 @@ fn expr_unsupported_handle(
 fn arm_body_unsupported_construct(
     arm: &crate::ast::HandleOpArm,
     globals: &std::collections::BTreeSet<String>,
+    effects_resumes_many: &std::collections::BTreeMap<String, bool>,
 ) -> Option<String> {
     use std::collections::BTreeSet;
+    // Plan B Task 55, Phase 4e captures+ Slice C — multi-let arm
+    // body shape `{ let r1: T1 = k(arg1); let r2: T2 = k(arg2);
+    // pure_tail }` is allowed when:
+    //   - The arm's effect is declared `resumes: many` (one-shot
+    //     effects continue to be rejected — the typecheck E0220
+    //     linearity gate already fires for one-shot multi-`k` paths
+    //     but codegen mirrors the gate here for completeness).
+    //   - `arg1` and `arg2` both satisfy `expr_is_pure`.
+    //   - `pure_tail` satisfies `expr_is_pure` and references only
+    //     `r1`, `r2`, plus globals.
+    //
+    // Slice C is checked BEFORE Slice B (multi-let has 2 stmts;
+    // single-let has 1, so they're disjoint, but checking multi-
+    // let first surfaces the `resumes_many` gate explicitly when
+    // the source uses multi-`k` shape on a one-shot effect).
+    if let Some(shape) = arm_body_multi_let_then_pure_tail_shape(&arm.body, &arm.k_name) {
+        let is_multi_shot = effects_resumes_many
+            .get(&arm.effect)
+            .copied()
+            .unwrap_or(false);
+        if !is_multi_shot {
+            return Some(format!(
+                "Slice C: arm body invokes `{}` twice (multi-shot pattern: \
+                 `let r1 = {}(...); let r2 = {}(...); ...`) but effect `{}` is \
+                 declared `resumes: one` (default). Declare `effect {} resumes: \
+                 many {{ ... }}` to opt in to multi-shot semantics; otherwise \
+                 the typecheck E0220 linearity gate already rejects this shape \
+                 at typecheck time",
+                arm.k_name, arm.k_name, arm.k_name, arm.effect, arm.effect
+            ));
+        }
+        if !expr_is_pure(shape.arg1_expr) {
+            // Fall through; regular walker surfaces the specific
+            // yield-able sub-shape in arg1.
+        } else if !expr_is_pure(shape.arg2_expr) {
+            // Fall through; regular walker surfaces the specific
+            // yield-able sub-shape in arg2.
+        } else if !expr_is_pure(shape.tail_expr) {
+            // Fall through; regular walker surfaces the specific
+            // yield-able sub-shape in tail.
+        } else {
+            // Multi-let tail can reference both binding names.
+            // Reuse Slice B's free-var walker with binding_name =
+            // name_1 and extra_bindings = {name_2}.
+            let mut extras = BTreeSet::new();
+            extras.insert(shape.binding_name_2.to_string());
+            if let Some(diag) = arm_body_post_arm_k_tail_free_vars_ok(
+                shape.tail_expr,
+                shape.binding_name_1,
+                &arm.k_name,
+                globals,
+                &extras,
+            ) {
+                return Some(diag);
+            }
+            // Slice C accepted shape. Allow.
+            return None;
+        }
+    }
     // Plan B Task 55, Phase 4e captures+ Slice B — non-tail-`k` arm
     // body of shape `{ let r: Ty = k(arg); pure_tail }` is allowed
     // when:
@@ -1275,6 +1354,109 @@ struct HandlerArmSynth {
     /// `Done(result)`. `None` for tail-`k` arms or for arms whose
     /// body doesn't match the let-then-pure-tail shape.
     post_arm_k: Option<PostArmKSynth>,
+    /// Plan B Task 55, Phase 4e captures+ Slice C — set when the arm
+    /// body matches the multi-let shape `{ let r1: T1 = k(arg1);
+    /// let r2: T2 = k(arg2); pure_tail }` for a `resumes: many`
+    /// effect. Mutually exclusive with [`Self::post_arm_k`] (the
+    /// shape detectors disambiguate via stmts.len() — Slice B's
+    /// detector requires exactly 1 Let stmt; Slice C's requires
+    /// exactly 2). Two FuncIds are allocated at the pre-pass: one
+    /// for `post_arm_k_1` (handles the post-`k(arg1)` rest = `let
+    /// r2 = k(arg2); pure_tail`), one for `post_arm_k_2` (handles
+    /// the post-`k(arg2)` rest = `pure_tail`).
+    ///
+    /// `None` for arms whose body doesn't match the multi-let
+    /// shape OR whose effect isn't `resumes: many`.
+    post_arm_k_chain: Option<MultiLetPostArmKChain>,
+}
+
+/// Plan B Task 55, Phase 4e captures+ Slice C — synthetic post-arm-k
+/// continuation chain for an arm body of shape `{ let r1: T1 =
+/// k(arg1); let r2: T2 = k(arg2); pure_tail }` of a `resumes: many`
+/// effect. Multi-shot semantics: the arm invokes the captured
+/// continuation `k` twice (once with arg1, once with arg2); each
+/// invocation drives the helper synth-cont independently and
+/// produces a separate result (r1, r2). The pure tail combines
+/// both.
+///
+/// Implementation requires TWO post-arm-k synth fns + two heap-
+/// allocated TAG_CLOSURE records:
+///
+///   - `post_arm_k_1` (allocated at pre-pass; defined in its own
+///     post-pass): receives `r1` from `args_ptr[0]` (the helper
+///     synth-cont's dispatch result for `k(arg1)`); reads
+///     `(k_closure, k_fn)` from its `closure_ptr` (captured at
+///     arm-fn body-emit time); allocates `post_arm_k_2`'s closure
+///     with `r1` captured; lowers `arg2`; emits
+///     `Call(k_closure, k_fn, [arg2, post_arm_k_2_closure_ptr,
+///     post_arm_k_2_fn_addr])`.
+///   - `post_arm_k_2` (allocated at pre-pass; defined in its own
+///     post-pass): receives `r2` from `args_ptr[0]`; reads `r1`
+///     from its `closure_ptr`; lowers `pure_tail` with both `r1`
+///     and `r2` in env; widens; emits `Done(widened)`.
+///
+/// Slice C first-commit restrictions:
+///   - Effect declared `resumes: many` (one-shot effects continue
+///     to be rejected via the existing E0220 linearity gate at
+///     typecheck; codegen mirrors that here for completeness even
+///     though E0220 already fires).
+///   - Both `arg1` and `arg2` must satisfy `expr_is_pure`.
+///   - `pure_tail` must satisfy `expr_is_pure` and reference only
+///     `r1`, `r2`, plus globals (no op-args, no outer-scope captures
+///     into the chain — those need a captures-bearing extension
+///     paralleling Slice B's deferred extension).
+///
+/// The k_closure / k_fn passed to the arm fn at runtime is the
+/// helper synth-cont's heap-allocated TAG_CLOSURE record + the
+/// helper synth-cont's fn pointer. PR #26's helper synth-cont
+/// closure is already heap-allocated when the helper has captures;
+/// for captures-free helpers it is null but the synth-cont fn
+/// pointer is still a function pointer. Multi-shot reuses the
+/// SAME k_closure across both invocations — k_closure is read-
+/// only once allocated, so re-invocation is safe.
+#[derive(Clone, Debug)]
+struct MultiLetPostArmKChain {
+    /// The `arg1` expression in the first `let r1 = k(arg1)`. Lowered
+    /// inside the arm-fn body emit (NOT inside `post_arm_k_1`'s
+    /// body). Must satisfy `expr_is_pure`.
+    arg1_expr: crate::ast::Expr,
+    /// `post_arm_k_1` synth fn `FuncId`. Allocated at the pre-pass.
+    /// Linker symbol: `sigil_handler_post_arm_k_1_<arm_fn_idx>`.
+    post_arm_k_1_func_id: cranelift_module::FuncId,
+    /// Source-level binding name for the FIRST let (e.g., "r1").
+    /// Bound in `post_arm_k_2`'s env from its closure_ptr at fn
+    /// entry.
+    binding_name_1: String,
+    /// Cranelift type that `post_arm_k_1` narrows `args_ptr[0]` to
+    /// at fn entry, before storing into `post_arm_k_2`'s closure
+    /// record. Derived from the first `LetStmt::ty`.
+    binding_ty_1: Type,
+    /// `EnvSlotKind` for `binding_name_1`'s slot in `post_arm_k_2`'s
+    /// closure record. Drives the bitmap (pointer slots become GC
+    /// roots). Derived from `binding_ty_1`.
+    binding_kind_1: crate::ast::EnvSlotKind,
+    /// The `arg2` expression in the second `let r2 = k(arg2)`.
+    /// Lowered inside `post_arm_k_1`'s body (NOT inside the arm
+    /// fn). Must satisfy `expr_is_pure`.
+    arg2_expr: crate::ast::Expr,
+    /// `post_arm_k_2` synth fn `FuncId`. Allocated at the pre-pass.
+    /// Linker symbol: `sigil_handler_post_arm_k_2_<arm_fn_idx>`.
+    post_arm_k_2_func_id: cranelift_module::FuncId,
+    /// Source-level binding name for the SECOND let (e.g., "r2").
+    /// Bound in `post_arm_k_2`'s env from `args_ptr[0]` at fn
+    /// entry.
+    binding_name_2: String,
+    /// Cranelift type that `post_arm_k_2` narrows `args_ptr[0]` to
+    /// at fn entry. Derived from the second `LetStmt::ty`.
+    binding_ty_2: Type,
+    /// The `pure_tail` expression `post_arm_k_2` lowers. Must
+    /// satisfy `expr_is_pure` and reference only `binding_name_1`,
+    /// `binding_name_2`, plus globals.
+    tail_expr: crate::ast::Expr,
+    /// Cranelift type of `tail_expr`'s lowered value, used to
+    /// widen to I64 before `sigil_next_step_done`. Equals the
+    /// arm's `body_ty` (the op's declared return type).
+    tail_ty: Type,
 }
 
 /// Plan B Task 55, Phase 4e captures+ Slice B — synthetic post-arm-k
@@ -2007,6 +2189,70 @@ fn collect_handle_arms_in_expr(
                     None
                 };
 
+                // Plan B Task 55, Phase 4e captures+ Slice C —
+                // detect multi-let shape `{ let r1 = k(arg1); let
+                // r2 = k(arg2); pure_tail }` for `resumes: many`
+                // effects. Allocates 2 post-arm-k FuncIds at the
+                // pre-pass: one for the post-`k(arg1)` rest, one
+                // for the post-`k(arg2)` rest. Walker enforces the
+                // `resumes_many` gate and the free-var restriction
+                // on `pure_tail` at the codegen-entry guard; this
+                // pre-pass code only fires after the walker has
+                // accepted the shape, so the `is_multi_shot` check
+                // here is defensive (should be true).
+                let post_arm_k_chain = if let Some(shape) =
+                    arm_body_multi_let_then_pure_tail_shape(&rewritten_body, &arm.k_name)
+                {
+                    let is_multi_shot = ctx
+                        .effects
+                        .get(&arm.effect)
+                        .map(|e| e.resumes_many)
+                        .unwrap_or(false);
+                    if !is_multi_shot {
+                        None
+                    } else {
+                        let arm_fn_idx = synth.len();
+                        let post_arm_k_1_mangled =
+                            format!("sigil_handler_post_arm_k_1_{arm_fn_idx}");
+                        let post_arm_k_1_func_id = module
+                            .declare_function(
+                                &post_arm_k_1_mangled,
+                                Linkage::Local,
+                                ctx.cps_arm_sig,
+                            )
+                            .map_err(|e| format!("declare {post_arm_k_1_mangled}: {e}"))?;
+                        let post_arm_k_2_mangled =
+                            format!("sigil_handler_post_arm_k_2_{arm_fn_idx}");
+                        let post_arm_k_2_func_id = module
+                            .declare_function(
+                                &post_arm_k_2_mangled,
+                                Linkage::Local,
+                                ctx.cps_arm_sig,
+                            )
+                            .map_err(|e| format!("declare {post_arm_k_2_mangled}: {e}"))?;
+                        let binding_ty_1 =
+                            cranelift_ty_for_type_expr(shape.binding_te_1, ctx.pointer_ty);
+                        let binding_ty_2 =
+                            cranelift_ty_for_type_expr(shape.binding_te_2, ctx.pointer_ty);
+                        let binding_kind_1 = slot_kind_for_type_expr_post_mono(shape.binding_te_1);
+                        Some(MultiLetPostArmKChain {
+                            arg1_expr: shape.arg1_expr.clone(),
+                            post_arm_k_1_func_id,
+                            binding_name_1: shape.binding_name_1.to_string(),
+                            binding_ty_1,
+                            binding_kind_1,
+                            arg2_expr: shape.arg2_expr.clone(),
+                            post_arm_k_2_func_id,
+                            binding_name_2: shape.binding_name_2.to_string(),
+                            binding_ty_2,
+                            tail_expr: shape.tail_expr.clone(),
+                            tail_ty: body_ty,
+                        })
+                    }
+                } else {
+                    None
+                };
+
                 synth.push(HandlerArmSynth {
                     func_id,
                     body: rewritten_body,
@@ -2016,6 +2262,7 @@ fn collect_handle_arms_in_expr(
                     captures,
                     k_name: arm.k_name.clone(),
                     post_arm_k,
+                    post_arm_k_chain,
                 });
                 arm_indices.push(global_idx);
             }
@@ -2158,6 +2405,99 @@ struct ArmBodyLetThenPureTailMatch<'a> {
     binding_name: &'a str,
     binding_te: &'a crate::ast::TypeExpr,
     arg_expr: &'a crate::ast::Expr,
+    tail_expr: &'a crate::ast::Expr,
+}
+
+/// Plan B Task 55, Phase 4e captures+ Slice C — recognise the
+/// multi-let arm body shape `{ let r1: T1 = k(arg1); let r2: T2 =
+/// k(arg2); pure_tail }`. This is the two-let extension of
+/// [`arm_body_let_then_pure_tail_shape`] that exercises multi-shot
+/// `k` semantics (the arm invokes `k` twice with different args).
+///
+/// Returns the matched components when the arm body's structure is
+/// exactly:
+/// ```text
+///     Expr::Block {
+///         stmts: [
+///             Stmt::Let { name: name_1, ty: ty_1, value: Expr::Call {
+///                 callee: Expr::Ident(k_name, _),
+///                 args: [arg1_expr],
+///             } },
+///             Stmt::Let { name: name_2, ty: ty_2, value: Expr::Call {
+///                 callee: Expr::Ident(k_name, _),
+///                 args: [arg2_expr],
+///             } },
+///         ],
+///         tail: Some(tail_expr),
+///     }
+/// ```
+///
+/// Both `Stmt::Let`s must bind a call to the SAME `k_name`. The
+/// caller (the pre-pass + walker) enforces additional restrictions:
+///   - Effect must be `resumes: many` — one-shot effects continue
+///     to reject multi-`k` invocation per the typecheck E0220 gate.
+///   - `arg1_expr` and `arg2_expr` must satisfy `expr_is_pure`.
+///   - `tail_expr` must satisfy `expr_is_pure` and free vars must
+///     be ⊆ `{name_1, name_2} ∪ globals`.
+///
+/// This is the source-side surface for multi-shot. Future surface
+/// extensions (3+ k invocations, Binary-of-k-calls, captures into
+/// the chain) layer on top.
+///
+/// Returned references all borrow from `body`'s sub-tree.
+fn arm_body_multi_let_then_pure_tail_shape<'a>(
+    body: &'a crate::ast::Expr,
+    k_name: &str,
+) -> Option<ArmBodyMultiLetThenPureTailMatch<'a>> {
+    use crate::ast::{Expr, Stmt};
+    let block = match body {
+        Expr::Block(b) => b,
+        _ => return None,
+    };
+    if block.stmts.len() != 2 {
+        return None;
+    }
+    let let_1 = match &block.stmts[0] {
+        Stmt::Let(l) => l,
+        _ => return None,
+    };
+    let let_2 = match &block.stmts[1] {
+        Stmt::Let(l) => l,
+        _ => return None,
+    };
+    let extract_k_call = |value: &'a Expr| -> Option<&'a Expr> {
+        if let Expr::Call { callee, args, .. } = value {
+            if let Expr::Ident(n, _) = callee.as_ref() {
+                if n == k_name && args.len() == 1 {
+                    return Some(&args[0]);
+                }
+            }
+        }
+        None
+    };
+    let arg1_expr = extract_k_call(&let_1.value)?;
+    let arg2_expr = extract_k_call(&let_2.value)?;
+    let tail = block.tail.as_ref()?;
+    Some(ArmBodyMultiLetThenPureTailMatch {
+        binding_name_1: &let_1.name,
+        binding_te_1: &let_1.ty,
+        arg1_expr,
+        binding_name_2: &let_2.name,
+        binding_te_2: &let_2.ty,
+        arg2_expr,
+        tail_expr: tail,
+    })
+}
+
+/// Plan B Task 55, Phase 4e captures+ Slice C — borrowed view of a
+/// matched [`arm_body_multi_let_then_pure_tail_shape`] result.
+struct ArmBodyMultiLetThenPureTailMatch<'a> {
+    binding_name_1: &'a str,
+    binding_te_1: &'a crate::ast::TypeExpr,
+    arg1_expr: &'a crate::ast::Expr,
+    binding_name_2: &'a str,
+    binding_te_2: &'a crate::ast::TypeExpr,
+    arg2_expr: &'a crate::ast::Expr,
     tail_expr: &'a crate::ast::Expr,
 }
 
@@ -4274,7 +4614,142 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // the tail position recognised by
                 // `arm_body_tail_is_k_call`; non-tail `k` use is
                 // rejected with a Phase-4e-pointing diagnostic.
-                let next_step_ptr = if let Some(post_arm_k) = &synth.post_arm_k {
+                let next_step_ptr = if let Some(chain) = &synth.post_arm_k_chain {
+                    // --- Slice C: multi-let `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }` path ---
+                    //
+                    // For arms of `resumes: many` effects whose body
+                    // matches the multi-let shape, the arm fn invokes
+                    // `k(arg1)` and packs a heap-allocated TAG_CLOSURE
+                    // record holding `(k_closure, k_fn)` as the
+                    // post-arm-k closure. The post_arm_k_1 synth fn
+                    // (defined in its own pass at the bottom of
+                    // `emit_object`) reads `(k_closure, k_fn)` from
+                    // its closure_ptr and uses them to invoke `k(arg2)`
+                    // — re-using the SAME k_closure (helper synth-cont's
+                    // closure record, heap-allocated by PR #26's
+                    // captures-bearing slice). Multi-shot semantics
+                    // emerge from the trampoline dispatching into the
+                    // helper synth-cont k_fn twice with different args.
+                    //
+                    // post_arm_k_1's closure layout (TAG_CLOSURE):
+                    //   offset 0: header word (TAG_CLOSURE | count=3 | bitmap=0b10).
+                    //   offset 8: code_ptr (null — synth fns dispatch
+                    //     via FuncId, not via closure record).
+                    //   offset 16: k_closure (pointer; bitmap bit 1 set).
+                    //   offset 24: k_fn (non-pointer fn ptr).
+                    //
+                    // Bisecting hint: a regression in the Slice C e2e
+                    // test (`slice_c_choose_multi_shot_*`) after this
+                    // commit means either (a) the closure-record's
+                    // bitmap encoding is wrong (k_closure not GC-rooted
+                    // → dangling pointer post-GC), (b) the arm fn's
+                    // args_ptr stores at offsets 0/8/16 don't match
+                    // what helper synth-cont reads (the trailing-pair
+                    // convention from Slice A), or (c) post_arm_k_1's
+                    // closure_ptr reads don't match the arm fn's
+                    // closure-record stores at offsets 16/24.
+                    let arg1_value = lowerer.lower_expr(&chain.arg1_expr);
+                    let arg1_ty = lowerer.builder.func.dfg.value_type(arg1_value);
+                    let widened_arg1 = if arg1_ty == types::I64 {
+                        arg1_value
+                    } else if arg1_ty.is_int() && arg1_ty.bits() < 64 {
+                        lowerer.builder.ins().uextend(types::I64, arg1_value)
+                    } else {
+                        assert_eq!(
+                            arg1_ty, pointer_ty,
+                            "codegen Phase 4e captures+ Slice C: unexpected k-arg1 \
+                             Cranelift type {arg1_ty:?} for next_step_call slot widen"
+                        );
+                        arg1_value
+                    };
+
+                    // Allocate post_arm_k_1's TAG_CLOSURE record
+                    // capturing (k_closure, k_fn). Bitmap: slot 2
+                    // (k_closure) is pointer, slot 3 (k_fn) is not.
+                    let count: u8 = 3;
+                    let bitmap: u32 = 1u32 << 1;
+                    let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
+                    let payload_bytes: i64 = 8 + 8 * 2;
+                    let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
+                    let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                    let alloc_call = lowerer
+                        .builder
+                        .ins()
+                        .call(alloc_ref, &[header_v, payload_v]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
+                    let post_arm_k_1_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
+                    // code_ptr at offset 8 = null.
+                    let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        null_v,
+                        post_arm_k_1_closure_ptr,
+                        8,
+                    );
+                    // k_closure at offset 16 (slot 2).
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        k_closure_v,
+                        post_arm_k_1_closure_ptr,
+                        16,
+                    );
+                    // k_fn at offset 24 (slot 3).
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        k_fn_v,
+                        post_arm_k_1_closure_ptr,
+                        24,
+                    );
+
+                    // post_arm_k_1's func_addr.
+                    let post_arm_k_1_fn_ref = module
+                        .declare_func_in_func(chain.post_arm_k_1_func_id, lowerer.builder.func);
+                    let post_arm_k_1_fn_addr = lowerer
+                        .builder
+                        .ins()
+                        .func_addr(pointer_ty, post_arm_k_1_fn_ref);
+
+                    // Build Call(k_closure, k_fn, [arg1, post_arm_k_1_closure_ptr,
+                    // post_arm_k_1_fn_addr]) via the trailing-pair convention.
+                    let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                    let call_ns = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                    let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                    let argp_call = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_args_ptr_ref, &[ns_ptr]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
+                    let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        widened_arg1,
+                        argp_v,
+                        POST_ARM_K_ARG_OFF,
+                    );
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        post_arm_k_1_closure_ptr,
+                        argp_v,
+                        POST_ARM_K_CLOSURE_OFF,
+                    );
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        post_arm_k_1_fn_addr,
+                        argp_v,
+                        POST_ARM_K_FN_OFF,
+                    );
+                    ns_ptr
+                } else if let Some(post_arm_k) = &synth.post_arm_k {
                     // --- Slice B: non-tail `k(arg); pure_tail` path ---
                     //
                     // The arm body is `{ let r = k(arg); pure_tail }`.
@@ -4671,6 +5146,418 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             module
                 .define_function(post_arm_k.func_id, &mut ctx)
                 .map_err(|e| format!("define post-arm-k synth fn: {e}"))?;
+            module.clear_context(&mut ctx);
+        }
+    }
+
+    // Plan B Task 55, Phase 4e captures+ Slice C — chained post-arm-k
+    // synth fn definition passes for the multi-let arm body shape
+    // `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }` of
+    // `resumes: many` effects.
+    //
+    // post_arm_k_1: receives r1 from args_ptr[0]; reads (k_closure,
+    // k_fn) from closure_ptr at offsets 16/24; allocates
+    // post_arm_k_2's TAG_CLOSURE record capturing r1; lowers
+    // arg2_expr; emits `Call(k_closure, k_fn, [arg2,
+    // post_arm_k_2_closure_ptr, post_arm_k_2_fn_addr])`.
+    //
+    // post_arm_k_2: receives r2 from args_ptr[0]; reads r1 from
+    // closure_ptr at offset 16; lowers tail_expr with both bindings
+    // in env; widens; emits `Done(widened)`.
+    {
+        let post_arm_k_chain_sig = cps_signature(pointer_ty, &module);
+        for synth in &handler_arm_synth {
+            let chain = match &synth.post_arm_k_chain {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // ---- post_arm_k_1 definition pass ----
+            ctx.func.signature = post_arm_k_chain_sig.clone();
+            ctx.func.name = UserFuncName::user(0, chain.post_arm_k_1_func_id.as_u32());
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+                let mut stackmap = StackMapBuilder::new();
+                let block = builder.create_block();
+                builder.append_block_params_for_function_params(block);
+                builder.switch_to_block(block);
+                builder.seal_block(block);
+
+                let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                // block_params[0] = closure_ptr (post_arm_k_1's own
+                // closure record holding [k_closure, k_fn] at offsets
+                // 16/24); block_params[1] = args_ptr (= [r1] from
+                // helper synth-cont's `Call(post_arm_k_1, [synth_cont_result])`);
+                // block_params[2] = args_len (== 1 from the helper
+                // synth-cont's terminal Call dispatch).
+                let post_arm_k_1_closure_ptr = block_params[0];
+                let args_ptr = block_params[1];
+
+                // Read r1 from args_ptr[0], narrow per binding_ty_1.
+                let r1_widened = builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), args_ptr, 0);
+                let r1_value = if chain.binding_ty_1 == types::I64 {
+                    r1_widened
+                } else if chain.binding_ty_1.is_int() && chain.binding_ty_1.bits() < 64 {
+                    builder.ins().ireduce(chain.binding_ty_1, r1_widened)
+                } else {
+                    assert_eq!(
+                        chain.binding_ty_1, pointer_ty,
+                        "codegen Phase 4e captures+ Slice C: unexpected r1 binding \
+                         Cranelift type {:?} for post_arm_k_1 in fn `{}`'s chain",
+                        chain.binding_ty_1, synth.k_name
+                    );
+                    r1_widened
+                };
+
+                // Read (k_closure, k_fn) from post_arm_k_1's
+                // closure_ptr at offsets 16/24.
+                let k_closure_v = builder.ins().load(
+                    pointer_ty,
+                    MemFlags::trusted(),
+                    post_arm_k_1_closure_ptr,
+                    16,
+                );
+                let k_fn_v = builder.ins().load(
+                    pointer_ty,
+                    MemFlags::trusted(),
+                    post_arm_k_1_closure_ptr,
+                    24,
+                );
+
+                let PerFnRefs {
+                    string_new_ref,
+                    println_ref,
+                    panic_arith_ref,
+                    alloc_ref,
+                    int_to_string_ref,
+                    handler_frame_new_ref,
+                    handle_push_ref,
+                    handle_pop_ref,
+                    handler_frame_set_arm_ref,
+                    perform_ref,
+                    run_loop_ref,
+                    next_step_done_ref: _,
+                    next_step_call_ref,
+                    next_step_args_ptr_ref,
+                    continuation_identity_ref,
+                    handler_arm_refs_per_handle,
+                    user_fn_refs,
+                    lit_gvs,
+                    div_zero_gv,
+                    mod_zero_gv,
+                } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
+
+                let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                env.insert(chain.binding_name_1.clone(), r1_value);
+
+                let mut lowerer = Lowerer {
+                    builder,
+                    stackmap: &mut stackmap,
+                    env,
+                    pointer_ty,
+                    closure_ptr: post_arm_k_1_closure_ptr,
+                    lit_gvs,
+                    div_zero_gv,
+                    mod_zero_gv,
+                    string_new_ref,
+                    println_ref,
+                    panic_arith_ref,
+                    alloc_ref,
+                    int_to_string_ref,
+                    handler_frame_new_ref,
+                    handle_push_ref,
+                    handle_pop_ref,
+                    handler_frame_set_arm_ref,
+                    perform_ref,
+                    run_loop_ref,
+                    handler_arm_refs_per_handle,
+                    handler_arm_synth: &handler_arm_synth,
+                    handler_arm_indices: &handler_arm_indices,
+                    continuation_identity_ref,
+                    effect_ids: &checked.effect_ids,
+                    op_ids: &checked.op_ids,
+                    effects: &checked.effects,
+                    user_fn_refs,
+                    user_fns: &user_fns,
+                    type_layouts: &type_layouts,
+                    ctor_index: &ctor_index,
+                    match_scrut_tys: &checked.match_scrut_tys,
+                };
+
+                // Lower arg2_expr (pure; reads `r1` from env if needed).
+                let arg2_value = lowerer.lower_expr(&chain.arg2_expr);
+                let arg2_ty = lowerer.builder.func.dfg.value_type(arg2_value);
+                let widened_arg2 = if arg2_ty == types::I64 {
+                    arg2_value
+                } else if arg2_ty.is_int() && arg2_ty.bits() < 64 {
+                    lowerer.builder.ins().uextend(types::I64, arg2_value)
+                } else {
+                    assert_eq!(
+                        arg2_ty, pointer_ty,
+                        "codegen Phase 4e captures+ Slice C: unexpected arg2 \
+                         Cranelift type {arg2_ty:?} for post_arm_k_1 emit"
+                    );
+                    arg2_value
+                };
+
+                // Allocate post_arm_k_2's TAG_CLOSURE record capturing r1.
+                let count_2: u8 = 2;
+                let bitmap_2: u32 = if chain.binding_kind_1.is_pointer() {
+                    1u32 << 1
+                } else {
+                    0
+                };
+                let header_2: u64 = header_word(TAG_CLOSURE, count_2, bitmap_2);
+                let payload_2_bytes: i64 = 8 + 8;
+                let header_2_v = lowerer.builder.ins().iconst(types::I64, header_2 as i64);
+                let payload_2_v = lowerer.builder.ins().iconst(pointer_ty, payload_2_bytes);
+                let alloc_2_call = lowerer
+                    .builder
+                    .ins()
+                    .call(alloc_ref, &[header_2_v, payload_2_v]);
+                lowerer
+                    .stackmap
+                    .push_placeholder(function_code_offset(&lowerer.builder, alloc_2_call));
+                let post_arm_k_2_closure_ptr = lowerer.builder.inst_results(alloc_2_call)[0];
+                // code_ptr at offset 8 = null.
+                let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                lowerer.builder.ins().store(
+                    MemFlags::trusted(),
+                    null_v,
+                    post_arm_k_2_closure_ptr,
+                    8,
+                );
+                // r1 at offset 16, widened to I64 per kind.
+                let r1_widened_for_store = match chain.binding_kind_1 {
+                    crate::ast::EnvSlotKind::Int => r1_value,
+                    crate::ast::EnvSlotKind::Bool
+                    | crate::ast::EnvSlotKind::Byte
+                    | crate::ast::EnvSlotKind::Unit
+                    | crate::ast::EnvSlotKind::Char => {
+                        lowerer.builder.ins().uextend(types::I64, r1_value)
+                    }
+                    crate::ast::EnvSlotKind::String
+                    | crate::ast::EnvSlotKind::Closure
+                    | crate::ast::EnvSlotKind::User => r1_value,
+                };
+                lowerer.builder.ins().store(
+                    MemFlags::trusted(),
+                    r1_widened_for_store,
+                    post_arm_k_2_closure_ptr,
+                    16,
+                );
+
+                // post_arm_k_2's func_addr.
+                let post_arm_k_2_fn_ref =
+                    module.declare_func_in_func(chain.post_arm_k_2_func_id, lowerer.builder.func);
+                let post_arm_k_2_fn_addr = lowerer
+                    .builder
+                    .ins()
+                    .func_addr(pointer_ty, post_arm_k_2_fn_ref);
+
+                // Build Call(k_closure, k_fn, [arg2,
+                // post_arm_k_2_closure_ptr, post_arm_k_2_fn_addr]).
+                let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                let call_ns = lowerer
+                    .builder
+                    .ins()
+                    .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
+                lowerer
+                    .stackmap
+                    .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                let argp_call = lowerer
+                    .builder
+                    .ins()
+                    .call(next_step_args_ptr_ref, &[ns_ptr]);
+                lowerer
+                    .stackmap
+                    .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
+                let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                lowerer.builder.ins().store(
+                    MemFlags::trusted(),
+                    widened_arg2,
+                    argp_v,
+                    POST_ARM_K_ARG_OFF,
+                );
+                lowerer.builder.ins().store(
+                    MemFlags::trusted(),
+                    post_arm_k_2_closure_ptr,
+                    argp_v,
+                    POST_ARM_K_CLOSURE_OFF,
+                );
+                lowerer.builder.ins().store(
+                    MemFlags::trusted(),
+                    post_arm_k_2_fn_addr,
+                    argp_v,
+                    POST_ARM_K_FN_OFF,
+                );
+                lowerer.builder.ins().return_(&[ns_ptr]);
+                lowerer.builder.finalize();
+            }
+            module
+                .define_function(chain.post_arm_k_1_func_id, &mut ctx)
+                .map_err(|e| format!("define post_arm_k_1 synth fn: {e}"))?;
+            module.clear_context(&mut ctx);
+
+            // ---- post_arm_k_2 definition pass ----
+            ctx.func.signature = post_arm_k_chain_sig.clone();
+            ctx.func.name = UserFuncName::user(0, chain.post_arm_k_2_func_id.as_u32());
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+                let mut stackmap = StackMapBuilder::new();
+                let block = builder.create_block();
+                builder.append_block_params_for_function_params(block);
+                builder.switch_to_block(block);
+                builder.seal_block(block);
+
+                let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                // block_params[0] = closure_ptr (post_arm_k_2's own
+                // closure record holding [r1] at offset 16);
+                // block_params[1] = args_ptr (= [r2] from helper
+                // synth-cont's `Call(post_arm_k_2, [synth_cont_result_2])`);
+                // block_params[2] = args_len (== 1).
+                let post_arm_k_2_closure_ptr = block_params[0];
+                let args_ptr = block_params[1];
+
+                // Read r2 from args_ptr[0], narrow per binding_ty_2.
+                let r2_widened = builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), args_ptr, 0);
+                let r2_value = if chain.binding_ty_2 == types::I64 {
+                    r2_widened
+                } else if chain.binding_ty_2.is_int() && chain.binding_ty_2.bits() < 64 {
+                    builder.ins().ireduce(chain.binding_ty_2, r2_widened)
+                } else {
+                    assert_eq!(
+                        chain.binding_ty_2, pointer_ty,
+                        "codegen Phase 4e captures+ Slice C: unexpected r2 binding \
+                         Cranelift type {:?} for post_arm_k_2 in fn `{}`'s chain",
+                        chain.binding_ty_2, synth.k_name
+                    );
+                    r2_widened
+                };
+
+                // Read r1 from closure_ptr at offset 16, narrow per
+                // binding_kind_1.
+                let r1_widened_load = builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    post_arm_k_2_closure_ptr,
+                    16,
+                );
+                let r1_value = match chain.binding_kind_1 {
+                    crate::ast::EnvSlotKind::Int => r1_widened_load,
+                    crate::ast::EnvSlotKind::Bool
+                    | crate::ast::EnvSlotKind::Byte
+                    | crate::ast::EnvSlotKind::Unit => {
+                        builder.ins().ireduce(types::I8, r1_widened_load)
+                    }
+                    crate::ast::EnvSlotKind::Char => {
+                        builder.ins().ireduce(types::I32, r1_widened_load)
+                    }
+                    crate::ast::EnvSlotKind::String
+                    | crate::ast::EnvSlotKind::Closure
+                    | crate::ast::EnvSlotKind::User => {
+                        if pointer_ty == types::I64 {
+                            r1_widened_load
+                        } else {
+                            builder.ins().ireduce(pointer_ty, r1_widened_load)
+                        }
+                    }
+                };
+
+                let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                env.insert(chain.binding_name_1.clone(), r1_value);
+                env.insert(chain.binding_name_2.clone(), r2_value);
+
+                let PerFnRefs {
+                    string_new_ref,
+                    println_ref,
+                    panic_arith_ref,
+                    alloc_ref,
+                    int_to_string_ref,
+                    handler_frame_new_ref,
+                    handle_push_ref,
+                    handle_pop_ref,
+                    handler_frame_set_arm_ref,
+                    perform_ref,
+                    run_loop_ref,
+                    next_step_done_ref,
+                    next_step_call_ref: _,
+                    next_step_args_ptr_ref: _,
+                    continuation_identity_ref,
+                    handler_arm_refs_per_handle,
+                    user_fn_refs,
+                    lit_gvs,
+                    div_zero_gv,
+                    mod_zero_gv,
+                } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
+
+                let mut lowerer = Lowerer {
+                    builder,
+                    stackmap: &mut stackmap,
+                    env,
+                    pointer_ty,
+                    closure_ptr: post_arm_k_2_closure_ptr,
+                    lit_gvs,
+                    div_zero_gv,
+                    mod_zero_gv,
+                    string_new_ref,
+                    println_ref,
+                    panic_arith_ref,
+                    alloc_ref,
+                    int_to_string_ref,
+                    handler_frame_new_ref,
+                    handle_push_ref,
+                    handle_pop_ref,
+                    handler_frame_set_arm_ref,
+                    perform_ref,
+                    run_loop_ref,
+                    handler_arm_refs_per_handle,
+                    handler_arm_synth: &handler_arm_synth,
+                    handler_arm_indices: &handler_arm_indices,
+                    continuation_identity_ref,
+                    effect_ids: &checked.effect_ids,
+                    op_ids: &checked.op_ids,
+                    effects: &checked.effects,
+                    user_fn_refs,
+                    user_fns: &user_fns,
+                    type_layouts: &type_layouts,
+                    ctor_index: &ctor_index,
+                    match_scrut_tys: &checked.match_scrut_tys,
+                };
+
+                let tail_value = lowerer.lower_expr(&chain.tail_expr);
+                let widened_tail = if chain.tail_ty == types::I64 {
+                    tail_value
+                } else if chain.tail_ty.is_int() && chain.tail_ty.bits() < 64 {
+                    lowerer.builder.ins().uextend(types::I64, tail_value)
+                } else {
+                    assert_eq!(
+                        chain.tail_ty, pointer_ty,
+                        "codegen Phase 4e captures+ Slice C: unexpected post_arm_k_2 \
+                         tail Cranelift type {:?} for fn `{}`'s chain",
+                        chain.tail_ty, synth.k_name
+                    );
+                    tail_value
+                };
+                let done_call = lowerer
+                    .builder
+                    .ins()
+                    .call(next_step_done_ref, &[widened_tail]);
+                lowerer
+                    .stackmap
+                    .push_placeholder(function_code_offset(&lowerer.builder, done_call));
+                let next_step = lowerer.builder.inst_results(done_call)[0];
+                lowerer.builder.ins().return_(&[next_step]);
+                lowerer.builder.finalize();
+            }
+            module
+                .define_function(chain.post_arm_k_2_func_id, &mut ctx)
+                .map_err(|e| format!("define post_arm_k_2 synth fn: {e}"))?;
             module.clear_context(&mut ctx);
         }
     }
@@ -9365,5 +10252,214 @@ mod tests {
             diag.contains("inner") && diag.contains("let"),
             "diagnostic points at inner-let restriction: {diag}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Plan B Task 55, Phase 4e captures+ Slice C — `arm_body_multi_let_
+    // then_pure_tail_shape` unit tests. Pin the shape detector's
+    // match/no-match boundary so a future regression in the multi-let
+    // shape recognition fires precisely.
+    // -----------------------------------------------------------------
+
+    fn slice_c_block_two_lets_with_k_calls(
+        binding_name_1: &str,
+        binding_ty_1: crate::ast::TypeExpr,
+        k_arg_1: crate::ast::Expr,
+        binding_name_2: &str,
+        binding_ty_2: crate::ast::TypeExpr,
+        k_arg_2: crate::ast::Expr,
+        tail: crate::ast::Expr,
+    ) -> crate::ast::Expr {
+        use crate::ast::{Block, Expr, LetStmt, Stmt};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let make_k_call = |arg: Expr| Expr::Call {
+            callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+            args: vec![arg],
+            span: span.clone(),
+        };
+        Expr::Block(Box::new(Block {
+            stmts: vec![
+                Stmt::Let(LetStmt {
+                    name: binding_name_1.to_string(),
+                    ty: binding_ty_1,
+                    value: make_k_call(k_arg_1),
+                    span: span.clone(),
+                }),
+                Stmt::Let(LetStmt {
+                    name: binding_name_2.to_string(),
+                    ty: binding_ty_2,
+                    value: make_k_call(k_arg_2),
+                    span: span.clone(),
+                }),
+            ],
+            tail: Some(tail),
+            span: span.clone(),
+        }))
+    }
+
+    #[test]
+    fn arm_body_multi_let_then_pure_tail_shape_matches_two_lets_with_k_calls() {
+        use crate::ast::{BinOp, Expr, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = slice_c_block_two_lets_with_k_calls(
+            "r1",
+            TypeExpr::Named("Int".to_string(), span.clone()),
+            Expr::IntLit(1, span.clone()),
+            "r2",
+            TypeExpr::Named("Int".to_string(), span.clone()),
+            Expr::IntLit(2, span.clone()),
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r1".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("r2".to_string(), span.clone())),
+                span: span.clone(),
+            },
+        );
+        let m = arm_body_multi_let_then_pure_tail_shape(&body, "k").expect("shape matches");
+        assert_eq!(m.binding_name_1, "r1");
+        assert_eq!(m.binding_name_2, "r2");
+    }
+
+    #[test]
+    fn arm_body_multi_let_then_pure_tail_shape_rejects_single_let() {
+        // Slice B's single-let shape — Slice C detector requires 2 stmts.
+        use crate::ast::{BinOp, Expr, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = slice_b_block_let_k_call_tail(
+            "r",
+            TypeExpr::Named("Int".to_string(), span.clone()),
+            Expr::IntLit(99, span.clone()),
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(1, span.clone())),
+                span: span.clone(),
+            },
+        );
+        assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_multi_let_then_pure_tail_shape_rejects_three_lets() {
+        // Three Lets — Slice C detector requires exactly 2.
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let make_let = |name: &str| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::IntLit(1, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![make_let("r1"), make_let("r2"), make_let("r3")],
+            tail: Some(Expr::Ident("r1".to_string(), span.clone())),
+            span: span.clone(),
+        }));
+        assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_multi_let_then_pure_tail_shape_rejects_first_let_with_non_k_call_value() {
+        // First let's value is `99` (not a `k` call) — Slice C
+        // detector requires both let values to be `k(arg)` calls.
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![
+                Stmt::Let(LetStmt {
+                    name: "r1".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::IntLit(99, span.clone()),
+                    span: span.clone(),
+                }),
+                Stmt::Let(LetStmt {
+                    name: "r2".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::Call {
+                        callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                        args: vec![Expr::IntLit(1, span.clone())],
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                }),
+            ],
+            tail: Some(Expr::Ident("r1".to_string(), span.clone())),
+            span: span.clone(),
+        }));
+        assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_multi_let_then_pure_tail_shape_rejects_block_without_tail() {
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let make_let = |name: &str| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::IntLit(1, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![make_let("r1"), make_let("r2")],
+            tail: None,
+            span: span.clone(),
+        }));
+        assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_multi_let_then_pure_tail_shape_rejects_different_k_names_in_lets() {
+        // Each Let's value must invoke the SAME `k_name`. If the
+        // first invokes `k` and the second invokes `j`, Slice C
+        // rejects (the second isn't a captured-continuation invocation).
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![
+                Stmt::Let(LetStmt {
+                    name: "r1".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::Call {
+                        callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                        args: vec![Expr::IntLit(1, span.clone())],
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                }),
+                Stmt::Let(LetStmt {
+                    name: "r2".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::Call {
+                        callee: Box::new(Expr::Ident("j".to_string(), span.clone())),
+                        args: vec![Expr::IntLit(2, span.clone())],
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                }),
+            ],
+            tail: Some(Expr::Ident("r1".to_string(), span.clone())),
+            span: span.clone(),
+        }));
+        // Detector with k_name = "k": 2nd let invokes "j", not "k", reject.
+        assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
     }
 }

@@ -3057,3 +3057,64 @@ fn slice_b_arm_body_post_arm_k_tail_referencing_k_is_rejected_at_codegen() {
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+#[test]
+fn slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_args() {
+    // Plan B Task 55, Phase 4e captures+ Slice C — multi-shot `k`
+    // via the multi-let arm body shape `{ let r1 = k(arg1); let
+    // r2 = k(arg2); pure_tail }` for a `resumes: many` effect.
+    //
+    // The arm body invokes `k` twice with different args; each
+    // invocation drives the helper's synth-cont independently and
+    // produces a separate result. The pure tail combines both.
+    //
+    // helper:
+    //   `let b: Bool = perform Choose.flip(); if b then 1 else 0`
+    //   helper's body is the LetBindThenTail shape from PR #26's
+    //   `a5ee4c6` slice. helper synth-cont reads b from args_ptr[0],
+    //   computes the tail (1 if b, else 0), dispatches
+    //   Call(post_arm_k_*, [tail_value]).
+    //
+    // arm body:
+    //   `Choose.flip(k) => { let r1: Int = k(true); let r2: Int =
+    //                        k(false); r1 + r2 }`
+    //   - arm fn invokes k(true): packs Call(k_closure, k_fn, [true,
+    //     post_arm_k_1_closure, post_arm_k_1_fn]) where
+    //     post_arm_k_1_closure captures (k_closure, k_fn).
+    //   - helper synth-cont reads b=true, returns 1, dispatches
+    //     Call(post_arm_k_1, [1]).
+    //   - post_arm_k_1 reads r1=1, reads (k_closure, k_fn) from its
+    //     closure_ptr, allocates post_arm_k_2's closure with r1=1,
+    //     packs Call(k_closure, k_fn, [false, post_arm_k_2_closure,
+    //     post_arm_k_2_fn]).
+    //   - helper synth-cont reads b=false, returns 0, dispatches
+    //     Call(post_arm_k_2, [0]).
+    //   - post_arm_k_2 reads r2=0, reads r1=1 from closure_ptr,
+    //     computes r1 + r2 = 1, returns Done(1).
+    //
+    // Expected stdout: "1\n".
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_choose_multi_shot");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1\n",
+        "Slice C multi-shot: arm invokes k(true) → r1=1 (helper's tail with \
+         b=true), then k(false) → r2=0 (helper's tail with b=false); arm \
+         returns r1+r2 = 1. stderr={stderr:?}"
+    );
+}
