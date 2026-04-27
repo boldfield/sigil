@@ -106,37 +106,56 @@ struct UserFnEntry {
 /// Plan B Task 55, Phase 4e — calling-convention selection for a
 /// user-defined fn.
 ///
-/// `Native` corresponds to the existing closure-convention signature
+/// **Naming note (PR #26 should-fix #3 at `a2840b6`):** these
+/// variants name the *runtime calling shape*, not the colorer's
+/// classification. A fn classified [`crate::color::Color::Cps`]
+/// can still get `UserFnAbi::Sync` (when its body shape isn't
+/// supported by the CPS body lowering yet — e.g., a CPS-color
+/// `main` with multiple stmts). The two namespaces are
+/// deliberately orthogonal: `Color` is what the analysis says,
+/// `UserFnAbi` is what codegen will actually emit. Don't conflate
+/// `UserFnAbi::Sync` with `Color::Native`.
+///
+/// `Sync` corresponds to the existing closure-convention signature
 /// every user fn has used since Plan A2 task 32:
 /// `(closure_ptr, user_arg1, ..., user_argN) -> ret_ty`. The fn
 /// body is lowered through the standard [`Lowerer`] path, with
 /// `lower_perform_non_io_to_value` driving `sigil_run_loop`
 /// synchronously at non-IO perform sites (the Phase 4d MVP shape).
+/// All `Color::Native` fns and any `Color::Cps` fn whose body
+/// shape isn't supported by the CPS body lowering yet get this
+/// ABI and remain on the synchronous path.
 ///
 /// `Cps` corresponds to the uniform CPS calling convention
 /// (`cps_signature`): `(closure_ptr, args_ptr, args_len) -> *mut
 /// NextStep`. The fn body emits a `NextStep` directly — for the
-/// `is_simple_tail_perform_body` shape, this is just
-/// `sigil_perform(...)` returning its NextStep. The fn's caller
-/// drives `sigil_run_loop` (when called from a Native fn via the
-/// inlined wrapper) or returns the NextStep up to the surrounding
-/// trampoline (when called from a CPS fn).
+/// `is_simple_tail_perform_with_pure_args_body` shape, this is
+/// just `sigil_perform(...)` returning its NextStep. The fn's
+/// caller drives `sigil_run_loop` (when called from a `Sync` fn
+/// via the inlined wrapper) or returns the NextStep up to the
+/// surrounding trampoline (when called from a `Cps` fn).
 ///
 /// Selection rule (per [`compute_user_fn_abi`]): a fn is `Cps` iff
 /// it is colored CPS by [`crate::color::ColoredProgram`] AND its
 /// body matches a shape codegen can lower in CPS form (initially:
-/// only [`is_simple_tail_perform_body`]). All other fns — including
-/// CPS-color fns whose body shape isn't yet supported — get
-/// `Native` and continue to use the synchronous-`run_loop` path.
-/// The synchronous path is correct under tail-position perform
-/// shapes (the Phase 4d MVP guarantee) but has the discard-`k`
-/// cross-call-boundary correctness gap that Phase 4e closes once
-/// the lambda-lifting machinery (a later commit on this branch)
-/// covers more body shapes.
+/// only [`is_simple_tail_perform_with_pure_args_body`]). All
+/// other fns — including CPS-color fns whose body shape isn't
+/// yet supported — get `Sync` and continue to use the
+/// synchronous-`run_loop` path. The synchronous path is correct
+/// under tail-position perform shapes (the Phase 4d MVP guarantee)
+/// but has the discard-`k` cross-call-boundary correctness gap
+/// that Phase 4e closes once the lambda-lifting machinery (a
+/// later commit on this branch) covers more body shapes.
+//
+// `#[allow(dead_code)]`: the enum variants are constructed and
+// stored on `UserFnEntry::abi`, but no code reads them in a `match`
+// yet. The transitional attribute is removed in the next commit on
+// this branch (signature selection), where the user-fn pre-pass
+// gates signature declaration on this field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 enum UserFnAbi {
-    Native,
+    Sync,
     Cps,
 }
 
@@ -145,7 +164,7 @@ enum UserFnAbi {
 ///
 /// Returns [`UserFnAbi::Cps`] iff `name` is colored CPS by `colored`
 /// AND `body` matches a shape codegen can lower in CPS form. At
-/// HEAD that shape is exactly [`is_simple_tail_perform_body`] —
+/// HEAD that shape is exactly [`is_simple_tail_perform_with_pure_args_body`] —
 /// future commits widen the predicate as the body lowering covers
 /// more shapes (stmts before tail perform, conditional/match in
 /// tail position, eventually arbitrary CPS-color bodies via the
@@ -167,10 +186,10 @@ fn compute_user_fn_abi(
     body: &crate::ast::Block,
     colored: &ColoredProgram,
 ) -> UserFnAbi {
-    if colored.needs_cps_transform(name) && is_simple_tail_perform_body(body) {
+    if colored.needs_cps_transform(name) && is_simple_tail_perform_with_pure_args_body(body) {
         UserFnAbi::Cps
     } else {
-        UserFnAbi::Native
+        UserFnAbi::Sync
     }
 }
 
@@ -4902,18 +4921,39 @@ fn cps_signature(pointer_ty: Type, module: &ObjectModule) -> Signature {
 }
 
 /// Plan B Task 55, Phase 4e — does this fn body match the **simple
-/// tail perform** shape that the first slice of CPS body lowering
-/// supports?
+/// tail perform with pure args** shape that the first slice of CPS
+/// body lowering supports?
 ///
-/// A body is "simple tail perform" iff its statement list is empty
-/// AND its tail is a non-IO [`crate::ast::Expr::Perform`]. This is
-/// the strictest CPS-color body shape: lowering emits a single
-/// `sigil_perform(effect_id, op_id, args_ptr, args_len,
+/// A body matches iff:
+///
+/// 1. Its statement list is empty.
+/// 2. Its tail is a non-IO [`crate::ast::Expr::Perform`].
+/// 3. **Every arg of the perform is pure** — see [`expr_is_pure`].
+///    Calls (which may target CPS-color callees that yield to the
+///    trampoline), nested performs, lambdas, closure records, and
+///    handle expressions are all rejected; literals, identifiers,
+///    arithmetic, and conditionals over pure sub-expressions are
+///    accepted.
+///
+/// This is the strictest CPS-color body shape: lowering emits a
+/// single `sigil_perform(effect_id, op_id, args_ptr, args_len,
 /// k_closure_loaded, k_fn_loaded)` and returns the resulting
 /// `*mut NextStep` directly. No continuation closures, no lambda-
 /// lifting, no synthetic post-yield fn IDs needed — the
 /// caller-supplied `(k_closure, k_fn)` pair (loaded from the fn's
 /// `args_ptr` slots) becomes the continuation for the perform site.
+///
+/// **Why arg purity matters.** Without this check, a body like
+/// `perform E.op(other_cps_helper())` would classify as eligible.
+/// But evaluating `other_cps_helper()` synchronously inside a fn
+/// that's already returning `*mut NextStep` is impossible — the
+/// callee yields to the trampoline before its result is available.
+/// The arg-purity check rejects such bodies up front so codegen
+/// never emits incomplete CPS-form output. Reviewer-flagged in
+/// PR #26 mid-flight at `a2840b6` (must-fix #2): the prior
+/// "args may be arbitrary pure expressions" doc-only contract
+/// without an enforcement check was the kind of structural debt
+/// that gets paid through bug bisects.
 ///
 /// **Why this carve-out exists.** The full Phase 4e roadmap needs
 /// lambda-lifting machinery (closure-convert side-table extension
@@ -4930,29 +4970,115 @@ fn cps_signature(pointer_ty: Type, module: &ObjectModule) -> Signature {
 ///    flow into the perform's args without crossing a yield.
 /// 2. Conditional / match in tail position whose every branch is
 ///    itself a simple-tail-perform body.
-/// 3. Arbitrary CPS-color bodies via the synthetic-continuation
-///    closure pre-pass.
+/// 3. Calls in args via lambda-lifting (the synthetic-continuation
+///    closure pre-pass).
+/// 4. Arbitrary CPS-color bodies via the same pre-pass.
 ///
-/// The classifier returns `false` for any body that has stmts, for
-/// IO performs (which use the synchronous `lower_perform` path
-/// regardless of color), and for non-perform tail expressions
-/// (which need the lambda-lifting pipeline). It is conservative —
-/// false negatives are acceptable (force the body through the
-/// existing native-ABI path), false positives are not (would cause
-/// codegen to emit incomplete CPS-form output).
+/// The classifier is conservative — false negatives are acceptable
+/// (force the body through the existing native-ABI path), false
+/// positives are not (would cause codegen to emit incomplete
+/// CPS-form output).
 ///
 /// Used by [`compute_user_fn_abi`] (the user-fn pre-pass ABI-
 /// selection helper) to decide whether to declare the fn with the
 /// [`cps_signature`] CPS ABI or with the existing native ABI. The
 /// transitional `#[allow(dead_code)]` from `76c17ae` is removed
 /// at this commit — the function is now consumed.
-fn is_simple_tail_perform_body(body: &crate::ast::Block) -> bool {
+fn is_simple_tail_perform_with_pure_args_body(body: &crate::ast::Block) -> bool {
     if !body.stmts.is_empty() {
         return false;
     }
     match &body.tail {
-        Some(crate::ast::Expr::Perform(p)) => p.effect != "IO",
+        Some(crate::ast::Expr::Perform(p)) => {
+            if p.effect == "IO" {
+                return false;
+            }
+            p.args.iter().all(expr_is_pure)
+        }
         _ => false,
+    }
+}
+
+/// Plan B Task 55, Phase 4e — is this expression pure for the
+/// purposes of [`is_simple_tail_perform_with_pure_args_body`]'s
+/// arg-purity check?
+///
+/// "Pure" here means: evaluating the expression does NOT require
+/// yielding to the trampoline (so the synchronous CPS-ABI body
+/// lowering can evaluate it inline before building the perform's
+/// NextStep). Literals, identifiers, closure-env loads, and
+/// recursive compounds over pure sub-expressions are pure. Calls
+/// (may target CPS callees), performs (yield by definition), and
+/// lambdas/closure records (allocate but also indicate first-class
+/// fn values that may need their own CPS treatment downstream) are
+/// not.
+///
+/// Conservative: `Expr::Call` is rejected unconditionally even
+/// though calls to Native-color callees are technically safe. The
+/// alternative (color-aware purity) requires the colored program
+/// at the analysis site, which the classifier doesn't have access
+/// to. False negatives are acceptable; rejecting `int_to_string`
+/// in a perform's args means the surrounding fn falls through to
+/// the native-ABI path, which lowers correctly via the existing
+/// synchronous shape.
+fn expr_is_pure(e: &crate::ast::Expr) -> bool {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::Ident(..)
+        | Expr::ClosureEnvLoad { .. } => true,
+        Expr::Binary { lhs, rhs, .. } => expr_is_pure(lhs) && expr_is_pure(rhs),
+        Expr::Unary { operand, .. } => expr_is_pure(operand),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => expr_is_pure(cond) && block_is_pure(then_block) && block_is_pure(else_block),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => expr_is_pure(scrutinee) && arms.iter().all(|a| expr_is_pure(&a.body)),
+        Expr::Block(b) => block_is_pure(b),
+        Expr::RecordLit { fields, .. } => fields.iter().all(|f| expr_is_pure(&f.value)),
+        // Reject any yield-able shape and any first-class-fn-value
+        // construction (lambdas / closure records). Conservative; a
+        // future commit could allow lambdas if it's clear they don't
+        // need CPS treatment downstream.
+        Expr::Call { .. }
+        | Expr::Perform(_)
+        | Expr::Handle { .. }
+        | Expr::Lambda { .. }
+        | Expr::ClosureRecord { .. } => false,
+    }
+}
+
+/// Helper for [`expr_is_pure`]: a [`crate::ast::Block`] is pure iff
+/// every stmt and the tail are pure. `Stmt::Perform` is always
+/// rejected (yield by definition). Used recursively to cover the
+/// `Expr::If` / `Expr::Match` / `Expr::Block` arms of `expr_is_pure`.
+fn block_is_pure(b: &crate::ast::Block) -> bool {
+    use crate::ast::Stmt;
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                if !expr_is_pure(&l.value) {
+                    return false;
+                }
+            }
+            Stmt::Expr(e) => {
+                if !expr_is_pure(e) {
+                    return false;
+                }
+            }
+            Stmt::Perform(_) => return false,
+        }
+    }
+    match &b.tail {
+        Some(t) => expr_is_pure(t),
+        None => true,
     }
 }
 
@@ -5201,7 +5327,7 @@ mod tests {
 
     // ---------------- Plan B Task 55, Phase 4e — body-shape classifier
     //
-    // Pins `is_simple_tail_perform_body` for the body shapes the
+    // Pins `is_simple_tail_perform_with_pure_args_body` for the body shapes the
     // first slice of CPS body lowering supports vs. rejects. The
     // classifier identifies bodies that don't need lambda-lifting:
     // empty stmts + tail = non-IO `Expr::Perform`. Pure analysis at
@@ -5222,7 +5348,7 @@ mod tests {
             })),
             span,
         };
-        assert!(is_simple_tail_perform_body(&body));
+        assert!(is_simple_tail_perform_with_pure_args_body(&body));
     }
 
     #[test]
@@ -5244,7 +5370,7 @@ mod tests {
             })),
             span,
         };
-        assert!(is_simple_tail_perform_body(&body));
+        assert!(is_simple_tail_perform_with_pure_args_body(&body));
     }
 
     #[test]
@@ -5266,7 +5392,7 @@ mod tests {
             })),
             span,
         };
-        assert!(!is_simple_tail_perform_body(&body));
+        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
     }
 
     #[test]
@@ -5295,7 +5421,7 @@ mod tests {
             })),
             span,
         };
-        assert!(!is_simple_tail_perform_body(&body));
+        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
     }
 
     #[test]
@@ -5308,7 +5434,7 @@ mod tests {
             tail: Some(Expr::IntLit(42, span.clone())),
             span,
         };
-        assert!(!is_simple_tail_perform_body(&body));
+        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
     }
 
     #[test]
@@ -5321,14 +5447,105 @@ mod tests {
             tail: None,
             span,
         };
-        assert!(!is_simple_tail_perform_body(&body));
+        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+    }
+
+    #[test]
+    fn perform_with_call_arg_is_not_simple_tail_perform_with_pure_args() {
+        // PR #26 mid-flight at a2840b6 must-fix #2: the classifier
+        // must reject a perform whose args contain a call. Calls
+        // may target CPS-color callees that yield to the
+        // trampoline, which is incompatible with the synchronous
+        // CPS body lowering this classifier gates. Synthetic AST
+        // because we want to exercise the purity check directly,
+        // independent of typecheck.
+        use crate::ast::{Block, Expr, PerformExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: vec![Expr::Call {
+                    callee: Box::new(Expr::Ident("some_helper".to_string(), span.clone())),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }],
+                span: span.clone(),
+            })),
+            span,
+        };
+        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+    }
+
+    #[test]
+    fn perform_with_perform_arg_is_not_simple_tail_perform_with_pure_args() {
+        // Similar to above but with a perform inside another
+        // perform's args. The inner perform yields, so the outer
+        // can't be evaluated synchronously inside a CPS-ABI body.
+        use crate::ast::{Block, Expr, PerformExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: vec![Expr::Perform(PerformExpr {
+                    effect: "Other".to_string(),
+                    op: "boom".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                })],
+                span: span.clone(),
+            })),
+            span,
+        };
+        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+    }
+
+    #[test]
+    fn perform_with_pure_compound_arg_is_simple_tail_perform_with_pure_args() {
+        // Recursive purity: pure compound (binary, conditional)
+        // over pure leaves is still pure. `perform E.op(if true {
+        // 1 } else { 2 })` qualifies.
+        use crate::ast::{Block, Expr, PerformExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let then_block = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::IntLit(1, span.clone())),
+            span: span.clone(),
+        };
+        let else_block = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::IntLit(2, span.clone())),
+            span: span.clone(),
+        };
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: vec![Expr::If {
+                    cond: Box::new(Expr::BoolLit(true, span.clone())),
+                    then_block: Box::new(then_block),
+                    else_block: Box::new(else_block),
+                    span: span.clone(),
+                }],
+                span: span.clone(),
+            })),
+            span,
+        };
+        assert!(is_simple_tail_perform_with_pure_args_body(&body));
     }
 
     // ---------------- Plan B Task 55, Phase 4e — ABI selection
     //
     // Pins `compute_user_fn_abi`'s combination rule: a fn is
     // `UserFnAbi::Cps` iff the colorer marks it CPS AND its body
-    // matches `is_simple_tail_perform_body`. The selector exists so
+    // matches `is_simple_tail_perform_with_pure_args_body`. The selector exists so
     // future signature-declaration changes (next commit) consult it
     // rather than re-deriving the rule inline.
     //
@@ -5378,7 +5595,7 @@ mod tests {
         let body = body_of(&prog, "main");
         assert_eq!(
             compute_user_fn_abi("main", &body, &colored),
-            UserFnAbi::Native
+            UserFnAbi::Sync
         );
     }
 
@@ -5386,7 +5603,7 @@ mod tests {
     fn compute_user_fn_abi_cps_for_simple_tail_perform_helper() {
         // helper has a single tail-position perform; row contains
         // non-IO effect → intrinsic CPS color. Body shape matches
-        // `is_simple_tail_perform_body`. Combined: Cps.
+        // `is_simple_tail_perform_with_pure_args_body`. Combined: Cps.
         let src = "effect E { op: () -> Int }\n\
                    fn helper() -> Int ![E] { perform E.op() }\n\
                    fn main() -> Int ![IO] {\n  \
@@ -5428,27 +5645,31 @@ mod tests {
         // isn't supported by the simple-tail-perform classifier.
         assert_eq!(
             compute_user_fn_abi("main", &main_body, &colored),
-            UserFnAbi::Native,
+            UserFnAbi::Sync,
             "main is CPS-color but has complex body → Native ABI"
         );
     }
 
     #[test]
-    fn compute_user_fn_abi_native_for_native_color_with_simple_tail_perform_body() {
-        // Hypothetical: a fn whose body shape matches
-        // is_simple_tail_perform_body but whose row is `![]`. The
-        // colorer would classify this Native (no perform of non-IO
-        // effect at the type level). Synthetic — typecheck would
-        // reject this in real code (E0042: unhandled effect), but
-        // the codegen-side accessor must remain robust against
-        // post-mono synthetic programs. compute_user_fn_abi gates
-        // on color first; if Native, returns Native regardless of
-        // body shape.
+    fn compute_user_fn_abi_cps_for_intrinsic_perform_in_empty_row_synthetic() {
+        // Renamed from the prior misleading
+        // `..._native_for_native_color_with_simple_tail_perform_body`
+        // (PR #26 mid-flight at a2840b6 must-fix #1a). Despite the
+        // synthetic fn having empty effects row, the colorer
+        // classifies it CPS because `find_non_io_perform_in_block`
+        // walks the body and taints on the perform of `Raise.fail`.
+        // The synthetic shape is unreachable through the real
+        // pipeline (typecheck rejects with E0042: unhandled
+        // effect), but the codegen-side accessor must remain
+        // robust against post-mono synthetic programs.
         //
-        // We construct this synthetically using infer_colors on a
-        // hand-built MonoProgram (mirroring color::tests pattern)
-        // — the pipeline path can't reach this state because
-        // typecheck blocks it.
+        // What this test pins: when the colorer says CPS (for any
+        // reason — row, body taint, SCC bridge), `compute_user_fn_
+        // abi` checks the body shape and returns Cps when both
+        // gates pass. Combined with
+        // `..._sync_when_color_native_short_circuits_regardless_of_
+        // body_shape` below, the two together exercise both
+        // positive arms of the `&&` in `compute_user_fn_abi`.
         use crate::ast::{Block, Expr, FnDecl, Item, PerformExpr, Program, TypeExpr};
         use crate::elaborate::AnfProgram;
         use crate::errors::Span;
@@ -5471,7 +5692,6 @@ mod tests {
             generic_params: Vec::new(),
             params: Vec::new(),
             return_type: TypeExpr::Named("Int".to_string(), span.clone()),
-            // Empty effects row → colorer says Native.
             effects: Vec::new(),
             effect_row_var: None,
             body: body.clone(),
@@ -5498,15 +5718,96 @@ mod tests {
         let anf = AnfProgram { checked };
         let mono = MonoProgram { anf };
         let colored = crate::color::infer_colors(mono);
-        // Sanity: the synthetic fn is Native (empty row, the local
-        // walk skips Perform sites for non-fn-row purposes... wait,
-        // actually `find_non_io_perform_in_block` DOES walk and
-        // would taint as CPS via "performs Raise.fail" rule).
         assert_eq!(
             compute_user_fn_abi("f", &body, &colored),
             UserFnAbi::Cps,
-            "intrinsic perform makes f CPS even with empty row \
-             (color.rs's find_non_io_perform_in_block taint)"
+            "intrinsic perform of non-IO effect taints the fn as CPS via \
+             find_non_io_perform_in_block; combined with the simple-tail-\
+             perform body shape, compute_user_fn_abi returns Cps"
+        );
+    }
+
+    #[test]
+    fn compute_user_fn_abi_sync_when_color_native_short_circuits_regardless_of_body_shape() {
+        // PR #26 mid-flight at a2840b6 must-fix #1b: pin that
+        // `compute_user_fn_abi` short-circuits on `Color::Native`
+        // and returns `UserFnAbi::Sync` regardless of body shape.
+        // The previous test infrastructure routes through
+        // `infer_colors`, where any non-IO perform in a body taints
+        // the fn CPS — leaving the Native short-circuit untested.
+        //
+        // Bypass `infer_colors` and construct a `ColoredProgram`
+        // directly with a synthetic Native classification for a fn
+        // whose body IS simple-tail-perform. If a future refactor
+        // reordered the `&&` in `compute_user_fn_abi` (body-gate
+        // before color-gate), this test would fail.
+        use crate::ast::{Block, Expr, FnDecl, Item, PerformExpr, Program, TypeExpr};
+        use crate::color::{Color, ColoredProgram};
+        use crate::elaborate::AnfProgram;
+        use crate::errors::Span;
+        use crate::monomorphize::MonoProgram;
+        use crate::typecheck::CheckedProgram;
+        let span = Span::synthetic("test.sigil");
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            })),
+            span: span.clone(),
+        };
+        let fn_decl = FnDecl {
+            name: "f".to_string(),
+            name_span: span.clone(),
+            generic_params: Vec::new(),
+            params: Vec::new(),
+            return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            body: body.clone(),
+            span: span.clone(),
+        };
+        let program = Program {
+            items: vec![Item::Fn(Box::new(fn_decl))],
+            file: "test.sigil".to_string(),
+        };
+        let checked = CheckedProgram {
+            program,
+            string_literals: Vec::new(),
+            lambda_captures: Vec::new(),
+            types: std::collections::BTreeMap::new(),
+            match_scrut_tys: std::collections::BTreeMap::new(),
+            fn_schemes: std::collections::BTreeMap::new(),
+            call_site_instantiations: std::collections::BTreeMap::new(),
+            ctor_site_instantiations: std::collections::BTreeMap::new(),
+            effects: std::collections::BTreeMap::new(),
+            effect_ids: std::collections::BTreeMap::new(),
+            op_ids: std::collections::BTreeMap::new(),
+            handle_arm_captures: std::collections::BTreeMap::new(),
+        };
+        let anf = AnfProgram { checked };
+        let mono = MonoProgram { anf };
+        // Build ColoredProgram manually with `colors[("f")] = Native`,
+        // overriding what `infer_colors` would have returned. This is
+        // the test setup that pins the short-circuit; reordering the
+        // `&&` in `compute_user_fn_abi` to check body shape first
+        // would make this test fail.
+        let colored = ColoredProgram {
+            mono,
+            colors: vec![("f".to_string(), Color::Native)],
+            reasons: vec![("f".to_string(), "test: forced Native".to_string())],
+        };
+        // Sanity: the body IS simple-tail-perform; if not for the
+        // forced-Native classification, the fn would be Cps.
+        assert!(is_simple_tail_perform_with_pure_args_body(&body));
+        // The actual assertion: Sync, because color short-circuits.
+        assert_eq!(
+            compute_user_fn_abi("f", &body, &colored),
+            UserFnAbi::Sync,
+            "Color::Native must short-circuit `compute_user_fn_abi` \
+             regardless of body shape eligibility"
         );
     }
 }
