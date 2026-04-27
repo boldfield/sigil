@@ -3059,6 +3059,59 @@ fn slice_b_arm_body_post_arm_k_tail_referencing_k_is_rejected_at_codegen() {
 }
 
 #[test]
+fn slice_b_post_arm_k_synth_fn_lowered_tail_type_differs_from_op_return_type() {
+    // Pins the Slice B post_arm_k synth fn's "actual lowered tail
+    // Cranelift type vs. pre-stored op return type" fix from
+    // `113b7da`. Without this regression test, a future refactor
+    // that re-introduces a pre-stored `tail_ty = body_ty` (op's
+    // declared return type) would silently break only when the
+    // arm's tail expression type differs from the op's return type.
+    //
+    // Slice B's original e2e tests all used `Raise.fail: () -> Int`
+    // with arm tail also Int — body_ty matched tail_ty so the
+    // bug never surfaced. Slice C's `Choose.flip: () -> Bool` with
+    // arm tail Int incidentally exposed it.
+    //
+    // This test uses Slice B's single-let shape but with op return
+    // type `Bool` and arm tail type `Int` to force the divergence
+    // at the Slice B path specifically:
+    //
+    //   effect Raise { fail: () -> Bool }     // op returns Bool
+    //   helper returns Bool ![Raise]
+    //   arm: Raise.fail(k) => { let r: Bool = k(true); if r { 1 } else { 0 } }
+    //                                          // tail returns Int
+    //
+    // Pre-fix: post_arm_k synth fn would attempt
+    //   uextend.i64 v_int   (where v_int is already I64)
+    // and Cranelift's verifier would reject the invalid widen.
+    //
+    // Post-fix: the synth fn reads `dfg.value_type(tail_value) ==
+    // I64`, takes the no-widen branch, ships terminal `Done(1)`.
+    let src = "effect Raise { fail: () -> Bool }\n\
+               fn helper() -> Bool ![Raise, IO] {\n  \
+                 let b: Bool = perform Raise.fail();\n  \
+                 b\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let r: Bool = k(true);\n      \
+                     if r { 1 } else { 0 }\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_b_post_arm_k_body_ty_neq_tail_ty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1\n",
+        "Slice B body_ty != tail_ty: helper returns Bool, post_arm_k tail \
+         returns Int. r=true → if r {{ 1 }} else {{ 0 }} = 1. stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_args() {
     // Plan B Task 55, Phase 4e captures+ Slice C — multi-shot `k`
     // via the multi-let arm body shape `{ let r1 = k(arg1); let
@@ -3116,5 +3169,157 @@ fn slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_args() {
         "Slice C multi-shot: arm invokes k(true) → r1=1 (helper's tail with \
          b=true), then k(false) → r2=0 (helper's tail with b=false); arm \
          returns r1+r2 = 1. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_c_multi_let_arm_body_with_resumes_one_effect_is_rejected_at_codegen() {
+    // Slice C negative coverage: multi-let arm body shape is
+    // accepted only when the effect is declared `resumes: many`.
+    // For default `resumes: one` effects, the walker rejects with
+    // a Slice-C-pointing diagnostic.
+    //
+    // The typecheck E0220 linearity gate already rejects multi-`k`
+    // invocation in `resumes: one` arms; the codegen-side gate
+    // here mirrors it so the diagnostic surfaces with both the
+    // typecheck framing AND the Slice C framing.
+    let src = "effect Raise { fail: () -> Bool }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let b: Bool = perform Raise.fail();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "slice_c_reject_resumes_one_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_c_reject_resumes_one_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: multi-let arm on `resumes: one` effect. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen() {
+    // Slice C negative coverage: shape detector requires exactly 2
+    // `Stmt::Let`s. 3+ Lets are deferred to a future captures-bearing
+    // extension that generalises the chain to N.
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     let r3: Int = k(true);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "slice_c_reject_three_lets_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_c_reject_three_lets_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: 3-let arm body (Slice C v1 supports only 2). \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn slice_c_choose_multi_shot_with_string_chain_threads_pointer_through_closures() {
+    // Slice C pointer-typed chain variant. The reviewer flagged
+    // (PR #27 mid-flight at 113b7da) that the Slice C e2e test
+    // uses Int + Bool, which doesn't exercise the pointer-typed
+    // path at any of the three SSA-live-across-arena-allocs sites:
+    //   1. arm-fn body emit: `widened_arg1` lives across post_arm_k_1's
+    //      closure-record alloc + next_step_call.
+    //   2. arm-fn body emit: `post_arm_k_1_closure_ptr` (freshly
+    //      heap-alloc'd) lives across next_step_call.
+    //   3. post_arm_k_1 body: `widened_arg2` lives across
+    //      post_arm_k_2's closure-record alloc + next_step_call.
+    //
+    // This test forces String values through the chain by:
+    //   - helper returns String (so r1 and r2 are pointer-typed).
+    //   - r1's binding_kind_1 is `EnvSlotKind::String` → bitmap bit
+    //     1 set in post_arm_k_2's closure record (r1 is GC-rooted).
+    //   - tail returns `r2` (a String).
+    //
+    // If Boehm-precise GC is missing a root at any of the three
+    // sites, the String pointer would dangle after a GC sweep —
+    // either a crash or wrong output. Today the test passes because
+    // the strings are static literals (sigil_string_new returns
+    // pooled refs that don't get collected); a future test
+    // exercising fresh heap String allocations across the chain
+    // would harden this further.
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> String ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { \"yes\" } else { \"no\" }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: String = k(true);\n      \
+                     let r2: String = k(false);\n      \
+                     r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_choose_multi_shot_string");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "no\n",
+        "Slice C String-typed chain: r1=\"yes\" (helper(true)), r2=\"no\" \
+         (helper(false)); tail returns r2 = \"no\". stderr={stderr:?}"
     );
 }

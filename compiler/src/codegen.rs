@@ -4653,9 +4653,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     };
 
                     // Allocate post_arm_k_1's TAG_CLOSURE record
-                    // capturing (k_closure, k_fn). Bitmap: slot 2
-                    // (k_closure) is pointer, slot 3 (k_fn) is not.
+                    // capturing (k_closure, k_fn). Bitmap encoding
+                    // (matching `alloc_arm_closure_record`'s loop
+                    // `bitmap |= 1u32 << (i + 1)`): bit `i + 1`
+                    // marks capture-slot `i` as a GC-tracked
+                    // pointer. Slot 0 is the code_ptr (bit 0;
+                    // always non-pointer), captures start at slot
+                    // 1 (bit 1). Here capture[0] = k_closure
+                    // (pointer; bit 1 set); capture[1] = k_fn
+                    // (non-pointer; no bit).
                     let count: u8 = 3;
+                    // capture-slot 0 (k_closure) is pointer; bit
+                    // index = slot_index + 1 = 1.
                     let bitmap: u32 = 1u32 << 1;
                     let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
                     let payload_bytes: i64 = 8 + 8 * 2;
@@ -5305,8 +5314,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arg2_value
                 };
 
-                // Allocate post_arm_k_2's TAG_CLOSURE record capturing r1.
+                // Allocate post_arm_k_2's TAG_CLOSURE record capturing
+                // r1. Bitmap encoding mirrors the comment on
+                // `post_arm_k_1`'s closure record above: bit `i + 1`
+                // marks capture-slot `i`. Here capture[0] = r1; bit 1
+                // is set if r1's `binding_kind_1` is pointer.
                 let count_2: u8 = 2;
+                // capture-slot 0 (r1) is pointer iff its kind is
+                // pointer; bit index = slot_index + 1 = 1.
                 let bitmap_2: u32 = if chain.binding_kind_1.is_pointer() {
                     1u32 << 1
                 } else {
@@ -5332,22 +5347,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     post_arm_k_2_closure_ptr,
                     8,
                 );
-                // r1 at offset 16, widened to I64 per kind.
-                let r1_widened_for_store = match chain.binding_kind_1 {
-                    crate::ast::EnvSlotKind::Int => r1_value,
-                    crate::ast::EnvSlotKind::Bool
-                    | crate::ast::EnvSlotKind::Byte
-                    | crate::ast::EnvSlotKind::Unit
-                    | crate::ast::EnvSlotKind::Char => {
-                        lowerer.builder.ins().uextend(types::I64, r1_value)
-                    }
-                    crate::ast::EnvSlotKind::String
-                    | crate::ast::EnvSlotKind::Closure
-                    | crate::ast::EnvSlotKind::User => r1_value,
-                };
+                // r1 at offset 16, stored as I64. Use the original
+                // `r1_widened` (pre-narrow) directly — the round-trip
+                // narrow-to-binding_ty-then-widen-back-to-I64 was
+                // wasted work for non-Int captures (Bool/Char/etc.).
+                // For Int captures `r1_value == r1_widened` already.
+                // For pointer captures both are I64 on supported
+                // targets (where pointer_ty == I64). Skipping the
+                // round-trip drops two instructions per non-Int
+                // capture without changing the stored bit pattern.
                 lowerer.builder.ins().store(
                     MemFlags::trusted(),
-                    r1_widened_for_store,
+                    r1_widened,
                     post_arm_k_2_closure_ptr,
                     16,
                 );
@@ -8271,7 +8282,18 @@ fn is_simple_tail_perform_with_pure_args_body(body: &crate::ast::Block) -> bool 
 /// purposes of [`is_simple_tail_perform_with_pure_args_body`]'s
 /// arg-purity check?
 ///
-/// "Pure" here means: evaluating the expression does NOT require
+/// "Pure" here means **non-yield-able and not a call at all** —
+/// NOT "side-effect-free in the usual sense". Specifically, the
+/// classifier rejects every `Expr::Call`, even calls to Native-
+/// color callees that are technically safe to inline (cf. the
+/// "Conservative" paragraph below). Readers who think of "pure"
+/// as "no side effects" will be surprised that
+/// `int_to_string(x)` (a call to a global, side-effect-free in the
+/// usual sense) doesn't pass; the classifier name reflects the
+/// classifier's needs (synchronous evaluation without trampoline
+/// yields), not the conventional meaning.
+///
+/// Evaluating a "pure" (here-defined) expression does NOT require
 /// yielding to the trampoline (so the synchronous CPS-ABI body
 /// lowering can evaluate it inline before building the perform's
 /// NextStep). Literals, identifiers, closure-env loads, and
