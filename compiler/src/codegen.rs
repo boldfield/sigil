@@ -2287,11 +2287,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     let mut handler_arm_synth: Vec<HandlerArmSynth> = Vec::new();
     let mut handler_arm_indices: BTreeMap<Span, Vec<usize>> = BTreeMap::new();
     {
-        let mut cps_arm_sig = Signature::new(isa_call_conv(&module));
-        cps_arm_sig.params.push(AbiParam::new(pointer_ty)); // closure_ptr
-        cps_arm_sig.params.push(AbiParam::new(pointer_ty)); // args_ptr
-        cps_arm_sig.params.push(AbiParam::new(types::I32)); // args_len
-        cps_arm_sig.returns.push(AbiParam::new(pointer_ty)); // *mut NextStep
+        let cps_arm_sig = cps_signature(pointer_ty, &module);
         let arm_synth_ctx = ArmSynthCtx {
             cps_arm_sig: &cps_arm_sig,
             op_ids: &checked.op_ids,
@@ -4759,6 +4755,48 @@ fn isa_call_conv(_m: &ObjectModule) -> isa::CallConv {
     // picks as the default for the host; relying on the default keeps the
     // selection deterministic.
     isa::CallConv::triple_default(&Triple::host())
+}
+
+/// Plan B Task 55, Phase 4d / 4e — uniform CPS calling convention used
+/// by every CPS-form fn callable from the trampoline:
+///
+/// ```text
+/// extern "C" fn(closure_ptr: *const u8, args_ptr: *const u64, args_len: u32) -> *mut NextStep
+/// ```
+///
+/// At HEAD this signature is shared by:
+///
+/// - **Synthetic handler-arm fns** (Phase 3b – 4d MVP) — one per
+///   `Effect.op(args, k) => body` arm; declared in `emit_object`'s
+///   pre-pass that walks `Expr::Handle` sites.
+/// - **The runtime intrinsic `sigil_continuation_identity`** (Phase 4d
+///   MVP) — packs its single u64 arg as a terminal `NextStep::Done`.
+///   Codegen emits its address as `k_fn` at every non-IO perform site.
+///
+/// Phase 4e (in-flight on `plan-b-task-55-phase-4e`) extends usage to:
+///
+/// - **CPS-color user fns** — declared with this signature at the
+///   user-fn pre-pass loop in `emit_object`, driven by
+///   [`crate::color::ColoredProgram::cps_color_user_fns`].
+/// - **Synthesised continuation closures** for non-tail-`k` arms and
+///   non-tail-CPS-call yields in CPS-color user fn bodies — allocated
+///   at the same pre-pass that allocates per-arm CPS fn synths today.
+///
+/// The shared helper exists so a future tweak to the CPS calling
+/// convention (e.g., adding an `effect_id` param for tracing, or a
+/// `flags` slot) lands in one place rather than four. Reusing it for
+/// the user-fn signature pre-pass also makes the colorer-driven ABI
+/// selection's call site read as `cps_signature(pointer_ty)` rather
+/// than re-constructing the same shape inline — keeping the diff
+/// localised when the upcoming Phase 4e codegen-consumes-color commit
+/// adds the new call site.
+fn cps_signature(pointer_ty: Type, module: &ObjectModule) -> Signature {
+    let mut sig = Signature::new(isa_call_conv(module));
+    sig.params.push(AbiParam::new(pointer_ty)); // closure_ptr
+    sig.params.push(AbiParam::new(pointer_ty)); // args_ptr
+    sig.params.push(AbiParam::new(types::I32)); // args_len
+    sig.returns.push(AbiParam::new(pointer_ty)); // *mut NextStep
+    sig
 }
 
 #[cfg(test)]
