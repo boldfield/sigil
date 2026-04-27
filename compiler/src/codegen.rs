@@ -1916,7 +1916,7 @@ impl Default for StackMapBuilder {
 pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), String> {
     // Plan A1 Stage 1 stops at the hello-world shape. Validate that shape
     // up front so codegen can assume it.
-    let checked: &CheckedProgram = &cc.cps.colored.mono.anf.checked;
+    let checked: &CheckedProgram = &cc.colored.mono.anf.checked;
 
     // Plan B task 48 — codegen-entry guard. The verification-debt
     // entry "Codegen path for un-monomorphized generic params" in

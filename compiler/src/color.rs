@@ -63,6 +63,70 @@ pub struct ColoredProgram {
     pub reasons: Vec<(String, String)>,
 }
 
+impl ColoredProgram {
+    /// Plan B Task 55, Phase 4e — does the user fn named `name` need
+    /// CPS-form codegen treatment?
+    ///
+    /// At HEAD this is equivalent to "is `name` CPS-color?", because
+    /// the [`Color::Cps`] classification is exactly the set of fns
+    /// that need CPS calling convention + CPS-aware body lowering.
+    /// Future Phase 4e commits may refine the per-fn decision (e.g.,
+    /// a CPS-color fn whose body has no perform and no CPS-call
+    /// could in principle be emitted as native; Plan B treats this
+    /// as a v2 optimization), but at HEAD the answer matches color
+    /// directly.
+    ///
+    /// Returns `false` for fns not in the colored program (no panic).
+    /// The codegen entry walker is the source of truth for which fns
+    /// reach codegen; this accessor is a query, not an assertion.
+    ///
+    /// **Consumer contract.** Consumers driven by per-fn ABI
+    /// selection should iterate [`Self::cps_color_user_fns`] directly
+    /// (e.g., `for name in colored.cps_color_user_fns()` then look
+    /// up the FuncId keyed by `name`), not query `needs_cps_transform`
+    /// with a name harvested from an AST walk. The latter pattern
+    /// allows a typo to silently classify an unknown name as Native
+    /// (since this method returns `false` for unknown fns by design).
+    /// The codegen-consumes-color commit follows the iterate-the-list
+    /// pattern.
+    pub fn needs_cps_transform(&self, name: &str) -> bool {
+        self.colors
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| matches!(c, Color::Cps))
+            .unwrap_or(false)
+    }
+
+    /// Plan B Task 55, Phase 4e — list CPS-color user fn names in
+    /// program declaration order (matching the order in which they
+    /// appear in [`Self::colors`], which is the post-monomorphization
+    /// program order from `monomorphize::run`).
+    ///
+    /// Used by the codegen-consumes-color commit (next on this branch)
+    /// to iterate the fns that need CPS calling convention. Stable
+    /// ordering matters for reproducibility (Plan A1's reproducibility
+    /// test compares object-file bytes between runs); the underlying
+    /// `colors` Vec preserves program declaration order
+    /// (`color.rs::infer_colors` iterates
+    /// `mono.anf.checked.program.items`), so this accessor preserves
+    /// that. Source declaration order is stronger than alphabetical
+    /// — a future refactor that silently swaps to a BTreeMap-derived
+    /// order (alphabetical-only) would change reproducibility-relevant
+    /// byte sequences without the colorer's tests catching it.
+    pub fn cps_color_user_fns(&self) -> Vec<String> {
+        self.colors
+            .iter()
+            .filter_map(|(name, c)| {
+                if matches!(c, Color::Cps) {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
 /// The only effect treated as "pure" for native classification in
 /// Plan B v1. Plan B Stage 6 keeps this as a special case for the
 /// top-level IO handler shim. Anything else in the row makes the
@@ -1812,5 +1876,153 @@ mod tests {
         // either edge regime.
         assert_eq!(color_of(&cp, "caller"), Color::Native);
         assert_eq!(reason_of(&cp, "caller"), "native: pure row");
+    }
+
+    // ---------------- Plan B Task 55, Phase 4e — accessor methods on
+    // ColoredProgram (relocated from `cps::tests` when the
+    // `CpsProgram` wrapper was deleted as a transitional artifact).
+    //
+    // The Phase 4e roadmap originally landed `needs_cps_transform`
+    // and `cps_color_user_fns` as methods on a `CpsProgram` wrapper
+    // (`a756bd3`). After confirming Option B as the architectural
+    // direction (inline lowering in codegen, not a separate IR
+    // pass), the wrapper carried no CPS-form-specific metadata
+    // and was deleted; the accessors moved here. See the
+    // `[DEVIATION Task 55] Phase 4e — comprehensive` entry's
+    // section 1 update at that commit for the architectural
+    // rationale.
+
+    #[test]
+    fn needs_cps_transform_native_main_returns_false() {
+        let src = r#"
+            fn main() -> Int ![] { 42 }
+        "#;
+        let cp = color_from_src(src);
+        assert!(!cp.needs_cps_transform("main"));
+    }
+
+    #[test]
+    fn needs_cps_transform_unknown_fn_returns_false() {
+        let src = r#"
+            fn main() -> Int ![] { 42 }
+        "#;
+        let cp = color_from_src(src);
+        // Querying a fn that doesn't exist returns false (not a panic).
+        // The codegen entry walker is the source of truth for which fns
+        // reach codegen; this accessor is a query, not an assertion.
+        assert!(!cp.needs_cps_transform("nonexistent_fn"));
+    }
+
+    #[test]
+    fn needs_cps_transform_classifies_cps_color_helper_correctly() {
+        // statement_form_non_io_perform_inside_handle source — the
+        // existing passing e2e test with main calling helper inside
+        // a handle body. helper has row ![E] (intrinsic CPS); main
+        // is CPS via SCC bridge. Verify the accessor returns true
+        // for both.
+        let src = "effect E { op: () -> Int }\n\
+                   fn helper() -> Int ![E] {\n  \
+                     perform E.op();\n  \
+                     42\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let n: Int = handle helper() with { E.op(k) => 99 };\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let cp = color_from_src(src);
+        assert!(cp.needs_cps_transform("helper"));
+        assert!(cp.needs_cps_transform("main"));
+    }
+
+    #[test]
+    fn cps_color_user_fns_lists_program_order_cps_only() {
+        let src = "effect E { op: () -> Int }\n\
+                   fn helper() -> Int ![E] {\n  \
+                     perform E.op();\n  \
+                     42\n\
+                   }\n\
+                   fn pure_helper(n: Int) -> Int ![] { n + 1 }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let n: Int = handle helper() with { E.op(k) => pure_helper(99) };\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let cp = color_from_src(src);
+        let cps_fns = cp.cps_color_user_fns();
+        // helper is intrinsic CPS; main is CPS via bridge to helper;
+        // pure_helper has empty row and no perform → Native. Order
+        // follows program order (helper, pure_helper, main).
+        assert_eq!(cps_fns, vec!["helper".to_string(), "main".to_string()]);
+    }
+
+    #[test]
+    fn cps_color_user_fns_pins_multi_level_scc_bridge_ordering() {
+        // a → b → c, where c is intrinsically CPS, and verify
+        // cps_color_user_fns lists all three in program declaration
+        // order. Pins the transitive-closure invariant for ordering,
+        // which is load-bearing if the codegen-consumes-color commit
+        // relies on the order. The 2-fn test above
+        // (`cps_color_user_fns_lists_program_order_cps_only`)
+        // exercises a single-hop bridge; this exercises three hops
+        // and confirms the program-declaration-order property holds
+        // through transitive classification (not just directly-
+        // intrinsic-CPS members).
+        let src = "effect E { op: () -> Int }\n\
+                   fn c() -> Int ![E] {\n  \
+                     perform E.op()\n\
+                   }\n\
+                   fn b() -> Int ![E] {\n  \
+                     c()\n\
+                   }\n\
+                   fn a() -> Int ![E] {\n  \
+                     b()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let cp = color_from_src(src);
+        let cps_fns = cp.cps_color_user_fns();
+        // c is intrinsic CPS (row contains E + body performs E.op);
+        // b and a become CPS via SCC bridge (a → b → c). main is
+        // Native (empty row, no perform, no calls). Order follows
+        // source declaration: c, b, a.
+        assert_eq!(
+            cps_fns,
+            vec!["c".to_string(), "b".to_string(), "a".to_string()]
+        );
+    }
+
+    #[test]
+    fn cps_color_user_fns_pins_mutual_recursion_scc_with_cps_bridge() {
+        // a and b mutually recurse; both call c; c performs E.op
+        // (intrinsic CPS). The mutual recursion forms a single SCC
+        // {a, b}; the SCC bridges to c's singleton SCC (which is
+        // CPS). All three end up CPS — a and b via SCC-bridge-to-cps,
+        // c intrinsically. Pins the SCC-collapse + multi-member
+        // ordering invariant: cps_color_user_fns() should list all
+        // SCC members in source declaration order, not just one
+        // representative member.
+        let src = "effect E { op: () -> Int }\n\
+                   fn c() -> Int ![E] {\n  \
+                     perform E.op()\n\
+                   }\n\
+                   fn a() -> Int ![E] {\n  \
+                     let x: Int = c();\n  \
+                     b()\n\
+                   }\n\
+                   fn b() -> Int ![E] {\n  \
+                     let y: Int = c();\n  \
+                     a()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let cp = color_from_src(src);
+        let cps_fns = cp.cps_color_user_fns();
+        // c is intrinsic CPS. a and b are mutually recursive — they
+        // form a single SCC {a, b} which bridges to c's CPS
+        // classification. All three are CPS. Source declaration
+        // order: c, a, b. main is Native (excluded).
+        assert_eq!(
+            cps_fns,
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
     }
 }

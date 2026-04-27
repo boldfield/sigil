@@ -45,13 +45,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ast::{
     Block, EnvSlotKind, Expr, FnDecl, Item, LetStmt, MatchArm, PerformExpr, RecordFieldLit, Stmt,
 };
-use crate::cps::CpsProgram;
+use crate::color::ColoredProgram;
 use crate::errors::Span;
 use crate::typecheck::Ty;
 
 #[derive(Clone, Debug)]
 pub struct ClosureConvertedProgram {
-    pub cps: CpsProgram,
+    pub colored: ColoredProgram,
     /// Per-fn capture summary. Populated for both original and synthetic
     /// items; each entry is `(fn_name, [captured_name, ...])`. The
     /// authoritative per-slot metadata (slot kind, load/store width) lives
@@ -61,12 +61,12 @@ pub struct ClosureConvertedProgram {
     pub captures: Vec<(String, Vec<String>)>,
 }
 
-pub fn convert(mut cps: CpsProgram) -> ClosureConvertedProgram {
+pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
     // Move the per-lambda capture side-table out of the checked program so
     // the rewriter can consume it without tangling borrows with the item
     // list below. The field is not read by any downstream pass.
-    let all_captures = std::mem::take(&mut cps.colored.mono.anf.checked.lambda_captures);
-    let original_items = std::mem::take(&mut cps.colored.mono.anf.checked.program.items);
+    let all_captures = std::mem::take(&mut colored.mono.anf.checked.lambda_captures);
+    let original_items = std::mem::take(&mut colored.mono.anf.checked.program.items);
 
     // Pre-scan for user fn names that would collide with `$lambda_N`
     // AFTER codegen's `$` → `__` mangling. A user fn named
@@ -142,9 +142,9 @@ pub fn convert(mut cps: CpsProgram) -> ClosureConvertedProgram {
         })
         .collect();
 
-    cps.colored.mono.anf.checked.program.items = new_items;
+    colored.mono.anf.checked.program.items = new_items;
 
-    ClosureConvertedProgram { cps, captures }
+    ClosureConvertedProgram { colored, captures }
 }
 
 struct Converter {
@@ -511,12 +511,11 @@ mod tests {
         let anf = crate::elaborate::elaborate(checked);
         let mono = crate::monomorphize::monomorphize(anf);
         let colored = crate::color::infer_colors(mono);
-        let cps = crate::cps::transform(colored);
-        convert(cps)
+        convert(colored)
     }
 
     fn items(cc: &ClosureConvertedProgram) -> &[Item] {
-        &cc.cps.colored.mono.anf.checked.program.items
+        &cc.colored.mono.anf.checked.program.items
     }
 
     fn fn_by_name<'a>(cc: &'a ClosureConvertedProgram, name: &str) -> &'a FnDecl {

@@ -14,7 +14,6 @@ pub mod cli;
 pub mod closure_convert;
 pub mod codegen;
 pub mod color;
-pub mod cps;
 pub mod elaborate;
 pub mod errors;
 pub mod layout;

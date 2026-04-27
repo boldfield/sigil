@@ -248,8 +248,7 @@ fn hello() {
 #[test]
 fn stackmap_section_parses_v0_placeholder() {
     use sigil_compiler::{
-        closure_convert, codegen, color, cps, elaborate, lexer, monomorphize, parser, resolve,
-        typecheck,
+        closure_convert, codegen, color, elaborate, lexer, monomorphize, parser, resolve, typecheck,
     };
     use sigil_runtime::stackmap::{
         parse_section, ParseError, STACKMAP_FLAG_PLACEHOLDER, STACKMAP_VERSION_PLACEHOLDER,
@@ -275,8 +274,7 @@ fn stackmap_section_parses_v0_placeholder() {
     let anf = elaborate::elaborate(checked);
     let mono = monomorphize::monomorphize(anf);
     let colored = color::infer_colors(mono);
-    let cps_ir = cps::transform(colored);
-    let cc = closure_convert::convert(cps_ir);
+    let cc = closure_convert::convert(colored);
 
     let obj_path =
         std::env::temp_dir().join(format!("sigil_e2e_stackmap_{}.o", std::process::id()));
