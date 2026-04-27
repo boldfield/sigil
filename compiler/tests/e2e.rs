@@ -2039,6 +2039,89 @@ fn cps_abi_helper_with_simple_tail_perform_called_from_native_main_returns_arm_v
 }
 
 #[test]
+fn cps_abi_helper_called_twice_from_one_caller_uses_independent_stack_slots() {
+    // Plan B Task 55, Phase 4e — S3 from PR #26 mid-flight at
+    // 33f2231. The native↔CPS interop wrapper at `lower_call`
+    // creates a fresh stack slot per CPS-callee call site (see
+    // `Lowerer::lower_call` Cps arm — `create_sized_stack_slot`
+    // runs inside the match). This test pins that two calls to
+    // the same CPS callee from one caller don't accidentally
+    // share or alias the slot. Aliasing would manifest as one
+    // call's `[null, identity]` being clobbered by the other's,
+    // which (because both write the same values) wouldn't be
+    // observable at runtime — but the slot-allocation count is
+    // a structural property the test pins.
+    //
+    // Two handle expressions, each calling raise_e and discharging
+    // E with different arm values. Expected stdout: each handle's
+    // arm value, both correctly returned.
+    let src = "effect E { op: () -> Int }\n\
+               fn raise_e() -> Int ![E] { perform E.op() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle raise_e() with { E.op(k) => 10 };\n  \
+                 let b: Int = handle raise_e() with { E.op(k) => 20 };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "cps_abi_helper_called_twice_independent_slots");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "10\n20\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn cps_abi_helper_with_bool_return_exercises_ireduce_narrow() {
+    // Plan B Task 55, Phase 4e — S3 from PR #26 mid-flight at
+    // 33f2231. The wrapper's narrow step (`Lowerer::lower_call`
+    // Cps arm at the ret_ty branch) chooses between identity-on-
+    // I64, `ireduce` for narrower-than-I64 ints, and a
+    // `debug_assert_eq!(ret_ty, pointer_ty)` for pointer-typed
+    // returns. The ireduce path wasn't covered by the prior happy-
+    // path test (Int → I64). Bool exercises the I8 narrow.
+    //
+    // helper returns Bool; arm returns `true`. main asserts the
+    // value via an if-expression that prints accordingly.
+    let src = "effect B { op: () -> Bool }\n\
+               fn raise_b() -> Bool ![B] { perform B.op() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Bool = handle raise_b() with { B.op(k) => true };\n  \
+                 if result {\n    \
+                   perform IO.println(\"yes\")\n  \
+                 } else {\n    \
+                   perform IO.println(\"no\")\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "cps_abi_helper_bool_return_ireduce");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "yes\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn cps_abi_helper_with_string_return_exercises_pointer_ret_path() {
+    // Plan B Task 55, Phase 4e — S3 from PR #26 mid-flight at
+    // 33f2231. The wrapper's narrow step takes the
+    // `debug_assert_eq!(ret_ty, pointer_ty)` branch when the
+    // callee returns a pointer-typed value (String, user-type
+    // heap pointer). The trampoline's u64 result is bit-identical
+    // to the pointer value on supported targets (pointer_ty == I64
+    // on x86_64-linux + aarch64-darwin). Pins this branch.
+    //
+    // helper returns String; arm returns a literal. main prints it.
+    let src = "effect S { op: () -> String }\n\
+               fn raise_s() -> String ![S] { perform S.op() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = handle raise_s() with { S.op(k) => \"phase4e\" };\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "cps_abi_helper_string_return_pointer_ret");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "phase4e\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
 #[ignore = "Phase 4e pending: pins the discard-k correctness gap across function-call boundaries; inverts to a normal test (asserting stdout 42, code 0) when Phase 4e ships the colorer's handler-discharge refinement"]
 fn discard_k_handler_does_not_abort_helper_phase_4e_pending() {
     // Plan B Task 55 (Phase 4d MVP) — pinning test for the

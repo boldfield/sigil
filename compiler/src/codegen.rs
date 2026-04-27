@@ -165,26 +165,60 @@ enum UserFnAbi {
 /// lambda-lifting machinery).
 ///
 /// Conservative: false negatives are acceptable (a CPS-color fn
-/// gets `Native` ABI and uses the synchronous-`run_loop` path,
+/// gets `Sync` ABI and uses the synchronous-`run_loop` path,
 /// preserving the Phase 4d MVP behaviour); false positives are not
-/// (would cause incomplete CPS-form codegen output for a body
-/// shape we don't yet handle).
+/// (would cause incomplete CPS-form codegen output OR — pre-D1-fix
+/// — a hard `assert!`-crash in the body emit branch on otherwise-
+/// valid Sigil programs).
 ///
-/// At HEAD this function is called from the user-fn pre-pass loop
-/// in `emit_object`, but its return value is stored in
-/// [`UserFnEntry::abi`] without yet driving signature selection
-/// (still uses the closure-convention shape). The next commit on
-/// this branch consumes the field at signature declaration time.
+/// **D1 must-fix from PR #26 mid-flight at `33f2231`:** the prior
+/// implementation gated on color + body shape only, missing the
+/// downstream codegen restrictions on user-fn arity and tail-perform
+/// arg count. A fn like `fn helper(x: Int) -> Int ![E] { perform
+/// E.op(x) }` (arity-1 user fn, classifier accepts because `x` is
+/// pure) would classify as `Cps` and then crash at the body emit
+/// branch's `assert!(f.params.is_empty())`. The fix gates on those
+/// arities here, so non-supported shapes fall through to `Sync` ABI
+/// cleanly. Both gates are relaxed in the next commit on this
+/// branch (user-arg unpacking + perform-args packing in the CPS
+/// body lowering).
+///
+/// Order of checks matters: color first (cheap), then body shape
+/// (also cheap), then arity gates. A reordering that swapped color
+/// and body-shape would change observable behavior for the
+/// `compute_user_fn_abi_sync_when_color_native_short_circuits_
+/// regardless_of_body_shape` test pinning.
 fn compute_user_fn_abi(
     name: &str,
+    params: &[crate::ast::Param],
     body: &crate::ast::Block,
     colored: &ColoredProgram,
 ) -> UserFnAbi {
-    if colored.needs_cps_transform(name) && is_simple_tail_perform_with_pure_args_body(body) {
-        UserFnAbi::Cps
-    } else {
-        UserFnAbi::Sync
+    if !colored.needs_cps_transform(name) {
+        return UserFnAbi::Sync;
     }
+    if !is_simple_tail_perform_with_pure_args_body(body) {
+        return UserFnAbi::Sync;
+    }
+    // D1 gate: arity-0 user-fn params. Arity-N fns fall through to
+    // Sync ABI; the next slice's user-arg unpacking widens this.
+    if !params.is_empty() {
+        return UserFnAbi::Sync;
+    }
+    // D1 gate: arity-0 tail-perform args. The classifier already
+    // rejected impure args; this rejects ANY args (pure or not).
+    // The next slice's perform-args packing widens this.
+    let perform_args = match &body.tail {
+        Some(crate::ast::Expr::Perform(p)) => &p.args,
+        _ => unreachable!(
+            "is_simple_tail_perform_with_pure_args_body invariant broken: \
+             tail is not Expr::Perform after the body-shape gate accepted"
+        ),
+    };
+    if !perform_args.is_empty() {
+        return UserFnAbi::Sync;
+    }
+    UserFnAbi::Cps
 }
 
 /// Map a surface-syntax `TypeExpr` to the Cranelift IR type codegen uses
@@ -2350,7 +2384,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // field; this commit consumes it for signature selection.
             // The transitional `#[allow(dead_code)]` on
             // `UserFnEntry::abi` is removed at the same time.
-            let abi = compute_user_fn_abi(&f.name, &f.body, &cc.colored);
+            let abi = compute_user_fn_abi(&f.name, &f.params, &f.body, &cc.colored);
             let (sig, param_tys, ret_ty) = match abi {
                 UserFnAbi::Sync => {
                     let mut sig = Signature::new(isa_call_conv(&module));
@@ -2597,28 +2631,30 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // tail-perform via the lambda-lifting machinery) will
             // restructure this branch.
             //
-            // Restrictions for the first slice (this commit), all
-            // tightened by `is_simple_tail_perform_with_pure_args_
-            // body` + by hand assertion below:
+            // Restrictions for the first slice (this commit) are
+            // gated by `compute_user_fn_abi` (D1 from PR #26 mid-
+            // flight at 33f2231):
             //
             //   - User fn has zero params (no user args to unpack).
             //   - The tail perform has zero args (no args buffer to
             //     pack).
             //
-            // Helpers with non-zero arity or performs with args
-            // would route through `UserFnAbi::Sync` today (the
-            // classifier returns false for them at HEAD if the
-            // body has stmts, but a zero-stmt body with non-zero-
-            // arity tail perform does pass the classifier — so the
-            // assertion below catches the gap until the next-slice
-            // commit covers user-arg unpacking).
+            // Both gates land in `compute_user_fn_abi` so non-
+            // supported shapes fall through to `UserFnAbi::Sync`
+            // and use the synchronous run_loop path. The assertions
+            // below are defense-in-depth contract checks against
+            // pre-pass / body-emit drift; they are no longer the
+            // user-facing failure mode for arity-N programs (the D1
+            // gate is). If they fire, `compute_user_fn_abi` and
+            // this branch are out of sync — that's a compiler-
+            // internal invariant violation, not a Sigil program
+            // error.
             if entry.abi == UserFnAbi::Cps {
-                assert!(
+                debug_assert!(
                     f.params.is_empty(),
                     "codegen Phase 4e: CPS-ABI fn `{}` has user params; \
-                     arity-0 user fns are the only CPS-ABI shape supported \
-                     in this commit (next slice covers arity-N user-arg \
-                     unpacking)",
+                     compute_user_fn_abi's D1 gate should have prevented \
+                     this fn from getting CPS ABI",
                     f.name
                 );
                 let body_perform = match &f.body.tail {
@@ -2630,36 +2666,43 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         f.name
                     ),
                 };
-                assert!(
+                debug_assert!(
                     body_perform.args.is_empty(),
                     "codegen Phase 4e: CPS-ABI fn `{}` body's perform has \
-                     {} args; arity-0 performs are the only CPS-ABI shape \
-                     supported in this commit (next slice covers perform-arg \
-                     packing in the CPS body lowering)",
+                     {} args; compute_user_fn_abi's D1 gate should have \
+                     prevented this fn from getting CPS ABI",
                     f.name,
                     body_perform.args.len()
                 );
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 // block_params[0] = closure_ptr (unused at HEAD)
                 let args_ptr = block_params[1];
-                // block_params[2] = args_len (unused — fixed shape)
+                // block_params[2] = args_len; per the cps_signature
+                // convention, this is the user-arg count packed
+                // before the trailing (k_closure, k_fn) pair. At
+                // this slice (arity-0 user fns), the wrapper sends
+                // 0; future arity-N slices will use args_len as
+                // the user-arg unpacking loop bound.
                 let _ = block_params[2];
-                // Load (k_closure, k_fn) from args_ptr[0], args_ptr[1].
-                // The native-of-CPS wrapper at the call site packs
-                // exactly these two slots when the user fn has zero
-                // user args. Future user-arg-unpacking work shifts
-                // these offsets by N*8 where N = user arg count.
+                // Load (k_closure, k_fn) from `args_ptr` at the
+                // user-arg-count-shifted offsets. With user_arg_count
+                // = 0 (the arity-0 restriction enforced by
+                // compute_user_fn_abi), the offsets are 0 and 8.
+                // `k_closure_offset` / `k_fn_offset` keep the
+                // wrapper and body emit in lockstep when arity-N
+                // slices land — see those helpers' docs.
+                let user_arg_count: usize = 0;
                 let k_closure_loaded = builder.ins().load(
                     pointer_ty,
                     cranelift::prelude::MemFlags::new(),
                     args_ptr,
-                    0,
+                    k_closure_offset(user_arg_count),
                 );
                 let k_fn_loaded = builder.ins().load(
                     pointer_ty,
                     cranelift::prelude::MemFlags::new(),
                     args_ptr,
-                    8,
+                    k_fn_offset(user_arg_count),
                 );
 
                 // Resolve effect_id + op_id at fn entry.
@@ -4068,30 +4111,29 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         self.builder.inst_results(call)[0]
                     }
                     UserFnAbi::Cps => {
-                        // First slice supports arity-0 user fns
-                        // only (matching the body emission's
-                        // arity-0 restriction). The pre-pass'
-                        // `compute_user_fn_abi` returns Cps only
-                        // for fns whose body matches `is_simple_
-                        // tail_perform_with_pure_args_body`, which
-                        // by itself doesn't constrain user-fn
-                        // arity — but the body emission asserts
-                        // arity-0. Future commits widen both
-                        // sides together.
-                        assert!(
+                        // The pre-pass' `compute_user_fn_abi` is
+                        // the source of truth for which fns get the
+                        // CPS ABI. The D1 gate there ensures arity-0
+                        // user args + arity-0 perform args; the
+                        // assertion below pins the call-site half
+                        // of that contract (a CPS callee with user
+                        // args means the gate let an arity-N
+                        // through, which would also have crashed at
+                        // body emission). Removable once the
+                        // arity-N slice ships.
+                        debug_assert!(
                             args.is_empty(),
                             "codegen Phase 4e: CPS-ABI callee `{name}` called \
-                             with {} user args; arity-0 calls are the only \
-                             CPS-ABI shape supported in this commit (next \
-                             slice covers arity-N user-arg packing in the \
-                             native\u{2194}CPS wrapper)",
+                             with {} user args; D1 gate in compute_user_fn_abi \
+                             should have prevented this fn from getting CPS ABI",
                             args.len()
                         );
 
                         // Stack slot for `[k_closure, k_fn]` (2 u64
                         // slots = 16 bytes, 8-byte aligned). The
-                        // callee reads these from `args_ptr[0]` and
-                        // `args_ptr[1]`. `k_closure = null` and
+                        // callee reads these from `args_ptr` at
+                        // `k_closure_offset(0)` and `k_fn_offset(0)`
+                        // (= 0 and 8). `k_closure = null` and
                         // `k_fn = sigil_continuation_identity`
                         // mirrors the Phase 4d MVP perform-site
                         // shape: when the trampoline eventually
@@ -4102,6 +4144,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         // directly. Either way the synchronous
                         // wrapper unwinds to `sigil_run_loop`'s
                         // u64 return.
+                        let user_arg_count: usize = 0;
                         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                             StackSlotKind::ExplicitSlot,
                             16,
@@ -4112,10 +4155,26 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             .builder
                             .ins()
                             .func_addr(self.pointer_ty, self.continuation_identity_ref);
-                        self.builder.ins().stack_store(null_k_closure, slot, 0);
-                        self.builder.ins().stack_store(identity_k_fn, slot, 8);
+                        self.builder.ins().stack_store(
+                            null_k_closure,
+                            slot,
+                            k_closure_offset(user_arg_count),
+                        );
+                        self.builder.ins().stack_store(
+                            identity_k_fn,
+                            slot,
+                            k_fn_offset(user_arg_count),
+                        );
                         let args_ptr = self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
-                        let args_len = self.builder.ins().iconst(types::I32, 2);
+                        // D2 fix from PR #26 mid-flight at 33f2231:
+                        // `args_len` per `cps_signature` convention is
+                        // the user-arg count, NOT the trailing-pair
+                        // slot count. Was incorrectly `2` here. Now
+                        // `0` matches the perform-site precedent
+                        // (`lower_perform_non_io_to_value`) and the
+                        // runtime's `args_ptr=null ⟹ args_len=0`
+                        // contract.
+                        let args_len = self.builder.ins().iconst(types::I32, user_arg_count as i64);
 
                         let func_ref = self.user_fn_refs[name];
                         let null_closure_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
@@ -5197,6 +5256,56 @@ fn cps_signature(pointer_ty: Type, module: &ObjectModule) -> Signature {
     sig
 }
 
+/// Plan B Task 55, Phase 4d/4e — `args_len` convention for the CPS
+/// calling convention.
+///
+/// `args_len` is the **user-arg count** packed into `args_ptr`,
+/// excluding the trailing `(k_closure, k_fn)` pair. With `N` user
+/// args, `args_ptr` packs `[user_arg_0, user_arg_1, ...,
+/// user_arg_{N-1}, k_closure, k_fn]` — total `N + 2` 8-byte slots,
+/// but `args_len = N`. The continuation pair lives at byte offsets
+/// `8*N` (k_closure) and `8*N + 8` (k_fn) relative to `args_ptr`;
+/// see [`k_closure_offset`] and [`k_fn_offset`].
+///
+/// This matches the perform-site convention from Phase 4b
+/// (`lower_perform_non_io_to_value`): `args_len` counts user args,
+/// not slot count. The runtime contract on `sigil_perform`
+/// `args_ptr=null ⟹ args_len=0` falls out naturally.
+///
+/// At the first Phase 4e slice (arity-0 CPS user fns), `N == 0`,
+/// so `args_len = 0` and the continuation pair is at offsets 0
+/// and 8 directly. The next slice (user-arg unpacking + perform-
+/// args packing) generalises to arity-N.
+const fn _cps_args_len_convention_doc() {}
+
+/// Plan B Task 55, Phase 4d/4e — byte offset within `args_ptr` for
+/// the `k_closure` slot, given the user-arg count packed before it.
+/// Each user arg is 8 bytes; `k_closure` lives immediately after
+/// the user args.
+///
+/// Used by both:
+///   - the **CPS body emission** (`emit_object`'s user-fn body
+///     emit branch) to load the captured continuation closure
+///     pointer at fn entry.
+///   - the **native↔CPS interop wrapper** (`Lowerer::lower_call`'s
+///     direct-call arm for CPS callees) to write
+///     `(null_k_closure, identity_k_fn)` into the args_ptr buffer.
+///
+/// Extracting both offsets into shared helpers (rather than
+/// inlining `0` and `8` at two sites) keeps the writer and reader
+/// in lockstep when arity-N user-arg unpacking lands and the
+/// trailing-pair offsets shift by `N * 8`.
+fn k_closure_offset(user_arg_count: usize) -> i32 {
+    (user_arg_count as i32) * 8
+}
+
+/// Plan B Task 55, Phase 4d/4e — byte offset within `args_ptr` for
+/// the `k_fn` slot. Always `k_closure_offset + 8`. Companion to
+/// [`k_closure_offset`].
+fn k_fn_offset(user_arg_count: usize) -> i32 {
+    k_closure_offset(user_arg_count) + 8
+}
+
 /// Plan B Task 55, Phase 4e — does this fn body match the **simple
 /// tail perform with pure args** shape that the first slice of CPS
 /// body lowering supports?
@@ -5863,6 +5972,17 @@ mod tests {
         panic!("no fn `{name}` in program");
     }
 
+    fn params_of(prog: &crate::ast::Program, name: &str) -> Vec<crate::ast::Param> {
+        for item in &prog.items {
+            if let crate::ast::Item::Fn(f) = item {
+                if f.name == name {
+                    return f.params.clone();
+                }
+            }
+        }
+        panic!("no fn `{name}` in program");
+    }
+
     #[test]
     fn compute_user_fn_abi_native_for_pure_main() {
         let src = r#"
@@ -5870,8 +5990,9 @@ mod tests {
         "#;
         let (prog, colored) = colored_from_src(src);
         let body = body_of(&prog, "main");
+        let params = params_of(&prog, "main");
         assert_eq!(
-            compute_user_fn_abi("main", &body, &colored),
+            compute_user_fn_abi("main", &params, &body, &colored),
             UserFnAbi::Sync
         );
     }
@@ -5890,10 +6011,11 @@ mod tests {
                    }\n";
         let (prog, colored) = colored_from_src(src);
         let helper_body = body_of(&prog, "helper");
+        let helper_params = params_of(&prog, "helper");
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_body, &colored),
+            compute_user_fn_abi("helper", &helper_params, &helper_body, &colored),
             UserFnAbi::Cps,
-            "helper has CPS color + simple-tail-perform body"
+            "helper has CPS color + simple-tail-perform body + arity-0"
         );
     }
 
@@ -5913,17 +6035,18 @@ mod tests {
                    }\n";
         let (prog, colored) = colored_from_src(src);
         let main_body = body_of(&prog, "main");
+        let main_params = params_of(&prog, "main");
         // Sanity-check: main IS classified CPS by the colorer (bridge).
         assert!(
             colored.needs_cps_transform("main"),
             "colorer should classify main as CPS via bridge to helper"
         );
-        // ABI selection still picks Native because main's body shape
+        // ABI selection still picks Sync because main's body shape
         // isn't supported by the simple-tail-perform classifier.
         assert_eq!(
-            compute_user_fn_abi("main", &main_body, &colored),
+            compute_user_fn_abi("main", &main_params, &main_body, &colored),
             UserFnAbi::Sync,
-            "main is CPS-color but has complex body → Native ABI"
+            "main is CPS-color but has complex body → Sync ABI"
         );
     }
 
@@ -5995,12 +6118,15 @@ mod tests {
         let anf = AnfProgram { checked };
         let mono = MonoProgram { anf };
         let colored = crate::color::infer_colors(mono);
+        // Synthetic fn has zero params → arity gate accepts.
+        let no_params: Vec<crate::ast::Param> = Vec::new();
         assert_eq!(
-            compute_user_fn_abi("f", &body, &colored),
+            compute_user_fn_abi("f", &no_params, &body, &colored),
             UserFnAbi::Cps,
             "intrinsic perform of non-IO effect taints the fn as CPS via \
              find_non_io_perform_in_block; combined with the simple-tail-\
-             perform body shape, compute_user_fn_abi returns Cps"
+             perform body shape AND arity-0 user params AND arity-0 \
+             perform args, compute_user_fn_abi returns Cps"
         );
     }
 
@@ -6080,11 +6206,83 @@ mod tests {
         // forced-Native classification, the fn would be Cps.
         assert!(is_simple_tail_perform_with_pure_args_body(&body));
         // The actual assertion: Sync, because color short-circuits.
+        let no_params: Vec<crate::ast::Param> = Vec::new();
         assert_eq!(
-            compute_user_fn_abi("f", &body, &colored),
+            compute_user_fn_abi("f", &no_params, &body, &colored),
             UserFnAbi::Sync,
             "Color::Native must short-circuit `compute_user_fn_abi` \
              regardless of body shape eligibility"
+        );
+    }
+
+    // ---------------- Plan B Task 55, Phase 4e — D1 regression
+    // tests (PR #26 mid-flight at 33f2231): pin that
+    // `compute_user_fn_abi` short-circuits to `Sync` for arity-N
+    // user fns and for arity-N perform args, even when the
+    // classifier and color gates would otherwise accept. Without
+    // these gates, the body emit branch's `debug_assert!`s would
+    // fire on plausible Sigil programs.
+
+    #[test]
+    fn compute_user_fn_abi_sync_for_arity_n_intrinsic_cps_helper() {
+        // helper has arity-1 (`x: Int`); body is a single tail
+        // perform with the arg `x` (pure Ident). Pre-D1, this
+        // would have classified Cps and crashed at body emit's
+        // `assert!(f.params.is_empty())`. Post-D1, the arity gate
+        // in `compute_user_fn_abi` rejects → falls through to
+        // Sync ABI cleanly.
+        let src = "effect E { op: (Int) -> Int }\n\
+                   fn helper(x: Int) -> Int ![E] { perform E.op(x) }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let n: Int = handle helper(7) with { E.op(arg, k) => arg + 35 };\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let (prog, colored) = colored_from_src(src);
+        let helper_body = body_of(&prog, "helper");
+        let helper_params = params_of(&prog, "helper");
+        // Sanity: classifier accepts the body shape (perform's
+        // arg `x` is pure Ident); color taints CPS via row.
+        assert!(is_simple_tail_perform_with_pure_args_body(&helper_body));
+        assert!(colored.needs_cps_transform("helper"));
+        // The D1 arity gate rejects. Pre-fix this would have been
+        // Cps and crashed at body emit time.
+        assert_eq!(
+            compute_user_fn_abi("helper", &helper_params, &helper_body, &colored),
+            UserFnAbi::Sync,
+            "arity-1 helper must fall through to Sync ABI even though \
+             classifier + color gates accept; D1 arity gate is the \
+             load-bearing rejection"
+        );
+    }
+
+    #[test]
+    fn compute_user_fn_abi_sync_for_arity_0_helper_with_perform_args() {
+        // helper has arity-0 user params, but the tail perform has
+        // a literal arg. Pre-D1 (arity gate only on user params),
+        // this would have classified Cps and crashed at body emit's
+        // `assert!(body_perform.args.is_empty())`. Post-D1, the
+        // perform-args gate also fires.
+        let src = "effect E { op: (Int) -> Int }\n\
+                   fn helper() -> Int ![E] { perform E.op(7) }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let n: Int = handle helper() with { E.op(arg, k) => arg + 35 };\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let (prog, colored) = colored_from_src(src);
+        let helper_body = body_of(&prog, "helper");
+        let helper_params = params_of(&prog, "helper");
+        assert!(is_simple_tail_perform_with_pure_args_body(&helper_body));
+        assert!(colored.needs_cps_transform("helper"));
+        assert!(helper_params.is_empty());
+        // Perform's args list is non-empty → D1 perform-args gate
+        // rejects. Falls through to Sync ABI.
+        assert_eq!(
+            compute_user_fn_abi("helper", &helper_params, &helper_body, &colored),
+            UserFnAbi::Sync,
+            "arity-0 helper with arity-N perform must fall through to Sync \
+             ABI; D1 perform-args gate is the load-bearing rejection"
         );
     }
 }
