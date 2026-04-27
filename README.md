@@ -228,32 +228,37 @@ Stage 9 spec validation.
 
 | Gap | Behavior today | Closure point |
 |-----|----------------|---------------|
-| Discard-continuation handlers across function-call boundaries | Compiles + runs, **silently diverges** from algebraic semantics when the perform reaches the arm via a function call (see prose below) | Phase 4e |
-| Non-tail continuation use (`k(x) + 1`, `let r = k(x); …`) | Codegen-time rejection | Phase 4e |
-| Multi-shot continuations (`effect E resumes: many`) | Parses + typechecks; runtime UB if `k` invoked >1 times | Phase 4e |
+| Discard-continuation handlers across function-call boundaries | **Closed at PR #26** — the colorer-driven dispatch now reclassifies helper fns whose performs reach a discharging handler as CPS-color, so their performs return `NextStep::Call` to the enclosing trampoline rather than synchronously blocking on `sigil_run_loop`. | Phase 4e (PR #26) |
+| Non-tail continuation use (`k(x) + 1`, `let r = k(x); …`) | Codegen-time rejection | Phase 4e captures+ (follow-up PR) |
+| Multi-shot continuations (`effect E resumes: many`) | Parses + typechecks; runtime UB if `k` invoked >1 times | Phase 4e captures+ |
 | Multi-effect handlers (arms targeting different effects) | Codegen-time rejection | Phase 4f |
 | Return arms (`handle … with { return(v) => …, … }`) | Codegen-time rejection | Phase 4g |
-| Captures from a surrounding lambda's closure record | Codegen-time rejection | Phase 4e |
-| Stage 9 spec validation | Cannot run — gated on Phase 4e (the discard-`k` correctness gap) | Phase 4e |
+| Captures from a surrounding lambda's closure record | Codegen-time rejection | Phase 4e captures+ |
+| Stage 9 spec validation | Cannot run — was gated on Phase 4e's full closure; now gated on Phase 4e captures+ (multi-shot `k` is a P20 prerequisite) | Phase 4e captures+ |
 
-**Discard-continuation handlers (Raise-style early-exit) do not yet
-propagate through function-call boundaries.** Behavior currently
-matches the Phase 4c synchronous shape, where the arm's return value
-flows to the perform site, not the handle expression. Programs
-depending on this — e.g., `handle helper() with { Raise.fail(k) =>
-default }` where `helper` performs `Raise.fail` and the surrounding
-code expects the handle to return `default` — work as expected **only
-when the perform is in tail position of the handle body** (no
-function-call boundary between the handle and the perform). When the
-perform reaches the arm via a function call, the discarded
-continuation does not abort the helper fn: the arm's value is returned
-to the helper's perform site as if `k` had been invoked with that
-value, the helper continues executing, and the handle's overall result
-reflects the helper's tail expression rather than the arm's value. The
-fix is the colorer's handler-discharge refinement, which reclassifies
-helper fns whose performs reach a discharging handler as CPS-color so
-their performs return `NextStep::Call` to the enclosing trampoline
-rather than synchronously blocking on `sigil_run_loop`.
+**Phase 4e cadence pivot.** The original Phase 4e deviation entry
+committed to a single-PR comprehensive scope covering all four
+remaining lifts (discard-`k` correctness, non-tail `k`, multi-shot
+`k`, surrounding-lambda captures). PR #26 (`plan-b-task-55-phase-4e`)
+ships the architectural foundation (CPS-color user-fn calling
+convention, native↔CPS interop wrappers, codegen-consumes-color, the
+colorer regression-pinning) plus the helper-side lambda-lifting first
+slices (constant-tail synth-cont, captures-free / captures-bearing
+let-bind-then-tail synth-conts), closing hard condition #2 (both
+discard-`k` test inversions). The remaining three lifts — non-tail
+`k` use in arm bodies, multi-shot `k`, surrounding-lambda captures —
+split off into a `plan-b-task-55-phase-4e-captures` follow-up PR
+(branched against `main` after PR #26 lands). See the
+[Phase 4e cadence-pivot addendum in `PLAN_B_DEVIATIONS.md`](PLAN_B_DEVIATIONS.md)
+for full reasoning.
+
+The cadence pivot is the same shape as Phase 4b's per-phase-PR
+pivot from the foundation entry: a single-PR commitment was reached
+mid-implementation, and split for reviewability without changing
+the underlying architecture. The lambda-lifting + trailing-pair
+convention that sections 5 and 6 of the Phase 4e deviation entry
+commit to remains the standing architecture; the captures+ PR
+implements it as written.
 
 This list is a living section: each entry tracks an in-flight gap that
 will close in a specific tracked phase, and is updated alongside the

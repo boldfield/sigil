@@ -1443,3 +1443,33 @@ f) **`sigil_continuation_identity` retained for tail-k cases.** Phase 4e doesn't
 - *Arm body inside lambda crashes / reads wrong capture* — surrounding-lambda captures commit. The typecheck side-table's lambda-frame source annotation or codegen's read-from-lambda-`closure_ptr` lowering is the prime suspect.
 
 The bisecting hint is also embedded inline at the prime-suspect code change sites for each failure mode, so a `git blame` lands on the deviation entry without a documentation cross-reference.
+
+**Cadence pivot (added 2026-04-27 mid-Phase-4e, mirroring the foundation entry's "Cadence pivot" pattern):** the original Deviation text claimed *"Phase 4e ships **comprehensively** in a single PR — all four lifts plus the architectural pieces they share"* but **that turned out wrong in practice**. PR #26 (`plan-b-task-55-phase-4e`) reached 27 commits at HEAD `adf0e23` with three of the four lifts shipped — codegen consumes color (CPS-color user-fn calling convention + native↔CPS interop wrappers), colorer regression-pinning (item 4), and lambda-lifting first slices for the helper's non-tail body shape (`ConstantDone` constant-tail synth-cont at `b818fc3`; captures-free `LetBindThenTail` at `2a9958b`; captures-bearing `LetBindThenTail` at `a5ee4c6`). Hard condition #2 closed (both e2e test inversions landed at `b818fc3` / `2a9958b`). The remaining three lifts — non-tail `k` use in **arm bodies** (item 5), multi-shot `k` (item 6), surrounding-lambda captures (item 7) — split off into a follow-up PR.
+
+The pivot reasoning:
+
+- **Reviewability — single-PR LOC budget.** PR #26 net diff sits around +5,000/-300 lines across 25 substantive commits + foundation/test-coverage commits, with two concurrent reviewers (boldfield contextual + boldfield no-context) cycling roughly every 1–2 commits. Bundling the remaining three lifts on the same branch projects to ~8,000–10,000 lines and another 15+ commits, which exceeds the threshold where the reviewer pair can verify a single-pass merge. The foundation entry's PR-#22 size (2,373/-272 with 4 fixup commits) was already at the upper bound; PR #26's current size is double that.
+- **Architectural slice independence.** The three remaining lifts share machinery (lambda-lifted continuations passed via the trailing `(post_k_closure, post_k_fn)` pair) but each is structurally independent: the arm-body walker rejection lifts in-isolation per slice; the synth-cont signature shift to "always read trailing post-k pair" can land as the foundation refactor of the captures+ PR; multi-shot's `resumes_many` gating is orthogonal to the trailing-pair convention. Splitting at the helper-side / arm-side boundary keeps the reviewer's diff per PR within the verifiable range while preserving the architectural integrity of each slice.
+- **Charter-invariant re-confirmation.** Mid-Phase-4e investigation surfaced an alternative arm-body-lowering shape ("synchronous drive in arm body" — arm fn drives `sigil_run_loop` internally per `k(arg)` call) that violates Plan B's stack-bounded trampoline charter (`run_loop` must remain the unique stack-bounded driver; nesting it inside arm-body lowering grows the C stack proportionally to handle depth). The lambda-lifting framing in sections 5 and 6 of this entry IS the right architecture; this entry's commitment to that framing is preserved. The follow-up PR explicitly does not revise sections 5/6 — it implements them as written.
+- **Stage 9 hard-gate timing.** The Stage 9 unblock condition is "comprehensive Phase 4e correctness", which requires items 5/6 to land. Stage 9's `scripts/validate-spec.sh` does not become runnable until the captures+ PR squash-merges. The "(closes at this PR)" suffix tracking the Stage 9 hard gate moves to the captures+ PR's foundation commit. The `PLAN_B_PROGRESS.md` Phase 4e entry's HARD GATE annotation gains a "split across PR #26 + captures+ PR" note.
+
+**What ships at PR #26 (closing here):**
+
+- All architectural foundation: CPS-color user-fn calling convention; native↔CPS interop wrappers; codegen-consumes-color per-fn ABI selection; colorer regression-pinning.
+- Lambda-lifting first slices for helper-side non-tail bodies: ConstantDone (constant-tail), LetBindThenTail captures-free, LetBindThenTail captures-bearing.
+- Hard condition #2 (both test inversions) — `discard_k_handler_does_not_abort_helper` and `statement_form_non_io_perform_inside_handle_compiles_and_runs`.
+- FFI-ref dedup (`prepare_per_fn_refs`) at `73c7e53`.
+- Pattern-walker dedup + Char capture e2e test + doc-comment precision at `adf0e23`.
+
+**What's deferred to the `plan-b-task-55-phase-4e-captures` follow-up PR (Phase 4e captures+):**
+
+- Item 5: non-tail `k` use in arm bodies — walker rejection lifts; arm-body lambda-lifting via post-arm-k synth fn; trailing-pair convention `[arg, post_arm_k_closure, post_arm_k_fn]` at the arm's `Call` emission; helper's synth-cont signature shifts to uniformly read trailing post-arm-k pair (slice A foundation refactor).
+- Item 6: multi-shot `k` use — `resumes_many` gating in pre-pass; heap-reified k_closure for `resumes: many` arms; `Choose`-style e2e test pinning multi-invocation invariance.
+- Item 7: surrounding-lambda closure captures into arm bodies — typecheck side-table extension; codegen reads from lambda's `closure_ptr` for outer-scope captures; the `arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen_phase_4e_pending` `#[ignore]`'d test inverts.
+- Test inversion + cleanup (walker's Phase-4e-pointing diagnostics removed) — at the captures+ PR's closeout commit.
+- README "Verification limits" section's full Phase-4e-closes-here statement — moves to the captures+ PR's closeout.
+- `PLAN_B_PROGRESS.md` Phase 4e final status flip to `done-pending-ci` — moves to the captures+ PR's closeout.
+
+The original Deviation text's "comprehensive single-PR" claim is preserved unchanged above for historical accuracy. Future agents resuming Phase 4e work after this point should expect: (1) PR #26 closes with this addendum, (2) `plan-b-task-55-phase-4e-captures` branch opens against `main` (NOT against `plan-b-task-55-phase-4e`) — captures+ inherits the architectural foundation through `main` after PR #26 squash-merges, (3) the captures+ PR's foundation commit lands the helper-synth-cont signature shift (slice A) so subsequent slices have a consistent base to layer on.
+
+**Implementing commit(s) for this addendum:** the closeout commit on `plan-b-task-55-phase-4e` (this addendum + README/PROGRESS updates noting the deferral). PR #26 description refresh names the addendum location for reviewers landing after the split.
