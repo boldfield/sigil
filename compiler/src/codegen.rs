@@ -5557,7 +5557,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             }
             module
                 .define_function(chain.post_arm_k_2_func_id, &mut ctx)
-                .map_err(|e| format!("define post_arm_k_2 synth fn: {e}"))?;
+                .map_err(|e| {
+                    format!(
+                        "define post_arm_k_2 synth fn for `{}`: {e:#?}\n\nfunction IR:\n{}",
+                        synth.k_name, ctx.func
+                    )
+                })?;
             module.clear_context(&mut ctx);
         }
     }
