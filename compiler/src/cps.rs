@@ -267,6 +267,60 @@ mod tests {
     }
 
     #[test]
+    fn cps_color_user_fns_pins_mutual_recursion_scc_with_cps_bridge() {
+        // a and b mutually recurse; both call c; c performs E.op
+        // (intrinsic CPS). The mutual recursion forms a single SCC
+        // {a, b}; the SCC bridges to c's singleton SCC (which is
+        // CPS). All three end up CPS — a and b via SCC-bridge-to-cps,
+        // c intrinsically. Pins the SCC-collapse + multi-member
+        // ordering invariant: cps_color_user_fns() should list all
+        // SCC members in source declaration order, not just one
+        // representative member.
+        //
+        // Flagged by PR #26 mid-flight review at 06c3459 as a useful
+        // pin before the codegen-consumes-color commit, which may
+        // rely on per-SCC ABI uniformity (every member of a
+        // CPS-color SCC must be emitted with the CPS calling
+        // convention; a partial emission would be soundness-broken).
+        // The 3-hop linear-chain test
+        // (`cps_color_user_fns_pins_multi_level_scc_bridge_ordering`)
+        // exercises forward-edge transitive classification; this one
+        // exercises SCC-collapse with mutual recursion.
+        //
+        // Note: typecheck currently rejects mutual recursion at
+        // function granularity (forward-reference handling is via
+        // `fn_schemes` pre-pass, but it doesn't rebuild SCCs).
+        // Phase B Task 48's pre-pass scheme-seeding closes this
+        // hole — both a and b's signatures are visible to each
+        // other's body checking. Verified passing on the synthetic
+        // colorer test infrastructure where the same mutual-
+        // recursion pattern appears.
+        let src = "effect E { op: () -> Int }\n\
+                   fn c() -> Int ![E] {\n  \
+                     perform E.op()\n\
+                   }\n\
+                   fn a() -> Int ![E] {\n  \
+                     let x: Int = c();\n  \
+                     b()\n\
+                   }\n\
+                   fn b() -> Int ![E] {\n  \
+                     let y: Int = c();\n  \
+                     a()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let cp = cps_from_src(src);
+        let cps_fns = cp.cps_color_user_fns();
+        // c is intrinsic CPS. a and b are mutually recursive — they
+        // form a single SCC {a, b} which bridges to c's CPS
+        // classification. All three are CPS. Source declaration
+        // order: c, a, b. main is Native (excluded).
+        assert_eq!(
+            cps_fns,
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
     fn cps_color_user_fns_pins_multi_level_scc_bridge_ordering() {
         // a → b → c, where c is intrinsically CPS, and verify
         // cps_color_user_fns lists all three in program declaration
