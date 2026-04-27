@@ -1060,14 +1060,36 @@ fn statement_form_non_io_perform_inside_handle_compiles_and_runs() {
     // path; non-IO → `lower_perform_non_io_to_value` with the value
     // discarded.
     //
-    // Phase 3b semantics note: the arm value flows back to the
-    // perform site (via `sigil_perform` → `sigil_run_loop`), not to
-    // the handle site. So in this test, helper's `perform E.op();`
-    // returns 99 (the arm value) which is discarded by the Stmt;
-    // helper continues to its tail `42` and returns 42. The handle
-    // expression therefore evaluates to 42, NOT to 99. Phase 4d's
-    // continuation reification will revise this so a `k`-ignoring
-    // arm aborts helper's continuation back to the handle site.
+    // **Phase 4e (this commit) — assertion inverted from `42` to
+    // `99`.** Helper now matches the stmt-then-constant-tail body
+    // shape (`is_simple_yield_then_constant_tail_body`), so
+    // `compute_user_fn_abi` returns `Cps`. Codegen synthesises a
+    // continuation closure that returns `Done(42)` (helper's tail)
+    // and emits helper's body as `sigil_perform(eff, op, ..., null,
+    // &synth_cont)` — yielding to the trampoline with the synth-
+    // cont as the perform's k.
+    //
+    // Algebraic semantics under the Phase 4e shape:
+    //
+    //   - The arm `E.op(k) => 99` discards `k` (no reference to k
+    //     in the arm body). It returns Done(99) directly.
+    //   - The trampoline observes Done(99) and unwinds to the
+    //     wrapper that called helper. The synth-cont — which would
+    //     have returned Done(42) if the arm called k(any_value) —
+    //     never runs.
+    //   - main's `let n = ...` binds n = 99. main prints "99\n".
+    //
+    // This is the **discard-k correctness fix for stmt-form
+    // perform yields** — the algebraic-semantics-correct behavior
+    // that was the load-bearing piece for inverting this test
+    // alongside (eventually) the `discard_k_handler_does_not_
+    // abort_helper_phase_4e_pending` test.
+    //
+    // The previously-asserted `42` was the Phase 4d MVP synchronous
+    // shape: helper's perform synchronously called sigil_run_loop
+    // which dispatched the arm; arm returned 99 to the perform
+    // site (where the Stmt::Perform discarded it); helper then
+    // continued to its tail `42`. Pre-Phase-4e behavior.
     let src = "effect E { op: () -> Int }\n\
                fn helper() -> Int ![E] {\n  \
                  perform E.op();\n  \
@@ -1080,7 +1102,11 @@ fn statement_form_non_io_perform_inside_handle_compiles_and_runs() {
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "stmt_perform_non_io_in_handle");
     assert_eq!(exit, 0, "stdout={stdout:?} stderr={stderr:?}");
-    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n",
+        "Phase 4e: discard-k arm fires; arm value flows to handle site, \
+         not to perform site. stderr={stderr:?}"
+    );
 }
 
 #[test]

@@ -195,10 +195,12 @@ fn compute_user_fn_abi(
     if !colored.needs_cps_transform(name) {
         return UserFnAbi::Sync;
     }
-    if !is_simple_tail_perform_with_pure_args_body(body) {
-        return UserFnAbi::Sync;
+    if is_simple_tail_perform_with_pure_args_body(body)
+        || is_simple_yield_then_constant_tail_body(body)
+    {
+        return UserFnAbi::Cps;
     }
-    UserFnAbi::Cps
+    UserFnAbi::Sync
 }
 
 /// Map a surface-syntax `TypeExpr` to the Cranelift IR type codegen uses
@@ -1273,6 +1275,39 @@ struct ArmCapture {
     /// the `CheckedProgram::handle_arm_captures` side-table at codegen
     /// pre-pass time.
     kind: crate::ast::EnvSlotKind,
+}
+
+/// Plan B Task 55, Phase 4e — synthetic continuation closure for a
+/// CPS-color user fn whose body matches the **stmt-then-constant-
+/// tail** shape (per [`is_simple_yield_then_constant_tail_body`]).
+///
+/// Each entry represents one synthesised fn that codegen emits as
+/// a standalone CPS-ABI fn: the parent helper's body builds
+/// `sigil_perform(..., k_fn = &this_synth_cont)`, and the trampoline
+/// dispatches into `this_synth_cont` when the arm calls `k(value)`.
+///
+/// First-slice constraints (this commit's restriction):
+///   - The synth-cont's body is just `Done(constant)` — no captures
+///     of helper's user params or k_closure / k_fn yet (those need
+///     the closure-convert side-table extension, future commit).
+///   - The constant is restricted to [`crate::ast::Expr::IntLit`]
+///     in this slice; future commits widen to other literals.
+#[derive(Clone, Debug)]
+struct CpsContinuationSynth {
+    /// Cranelift FuncId for this synthesised continuation. Allocated
+    /// at the user-fn pre-pass alongside the user fn's FuncId so
+    /// the user-fn body emit can reference it via `func_addr` when
+    /// building the `sigil_perform` call's `k_fn` arg.
+    func_id: cranelift_module::FuncId,
+    /// The user fn this synth-cont belongs to. Keys into the
+    /// `cps_continuation_synth_indices` map for body-emit-time
+    /// FuncId lookup.
+    parent_fn_name: String,
+    /// The constant value the synth-cont's body returns wrapped in
+    /// `Done(...)`. At HEAD this is always an `i64` (IntLit value);
+    /// future widenings to BoolLit / CharLit / StringLit add a
+    /// type-tagged variant here.
+    constant_value: i64,
 }
 
 /// Walk a block looking for `Expr::Handle` sites and allocating
@@ -2352,6 +2387,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // signature gains the closure_ptr param at index 0 (always null from
     // the shim). Tagging the return value happens inside main's lowering;
     // other user fns return their raw Cranelift value.
+    // Plan B Task 55, Phase 4e — synthetic continuation closures
+    // for stmt-then-constant-tail CPS-color user fns. Allocated in
+    // the same pass as user fn FuncIds so the user-fn body emit
+    // can `func_addr` to the synth-cont when building the
+    // `sigil_perform` call's `k_fn` arg. Keys: parent fn name.
+    let mut cps_continuation_synth: Vec<CpsContinuationSynth> = Vec::new();
+    let mut cps_continuation_synth_indices: BTreeMap<String, usize> = BTreeMap::new();
+
     let mut user_fns: BTreeMap<String, UserFnEntry> = BTreeMap::new();
     for item in &checked.program.items {
         if let crate::ast::Item::Fn(f) = item {
@@ -2413,6 +2456,38 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     abi,
                 },
             );
+
+            // Plan B Task 55, Phase 4e — if the fn matches the
+            // stmt-then-constant-tail shape, allocate a synthetic
+            // continuation closure FuncId. The synth-cont body is
+            // emitted at the bottom of `emit_object` (mirrors the
+            // `HandlerArmSynth` definition pass pattern).
+            if abi == UserFnAbi::Cps && is_simple_yield_then_constant_tail_body(&f.body) {
+                let constant_value = match &f.body.tail {
+                    Some(crate::ast::Expr::IntLit(n, _)) => *n,
+                    _ => unreachable!(
+                        "is_simple_yield_then_constant_tail_body classifier \
+                         guarantees tail is IntLit"
+                    ),
+                };
+                let synth_cont_sig = cps_signature(pointer_ty, &module);
+                // Use a global-index-based name to avoid collisions
+                // with user-fn names that contain `$` (synthetic
+                // lambda fns) or other lexer-rejected chars. Mirrors
+                // the `sigil_handler_arm_{N}` convention from Phase
+                // 3b.
+                let synth_cont_idx = cps_continuation_synth.len();
+                let synth_cont_name = format!("sigil_post_yield_cont_{synth_cont_idx}");
+                let synth_cont_func_id = module
+                    .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
+                    .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
+                cps_continuation_synth.push(CpsContinuationSynth {
+                    func_id: synth_cont_func_id,
+                    parent_fn_name: f.name.clone(),
+                    constant_value,
+                });
+                cps_continuation_synth_indices.insert(f.name.clone(), synth_cont_idx);
+            }
         }
     }
 
@@ -2627,14 +2702,67 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // pack into a fresh stack slot via the Phase 4b machinery
             // generalised here.
             if entry.abi == UserFnAbi::Cps {
-                let body_perform = match &f.body.tail {
-                    Some(crate::ast::Expr::Perform(p)) => p.clone(),
-                    _ => unreachable!(
-                        "codegen Phase 4e: CPS-ABI fn `{}` body is not a \
-                         simple tail perform — `compute_user_fn_abi` invariant \
-                         broken",
-                        f.name
-                    ),
+                // Plan B Task 55, Phase 4e — branch on body shape.
+                // Two CPS-eligible shapes at HEAD:
+                //
+                //   (1) **Tail-perform**: `body.tail =
+                //       Some(Expr::Perform(p))` with pure args.
+                //       Helper's perform site uses helper's caller's
+                //       `(k_closure, k_fn)` (loaded from `args_ptr`)
+                //       as the perform's continuation — when the arm
+                //       calls `k(arg)`, the trampoline forwards arg
+                //       to the caller's continuation.
+                //
+                //   (2) **Yield-then-constant-tail**: `body.stmts =
+                //       [Stmt::Perform(p)]` + `body.tail =
+                //       Some(Expr::IntLit(...))`. Helper synthesises
+                //       a continuation closure (`CpsContinuationSynth`,
+                //       allocated in the user-fn pre-pass) whose
+                //       body returns `Done(constant)` for the tail
+                //       expression. Helper's perform site uses that
+                //       synth-cont's address as `k_fn` (with null
+                //       `k_closure` — no captures in this slice). The
+                //       synth-cont ignores the perform's value (the
+                //       Stmt::Perform discards it) and returns the
+                //       constant; the trampoline then unwinds to the
+                //       wrapper's `sigil_run_loop` driver.
+                //
+                // The `CpsContinuationSynth` is the lambda-lift for
+                // the post-yield rest-of-body. First-slice restriction:
+                // tail is a constant literal (no captures needed). Future
+                // commits widen to non-constant tails (with closure
+                // captures) and multi-yield bodies.
+                let is_yield_then_constant = is_simple_yield_then_constant_tail_body(&f.body);
+                let (body_perform, synth_cont_func_id_opt) = if is_yield_then_constant {
+                    let p = match &f.body.stmts[0] {
+                        crate::ast::Stmt::Perform(p) => p.clone(),
+                        _ => unreachable!(
+                            "is_simple_yield_then_constant_tail_body \
+                             classifier guarantees stmts[0] is Stmt::Perform"
+                        ),
+                    };
+                    let synth_cont_idx = match cps_continuation_synth_indices.get(&f.name) {
+                        Some(i) => *i,
+                        None => unreachable!(
+                            "codegen Phase 4e: CPS-ABI fn `{}` matches yield-\
+                             then-constant-tail body shape but has no synth-\
+                             cont allocated in the pre-pass",
+                            f.name
+                        ),
+                    };
+                    let synth_cont_func_id = cps_continuation_synth[synth_cont_idx].func_id;
+                    (p, Some(synth_cont_func_id))
+                } else {
+                    let p = match &f.body.tail {
+                        Some(crate::ast::Expr::Perform(p)) => p.clone(),
+                        _ => unreachable!(
+                            "codegen Phase 4e: CPS-ABI fn `{}` body is not a \
+                             simple tail perform nor a yield-then-constant — \
+                             `compute_user_fn_abi` invariant broken",
+                            f.name
+                        ),
+                    };
+                    (p, None)
                 };
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 let closure_ptr = block_params[0];
@@ -2687,25 +2815,54 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env.insert(p.name.clone(), value);
                 }
 
-                // Phase 2 — load (k_closure, k_fn) from args_ptr at
-                // the user-arg-count-shifted offsets. The wrapper
-                // at the call site writes them at the same offsets
-                // computed via `k_closure_offset(user_arg_count)`
-                // / `k_fn_offset(user_arg_count)`, so the read/write
-                // sites stay in lockstep when arity-N slices land
-                // (S1 fix from PR #26 mid-flight at 33f2231).
-                let k_closure_loaded = builder.ins().load(
-                    pointer_ty,
-                    MemFlags::trusted(),
-                    args_ptr,
-                    k_closure_offset(user_arg_count),
-                );
-                let k_fn_loaded = builder.ins().load(
-                    pointer_ty,
-                    MemFlags::trusted(),
-                    args_ptr,
-                    k_fn_offset(user_arg_count),
-                );
+                // Phase 2 — choose (k_closure, k_fn) for the perform
+                // call based on the body shape:
+                //
+                //   - **Tail-perform shape** (`synth_cont_func_id_opt
+                //     == None`): use helper's caller's continuation,
+                //     loaded from `args_ptr` at the user-arg-count-
+                //     shifted offsets. The wrapper at the call site
+                //     writes (k_closure, k_fn) at the same offsets
+                //     computed via `k_closure_offset(user_arg_count)`
+                //     / `k_fn_offset(user_arg_count)`, so the read/
+                //     write sites stay in lockstep across arity
+                //     widening (S1 fix from PR #26 mid-flight at
+                //     33f2231).
+                //
+                //   - **Yield-then-constant-tail shape** (`synth_cont
+                //     _func_id_opt == Some(id)`): use the lambda-
+                //     lifted post-yield continuation. `k_closure`
+                //     is null because the synth-cont has no
+                //     captures in this slice; `k_fn` is the
+                //     synth-cont's func_addr. Helper's caller's
+                //     continuation (which the wrapper still passes
+                //     at the trailing offsets) is unused here —
+                //     synth-cont returns Done(constant) directly,
+                //     and the trampoline unwinds to the wrapper's
+                //     `sigil_run_loop` driver which observes the
+                //     Done.
+                let (k_closure_loaded, k_fn_loaded) =
+                    if let Some(synth_cont_func_id) = synth_cont_func_id_opt {
+                        let synth_cont_ref =
+                            module.declare_func_in_func(synth_cont_func_id, builder.func);
+                        let null_k_closure = builder.ins().iconst(pointer_ty, 0);
+                        let synth_cont_addr = builder.ins().func_addr(pointer_ty, synth_cont_ref);
+                        (null_k_closure, synth_cont_addr)
+                    } else {
+                        let k_closure = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            k_closure_offset(user_arg_count),
+                        );
+                        let k_fn = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            k_fn_offset(user_arg_count),
+                        );
+                        (k_closure, k_fn)
+                    };
 
                 // Phase 3 — resolve effect_id + op_id at fn entry.
                 let effect_id = match checked.effect_ids.get(&body_perform.effect) {
@@ -3317,6 +3474,53 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             module
                 .define_function(synth.func_id, &mut ctx)
                 .map_err(|e| format!("define handler arm fn: {e}"))?;
+            module.clear_context(&mut ctx);
+        }
+    }
+
+    // Plan B Task 55, Phase 4e — synthetic continuation closure
+    // definition pass. For each `CpsContinuationSynth` allocated at
+    // the user-fn pre-pass (one per CPS-color user fn matching the
+    // stmt-then-constant-tail body shape), emit a fn body that
+    // returns `Done(constant)`. Mirrors the synthetic-arm-fn
+    // definition pass above; first-slice restriction is that the
+    // synth-cont has no captures (closure_ptr unused, args_ptr
+    // unused — the synth-cont ignores the perform's value because
+    // `Stmt::Perform` discards it, and the constant tail is a
+    // compile-time literal needing no captures).
+    {
+        let synth_cont_sig = cps_signature(pointer_ty, &module);
+        for synth in &cps_continuation_synth {
+            ctx.func.signature = synth_cont_sig.clone();
+            ctx.func.name = UserFuncName::user(0, synth.func_id.as_u32());
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+                let block = builder.create_block();
+                builder.append_block_params_for_function_params(block);
+                builder.switch_to_block(block);
+                builder.seal_block(block);
+
+                // closure_ptr / args_ptr / args_len unused — see
+                // CpsContinuationSynth's docstring for the
+                // first-slice restriction (no captures, no
+                // perform-result use). Future widening replaces
+                // this branch with a Lowerer-driven body emission
+                // that reads captures from closure_ptr and the
+                // perform's result from args_ptr.
+                let _ = builder.block_params(block).to_vec();
+
+                // sigil_next_step_done(constant) → *NextStep
+                let next_step_done_ref = module.declare_func_in_func(next_step_done, builder.func);
+                let constant_v = builder.ins().iconst(types::I64, synth.constant_value);
+                let done_call = builder.ins().call(next_step_done_ref, &[constant_v]);
+                stackmap.push_placeholder(function_code_offset(&builder, done_call));
+                let next_step = builder.inst_results(done_call)[0];
+                builder.ins().return_(&[next_step]);
+                builder.finalize();
+            }
+            module
+                .define_function(synth.func_id, &mut ctx)
+                .map_err(|e| format!("define synth-cont for `{}`: {e}", synth.parent_fn_name))?;
             module.clear_context(&mut ctx);
         }
     }
@@ -5580,6 +5784,80 @@ fn block_is_pure(b: &crate::ast::Block) -> bool {
     }
 }
 
+/// Plan B Task 55, Phase 4e — does this fn body match the **simple
+/// yield then constant tail** shape that the first slice of lambda-
+/// lifting supports?
+///
+/// A body matches iff:
+///
+/// 1. Its statement list has exactly one stmt.
+/// 2. That stmt is a non-IO [`crate::ast::Stmt::Perform`].
+/// 3. Every arg of the perform is pure (per [`expr_is_pure`]).
+/// 4. The tail expression is a constant literal (initially:
+///    [`crate::ast::Expr::IntLit`] only — future widenings cover
+///    BoolLit / CharLit / StringLit).
+///
+/// **Why this carve-out exists.** The full Phase 4e lambda-lifting
+/// machinery needs synthetic continuation closures that capture
+/// helper's k_closure / k_fn and any user params referenced by
+/// the post-yield rest-of-body. Closure captures require a
+/// closure-convert side-table extension (the "S1" item from prior
+/// reviews), which is its own commit. This classifier identifies
+/// the strictest stmt-then-tail subset that does NOT need closure
+/// captures: the synth-cont's body is a constant literal so it
+/// captures NOTHING, and the perform's args are pure so they can
+/// be lowered synchronously at the parent fn's entry block.
+///
+/// **Synth-cont shape under this classifier.** For a body matching
+/// `perform E.op(); 42`, codegen synthesises:
+///
+/// ```text
+/// extern "C" fn synth_cont(closure_ptr, args_ptr, args_len) -> *NextStep {
+///     // closure_ptr / args_ptr / args_len ignored — Stmt::Perform
+///     // discards the perform's result, and the tail is constant.
+///     return sigil_next_step_done(42)
+/// }
+/// ```
+///
+/// Helper's body emit builds `sigil_perform(eff, op, args, len,
+/// k_closure=null, k_fn=&synth_cont)` and returns its NextStep.
+/// When the trampoline eventually dispatches the arm:
+///   - **Discard-k arm** (no `k` in arm body) returns Done(arm_value)
+///     directly — the synth-cont never runs. The handle's overall
+///     value is the arm's value. **This is the discard-k correctness
+///     fix for stmt-form perform yields**, the load-bearing piece
+///     for inverting `statement_form_non_io_perform_inside_handle_
+///     compiles_and_runs` (`42` → `99`).
+///   - **Use-k arm** (`k(value)` in arm body) builds Call(synth_cont,
+///     [value]); trampoline runs synth_cont which returns Done(42)
+///     ignoring the value. Tail-position `k(value)` arms produce
+///     the same observable behavior they would have under the
+///     synchronous Phase 4d MVP shape (the tail expression is
+///     the value).
+///
+/// Future Phase 4e commits widen this classifier to:
+///
+/// 1. Tail expressions referencing user params or let-bindings —
+///    requires synth-cont closure captures.
+/// 2. Multi-stmt bodies with multiple yields — requires per-yield
+///    synth-cont chaining.
+/// 3. `Stmt::Let(name, perform)` — synth-cont takes the perform's
+///    result as `name` in its env.
+fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
+    use crate::ast::{Expr, Stmt};
+    if body.stmts.len() != 1 {
+        return false;
+    }
+    let yield_perform = match &body.stmts[0] {
+        Stmt::Perform(p) if p.effect != "IO" => p,
+        _ => return false,
+    };
+    if !yield_perform.args.iter().all(expr_is_pure) {
+        return false;
+    }
+    matches!(&body.tail, Some(Expr::IntLit(_, _)))
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -5933,6 +6211,119 @@ mod tests {
             span,
         };
         assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+    }
+
+    // ---------------- Plan B Task 55, Phase 4e — yield-then-
+    // constant-tail classifier (lambda-lifting first slice).
+
+    #[test]
+    fn yield_then_constant_tail_body_recognised() {
+        use crate::ast::{Block, Expr, PerformExpr, Stmt};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::IntLit(42, span.clone())),
+            span,
+        };
+        assert!(is_simple_yield_then_constant_tail_body(&body));
+    }
+
+    #[test]
+    fn yield_then_constant_tail_with_pure_perform_args_recognised() {
+        // The classifier accepts pure perform args (Idents,
+        // literals, pure compounds). They get lowered via Lowerer
+        // at body-emit time; the env is populated from the user-
+        // arg unpack at the parent fn's entry block.
+        use crate::ast::{Block, Expr, PerformExpr, Stmt};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: vec![Expr::Ident("x".to_string(), span.clone())],
+                span: span.clone(),
+            })],
+            tail: Some(Expr::IntLit(42, span.clone())),
+            span,
+        };
+        assert!(is_simple_yield_then_constant_tail_body(&body));
+    }
+
+    #[test]
+    fn yield_then_non_constant_tail_is_not_yield_then_constant() {
+        // Tail is `Expr::Ident("x")` — not a literal constant.
+        // Future widening (with closure captures) will support
+        // this; first slice restricts to literal tail.
+        use crate::ast::{Block, Expr, PerformExpr, Stmt};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert!(!is_simple_yield_then_constant_tail_body(&body));
+    }
+
+    #[test]
+    fn yield_with_io_perform_is_not_yield_then_constant() {
+        // IO performs use the synchronous lower_perform path
+        // regardless of color; classifier rejects.
+        use crate::ast::{Block, Expr, PerformExpr, Stmt};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Perform(PerformExpr {
+                effect: "IO".to_string(),
+                op: "println".to_string(),
+                args: vec![Expr::StringLit("hi".to_string(), span.clone())],
+                span: span.clone(),
+            })],
+            tail: Some(Expr::IntLit(42, span.clone())),
+            span,
+        };
+        assert!(!is_simple_yield_then_constant_tail_body(&body));
+    }
+
+    #[test]
+    fn multi_stmt_body_is_not_yield_then_constant() {
+        // Classifier requires exactly one stmt. Multi-stmt bodies
+        // need full lambda-lifting (with chained synth-conts) —
+        // future commit.
+        use crate::ast::{Block, Expr, PerformExpr, Stmt};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![
+                Stmt::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                Stmt::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+            ],
+            tail: Some(Expr::IntLit(42, span.clone())),
+            span,
+        };
+        assert!(!is_simple_yield_then_constant_tail_body(&body));
     }
 
     #[test]
