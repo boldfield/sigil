@@ -1410,7 +1410,11 @@ f) **`sigil_continuation_identity` retained for tail-k cases.** Phase 4e doesn't
 **User's hard conditions for the comprehensive Phase 4e PR (mirroring the Phase 4d MVP entry's pattern):**
 
 1. README "Verification limits" lands in the same PR — explicit, user-facing call-out of what closes here AND what remains for Phase 4f/4g (multi-effect, return arms).
-2. The `#[ignore]`'d e2e test `discard_k_handler_does_not_abort_helper_phase_4e_pending` inverts (un-`#[ignore]`'d, stdout assertion flipped from `142` to `42`) at the colorer-refinement commit. The test's commit message names this entry by title.
+2. **Two e2e tests** invert at the codegen-consumes-color commit (per `df251fc`'s discovery — both pin the same algebraic-semantics gap from different angles). The Test inversion + cleanup commit organisation step covers both:
+   - (a) `discard_k_handler_does_not_abort_helper_phase_4e_pending` — un-`#[ignore]`'d, stdout assertion flipped from `142` to `42`. The Phase 4d MVP entry's `#[ignore]`'d pinning test.
+   - (b) `statement_form_non_io_perform_inside_handle_compiles_and_runs` (`compiler/tests/e2e.rs` around line 1054) — already a passing test today; stdout assertion flips from `42` (the Phase 4d MVP synchronous-shape behaviour where helper's stmt-form perform of `E.op()` returns the arm value to be discarded by the Stmt) to `99` (algebraic semantics — discard-`k` arm fires, helper aborts, the handle's overall is the arm value). The colorer pinning test added in `df251fc` (`statement_form_non_io_perform_inside_handle_classifies_main_cps_via_bridge`) attributes a regression here to codegen, not to the colorer.
+
+   The test inversion commit's message names this entry by title and explicitly calls out **both** inversions so a reviewer at the test-inversion checkpoint cannot miss either one. A reviewer who checks only (a) and not (b) would miss that the existing positive test also needs to flip its assertion.
 3. `PLAN_B_PROGRESS.md` Phase 4e entry calls out the Stage 9 unblock explicitly — the existing "Phase 4e is a Stage 9 prerequisite (HARD GATE)" line stays, with a new "(closes at this PR)" suffix added when the PR squash-merges.
 4. Bisecting-hint pattern: failure-mode catalogue across the three architectural surfaces — calling-convention shift / CPS transform correctness / colorer refinement — so a future bisecting agent can attribute regressions to specific commits within this PR.
 
