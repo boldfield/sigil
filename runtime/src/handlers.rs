@@ -542,15 +542,24 @@ pub unsafe extern "C" fn sigil_next_step_args_ptr(ns: *mut NextStep) -> *mut u64
 ///
 /// Codegen emits the address of this function as the `k_fn_ptr` arg
 /// to every non-IO `sigil_perform` site (with `k_closure_ptr` set to
-/// null). When a synthetic CPS arm fn invokes its captured `k(value)`
-/// in tail position, codegen lowers the call as
-/// `sigil_next_step_call(loaded_k_closure, loaded_k_fn, /*arg_count=*/1)`
-/// followed by a single u64 store of `value` at the args buffer's slot 0;
-/// the returned `NextStep::Call` is the arm fn's return value. The
+/// null) for performs that don't have a helper synth-cont in scope —
+/// e.g., when the perform is in tail position of the handle body (no
+/// CPS-color helper wrapping it). When a synthetic CPS arm fn invokes
+/// its captured `k(value)` in tail position, codegen lowers the call
+/// as `sigil_next_step_call(loaded_k_closure, loaded_k_fn,
+/// /*arg_count=*/3)` followed by stores of `[value,
+/// post_arm_k_closure, post_arm_k_fn]` at offsets 0/8/16 of the args
+/// buffer (Phase 4e captures+ Slice A trailing-pair convention). The
+/// returned `NextStep::Call` is the arm fn's return value. The
 /// trampoline (`sigil_run_loop`) dispatches the `Call`, invoking
-/// `sigil_continuation_identity(null, args_ptr=&[value], args_len=1)`,
-/// which returns a `NextStep::Done(value)` from the arena. `run_loop`
-/// then returns `value` to the perform site.
+/// `sigil_continuation_identity(null, args_ptr, args_len)`. Identity
+/// reads only `args_ptr[0]` and returns `NextStep::Done(value)` —
+/// the trailing post-arm-k slots are intentionally ignored at the
+/// identity dispatch point. They matter when the runtime dispatches
+/// into a *helper synth-cont* k_fn (the captures+ Slice B+ paths)
+/// where the synth-cont DOES forward its result through the post-
+/// arm-k pair; identity is the terminal case where there is no
+/// further chaining.
 ///
 /// The shape produces algebraic-correct results when:
 ///   - `k(arg)` is invoked in tail position of the arm body, AND
@@ -560,12 +569,15 @@ pub unsafe extern "C" fn sigil_next_step_args_ptr(ns: *mut NextStep) -> *mut u64
 ///     result back to the perform site).
 ///
 /// Both conditions are enforced by the `unsupported_handle_construct`
-/// codegen-entry walker. Non-tail `k` use, multi-shot `k` use, and
-/// the discard-`k` correctness gap across function-call boundaries
-/// require Plan B Task 55 Phase 4e (colorer's handler-discharge
-/// refinement + native↔CPS interop boundary). See
-/// `[DEVIATION Task 55] Phase 4d` in `PLAN_B_DEVIATIONS.md` and the
-/// "Verification limits (in-flight)" section in `README.md`.
+/// codegen-entry walker for the Phase 4d MVP path. The captures+
+/// Slice A foundation refactor extends the trailing-pair convention
+/// to all tail-`k` arm-fn emissions (args_len=3); identity tolerates
+/// `args_len >= 1` and reads only the first slot. Non-tail `k` use,
+/// multi-shot `k` use, and surrounding-lambda captures into arm
+/// bodies remain rejected by the walker until captures+ Slices B/C/D.
+/// See `[DEVIATION Task 55] Phase 4e captures+` in
+/// `PLAN_B_DEVIATIONS.md` and the "Verification limits (in-flight)"
+/// section in `README.md`.
 ///
 /// # Safety
 ///
@@ -579,17 +591,32 @@ pub unsafe extern "C" fn sigil_continuation_identity(
     args_ptr: *const u64,
     args_len: u32,
 ) -> *mut NextStep {
-    debug_assert_eq!(
-        args_len, 1,
-        "sigil_continuation_identity: arity 1 invariant — codegen always emits \
-         sigil_next_step_call with arg_count=1 for tail-k lowering"
+    // Plan B Task 55, Phase 4e captures+ Slice A — identity tolerates
+    // `args_len >= 1`. Tail-`k` arm-fn emissions now uniformly pack
+    // `[arg, post_arm_k_closure, post_arm_k_fn]` at args_len=3 (the
+    // trailing-pair convention). When the arm dispatches into a
+    // helper synth-cont k_fn, the synth-cont reads the post-arm-k
+    // pair from args_ptr[1..3] and forwards its result to it; when
+    // the arm dispatches into identity directly (perform in tail
+    // position of handle body, no helper synth-cont), the trailing
+    // pair is irrelevant — identity reads only args_ptr[0] and
+    // returns terminal Done.
+    debug_assert!(
+        args_len >= 1,
+        "sigil_continuation_identity: args_len must be >= 1 (codegen \
+         emits arg_count=1 from synth-cont's `Call(post_arm_k_*, [result])` \
+         dispatch and arg_count=3 from arm-fn tail-`k` direct emit per \
+         the Phase 4e captures+ Slice A trailing-pair convention)"
     );
     debug_assert!(
         !args_ptr.is_null(),
         "sigil_continuation_identity: args_ptr must be non-null when args_len >= 1"
     );
-    // SAFETY: caller (codegen tail-k lowering) guarantees args_ptr
-    // points to >= 1 readable u64 holding the captured arg.
+    // SAFETY: caller (codegen tail-k lowering or synth-cont post-arm-k
+    // dispatch) guarantees args_ptr points to >= 1 readable u64
+    // holding the captured arg at slot 0. Trailing slots, if any
+    // (Slice A's post-arm-k pair at slots 1..3), are ignored —
+    // identity is the terminal continuation.
     let value = *args_ptr;
     sigil_next_step_done(value)
 }
@@ -1030,6 +1057,42 @@ mod tests {
         // of every loop iteration including the terminal Done check.
         // Matches `run_loop_dispatches_call_then_done` above.
         assert_eq!(dispatches_after - dispatches_before, 2);
+        reset_state();
+    }
+
+    #[test]
+    fn continuation_identity_tolerates_args_len_3_trailing_pair_convention() {
+        // Plan B Task 55, Phase 4e captures+ Slice A — trailing-pair
+        // convention. Tail-`k` arm-fn emissions now uniformly pack
+        // `[arg, post_arm_k_closure, post_arm_k_fn]` at `args_len=3`.
+        // When the arm dispatches into identity directly (perform in
+        // tail position of the handle body, no helper synth-cont in
+        // scope), identity sees args_len=3 — the trailing pair is
+        // irrelevant since identity is the terminal continuation.
+        //
+        // Identity must read only `args_ptr[0]` and produce
+        // `NextStep::Done(args_ptr[0])`, ignoring the trailing slots.
+        //
+        // Bisecting hint: a regression in the existing
+        // `arm_uses_k_in_tail_position_returns_continuation_value`
+        // e2e test after Slice A would surface as identity's
+        // arity-1 invariant firing here. This unit test pins the
+        // contract directly so the failure attribution is unambiguous.
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let known: u64 = 0xFEEDFACE_DEADBEEF;
+        // [arg, post_arm_k_closure (null), post_arm_k_fn (irrelevant)]
+        let args: [u64; 3] = [known, 0xCAFE, 0xBABE];
+        // SAFETY: not an interior pointer (stack array, non-GC, outlives the call).
+        let ns = unsafe { sigil_continuation_identity(ptr::null(), args.as_ptr(), 3) };
+        unsafe {
+            assert_eq!((*ns).tag, NEXT_STEP_TAG_DONE);
+            assert_eq!((*ns).value, known);
+            assert_eq!((*ns).arg_count, 0);
+            assert!((*ns).closure_ptr.is_null());
+            assert!((*ns).fn_ptr.is_null());
+        }
         reset_state();
     }
 
