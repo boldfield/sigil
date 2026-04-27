@@ -3346,3 +3346,70 @@ fn slice_c_choose_multi_shot_with_string_chain_threads_pointer_through_closures(
          (helper(false)); tail returns r2 = \"no\". stderr={stderr:?}"
     );
 }
+
+#[test]
+fn slice_c_multi_let_arm_body_with_different_callee_in_second_let_is_rejected_at_codegen() {
+    // Slice C negative coverage: when the multi-let arm body's
+    // second `Stmt::Let` invokes a callee OTHER than the captured
+    // continuation `k`, the multi-let shape detector returns None
+    // (because both Lets must invoke the same k_name), and the
+    // regular arm-body walker fires instead — rejecting the first
+    // non-tail `k` call with the existing "non-tail k" diagnostic.
+    //
+    // This e2e pins the walker-level fall-through. The detector-level
+    // rejection is covered by
+    // `arm_body_multi_let_then_pure_tail_shape_rejects_different_k_names_in_lets`
+    // (unit test); this test pins the integration: source like
+    //
+    //   Choose.flip(k) => {
+    //     let r1: Int = k(true);
+    //     let r2: Int = different_fn(false);  // callee is NOT `k`
+    //     r1 + r2
+    //   }
+    //
+    // is rejected at codegen, even though the detector silently
+    // declines to match (so the rejection diagnostic comes from
+    // the non-tail-`k` walker, not from a multi-let-specific path).
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn different_fn(b: Bool) -> Int ![] { if b { 1 } else { 0 } }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = different_fn(false);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "slice_c_reject_diff_callee_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_c_reject_diff_callee_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: multi-let with non-`k` callee in 2nd Let — \
+         detector returns None; regular walker rejects 1st non-tail `k` call. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}

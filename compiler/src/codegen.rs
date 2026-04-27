@@ -4662,6 +4662,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // 1 (bit 1). Here capture[0] = k_closure
                     // (pointer; bit 1 set); capture[1] = k_fn
                     // (non-pointer; no bit).
+                    //
+                    // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
+                    // `post_arm_k_1_closure_ptr` (returned by `alloc_call`
+                    // below) is a heap pointer that lives across the
+                    // subsequent `next_step_call` arena allocation. See
+                    // the central TODO at the synth-cont's
+                    // `post_arm_k_closure` load site for the full
+                    // 4-site audit framing.
                     let count: u8 = 3;
                     // capture-slot 0 (k_closure) is pointer; bit
                     // index = slot_index + 1 = 1.
@@ -5319,6 +5327,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // `post_arm_k_1`'s closure record above: bit `i + 1`
                 // marks capture-slot `i`. Here capture[0] = r1; bit 1
                 // is set if r1's `binding_kind_1` is pointer.
+                //
+                // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
+                // `widened_arg2` (above) and `post_arm_k_2_closure_ptr`
+                // (below, returned by `alloc_2_call`) are heap pointers
+                // (when their types are pointer-typed) that live across
+                // the subsequent `next_step_call` arena allocation. See
+                // the central TODO at the synth-cont's
+                // `post_arm_k_closure` load site for the 4-site audit.
                 let count_2: u8 = 2;
                 // capture-slot 0 (r1) is pointer iff its kind is
                 // pointer; bit index = slot_index + 1 = 1.
@@ -5642,25 +5658,45 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // ConstantDone and LetBindThenTail arms to dispatch
                 // their result through the post-arm-k continuation.
                 //
-                // TODO(plan-b-task-55-phase-4e-captures/slice-b-stackmap-root):
-                // For Slice A, `post_arm_k_closure` is always null
-                // (the arm-fn tail-`k` direct emit packs `[arg, null,
-                // &identity]`), so no GC root is needed across
-                // `emit_dispatch_to_post_arm_k`'s arena allocations.
-                // For Slice B (non-tail `k` lift), the arm-fn will
-                // pack `[arg, post_arm_k_closure_ptr,
-                // post_arm_k_fn_ptr]` where `post_arm_k_closure_ptr`
-                // is a real heap-allocated TAG_CLOSURE record. The
-                // SSA value loaded here lives across
-                // `next_step_call`'s arena allocation inside
-                // `emit_dispatch_to_post_arm_k`; Slice B must add a
-                // stackmap entry on the load (or on the arena alloc
-                // call) so Boehm-precise GC roots
-                // `post_arm_k_closure` across the allocation.
-                // Failure mode if missed: `post_arm_k_closure` is a
-                // dangling pointer when the synth-cont returns its
-                // `Call(post_arm_k_*, [result])`, the trampoline
-                // dispatches into freed memory.
+                // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
+                // This marker covers FOUR sites where heap pointers
+                // live across arena allocations:
+                //   1. THIS site (Slice A's helper synth-cont load
+                //      of `post_arm_k_closure` — null for tail-`k`
+                //      arms, but a real heap-allocated TAG_CLOSURE
+                //      record under Slice B / C non-tail-`k` paths).
+                //   2. Slice C arm-fn body emit: `widened_arg1` +
+                //      `post_arm_k_1_closure_ptr` live across
+                //      `next_step_call` after the closure-record alloc.
+                //   3. Slice C `post_arm_k_1` body: `widened_arg2`
+                //      lives across `post_arm_k_2`'s closure-record
+                //      alloc.
+                //   4. (Slice D, future): surrounding-lambda capture
+                //      pointers live across arm-closure-record alloc.
+                //
+                // Today the closure_ptr-load path here is the only
+                // one with a load that an explicit stackmap-root
+                // annotation could attach to. The other three sites
+                // construct heap pointers via `sigil_alloc` calls
+                // and the resulting SSA values are live across
+                // subsequent allocations — relying on Cranelift /
+                // StackMapBuilder auto-tracking to root them.
+                //
+                // Closeout commit: either document the auto-tracking
+                // guarantee end-to-end (StackMapBuilder/Lowerer
+                // contract: "any SSA value of pointer type live
+                // across an instruction marked via push_placeholder
+                // is recorded as a root") OR add explicit root
+                // annotations at the four sites and remove this TODO.
+                // End-to-end verification with fresh-heap-String
+                // allocations is gated on Stage 6 stdlib growth
+                // (when `String.concat` / `String.from_int` etc.
+                // expose runtime string allocation that would force
+                // GC pressure through these sites).
+                //
+                // Failure mode if missed: heap pointer dangles after
+                // a GC sweep, trampoline dispatches into freed
+                // memory.
                 let synth_cont_args_ptr = block_params[1];
                 let post_arm_k_closure = builder.ins().load(
                     pointer_ty,
