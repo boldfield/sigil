@@ -2099,6 +2099,60 @@ fn cps_abi_helper_with_bool_return_exercises_ireduce_narrow() {
 }
 
 #[test]
+fn cps_abi_helper_with_arity_n_user_args_and_perform_args_returns_arm_value() {
+    // Plan B Task 55, Phase 4e — widened arity slice. Helper
+    // takes one user param `x: Int` and forwards it as the
+    // perform's argument. Arm receives `x` as the op-arg and
+    // returns it doubled. End-to-end:
+    //
+    //   1. main calls `helper(7)` via the native↔CPS interop
+    //      wrapper at lower_call (Cps arm). The wrapper allocates
+    //      a 24-byte stack slot for `[user_arg=7, k_closure=null,
+    //      k_fn=identity]` and calls helper(closure_ptr=null,
+    //      args_ptr=slot, args_len=1).
+    //   2. helper's CPS body emission unpacks `x` from
+    //      `args_ptr[0]`, loads (k_closure, k_fn) from
+    //      `args_ptr[1]`/`args_ptr[2]`, packs `x` into a fresh
+    //      stack slot for the perform's args buffer, and
+    //      calls `sigil_perform(...)` returning its NextStep.
+    //   3. Trampoline dispatches the arm with `x=7` + the
+    //      identity continuation. Arm body `arg * 2` returns
+    //      `Done(14)`.
+    //   4. Trampoline returns 14 to the wrapper; wrapper narrows
+    //      to Int. main's `let n: Int = ...` binds 14.
+    //
+    // What this test pins:
+    //   - User-arg unpacking from args_ptr[0..N*8] in the CPS
+    //     body emission, with type narrow (here Int → I64
+    //     identity, so no ireduce).
+    //   - Perform-arg lowering via Lowerer (the Ident `x` lookup
+    //     hits the env populated from args_ptr unpack).
+    //   - Perform-arg packing into a fresh stack slot, with
+    //     widening discipline.
+    //   - User-arg packing in the wrapper at the call site, with
+    //     widening discipline.
+    //   - `args_len = user_arg_count` per the cps_signature
+    //     convention (D2 fix from PR #26 mid-flight at 33f2231).
+    //   - `k_closure_offset(N)` / `k_fn_offset(N)` keeping write
+    //     and read sites in lockstep across arity widening (S1).
+    //
+    // The two existing Phase 4e tests previously excluded this
+    // path via the D1 arity gate; this commit removes the gate
+    // and the new test exercises the now-supported shape.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(x: Int) -> Int ![E] { perform E.op(x) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(7) with { E.op(arg, k) => arg + arg };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "cps_abi_helper_arity_n_user_args_perform_args");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "14\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
 fn cps_abi_helper_with_string_return_exercises_pointer_ret_path() {
     // Plan B Task 55, Phase 4e — S3 from PR #26 mid-flight at
     // 33f2231. The wrapper's narrow step takes the
