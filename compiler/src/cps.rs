@@ -71,8 +71,21 @@
 //!
 //! ## What this module exposes today
 //!
-//! - [`CpsProgram`] — wraps [`ColoredProgram`] and (in future Phase 4e
-//!   commits) carries side-tables for CPS-form metadata.
+//! - [`CpsProgram`] — wraps [`ColoredProgram`] as a typed pipeline
+//!   checkpoint. At HEAD the wrapper carries no CPS-form-specific
+//!   metadata; it exists because each pipeline pass produces its own
+//!   typed output by convention (lex → parse → resolve → typecheck →
+//!   elaborate → monomorphize → infer_colors → cps::transform →
+//!   closure_convert → emit_object). If Option B (above) ships and
+//!   the codegen-consumes-color commit lands without adding fields
+//!   here, future Phase 4e commits may add CPS-form metadata fields
+//!   (e.g., per-fn yield-point side-tables, synthetic continuation
+//!   FuncId allocations) that justify the wrapper retroactively. If
+//!   no such metadata accrues, a future cleanup commit could fold the
+//!   accessors below into [`ColoredProgram`] and drop `CpsProgram`
+//!   entirely. The decision is deferred to the implementing commits;
+//!   the wrapper is preserved at HEAD to match the staged-pipeline
+//!   convention.
 //! - [`transform`] — pass-through producer of `CpsProgram`.
 //! - [`CpsProgram::needs_cps_transform`] — accessor: does this fn
 //!   need CPS-form codegen treatment? (= is it CPS-color?)
@@ -121,8 +134,26 @@ impl CpsProgram {
     /// to iterate the fns that need CPS calling convention. Stable
     /// ordering matters for reproducibility (Plan A1's reproducibility
     /// test compares object-file bytes between runs); the underlying
-    /// `colors` Vec is BTreeMap-derived and program-order-stable, so
-    /// this accessor preserves that.
+    /// `colors` Vec preserves program declaration order
+    /// (`color.rs::infer_colors` iterates `mono.anf.checked.program.
+    /// items`), so this accessor preserves that. Source declaration
+    /// order is stronger than alphabetical — a future refactor that
+    /// silently swaps to a BTreeMap-derived order (alphabetical-only)
+    /// would change reproducibility-relevant byte sequences without
+    /// the colorer's tests catching it. This is the property pinned
+    /// by `cps_color_user_fns_lists_program_order_cps_only` and
+    /// `cps_color_user_fns_pins_multi_level_scc_bridge_ordering` in
+    /// `cps::tests`.
+    ///
+    /// **Consumer contract.** Consumers driven by per-fn ABI
+    /// selection should iterate this list directly (e.g.,
+    /// `for name in cps_color_user_fns()` then look up the FuncId
+    /// keyed by `name`), not query `needs_cps_transform(some_name)`
+    /// with a name harvested from an AST walk. The latter pattern
+    /// allows a typo to silently classify an unknown name as Native
+    /// (since `needs_cps_transform` returns `false` for unknown fns
+    /// by design — see its doc comment). The codegen-consumes-color
+    /// commit follows the iterate-the-list pattern.
     pub fn cps_color_user_fns(&self) -> Vec<String> {
         self.colored
             .colors
@@ -233,6 +264,51 @@ mod tests {
         let cp = cps_from_src(src);
         assert!(cp.needs_cps_transform("helper"));
         assert!(cp.needs_cps_transform("main"));
+    }
+
+    #[test]
+    fn cps_color_user_fns_pins_multi_level_scc_bridge_ordering() {
+        // a → b → c, where c is intrinsically CPS, and verify
+        // cps_color_user_fns lists all three in program declaration
+        // order. Pins the transitive-closure invariant for ordering,
+        // which is load-bearing if the codegen-consumes-color commit
+        // relies on the order. The 2-level test below
+        // (`cps_color_user_fns_lists_program_order_cps_only`)
+        // exercises a single-hop bridge; this exercises three hops
+        // and confirms the program-declaration-order property holds
+        // through transitive classification (not just directly-
+        // intrinsic-CPS members).
+        //
+        // Surface syntax notes:
+        //   - `effect E { op: () -> Int }` declares the intrinsic
+        //     CPS source.
+        //   - `c` performs E.op (intrinsic CPS).
+        //   - `b` calls `c` (bridge to c's SCC, which is CPS).
+        //   - `a` calls `b` (bridge to b's SCC, which is CPS via
+        //     bridge — this is the multi-hop case).
+        //   - `main` is required for the typecheck/elaborate
+        //     pipeline; it's Native (just returns 0).
+        let src = "effect E { op: () -> Int }\n\
+                   fn c() -> Int ![E] {\n  \
+                     perform E.op()\n\
+                   }\n\
+                   fn b() -> Int ![E] {\n  \
+                     c()\n\
+                   }\n\
+                   fn a() -> Int ![E] {\n  \
+                     b()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let cp = cps_from_src(src);
+        let cps_fns = cp.cps_color_user_fns();
+        // c is intrinsic CPS (row contains E + body performs E.op);
+        // b and a become CPS via SCC bridge (a → b → c). main is
+        // Native (empty row, no perform, no calls). Order follows
+        // source declaration: c, b, a.
+        assert_eq!(
+            cps_fns,
+            vec!["c".to_string(), "b".to_string(), "a".to_string()]
+        );
     }
 
     #[test]
