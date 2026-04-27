@@ -91,15 +91,16 @@ struct UserFnEntry {
     /// `(closure_ptr, args_ptr, args_len) -> *mut NextStep` (per
     /// [`cps_signature`]).
     ///
-    /// At HEAD this field is populated but not yet consumed: every
-    /// fn ends up with the existing native-ABI signature regardless
-    /// of `abi`. The next commit on this branch is the first
-    /// consumer — it gates signature selection on this field, so
-    /// CPS-color fns whose body is simple-tail-perform get the CPS
-    /// ABI declaration. Splitting at this boundary keeps each commit
-    /// focused: this one wires the ABI decision into the per-fn
-    /// metadata; the next one branches signature declaration on it.
-    #[allow(dead_code)]
+    /// Consumed by the user-fn pre-pass loop in `emit_object` to
+    /// drive signature selection: `UserFnAbi::Sync` fns get the
+    /// existing closure-convention signature; `UserFnAbi::Cps` fns
+    /// get [`cps_signature`]. The body emit pass branches on this
+    /// field too — `Cps` fns get the CPS body shape (perform site
+    /// returning `*mut NextStep` directly); `Sync` fns get the
+    /// existing native body lowering. The native-of-CPS call site
+    /// wrapper at `lower_call` consults this field on the callee's
+    /// `UserFnEntry` to decide whether to emit the inlined
+    /// run_loop driver.
     abi: UserFnAbi,
 }
 
@@ -146,14 +147,7 @@ struct UserFnEntry {
 /// but has the discard-`k` cross-call-boundary correctness gap
 /// that Phase 4e closes once the lambda-lifting machinery (a
 /// later commit on this branch) covers more body shapes.
-//
-// `#[allow(dead_code)]`: the enum variants are constructed and
-// stored on `UserFnEntry::abi`, but no code reads them in a `match`
-// yet. The transitional attribute is removed in the next commit on
-// this branch (signature selection), where the user-fn pre-pass
-// gates signature declaration on this field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum UserFnAbi {
     Sync,
     Cps,
@@ -2347,27 +2341,49 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     let mut user_fns: BTreeMap<String, UserFnEntry> = BTreeMap::new();
     for item in &checked.program.items {
         if let crate::ast::Item::Fn(f) = item {
-            // Plan B Task 55, Phase 4e — record the per-fn ABI
-            // decision now even though signature selection still uses
-            // the existing native-ABI shape. The next commit on this
-            // branch is the first to gate signature selection on
-            // `abi`; splitting at this boundary lets the per-fn
-            // classification land with the analysis-surface tests
-            // (76c17ae's classifier tests) before the codegen-shape
-            // change.
+            // Plan B Task 55, Phase 4e — per-fn ABI selection.
+            // `compute_user_fn_abi` returns `Cps` iff the colorer
+            // marks the fn CPS AND its body matches
+            // `is_simple_tail_perform_with_pure_args_body`. The
+            // signature, param_tys, and ret_ty all branch on this
+            // decision. The previous commit (cbe95fc) populated the
+            // field; this commit consumes it for signature selection.
+            // The transitional `#[allow(dead_code)]` on
+            // `UserFnEntry::abi` is removed at the same time.
             let abi = compute_user_fn_abi(&f.name, &f.body, &cc.colored);
-            let mut sig = Signature::new(isa_call_conv(&module));
-            // arg 0: closure_ptr (always pointer-sized).
-            sig.params.push(AbiParam::new(pointer_ty));
-            let mut param_tys: Vec<Type> = Vec::with_capacity(f.params.len() + 1);
-            param_tys.push(pointer_ty);
-            for p in &f.params {
-                let t = cranelift_ty_for_type_expr(&p.ty, pointer_ty);
-                sig.params.push(AbiParam::new(t));
-                param_tys.push(t);
-            }
-            let ret_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
-            sig.returns.push(AbiParam::new(ret_ty));
+            let (sig, param_tys, ret_ty) = match abi {
+                UserFnAbi::Sync => {
+                    let mut sig = Signature::new(isa_call_conv(&module));
+                    // arg 0: closure_ptr (always pointer-sized).
+                    sig.params.push(AbiParam::new(pointer_ty));
+                    let mut param_tys: Vec<Type> = Vec::with_capacity(f.params.len() + 1);
+                    param_tys.push(pointer_ty);
+                    for p in &f.params {
+                        let t = cranelift_ty_for_type_expr(&p.ty, pointer_ty);
+                        sig.params.push(AbiParam::new(t));
+                        param_tys.push(t);
+                    }
+                    let ret_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+                    sig.returns.push(AbiParam::new(ret_ty));
+                    (sig, param_tys, ret_ty)
+                }
+                UserFnAbi::Cps => {
+                    // Uniform CPS calling convention: (closure_ptr,
+                    // args_ptr, args_len) -> *mut NextStep. Matches
+                    // the synthetic-arm-fn ABI from Phase 4d and the
+                    // `cps_signature` helper. User args are unpacked
+                    // from `args_ptr` at fn entry; the trailing two
+                    // slots carry (k_closure, k_fn). The fn's
+                    // declared return type is preserved as `ret_ty`
+                    // here so the native-of-CPS wrapper at call
+                    // sites knows how to narrow the trampoline's
+                    // u64 result back to the user-visible type.
+                    let sig = cps_signature(pointer_ty, &module);
+                    let param_tys = vec![pointer_ty, pointer_ty, types::I32];
+                    let ret_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+                    (sig, param_tys, ret_ty)
+                }
+            };
 
             let mangled = mangle_user_fn(&f.name);
             let func_id = module
@@ -2563,6 +2579,154 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 .collect();
             let div_zero_gv = module.declare_data_in_func(div_zero_msg_id, builder.func);
             let mod_zero_gv = module.declare_data_in_func(mod_zero_msg_id, builder.func);
+
+            // Plan B Task 55, Phase 4e — branch on the per-fn ABI
+            // selected at the pre-pass.
+            //
+            // `UserFnAbi::Cps` fns have CPS calling convention block
+            // params `(closure_ptr, args_ptr, args_len)` and return
+            // `*mut NextStep`. The body emission is hand-rolled
+            // here for the strictest body shape `is_simple_tail_
+            // perform_with_pure_args_body` accepts. The Lowerer-
+            // driven path used for `UserFnAbi::Sync` fns isn't
+            // appropriate because Lowerer's API returns an
+            // `Option<Value>` (the body's tail value) rather than a
+            // NextStep, and routing through it would require
+            // rewriting half the codegen entry surface. Future
+            // Phase 4e commits widening the body shape (stmt-then-
+            // tail-perform via the lambda-lifting machinery) will
+            // restructure this branch.
+            //
+            // Restrictions for the first slice (this commit), all
+            // tightened by `is_simple_tail_perform_with_pure_args_
+            // body` + by hand assertion below:
+            //
+            //   - User fn has zero params (no user args to unpack).
+            //   - The tail perform has zero args (no args buffer to
+            //     pack).
+            //
+            // Helpers with non-zero arity or performs with args
+            // would route through `UserFnAbi::Sync` today (the
+            // classifier returns false for them at HEAD if the
+            // body has stmts, but a zero-stmt body with non-zero-
+            // arity tail perform does pass the classifier — so the
+            // assertion below catches the gap until the next-slice
+            // commit covers user-arg unpacking).
+            if entry.abi == UserFnAbi::Cps {
+                assert!(
+                    f.params.is_empty(),
+                    "codegen Phase 4e: CPS-ABI fn `{}` has user params; \
+                     arity-0 user fns are the only CPS-ABI shape supported \
+                     in this commit (next slice covers arity-N user-arg \
+                     unpacking)",
+                    f.name
+                );
+                let body_perform = match &f.body.tail {
+                    Some(crate::ast::Expr::Perform(p)) => p,
+                    _ => unreachable!(
+                        "codegen Phase 4e: CPS-ABI fn `{}` body is not a \
+                         simple tail perform — `compute_user_fn_abi` invariant \
+                         broken",
+                        f.name
+                    ),
+                };
+                assert!(
+                    body_perform.args.is_empty(),
+                    "codegen Phase 4e: CPS-ABI fn `{}` body's perform has \
+                     {} args; arity-0 performs are the only CPS-ABI shape \
+                     supported in this commit (next slice covers perform-arg \
+                     packing in the CPS body lowering)",
+                    f.name,
+                    body_perform.args.len()
+                );
+                let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                // block_params[0] = closure_ptr (unused at HEAD)
+                let args_ptr = block_params[1];
+                // block_params[2] = args_len (unused — fixed shape)
+                let _ = block_params[2];
+                // Load (k_closure, k_fn) from args_ptr[0], args_ptr[1].
+                // The native-of-CPS wrapper at the call site packs
+                // exactly these two slots when the user fn has zero
+                // user args. Future user-arg-unpacking work shifts
+                // these offsets by N*8 where N = user arg count.
+                let k_closure_loaded = builder.ins().load(
+                    pointer_ty,
+                    cranelift::prelude::MemFlags::new(),
+                    args_ptr,
+                    0,
+                );
+                let k_fn_loaded = builder.ins().load(
+                    pointer_ty,
+                    cranelift::prelude::MemFlags::new(),
+                    args_ptr,
+                    8,
+                );
+
+                // Resolve effect_id + op_id at fn entry.
+                let effect_id = match checked.effect_ids.get(&body_perform.effect) {
+                    Some(id) => *id,
+                    None => unreachable!(
+                        "codegen Phase 4e: effect `{}` missing from effect_ids \
+                         map; typecheck E0042 should have caught this",
+                        body_perform.effect
+                    ),
+                };
+                let op_id = match checked
+                    .op_ids
+                    .get(&(body_perform.effect.clone(), body_perform.op.clone()))
+                {
+                    Some(id) => *id,
+                    None => unreachable!(
+                        "codegen Phase 4e: op_id missing for `{}.{}`; \
+                         typecheck E0043 should have caught this",
+                        body_perform.effect, body_perform.op
+                    ),
+                };
+                let effect_id_v = builder.ins().iconst(types::I32, effect_id as i64);
+                let op_id_v = builder.ins().iconst(types::I32, op_id as i64);
+
+                // Re-declare per-fn FuncRefs needed for the perform
+                // call. Mirrors the user-fn loop below; CPS fns
+                // don't need the full FFI ref set so we declare a
+                // minimum.
+                let perform_ref = module.declare_func_in_func(perform_func, builder.func);
+
+                // sigil_perform(effect_id, op_id, args_ptr=null,
+                // args_len=0, k_closure_loaded, k_fn_loaded). args_ptr
+                // is null because the perform has zero args (the
+                // classifier guarantee, asserted above).
+                let null_perform_args_ptr = builder.ins().iconst(pointer_ty, 0);
+                let zero_args_len = builder.ins().iconst(types::I32, 0);
+                let perform_call = builder.ins().call(
+                    perform_ref,
+                    &[
+                        effect_id_v,
+                        op_id_v,
+                        null_perform_args_ptr,
+                        zero_args_len,
+                        k_closure_loaded,
+                        k_fn_loaded,
+                    ],
+                );
+                stackmap.push_placeholder(function_code_offset(&builder, perform_call));
+                let next_step = builder.inst_results(perform_call)[0];
+                builder.ins().return_(&[next_step]);
+                builder.finalize();
+                // `finalize()` consumes `builder` (takes `self`), which
+                // ends the `&mut ctx.func` borrow. The module
+                // operations below need `&mut ctx` and now safely
+                // get it. The Sync path below relies on the inner
+                // `{...}` block to bound the builder's lifetime; the
+                // CPS branch's `continue` exits inside the inner
+                // block but the consuming `finalize()` already
+                // released the borrow.
+
+                module
+                    .define_function(entry.func_id, &mut ctx)
+                    .map_err(|e| format!("define {}: {e}", f.name))?;
+                module.clear_context(&mut ctx);
+                continue;
+            }
 
             // Seed the per-fn env with user params. Block param 0 is the
             // closure_ptr; user params follow.
@@ -3873,16 +4037,129 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.lower_ctor_alloc(&type_name, variant_idx, &field_vals)
             }
             Expr::Ident(name, _) if self.user_fn_refs.contains_key(name) => {
-                let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-                let func_ref = self.user_fn_refs[name];
-                let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
-                let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 1);
-                all_args.push(null_closure);
-                all_args.extend(arg_vals);
-                let call = self.builder.ins().call(func_ref, &all_args);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                // Plan B Task 55, Phase 4e — branch on the callee's
+                // ABI. Sync callees use the existing closure-
+                // convention direct call. Cps callees use the
+                // inlined native↔CPS interop wrapper: pack args
+                // (none for arity-0 callees) into a stack-slot u64
+                // buffer, append (k_closure=null, k_fn=&identity)
+                // for the continuation, call the CPS fn → *mut
+                // NextStep, drive sigil_run_loop → u64, narrow
+                // back to the callee's declared return type.
+                let callee_entry = match self.user_fns.get(name) {
+                    Some(e) => e,
+                    None => unreachable!(
+                        "codegen: user_fn_refs contains `{name}` but user_fns \
+                         doesn't — pre-pass invariant broken"
+                    ),
+                };
+                match callee_entry.abi {
+                    UserFnAbi::Sync => {
+                        let arg_vals: Vec<Value> =
+                            args.iter().map(|a| self.lower_expr(a)).collect();
+                        let func_ref = self.user_fn_refs[name];
+                        let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+                        let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 1);
+                        all_args.push(null_closure);
+                        all_args.extend(arg_vals);
+                        let call = self.builder.ins().call(func_ref, &all_args);
+                        self.stackmap
+                            .push_placeholder(function_code_offset(&self.builder, call));
+                        self.builder.inst_results(call)[0]
+                    }
+                    UserFnAbi::Cps => {
+                        // First slice supports arity-0 user fns
+                        // only (matching the body emission's
+                        // arity-0 restriction). The pre-pass'
+                        // `compute_user_fn_abi` returns Cps only
+                        // for fns whose body matches `is_simple_
+                        // tail_perform_with_pure_args_body`, which
+                        // by itself doesn't constrain user-fn
+                        // arity — but the body emission asserts
+                        // arity-0. Future commits widen both
+                        // sides together.
+                        assert!(
+                            args.is_empty(),
+                            "codegen Phase 4e: CPS-ABI callee `{name}` called \
+                             with {} user args; arity-0 calls are the only \
+                             CPS-ABI shape supported in this commit (next \
+                             slice covers arity-N user-arg packing in the \
+                             native\u{2194}CPS wrapper)",
+                            args.len()
+                        );
+
+                        // Stack slot for `[k_closure, k_fn]` (2 u64
+                        // slots = 16 bytes, 8-byte aligned). The
+                        // callee reads these from `args_ptr[0]` and
+                        // `args_ptr[1]`. `k_closure = null` and
+                        // `k_fn = sigil_continuation_identity`
+                        // mirrors the Phase 4d MVP perform-site
+                        // shape: when the trampoline eventually
+                        // dispatches the callee's perform's arm,
+                        // a `k(arg)` invocation rolls through
+                        // identity to terminal Done(arg); a
+                        // discard-k arm returns Done(arm_value)
+                        // directly. Either way the synchronous
+                        // wrapper unwinds to `sigil_run_loop`'s
+                        // u64 return.
+                        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            16,
+                            3,
+                        ));
+                        let null_k_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+                        let identity_k_fn = self
+                            .builder
+                            .ins()
+                            .func_addr(self.pointer_ty, self.continuation_identity_ref);
+                        self.builder.ins().stack_store(null_k_closure, slot, 0);
+                        self.builder.ins().stack_store(identity_k_fn, slot, 8);
+                        let args_ptr = self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
+                        let args_len = self.builder.ins().iconst(types::I32, 2);
+
+                        let func_ref = self.user_fn_refs[name];
+                        let null_closure_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
+                        let cps_call = self
+                            .builder
+                            .ins()
+                            .call(func_ref, &[null_closure_ptr, args_ptr, args_len]);
+                        self.stackmap
+                            .push_placeholder(function_code_offset(&self.builder, cps_call));
+                        let next_step = self.builder.inst_results(cps_call)[0];
+
+                        // Drive the trampoline. Returns u64.
+                        let run_loop_call =
+                            self.builder.ins().call(self.run_loop_ref, &[next_step]);
+                        self.stackmap
+                            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
+                        let raw_u64 = self.builder.inst_results(run_loop_call)[0];
+
+                        // Narrow `raw_u64` back to the callee's
+                        // declared return type. Mirrors the
+                        // narrow-on-perform-side discipline from
+                        // `lower_perform_non_io_to_value`.
+                        let ret_ty = callee_entry.ret_ty;
+                        if ret_ty == types::I64 {
+                            raw_u64
+                        } else if ret_ty.is_int() && ret_ty.bits() < 64 {
+                            self.builder.ins().ireduce(ret_ty, raw_u64)
+                        } else {
+                            // Pointer-typed return: the trampoline's
+                            // u64 is bit-identical to the pointer
+                            // value on supported targets (pointer_ty
+                            // == I64 on x86_64-linux + aarch64-darwin).
+                            // No conversion needed; debug_assert pins
+                            // the invariant.
+                            debug_assert_eq!(
+                                ret_ty, self.pointer_ty,
+                                "codegen Phase 4e: CPS callee `{name}` \
+                                 has unexpected ret_ty {ret_ty:?}; expected \
+                                 I64 or pointer_ty"
+                            );
+                            raw_u64
+                        }
+                    }
+                }
             }
             // Plan A2 task 34: language builtin `int_to_string(Int) ->
             // String !`. Typecheck seeds the signature via

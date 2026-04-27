@@ -1982,6 +1982,63 @@ fn arm_uses_k_in_non_tail_position_is_rejected_pointing_at_phase_4e() {
 }
 
 #[test]
+fn cps_abi_helper_with_simple_tail_perform_called_from_native_main_returns_arm_value() {
+    // Plan B Task 55, Phase 4e — the first slice of CPS-ABI
+    // user-fn emission. `raise_e` has an empty stmts list and tail
+    // = `perform E.op()`; it matches `is_simple_tail_perform_with
+    // _pure_args_body` and is intrinsically CPS-color (row contains
+    // `E`). `compute_user_fn_abi` returns `UserFnAbi::Cps`, so
+    // `raise_e` is declared with the CPS calling convention
+    // `(closure_ptr, args_ptr, args_len) -> *mut NextStep` (per
+    // `cps_signature`).
+    //
+    // `main` is CPS-color via the SCC bridge to `raise_e`, but its
+    // body is multi-stmt — `compute_user_fn_abi` returns
+    // `UserFnAbi::Sync`, so `main` keeps the existing closure-
+    // convention signature and the synchronous body lowering. The
+    // call to `raise_e` from `main` routes through the inlined
+    // native↔CPS interop wrapper at `lower_call`: pack
+    // `(k_closure=null, k_fn=sigil_continuation_identity)` into a
+    // 16-byte stack slot, call `raise_e(closure_ptr=null, args_ptr,
+    // args_len=2)` → `*mut NextStep`, drive `sigil_run_loop` →
+    // u64, narrow back to `Int`.
+    //
+    // **Architectural shift**: today's `lower_perform_non_io_to_
+    // value` (Phase 4d MVP) inlines the perform site inside `raise
+    // _e`'s native-ABI body. This test exercises the same
+    // observable behaviour (stdout `42`, the arm value) but
+    // through the CPS-ABI path: `raise_e`'s body emits a tail
+    // `sigil_perform(...)` returning `*mut NextStep` directly, and
+    // the synchronous run_loop driver moves to the call site.
+    // Under tail-position perform semantics the two shapes are
+    // observationally equivalent; the architectural difference
+    // only matters for cross-function-call discard-k correctness
+    // (the `discard_k_handler_does_not_abort_helper_phase_4e_
+    // pending` test, which inverts in a later commit when both
+    // `main` and `raise_e` become CPS-ABI via the lambda-lifting
+    // machinery).
+    //
+    // What this test pins: signature selection routes the right
+    // fn through the CPS-ABI path; the body emit branch produces
+    // a valid Cranelift function with the right shape; the call-
+    // site wrapper packs args correctly and drives the trampoline;
+    // the ret-type narrow returns the right value.
+    let src = "effect E { op: () -> Int }\n\
+               fn raise_e() -> Int ![E] { perform E.op() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle raise_e() with { E.op(k) => 42 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "cps_abi_helper_with_simple_tail_perform_called_from_native_main",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
 #[ignore = "Phase 4e pending: pins the discard-k correctness gap across function-call boundaries; inverts to a normal test (asserting stdout 42, code 0) when Phase 4e ships the colorer's handler-discharge refinement"]
 fn discard_k_handler_does_not_abort_helper_phase_4e_pending() {
     // Plan B Task 55 (Phase 4d MVP) — pinning test for the
