@@ -2992,6 +2992,22 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             builder.seal_block(block);
 
             // Runtime FuncRefs for this fn's definition.
+            //
+            // TODO(plan-b-task-55-phase-4e/ffi-ref-extraction):
+            // The ~50 lines of FFI ref + lit_gv + handler_arm_refs
+            // setup below are duplicated at three sites: this
+            // user-fn body emit, the synth-arm-fn body emit
+            // (search for "Per-arm-fn FFI refs"), and the
+            // synth-cont definition pass for LetBindThenTail
+            // (search for "Per-fn FFI refs"). PR #26 mid-flight
+            // reviews at 33f2231, a5ee4c6, and 2be70ce all flagged
+            // the duplication. The agent committed at 2be70ce to
+            // extracting `prepare_lowerer_refs(...)` in the next
+            // commit on this branch before any further slice
+            // expansion. This grep-able marker tracks the
+            // commitment so it can't slip if slice ordering
+            // shifts. Remove the marker when the extraction
+            // lands.
             let string_new_ref = module.declare_func_in_func(string_new, builder.func);
             let println_ref = module.declare_func_in_func(println, builder.func);
             let panic_arith_ref = module.declare_func_in_func(panic_arith, builder.func);
@@ -7914,6 +7930,112 @@ mod tests {
             0,
             "pattern-bound `threshold` shadows helper param; walker must \
              not capture. Pre-fix this returned [threshold] (incorrect)."
+        );
+    }
+
+    #[test]
+    fn collect_synth_cont_captures_match_with_tuple_pattern_var_shadows_param() {
+        // PR #26 mid-flight at 2be70ce review item #1:
+        // Pattern::Tuple binding shape was unpinned — the
+        // `Tuple(patterns)` arm of `collect_pattern_bindings`
+        // recurses into each sub-pattern; without a test, a
+        // future refactor could break tuple recursion silently.
+        //
+        // Source-equivalent body: `match (x, x) { (threshold, _)
+        // => threshold + 1 }`. The pattern's first component
+        // binds `threshold`, shadowing helper's user-param.
+        // Walker must not capture `threshold`.
+        use crate::ast::{BinOp, Expr, MatchArm, Param, Pattern, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Match {
+            scrutinee: Box::new(Expr::Ident("x".to_string(), span.clone())),
+            arms: vec![MatchArm {
+                pattern: Pattern::Tuple(
+                    vec![
+                        Pattern::Var("threshold".to_string(), span.clone()),
+                        Pattern::Wildcard(span.clone()),
+                    ],
+                    span.clone(),
+                ),
+                body: Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Ident("threshold".to_string(), span.clone())),
+                    rhs: Box::new(Expr::IntLit(1, span.clone())),
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "threshold".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        assert_eq!(
+            captures.len(),
+            0,
+            "Tuple pattern's first-component binding `threshold` shadows \
+             helper param; walker must not capture"
+        );
+    }
+
+    #[test]
+    fn collect_synth_cont_captures_match_with_ctor_positional_pattern_var_shadows_param() {
+        // PR #26 mid-flight at 2be70ce review item #1:
+        // Pattern::Ctor::Positional binding shape was unpinned.
+        // Source-equivalent: `match opt { Some(threshold) =>
+        // threshold + 1, None => 0 }`. The Some's positional
+        // binding shadows helper's user-param.
+        use crate::ast::{BinOp, CtorPatternFields, Expr, MatchArm, Param, Pattern, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Match {
+            scrutinee: Box::new(Expr::Ident("x".to_string(), span.clone())),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Ctor {
+                        name: "Some".to_string(),
+                        fields: CtorPatternFields::Positional(vec![Pattern::Var(
+                            "threshold".to_string(),
+                            span.clone(),
+                        )]),
+                        span: span.clone(),
+                    },
+                    body: Expr::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(Expr::Ident("threshold".to_string(), span.clone())),
+                        rhs: Box::new(Expr::IntLit(1, span.clone())),
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                },
+                MatchArm {
+                    pattern: Pattern::Ctor {
+                        name: "None".to_string(),
+                        fields: CtorPatternFields::Unit,
+                        span: span.clone(),
+                    },
+                    body: Expr::IntLit(0, span.clone()),
+                    span: span.clone(),
+                },
+            ],
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "threshold".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        assert_eq!(
+            captures.len(),
+            0,
+            "Ctor::Positional pattern's binding `threshold` shadows helper \
+             param in Some arm; None arm has no binding. Walker must not \
+             capture in either arm."
         );
     }
 

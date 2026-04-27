@@ -2373,6 +2373,153 @@ fn cps_abi_arity_n_helper_with_constant_done_synth_cont() {
 }
 
 #[test]
+fn cps_abi_arity_n_helper_with_constant_done_synth_cont_use_k() {
+    // PR #26 mid-flight at 2be70ce review item #2: companion to
+    // `cps_abi_arity_n_helper_with_constant_done_synth_cont`
+    // — that test pinned the BUILD path (helper unpacks user
+    // param, packs into perform args, dispatches arm) but left
+    // the synth-cont's RUN path under the ConstantDone shape
+    // unexercised.
+    //
+    // This test uses `=> k(arg)` arm to force the synth-cont to
+    // fire. arm builds Call(synth_cont, [arg]) → trampoline
+    // dispatches synth_cont → synth_cont returns Done(99)
+    // (ignoring k_arg per ConstantDone semantics). Result `99`
+    // (NOT `arg + 35` since the synth-cont always returns the
+    // constant tail).
+    //
+    // Closes the coverage symmetry with the LetBindThenTail
+    // `discard_k` + `use_k` test pair.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(x: Int) -> Int ![E] {\n  \
+                 perform E.op(x);\n  \
+                 99\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(7) with { E.op(arg, k) => k(arg) };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_arity_n_constant_done_use_k");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Arm `=> k(arg)` calls k → trampoline runs synth_cont with
+    // args_ptr[0] = arg = 7. synth_cont (ConstantDone) returns
+    // Done(99) ignoring args_ptr. Trampoline returns 99 to
+    // wrapper. main: n = 99.
+    assert_eq!(
+        stdout, "99\n",
+        "ConstantDone synth-cont's RUN path: arm calls k(arg) → \
+         synth-cont fires → ignores k_arg, returns Done(99). stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cps_abi_let_yield_helper_with_bool_binding_exercises_ireduce_narrow() {
+    // PR #26 mid-flight at 2be70ce review item #3 (prior-gap
+    // follow-up): non-Int binding in LetBindThenTail. The
+    // synth-cont's binding-load narrows from I64 (the args_ptr
+    // u64 slot) to the binding's declared Cranelift type via
+    // `ireduce` — for Bool, that's I64 → I8. This path was
+    // unexercised in the e2e suite.
+    //
+    // helper: `let b: Bool = perform B.op(); if b then 1 else 0`.
+    // Use-k arm `=> k(true)` — synth-cont reads args_ptr[0] =
+    // 1 (widened bool true), narrows to I8 = 1, binds `b: Bool
+    // = true`, lowers `if b then 1 else 0` = 1. Result `1`.
+    let src = "effect B { op: () -> Bool }\n\
+               fn helper() -> Int ![B, IO] {\n  \
+                 let b: Bool = perform B.op();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with { B.op(k) => k(true) };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_let_yield_bool_binding");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1\n",
+        "Bool binding in LetBindThenTail: synth-cont ireduce I64 → I8 \
+         on args_ptr load; `if b then 1 else 0` with b=true → 1. \
+         stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cps_abi_let_yield_helper_with_string_binding_exercises_pointer_path() {
+    // PR #26 mid-flight at 2be70ce review item #3 (prior-gap
+    // follow-up): pointer-typed binding in LetBindThenTail. The
+    // synth-cont's binding-load takes the pointer-pass-through
+    // arm of the narrow switch (no ireduce on pointer_ty == I64
+    // targets). This path was unexercised in the e2e suite.
+    //
+    // helper: `let s: String = perform S.op(); s` — tail just
+    // returns the binding. Use-k arm `=> k("hello")` — synth-
+    // cont reads args_ptr[0] (String pointer), passes through,
+    // binds `s`, lowers tail `s`. Result is the string "hello".
+    let src = "effect S { op: () -> String }\n\
+               fn helper() -> String ![S, IO] {\n  \
+                 let s: String = perform S.op();\n  \
+                 s\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = handle helper() with { S.op(k) => k(\"hello\") };\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_let_yield_string_binding");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "hello\n",
+        "String binding in LetBindThenTail: synth-cont pointer-path \
+         on args_ptr load; tail returns binding directly. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cps_abi_captures_bearing_with_bool_capture_exercises_widen_narrow_symmetry() {
+    // PR #26 mid-flight at 2be70ce review item #3 (prior-gap
+    // follow-up): non-Int capture type. The closure record's
+    // slot encoding for non-Int captures requires:
+    //   - On the WRITE side (helper's body emit alloc): widen
+    //     to I64 via uextend (Bool I8 → I64).
+    //   - On the READ side (synth-cont's capture-load): narrow
+    //     back to the declared kind via ireduce (I64 → I8).
+    // A regression in either side would silently produce
+    // garbage in the upper bits.
+    //
+    // helper takes `flag: Bool` user param, captures it; tail
+    // `if flag then x else 0`. use-k arm `=> k(99)` →
+    // synth-cont loads flag from closure record (offset 16,
+    // narrows I64→I8), binds x=99, lowers `if flag then x
+    // else 0` with flag=true → 99.
+    //
+    // For flag=false: the test inverts (n = 0). Both paths
+    // exercise the widen/narrow symmetry.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(flag: Bool) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 if flag { x } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle helper(true) with { Raise.fail(k) => k(99) };\n  \
+                 let b: Int = handle helper(false) with { Raise.fail(k) => k(99) };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_bearing_bool");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n0\n",
+        "Bool capture's widen/narrow symmetry: helper(true) k(99) → \
+         flag=true so x=99 returned; helper(false) k(99) → flag=false \
+         so 0 returned. stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn captures_bearing_synth_cont_with_two_user_params_captured() {
     // PR #26 mid-flight at a5ee4c6 item #2 (prior-gap follow-up):
     // multi-capture e2e — pins the closure record's slot ordering
