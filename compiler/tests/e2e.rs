@@ -2275,6 +2275,103 @@ fn discard_k_handler_does_abort_helper_across_call_boundary() {
 }
 
 #[test]
+fn captures_bearing_synth_cont_arity_n_helper_discard_k() {
+    // Plan B Task 55, Phase 4e — captures-bearing slice. helper
+    // takes `threshold: Int` user param and references it in the
+    // tail expression `x + threshold`. The synth-cont captures
+    // `threshold` via closure record at the perform site; when
+    // the trampoline dispatches the arm `Raise.fail(k) => 42`
+    // (discards k), the synth-cont never runs and the arm's
+    // value flows directly to main's let-binding.
+    //
+    // Phase 4d MVP synchronous shape would have:
+    //   - helper synchronously runs sigil_run_loop
+    //   - arm returns 42; helper x = 42
+    //   - helper computes 42 + threshold = 42 + 10 = 52
+    //   - main: n = 52
+    //
+    // Phase 4e captures-bearing shape:
+    //   - helper allocates closure record with threshold = 10
+    //   - helper builds NextStep::Call(arm, [..., k_closure=record,
+    //     k_fn=&synth_cont]) and returns it
+    //   - main's wrapper drives sigil_run_loop
+    //   - arm `=> 42` discards k → returns Done(42); synth-cont
+    //     never runs (record never read)
+    //   - sigil_run_loop returns 42 to wrapper
+    //   - main: n = 42
+    //
+    // **The captures-bearing slice extends the discard-k
+    // correctness fix to arity-N helpers** — the constant-tail
+    // and arity-0 let-yield slices unblocked discard-k for
+    // simpler shapes; this commit closes the remaining gap for
+    // helpers that use their user params in the post-yield
+    // expression.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(threshold: Int) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x + threshold\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   Raise.fail(k) => 42,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_arity_n_discard_k");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "Phase 4e captures-bearing slice: arity-N helper with captured \
+         user param + discard-k arm produces algebraic-correct value (42, \
+         not 52). stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn captures_bearing_synth_cont_arity_n_helper_use_k() {
+    // Companion to captures_bearing_synth_cont_arity_n_helper_
+    // discard_k — pins the use-k path.
+    //
+    // Arm `Raise.fail(k) => k(7)`:
+    //   - arm builds Call(synth_cont, [k_closure=record, 7])
+    //   - trampoline runs synth_cont(closure_ptr=record,
+    //     args_ptr=[7], args_len=1)
+    //   - synth-cont loads x=7 from args_ptr[0]
+    //   - synth-cont loads threshold=10 from
+    //     closure_ptr + 16 (capture slot 0)
+    //   - synth-cont lowers `x + threshold` = 7 + 10 = 17 via
+    //     Lowerer (env={x: 7, threshold: 10})
+    //   - synth-cont returns Done(17)
+    //   - trampoline returns 17 to wrapper
+    //   - main: n = 17
+    //
+    // This is the load-bearing test for the captures-load path
+    // — the synth-cont's `closure_ptr + 16 + 8*i` reads + the
+    // env-bind chain.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(threshold: Int) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x + threshold\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   Raise.fail(k) => k(7),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_arity_n_use_k");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "17\n",
+        "Phase 4e captures-bearing use-k path: arm calls k(7) → \
+         synth_cont reads threshold=10 from closure record + binds \
+         x=7 → x + threshold = 17. stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn discard_k_handler_use_k_arm_runs_synth_cont_with_bound_value() {
     // Companion to `discard_k_handler_does_abort_helper_across_
     // call_boundary` — pins the use-k arm path. When the arm calls

@@ -188,7 +188,13 @@ enum UserFnAbi {
 /// pinning.
 fn compute_user_fn_abi(
     name: &str,
-    params: &[crate::ast::Param],
+    // The `_params` parameter is preserved (with leading underscore
+    // marking the unused state) for forward compatibility — earlier
+    // slices used it for the arity-0 gate; the captures-bearing
+    // slice (this commit) handles arity-N transparently via the
+    // pre-pass's free-var analysis. Future slices may add arity-
+    // related gates that consume it again.
+    _params: &[crate::ast::Param],
     body: &crate::ast::Block,
     colored: &ColoredProgram,
 ) -> UserFnAbi {
@@ -200,14 +206,15 @@ fn compute_user_fn_abi(
     {
         return UserFnAbi::Cps;
     }
-    // Let-yield-then-pure-tail shape — captures-free slice
-    // restricted to arity-0 helpers. The synth-cont binds the
-    // perform's result by name and lowers the tail via Lowerer;
-    // for non-zero-arity helpers, the tail might reference user
-    // params which would require synth-cont closure captures
-    // (next major commit). Helpers with this body shape AND user
-    // params fall through to Sync ABI cleanly here.
-    if params.is_empty() && is_simple_let_yield_then_pure_tail_body(body) {
+    // Let-yield-then-pure-tail shape — captures-bearing slice
+    // (this commit). Lifts the prior arity-0 restriction: helpers
+    // with user params referenced in the tail are now CPS-eligible
+    // because the synth-cont can capture them via closure record.
+    // The pre-pass populates `CpsContinuationKind::LetBindThenTail
+    // .captures` via `collect_synth_cont_captures`; helper's body
+    // emit allocates the closure record at the perform site and
+    // passes its pointer as `k_closure`.
+    if is_simple_let_yield_then_pure_tail_body(body) {
         return UserFnAbi::Cps;
     }
     UserFnAbi::Sync
@@ -1355,6 +1362,29 @@ struct CpsContinuationSynth {
     kind: CpsContinuationKind,
 }
 
+/// Plan B Task 55, Phase 4e — one captured user-param of the parent
+/// helper that the synth-cont closure record holds. Mirrors the
+/// shape of [`ArmCapture`] used by Phase 4d's per-arm closure
+/// records — we keep a separate struct (rather than aliasing) so
+/// the captures-bearing slice's intent is explicit at the type
+/// level: synth-cont captures come from the parent helper's user
+/// params via free-var analysis on the tail expression, not from
+/// the typechecker's `handle_arm_captures` side-table.
+///
+/// At HEAD the captures only cover helper's user params (free names
+/// in the tail that resolve to a `Param`). Future widenings may
+/// add captures from let-bindings in multi-stmt bodies (chained
+/// synth-conts), or from surrounding-lambda closures (the
+/// closure-convert side-table extension).
+#[derive(Clone, Debug)]
+struct SynthContCapture {
+    /// Source-level name (matches a helper param's name).
+    name: String,
+    /// Slot kind for the closure-record encoding; drives bitmap
+    /// + load/store widening.
+    kind: EnvSlotKind,
+}
+
 /// Plan B Task 55, Phase 4e — discriminates the body-shape variants
 /// of a [`CpsContinuationSynth`].
 #[derive(Clone, Debug)]
@@ -1374,16 +1404,24 @@ enum CpsContinuationKind {
     /// **Let-bind-then-tail shape** (per
     /// [`is_simple_let_yield_then_pure_tail_body`]): the synth-cont
     /// reads `args_ptr[0]` as the let-binding's value, binds it in
-    /// a fresh Lowerer's env under `binding_name`, lowers `tail_expr`
-    /// via Lowerer (which can reference `binding_name` and other
-    /// pure shapes), widens the result to I64, returns
-    /// `Done(value)`. Used when the parent helper's body is
-    /// `let name = perform ...; tail_expr` and the tail is a pure
-    /// expression that may reference `name`.
+    /// a fresh Lowerer's env under `binding_name`, loads any
+    /// `captures` from `closure_ptr`, lowers `tail_expr` via
+    /// Lowerer (which can reference `binding_name`, captured user
+    /// params, and other pure shapes), widens the result to I64,
+    /// returns `Done(value)`. Used when the parent helper's body
+    /// is `let name = perform ...; tail_expr` and the tail is a
+    /// pure expression that may reference `name` and/or helper's
+    /// user params.
     ///
-    /// First-slice constraint: the parent helper has zero user
-    /// params (no captures of helper's user state needed). The
-    /// captures-bearing slice (future commit) lifts this.
+    /// **Captures-bearing extension (this commit's slice)**: the
+    /// `captures` list enumerates user params of the parent helper
+    /// that the tail expression references by name. The synth-cont
+    /// reads them from `closure_ptr` at fn entry (via the same
+    /// `lower_closure_env_load` machinery user lambdas use). The
+    /// parent helper's body emit allocates the closure record at
+    /// the perform site and passes its pointer as `k_closure` to
+    /// `sigil_perform`. When `captures` is empty, the parent
+    /// passes null `k_closure` (no allocation).
     LetBindThenTail {
         /// Source-level name of the let-binding (the name `args_ptr
         /// [0]` is bound to in the synth-cont's env).
@@ -1395,14 +1433,178 @@ enum CpsContinuationKind {
         binding_ty: Type,
         /// The post-yield rest-of-body that the synth-cont lowers
         /// via Lowerer.lower_expr. Pure per the classifier; may
-        /// reference `binding_name`. Boxed because `Expr` has a
-        /// large representation and clippy flags
-        /// `clippy::large_enum_variant` on the unboxed shape.
+        /// reference `binding_name` and any of `captures`. Boxed
+        /// because `Expr` has a large representation and clippy
+        /// flags `clippy::large_enum_variant` on the unboxed
+        /// shape.
         tail_expr: Box<crate::ast::Expr>,
         /// Cranelift type of the tail expression's value. Used to
         /// widen to I64 before wrapping in `Done(...)`.
         tail_ty: Type,
+        /// Captures of the parent helper's user params that the
+        /// tail expression references. Computed via free-var
+        /// analysis at the user-fn pre-pass. Empty when the
+        /// helper is arity-0 OR when the tail doesn't reference
+        /// any user params (e.g., constant tail). When empty, the
+        /// parent helper passes null `k_closure`; when non-empty,
+        /// the parent allocates a closure record holding the
+        /// captures and passes its pointer.
+        captures: Vec<SynthContCapture>,
     },
+}
+
+/// Plan B Task 55, Phase 4e — derive an [`EnvSlotKind`] from a
+/// surface-syntax [`crate::ast::TypeExpr`]. Used at the synth-cont
+/// pre-pass to compute `SynthContCapture::kind` from a parent
+/// helper's parameter declarations.
+///
+/// Mirrors [`crate::closure_convert::slot_kind_for_ty`] but works
+/// on the post-monomorphization `TypeExpr` rather than the
+/// typechecker's `Ty` (which the codegen-side pre-pass doesn't
+/// have direct access to). `TypeExpr::Apply` is rejected at the
+/// codegen-entry walker before this function runs (per Plan B
+/// Task 49's monomorphization invariant), so we only need to
+/// handle `TypeExpr::Named`. The name resolution mirrors
+/// `cranelift_ty_for_type_expr`'s primitive-name table; non-
+/// primitive names are treated as user-type pointers.
+fn slot_kind_for_type_expr_post_mono(te: &crate::ast::TypeExpr) -> EnvSlotKind {
+    match te {
+        crate::ast::TypeExpr::Named(name, _) => match name.as_str() {
+            "Int" => EnvSlotKind::Int,
+            "Bool" => EnvSlotKind::Bool,
+            "Char" => EnvSlotKind::Char,
+            "Byte" => EnvSlotKind::Byte,
+            "Unit" => EnvSlotKind::Unit,
+            "String" => EnvSlotKind::String,
+            // User-defined types (and any monomorphized name from
+            // mangle_type) are pointer-typed.
+            _ => EnvSlotKind::User,
+        },
+        crate::ast::TypeExpr::Apply { .. } => unreachable!(
+            "codegen Phase 4e: slot_kind_for_type_expr_post_mono received \
+             TypeExpr::Apply — monomorphization (Task 49) should have erased it"
+        ),
+    }
+}
+
+/// Plan B Task 55, Phase 4e — collect the names that the synth-cont
+/// must capture from the parent helper.
+///
+/// Walks `tail_expr` and harvests every `Expr::Ident` whose name
+/// matches a helper param AND isn't shadowed by `bound`. The
+/// `bound` set initially contains the let-binding's name (so
+/// `let x = perform; x + threshold` correctly captures `threshold`
+/// but not `x`).
+///
+/// Recursive shapes (Block, Match, If) extend `bound` with locally-
+/// introduced let-bindings as the walker descends. Shape mirrors
+/// `expr_is_pure` since the classifier already restricted to pure
+/// tail expressions — yield-able shapes (Call, Perform, Lambda,
+/// ClosureRecord, Handle) won't appear here.
+///
+/// Returns captures in source-encounter order (deduplicated). The
+/// order matters because the closure record's slots are positional
+/// — `captures[i]` is at `closure_ptr + 16 + 8*i` and the synth-cont
+/// reads them in this same order.
+fn collect_synth_cont_captures(
+    tail_expr: &crate::ast::Expr,
+    let_binding_name: &str,
+    helper_params: &[crate::ast::Param],
+) -> Vec<SynthContCapture> {
+    let mut bound: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    bound.insert(let_binding_name.to_string());
+    let mut out: Vec<SynthContCapture> = Vec::new();
+    walk_collect_captures(tail_expr, &mut bound, helper_params, &mut out);
+    out
+}
+
+fn walk_collect_captures(
+    e: &crate::ast::Expr,
+    bound: &mut std::collections::BTreeSet<String>,
+    helper_params: &[crate::ast::Param],
+    out: &mut Vec<SynthContCapture>,
+) {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::ClosureEnvLoad { .. } => {}
+        Expr::Ident(name, _) => {
+            if !bound.contains(name) {
+                if let Some(param) = helper_params.iter().find(|p| p.name == *name) {
+                    if !out.iter().any(|c| c.name == *name) {
+                        out.push(SynthContCapture {
+                            name: name.clone(),
+                            kind: slot_kind_for_type_expr_post_mono(&param.ty),
+                        });
+                    }
+                }
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_collect_captures(lhs, bound, helper_params, out);
+            walk_collect_captures(rhs, bound, helper_params, out);
+        }
+        Expr::Unary { operand, .. } => {
+            walk_collect_captures(operand, bound, helper_params, out);
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            walk_collect_captures(cond, bound, helper_params, out);
+            walk_collect_captures_block(then_block, bound, helper_params, out);
+            walk_collect_captures_block(else_block, bound, helper_params, out);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            walk_collect_captures(scrutinee, bound, helper_params, out);
+            for arm in arms {
+                walk_collect_captures(&arm.body, bound, helper_params, out);
+            }
+        }
+        Expr::Block(b) => walk_collect_captures_block(b, bound, helper_params, out),
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                walk_collect_captures(&f.value, bound, helper_params, out);
+            }
+        }
+        // Yield-able shapes — classifier rejects, but defensive:
+        Expr::Call { .. }
+        | Expr::Perform(_)
+        | Expr::Handle { .. }
+        | Expr::Lambda { .. }
+        | Expr::ClosureRecord { .. } => {}
+    }
+}
+
+fn walk_collect_captures_block(
+    b: &crate::ast::Block,
+    bound: &mut std::collections::BTreeSet<String>,
+    helper_params: &[crate::ast::Param],
+    out: &mut Vec<SynthContCapture>,
+) {
+    use crate::ast::Stmt;
+    let saved: std::collections::BTreeSet<String> = bound.clone();
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                walk_collect_captures(&l.value, bound, helper_params, out);
+                bound.insert(l.name.clone());
+            }
+            Stmt::Expr(e) => walk_collect_captures(e, bound, helper_params, out),
+            Stmt::Perform(_) => {}
+        }
+    }
+    if let Some(t) = &b.tail {
+        walk_collect_captures(t, bound, helper_params, out);
+    }
+    *bound = saved;
 }
 
 /// Walk a block looking for `Expr::Handle` sites and allocating
@@ -2591,11 +2793,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         };
                         let binding_ty = cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty);
                         let tail_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+                        // Captures-bearing slice (this commit):
+                        // free-var analysis on the tail to find
+                        // helper user params referenced. Empty for
+                        // arity-0 helpers OR for tails that don't
+                        // reference helper's params.
+                        let captures =
+                            collect_synth_cont_captures(&tail_expr, &let_stmt.name, &f.params);
                         Some(CpsContinuationKind::LetBindThenTail {
                             binding_name: let_stmt.name,
                             binding_ty,
                             tail_expr: Box::new(tail_expr),
                             tail_ty,
+                            captures,
                         })
                     } else {
                         None
@@ -2998,9 +3208,96 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     if let Some(synth_cont_func_id) = synth_cont_func_id_opt {
                         let synth_cont_ref =
                             module.declare_func_in_func(synth_cont_func_id, builder.func);
-                        let null_k_closure = builder.ins().iconst(pointer_ty, 0);
                         let synth_cont_addr = builder.ins().func_addr(pointer_ty, synth_cont_ref);
-                        (null_k_closure, synth_cont_addr)
+
+                        // Captures-bearing slice: if the synth-cont's
+                        // kind is LetBindThenTail with non-empty
+                        // captures, alloc a closure record holding
+                        // the captured user-param values from
+                        // helper's env. Otherwise pass null
+                        // k_closure (synth-cont has no captures,
+                        // mirroring `alloc_arm_closure_record`'s
+                        // null-for-empty convention).
+                        let synth_cont_idx = cps_continuation_synth_indices[&f.name];
+                        let captures: Vec<SynthContCapture> =
+                            match &cps_continuation_synth[synth_cont_idx].kind {
+                                CpsContinuationKind::LetBindThenTail { captures, .. } => {
+                                    captures.clone()
+                                }
+                                _ => Vec::new(),
+                            };
+
+                        let k_closure = if captures.is_empty() {
+                            builder.ins().iconst(pointer_ty, 0)
+                        } else {
+                            // Inline the closure-record allocation
+                            // (parallel to `alloc_arm_closure_record`
+                            // but called pre-Lowerer-construction
+                            // because k_closure must be ready before
+                            // the Lowerer's perform-args lowering
+                            // phase). Layout: TAG_CLOSURE header at
+                            // offset 0, null code_ptr at offset 8,
+                            // env slots at offset 16 + 8*i.
+                            assert!(
+                                captures.len() < MAX_CLOSURE_ENV_SLOTS,
+                                "synth-cont closure env >= {MAX_CLOSURE_ENV_SLOTS} \
+                                 slots exceeds the bitmap layout"
+                            );
+                            let mut bitmap: u32 = 0;
+                            for (i, c) in captures.iter().enumerate() {
+                                if c.kind.is_pointer() {
+                                    bitmap |= 1u32 << (i + 1);
+                                }
+                            }
+                            let count: u8 = 1 + captures.len() as u8;
+                            let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
+                            let payload_bytes: i64 = 8 + 8 * captures.len() as i64;
+
+                            let header_v = builder.ins().iconst(types::I64, header as i64);
+                            let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
+                            let alloc_ref = module.declare_func_in_func(alloc, builder.func);
+                            let alloc_call = builder.ins().call(alloc_ref, &[header_v, payload_v]);
+                            stackmap.push_placeholder(function_code_offset(&builder, alloc_call));
+                            let cp = builder.inst_results(alloc_call)[0];
+
+                            // Null code_ptr at offset 8.
+                            let null_v = builder.ins().iconst(pointer_ty, 0);
+                            builder.ins().store(MemFlags::trusted(), null_v, cp, 8);
+
+                            // Env slots — read each capture from
+                            // helper's env (populated in Phase 1
+                            // from args_ptr unpack), widen to I64
+                            // per kind, store at offset 16 + 8*i.
+                            for (i, capture) in captures.iter().enumerate() {
+                                let raw = match env.get(&capture.name) {
+                                    Some(v) => *v,
+                                    None => unreachable!(
+                                        "codegen Phase 4e: synth-cont capture `{}` not \
+                                         found in helper `{}`'s env at body-emit time. \
+                                         Free-var analysis at the pre-pass should have \
+                                         restricted captures to helper's user params, \
+                                         which Phase 1 unpacks into env.",
+                                        capture.name, f.name
+                                    ),
+                                };
+                                let slot_val = match capture.kind {
+                                    EnvSlotKind::Int => raw,
+                                    EnvSlotKind::Bool
+                                    | EnvSlotKind::Byte
+                                    | EnvSlotKind::Unit
+                                    | EnvSlotKind::Char => builder.ins().uextend(types::I64, raw),
+                                    EnvSlotKind::String
+                                    | EnvSlotKind::Closure
+                                    | EnvSlotKind::User => raw,
+                                };
+                                let offset: i32 = 16 + 8 * i as i32;
+                                builder
+                                    .ins()
+                                    .store(MemFlags::trusted(), slot_val, cp, offset);
+                            }
+                            cp
+                        };
+                        (k_closure, synth_cont_addr)
                     } else {
                         let k_closure = builder.ins().load(
                             pointer_ty,
@@ -3682,19 +3979,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         binding_ty,
                         tail_expr,
                         tail_ty,
+                        captures,
                     } => {
-                        // Captures-free let-yield-then-pure-tail
+                        // Captures-bearing let-yield-then-pure-tail
                         // shape: load `args_ptr[0]` as I64, narrow
                         // to `binding_ty`, bind in env under
-                        // `binding_name`, lower `tail_expr` via
+                        // `binding_name`. For each capture in
+                        // `captures`, load from `closure_ptr` at
+                        // offset `16 + 8*i` (mirroring user-lambda
+                        // closure_env_load), narrow per kind, bind
+                        // in env. Then lower `tail_expr` via
                         // Lowerer, widen result to I64, emit
                         // `Done(value)`.
                         //
-                        // The arity-0-helpers restriction (enforced
-                        // by `compute_user_fn_abi`) means no helper
-                        // user params need capturing — env contains
-                        // only the binding. closure_ptr is null
-                        // because there are no captures.
+                        // When `captures` is empty (arity-0 helper
+                        // OR tail not referencing helper's params),
+                        // helper passed null `closure_ptr`; the
+                        // capture-load loop runs zero iterations
+                        // and the env contains only the binding.
                         let args_ptr = block_params[1];
                         let widened =
                             builder
@@ -3716,6 +4018,38 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                         let mut env: BTreeMap<String, Value> = BTreeMap::new();
                         env.insert(binding_name.clone(), bound_value);
+
+                        // Captures-bearing extension: read each
+                        // capture from `closure_ptr` at offset 16 +
+                        // 8*i. Mirrors `lower_closure_env_load`
+                        // (which reads from `self.closure_ptr`); we
+                        // emit the loads here directly because we
+                        // pre-Lowerer-construction.
+                        let synth_closure_ptr = block_params[0];
+                        for (i, capture) in captures.iter().enumerate() {
+                            let offset: i32 = 16 + 8 * i as i32;
+                            let raw = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                synth_closure_ptr,
+                                offset,
+                            );
+                            let val = match capture.kind {
+                                EnvSlotKind::Int => raw,
+                                EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
+                                    builder.ins().ireduce(types::I8, raw)
+                                }
+                                EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
+                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
+                                    if pointer_ty == types::I64 {
+                                        raw
+                                    } else {
+                                        builder.ins().ireduce(pointer_ty, raw)
+                                    }
+                                }
+                            };
+                            env.insert(capture.name.clone(), val);
+                        }
 
                         // Per-fn FFI refs — same shape as the user-
                         // fn body emit + synth-arm-fn body emit.
@@ -7389,5 +7723,129 @@ mod tests {
             "arity-0 helper with arity-N perform now classifies Cps after \
              the D1 perform-args gate's removal in this commit"
         );
+    }
+
+    // ---------------- Plan B Task 55, Phase 4e — captures-bearing
+    // synth-cont slice (this commit): the let-yield-then-pure-tail
+    // shape now accepts arity-N helpers, with the synth-cont
+    // capturing helper's user params referenced in the tail.
+
+    #[test]
+    fn compute_user_fn_abi_cps_for_arity_n_let_yield_helper_with_capture() {
+        // helper takes `threshold: Int`; body is `let x = perform
+        // Raise.fail(); x + threshold`. Pre-captures-slice
+        // (`f911a0b`), the arity-0 gate in `compute_user_fn_abi`
+        // rejected → Sync. Post-captures-slice (this commit), the
+        // gate is removed → Cps. The pre-pass populates
+        // `LetBindThenTail.captures = [SynthContCapture { name:
+        // "threshold", kind: Int }]`; helper's body emit allocates
+        // a closure record holding `threshold`, passes its pointer
+        // as `k_closure`; synth-cont reads `threshold` from
+        // `closure_ptr + 16` at fn entry.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn helper(threshold: Int) -> Int ![Raise, IO] {\n  \
+                     let x: Int = perform Raise.fail();\n  \
+                     x + threshold\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let n: Int = handle helper(10) with { Raise.fail(k) => 42 };\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let (prog, colored) = colored_from_src(src);
+        let helper_body = body_of(&prog, "helper");
+        let helper_params = params_of(&prog, "helper");
+        // Sanity: classifier accepts the body shape; color taints
+        // CPS via row.
+        assert!(is_simple_let_yield_then_pure_tail_body(&helper_body));
+        assert!(colored.needs_cps_transform("helper"));
+        assert_eq!(helper_params.len(), 1);
+        // Inverted from prior arity-0 restriction — the gate is
+        // gone in this commit.
+        assert_eq!(
+            compute_user_fn_abi("helper", &helper_params, &helper_body, &colored),
+            UserFnAbi::Cps,
+            "arity-N let-yield-helper with capture now classifies Cps after \
+             the captures-bearing slice's arity gate lift"
+        );
+    }
+
+    #[test]
+    fn collect_synth_cont_captures_finds_helper_param_in_tail() {
+        // Free-var analysis on `x + threshold` with let-binding
+        // `x` and helper params `[threshold]` returns
+        // `[threshold]`. Pin the analysis surface directly.
+        use crate::ast::{BinOp, Expr, Param, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("x".to_string(), span.clone())),
+            rhs: Box::new(Expr::Ident("threshold".to_string(), span.clone())),
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "threshold".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].name, "threshold");
+        assert_eq!(captures[0].kind, EnvSlotKind::Int);
+    }
+
+    #[test]
+    fn collect_synth_cont_captures_excludes_let_binding_name() {
+        // Free-var analysis on `x + 100` — the let-binding `x` is
+        // shadowed; `100` is a literal. No captures.
+        use crate::ast::{BinOp, Expr, Param, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("x".to_string(), span.clone())),
+            rhs: Box::new(Expr::IntLit(100, span.clone())),
+            span: span.clone(),
+        };
+        // Even with a `threshold` param, if the tail doesn't use it,
+        // captures stays empty.
+        let helper_params = vec![Param {
+            name: "threshold".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        assert_eq!(captures.len(), 0);
+    }
+
+    #[test]
+    fn collect_synth_cont_captures_skips_globals() {
+        // Free-var analysis on `x + helper(threshold)` where
+        // `helper` is a top-level fn (not a helper param). The
+        // analysis shouldn't capture it (it's a global). Note the
+        // classifier rejects bodies with calls in tail; this test
+        // exercises the analysis directly to pin the global skip.
+        use crate::ast::{Expr, Param, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Call {
+            callee: Box::new(Expr::Ident("not_a_param".to_string(), span.clone())),
+            args: vec![Expr::Ident("threshold".to_string(), span.clone())],
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "threshold".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        // The analysis defensively returns empty for Call (yield-able
+        // shape); even if it descended, `not_a_param` isn't in
+        // helper_params and would be skipped.
+        // We get 0 captures because the walker treats Expr::Call as
+        // a yield-able shape and doesn't recurse (defensive — the
+        // classifier already rejects Call in tail).
+        assert_eq!(captures.len(), 0);
     }
 }
