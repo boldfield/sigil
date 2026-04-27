@@ -2202,14 +2202,13 @@ fn cps_abi_helper_with_string_return_exercises_pointer_ret_path() {
 }
 
 #[test]
-#[ignore = "Phase 4e pending: pins the discard-k correctness gap across function-call boundaries; inverts to a normal test (asserting stdout 42, code 0) when Phase 4e ships the colorer's handler-discharge refinement"]
-fn discard_k_handler_does_not_abort_helper_phase_4e_pending() {
-    // Plan B Task 55 (Phase 4d MVP) — pinning test for the
-    // discard-k correctness gap, slated to close in Phase 4e
-    // (colorer's handler-discharge refinement + native↔CPS interop
-    // boundary). See `[DEVIATION Task 55] Phase 4d` in
-    // PLAN_B_DEVIATIONS.md and the README "Verification limits
-    // (in-flight)" section.
+fn discard_k_handler_does_abort_helper_across_call_boundary() {
+    // Plan B Task 55, Phase 4e — **inverted from the previously
+    // `#[ignore]`'d `discard_k_handler_does_not_abort_helper_phase
+    // _4e_pending`**. The captures-free let-yield-then-pure-tail
+    // synth-cont slice closes the discard-k correctness gap across
+    // function-call boundaries. See `[DEVIATION Task 55] Phase 4e`
+    // in PLAN_B_DEVIATIONS.md.
     //
     // Algebraic semantics says: a discard-`k` arm (Raise.fail(k) =>
     // 42) should produce the arm value as the handle's overall
@@ -2218,26 +2217,42 @@ fn discard_k_handler_does_not_abort_helper_phase_4e_pending() {
     // (helper() performs Raise.fail; main wraps helper in a
     // handle).
     //
-    // Phase 4d MVP synchronous shape: `sigil_run_loop` returns the
-    // arm value (42) to the perform site INSIDE helper. helper then
-    // continues executing the post-perform code (`+ 100`), returns
-    // 142 to main, and main's handle expression unwraps to 142
-    // (NOT 42).
+    // **Phase 4e correctness chain:**
     //
-    // Expected (Phase 4e+): stdout "42\n", exit 0.
-    // Current (Phase 4d MVP): stdout "142\n", exit 0 (compiles +
-    // runs; produces wrong result vs. algebraic semantics).
+    //   1. helper has body `let x: Int = perform Raise.fail(); x +
+    //      100`. The classifier `is_simple_let_yield_then_pure_
+    //      tail_body` matches; `compute_user_fn_abi` returns Cps
+    //      (helper has 0 user params — captures-free constraint
+    //      satisfied).
     //
-    // The `#[ignore]` keeps this test grep-findable in CI as a
-    // structural reminder of what Phase 4e closes. When Phase 4e
-    // ships, the test inverts to active by removing the `#[ignore]`
-    // attribute and the assertions below match algebraic semantics
-    // (stdout "42\n").
+    //   2. Codegen pre-pass allocates a `CpsContinuationSynth`
+    //      with `kind = LetBindThenTail { binding_name = "x",
+    //      binding_ty = I64, tail_expr = x + 100, tail_ty = I64 }`.
     //
-    // To verify the current (broken) behaviour locally:
-    //   cargo test -p sigil-compiler --test e2e \
-    //     discard_k_handler_does_not_abort_helper_phase_4e_pending \
-    //     -- --ignored
+    //   3. helper's CPS body emit builds `sigil_perform(eff, op,
+    //      ..., k_closure=null, k_fn=&synth_cont)` and returns its
+    //      NextStep up to main's wrapper.
+    //
+    //   4. main's wrapper drives sigil_run_loop on helper's
+    //      NextStep. Trampoline dispatches the arm.
+    //
+    //   5. Arm body: `42` (no reference to k → discards). Returns
+    //      Done(42). **The synth-cont never runs.** helper's rest-
+    //      of-body (`x + 100`) is dropped.
+    //
+    //   6. Trampoline observes Done(42) and returns 42 up to the
+    //      wrapper. main: n = 42. Prints "42\n".
+    //
+    // The previously-pinned `142` was the Phase 4d MVP synchronous
+    // shape: helper's perform synchronously called sigil_run_loop;
+    // run_loop returned arm value 42; helper bound x = 42;
+    // helper computed 42 + 100 = 142; main's handle overall = 142.
+    //
+    // **This is the second of hard condition #2's two enumerated
+    // test inversions** (the first being `statement_form_non_io_
+    // perform_inside_handle_compiles_and_runs`, inverted at
+    // `b818fc3`). With this test inverted, hard condition #2
+    // closes.
     let src = "effect Raise { fail: () -> Int }\n\
                fn helper() -> Int ![Raise, IO] {\n  \
                  let x: Int = perform Raise.fail();\n  \
@@ -2250,21 +2265,47 @@ fn discard_k_handler_does_not_abort_helper_phase_4e_pending() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase4d_pending_discard_k_cross_call");
-    // Phase 4e EXPECTED behaviour (uncomment when 4e ships, remove
-    // the current-behaviour assertion below, and remove the
-    // `#[ignore]` attribute):
-    // assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    // assert_eq!(stdout, "42\n", "Phase 4e algebraic-correct stdout; stderr={stderr:?}");
-
-    // Phase 4d MVP CURRENT (broken) behaviour: arm value 42 flows
-    // to perform site → helper computes 42 + 100 = 142 → handle
-    // overall = 142.
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_discard_k_cross_call");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "142\n",
-        "Phase 4d MVP synchronous shape produces 142 (helper continues post-perform); \
-         Phase 4e closes this gap. stderr={stderr:?}"
+        stdout, "42\n",
+        "Phase 4e algebraic-correct: discard-k arm aborts helper's \
+         rest-of-body across the call boundary. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn discard_k_handler_use_k_arm_runs_synth_cont_with_bound_value() {
+    // Companion to `discard_k_handler_does_abort_helper_across_
+    // call_boundary` — pins the use-k arm path. When the arm calls
+    // `k(value)`, the synth-cont runs with `args_ptr[0] = value`,
+    // binds `x = value` in the env, lowers `x + 100`, returns
+    // `Done(value + 100)`. Main: n = value + 100.
+    //
+    // For arm `Raise.fail(k) => k(7)`: synth-cont runs with x=7;
+    // returns Done(107). main prints "107\n".
+    //
+    // This pins the synth-cont's Lowerer-driven body emission
+    // (binding lookup + Binary lowering) — the alternative to the
+    // ConstantDone shape's hand-rolled iconst-only path.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x + 100\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => k(7),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_use_k_arm_synth_cont");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "107\n",
+        "Phase 4e use-k path: arm calls k(7) → synth-cont binds x=7 → \
+         x + 100 = 107. stderr={stderr:?}"
     );
 }
 
