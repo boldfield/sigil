@@ -832,7 +832,7 @@ mod tests {
     // `IO` effect), so we construct `MonoProgram`s directly to
     // exercise `infer_colors`.
 
-    use crate::ast::{Block as AstBlock, FnDecl, Item, Param, Program, TypeExpr};
+    use crate::ast::{Block as AstBlock, FnDecl, HandleOpArm, Item, Param, Program, TypeExpr};
     use crate::elaborate::AnfProgram;
     use crate::errors::Span;
     use crate::monomorphize::MonoProgram;
@@ -1127,6 +1127,173 @@ mod tests {
         let main_reason = reason_of(&cp, "main");
         assert!(
             main_reason.contains("transitively calls `helper`"),
+            "got: {main_reason}"
+        );
+    }
+
+    // ---------------- Plan B Task 55, Phase 4e regression guards
+    //
+    // These tests pin the colorer's behavior for the discharge-via-call-
+    // graph scenario that Phase 4e's codegen-consumes-color work depends
+    // on. The colorer is **already correct** for these cases — it
+    // classifies a fn whose handle body calls a CPS-color helper as CPS
+    // via the existing call-graph SCC bridge propagation. The Phase 4e
+    // deviation entry's "colorer's handler-discharge refinement" framing
+    // was misleading: the actual refinement is in codegen (consume color
+    // and emit CPS-color user fns with the CPS calling convention), not
+    // in color.rs. These tests exist so a future refactor of the colorer
+    // that drops the call-graph edges out of `Expr::Handle` bodies — or
+    // that special-cases handle-discharged effects to avoid recording
+    // them as edges — is caught early. Without these tests, such a
+    // regression would silently make Phase 4e codegen emit native
+    // calling conventions for fns whose performs reach a discharging
+    // handler via cross-function-call boundaries, reproducing the
+    // discard-k correctness gap the `#[ignore]`'d e2e
+    // `discard_k_handler_does_not_abort_helper_phase_4e_pending`
+    // currently pins.
+
+    /// Build a minimal `HandleOpArm` for `Effect.op(k) => IntLit(value)`
+    /// with no user op-args. Used by the discharge-via-call-graph
+    /// regression tests below; the arm body is a literal, the
+    /// continuation `k` is named but unused. Span is the shared
+    /// constant `span()`; tests that need unique spans for shadowing
+    /// precision use `unique_span()`.
+    fn synth_op_arm_int_literal(effect: &str, op: &str, value: i64) -> HandleOpArm {
+        HandleOpArm {
+            effect: effect.to_string(),
+            effect_span: span(),
+            op: op.to_string(),
+            op_span: span(),
+            params: Vec::new(),
+            k_name: "k".to_string(),
+            k_span: span(),
+            body: Expr::IntLit(value, span()),
+            span: span(),
+        }
+    }
+
+    #[test]
+    fn handle_body_calling_cps_helper_makes_caller_cps_via_bridge() {
+        // helper() -> Int ![Raise] { 0 }     -- intrinsically CPS
+        // main()   -> Int ![]      { handle helper() with { Raise.fail(k) => 42 } }
+        //
+        // Phase 4e discharge-via-call-graph: main's call to helper is
+        // recorded via the synthetic calls map (the `walk_expr_for_fn_
+        // idents` recursion through `Expr::Handle::body` collects the
+        // Ident span). The colorer's `collect_calls_in_expr` for
+        // `Expr::Handle` mirrors this — it walks the body for call
+        // edges. Helper's intrinsic CPS color (row contains `Raise`)
+        // taints main via SCC bridge. Reason text asserts the expected
+        // `transitively calls helper` form.
+        let helper = synth_fn("helper", vec!["Raise"], empty_block());
+        let main_body = AstBlock {
+            stmts: Vec::new(),
+            tail: Some(Expr::Handle {
+                body: Box::new(Expr::Call {
+                    callee: Box::new(Expr::Ident("helper".to_string(), span())),
+                    args: Vec::new(),
+                    span: span(),
+                }),
+                return_arm: None,
+                op_arms: vec![synth_op_arm_int_literal("Raise", "fail", 42)],
+                span: span(),
+            }),
+            span: span(),
+        };
+        let main = synth_fn("main", vec![], main_body);
+        let prog = synth_program(vec![helper, main]);
+        let cp = infer_colors(prog);
+        assert_eq!(color_of(&cp, "helper"), Color::Cps);
+        assert_eq!(color_of(&cp, "main"), Color::Cps);
+        let main_reason = reason_of(&cp, "main");
+        assert!(
+            main_reason.contains("transitively calls `helper`"),
+            "got: {main_reason}"
+        );
+    }
+
+    #[test]
+    fn handle_body_with_only_direct_perform_keeps_caller_native_under_existing_local_rule() {
+        // main() -> Int ![] { handle perform Raise.fail() with { Raise.fail(k) => 42 } }
+        //
+        // Pins the `find_non_io_perform_in_expr` skip-the-handle-body
+        // rule (line 414 in this file at HEAD). main's body has a
+        // direct `perform Raise.fail()` syntactically inside the
+        // handle's body; the local-walk explicitly does NOT descend
+        // into the handle body, so main's local color stays Native.
+        // No call-graph edges (main calls no other fn), no
+        // intrinsic-CPS triggers. Phase 4e's codegen-consumes-color
+        // work relies on this rule for the "perform-in-tail-position-
+        // of-handle-body" shape that Phase 4d MVP already handles
+        // correctly under the synchronous run_loop pattern; if this
+        // test starts failing, codegen will start emitting CPS
+        // calling convention for fns that don't need it, regressing
+        // performance even when correctness is preserved.
+        let main_body = AstBlock {
+            stmts: Vec::new(),
+            tail: Some(Expr::Handle {
+                body: Box::new(Expr::Perform(crate::ast::PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span(),
+                })),
+                return_arm: None,
+                op_arms: vec![synth_op_arm_int_literal("Raise", "fail", 42)],
+                span: span(),
+            }),
+            span: span(),
+        };
+        let main = synth_fn("main", vec![], main_body);
+        let prog = synth_program(vec![main]);
+        let cp = infer_colors(prog);
+        assert_eq!(color_of(&cp, "main"), Color::Native);
+        assert_eq!(reason_of(&cp, "main"), "native: pure row");
+    }
+
+    #[test]
+    fn handle_arm_body_performing_undischarged_effect_taints_caller_intrinsically() {
+        // main() -> Int ![] { handle 0 with { Raise.fail(k) => perform Other.boom() } }
+        //
+        // Pins the existing rule that `find_non_io_perform_in_expr`
+        // **does** walk arm bodies. The arm body's perform of an
+        // effect not in the handle's discharged set leaks into main's
+        // intrinsic-CPS classification. Synthetic test only — typecheck
+        // would E0042 this in real code (the row doesn't list `Other`),
+        // but the colorer is the source of truth post-mono and must
+        // remain robust. Phase 4e doesn't change this rule.
+        let main_body = AstBlock {
+            stmts: Vec::new(),
+            tail: Some(Expr::Handle {
+                body: Box::new(Expr::IntLit(0, span())),
+                return_arm: None,
+                op_arms: vec![HandleOpArm {
+                    effect: "Raise".to_string(),
+                    effect_span: span(),
+                    op: "fail".to_string(),
+                    op_span: span(),
+                    params: Vec::new(),
+                    k_name: "k".to_string(),
+                    k_span: span(),
+                    body: Expr::Perform(crate::ast::PerformExpr {
+                        effect: "Other".to_string(),
+                        op: "boom".to_string(),
+                        args: Vec::new(),
+                        span: span(),
+                    }),
+                    span: span(),
+                }],
+                span: span(),
+            }),
+            span: span(),
+        };
+        let main = synth_fn("main", vec![], main_body);
+        let prog = synth_program(vec![main]);
+        let cp = infer_colors(prog);
+        assert_eq!(color_of(&cp, "main"), Color::Cps);
+        let main_reason = reason_of(&cp, "main");
+        assert!(
+            main_reason.contains("performs `Other.boom`"),
             "got: {main_reason}"
         );
     }
