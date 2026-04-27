@@ -188,13 +188,6 @@ enum UserFnAbi {
 /// pinning.
 fn compute_user_fn_abi(
     name: &str,
-    // The `_params` parameter is preserved (with leading underscore
-    // marking the unused state) for forward compatibility — earlier
-    // slices used it for the arity-0 gate; the captures-bearing
-    // slice (this commit) handles arity-N transparently via the
-    // pre-pass's free-var analysis. Future slices may add arity-
-    // related gates that consume it again.
-    _params: &[crate::ast::Param],
     body: &crate::ast::Block,
     colored: &ColoredProgram,
 ) -> UserFnAbi {
@@ -1565,7 +1558,20 @@ fn walk_collect_captures(
         } => {
             walk_collect_captures(scrutinee, bound, helper_params, out);
             for arm in arms {
-                walk_collect_captures(&arm.body, bound, helper_params, out);
+                // PR #26 mid-flight at a5ee4c6 review item #1: each
+                // match arm's pattern introduces fresh names that
+                // shadow the surrounding scope (helper's params,
+                // outer let-bindings) for the duration of the arm
+                // body's evaluation. The walker must add those
+                // pattern-bound names to `bound` before recursing
+                // into the arm body, so a free Ident in the body
+                // that resolves to a pattern binding doesn't get
+                // mis-captured as a helper user-param. Use a per-
+                // arm clone so subsequent arms see the original
+                // bound set (pattern bindings are arm-local).
+                let mut arm_bound = bound.clone();
+                collect_pattern_bindings(&arm.pattern, &mut arm_bound);
+                walk_collect_captures(&arm.body, &mut arm_bound, helper_params, out);
             }
         }
         Expr::Block(b) => walk_collect_captures_block(b, bound, helper_params, out),
@@ -1580,6 +1586,51 @@ fn walk_collect_captures(
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => {}
+    }
+}
+
+/// Plan B Task 55, Phase 4e — collect names that a [`Pattern`] binds.
+///
+/// Used by [`walk_collect_captures`] when descending into a match
+/// arm body to extend the `bound` set with pattern-introduced
+/// names so they shadow surrounding-scope captures.
+///
+/// Pattern binding shapes (per `Pattern` enum at ast.rs):
+///   - `IntLit` / `BoolLit` / `CharLit` / `Wildcard`: no binding
+///   - `Var(name)`: binds `name`
+///   - `Tuple(patterns)`: recursively
+///   - `Ctor { fields: Unit }`: no binding
+///   - `Ctor { fields: Positional(patterns) }`: recursively from each
+///   - `Ctor { fields: Record(record_fields) }`: recursively from
+///     each `CtorPatternField.pattern`
+fn collect_pattern_bindings(p: &crate::ast::Pattern, out: &mut std::collections::BTreeSet<String>) {
+    use crate::ast::{CtorPatternFields, Pattern};
+    match p {
+        Pattern::IntLit(..)
+        | Pattern::BoolLit(..)
+        | Pattern::CharLit(..)
+        | Pattern::Wildcard(_) => {}
+        Pattern::Var(name, _) => {
+            out.insert(name.clone());
+        }
+        Pattern::Tuple(patterns, _) => {
+            for sub in patterns {
+                collect_pattern_bindings(sub, out);
+            }
+        }
+        Pattern::Ctor { fields, .. } => match fields {
+            CtorPatternFields::Unit => {}
+            CtorPatternFields::Positional(patterns) => {
+                for sub in patterns {
+                    collect_pattern_bindings(sub, out);
+                }
+            }
+            CtorPatternFields::Record(record_fields) => {
+                for rf in record_fields {
+                    collect_pattern_bindings(&rf.pattern, out);
+                }
+            }
+        },
     }
 }
 
@@ -2704,7 +2755,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // field; this commit consumes it for signature selection.
             // The transitional `#[allow(dead_code)]` on
             // `UserFnEntry::abi` is removed at the same time.
-            let abi = compute_user_fn_abi(&f.name, &f.params, &f.body, &cc.colored);
+            let abi = compute_user_fn_abi(&f.name, &f.body, &cc.colored);
             let (sig, param_tys, ret_ty) = match abi {
                 UserFnAbi::Sync => {
                     let mut sig = Signature::new(isa_call_conv(&module));
@@ -3125,7 +3176,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // redundant here — it's a future hook for tooling
                 // (e.g., a runtime-checked arity assertion in
                 // `--debug-counters` builds).
-                let _ = block_params[2];
+                let _args_len = block_params[2];
                 let user_arg_count = f.params.len();
 
                 // Phase 1 — unpack user args from `args_ptr` at
@@ -3956,7 +4007,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // block_params[2] = args_len (== 1 from the
                 // perform's `sigil_next_step_call` arg_count when
                 // the arm calls `k(value)`).
-                let _ = block_params[2];
+                let _args_len = block_params[2];
 
                 let next_step_done_ref = module.declare_func_in_func(next_step_done, builder.func);
 
@@ -7424,9 +7475,8 @@ mod tests {
         "#;
         let (prog, colored) = colored_from_src(src);
         let body = body_of(&prog, "main");
-        let params = params_of(&prog, "main");
         assert_eq!(
-            compute_user_fn_abi("main", &params, &body, &colored),
+            compute_user_fn_abi("main", &body, &colored),
             UserFnAbi::Sync
         );
     }
@@ -7445,9 +7495,8 @@ mod tests {
                    }\n";
         let (prog, colored) = colored_from_src(src);
         let helper_body = body_of(&prog, "helper");
-        let helper_params = params_of(&prog, "helper");
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_params, &helper_body, &colored),
+            compute_user_fn_abi("helper", &helper_body, &colored),
             UserFnAbi::Cps,
             "helper has CPS color + simple-tail-perform body + arity-0"
         );
@@ -7469,7 +7518,6 @@ mod tests {
                    }\n";
         let (prog, colored) = colored_from_src(src);
         let main_body = body_of(&prog, "main");
-        let main_params = params_of(&prog, "main");
         // Sanity-check: main IS classified CPS by the colorer (bridge).
         assert!(
             colored.needs_cps_transform("main"),
@@ -7478,7 +7526,7 @@ mod tests {
         // ABI selection still picks Sync because main's body shape
         // isn't supported by the simple-tail-perform classifier.
         assert_eq!(
-            compute_user_fn_abi("main", &main_params, &main_body, &colored),
+            compute_user_fn_abi("main", &main_body, &colored),
             UserFnAbi::Sync,
             "main is CPS-color but has complex body → Sync ABI"
         );
@@ -7552,10 +7600,8 @@ mod tests {
         let anf = AnfProgram { checked };
         let mono = MonoProgram { anf };
         let colored = crate::color::infer_colors(mono);
-        // Synthetic fn has zero params → arity gate accepts.
-        let no_params: Vec<crate::ast::Param> = Vec::new();
         assert_eq!(
-            compute_user_fn_abi("f", &no_params, &body, &colored),
+            compute_user_fn_abi("f", &body, &colored),
             UserFnAbi::Cps,
             "intrinsic perform of non-IO effect taints the fn as CPS via \
              find_non_io_perform_in_block; combined with the simple-tail-\
@@ -7640,9 +7686,8 @@ mod tests {
         // forced-Native classification, the fn would be Cps.
         assert!(is_simple_tail_perform_with_pure_args_body(&body));
         // The actual assertion: Sync, because color short-circuits.
-        let no_params: Vec<crate::ast::Param> = Vec::new();
         assert_eq!(
-            compute_user_fn_abi("f", &no_params, &body, &colored),
+            compute_user_fn_abi("f", &body, &colored),
             UserFnAbi::Sync,
             "Color::Native must short-circuit `compute_user_fn_abi` \
              regardless of body shape eligibility"
@@ -7690,7 +7735,7 @@ mod tests {
         // Inverted from prior commit's Sync expectation — the
         // arity gate is gone.
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_params, &helper_body, &colored),
+            compute_user_fn_abi("helper", &helper_body, &colored),
             UserFnAbi::Cps,
             "arity-N intrinsic-CPS helper now classifies Cps after the \
              D1 arity gate's removal in this commit"
@@ -7718,7 +7763,7 @@ mod tests {
         assert!(colored.needs_cps_transform("helper"));
         assert!(helper_params.is_empty());
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_params, &helper_body, &colored),
+            compute_user_fn_abi("helper", &helper_body, &colored),
             UserFnAbi::Cps,
             "arity-0 helper with arity-N perform now classifies Cps after \
              the D1 perform-args gate's removal in this commit"
@@ -7763,7 +7808,7 @@ mod tests {
         // Inverted from prior arity-0 restriction — the gate is
         // gone in this commit.
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_params, &helper_body, &colored),
+            compute_user_fn_abi("helper", &helper_body, &colored),
             UserFnAbi::Cps,
             "arity-N let-yield-helper with capture now classifies Cps after \
              the captures-bearing slice's arity gate lift"
@@ -7820,12 +7865,121 @@ mod tests {
     }
 
     #[test]
-    fn collect_synth_cont_captures_skips_globals() {
-        // Free-var analysis on `x + helper(threshold)` where
-        // `helper` is a top-level fn (not a helper param). The
-        // analysis shouldn't capture it (it's a global). Note the
-        // classifier rejects bodies with calls in tail; this test
-        // exercises the analysis directly to pin the global skip.
+    fn collect_synth_cont_captures_match_pattern_var_shadows_param() {
+        // PR #26 mid-flight at a5ee4c6 item #1: when a match arm's
+        // pattern binds a name (`Pattern::Var`) that shadows a
+        // helper param, the walker must NOT capture the param —
+        // the arm body's reference resolves to the pattern
+        // binding, not the outer scope.
+        //
+        // Source-equivalent body:
+        //   `match x { threshold => threshold + 1 }`
+        // Helper has param `threshold: Int`; the pattern binds
+        // a fresh `threshold` to the scrutinee value, so the
+        // `threshold` in the arm body refers to the binding,
+        // not helper's param. Walker should return empty
+        // captures.
+        //
+        // Pre-fix, the walker recursed into arm bodies without
+        // adding pattern-bound names to `bound`, so `threshold`
+        // (helper param) would be captured. At runtime the
+        // synth-cont would load helper's `threshold` from the
+        // closure record and use it as `threshold + 1`, ignoring
+        // the scrutinee — wrong result.
+        use crate::ast::{BinOp, Expr, MatchArm, Param, Pattern, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Match {
+            scrutinee: Box::new(Expr::Ident("x".to_string(), span.clone())),
+            arms: vec![MatchArm {
+                pattern: Pattern::Var("threshold".to_string(), span.clone()),
+                body: Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Ident("threshold".to_string(), span.clone())),
+                    rhs: Box::new(Expr::IntLit(1, span.clone())),
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "threshold".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        assert_eq!(
+            captures.len(),
+            0,
+            "pattern-bound `threshold` shadows helper param; walker must \
+             not capture. Pre-fix this returned [threshold] (incorrect)."
+        );
+    }
+
+    #[test]
+    fn collect_synth_cont_captures_match_with_ctor_pattern_handles_record_field_bindings() {
+        // The Pattern::Ctor with Record fields shape introduces
+        // bindings via field-pun (`Point { x, y }`) or rename
+        // (`Point { x: px }`). `collect_pattern_bindings` recurses
+        // into each field's pattern. Pin acceptance of a record-
+        // pattern shadowing a helper param.
+        //
+        // Source-equivalent: `match scrut { Point { threshold } =>
+        // threshold + 1 }`. The field-pun binds `threshold` from
+        // the Point's `threshold` field. Helper's `threshold`
+        // param is shadowed inside the arm body.
+        use crate::ast::{
+            BinOp, CtorPatternField, CtorPatternFields, Expr, MatchArm, Param, Pattern, TypeExpr,
+        };
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Match {
+            scrutinee: Box::new(Expr::Ident("x".to_string(), span.clone())),
+            arms: vec![MatchArm {
+                pattern: Pattern::Ctor {
+                    name: "Point".to_string(),
+                    fields: CtorPatternFields::Record(vec![CtorPatternField {
+                        name: "threshold".to_string(),
+                        pattern: Pattern::Var("threshold".to_string(), span.clone()),
+                        span: span.clone(),
+                    }]),
+                    span: span.clone(),
+                },
+                body: Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Ident("threshold".to_string(), span.clone())),
+                    rhs: Box::new(Expr::IntLit(1, span.clone())),
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "threshold".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        assert_eq!(
+            captures.len(),
+            0,
+            "Ctor::Record pattern field-binding `threshold` shadows helper \
+             param; walker must not capture"
+        );
+    }
+
+    #[test]
+    fn collect_synth_cont_captures_does_not_recurse_into_call_in_tail() {
+        // Renamed from the prior misleading
+        // `..._skips_globals` (PR #26 mid-flight at a5ee4c6 item
+        // #7). The walker treats `Expr::Call` as a yield-able
+        // shape and defensively skips recursion into it; the
+        // classifier already rejects bodies with calls in tail,
+        // so the walker never has to make a global-vs-param
+        // resolution decision. This test pins the defensive skip,
+        // not a global-resolution rule.
         use crate::ast::{Expr, Param, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");

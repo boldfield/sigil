@@ -2329,6 +2329,87 @@ fn captures_bearing_synth_cont_arity_n_helper_discard_k() {
 }
 
 #[test]
+fn cps_abi_arity_n_helper_with_constant_done_synth_cont() {
+    // PR #26 mid-flight at a5ee4c6 item #2 (prior-gap follow-up):
+    // arity-N helper whose body matches the ConstantDone shape
+    // (Stmt::Perform with arg, then constant tail). The synth-
+    // cont ignores k_arg (Stmt::Perform discards) and returns
+    // Done(constant); helper has user param `x` referenced in
+    // the perform's args (not the tail). Pins that:
+    //   - compute_user_fn_abi accepts arity-N helpers with
+    //     ConstantDone shape (no captures needed because the
+    //     constant tail doesn't reference user params)
+    //   - helper's body emit unpacks `x` from args_ptr[0],
+    //     packs it into the perform's args buffer, dispatches
+    //     to the arm
+    //   - arm `=> 99` discards k → returns Done(99); synth-cont
+    //     never runs
+    //   - main: n = 99
+    //
+    // Adjacent shape to the captures-bearing tests but exercises
+    // the ConstantDone path, not LetBindThenTail. Pre-this-test,
+    // this body shape's arity-N variant was untested.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(x: Int) -> Int ![E] {\n  \
+                 perform E.op(x);\n  \
+                 99\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(7) with { E.op(arg, k) => arg + 35 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_arity_n_constant_done");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Arm `E.op(arg, k) => arg + 35` uses k? No — `arg + 35` is
+    // pure expression not referencing k. So arm DISCARDS k. Arm
+    // returns Done(arg + 35) = Done(7 + 35) = Done(42). Trampoline
+    // returns 42 to wrapper. main: n = 42.
+    assert_eq!(
+        stdout, "42\n",
+        "arity-N helper with ConstantDone shape; arm discards k → \
+         arg value flows directly. arg=7 + 35 = 42. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn captures_bearing_synth_cont_with_two_user_params_captured() {
+    // PR #26 mid-flight at a5ee4c6 item #2 (prior-gap follow-up):
+    // multi-capture e2e — pins the closure record's slot ordering
+    // (`captures[0]` at offset 16, `captures[1]` at offset 24).
+    // Pre-this-test, only single-capture (`threshold`) was
+    // exercised.
+    //
+    // helper takes two user params (threshold, multiplier); tail
+    // references both. The synth-cont's closure record holds
+    // [threshold, multiplier] at offsets 16, 24. Synth-cont reads
+    // both at fn entry, binds both in env, lowers `(x + threshold)
+    // * multiplier`.
+    //
+    // Use-k arm `=> k(7)`: synth-cont fires, x=7, threshold=10,
+    // multiplier=3, result = (7 + 10) * 3 = 51. main: n = 51.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(threshold: Int, multiplier: Int) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 (x + threshold) * multiplier\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10, 3) with {\n    \
+                   Raise.fail(k) => k(7),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4e_multi_capture_use_k");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "51\n",
+        "multi-capture synth-cont: threshold=10 + multiplier=3 captured; \
+         use-k binds x=7; (7+10)*3 = 51. stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn captures_bearing_synth_cont_arity_n_helper_use_k() {
     // Companion to captures_bearing_synth_cont_arity_n_helper_
     // discard_k — pins the use-k path.
