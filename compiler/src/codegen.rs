@@ -1453,10 +1453,6 @@ struct MultiLetPostArmKChain {
     /// satisfy `expr_is_pure` and reference only `binding_name_1`,
     /// `binding_name_2`, plus globals.
     tail_expr: crate::ast::Expr,
-    /// Cranelift type of `tail_expr`'s lowered value, used to
-    /// widen to I64 before `sigil_next_step_done`. Equals the
-    /// arm's `body_ty` (the op's declared return type).
-    tail_ty: Type,
 }
 
 /// Plan B Task 55, Phase 4e captures+ Slice B — synthetic post-arm-k
@@ -1497,12 +1493,6 @@ struct PostArmKSynth {
     /// `binding_name` plus globals. The post-arm-k synth fn returns
     /// `Done(widen(tail_value, I64))`.
     tail_expr: crate::ast::Expr,
-    /// Cranelift type of `tail_expr`'s lowered value, used to widen
-    /// to I64 before `sigil_next_step_done`. Equals the arm body's
-    /// overall result type (since the let-binding shadows the
-    /// perform's value into the tail), which for Slice B equals the
-    /// arm's `body_ty` (the op's declared return type).
-    tail_ty: Type,
 }
 
 /// Plan B Task 55 (Phase 4d) — one captured outer-scope binding for a
@@ -2175,15 +2165,15 @@ fn collect_handle_arms_in_expr(
                         binding_ty,
                         arg_expr: shape.arg_expr.clone(),
                         tail_expr: shape.tail_expr.clone(),
-                        // For Slice B's accepted shape, the arm
-                        // body's overall type IS the tail's type
-                        // (the let-binding's value flows into the
-                        // synth-cont; the synth-cont's result flows
-                        // back as `r`; tail produces the arm's
-                        // overall result), and the arm's overall
-                        // type equals the op's declared return type
-                        // (already resolved into `body_ty`).
-                        tail_ty: body_ty,
+                        // tail_ty intentionally NOT pre-stored: the
+                        // pre-pass can't know the actual lowered
+                        // Cranelift type (it's whatever Lowerer
+                        // produces for `tail_expr`, which depends on
+                        // typecheck-side type info we don't thread
+                        // here). The post-arm-k synth fn definition
+                        // pass reads `dfg.value_type(tail_value)`
+                        // after lowering. Slice C's bug fix; same
+                        // pattern applied here proactively.
                     })
                 } else {
                     None
@@ -2246,7 +2236,6 @@ fn collect_handle_arms_in_expr(
                             binding_name_2: shape.binding_name_2.to_string(),
                             binding_ty_2,
                             tail_expr: shape.tail_expr.clone(),
-                            tail_ty: body_ty,
                         })
                     }
                 } else {
@@ -5119,16 +5108,30 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
-            let widened_tail = if post_arm_k.tail_ty == types::I64 {
+            // Slice C bug fix: read the actual lowered Cranelift type
+            // from the SSA value, not from the pre-stored
+            // `post_arm_k.tail_ty`. The pre-pass set `tail_ty =
+            // body_ty` (op's declared return type), but the arm
+            // body's overall return type is the handle's overall
+            // type — those differ when the op's return type doesn't
+            // match the arm body's tail type (e.g., op returns Bool
+            // but arm tail is `r1 + r2` returning Int). Slice B's
+            // tests happen to use Int = op's return type so the
+            // bug never surfaced; Slice C's `Choose.flip: () -> Bool`
+            // with arm tail `r1 + r2: Int` exposed it as a Cranelift
+            // verifier rejection of `uextend.i64 v5` where v5 is
+            // already I64.
+            let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
+            let widened_tail = if actual_tail_ty == types::I64 {
                 tail_value
-            } else if post_arm_k.tail_ty.is_int() && post_arm_k.tail_ty.bits() < 64 {
+            } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
                 lowerer.builder.ins().uextend(types::I64, tail_value)
             } else {
                 assert_eq!(
-                    post_arm_k.tail_ty, pointer_ty,
+                    actual_tail_ty, pointer_ty,
                     "codegen Phase 4e captures+ Slice B: unexpected post-arm-k tail \
-                     Cranelift type {:?} for fn `{}`'s post-arm-k synth fn",
-                    post_arm_k.tail_ty, synth.k_name
+                     Cranelift type {actual_tail_ty:?} for fn `{}`'s post-arm-k synth fn",
+                    synth.k_name
                 );
                 tail_value
             };
@@ -5531,16 +5534,28 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 };
 
                 let tail_value = lowerer.lower_expr(&chain.tail_expr);
-                let widened_tail = if chain.tail_ty == types::I64 {
+                // Slice C bug fix: read the actual lowered Cranelift
+                // type from the SSA value, not from the pre-stored
+                // `chain.tail_ty`. The pre-pass set `tail_ty =
+                // body_ty` (op's declared return type), but the arm
+                // body's overall return type is the handle's overall
+                // type — those differ when the op's return type
+                // doesn't match the arm body's tail type (e.g., op
+                // returns Bool but arm tail is `r1 + r2` returning
+                // Int). Same fix applied to Slice B's post_arm_k
+                // synth fn (which had the latent bug but didn't
+                // surface in its tests).
+                let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
+                let widened_tail = if actual_tail_ty == types::I64 {
                     tail_value
-                } else if chain.tail_ty.is_int() && chain.tail_ty.bits() < 64 {
+                } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
                     lowerer.builder.ins().uextend(types::I64, tail_value)
                 } else {
                     assert_eq!(
-                        chain.tail_ty, pointer_ty,
+                        actual_tail_ty, pointer_ty,
                         "codegen Phase 4e captures+ Slice C: unexpected post_arm_k_2 \
-                         tail Cranelift type {:?} for fn `{}`'s chain",
-                        chain.tail_ty, synth.k_name
+                         tail Cranelift type {actual_tail_ty:?} for fn `{}`'s chain",
+                        synth.k_name
                     );
                     tail_value
                 };
@@ -5557,12 +5572,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             }
             module
                 .define_function(chain.post_arm_k_2_func_id, &mut ctx)
-                .map_err(|e| {
-                    format!(
-                        "define post_arm_k_2 synth fn for `{}`: {e:#?}\n\nfunction IR:\n{}",
-                        synth.k_name, ctx.func
-                    )
-                })?;
+                .map_err(|e| format!("define post_arm_k_2 synth fn: {e}"))?;
             module.clear_context(&mut ctx);
         }
     }
