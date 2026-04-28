@@ -710,6 +710,85 @@ pub unsafe extern "C" fn sigil_io_println_arm(
     ns
 }
 
+/// Plan B Task 57 — runtime-side default handler for
+/// `ArithError.div_by_zero`. Conforms to the Phase 4 CPS arm fn ABI.
+///
+/// Behavior: write `"sigil: arithmetic error: division by zero\n"`
+/// to stderr, then call `std::process::exit(2)`. Function never
+/// returns — the `*mut NextStep` return type is structurally
+/// unreachable. Preserves Plan A2's `examples/div_by_zero.sigil`
+/// user-visible behavior verbatim (same stderr banner, same exit
+/// code 2). User programs that wrap arithmetic in `handle ... with
+/// { ArithError.div_by_zero(k) => ... }` install a deeper frame on
+/// the handler stack that intercepts the perform before it reaches
+/// this default; programs that don't install their own handler
+/// fall through to here.
+///
+/// `in_args` is unused (op takes no user args; the trailing-pair
+/// `(k_closure, k_fn)` at `in_args[0..2]` is irrelevant since exit
+/// never resumes). `args_len` is asserted to be 2 (the trailing
+/// pair without user args) per the Phase 4 CPS arm fn ABI applied
+/// to a zero-user-arg op.
+///
+/// # Safety
+///
+/// `in_args` must point to at least two readable u64 (`args_len ==
+/// 2`) under the Phase 4 CPS arm fn ABI's trailing-pair convention
+/// — even though this fn reads neither. The trampoline guarantees
+/// the invariant when dispatching from a `NextStep::Call` produced
+/// by `sigil_perform` against the top-level ArithError frame.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_arith_error_div_by_zero_arm(
+    _closure_ptr: *const u8,
+    _in_args: *const u64,
+    args_len: u32,
+) -> *mut NextStep {
+    // `arith_error_default_arm` is `-> !` (`process::exit(2)`); the
+    // never-type unifies with the `*mut NextStep` return type. No
+    // terminator needed after the call.
+    arith_error_default_arm("division by zero", args_len)
+}
+
+/// Plan B Task 57 — `ArithError.mod_by_zero` parallel of
+/// `sigil_arith_error_div_by_zero_arm`. Same shape; banner reads
+/// `"sigil: arithmetic error: remainder by zero\n"`. Exists as a
+/// distinct symbol because the Phase 4 CPS arm fn ABI doesn't pass
+/// op_id to arm fns — arm dispatch is keyed by the `set_arm` slot,
+/// not by op_id read at fn entry. The two arm fns share an internal
+/// helper parameterised on the message string.
+///
+/// # Safety
+///
+/// Same contract as `sigil_arith_error_div_by_zero_arm`.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_arith_error_mod_by_zero_arm(
+    _closure_ptr: *const u8,
+    _in_args: *const u64,
+    args_len: u32,
+) -> *mut NextStep {
+    arith_error_default_arm("remainder by zero", args_len)
+}
+
+/// Internal helper for the two `ArithError` default arm fns. Writes
+/// `"sigil: arithmetic error: <reason>\n"` to stderr and calls
+/// `std::process::exit(2)`. Never returns.
+///
+/// `args_len` is debug-asserted to be 2 (zero user args + trailing
+/// pair). Caller (`sigil_perform`) guarantees the invariant.
+fn arith_error_default_arm(reason: &str, args_len: u32) -> ! {
+    debug_assert!(
+        args_len == 2,
+        "sigil_arith_error_*_arm: args_len must be exactly 2 (zero user args + \
+         trailing-pair `(k_closure, k_fn)`); got {args_len}"
+    );
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "sigil: arithmetic error: {reason}");
+    let _ = stderr.flush();
+    drop(stderr);
+    std::process::exit(2);
+}
+
 // ---------------------------------------------------------------------
 // `sigil_perform` and `sigil_run_loop`
 // ---------------------------------------------------------------------

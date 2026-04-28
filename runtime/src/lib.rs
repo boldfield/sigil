@@ -12,8 +12,10 @@
 //!   stack, `sigil_perform`, `sigil_run_loop`, NextStep helpers.
 //! - `counters` — runtime instrumentation counters (task 0.10).
 //! - `stackmap` — object-file section constants (task 0.11).
-//! - `arith` — Plan A2 task 25: `sigil_panic_arith_error`,
-//!   `sigil_int_to_string`, checked-overflow arith primitives.
+//! - `arith` — Plan A2 task 25 / Plan B Task 57: `sigil_int_to_-
+//!   string`, checked-overflow arith primitives. Plan A2's
+//!   `sigil_panic_arith_error` retired in Task 57; replaced by the
+//!   ArithError handler-arm fns in `handlers` (see below).
 //! - `byte` — Plan A2 task 25: `Byte` conversion and wrapping arith
 //!   primitives.
 //!
@@ -24,7 +26,6 @@
 //! - `sigil_string_new`, `sigil_string_len`
 //! - `sigil_println`
 //! - `sigil_counter_read`, `sigil_counter_print_all`
-//! - `sigil_panic_arith_error` (Plan A2)
 //! - `sigil_int_to_string` (Plan A2)
 //! - `sigil_checked_add`, `sigil_checked_sub`, `sigil_checked_mul` (Plan A2)
 //! - `sigil_byte_from_int_checked`, `sigil_byte_to_int`,
@@ -34,7 +35,11 @@
 //!   `sigil_handler_frame_set_return`, `sigil_handle_push`,
 //!   `sigil_handle_pop`, `sigil_perform`, `sigil_run_loop`,
 //!   `sigil_next_step_done`, `sigil_next_step_call`,
-//!   `sigil_next_step_args_ptr` (Plan B)
+//!   `sigil_next_step_args_ptr`, `sigil_continuation_identity` (Plan B)
+//! - `sigil_io_println_arm`, `sigil_arith_error_div_by_zero_arm`,
+//!   `sigil_arith_error_mod_by_zero_arm` (Plan B Task 57 — runtime-
+//!   side default arm fns installed by the `main` shim's top-level
+//!   handler frames)
 
 pub mod arena;
 pub mod arith;

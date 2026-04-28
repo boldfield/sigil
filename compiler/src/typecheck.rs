@@ -2099,30 +2099,39 @@ impl Tc {
             }
         }
         if f.name == "main" {
-            // Main's signature is fixed in Plan A1: `() -> Int ![IO]` or `() -> Int ![]`.
-            // Anything else — wrong return type, any parameters, or an effect row
-            // containing anything other than IO — is E0041.
+            // `fn main`'s signature shape is constrained: returns `Int`,
+            // takes no params, effect row may only contain effects the
+            // top-level `main` shim discharges. Plan B Task 57 expanded
+            // the discharged set from `{IO}` to `{IO, ArithError}` —
+            // both have top-level handler frames installed by the shim
+            // (per `[DEVIATION Task 57] Top-level handler installation
+            // in main shim` in PLAN_B_DEVIATIONS.md). Programs whose
+            // `main` row references any other effect would `sigil_-
+            // perform` against an unhandled effect at runtime.
             if !type_is(&f.return_type, "Int") {
                 self.push_error(
                     "E0041",
                     f.span.clone(),
-                    "`fn main` must return `Int` (expected `fn main() -> Int ![IO]` or `fn main() -> Int ![]`)",
+                    "`fn main` must return `Int` (expected `fn main() -> Int ![IO]`, \
+                     `fn main() -> Int ![ArithError]`, `fn main() -> Int ![IO, ArithError]`, \
+                     or `fn main() -> Int ![]`)",
                 );
             }
             if !f.params.is_empty() {
                 self.push_error(
                     "E0041",
                     f.span.clone(),
-                    "`fn main` takes no parameters in Plan A1 (expected `fn main() -> Int ![IO]`)",
+                    "`fn main` takes no parameters (expected `fn main() -> Int ![IO]` or similar)",
                 );
             }
             for effect in &f.effects {
-                if effect != "IO" {
+                if effect != "IO" && effect != "ArithError" {
                     self.push_error(
                         "E0041",
                         f.span.clone(),
                         format!(
-                            "`fn main`'s effect row may only contain `IO` in Plan A1 (saw `{effect}`)",
+                            "`fn main`'s effect row may only contain effects discharged by \
+                             the top-level shim (`IO` or `ArithError`); saw `{effect}`",
                         ),
                     );
                 }
@@ -2233,17 +2242,33 @@ impl Tc {
         }
     }
 
-    fn check_perform(&mut self, p: &PerformExpr, row: &[String]) -> Option<Ty> {
-        if !row.iter().any(|e| e == &p.effect) {
+    /// Plan B Task 57 — verify that the surrounding fn's effect row
+    /// declares `effect_name`. Used by both `check_perform` (for
+    /// every `perform` site) and the `Expr::Binary` arm of
+    /// `check_expr` (for `BinOp::Div`/`Mod` sites, which lower to
+    /// `perform ArithError.{div,mod}_by_zero()` at elaborate-time).
+    /// The deviation entry `[DEVIATION Task 57] BinOp::Div and
+    /// BinOp::Mod elaborate to perform-bearing form` documents why
+    /// the row introduction happens at typecheck rather than waiting
+    /// for elaborate's rewrite.
+    ///
+    /// Emits E0042 with a context-specific message when missing;
+    /// returns whether the row contains `effect_name` for callers
+    /// that want to skip downstream registry lookups on missing rows
+    /// (today no caller uses the return).
+    fn register_effect_use(&mut self, effect_name: &str, row: &[String], span: Span, ctx: &str) {
+        if !row.iter().any(|e| e == effect_name) {
             self.push_error(
                 "E0042",
-                p.span.clone(),
-                format!(
-                    "`perform {}.{}` requires `{}` in the enclosing function's effect row",
-                    p.effect, p.op, p.effect,
-                ),
+                span,
+                format!("`{ctx}` requires `{effect_name}` in the enclosing function's effect row"),
             );
         }
+    }
+
+    fn check_perform(&mut self, p: &PerformExpr, row: &[String]) -> Option<Ty> {
+        let ctx = format!("perform {}.{}", p.effect, p.op);
+        self.register_effect_use(&p.effect, row, p.span.clone(), &ctx);
         // Plan B task 54 + Task 57 — every effect (including the
         // builtin `IO` and `ArithError`) dispatches through the
         // typechecker's effect registry built in the top-level
@@ -2422,9 +2447,23 @@ impl Tc {
             Expr::Perform(p) => self.check_perform(p, row),
             Expr::BoolLit(_, _) => Some(Ty::Bool),
             Expr::CharLit(_, _) => Some(Ty::Char),
-            Expr::Binary { op, lhs, rhs, .. } => {
+            Expr::Binary { op, lhs, rhs, span } => {
                 let lt = self.check_expr(lhs, row);
                 let rt = self.check_expr(rhs, row);
+                // Plan B Task 57 — `BinOp::Div` and `BinOp::Mod`
+                // elaborate to a perform-bearing form (`if rhs == 0
+                // { perform ArithError.{div,mod}_by_zero() } else {
+                // … }`); the row introduction happens here at
+                // typecheck because elaborate runs after typecheck
+                // and cannot influence the row check upstream. See
+                // `[DEVIATION Task 57] BinOp::Div and BinOp::Mod
+                // elaborate to perform-bearing form` in
+                // `PLAN_B_DEVIATIONS.md`.
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    let opname = if matches!(op, BinOp::Div) { "/" } else { "%" };
+                    let ctx = format!("operator `{opname}` (may abort with ArithError)");
+                    self.register_effect_use("ArithError", row, span.clone(), &ctx);
+                }
                 self.check_binop(*op, lt, rt, lhs.span(), rhs.span())
             }
             Expr::Unary { op, operand, span } => {
@@ -2552,6 +2591,17 @@ impl Tc {
     ) -> Option<Ty> {
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                self.require_operand(op, Ty::Int, lt, lspan);
+                self.require_operand(op, Ty::Int, rt, rspan);
+                Some(Ty::Int)
+            }
+            BinOp::SdivUnchecked | BinOp::SremUnchecked => {
+                // Plan B Task 57 — codegen-internal variants produced
+                // only by elaborate's `BinOp::Div`/`Mod` rewrite. The
+                // typechecker reaches this arm only via synthetic
+                // walks (e.g. typecheck-tests-walking-elaborated-IR),
+                // not via user source. Same operand/result types as
+                // the pre-elaborate variants.
                 self.require_operand(op, Ty::Int, lt, lspan);
                 self.require_operand(op, Ty::Int, rt, rspan);
                 Some(Ty::Int)
@@ -4212,6 +4262,11 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::GtEq => ">=",
         BinOp::And => "&&",
         BinOp::Or => "||",
+        // Plan B Task 57 — codegen-internal variants surface in
+        // diagnostics only via post-elaborate IR walks; the surface
+        // syntax is the same as their pre-elaborate counterparts.
+        BinOp::SdivUnchecked => "/",
+        BinOp::SremUnchecked => "%",
     }
 }
 

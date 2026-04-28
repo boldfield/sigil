@@ -298,24 +298,29 @@ fn stackmap_section_parses_v0_placeholder() {
         panic!("stackmap parse failed: {e:?}");
     });
     assert_eq!(parsed.version, STACKMAP_VERSION_PLACEHOLDER);
-    // Plan B Task 57 — hello.sigil's compile produces 9 placeholder
-    // stackmap records:
-    //   - 6 in the `main` C shim (per `[DEVIATION Task 57] Top-level
-    //     handler installation in main shim`):
-    //       sigil_gc_init, sigil_handler_frame_new, sigil_handler_-
-    //       frame_set_arm, sigil_handle_push, sigil_user_main,
-    //       sigil_handle_pop.
+    // Plan B Task 57 — hello.sigil's compile produces 14 placeholder
+    // stackmap records after Slice 2's ArithError refactor:
+    //   - 11 in the `main` C shim (two handler frames pushed/popped
+    //     per `[DEVIATION Task 57] Top-level handler installation in
+    //     main shim`):
+    //       sigil_gc_init,
+    //       arith: handler_frame_new + 2× set_arm (div_by_zero,
+    //              mod_by_zero) + handle_push,
+    //       io:    handler_frame_new + set_arm (println) +
+    //              handle_push,
+    //       sigil_user_main,
+    //       2× handle_pop (IO then ArithError, reverse-order).
     //   - 3 in the user `main` body emitting `perform IO.println(
-    //     "Hello, world!")`:
+    //     "hello, world")`:
     //       sigil_string_new (the literal), sigil_perform (the
     //       perform), sigil_run_loop (the trampoline driver in
     //       lower_perform_to_value).
     //
-    // Pre-Task-57 (synchronous IO shortcut) this number was 4 —
-    // gc_init + user_main + sigil_string_new + sigil_println — but
-    // the IO frame push/pop in the shim and the perform → run_loop
-    // path in user code added 5 net call sites.
-    assert_eq!(parsed.records.len(), 9, "expected 9 placeholder records");
+    // Slice 1 was 9 (single IO frame). Slice 2 adds 5 net sites
+    // (ArithError frame_new + 2 set_arm + push + pop). Pre-Task-57
+    // was 4 (synchronous IO shortcut + sigil_panic_arith_error never
+    // emitted in hello.sigil).
+    assert_eq!(parsed.records.len(), 14, "expected 14 placeholder records");
     for r in &parsed.records {
         assert_eq!(r.live_count, 0, "v0 invariant: live_count always 0");
         assert_eq!(
@@ -451,13 +456,18 @@ fn match_primitive_with_wildcard() {
     assert_eq!(code, 17, "n=2 hits wildcard → 17");
 }
 
-/// Modulo-by-zero takes the same runtime-trap path as division-by-zero
-/// but with a different reason string. The canonical
+/// Modulo-by-zero takes the same default-handler path as division-by-
+/// zero but with a different reason string. The canonical
 /// `examples/div_by_zero.sigil` covers the `/` path via
 /// [`div_by_zero_example_traps`]; this test covers the `%` path.
+///
+/// Plan B Task 57 — row updated from `![]` to `![ArithError]` per
+/// the elaborate-time-rewrite tracked-effect doctrine. User-visible
+/// behaviour (stderr banner + exit 2) preserved verbatim by the
+/// runtime-side `sigil_arith_error_mod_by_zero_arm` default arm fn.
 #[test]
 fn mod_by_zero_traps() {
-    let source = "fn main() -> Int ![] {\n\
+    let source = "fn main() -> Int ![ArithError] {\n\
                     let a: Int = 10;\n\
                     let b: Int = 0;\n\
                     let r: Int = a % b;\n\
@@ -468,6 +478,38 @@ fn mod_by_zero_traps() {
     assert!(
         stderr.contains("remainder by zero"),
         "stderr missing mod-zero banner: {stderr:?}"
+    );
+}
+
+/// Plan B Task 57 — `examples/div_recover.sigil` exercises algebraic
+/// recovery from a div-by-zero via a user-installed `ArithError`
+/// handler. Confirms that:
+///
+/// - typecheck accepts `![ArithError]` on the inner fn doing
+///   division, and `![IO]` on the outer fn whose handle expression
+///   discharges `ArithError`;
+/// - elaborate's `BinOp::Div` rewrite produces a perform-bearing
+///   form that flows through `sigil_perform`;
+/// - the user's `ArithError.div_by_zero(k) => 999` handler frame
+///   intercepts the perform before the top-level shim's default
+///   (the frame walk is inward-first);
+/// - the recovery value `999` flows back to the outer fn's handle
+///   expression, and the program prints `999` then exits 0.
+#[test]
+fn div_recover_example_returns_999() {
+    let root = workspace_root();
+    let source = root.join("examples/div_recover.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "div_recover_example");
+    assert_eq!(code, 0, "div_recover exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "999\n",
+        "div_recover stdout mismatch (expected user handler to recover with 999); \
+         stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "div_recover should not abort via the default ArithError arm fn; \
+         stderr should be empty"
     );
 }
 
