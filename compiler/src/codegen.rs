@@ -1569,18 +1569,6 @@ struct HandlerReturnArmSynth {
     /// `ireduce`, `I32` for Char via `ireduce`, `I64` and pointer-
     /// typed values stay as-is).
     binding_ty: Type,
-    /// Cranelift type of the return-arm body's result. Currently
-    /// unused — the synth fn body's actual type is read via
-    /// `dfg.value_type` after lowering (Slice C's pattern), and the
-    /// handle-exit dispatch in `Expr::Handle` reads the narrow-back
-    /// type via `Lowerer::type_of_expr(&ra.body, &preview)`. Kept
-    /// here as a forward-compat slot in case a future commit wants
-    /// to pre-resolve `body_ty` at the pre-pass (mirroring the way
-    /// `HandlerArmSynth::body_ty` is pre-resolved). Marked
-    /// `#[allow(dead_code)]` to silence the unused-field warning
-    /// without losing the documentation slot.
-    #[allow(dead_code)]
-    body_ty: Type,
     /// Captures consumed by this return-arm body, in return-arm-local
     /// slot order matching `body`'s rewritten `Expr::ClosureEnvLoad
     /// { index }` references. Each entry is the captured name plus
@@ -2194,65 +2182,37 @@ struct ArmSynthCtx<'a> {
     handle_body_ty: &'a BTreeMap<Span, crate::typecheck::Ty>,
 }
 
+struct CollectMut<'a> {
+    synth: &'a mut Vec<HandlerArmSynth>,
+    indices: &'a mut BTreeMap<Span, Vec<usize>>,
+    return_synth: &'a mut Vec<HandlerReturnArmSynth>,
+    return_indices: &'a mut BTreeMap<Span, usize>,
+}
+
 fn collect_handle_arms_in_block(
     b: &crate::ast::Block,
     module: &mut ObjectModule,
     ctx: &ArmSynthCtx<'_>,
-    synth: &mut Vec<HandlerArmSynth>,
-    indices: &mut BTreeMap<Span, Vec<usize>>,
-    return_synth: &mut Vec<HandlerReturnArmSynth>,
-    return_indices: &mut BTreeMap<Span, usize>,
+    out: &mut CollectMut<'_>,
 ) -> Result<(), String> {
     use crate::ast::Stmt;
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                collect_handle_arms_in_expr(
-                    &l.value,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(&l.value, module, ctx, out)?;
             }
             Stmt::Expr(e) => {
-                collect_handle_arms_in_expr(
-                    e,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(e, module, ctx, out)?;
             }
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    collect_handle_arms_in_expr(
-                        a,
-                        module,
-                        ctx,
-                        synth,
-                        indices,
-                        return_synth,
-                        return_indices,
-                    )?;
+                    collect_handle_arms_in_expr(a, module, ctx, out)?;
                 }
             }
         }
     }
     if let Some(tail) = &b.tail {
-        collect_handle_arms_in_expr(
-            tail,
-            module,
-            ctx,
-            synth,
-            indices,
-            return_synth,
-            return_indices,
-        )?;
+        collect_handle_arms_in_expr(tail, module, ctx, out)?;
     }
     Ok(())
 }
@@ -2261,10 +2221,7 @@ fn collect_handle_arms_in_expr(
     e: &crate::ast::Expr,
     module: &mut ObjectModule,
     ctx: &ArmSynthCtx<'_>,
-    synth: &mut Vec<HandlerArmSynth>,
-    indices: &mut BTreeMap<Span, Vec<usize>>,
-    return_synth: &mut Vec<HandlerReturnArmSynth>,
-    return_indices: &mut BTreeMap<Span, usize>,
+    out: &mut CollectMut<'_>,
 ) -> Result<(), String> {
     use crate::ast::Expr;
     match e {
@@ -2276,159 +2233,47 @@ fn collect_handle_arms_in_expr(
         | Expr::ClosureEnvLoad { .. }
         | Expr::Perform(_) => Ok(()),
         Expr::Binary { lhs, rhs, .. } => {
-            collect_handle_arms_in_expr(
-                lhs,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
-            collect_handle_arms_in_expr(
-                rhs,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )
+            collect_handle_arms_in_expr(lhs, module, ctx, out)?;
+            collect_handle_arms_in_expr(rhs, module, ctx, out)
         }
-        Expr::Unary { operand, .. } => collect_handle_arms_in_expr(
-            operand,
-            module,
-            ctx,
-            synth,
-            indices,
-            return_synth,
-            return_indices,
-        ),
+        Expr::Unary { operand, .. } => collect_handle_arms_in_expr(operand, module, ctx, out),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
         } => {
-            collect_handle_arms_in_expr(
-                cond,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
-            collect_handle_arms_in_block(
-                then_block,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
-            collect_handle_arms_in_block(
-                else_block,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )
+            collect_handle_arms_in_expr(cond, module, ctx, out)?;
+            collect_handle_arms_in_block(then_block, module, ctx, out)?;
+            collect_handle_arms_in_block(else_block, module, ctx, out)
         }
-        Expr::Block(b) => collect_handle_arms_in_block(
-            b,
-            module,
-            ctx,
-            synth,
-            indices,
-            return_synth,
-            return_indices,
-        ),
+        Expr::Block(b) => collect_handle_arms_in_block(b, module, ctx, out),
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            collect_handle_arms_in_expr(
-                scrutinee,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
+            collect_handle_arms_in_expr(scrutinee, module, ctx, out)?;
             for a in arms {
-                collect_handle_arms_in_expr(
-                    &a.body,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(&a.body, module, ctx, out)?;
             }
             Ok(())
         }
         Expr::Call { callee, args, .. } => {
-            collect_handle_arms_in_expr(
-                callee,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
+            collect_handle_arms_in_expr(callee, module, ctx, out)?;
             for a in args {
-                collect_handle_arms_in_expr(
-                    a,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(a, module, ctx, out)?;
             }
             Ok(())
         }
-        Expr::Lambda { body, .. } => collect_handle_arms_in_expr(
-            body,
-            module,
-            ctx,
-            synth,
-            indices,
-            return_synth,
-            return_indices,
-        ),
+        Expr::Lambda { body, .. } => collect_handle_arms_in_expr(body, module, ctx, out),
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
-                collect_handle_arms_in_expr(
-                    ee,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(ee, module, ctx, out)?;
             }
             Ok(())
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                collect_handle_arms_in_expr(
-                    &f.value,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(&f.value, module, ctx, out)?;
             }
             Ok(())
         }
@@ -2441,43 +2286,19 @@ fn collect_handle_arms_in_expr(
             // Recurse into body + arm bodies + return-arm body so
             // nested handles also surface. Then allocate FuncIds for
             // this handle's arms (op arms + return arm if present).
-            collect_handle_arms_in_expr(
-                body,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
+            collect_handle_arms_in_expr(body, module, ctx, out)?;
             for arm in op_arms {
-                collect_handle_arms_in_expr(
-                    &arm.body,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(&arm.body, module, ctx, out)?;
             }
             if let Some(ra) = return_arm {
-                collect_handle_arms_in_expr(
-                    &ra.body,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(&ra.body, module, ctx, out)?;
             }
             // Allocate one synthetic CPS fn per arm. Linker symbol
             // is `sigil_handler_arm_<global_index>` to keep names
             // unique without needing per-handle counters.
             let mut arm_indices: Vec<usize> = Vec::with_capacity(op_arms.len());
             for arm in op_arms {
-                let global_idx = synth.len();
+                let global_idx = out.synth.len();
                 let mangled = format!("sigil_handler_arm_{global_idx}");
                 let func_id = module
                     .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
@@ -2600,15 +2421,15 @@ fn collect_handle_arms_in_expr(
                     arm_body_let_then_pure_tail_shape(&rewritten_body, &arm.k_name)
                 {
                     // The mangled symbol uses the parent arm fn's
-                    // global index (== `synth.len()` at the moment of
-                    // the corresponding `synth.push(HandlerArmSynth)`
+                    // global index (== `out.synth.len()` at the moment of
+                    // the corresponding `out.synth.push(HandlerArmSynth)`
                     // below). Each arm has at most one post-arm-k
                     // synth fn, so this is collision-free without
                     // needing a separate post-arm-k counter — but the
                     // name is the ARM-FN's index, not a sequential
                     // post-arm-k index. Naming the binding makes that
                     // explicit.
-                    let post_arm_k_arm_fn_idx = synth.len();
+                    let post_arm_k_arm_fn_idx = out.synth.len();
                     let post_arm_k_mangled =
                         format!("sigil_handler_post_arm_k_{post_arm_k_arm_fn_idx}");
                     let post_arm_k_func_id = module
@@ -2657,7 +2478,7 @@ fn collect_handle_arms_in_expr(
                     if !is_multi_shot {
                         None
                     } else {
-                        let arm_fn_idx = synth.len();
+                        let arm_fn_idx = out.synth.len();
                         let post_arm_k_1_mangled =
                             format!("sigil_handler_post_arm_k_1_{arm_fn_idx}");
                         let post_arm_k_1_func_id = module
@@ -2698,7 +2519,7 @@ fn collect_handle_arms_in_expr(
                     None
                 };
 
-                synth.push(HandlerArmSynth {
+                out.synth.push(HandlerArmSynth {
                     func_id,
                     body: rewritten_body,
                     arg_names,
@@ -2749,7 +2570,7 @@ fn collect_handle_arms_in_expr(
             // each name comes from the surrounding lambda's closure
             // env (Slice D pattern) or local env.
             if let Some(ra) = return_arm {
-                let global_idx = return_synth.len();
+                let global_idx = out.return_synth.len();
                 let mangled = format!("sigil_handler_return_arm_{global_idx}");
                 let func_id = module
                     .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
@@ -2851,15 +2672,14 @@ fn collect_handle_arms_in_expr(
                     .get(span)
                     .map(|ty| cranelift_ty_of_ty(ty, ctx.pointer_ty))
                     .unwrap_or(types::I64);
-                return_synth.push(HandlerReturnArmSynth {
+                out.return_synth.push(HandlerReturnArmSynth {
                     func_id,
                     body: rewritten_body,
                     binding_name: ra.binding.clone(),
                     binding_ty,
-                    body_ty: types::I64,
                     captures,
                 });
-                let prev_ret = return_indices.insert(span.clone(), global_idx);
+                let prev_ret = out.return_indices.insert(span.clone(), global_idx);
                 debug_assert!(
                     prev_ret.is_none(),
                     "codegen pre-pass: duplicate handle span {span:?} for return-arm \
@@ -2882,7 +2702,7 @@ fn collect_handle_arms_in_expr(
             // dedup → `debug_assert!` swap from review-fixup
             // commit `54b4a60`. The `insert` lives outside the
             // assert so the side effect runs in release builds too.
-            let prev = indices.insert(span.clone(), arm_indices);
+            let prev = out.indices.insert(span.clone(), arm_indices);
             debug_assert!(
                 prev.is_none(),
                 "codegen pre-pass: duplicate handle span {span:?} — \
@@ -4436,16 +4256,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             handle_return_arm_captures: &checked.handle_return_arm_captures,
             handle_body_ty: &checked.handle_body_ty,
         };
+        let mut arm_synth_mut = CollectMut {
+            synth: &mut handler_arm_synth,
+            indices: &mut handler_arm_indices,
+            return_synth: &mut handler_return_arm_synth,
+            return_indices: &mut handler_return_arm_indices,
+        };
         for item in &checked.program.items {
             if let crate::ast::Item::Fn(f) = item {
                 collect_handle_arms_in_block(
                     &f.body,
                     &mut module,
                     &arm_synth_ctx,
-                    &mut handler_arm_synth,
-                    &mut handler_arm_indices,
-                    &mut handler_return_arm_synth,
-                    &mut handler_return_arm_indices,
+                    &mut arm_synth_mut,
                 )?;
             }
         }
