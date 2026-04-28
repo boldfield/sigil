@@ -4772,43 +4772,29 @@ fn handle_with_nested_handle_in_return_arm_body_compiles() {
 }
 
 #[test]
-#[ignore]
-fn handle_with_bool_body_and_return_arm_uses_v_pending_proper_binding_ty() {
-    // Plan B Task 55 (Phase 4g) review-fix #3 PIN: the codegen
-    // pre-pass currently sets `HandlerReturnArmSynth.binding_ty
-    // = types::I64` as a placeholder (the pre-pass doesn't have
-    // direct access to the body's Cranelift type at AST-walk
-    // time). The synth fn binds `v` in the Lowerer env as I64,
-    // regardless of the body's actual type. When the body has
-    // type Bool (I8) and the return arm body uses `v` at narrow
-    // type (e.g., `not v`, `v && x`), the Lowerer expects v as
-    // I8 but env returns I64 — type mismatch in the lowered IR.
+fn handle_with_bool_body_and_return_arm_uses_v_at_narrow_type() {
+    // Plan B Stage 6 cleanup — **un-ignored from the previously
+    // `#[ignore]`'d `handle_with_bool_body_and_return_arm_uses_v_-
+    // pending_proper_binding_ty`**. The Phase 4g `binding_ty = I64`
+    // hardcode is resolved via option 2 (typecheck side-table):
+    // `CheckedProgram::handle_body_ty: BTreeMap<Span, Ty>` records
+    // the body type at typecheck time; codegen's return-arm pre-pass
+    // converts it to Cranelift type via `cranelift_ty_of_ty` and
+    // narrows `v` from the I64 args_ptr[0] slot to the correct
+    // type at synth-fn entry.
     //
-    // Concrete repro: `handle true with { return(v) => not v,
-    // ... }`. Body produces Bool (true); surrounding fn widens
-    // I8 → I64 for the trailing-pair packing; synth fn loads
-    // I64 from args_ptr[0] and binds `v` as I64 in env. Return
-    // arm body lowers `not v` — `not` expects I8, env has I64:
-    // verifier error.
+    // Body: `true` (BoolLit, Cranelift I8, widened to I64 for the
+    // trailing-pair packing). Return arm body: `if v { false } else
+    // { true }` — references `v` as Bool; the synth fn now loads
+    // I64, ireduce-narrows back to I8, binds `v: I8` in the Lowerer
+    // env. The `if` lowers cleanly with v: I8 cond.
     //
-    // Two resolution options for a follow-up commit:
-    //
-    //   - **Option 1 (forward):** thread body_ty from the
-    //     dispatch site (where `dfg.value_type(body_val)` is
-    //     known) into HandlerReturnArmSynth via mutable
-    //     side-table. Synth fn body emit reads the actual
-    //     binding_ty and narrows v on load.
-    //
-    //   - **Option 2 (typecheck side-table):** add
-    //     `CheckedProgram::handle_body_ty: BTreeMap<Span, Ty>`,
-    //     map Ty → Cranelift Type via existing `slot_kind_for_ty`
-    //     / `cranelift_ty_for_type_expr` family, store on
-    //     HandlerReturnArmSynth at pre-pass time.
-    //
-    // Mirrors the `discard_k_handler_does_not_abort_helper_phase_4e_pending`
-    // pin precedent (Phase 4d MVP); un-ignored at the resolution
-    // PR. This test would assert `compile_and_run` succeeds with
-    // stdout `false\n` (v=true → not v = false).
+    // Trace: handle's body produces `true` (I8). The surrounding fn
+    // widens to I64 for the trailing-pair Call to the return arm.
+    // The synth fn reads args_ptr[0] as I64, ireduces to I8, binds
+    // `v = true (I8)`. Return-arm body `if v { false } else { true }`
+    // → `false` (I8). The handle's overall = false; main's `if b`
+    // takes the else branch, prints "false\n", returns 1.
     let src = "effect Raise { fail: () -> Bool }\n\
                fn main() -> Int ![IO] {\n  \
                  let b: Bool = handle true with {\n    \
@@ -4823,7 +4809,10 @@ fn handle_with_bool_body_and_return_arm_uses_v_pending_proper_binding_ty() {
                    1\n  \
                  }\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_bool_body_v_pending_binding_ty");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    let (stdout, stderr, code) = compile_and_run(src, "stage_6_cleanup_bool_body_binding_ty");
+    assert_eq!(
+        code, 1,
+        "exit code; main returns 1 from the `if b` else branch; stderr={stderr:?}"
+    );
     assert_eq!(stdout, "false\n", "stdout mismatch; stderr={stderr:?}");
 }

@@ -410,6 +410,22 @@ pub struct CheckedProgram {
     /// captures (codegen resolves them through the user-fn / ctor /
     /// builtin tables).
     pub handle_return_arm_captures: BTreeMap<Span, Vec<(String, Ty)>>,
+    /// Plan B Stage 6 cleanup — per-`Expr::Handle` body type.
+    ///
+    /// The handle expression's body has a typecheck-determined `Ty`
+    /// that the codegen pre-pass for return-arm synth fns needs to
+    /// size the `v` binding correctly (Phase 4g shipped with
+    /// `binding_ty = I64` hardcoded; that's correct for I64 bodies
+    /// but produces verifier errors for narrow-type bodies — Bool,
+    /// Char — when the return arm body uses `v` at narrow type).
+    /// This side-table threads the body's `Ty` from typecheck to
+    /// the codegen pre-pass via the handle's `Span`.
+    ///
+    /// Resolves the `#[ignore]`'d e2e
+    /// `handle_with_bool_body_and_return_arm_uses_v_pending_proper_-
+    /// binding_ty` per the option-2 closure point in
+    /// `[Stage 6 cleanup]`.
+    pub handle_body_ty: BTreeMap<Span, Ty>,
 }
 
 /// Where a constructor is registered. Indexes a `TypeDecl` in the
@@ -660,6 +676,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         handler_scopes: Vec::new(),
         handle_arm_captures: BTreeMap::new(),
         handle_return_arm_captures: BTreeMap::new(),
+        handle_body_ty: BTreeMap::new(),
     };
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
@@ -946,6 +963,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             op_ids,
             handle_arm_captures: tc.handle_arm_captures,
             handle_return_arm_captures: tc.handle_return_arm_captures,
+            handle_body_ty: tc.handle_body_ty,
         },
         tc.errors,
     )
@@ -1133,6 +1151,12 @@ struct Tc {
     /// closure record passed as `closure_ptr` to
     /// `sigil_handler_frame_set_return`.
     handle_return_arm_captures: BTreeMap<Span, Vec<(String, Ty)>>,
+    /// Plan B Stage 6 cleanup — per-`Expr::Handle` body type.
+    /// Populated during `check_handle`'s body walk; consumed by
+    /// codegen's return-arm pre-pass to size the `v` binding's
+    /// Cranelift type correctly. See
+    /// `CheckedProgram::handle_body_ty`.
+    handle_body_ty: BTreeMap<Span, Ty>,
 }
 
 /// Plan B task 54 — one handler's effect-instantiation cache.
@@ -3188,6 +3212,22 @@ impl Tc {
         });
         let body_ty = self.check_expr(body, &body_row);
         self.handler_scopes.pop();
+
+        // Plan B Stage 6 cleanup — populate the per-handle body type
+        // side-table for the codegen pre-pass. Codegen reads this at
+        // each `Expr::Handle` site to size the return-arm `v` binding's
+        // Cranelift type correctly (Phase 4g shipped with `binding_ty
+        // = I64` hardcoded, which produces verifier errors when the
+        // body has a narrower type — Bool, Char — and the return arm
+        // body uses `v` at narrow type). Resolves the `#[ignore]`'d
+        // e2e `handle_with_bool_body_and_return_arm_uses_v_pending_-
+        // proper_binding_ty`. Resolve through the substitution so the
+        // recorded `Ty` is the post-inference concrete type, not a
+        // raw type variable.
+        if let Some(ref bt) = body_ty {
+            self.handle_body_ty
+                .insert(handle_span.clone(), self.deref(bt));
+        }
 
         // ---------- Phase 3: handler-overall type + arm walks ----------
         // Allocate a fresh handler-overall var; cross-arm unification
@@ -6896,6 +6936,7 @@ mod tests {
             handler_scopes: Vec::new(),
             handle_arm_captures: BTreeMap::new(),
             handle_return_arm_captures: BTreeMap::new(),
+            handle_body_ty: BTreeMap::new(),
         }
     }
 

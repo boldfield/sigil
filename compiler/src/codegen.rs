@@ -240,6 +240,30 @@ fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
     }
 }
 
+/// Plan B Stage 6 cleanup — Cranelift type for a typecheck `Ty`.
+///
+/// Free-fn variant of `Lowerer::cranelift_ty_of` (codegen.rs:9407)
+/// usable at the codegen pre-pass where no `Lowerer` instance is
+/// available (e.g., the return-arm synth pre-pass that consumes
+/// `CheckedProgram::handle_body_ty` to size the `v` binding's
+/// Cranelift type).
+fn cranelift_ty_of_ty(ty: &crate::typecheck::Ty, pointer_ty: Type) -> Type {
+    use crate::typecheck::Ty;
+    match ty {
+        Ty::Int => types::I64,
+        Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
+        Ty::Char => types::I32,
+        Ty::String | Ty::Fn(_) | Ty::User(_, _) => pointer_ty,
+        // Surface-AST guard at codegen entry (`contains_apply_or_-
+        // generic_ref`) ensures `Ty::Var` cannot reach codegen for
+        // monomorphized programs; if a stray var arrives here, fall
+        // back to pointer_ty defensively rather than panic — the
+        // worst-case behaviour is the binding gets an extra-wide
+        // slot, which at least doesn't miscompile.
+        Ty::Var(_) => pointer_ty,
+    }
+}
+
 /// Plan B task 48 — codegen-entry walker that asserts monomorphization
 /// has erased every generic-application and every generic-parameter
 /// reference. Called once at the top of `emit_object`. Closure point
@@ -2158,6 +2182,16 @@ struct ArmSynthCtx<'a> {
     /// references in the return-arm body into return-arm-local-indexed
     /// `Expr::ClosureEnvLoad` slots.
     handle_return_arm_captures: &'a BTreeMap<Span, Vec<(String, crate::typecheck::Ty)>>,
+    /// Plan B Stage 6 cleanup — typecheck-side per-handle body type
+    /// map. Keyed by handle span. The codegen return-arm pre-pass
+    /// reads this to size the `v` binding's Cranelift type correctly
+    /// (Phase 4g shipped with `binding_ty = I64` hardcoded; narrow-
+    /// type bodies like Bool / Char need the actual Cranelift type
+    /// at the synth-fn entry to lower the return-arm body cleanly).
+    /// Resolves the `#[ignore]`'d e2e
+    /// `handle_with_bool_body_and_return_arm_uses_v_pending_proper_-
+    /// binding_ty`.
+    handle_body_ty: &'a BTreeMap<Span, crate::typecheck::Ty>,
 }
 
 fn collect_handle_arms_in_block(
@@ -2788,28 +2822,40 @@ fn collect_handle_arms_in_expr(
                 // recovery — or, more simply, defer body_ty
                 // resolution to the synth-fn definition pass which
                 // has access to the typecheck-side info via
-                // `match_scrut_tys` / typecheck artifacts. For Phase
-                // 4g MVP we encode `binding_ty = I64` (universal
-                // widened slot) and `body_ty = I64` (synth fn widens
-                // result to I64 before the trailing-pair Call) —
-                // narrow-back happens at the surrounding fn after
-                // run_loop returns, mirroring
-                // `lower_perform_to_value`'s post-run_loop
-                // narrow.
+                // **Stage 6 cleanup — proper binding_ty resolution.**
+                // The handle's body type is recorded by typecheck in
+                // `CheckedProgram::handle_body_ty: BTreeMap<Span, Ty>`
+                // (populated at `check_handle`'s body walk). The
+                // codegen pre-pass reads it via `ctx.handle_body_ty`
+                // and converts to Cranelift type via
+                // `cranelift_ty_of_ty`. This resolves the Phase 4g
+                // MVP placeholder `binding_ty = I64` which produced
+                // verifier errors when the body's actual type was
+                // narrower (Bool I8, Char I32). The synth fn now
+                // unpacks `v` from `args_ptr[0]` as I64 (universal
+                // widened slot per the trailing-pair convention) and
+                // narrows back to `binding_ty` via `ireduce` before
+                // binding into the Lowerer env, so the return-arm
+                // body lowers cleanly even when it uses `v` at narrow
+                // type. Resolves the `#[ignore]`'d e2e
+                // `handle_with_bool_body_and_return_arm_uses_v_-
+                // pending_proper_binding_ty`.
                 //
-                // For type-aware narrow-back at the surrounding fn
-                // we still need `body_ty` (the return arm body's
-                // declared Cranelift type). We don't expose it here
-                // — Lowerer's `type_of_expr` provides it post-
-                // lowering. The handle-exit dispatch in
-                // `Expr::Handle` will compute `handler_overall_ty`
-                // via `type_of_expr(&ra.body, &mut preview)` at
-                // dispatch time. Defer to that site.
+                // body_ty stays I64 because the synth fn still widens
+                // its result to I64 before the trailing-pair Call —
+                // narrow-back at the surrounding fn happens via
+                // `Lowerer::type_of_expr(&ra.body, &preview)` at
+                // dispatch time, same as before.
+                let binding_ty = ctx
+                    .handle_body_ty
+                    .get(span)
+                    .map(|ty| cranelift_ty_of_ty(ty, ctx.pointer_ty))
+                    .unwrap_or(types::I64);
                 return_synth.push(HandlerReturnArmSynth {
                     func_id,
                     body: rewritten_body,
                     binding_name: ra.binding.clone(),
-                    binding_ty: types::I64,
+                    binding_ty,
                     body_ty: types::I64,
                     captures,
                 });
@@ -4388,6 +4434,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             pointer_ty,
             handle_arm_captures: &checked.handle_arm_captures,
             handle_return_arm_captures: &checked.handle_return_arm_captures,
+            handle_body_ty: &checked.handle_body_ty,
         };
         for item in &checked.program.items {
             if let crate::ast::Item::Fn(f) = item {
@@ -6027,13 +6074,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 }
 
                 // Unpack `v` from args_ptr[0] as I64; narrow per
-                // binding_ty. The pre-pass currently sets
-                // binding_ty = I64 (we don't have body's Cranelift
-                // type at pre-pass time; the surrounding-fn dispatch
-                // widens body_val to I64 before packing). The narrow
-                // here is a no-op for I64; future commits that
-                // resolve binding_ty more precisely will activate
-                // the narrower paths via `ireduce`.
+                // binding_ty. The pre-pass reads binding_ty from
+                // `CheckedProgram::handle_body_ty` (Stage 6 cleanup),
+                // so narrow-type bodies (Bool I8, Char I32) now bind
+                // `v` at the correct Cranelift type via `ireduce`.
+                // Pre-Stage-6-cleanup, binding_ty was hardcoded to
+                // I64 and the narrow path was a no-op; the
+                // `#[ignore]`'d e2e
+                // `handle_with_bool_body_and_return_arm_uses_v_-
+                // pending_proper_binding_ty` pinned the gap. The
+                // surrounding-fn dispatch widens body_val to I64
+                // before packing, so the I64 load + ireduce-back
+                // round-trip is sound.
                 let widened_v = builder.ins().load(
                     types::I64,
                     MemFlags::trusted(),
@@ -11278,6 +11330,7 @@ mod tests {
             op_ids: std::collections::BTreeMap::new(),
             handle_arm_captures: std::collections::BTreeMap::new(),
             handle_return_arm_captures: std::collections::BTreeMap::new(),
+            handle_body_ty: std::collections::BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
         let mono = MonoProgram { anf };
@@ -11352,6 +11405,7 @@ mod tests {
             op_ids: std::collections::BTreeMap::new(),
             handle_arm_captures: std::collections::BTreeMap::new(),
             handle_return_arm_captures: std::collections::BTreeMap::new(),
+            handle_body_ty: std::collections::BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
         let mono = MonoProgram { anf };
