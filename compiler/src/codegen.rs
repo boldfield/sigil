@@ -9411,7 +9411,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
             }
             Expr::Binary { op, .. } => match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => types::I64,
+                // Plan B Task 57 — `SdivUnchecked` / `SremUnchecked`
+                // are codegen-internal Int-returning variants
+                // produced by elaborate's `BinOp::Div` / `BinOp::Mod`
+                // rewrite. Mirror their counterparts in the I64
+                // arm; mirrors `elaborate::binop_result_type`'s
+                // parallel logic. Latent today (codegen lowers them
+                // via `sdiv`/`srem` directly, producing I64
+                // regardless of `type_of_expr`'s answer), but the
+                // two functions are parallel AST→type lookups across
+                // passes; drift here would silently corrupt a
+                // future pass that consults `type_of_expr` over a
+                // synthesized unchecked-Binary node.
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::SdivUnchecked
+                | BinOp::SremUnchecked => types::I64,
                 _ => types::I8, // comparison / logic → Bool
             },
             Expr::Unary { op, .. } => match op {

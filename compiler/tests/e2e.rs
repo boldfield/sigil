@@ -298,29 +298,25 @@ fn stackmap_section_parses_v0_placeholder() {
         panic!("stackmap parse failed: {e:?}");
     });
     assert_eq!(parsed.version, STACKMAP_VERSION_PLACEHOLDER);
-    // Plan B Task 57 — hello.sigil's compile produces 14 placeholder
-    // stackmap records after Slice 2's ArithError refactor:
-    //   - 11 in the `main` C shim (two handler frames pushed/popped
-    //     per `[DEVIATION Task 57] Top-level handler installation in
-    //     main shim`):
-    //       sigil_gc_init,
-    //       arith: handler_frame_new + 2× set_arm (div_by_zero,
-    //              mod_by_zero) + handle_push,
-    //       io:    handler_frame_new + set_arm (println) +
-    //              handle_push,
-    //       sigil_user_main,
-    //       2× handle_pop (IO then ArithError, reverse-order).
-    //   - 3 in the user `main` body emitting `perform IO.println(
-    //     "hello, world")`:
-    //       sigil_string_new (the literal), sigil_perform (the
-    //       perform), sigil_run_loop (the trampoline driver in
-    //       lower_perform_to_value).
-    //
-    // Slice 1 was 9 (single IO frame). Slice 2 adds 5 net sites
-    // (ArithError frame_new + 2 set_arm + push + pop). Pre-Task-57
-    // was 4 (synchronous IO shortcut + sigil_panic_arith_error never
-    // emitted in hello.sigil).
-    assert_eq!(parsed.records.len(), 14, "expected 14 placeholder records");
+    // Plan B Task 57 closeout-review observation — assert "≥1
+    // record" rather than an exact count. The exact count is
+    // mechanically derivable but brittle: every shim-touching
+    // change (Phase A2 → Slice 1 → Slice 2 was 4 → 9 → 14) requires
+    // updating it. The load-bearing invariant this test pins is
+    // **(a) the magic + version parse correctly, (b) every record
+    // is a v0 placeholder (live_count = 0, flag set)** — those are
+    // the per-record invariants the loop below verifies. The
+    // record count is currently a "non-zero records exist" sanity
+    // check; lifting it to `≥ 1` decouples this test from shim
+    // call-site drift. A future task that introduces a
+    // counter-aware test (e.g., asserting `HandlerWalkCount`
+    // increments per println) is the right home for cardinality
+    // assertions.
+    assert!(
+        !parsed.records.is_empty(),
+        "expected at least one placeholder record (got 0); shim must emit \
+         stackmap records for its FFI calls"
+    );
     for r in &parsed.records {
         assert_eq!(r.live_count, 0, "v0 invariant: live_count always 0");
         assert_eq!(
