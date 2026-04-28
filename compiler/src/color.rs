@@ -128,9 +128,16 @@ impl ColoredProgram {
 }
 
 /// The only effect treated as "pure" for native classification in
-/// Plan B v1. Plan B Stage 6 keeps this as a special case for the
-/// top-level IO handler shim. Anything else in the row makes the
-/// monomorph CPS.
+/// Plan B v1. Post-Task-57, IO is a normal registry-driven effect
+/// at typecheck and codegen — it routes through `sigil_perform`
+/// like every other effect — but the colorer keeps it special-cased
+/// here as a perf-preserving choice: the top-level IO handler is
+/// always installed by the `main` shim, and `lower_perform_to_value`
+/// wraps `sigil_perform` synchronously, so IO-only fns can stay
+/// Native-color without correctness loss. Lifting this constant
+/// would force every fn doing `perform IO.println(...)` into the
+/// CPS-ABI with trampoline overhead per println call. Anything else
+/// in the row makes the monomorph CPS.
 const NATIVE_EFFECT: &str = "IO";
 
 /// Local (pre-propagation) classification of a single fn.

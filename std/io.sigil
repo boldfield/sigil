@@ -1,10 +1,18 @@
 // sigil: 0.1
 //
-// Standard IO effect. For Stage 1 the compiler recognises IO.println as a
-// runtime intrinsic and lowers it to a direct `sigil_println` call. Plan B
-// Stage 6 must generalise this path: remove the intrinsic special-case in
-// compiler/src/codegen.rs, implement general effect-handler dispatch, and
-// route `perform IO.println` through a proper handler frame.
+// Standard IO effect. Documentation only — this file is **not**
+// loaded by typecheck. Per `[DEVIATION Task 57] Builtin-effect
+// injection (vs. full stdlib loading)` in PLAN_B_DEVIATIONS.md, the
+// `effect IO { ... }` declaration is constructed in code by
+// `compiler/src/typecheck.rs::builtin_effects()` and injected into
+// `tc.effects` at typecheck pre-pass start. `Item::Import(_)` is a
+// no-op everywhere in the pipeline today, so a user `import std.io`
+// statement parses fine but does not feed this file's contents to
+// the typechecker. A future stdlib-loading task may swap the
+// synthetic injection for a real import-resolution pipeline; until
+// then, edits to this file have no effect on compilation. The
+// builtin-injection path is the source of truth for the IO
+// effect's shape.
 
 effect IO {
   println: (String) -> Unit,

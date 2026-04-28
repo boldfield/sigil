@@ -632,6 +632,79 @@ pub unsafe extern "C" fn sigil_continuation_identity(
 }
 
 // ---------------------------------------------------------------------
+// Builtin top-level handler arm fns (Plan B Task 57)
+// ---------------------------------------------------------------------
+
+/// Plan B Task 57 — runtime-side default handler for `IO.println`.
+///
+/// Conforms to the Phase 4 CPS arm fn ABI:
+/// `extern "C" fn(closure_ptr, in_args, args_len) -> *mut NextStep`
+/// with the trailing-pair convention `in_args = [user_arg_0,
+/// k_closure, k_fn]`. For `IO.println` the user arg is a heap-string
+/// pointer (the same header-pointer form `sigil_string_new` produces);
+/// the trailing pair carries the caller's continuation.
+///
+/// Behavior: read the heap-string pointer from `in_args[0]`, write
+/// it to stdout via [`crate::io::sigil_println`], then build a
+/// `NextStep::Call` to the trailing-pair continuation `(k_closure,
+/// k_fn)` with the unit value (`i64 0`) as its single arg. The
+/// trampoline dispatches to `k`, which (under default IO usage from
+/// `lower_perform_to_value`) is `sigil_continuation_identity` —
+/// `Done(unit)`. The `sigil_run_loop` invocation in the caller's
+/// `lower_perform_to_value` then narrows the `u64` back to Unit
+/// (`i8 0`) at the source-level `perform IO.println(s)` site.
+///
+/// The `main` shim installed at codegen-time pushes a top-level IO
+/// handler frame whose op_id 0 (`println`) is set to this fn; user
+/// programs that wrap IO with their own `handle ... with { IO.println
+/// ... }` install a deeper frame that `sigil_perform`'s walk reaches
+/// first. The default top-level frame is the safety net for programs
+/// that never install their own IO handler.
+///
+/// # Safety
+///
+/// `in_args` must point to at least three readable u64 (`args_len ==
+/// 3`). `in_args[0]` must be a non-null heap-string pointer
+/// (returned by `sigil_string_new`); `in_args[1..3]` is the
+/// trailing-pair continuation. The trampoline guarantees these
+/// invariants when dispatching from a `NextStep::Call` produced by
+/// codegen's perform lowering applied to `IO.println(s)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_io_println_arm(
+    _closure_ptr: *const u8,
+    in_args: *const u64,
+    args_len: u32,
+) -> *mut NextStep {
+    debug_assert!(
+        args_len == 3,
+        "sigil_io_println_arm: args_len must be exactly 3 (in_args = \
+         [heap_string_ptr, k_closure, k_fn]); got {args_len}"
+    );
+    debug_assert!(
+        !in_args.is_null(),
+        "sigil_io_println_arm: in_args must be non-null when args_len == 3"
+    );
+    // SAFETY: caller (sigil_perform via the dispatched NextStep::Call)
+    // guarantees in_args points to 3 readable u64. Slot 0 is the
+    // heap-string pointer the user passed to `IO.println`; slots 1..3
+    // are the trailing-pair continuation.
+    let heap_ptr = *in_args as *const u8;
+    let k_closure = *in_args.add(1) as *mut u8;
+    let k_fn = *in_args.add(2) as *mut u8;
+    crate::io::sigil_println(heap_ptr);
+    // Build the outbound NextStep::Call dispatching to the trailing-
+    // pair k. arg_count=1: the unit value (`i64 0`) representing
+    // IO.println's declared Unit return type.
+    let ns = sigil_next_step_call(k_closure, k_fn, 1);
+    // SAFETY: sigil_next_step_call returns a non-null *mut NextStep
+    // with arg_count slots; sigil_next_step_args_ptr returns a pointer
+    // to slot 0.
+    let out_args = sigil_next_step_args_ptr(ns);
+    *out_args = 0; // unit value
+    ns
+}
+
+// ---------------------------------------------------------------------
 // `sigil_perform` and `sigil_run_loop`
 // ---------------------------------------------------------------------
 

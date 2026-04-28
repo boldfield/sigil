@@ -121,7 +121,7 @@ struct UserFnEntry {
 /// every user fn has used since Plan A2 task 32:
 /// `(closure_ptr, user_arg1, ..., user_argN) -> ret_ty`. The fn
 /// body is lowered through the standard [`Lowerer`] path, with
-/// `lower_perform_non_io_to_value` driving `sigil_run_loop`
+/// `lower_perform_to_value` driving `sigil_run_loop`
 /// synchronously at non-IO perform sites (the Phase 4d MVP shape).
 /// All `Color::Native` fns and any `Color::Cps` fn whose body
 /// shape isn't supported by the CPS body lowering yet get this
@@ -1397,7 +1397,7 @@ struct HandlerArmSynth {
     /// Bool and the arm body's `false` lowers to I8, not I64). The
     /// pre-stored field stays here as documentation of the op's
     /// declared return type for future passes that need it (e.g.,
-    /// `lower_perform_non_io_to_value`'s narrow-back uses the same
+    /// `lower_perform_to_value`'s narrow-back uses the same
     /// derivation directly off `EffectOp.return_type`); marked
     /// `#[allow(dead_code)]` because the body emit no longer reads
     /// it.
@@ -2647,7 +2647,7 @@ fn collect_handle_arms_in_expr(
             // placeholder (`I64` widened) and let the synth-fn body
             // emit pass narrow on read using the post-lowered body's
             // actual Cranelift type (mirroring how
-            // `lower_perform_non_io_to_value` narrows the run_loop
+            // `lower_perform_to_value` narrows the run_loop
             // result). Concretely: synth fn unpacks `v` from
             // `args_ptr[0]` as I64 and the surrounding fn passes
             // body_val widened to I64; the synth fn body then can
@@ -2744,7 +2744,7 @@ fn collect_handle_arms_in_expr(
                 // result to I64 before the trailing-pair Call) —
                 // narrow-back happens at the surrounding fn after
                 // run_loop returns, mirroring
-                // `lower_perform_non_io_to_value`'s post-run_loop
+                // `lower_perform_to_value`'s post-run_loop
                 // narrow.
                 //
                 // For type-aware narrow-back at the surrounding fn
@@ -3788,15 +3788,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
          generic params\""
     );
 
-    // Plan B Task 55 (Phase 2 minimum) — `handle <body> with { arms
-    // }` is supported only when the body contains no non-IO `perform`
-    // (the handle-frame setup, push/pop, and arm-fn synthesis path
-    // ships in Phase 3+ once the CPS calling convention lands). Any
-    // handle expression with a non-IO `perform` in its body would
-    // need the unimplemented runtime dispatch and is rejected here
-    // with a clean compile-time error. IO `perform` in handle bodies
-    // is fine — `IO` is special-cased in `lower_perform` and doesn't
-    // route through `sigil_perform`.
+    // Plan B Task 55 (Phases 2–4g, closed) — the codegen-entry guard
+    // `unsupported_handle_construct` rejects `handle` shapes that
+    // exceed the currently-implemented CPS arm-fn synthesis surface
+    // (e.g. nested `Lambda` / `ClosureRecord` in arm bodies). The
+    // remaining restrictions are documented at the call sites of the
+    // walker. Post-Task-57 IO is no longer special: every effect
+    // (including builtin `IO`) routes through `sigil_perform`, so
+    // the walker treats IO performs uniformly with non-IO performs.
     if let Some(msg) = unsupported_handle_construct(&checked.program) {
         return Err(msg);
     }
@@ -4084,6 +4083,22 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             &continuation_identity_sig,
         )
         .map_err(|e| format!("declare sigil_continuation_identity: {e}"))?;
+
+    // Plan B Task 57 — sigil_io_println_arm, the runtime-side default
+    // handler for `IO.println` installed at the top-level `main` shim.
+    // Same CPS arm fn ABI as `sigil_continuation_identity`. Reads the
+    // heap-string pointer from `in_args[0]`, calls `sigil_println`,
+    // then dispatches to the trailing-pair k. See `[DEVIATION Task 57]
+    // Top-level handler installation in main shim` in
+    // PLAN_B_DEVIATIONS.md.
+    let mut io_println_arm_sig = Signature::new(isa_call_conv(&module));
+    io_println_arm_sig.params.push(AbiParam::new(pointer_ty)); // closure_ptr
+    io_println_arm_sig.params.push(AbiParam::new(pointer_ty)); // in_args
+    io_println_arm_sig.params.push(AbiParam::new(types::I32)); // args_len
+    io_println_arm_sig.returns.push(AbiParam::new(pointer_ty));
+    let io_println_arm = module
+        .declare_function("sigil_io_println_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_io_println_arm: {e}"))?;
 
     // C-callable main: int main(int argc, char **argv). Stage 1 ignores argv.
     let mut main_sig = Signature::new(isa_call_conv(&module));
@@ -4460,7 +4475,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // isn't appropriate because Lowerer.lower_block returns
             // an `Option<Value>` (tail value) rather than a NextStep
             // pointer; routing the tail perform through that path
-            // would invoke `lower_perform_non_io_to_value` which
+            // would invoke `lower_perform_to_value` which
             // synchronously drives `sigil_run_loop` — exactly the
             // shape the CPS-ABI path replaces. We use Lowerer for
             // the perform's pure args (so Idents / arithmetic /
@@ -4785,7 +4800,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // avoids re-implementing the same logic just for
                 // the CPS body emission.
                 //
-                // The Lowerer's `lower_perform_non_io_to_value` is
+                // The Lowerer's `lower_perform_to_value` is
                 // NOT invoked from here — we lower only the perform
                 // args, then build the sigil_perform call site
                 // manually. This is what makes the CPS body emit
@@ -4836,7 +4851,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 // Phase 5 — lower perform args via Lowerer; pack
                 // into a stack slot. Mirrors the Phase 4b machinery
-                // from `lower_perform_non_io_to_value`. Empty-args
+                // from `lower_perform_to_value`. Empty-args
                 // case keeps the null `args_ptr` + `args_len = 0`
                 // shape (per `sigil_perform`'s safety contract).
                 let (perform_args_ptr, perform_args_len) = if body_perform.args.is_empty() {
@@ -5008,6 +5023,32 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     }
 
     // --- main shim -------------------------------------------------------
+    //
+    // Plan B Task 57 — the shim now installs the top-level IO handler
+    // frame between `sigil_gc_init` and `call sigil_user_main`, and
+    // pops it before reducing the return. The IO frame's single arm
+    // (op_id 0 = `println`) is set to the runtime-side default
+    // `sigil_io_println_arm` which calls `sigil_println` and tail-
+    // calls back through the trailing-pair k. Effect_id 1 is the
+    // reserved-low-id assignment for `IO` (Task 57's reserved-low-id
+    // convention pinned in `[DEVIATION Task 57] Builtin-effect
+    // injection`); user effects start at id 2 so this constant is
+    // stable per program.
+    //
+    // Slice 2 (ArithError refactor) will add a second handler frame
+    // (effect_id 0 = `ArithError`, 2 arms) **before** the IO frame in
+    // the install order so the IO frame is on top (last-pushed); the
+    // discipline check below currently has only one pop to verify
+    // and grows to two pops in Slice 2.
+    //
+    // The shim discipline check (debug-only) snapshots the IO frame
+    // pointer at push and compares against `sigil_handle_pop()`'s
+    // return at shim exit. Phase 4f added the same check shape at
+    // every `Expr::Handle` exit; the shim's bespoke push/pop path
+    // gets the same discipline for codebase symmetry. Mismatch
+    // implies push/pop count drift in the shim's emit or runtime
+    // corruption of the handler-stack head Cell — both warrant
+    // hard fail.
     ctx.func.signature = main_sig.clone();
     ctx.func.name = UserFuncName::user(0, main.as_u32());
     {
@@ -5019,14 +5060,65 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
         let gc_init_ref = module.declare_func_in_func(gc_init, builder.func);
         let user_main_ref = module.declare_func_in_func(user_main, builder.func);
+        let frame_new_ref = module.declare_func_in_func(handler_frame_new, builder.func);
+        let frame_set_arm_ref = module.declare_func_in_func(handler_frame_set_arm, builder.func);
+        let handle_push_ref = module.declare_func_in_func(handle_push, builder.func);
+        let handle_pop_ref = module.declare_func_in_func(handle_pop, builder.func);
+        let io_println_arm_ref = module.declare_func_in_func(io_println_arm, builder.func);
+
         let init_call = builder.ins().call(gc_init_ref, &[]);
         stackmap.push_placeholder(function_code_offset(&builder, init_call));
+
+        // Top-level IO handler frame: effect_id=1 (reserved low id),
+        // arm_count=1 (single op `println`).
+        let io_effect_id_v = builder.ins().iconst(types::I32, 1);
+        let io_arm_count_v = builder.ins().iconst(types::I32, 1);
+        let frame_new_call = builder
+            .ins()
+            .call(frame_new_ref, &[io_effect_id_v, io_arm_count_v]);
+        stackmap.push_placeholder(function_code_offset(&builder, frame_new_call));
+        let io_frame_ptr = builder.inst_results(frame_new_call)[0];
+
+        // Set arm op_id 0 (`println`) to `sigil_io_println_arm`.
+        // closure_ptr=null (the runtime arm fn is closure-less).
+        let io_op_id_v = builder.ins().iconst(types::I32, 0);
+        let io_arm_fn_ptr = builder.ins().func_addr(pointer_ty, io_println_arm_ref);
+        let io_null_closure = builder.ins().iconst(pointer_ty, 0);
+        let set_arm_call = builder.ins().call(
+            frame_set_arm_ref,
+            &[io_frame_ptr, io_op_id_v, io_arm_fn_ptr, io_null_closure],
+        );
+        stackmap.push_placeholder(function_code_offset(&builder, set_arm_call));
+
+        // Push the IO frame.
+        let push_call = builder.ins().call(handle_push_ref, &[io_frame_ptr]);
+        stackmap.push_placeholder(function_code_offset(&builder, push_call));
+
         // user-main takes the closure-calling-convention closure_ptr as
         // arg 0. The shim is not a closure entry point, so it passes a
         // null pointer; main's body never reads it.
         let null_closure = builder.ins().iconst(pointer_ty, 0);
         let um_call = builder.ins().call(user_main_ref, &[null_closure]);
         stackmap.push_placeholder(function_code_offset(&builder, um_call));
+
+        // Pop the IO frame and (in debug builds) verify the popped
+        // pointer matches the snapshot taken at push time.
+        let pop_call = builder.ins().call(handle_pop_ref, &[]);
+        stackmap.push_placeholder(function_code_offset(&builder, pop_call));
+        if cfg!(debug_assertions) {
+            let popped = builder.inst_results(pop_call)[0];
+            let mismatch = builder.ins().icmp(IntCC::NotEqual, popped, io_frame_ptr);
+            let ok = builder.create_block();
+            let bad = builder.create_block();
+            builder.ins().brif(mismatch, bad, &[], ok, &[]);
+            builder.switch_to_block(bad);
+            builder.seal_block(bad);
+            builder
+                .ins()
+                .trap(TrapCode::unwrap_user(TRAP_HANDLE_DISCIPLINE_VIOLATION));
+            builder.switch_to_block(ok);
+            builder.seal_block(ok);
+        }
 
         // user-main returns a tagged Int; untag to i32 via arithmetic
         // right-shift and narrow. Overflow beyond i32 is not observable in
@@ -5063,7 +5155,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     //
     // The body's lowered Cranelift `Value` is widened to I64 via
     // `uextend` if narrower (matching `sigil_next_step_done`'s I64
-    // signature) before the wrap call; `lower_perform_non_io_to_value`
+    // signature) before the wrap call; `lower_perform_to_value`
     // mirror-narrows on the perform side so the perform's
     // `type_of_expr` (the op's declared return type) and the actual
     // lowered Cranelift `Value` agree.
@@ -5128,7 +5220,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // the env. Each slot is a u64; narrower declared
                 // types (I8 Bool/Byte/Unit, I32 Char) get `ireduce`'d
                 // back, mirroring the `uextend` widening in
-                // `lower_perform_non_io_to_value`.
+                // `lower_perform_to_value`.
                 let mut env: BTreeMap<String, Value> = BTreeMap::new();
                 for (i, (name, declared_ty)) in synth
                     .arg_names
@@ -5156,7 +5248,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // port that smuggles a non-pointer-width
                         // value through this path panics in *both*
                         // dev and release builds — symmetric with
-                        // `lower_perform_non_io_to_value`'s
+                        // `lower_perform_to_value`'s
                         // perform-side widening fallthrough at
                         // codegen.rs:2542 per the deviation entry's
                         // "mirror" hardening discipline.
@@ -7040,6 +7132,18 @@ struct Lowerer<'a, 'b> {
     mod_zero_gv: GlobalValue,
 
     string_new_ref: FuncRef,
+    /// Plan B Task 57 — `sigil_println` is no longer called directly
+    /// by user code; `perform IO.println(s)` routes through
+    /// `sigil_perform` → `sigil_io_println_arm` (runtime-side default
+    /// arm fn). The per-fn FuncRef is still declared by
+    /// `prepare_per_fn_refs` — over-declaration is structural-only
+    /// per `PerFnRefs`'s existing comment — but no `Lowerer` method
+    /// consumes it. A future cleanup chore can drop the FuncRef +
+    /// the FuncId + the FFI declaration entirely; for now
+    /// `#[allow(dead_code)]` preserves the field-init shorthand at
+    /// the 16 Lowerer construction sites without a wider rename
+    /// diff.
+    #[allow(dead_code)]
     println_ref: FuncRef,
     panic_arith_ref: FuncRef,
     alloc_ref: FuncRef,
@@ -7074,7 +7178,7 @@ struct Lowerer<'a, 'b> {
     /// frame**.
     handler_frame_set_return_ref: FuncRef,
     /// Plan B Task 55 (Phase 3b) — `sigil_perform` runtime ref.
-    /// `lower_perform_non_io_to_value` calls this for non-IO
+    /// `lower_perform_to_value` calls this for non-IO
     /// effects; the result is a `*mut NextStep` of tag `CALL`
     /// pointing at the matching arm fn. The Call NextStep is then
     /// passed to `sigil_run_loop` (`run_loop_ref`) which dispatches
@@ -7082,7 +7186,7 @@ struct Lowerer<'a, 'b> {
     /// final `Done` value as u64.
     perform_ref: FuncRef,
     /// Plan B Task 55 (Phase 3b) — `sigil_run_loop` runtime ref.
-    /// Called by `lower_perform_non_io_to_value` to drive the CPS
+    /// Called by `lower_perform_to_value` to drive the CPS
     /// trampoline from the `NextStep::Call` returned by
     /// `sigil_perform`. Returns the final `NextStep::Done`'s value
     /// as u64; native code uses this directly.
@@ -7131,7 +7235,7 @@ struct Lowerer<'a, 'b> {
     /// `handler_return_arm_refs_per_handle`. Absent ⇒ no return arm.
     handler_return_arm_indices: &'b BTreeMap<Span, usize>,
     /// Plan B Task 55 (Phase 4d) — `sigil_continuation_identity`
-    /// runtime intrinsic. `lower_perform_non_io_to_value` emits
+    /// runtime intrinsic. `lower_perform_to_value` emits
     /// `func_addr(continuation_identity_ref)` as the `k_fn_ptr` arg
     /// to every non-IO `sigil_perform` call site so a tail-`k(arg)`
     /// arm body's `sigil_next_step_call` dispatches into the
@@ -7231,43 +7335,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let _ = self.lower_expr(e);
             }
             Stmt::Perform(p) => {
-                // IO performs go through the side-effect-only path
-                // (`lower_perform` returns no value); non-IO performs
-                // route through `sigil_perform` and discard the
-                // returned value, mirroring the dispatch in
-                // `Expr::Perform`. Without this dispatch, statement-
-                // form non-IO performs (`perform Raise.fail();`) hit
-                // the IO assertion in `lower_perform` and crash the
-                // compiler.
-                if p.effect == "IO" {
-                    self.lower_perform(p);
-                } else {
-                    let _ = self.lower_perform_non_io_to_value(p);
-                }
+                // Plan B Task 57 — every effect (including the builtin
+                // `IO`) routes through `sigil_perform` via the unified
+                // `lower_perform_to_value` helper. The IO synchronous
+                // shortcut that used to live in a now-deleted
+                // `lower_perform` helper is gone; statement-form
+                // performs lower the same as expression-form performs
+                // and discard the returned value.
+                let _ = self.lower_perform_to_value(p);
             }
         }
-    }
-
-    fn lower_perform(&mut self, p: &crate::ast::PerformExpr) {
-        // Plan A2 only recognises `IO.println(String)`; typecheck
-        // (E0042/E0043/E0044) rejects every other shape before codegen
-        // sees the program, so we assume the happy path. Non-IO
-        // performs are handled inline in `Expr::Perform`'s lowering
-        // because they return a value (extracted from the NextStep
-        // returned by `sigil_perform`); this `lower_perform` helper
-        // remains the IO-only side-effect path.
-        assert_eq!(
-            p.effect, "IO",
-            "non-IO effect reached lower_perform; \
-                                    `Expr::Perform` should dispatch non-IO inline"
-        );
-        assert_eq!(p.op, "println", "non-println IO op reached codegen");
-        assert_eq!(p.args.len(), 1, "IO.println arg count is not 1");
-
-        let heap = self.lower_expr(&p.args[0]);
-        let call = self.builder.ins().call(self.println_ref, &[heap]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, call));
     }
 
     /// Plan B Task 55 (Phase 4b) — lower a non-IO `perform Effect.op(args...)`
@@ -7288,7 +7365,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// returns the value as u64. Native code uses the u64 directly
     /// (cast to i64 via the type system; for Int returns this is the
     /// raw untagged Int per the Plan B Int ABI).
-    fn lower_perform_non_io_to_value(&mut self, p: &crate::ast::PerformExpr) -> Value {
+    fn lower_perform_to_value(&mut self, p: &crate::ast::PerformExpr) -> Value {
         // Bound check (defense-in-depth — runtime's `sigil_perform`
         // is the source of truth and aborts with a named effect_id /
         // op_id message on `args_len + 2 > MAX_INLINE_ARGS`). The
@@ -7357,7 +7434,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             //
             // PHASE-4-RESTRICTION (Plan B Task 55, Phase 4d):
             // stack-slot allocation here is sound *only* under the
-            // synchronous `lower_perform_non_io_to_value` →
+            // synchronous `lower_perform_to_value` →
             // `sigil_perform` → `sigil_run_loop` chain that returns
             // before this fn does (the runtime copies args into the
             // dispatched `NextStep::Call`'s arena slots before
@@ -7582,22 +7659,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 unreachable!("codegen: Expr::If should have been desugared by elaborate")
             }
             Expr::Perform(p) => {
-                if p.effect == "IO" {
-                    self.lower_perform(p);
-                    // IO.println returns Unit — represented as `i8 0`.
-                    self.builder.ins().iconst(types::I8, 0)
-                } else {
-                    // Plan B Task 55 (Phase 3b) — non-IO perform
-                    // routes through `sigil_perform`. `sigil_perform`
-                    // builds a `NextStep::Call` to the matching arm;
-                    // `lower_perform_non_io_to_value` then hands that
-                    // off to `sigil_run_loop`, which dispatches the
-                    // call (and any further calls the arm returns)
-                    // until a terminal `Done(value)` and returns the
-                    // value as u64. Codegen never reads the
-                    // `NextStep` layout directly.
-                    self.lower_perform_non_io_to_value(p)
-                }
+                // Plan B Task 55 (Phase 3b) + Task 57 — every perform
+                // (including builtin `IO`) routes through `sigil_-
+                // perform`. `sigil_perform` builds a `NextStep::Call`
+                // to the matching arm; `lower_perform_to_value` hands
+                // that off to `sigil_run_loop`, which dispatches the
+                // call (and any further calls the arm returns) until
+                // a terminal `Done(value)` and returns the value as
+                // u64. Codegen never reads the `NextStep` layout
+                // directly. For IO.println the returned u64 narrows
+                // back to Unit (i8 0) via the registry-driven
+                // narrow-back in `lower_perform_to_value`, so callers
+                // observe the same Unit value the old synchronous
+                // IO shortcut produced.
+                self.lower_perform_to_value(p)
             }
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::Lambda { .. } => {
@@ -7985,7 +8060,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     });
 
                     // Widen body_val to I64 for the trailing-pair
-                    // arg slot — mirrors `lower_perform_non_io_to_value`'s
+                    // arg slot — mirrors `lower_perform_to_value`'s
                     // perform-side widening at codegen.rs:6504-6543.
                     let body_ty = self.builder.func.dfg.value_type(body_val);
                     let body_val_widened = if body_ty == types::I64 {
@@ -8110,7 +8185,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // preserved through the capture rewrite); the
                     // synth return fn widens its body's value to I64
                     // before the trailing-pair Call, mirroring
-                    // `lower_perform_non_io_to_value`'s narrow-back
+                    // `lower_perform_to_value`'s narrow-back
                     // discipline. Build a preview map binding `v`
                     // to body_ty so any `Expr::Ident("v")` in the
                     // return arm body resolves correctly.
@@ -8203,7 +8278,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         // bytes. User args fill offsets `0..N*8`,
                         // each widened to u64 via `uextend` for
                         // narrower-than-I64 ints (mirrors Phase 4b
-                        // `lower_perform_non_io_to_value`). The
+                        // `lower_perform_to_value`). The
                         // trailing pair `(null_k_closure,
                         // identity_k_fn)` lives at
                         // `k_closure_offset(N)` and `k_fn_offset(N)`
@@ -8273,7 +8348,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         // `args_len` per `cps_signature` convention
                         // is the user-arg count, NOT the trailing-
                         // pair slot count. Matches the perform-site
-                        // precedent (`lower_perform_non_io_to_value`)
+                        // precedent (`lower_perform_to_value`)
                         // and the runtime's `args_ptr=null ⟹
                         // args_len=0` contract.
                         let args_len = self.builder.ins().iconst(types::I32, user_arg_count as i64);
@@ -8298,7 +8373,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         // Narrow `raw_u64` back to the callee's
                         // declared return type. Mirrors the
                         // narrow-on-perform-side discipline from
-                        // `lower_perform_non_io_to_value`.
+                        // `lower_perform_to_value`.
                         let ret_ty = callee_entry.ret_ty;
                         if ret_ty == types::I64 {
                             raw_u64
@@ -9187,13 +9262,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::IntLit(..) => types::I64,
             Expr::BoolLit(..) => types::I8,
             Expr::Perform(p) => {
-                // IO.println returns Unit (i8 0); non-IO performs
-                // return the op's declared return type, which we
-                // look up in the effect registry. Phase 3b only
-                // supports Int returns; Phase 4+ extends.
-                if p.effect == "IO" {
-                    types::I8
-                } else if let Some(eff) = self.effects.get(&p.effect) {
+                // Plan B Task 55 (Phase 3b) + Task 57 — every effect
+                // (including the builtin `IO`) consults the registry
+                // for its op's declared return type. IO.println's
+                // entry returns `Unit` (i8); ArithError.div_by_zero
+                // / mod_by_zero return `Int` (i64); other ops match
+                // their declared return type via `cranelift_ty_for_-
+                // type_expr`.
+                if let Some(eff) = self.effects.get(&p.effect) {
                     if let Some(op) = eff.ops.iter().find(|o| o.name == p.op) {
                         cranelift_ty_for_type_expr(&op.return_type, self.pointer_ty)
                     } else {
@@ -9425,7 +9501,7 @@ fn cps_signature(pointer_ty: Type, module: &ObjectModule) -> Signature {
 /// see [`k_closure_offset`] and [`k_fn_offset`].
 ///
 /// This matches the perform-site convention from Phase 4b
-/// (`lower_perform_non_io_to_value`): `args_len` counts user args,
+/// (`lower_perform_to_value`): `args_len` counts user args,
 /// not slot count. The runtime contract on `sigil_perform`
 /// `args_ptr=null ⟹ args_len=0` falls out naturally.
 ///
@@ -9775,6 +9851,18 @@ fn is_simple_tail_perform_with_pure_args_body(body: &crate::ast::Block) -> bool 
     }
     match &body.tail {
         Some(crate::ast::Expr::Perform(p)) => {
+            // Plan B Task 57 — IO performs are excluded from the
+            // CPS-color classifier as a perf-preserving choice. Post-
+            // Task-57 every effect routes through `sigil_perform`,
+            // but `lower_perform_to_value` wraps `sigil_perform` +
+            // `sigil_run_loop` synchronously for Native-color
+            // callers — so IO-only fns can stay Native-color
+            // without correctness loss (the top-level IO handler
+            // installed at the `main` shim is always on the stack
+            // when user code runs). Lifting this filter would
+            // promote IO-only fns into the CPS-ABI, which adds
+            // trampoline overhead on every println for no semantic
+            // benefit. The filter stays.
             if p.effect == "IO" {
                 return false;
             }
@@ -9942,6 +10030,15 @@ fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
     if body.stmts.len() != 1 {
         return false;
     }
+    // Plan B Task 57 — IO performs are excluded from this CPS-color
+    // classifier (same rationale as `is_simple_tail_perform_with_-
+    // pure_args_body`'s IO filter): IO-only fns stay Native-color
+    // post-Task-57 because the top-level IO handler at the `main`
+    // shim is always installed and `lower_perform_to_value`'s
+    // synchronous wrapping preserves the perf characteristics of the
+    // pre-refactor IO shortcut. The filter is perf-preserving, not
+    // correctness-bearing; lifting it would only add trampoline
+    // overhead on synchronous-Unit IO performs.
     let yield_perform = match &body.stmts[0] {
         Stmt::Perform(p) if p.effect != "IO" => p,
         _ => return false,
@@ -10029,6 +10126,11 @@ fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
         Stmt::Let(l) => l,
         _ => return false,
     };
+    // Plan B Task 57 — IO performs excluded for the same perf-
+    // preserving reason documented at `is_simple_tail_perform_with_-
+    // pure_args_body`: IO-only fns stay Native-color, the top-level
+    // IO handler at the shim handles the println synchronously via
+    // `lower_perform_to_value`'s wrapping, no trampoline overhead.
     let yield_perform = match &let_stmt.value {
         Expr::Perform(p) if p.effect != "IO" => p,
         _ => return false,

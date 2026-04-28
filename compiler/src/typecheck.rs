@@ -422,6 +422,78 @@ pub struct CtorInfo {
     pub variant_index: usize,
 }
 
+/// Plan B Task 57 — names of effects synthesized into `tc.effects`
+/// at typecheck pre-pass start. Order is load-bearing: `effect_id`
+/// assignment phase 1 walks this slice in order, giving `ArithError
+/// = 0` and `IO = 1`. User effects start at id 2 in alphabetical
+/// order (phase 2). The `main` shim hardcodes the resulting effect_
+/// ids when emitting the top-level handler frames; the reserved-low-
+/// id convention is what keeps those constants stable per program.
+pub const BUILTIN_EFFECT_NAMES: &[&str] = &["ArithError", "IO"];
+
+/// Plan B Task 57 — construct synthetic `EffectDecl`s for the
+/// builtin effects (`IO`, `ArithError`). Returned in the order
+/// fixed by `BUILTIN_EFFECT_NAMES` so callers iterating the result
+/// see ArithError before IO. ArithError carries two ops:
+/// `div_by_zero` (op_id 0) and `mod_by_zero` (op_id 1) — preserves
+/// Plan A2's distinct stderr messages for `/` vs. `%` div-by-zero;
+/// per `[DEVIATION Task 57] ArithError op return type` both ops
+/// have return type `Int` (v1 simplification; v2 path to `Never` is
+/// documented).
+fn builtin_effects() -> Vec<EffectDecl> {
+    let span = Span::synthetic("<builtin>");
+    let mut out = Vec::with_capacity(BUILTIN_EFFECT_NAMES.len());
+    out.push(EffectDecl {
+        name: "ArithError".to_string(),
+        name_span: span.clone(),
+        generic_params: Vec::new(),
+        resumes_many: false,
+        ops: vec![
+            EffectOp {
+                name: "div_by_zero".to_string(),
+                name_span: span.clone(),
+                params: Vec::new(),
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "mod_by_zero".to_string(),
+                name_span: span.clone(),
+                params: Vec::new(),
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                span: span.clone(),
+            },
+        ],
+        span: span.clone(),
+    });
+    out.push(EffectDecl {
+        name: "IO".to_string(),
+        name_span: span.clone(),
+        generic_params: Vec::new(),
+        resumes_many: false,
+        ops: vec![EffectOp {
+            name: "println".to_string(),
+            name_span: span.clone(),
+            params: vec![TypeExpr::Named("String".to_string(), span.clone())],
+            return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
+            span: span.clone(),
+        }],
+        span,
+    });
+    debug_assert_eq!(
+        out.len(),
+        BUILTIN_EFFECT_NAMES.len(),
+        "builtin_effects() count must match BUILTIN_EFFECT_NAMES",
+    );
+    debug_assert!(
+        out.iter()
+            .zip(BUILTIN_EFFECT_NAMES.iter())
+            .all(|(d, n)| d.name == *n),
+        "builtin_effects() order must match BUILTIN_EFFECT_NAMES",
+    );
+    out
+}
+
 pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // Pre-pass 1 (Plan A3 task 38): build the nominal-type symbol table.
     // Must precede the fn-env pre-pass so a `fn f(o: Option) -> ...`
@@ -522,6 +594,18 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // reads `effect_ids` / `op_ids` (assigned at the end of
     // `typecheck()`) for the runtime handler-stack ABI.
     let mut effects: BTreeMap<String, EffectDecl> = BTreeMap::new();
+    // Plan B Task 57 — synthetic builtin effects (`IO`, `ArithError`)
+    // are injected into `tc.effects` before walking user-declared
+    // effects. User redeclaration of a builtin name triggers the
+    // existing E0136 duplicate path because the builtin is already
+    // present in the BTreeMap. See `[DEVIATION Task 57] Builtin-effect
+    // injection (vs. full stdlib loading)` in `PLAN_B_DEVIATIONS.md`
+    // for why these are constructed in code rather than parsed from
+    // `std/*.sigil` (full stdlib loading is deferred to a later task
+    // per Plan B's "Do not implement Stage 7+ features" hard rule).
+    for builtin in builtin_effects() {
+        effects.insert(builtin.name.clone(), builtin);
+    }
     for item in &program.items {
         if let Item::Effect(ed) = item {
             if effects.contains_key(&ed.name) {
@@ -800,18 +884,38 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         resolved_ctors.insert(span, GenericInstantiation { name, type_args });
     }
 
-    // Plan B Task 55 — assign stable effect_id / op_id integers
-    // for the runtime handler-stack ABI. Effect IDs are assigned
-    // alphabetically over `tc.effects` keys (BTreeMap iteration is
-    // already sorted, so no extra sort needed); op IDs are assigned
-    // alphabetically within each effect over its declared `ops` Vec
-    // (sorted into a temporary because EffectDecl::ops preserves
-    // declaration order, not lex order). Same source program → same
-    // IDs across builds.
+    // Plan B Task 55 + Task 57 — assign stable effect_id / op_id
+    // integers for the runtime handler-stack ABI. **Effect IDs use
+    // a reserved-low-id convention** per `[DEVIATION Task 57]
+    // Builtin-effect injection`: phase 1 walks `BUILTIN_EFFECT_NAMES`
+    // in fixed order, assigning ids 0 (`ArithError`) and 1 (`IO`);
+    // phase 2 walks user effects in alphabetical order (BTreeMap
+    // iteration over `tc.effects.keys()`, skipping builtin names),
+    // starting at id `BUILTIN_EFFECT_NAMES.len()`. The `main` shim
+    // hardcodes effect_ids 0 and 1 when emitting top-level handler
+    // frames; this convention is what keeps those constants stable
+    // across user programs regardless of how many user effects are
+    // declared. Op IDs are assigned alphabetically within each
+    // effect over its declared `ops` Vec (sorted into a temporary
+    // because EffectDecl::ops preserves declaration order, not lex
+    // order). Same source program → same IDs across builds.
     let mut effect_ids: BTreeMap<String, u32> = BTreeMap::new();
     let mut op_ids: BTreeMap<(String, String), u32> = BTreeMap::new();
-    for (eff_idx, (eff_name, eff_decl)) in tc.effects.iter().enumerate() {
-        effect_ids.insert(eff_name.clone(), eff_idx as u32);
+    // Phase 1: builtins.
+    for (i, name) in BUILTIN_EFFECT_NAMES.iter().enumerate() {
+        effect_ids.insert((*name).to_string(), i as u32);
+    }
+    // Phase 2: user effects.
+    let mut next_user_id: u32 = BUILTIN_EFFECT_NAMES.len() as u32;
+    for eff_name in tc.effects.keys() {
+        if BUILTIN_EFFECT_NAMES.contains(&eff_name.as_str()) {
+            continue;
+        }
+        effect_ids.insert(eff_name.clone(), next_user_id);
+        next_user_id += 1;
+    }
+    // Op IDs: alphabetical per effect (unchanged across Task 55/57).
+    for (eff_name, eff_decl) in tc.effects.iter() {
         let mut op_names: Vec<&str> = eff_decl.ops.iter().map(|o| o.name.as_str()).collect();
         op_names.sort();
         // E0137 fires upstream for duplicate op names within an
@@ -2140,63 +2244,15 @@ impl Tc {
                 ),
             );
         }
-        // Stage 1 only understands IO.println(String); IO is still
-        // hard-wired here. Plan B Task 57 will refactor IO into a
-        // registry-driven effect alongside the other ones below.
-        if p.effect == "IO" && p.op == "println" {
-            if p.args.len() != 1 {
-                self.push_error(
-                    "E0043",
-                    p.span.clone(),
-                    format!(
-                        "`IO.println` takes exactly one String argument (got {})",
-                        p.args.len()
-                    ),
-                );
-                // Recovery returns `Some(Ty::Unit)` here — `IO.println`
-                // is hard-coded as `String -> Unit` and `Unit` is the
-                // op's actual declared return type, so the recovery
-                // shape matches what the registry path returns for a
-                // non-IO op (its `op_ret_ty.deref(...)`). When Task 57
-                // moves IO into the registry, both branches collapse
-                // into the same `op_ret_ty`-driven recovery.
-                return Some(Ty::Unit);
-            }
-            match self.check_expr(&p.args[0], row) {
-                Some(Ty::String) => {}
-                Some(other) => {
-                    self.push_error(
-                        "E0044",
-                        p.span.clone(),
-                        format!(
-                            "`IO.println` requires a `String` argument; got `{}`",
-                            ty_display(&other)
-                        ),
-                    );
-                }
-                None => {}
-            }
-            return Some(Ty::Unit);
-        }
-        if p.effect == "IO" {
-            // Plan A1 only recognises IO.println. Other IO ops arrive
-            // with Task 57's IO refactor; Stage 1 still rejects them.
-            // Walk the args so any nested type errors surface.
-            for a in &p.args {
-                let _ = self.check_expr(a, row);
-            }
-            self.push_error(
-                "E0042",
-                p.span.clone(),
-                format!("`IO.{}` is not a Plan A1 operation", p.op),
-            );
-            return Some(Ty::Unit);
-        }
-        // Plan B task 54 — non-IO effects dispatch through the
+        // Plan B task 54 + Task 57 — every effect (including the
+        // builtin `IO` and `ArithError`) dispatches through the
         // typechecker's effect registry built in the top-level
-        // pre-pass. The lookup needs to clone the operation out of
-        // the registry to avoid borrowing `self.effects` while the
-        // arg-typing recursion immutably borrows `self`.
+        // pre-pass. Task 57 dropped the Stage 1 IO hard-wire that
+        // used to live above this comment; IO.println is now an
+        // ordinary registry entry. The lookup needs to clone the
+        // operation out of the registry to avoid borrowing
+        // `self.effects` while the arg-typing recursion immutably
+        // borrows `self`.
         let eff_decl = match self.effects.get(&p.effect).cloned() {
             Some(d) => d,
             None => {
@@ -7166,19 +7222,72 @@ mod tests {
 
     #[test]
     fn effect_ids_assigned_alphabetically_per_program() {
-        // Plan B Task 55 — effect_ids are assigned in alphabetical
-        // order over the program's effects, regardless of declaration
-        // order. This pins the deterministic ABI guarantee codegen
-        // relies on.
+        // Plan B Task 55 + Task 57 — user effect_ids are assigned in
+        // alphabetical order, **starting at `BUILTIN_EFFECT_NAMES.len()`**
+        // (today: 2). The reserved low ids 0 (`ArithError`) and 1 (`IO`)
+        // belong to the builtin effects synthesized in `builtin_effects()`
+        // — see `[DEVIATION Task 57] Builtin-effect injection` for the
+        // reserved-low-id convention. Declaration order in source still
+        // doesn't matter for user effects; alphabetical sort over
+        // `tc.effects` keys (BTreeMap iteration) is the canonical order.
         let src = "effect Zeta { z: () -> Int }\n\
                    effect Alpha { a: () -> Int }\n\
                    effect Mu { m: () -> Int }\n\
                    fn main() -> Int ![] { 0 }\n";
         let (cp, errs) = pipeline_checked(src);
         assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
-        assert_eq!(cp.effect_ids.get("Alpha"), Some(&0));
-        assert_eq!(cp.effect_ids.get("Mu"), Some(&1));
-        assert_eq!(cp.effect_ids.get("Zeta"), Some(&2));
+        // Builtins occupy 0 and 1.
+        assert_eq!(cp.effect_ids.get("ArithError"), Some(&0));
+        assert_eq!(cp.effect_ids.get("IO"), Some(&1));
+        // User effects start at 2 in alphabetical order.
+        assert_eq!(cp.effect_ids.get("Alpha"), Some(&2));
+        assert_eq!(cp.effect_ids.get("Mu"), Some(&3));
+        assert_eq!(cp.effect_ids.get("Zeta"), Some(&4));
+    }
+
+    #[test]
+    fn builtin_effects_present_in_every_program() {
+        // Plan B Task 57 — even programs that declare no effects of
+        // their own carry the synthetic builtins `IO` (effect_id 1)
+        // and `ArithError` (effect_id 0) in `tc.effects`. The `main`
+        // shim hardcodes these effect_ids when emitting top-level
+        // handler frames; this test pins the convention.
+        let src = "fn main() -> Int ![] { 0 }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
+        assert_eq!(cp.effect_ids.get("ArithError"), Some(&0));
+        assert_eq!(cp.effect_ids.get("IO"), Some(&1));
+        // ArithError op_ids: div_by_zero (alphabetically first), mod_by_zero.
+        assert_eq!(
+            cp.op_ids
+                .get(&("ArithError".to_string(), "div_by_zero".to_string())),
+            Some(&0)
+        );
+        assert_eq!(
+            cp.op_ids
+                .get(&("ArithError".to_string(), "mod_by_zero".to_string())),
+            Some(&1)
+        );
+        // IO op_ids: println.
+        assert_eq!(
+            cp.op_ids.get(&("IO".to_string(), "println".to_string())),
+            Some(&0)
+        );
+    }
+
+    #[test]
+    fn user_redeclaring_io_triggers_e0136() {
+        // Plan B Task 57 — synthetic builtin `IO` is injected into
+        // `tc.effects` before user effects are walked, so a user
+        // declaring `effect IO { ... }` hits the existing E0136
+        // duplicate-effect path. Same for `ArithError`.
+        let src = "effect IO { println: (String) -> Unit }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0136"),
+            "expected E0136 for user redeclaring builtin IO; got: {errs:?}"
+        );
     }
 
     #[test]
