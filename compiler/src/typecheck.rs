@@ -410,6 +410,22 @@ pub struct CheckedProgram {
     /// captures (codegen resolves them through the user-fn / ctor /
     /// builtin tables).
     pub handle_return_arm_captures: BTreeMap<Span, Vec<(String, Ty)>>,
+    /// Plan B Stage 6 cleanup — per-`Expr::Handle` body type.
+    ///
+    /// The handle expression's body has a typecheck-determined `Ty`
+    /// that the codegen pre-pass for return-arm synth fns needs to
+    /// size the `v` binding correctly (Phase 4g shipped with
+    /// `binding_ty = I64` hardcoded; that's correct for I64 bodies
+    /// but produces verifier errors for narrow-type bodies — Bool,
+    /// Char — when the return arm body uses `v` at narrow type).
+    /// This side-table threads the body's `Ty` from typecheck to
+    /// the codegen pre-pass via the handle's `Span`.
+    ///
+    /// Resolves the `#[ignore]`'d e2e
+    /// `handle_with_bool_body_and_return_arm_uses_v_pending_proper_-
+    /// binding_ty` per the option-2 closure point in
+    /// `[Stage 6 cleanup]`.
+    pub handle_body_ty: BTreeMap<Span, Ty>,
 }
 
 /// Where a constructor is registered. Indexes a `TypeDecl` in the
@@ -660,6 +676,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         handler_scopes: Vec::new(),
         handle_arm_captures: BTreeMap::new(),
         handle_return_arm_captures: BTreeMap::new(),
+        handle_body_ty: BTreeMap::new(),
     };
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
@@ -946,6 +963,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             op_ids,
             handle_arm_captures: tc.handle_arm_captures,
             handle_return_arm_captures: tc.handle_return_arm_captures,
+            handle_body_ty: tc.handle_body_ty,
         },
         tc.errors,
     )
@@ -1133,6 +1151,12 @@ struct Tc {
     /// closure record passed as `closure_ptr` to
     /// `sigil_handler_frame_set_return`.
     handle_return_arm_captures: BTreeMap<Span, Vec<(String, Ty)>>,
+    /// Plan B Stage 6 cleanup — per-`Expr::Handle` body type.
+    /// Populated during `check_handle`'s body walk; consumed by
+    /// codegen's return-arm pre-pass to size the `v` binding's
+    /// Cranelift type correctly. See
+    /// `CheckedProgram::handle_body_ty`.
+    handle_body_ty: BTreeMap<Span, Ty>,
 }
 
 /// Plan B task 54 — one handler's effect-instantiation cache.
@@ -3108,6 +3132,64 @@ impl Tc {
             });
         }
 
+        // ---------- Phase 1.5: exhaustiveness check (E0142) ----------
+        // Stage 6 cleanup (option 2 from `[DEVIATION Task 55] Phase 4f`):
+        // a handle that lists any arm for `Effect` must cover every op
+        // declared on `Effect`. The body's effect row treats `Effect`
+        // as discharged, so any op NOT covered would runtime-abort if
+        // performed. We surface this at compile time via E0142.
+        //
+        // Iterate `discharged` (the effects that have at least one
+        // valid op-resolving arm — entries are added inside the
+        // E0139-success branch above, so unknown-effect arms aren't
+        // included). For each effect, check every declared op against
+        // `seen_arms`'s `(effect, op)` keys. Missing op names are
+        // collected and reported in alphabetical order (matches the
+        // op_id assignment order; deterministic across runs).
+        for eff_name in &discharged {
+            let eff_decl = match self.effects.get(eff_name).cloned() {
+                Some(d) => d,
+                None => continue,
+            };
+            let mut missing: Vec<String> = Vec::new();
+            for op in &eff_decl.ops {
+                let key = (eff_name.clone(), op.name.clone());
+                if !seen_arms.contains_key(&key) {
+                    missing.push(op.name.clone());
+                }
+            }
+            if !missing.is_empty() {
+                // Anchor the diagnostic on the first arm targeting
+                // this effect so the user sees where to add the
+                // missing arms. seen_arms holds the first-arm span
+                // per (effect, op) — pick the alphabetically-first
+                // op's first-arm span as the anchor.
+                let anchor_span = seen_arms
+                    .iter()
+                    .find(|((e, _), _)| e == eff_name)
+                    .map(|(_, span)| span.clone())
+                    .unwrap_or_else(|| handle_span.clone());
+                let listed = if missing.len() == 1 {
+                    format!("`{}.{}`", eff_name, missing[0])
+                } else {
+                    let parts: Vec<String> = missing
+                        .iter()
+                        .map(|op| format!("`{eff_name}.{op}`"))
+                        .collect();
+                    parts.join(", ")
+                };
+                self.push_error(
+                    "E0142",
+                    anchor_span,
+                    format!(
+                        "handler arms cover effect `{eff_name}` but do not exhaust its declared operations; \
+                         missing arm(s) for {listed}. Add an arm for each unhandled op (use `=> k(default)` \
+                         or `=> constant` for ops you don't expect to fire but need structurally present)",
+                    ),
+                );
+            }
+        }
+
         // ---------- Phase 2: body walk ----------
         // body_row = caller's literal effects ∪ discharged effects.
         // The contains check above already prevents duplicates from
@@ -3130,6 +3212,22 @@ impl Tc {
         });
         let body_ty = self.check_expr(body, &body_row);
         self.handler_scopes.pop();
+
+        // Plan B Stage 6 cleanup — populate the per-handle body type
+        // side-table for the codegen pre-pass. Codegen reads this at
+        // each `Expr::Handle` site to size the return-arm `v` binding's
+        // Cranelift type correctly (Phase 4g shipped with `binding_ty
+        // = I64` hardcoded, which produces verifier errors when the
+        // body has a narrower type — Bool, Char — and the return arm
+        // body uses `v` at narrow type). Resolves the `#[ignore]`'d
+        // e2e `handle_with_bool_body_and_return_arm_uses_v_pending_-
+        // proper_binding_ty`. Resolve through the substitution so the
+        // recorded `Ty` is the post-inference concrete type, not a
+        // raw type variable.
+        if let Some(ref bt) = body_ty {
+            self.handle_body_ty
+                .insert(handle_span.clone(), self.deref(bt));
+        }
 
         // ---------- Phase 3: handler-overall type + arm walks ----------
         // Allocate a fresh handler-overall var; cross-arm unification
@@ -6838,6 +6936,7 @@ mod tests {
             handler_scopes: Vec::new(),
             handle_arm_captures: BTreeMap::new(),
             handle_return_arm_captures: BTreeMap::new(),
+            handle_body_ty: BTreeMap::new(),
         }
     }
 
@@ -7531,6 +7630,85 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0141"), "expected E0141: {errs:?}");
+    }
+
+    #[test]
+    fn handle_single_op_effect_with_single_arm_no_e0142() {
+        // Stage 6 cleanup: E0142 fires only for multi-op effects with
+        // partial coverage. A single-op effect with a single arm is
+        // exhaustive by construction; no E0142.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.fail(k) => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0142"),
+            "single-op effect single-arm handler is exhaustive; \
+             E0142 should not fire: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_multi_op_effect_with_full_coverage_no_e0142() {
+        // Stage 6 cleanup: a multi-op effect with arms covering every
+        // declared op is exhaustive; no E0142.
+        let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Choose.left(k) => 1,\n\
+                       Choose.right(k) => 2,\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0142"),
+            "multi-op effect with full coverage is exhaustive; \
+             E0142 should not fire: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_multi_op_effect_with_partial_coverage_emits_e0142() {
+        // Stage 6 cleanup: a multi-op effect with arms covering only
+        // a subset of declared ops emits E0142 naming the unhandled
+        // op(s). Mirrors the option-2 resolution from the Phase 4f
+        // latent op_id/arm_count constraint deviation.
+        let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Choose.right(k) => 2 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0142"), "expected E0142: {errs:?}");
+        let msg = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0142")
+            .map(|e| e.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("Choose.left"),
+            "E0142 message should name the unhandled op `Choose.left`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn handle_multi_op_effect_with_no_arms_for_unrelated_effect_no_e0142() {
+        // Stage 6 cleanup: E0142 only fires for effects that have AT
+        // LEAST ONE arm in the handler. A multi-op effect that the
+        // handler doesn't target at all is not "discharged" — the
+        // body's row keeps the effect open, no exhaustiveness check
+        // applies.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   effect Choose { left: () -> Int, right: () -> Int }\n\
+                   fn main() -> Int ![Choose] {\n\
+                     handle 0 with { Raise.fail(k) => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0142"),
+            "Choose has no arms in the handler — exhaustiveness check should \
+             not apply to Choose; E0142 should not fire: {errs:?}"
+        );
     }
 
     #[test]

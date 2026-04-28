@@ -2305,3 +2305,49 @@ The selected approach is consistent with Plan B's "do not implement Stage 7+ fea
 3. **P20 — future chained-synth-cont extension.** Bundles with Slice C N-chain extension (multi-perform arm bodies) per [DEVIATION Task 58]. Same closure point as `examples/multishot_perf.sigil`'s "3-element Choose combinator" deferral (per [DEVIATION Task 60]).
 
 **Implementing commit(s):** Foundation `2c5b6b0` (this entry + Task 60 squash-hash flip + PROGRESS Task 61 entry transition `todo` → `in-progress`); P18 / P19 / P20 appended to `spec/validation-prompts.md` at `4825cc9`; closeout (PROGRESS Task 61 entry filled + this implementing-commit line backfilled) at `[HEAD]`.
+
+## 2026-04-28 — [Stage 6 cleanup] Bundled retirement of Phase 4f / 4g / Task 57 deferred items + 3 `#[ignore]`'d e2e test resolutions
+
+**Context:** Plan B Tasks 53-61 close at PR #34's squash-merge (`93d0777`). The remaining work before the Stage 6 review checkpoint is the deferred items named across `[DEVIATION Task 55] Phase 4f`, `[DEVIATION Task 55] Phase 4g`, `[DEVIATION Task 57]`, and the three `#[ignore]`'d e2e tests pinning specific known gaps. This PR retires them as a single bundled cleanup so the Stage 6 review checkpoint reads against a clean post-task-61 state.
+
+**Why bundled rather than fan-out PRs:** each item is small (~50-200 LOC) and they share testing surface (the same compiler/runtime crates, the same e2e harness, overlapping fixture programs). Review burden stays tractable at ~600-1000 LOC across 6-8 commits — comparable to Task 57's two-slice PR or Task 55's Phase 4e PR. Splitting into 6-8 separate PRs would multiply the review round-trips without reducing per-item complexity.
+
+**Items addressed (9 distinct):**
+
+1. **A.1** — Latent Phase 4f op_id/arm_count constraint pinned by `#[ignore]`'d e2e `partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution`. Resolved via **option 2 (typecheck E0142 exhaustiveness)** rather than option 1 (runtime convention fix) per the trade-off in `[DEVIATION Task 55] Phase 4f` line 75: option 2 surfaces the gap at compile time with a clean error rather than at runtime, which matches Sigil's "explicit errors over silent slips" discipline. The pinning test inverts to assert E0142 at compile time. New typecheck unit tests cover the surface (single-op effect with single-arm handler accepts; multi-op effect with full coverage accepts; multi-op effect with partial coverage emits E0142 naming the unhandled ops).
+
+2. **A.3 / Phase 4g binding_ty resolution** — pinned by `#[ignore]`'d e2e `handle_with_bool_body_and_return_arm_uses_v_pending_proper_binding_ty`. Resolved via typecheck side-table `CheckedProgram::handle_body_ty: BTreeMap<Span, Ty>` populated at handle expression sites; codegen reads the body's actual Cranelift type from this map for return-arm `binding_ty` instead of hardcoding I64. Mirrors the `handle_arm_captures` and `handle_return_arm_captures` side-table pattern.
+
+3. **A.2 / Task 57 IO color filter lift** — pinned by `#[ignore]`'d e2e `user_discard_k_io_handler_does_not_unwind_native_color_helper_pending_color_filter_lift`. Drops `crate::color::NATIVE_EFFECT = "IO"` constant + the 3 codegen classifier filters. **Perf-impact note:** this makes IO performs CPS-color-classifying, which propagates through call graphs. The Plan A2 `examples/fib_perf.sigil` perf floor (<50ms native fib(20)) and Plan B Task 60 `examples/fib_cps_perf.sigil` floor (<500ms CPS-forced fib(20)) are verified post-lift; if either trips, the lift rolls back to a narrower fix targeting only the discard-`k` cross-call correctness gap without coloring all IO callers. Closure point originally framed as "v2 path" in `[DEVIATION Task 57] IO color filter retention`; the deviation entry's reframing in this PR documents the perf check.
+
+4. **Phase 4f scope_id per-frame field** — diagnostic-precision improvement when an unhandled op walks past N frames of the same handle. Adds `scope_id: u32` to `HandlerFrame` (ABI-adjacent change; `MAX_HANDLER_ARMS` slot count unchanged). Codegen passes a per-handle id at frame allocation; `sigil_perform`'s walk includes scope_id in the diagnostic. Was deferred until "concrete motivation surfaces" per `[DEVIATION Task 55] Phase 4f` concern #5; this PR ships it preemptively as part of the bundled cleanup so the runtime ABI is stable for Plan C.
+
+5. **Phase 4g body_ty field cleanup** — `HandlerArmSynth.body_ty` is currently `#[allow(dead_code)]` after Phase 4g's body_ty fix (which switched to `dfg.value_type` reads). Field deleted; the future-compat slot is judged unnecessary now that Plan B has shipped.
+
+6. **Phase 4g walker arg threading refactor** — `collect_handle_arms_in_block` and `collect_handle_arms_in_expr` currently take 7 args (multiple mutable side-tables threaded explicitly). Replaced with a `CollectCtx` struct holding the four mutable side-tables + the immutable globals reference; signatures collapse to `(expr/block, &mut CollectCtx)`. Per the PR #29 reviewer's nit at the Phase 4g landing.
+
+7. **Task 57 Lowerer 16-site destructure cleanup** — `Lowerer.println_ref` / `panic_arith_ref` / `div_zero_gv` / `mod_zero_gv` fields are currently `#[allow(dead_code)]` after Task 57's IO/ArithError refactor. Fields deleted; 16 destructure sites updated (per the deferred item flagged in `[DEVIATION Task 57]`).
+
+8. **Task 57 FFI declaration drops** — `sigil_println` and `sigil_panic_arith_error` are declared in codegen's per-fn `dfg.ext_funcs` table but no longer referenced after Task 57. Declarations removed; per-fn table size reduced.
+
+9. **Task 57 0x40 trap slot disposition** — the trap slot reserved by retiring `TRAP_ARITH_ABORT` in Task 57 stays reserved with a documentation update naming it as available for future trap-catalogue rework. Not deleted (would risk reuse-conflict if a future rework lands the slot back at the same value).
+
+**Why not bundle in the architectural lifts (B.1 — Slice C N-chain extension; B.2 — chained-synth-cont; B.3 — TypeExpr::Fn; B.4 — arm-body-lambda; B.5 — generic-parameterised effects codegen):** those are **Plan-C-or-later territory** per `[DEVIATION Task 59]` and `[DEVIATION Task 61]`. Plan B's "Do not implement Stage 7+ features. Do not start Plan C." hard rules exclude them from this PR. They ship in Plan C foundation work where the scope is appropriate.
+
+**Closure point:** closed at this PR for 8 of the 9 named items. scope_id deferred — see framing immediately below. The architectural lifts (B above) remain Plan-C-or-later; the prompt-bank run-portion deferrals (D, the 6 `Oracle (notes)` markers in `spec/validation-prompts.md`) close mechanically when the corresponding architectural lifts land in Plan C.
+
+**scope_id deferral (item 4 in the original list).** The Phase 4f `scope_id` per-frame field was originally enumerated alongside the other 8 cleanup items in this PR's scope. After implementing the rest, scope_id was reassessed and deferred:
+
+- **No concrete motivation has surfaced.** The original `[DEVIATION Task 55] Phase 4f` framed scope_id as deferred "until concrete motivation surfaces (Stage 9 prompt produces a confusing diagnostic, etc.)". Plan B's numbered tasks closed without any Stage 9 prompt or other diagnostic surface needing scope_id to localize.
+- **The work is ABI-changing.** Adding scope_id requires extending `HandlerFrame`'s C-ABI struct (~50 LOC across runtime + abi crate), updating `sigil_handler_frame_new`'s signature to accept the new arg, threading per-handle ids through codegen at every frame allocation site, and surfacing the field in `sigil_perform`'s diagnostic path. ~150 LOC total.
+- **Honours Plan B's "Do not implement Stage 7+ features" discipline.** Adding ABI surface preemptively without a concrete diagnostic-precision use case is structurally similar to Stage-7-adjacent feature work. The "feature" is one nobody is asking for today; it's structural insurance against a hypothetical future diagnostic complaint.
+
+The closure point is unchanged from the original Phase 4f deviation: scope_id lands when a concrete motivation surfaces (typically: a Stage 9 prompt produces a confusing "op walked past N frames" diagnostic without scope_id to pin which handle level the walk traversed). The PR landing scope_id at that point ships the field definition + the diagnostic path that consumes it, in the same change so the field has a real consumer from day one.
+
+**Items shipped in this PR (8 of the 9 originally enumerated):** A.1 (E0142), A.2 (IO color filter lift), A.3 (binding_ty side-table), Phase 4g body_ty field cleanup, Phase 4g walker `CollectMut` refactor, Task 57 Lowerer dead-field cleanup, Task 57 FFI declaration drops, Task 57 0x40 trap slot disposition.
+
+**Item deferred (1 of the 9):** Phase 4f scope_id per-frame field — see deferral framing above.
+
+**Rationale for ordering within the PR:** A.1 (typecheck E0142 partial-handler exhaustiveness) lands first because it's typecheck-only and self-contained. A.3 / Phase 4g binding_ty resolution lands second because it shares the side-table pattern with A.1's typecheck work. A.2 / IO color filter lift lands third because it has the broadest blast radius (touches color.rs, codegen.rs). Phase 4g body_ty + walker cleanup land fourth as pure refactors. Task 57 codegen cleanup lands last with the largest mechanical-only delta (-159 LOC).
+
+**Implementing commit(s):** Foundation `b818584` (this entry + Task 61 squash-hash flip + PROGRESS Stage 6 cleanup section opened); A.1 E0142 partial-handler exhaustiveness at `f99f42d`; A.3 binding_ty resolution at `b9ed6f7`; A.2 IO color filter lift at `5c00eb0`; Phase 4g body_ty + walker cleanup at `fd321d2`; Task 57 codegen cleanup at `23d61d3`; closeout (PROGRESS Stage 6 cleanup entry filled + this implementing-commit line backfilled, scope_id deferral framing added) at `[HEAD]`.

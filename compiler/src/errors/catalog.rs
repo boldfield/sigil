@@ -818,6 +818,41 @@ pub const CATALOG: &[ErrorEntry] = &[
                       }",
     },
     ErrorEntry {
+        code: "E0142",
+        short: "handler does not cover every operation declared on the discharged effect",
+        long: "Plan B Stage 6 cleanup: a `handle ... with { ... }` block \
+               that lists arms for an effect must cover every operation \
+               declared on that effect. The body's effect row treats the \
+               effect as discharged, so any operation NOT covered by an \
+               arm would runtime-abort if performed. The exhaustiveness \
+               check surfaces this at compile time instead of at runtime.\n\n\
+               This rule applies per discharged effect: if the handler \
+               targets `Effect.op_a` but `Effect` declares both `op_a` \
+               and `op_b`, an arm for `op_b` is required even if the \
+               body never performs `op_b` (the body's row claims the \
+               full effect is discharged). The fix is to add the missing \
+               arm(s); use `=> k(default_value)` or `=> some_constant` \
+               for ops you don't expect to fire but need structurally \
+               present.\n\n\
+               Pre-Stage-6-cleanup, this constraint was a runtime abort \
+               from `sigil_perform`'s null-arm-slot path (pinned by the \
+               `#[ignore]`'d e2e `partial_handler_of_multi_op_effect_-\
+               aborts_at_runtime_pending_resolution`). The Stage 6 \
+               cleanup PR resolves it via this typecheck-time check, \
+               un-ignores the test, and inverts it to assert E0142.",
+        fix_example: "// Wrong (handler covers `div_by_zero` but not `mod_by_zero`):\n\
+                      effect ArithError { div_by_zero: () -> Int, mod_by_zero: () -> Int }\n\
+                      handle safe_divide(a, b) with {\n\
+                        ArithError.div_by_zero(k) => 0,   // E0142 here\n\
+                      }\n\n\
+                      // Right (cover both ops; mod_by_zero arm is unreachable\n\
+                      // in this program but its presence keeps coverage exhaustive):\n\
+                      handle safe_divide(a, b) with {\n\
+                        ArithError.div_by_zero(k) => 0,\n\
+                        ArithError.mod_by_zero(k) => 0,\n\
+                      }",
+    },
+    ErrorEntry {
         code: "E0220",
         short: "one-shot continuation used more than once on a code path",
         long: "Plan B task 54: in a handler arm for a one-shot effect, \

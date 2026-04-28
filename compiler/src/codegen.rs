@@ -191,6 +191,49 @@ fn compute_user_fn_abi(
     body: &crate::ast::Block,
     colored: &ColoredProgram,
 ) -> UserFnAbi {
+    // Plan B Stage 6 cleanup — `main` is structurally the entry
+    // point and is always emitted with `UserFnAbi::Sync`. The shim
+    // calls user_main with the Sync calling convention
+    // (`(closure_ptr) -> i32`) and treats the return value as the
+    // process exit code; there is no enclosing trampoline above the
+    // shim that could consume a `NextStep` record, so a Cps-ABI
+    // main has no useful caller and would simply trip Cranelift's
+    // verifier on the shim's Sync call site.
+    //
+    // **Why this is structural, not a workaround.** Pre-Stage-6-
+    // cleanup, main was already always Sync — `![IO]`-rowed main
+    // classified as `Color::Native` (the IO color exemption that
+    // Stage 6 cleanup removed), and main with any non-IO effect in
+    // row is rejected at typecheck (only `![IO]` and `![]` reach
+    // codegen for main). So the runtime behavior of main has never
+    // actually been Cps-ABI; the IO color filter lift made the
+    // colorer label it Cps without the rest of the pipeline being
+    // ready for that label at the entry point. Forcing Sync here
+    // re-establishes the pre-lift invariant at the ABI-selection
+    // layer rather than re-introducing the IO exemption at the
+    // colorer layer (which would reopen the discard-`k` correctness
+    // gap that A.2 closed for non-main fns).
+    //
+    // **The IO discard-`k` correctness goal still holds.** The
+    // lift's purpose was: user-installed discard-`k` IO handlers
+    // unwind helpers at the perform site. That correctness gap is
+    // about helpers called from main with discard-`k` handlers in
+    // scope (helpers are non-main; they remain Cps-color +
+    // potentially Cps-ABI post-lift). Main isn't wrapped in a
+    // user discard-`k` handler; it's wrapped in the shim's standard
+    // print/exit arm. Forcing main to Sync doesn't reopen the gap
+    // because `lower_perform_to_value` goes through `sigil_perform`
+    // synchronously — discard-`k` arms still fire correctly via
+    // run_loop dispatch from the perform site.
+    //
+    // If a future optimization needs Cps-ABI main (e.g., to share
+    // NextStep records with helper fns via a single arena), that
+    // PR ships the shim-side run_loop driver alongside the ABI
+    // change — same shape as scope_id's "deferred until concrete
+    // motivation" pattern.
+    if name == "main" {
+        return UserFnAbi::Sync;
+    }
     if !colored.needs_cps_transform(name) {
         return UserFnAbi::Sync;
     }
@@ -237,6 +280,40 @@ fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
         "Bool" | "Byte" | "Unit" => types::I8,
         "Char" => types::I32,
         _ => pointer_ty,
+    }
+}
+
+/// Plan B Stage 6 cleanup — Cranelift type for a typecheck `Ty`.
+///
+/// Free-fn shared by `Lowerer::cranelift_ty_of` (which delegates to
+/// this fn) and the codegen pre-pass paths where no `Lowerer`
+/// instance is available (e.g., the return-arm synth pre-pass that
+/// consumes `CheckedProgram::handle_body_ty` to size the `v`
+/// binding's Cranelift type).
+///
+/// `Ty::Var` is unreachable at codegen — typecheck either resolves
+/// every var through unification or rejects the program with E0132
+/// (ambiguous type), and the codegen-entry guard
+/// `contains_apply_or_generic_ref` rejects un-monomorphized AST. A
+/// stray `Ty::Var` arriving here would silently bind a value at the
+/// wrong width (e.g. a Bool body falling through to `pointer_ty`
+/// would bind `v: I64` while the consumer lowers `if v {...}`
+/// expecting I8 — exactly the verifier-error class Stage 6 cleanup's
+/// A.3 commit closed). Panic loudly so the bug surfaces at the
+/// codegen call site rather than as a downstream verifier error.
+fn cranelift_ty_of_ty(ty: &crate::typecheck::Ty, pointer_ty: Type) -> Type {
+    use crate::typecheck::Ty;
+    match ty {
+        Ty::Int => types::I64,
+        Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
+        Ty::Char => types::I32,
+        Ty::String | Ty::Fn(_) | Ty::User(_, _) => pointer_ty,
+        Ty::Var(id) => unreachable!(
+            "codegen: Ty::Var({id}) reached cranelift_ty_of_ty — \
+             typecheck must resolve every var through unification \
+             before codegen runs (or reject with E0132); a stray var \
+             here would silently bind a value at the wrong width"
+        ),
     }
 }
 
@@ -1545,18 +1622,6 @@ struct HandlerReturnArmSynth {
     /// `ireduce`, `I32` for Char via `ireduce`, `I64` and pointer-
     /// typed values stay as-is).
     binding_ty: Type,
-    /// Cranelift type of the return-arm body's result. Currently
-    /// unused — the synth fn body's actual type is read via
-    /// `dfg.value_type` after lowering (Slice C's pattern), and the
-    /// handle-exit dispatch in `Expr::Handle` reads the narrow-back
-    /// type via `Lowerer::type_of_expr(&ra.body, &preview)`. Kept
-    /// here as a forward-compat slot in case a future commit wants
-    /// to pre-resolve `body_ty` at the pre-pass (mirroring the way
-    /// `HandlerArmSynth::body_ty` is pre-resolved). Marked
-    /// `#[allow(dead_code)]` to silence the unused-field warning
-    /// without losing the documentation slot.
-    #[allow(dead_code)]
-    body_ty: Type,
     /// Captures consumed by this return-arm body, in return-arm-local
     /// slot order matching `body`'s rewritten `Expr::ClosureEnvLoad
     /// { index }` references. Each entry is the captured name plus
@@ -2158,67 +2223,49 @@ struct ArmSynthCtx<'a> {
     /// references in the return-arm body into return-arm-local-indexed
     /// `Expr::ClosureEnvLoad` slots.
     handle_return_arm_captures: &'a BTreeMap<Span, Vec<(String, crate::typecheck::Ty)>>,
+    /// Plan B Stage 6 cleanup — typecheck-side per-handle body type
+    /// map. Keyed by handle span. The codegen return-arm pre-pass
+    /// reads this to size the `v` binding's Cranelift type correctly
+    /// (Phase 4g shipped with `binding_ty = I64` hardcoded; narrow-
+    /// type bodies like Bool / Char need the actual Cranelift type
+    /// at the synth-fn entry to lower the return-arm body cleanly).
+    /// Resolves the `#[ignore]`'d e2e
+    /// `handle_with_bool_body_and_return_arm_uses_v_pending_proper_-
+    /// binding_ty`.
+    handle_body_ty: &'a BTreeMap<Span, crate::typecheck::Ty>,
+}
+
+struct CollectMut<'a> {
+    synth: &'a mut Vec<HandlerArmSynth>,
+    indices: &'a mut BTreeMap<Span, Vec<usize>>,
+    return_synth: &'a mut Vec<HandlerReturnArmSynth>,
+    return_indices: &'a mut BTreeMap<Span, usize>,
 }
 
 fn collect_handle_arms_in_block(
     b: &crate::ast::Block,
     module: &mut ObjectModule,
     ctx: &ArmSynthCtx<'_>,
-    synth: &mut Vec<HandlerArmSynth>,
-    indices: &mut BTreeMap<Span, Vec<usize>>,
-    return_synth: &mut Vec<HandlerReturnArmSynth>,
-    return_indices: &mut BTreeMap<Span, usize>,
+    out: &mut CollectMut<'_>,
 ) -> Result<(), String> {
     use crate::ast::Stmt;
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                collect_handle_arms_in_expr(
-                    &l.value,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(&l.value, module, ctx, out)?;
             }
             Stmt::Expr(e) => {
-                collect_handle_arms_in_expr(
-                    e,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(e, module, ctx, out)?;
             }
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    collect_handle_arms_in_expr(
-                        a,
-                        module,
-                        ctx,
-                        synth,
-                        indices,
-                        return_synth,
-                        return_indices,
-                    )?;
+                    collect_handle_arms_in_expr(a, module, ctx, out)?;
                 }
             }
         }
     }
     if let Some(tail) = &b.tail {
-        collect_handle_arms_in_expr(
-            tail,
-            module,
-            ctx,
-            synth,
-            indices,
-            return_synth,
-            return_indices,
-        )?;
+        collect_handle_arms_in_expr(tail, module, ctx, out)?;
     }
     Ok(())
 }
@@ -2227,10 +2274,7 @@ fn collect_handle_arms_in_expr(
     e: &crate::ast::Expr,
     module: &mut ObjectModule,
     ctx: &ArmSynthCtx<'_>,
-    synth: &mut Vec<HandlerArmSynth>,
-    indices: &mut BTreeMap<Span, Vec<usize>>,
-    return_synth: &mut Vec<HandlerReturnArmSynth>,
-    return_indices: &mut BTreeMap<Span, usize>,
+    out: &mut CollectMut<'_>,
 ) -> Result<(), String> {
     use crate::ast::Expr;
     match e {
@@ -2242,159 +2286,47 @@ fn collect_handle_arms_in_expr(
         | Expr::ClosureEnvLoad { .. }
         | Expr::Perform(_) => Ok(()),
         Expr::Binary { lhs, rhs, .. } => {
-            collect_handle_arms_in_expr(
-                lhs,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
-            collect_handle_arms_in_expr(
-                rhs,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )
+            collect_handle_arms_in_expr(lhs, module, ctx, out)?;
+            collect_handle_arms_in_expr(rhs, module, ctx, out)
         }
-        Expr::Unary { operand, .. } => collect_handle_arms_in_expr(
-            operand,
-            module,
-            ctx,
-            synth,
-            indices,
-            return_synth,
-            return_indices,
-        ),
+        Expr::Unary { operand, .. } => collect_handle_arms_in_expr(operand, module, ctx, out),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
         } => {
-            collect_handle_arms_in_expr(
-                cond,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
-            collect_handle_arms_in_block(
-                then_block,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
-            collect_handle_arms_in_block(
-                else_block,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )
+            collect_handle_arms_in_expr(cond, module, ctx, out)?;
+            collect_handle_arms_in_block(then_block, module, ctx, out)?;
+            collect_handle_arms_in_block(else_block, module, ctx, out)
         }
-        Expr::Block(b) => collect_handle_arms_in_block(
-            b,
-            module,
-            ctx,
-            synth,
-            indices,
-            return_synth,
-            return_indices,
-        ),
+        Expr::Block(b) => collect_handle_arms_in_block(b, module, ctx, out),
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            collect_handle_arms_in_expr(
-                scrutinee,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
+            collect_handle_arms_in_expr(scrutinee, module, ctx, out)?;
             for a in arms {
-                collect_handle_arms_in_expr(
-                    &a.body,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(&a.body, module, ctx, out)?;
             }
             Ok(())
         }
         Expr::Call { callee, args, .. } => {
-            collect_handle_arms_in_expr(
-                callee,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
+            collect_handle_arms_in_expr(callee, module, ctx, out)?;
             for a in args {
-                collect_handle_arms_in_expr(
-                    a,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(a, module, ctx, out)?;
             }
             Ok(())
         }
-        Expr::Lambda { body, .. } => collect_handle_arms_in_expr(
-            body,
-            module,
-            ctx,
-            synth,
-            indices,
-            return_synth,
-            return_indices,
-        ),
+        Expr::Lambda { body, .. } => collect_handle_arms_in_expr(body, module, ctx, out),
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
-                collect_handle_arms_in_expr(
-                    ee,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(ee, module, ctx, out)?;
             }
             Ok(())
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                collect_handle_arms_in_expr(
-                    &f.value,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(&f.value, module, ctx, out)?;
             }
             Ok(())
         }
@@ -2407,43 +2339,19 @@ fn collect_handle_arms_in_expr(
             // Recurse into body + arm bodies + return-arm body so
             // nested handles also surface. Then allocate FuncIds for
             // this handle's arms (op arms + return arm if present).
-            collect_handle_arms_in_expr(
-                body,
-                module,
-                ctx,
-                synth,
-                indices,
-                return_synth,
-                return_indices,
-            )?;
+            collect_handle_arms_in_expr(body, module, ctx, out)?;
             for arm in op_arms {
-                collect_handle_arms_in_expr(
-                    &arm.body,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(&arm.body, module, ctx, out)?;
             }
             if let Some(ra) = return_arm {
-                collect_handle_arms_in_expr(
-                    &ra.body,
-                    module,
-                    ctx,
-                    synth,
-                    indices,
-                    return_synth,
-                    return_indices,
-                )?;
+                collect_handle_arms_in_expr(&ra.body, module, ctx, out)?;
             }
             // Allocate one synthetic CPS fn per arm. Linker symbol
             // is `sigil_handler_arm_<global_index>` to keep names
             // unique without needing per-handle counters.
             let mut arm_indices: Vec<usize> = Vec::with_capacity(op_arms.len());
             for arm in op_arms {
-                let global_idx = synth.len();
+                let global_idx = out.synth.len();
                 let mangled = format!("sigil_handler_arm_{global_idx}");
                 let func_id = module
                     .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
@@ -2566,15 +2474,15 @@ fn collect_handle_arms_in_expr(
                     arm_body_let_then_pure_tail_shape(&rewritten_body, &arm.k_name)
                 {
                     // The mangled symbol uses the parent arm fn's
-                    // global index (== `synth.len()` at the moment of
-                    // the corresponding `synth.push(HandlerArmSynth)`
+                    // global index (== `out.synth.len()` at the moment of
+                    // the corresponding `out.synth.push(HandlerArmSynth)`
                     // below). Each arm has at most one post-arm-k
                     // synth fn, so this is collision-free without
                     // needing a separate post-arm-k counter — but the
                     // name is the ARM-FN's index, not a sequential
                     // post-arm-k index. Naming the binding makes that
                     // explicit.
-                    let post_arm_k_arm_fn_idx = synth.len();
+                    let post_arm_k_arm_fn_idx = out.synth.len();
                     let post_arm_k_mangled =
                         format!("sigil_handler_post_arm_k_{post_arm_k_arm_fn_idx}");
                     let post_arm_k_func_id = module
@@ -2623,7 +2531,7 @@ fn collect_handle_arms_in_expr(
                     if !is_multi_shot {
                         None
                     } else {
-                        let arm_fn_idx = synth.len();
+                        let arm_fn_idx = out.synth.len();
                         let post_arm_k_1_mangled =
                             format!("sigil_handler_post_arm_k_1_{arm_fn_idx}");
                         let post_arm_k_1_func_id = module
@@ -2664,7 +2572,7 @@ fn collect_handle_arms_in_expr(
                     None
                 };
 
-                synth.push(HandlerArmSynth {
+                out.synth.push(HandlerArmSynth {
                     func_id,
                     body: rewritten_body,
                     arg_names,
@@ -2715,7 +2623,7 @@ fn collect_handle_arms_in_expr(
             // each name comes from the surrounding lambda's closure
             // env (Slice D pattern) or local env.
             if let Some(ra) = return_arm {
-                let global_idx = return_synth.len();
+                let global_idx = out.return_synth.len();
                 let mangled = format!("sigil_handler_return_arm_{global_idx}");
                 let func_id = module
                     .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
@@ -2788,32 +2696,57 @@ fn collect_handle_arms_in_expr(
                 // recovery — or, more simply, defer body_ty
                 // resolution to the synth-fn definition pass which
                 // has access to the typecheck-side info via
-                // `match_scrut_tys` / typecheck artifacts. For Phase
-                // 4g MVP we encode `binding_ty = I64` (universal
-                // widened slot) and `body_ty = I64` (synth fn widens
-                // result to I64 before the trailing-pair Call) —
-                // narrow-back happens at the surrounding fn after
-                // run_loop returns, mirroring
-                // `lower_perform_to_value`'s post-run_loop
-                // narrow.
+                // **Stage 6 cleanup — proper binding_ty resolution.**
+                // The handle's body type is recorded by typecheck in
+                // `CheckedProgram::handle_body_ty: BTreeMap<Span, Ty>`
+                // (populated at `check_handle`'s body walk). The
+                // codegen pre-pass reads it via `ctx.handle_body_ty`
+                // and converts to Cranelift type via
+                // `cranelift_ty_of_ty`. This resolves the Phase 4g
+                // MVP placeholder `binding_ty = I64` which produced
+                // verifier errors when the body's actual type was
+                // narrower (Bool I8, Char I32). The synth fn now
+                // unpacks `v` from `args_ptr[0]` as I64 (universal
+                // widened slot per the trailing-pair convention) and
+                // narrows back to `binding_ty` via `ireduce` before
+                // binding into the Lowerer env, so the return-arm
+                // body lowers cleanly even when it uses `v` at narrow
+                // type. Resolves the `#[ignore]`'d e2e
+                // `handle_with_bool_body_and_return_arm_uses_v_-
+                // pending_proper_binding_ty`.
                 //
-                // For type-aware narrow-back at the surrounding fn
-                // we still need `body_ty` (the return arm body's
-                // declared Cranelift type). We don't expose it here
-                // — Lowerer's `type_of_expr` provides it post-
-                // lowering. The handle-exit dispatch in
-                // `Expr::Handle` will compute `handler_overall_ty`
-                // via `type_of_expr(&ra.body, &mut preview)` at
-                // dispatch time. Defer to that site.
-                return_synth.push(HandlerReturnArmSynth {
+                // body_ty stays I64 because the synth fn still widens
+                // its result to I64 before the trailing-pair Call —
+                // narrow-back at the surrounding fn happens via
+                // `Lowerer::type_of_expr(&ra.body, &preview)` at
+                // dispatch time, same as before.
+                // typecheck's `check_handle` populates `handle_body_ty`
+                // for every `Expr::Handle` whose body type resolves
+                // (which is every handle that reaches codegen — pipeline
+                // gates on typecheck err-list emptiness). A missing
+                // entry would silently re-introduce the Phase 4g
+                // I64 hardcode this cleanup is removing — `expect` so
+                // the invariant is load-bearing rather than papered
+                // over.
+                let binding_ty = ctx
+                    .handle_body_ty
+                    .get(span)
+                    .map(|ty| cranelift_ty_of_ty(ty, ctx.pointer_ty))
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen: handle_body_ty missing for Expr::Handle at {span:?} — \
+                             check_handle's body walk must populate this side-table for every \
+                             handle expression that reaches codegen"
+                        )
+                    });
+                out.return_synth.push(HandlerReturnArmSynth {
                     func_id,
                     body: rewritten_body,
                     binding_name: ra.binding.clone(),
-                    binding_ty: types::I64,
-                    body_ty: types::I64,
+                    binding_ty,
                     captures,
                 });
-                let prev_ret = return_indices.insert(span.clone(), global_idx);
+                let prev_ret = out.return_indices.insert(span.clone(), global_idx);
                 debug_assert!(
                     prev_ret.is_none(),
                     "codegen pre-pass: duplicate handle span {span:?} for return-arm \
@@ -2836,7 +2769,7 @@ fn collect_handle_arms_in_expr(
             // dedup → `debug_assert!` swap from review-fixup
             // commit `54b4a60`. The `insert` lives outside the
             // assert so the side effect runs in release builds too.
-            let prev = indices.insert(span.clone(), arm_indices);
+            let prev = out.indices.insert(span.clone(), arm_indices);
             debug_assert!(
                 prev.is_none(),
                 "codegen pre-pass: duplicate handle span {span:?} — \
@@ -3903,21 +3836,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_string_new", Linkage::Import, &string_new_sig)
         .map_err(|e| format!("declare sigil_string_new: {e}"))?;
 
-    let mut println_sig = Signature::new(isa_call_conv(&module));
-    println_sig.params.push(AbiParam::new(pointer_ty));
-    let println = module
-        .declare_function("sigil_println", Linkage::Import, &println_sig)
-        .map_err(|e| format!("declare sigil_println: {e}"))?;
-
-    // Plan A2: arithmetic-abort panic. `sigil_panic_arith_error(*const
-    // c_char) -> !`. Cranelift doesn't know the noreturn — we emit a
-    // `trap` after the call to satisfy Cranelift's terminator
-    // invariant; the runtime exits the process before the trap runs.
-    let mut panic_arith_sig = Signature::new(isa_call_conv(&module));
-    panic_arith_sig.params.push(AbiParam::new(pointer_ty));
-    let panic_arith = module
-        .declare_function("sigil_panic_arith_error", Linkage::Import, &panic_arith_sig)
-        .map_err(|e| format!("declare sigil_panic_arith_error: {e}"))?;
+    // Plan B Stage 6 cleanup — `sigil_println` and
+    // `sigil_panic_arith_error` FFI declarations removed. Both are
+    // Plan-A1/A2-era runtime fns that Task 57's IO-as-effect refactor
+    // (`[DEVIATION Task 57]`) made unreachable from compiler-emitted
+    // code: `perform IO.println(s)` now routes through `sigil_perform`
+    // → `sigil_io_println_arm` (runtime-side default arm fn), and
+    // `BinOp::Div`/`Mod` rewrite at elaborate to `perform
+    // ArithError.{div,mod}_by_zero()` dispatching to runtime-side
+    // `sigil_arith_error_{div,mod}_by_zero_arm`. The shipped runtime
+    // crate still exports `sigil_println` for the arm fn's internal
+    // use, but codegen no longer declares it as an import.
 
     // Plan A2 task 32: `sigil_alloc(header: u64, payload_bytes: usize)
     // -> *mut u8`. Heap allocation for closure records (and any future
@@ -4388,6 +4317,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             pointer_ty,
             handle_arm_captures: &checked.handle_arm_captures,
             handle_return_arm_captures: &checked.handle_return_arm_captures,
+            handle_body_ty: &checked.handle_body_ty,
+        };
+        let mut arm_synth_mut = CollectMut {
+            synth: &mut handler_arm_synth,
+            indices: &mut handler_arm_indices,
+            return_synth: &mut handler_return_arm_synth,
+            return_indices: &mut handler_return_arm_indices,
         };
         for item in &checked.program.items {
             if let crate::ast::Item::Fn(f) = item {
@@ -4395,10 +4331,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     &f.body,
                     &mut module,
                     &arm_synth_ctx,
-                    &mut handler_arm_synth,
-                    &mut handler_arm_indices,
-                    &mut handler_return_arm_synth,
-                    &mut handler_return_arm_indices,
+                    &mut arm_synth_mut,
                 )?;
             }
         }
@@ -4432,18 +4365,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // Symbol names describe the content for the linker's symbol table;
     // Mach-O section names (third arg) are capped at 16 chars and use
     // abbreviated forms. Keep the two independent.
-    let div_zero_msg_id = declare_cstring(
-        &mut module,
-        "sigil_arith_msg_div_zero",
-        "_sigil_amsg_dz",
-        b"division by zero",
-    )?;
-    let mod_zero_msg_id = declare_cstring(
-        &mut module,
-        "sigil_arith_msg_mod_zero",
-        "_sigil_amsg_mz",
-        b"remainder by zero",
-    )?;
+    // Plan B Stage 6 cleanup — `sigil_arith_msg_div_zero` /
+    // `sigil_arith_msg_mod_zero` C-string declarations removed.
+    // Task 57's BinOp::Div/Mod elaborate-time rewrite to
+    // `perform ArithError.{div,mod}_by_zero()` makes the codegen-side
+    // C-strings unreachable; the user-visible stderr banner now lives
+    // in runtime-side `sigil_arith_error_{div,mod}_by_zero_arm`.
 
     // --- define every user fn (original + synthetic $lambda_N) ----------
     //
@@ -4465,8 +4392,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // added in `f7d4a64` is removed at this commit.
     let per_fn_refs_ctx = PerFnRefsCtx {
         string_new,
-        println,
-        panic_arith,
         alloc,
         int_to_string,
         handler_frame_new,
@@ -4487,8 +4412,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         user_fns: &user_fns,
         string_literals,
         lit_ids: &lit_ids,
-        div_zero_msg_id,
-        mod_zero_msg_id,
     };
 
     let mut ctx = module.make_context();
@@ -4519,8 +4442,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // the emitted object code is unaffected.
             let PerFnRefs {
                 string_new_ref,
-                println_ref,
-                panic_arith_ref,
                 alloc_ref,
                 int_to_string_ref,
                 handler_frame_new_ref,
@@ -4538,8 +4459,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
                 lit_gvs,
-                div_zero_gv,
-                mod_zero_gv,
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
             // Plan B Task 55, Phase 4e — branch on the per-fn ABI
@@ -4896,11 +4815,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -5030,11 +4945,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 pointer_ty,
                 closure_ptr,
                 lit_gvs,
-                div_zero_gv,
-                mod_zero_gv,
                 string_new_ref,
-                println_ref,
-                panic_arith_ref,
                 alloc_ref,
                 int_to_string_ref,
                 handler_frame_new_ref,
@@ -5343,8 +5254,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // `next_step_args_ptr_ref`).
                 let PerFnRefs {
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -5362,8 +5271,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 // Block params: 0 = closure_ptr (null in Phase 4c),
@@ -5450,11 +5357,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -5963,8 +5866,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // captures + globals).
                 let PerFnRefs {
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -5982,8 +5883,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 // Block params: 0 = closure_ptr, 1 = args_ptr,
@@ -6027,13 +5926,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 }
 
                 // Unpack `v` from args_ptr[0] as I64; narrow per
-                // binding_ty. The pre-pass currently sets
-                // binding_ty = I64 (we don't have body's Cranelift
-                // type at pre-pass time; the surrounding-fn dispatch
-                // widens body_val to I64 before packing). The narrow
-                // here is a no-op for I64; future commits that
-                // resolve binding_ty more precisely will activate
-                // the narrower paths via `ireduce`.
+                // binding_ty. The pre-pass reads binding_ty from
+                // `CheckedProgram::handle_body_ty` (Stage 6 cleanup),
+                // so narrow-type bodies (Bool I8, Char I32) now bind
+                // `v` at the correct Cranelift type via `ireduce`.
+                // Pre-Stage-6-cleanup, binding_ty was hardcoded to
+                // I64 and the narrow path was a no-op; the
+                // `#[ignore]`'d e2e
+                // `handle_with_bool_body_and_return_arm_uses_v_-
+                // pending_proper_binding_ty` pinned the gap. The
+                // surrounding-fn dispatch widens body_val to I64
+                // before packing, so the I64 load + ireduce-back
+                // round-trip is sound.
                 let widened_v = builder.ins().load(
                     types::I64,
                     MemFlags::trusted(),
@@ -6078,11 +5982,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -6277,8 +6177,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
             let PerFnRefs {
                 string_new_ref,
-                println_ref,
-                panic_arith_ref,
                 alloc_ref,
                 int_to_string_ref,
                 handler_frame_new_ref,
@@ -6296,8 +6194,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
                 lit_gvs,
-                div_zero_gv,
-                mod_zero_gv,
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
             let closure_ptr = block_params[0];
@@ -6308,11 +6204,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 pointer_ty,
                 closure_ptr,
                 lit_gvs,
-                div_zero_gv,
-                mod_zero_gv,
                 string_new_ref,
-                println_ref,
-                panic_arith_ref,
                 alloc_ref,
                 int_to_string_ref,
                 handler_frame_new_ref,
@@ -6465,8 +6357,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 let PerFnRefs {
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -6484,8 +6374,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 let mut env: BTreeMap<String, Value> = BTreeMap::new();
@@ -6498,11 +6386,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr: post_arm_k_1_closure_ptr,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -6730,8 +6614,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 let PerFnRefs {
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -6749,8 +6631,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 let mut lowerer = Lowerer {
@@ -6760,11 +6640,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr: post_arm_k_2_closure_ptr,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -7067,8 +6943,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // emitting relocations.
                         let PerFnRefs {
                             string_new_ref,
-                            println_ref,
-                            panic_arith_ref,
                             alloc_ref,
                             int_to_string_ref,
                             handler_frame_new_ref,
@@ -7086,8 +6960,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_return_arm_refs_per_handle,
                             user_fn_refs,
                             lit_gvs,
-                            div_zero_gv,
-                            mod_zero_gv,
                         } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                         let closure_ptr = block_params[0];
@@ -7098,11 +6970,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             pointer_ty,
                             closure_ptr,
                             lit_gvs,
-                            div_zero_gv,
-                            mod_zero_gv,
                             string_new_ref,
-                            println_ref,
-                            panic_arith_ref,
                             alloc_ref,
                             int_to_string_ref,
                             handler_frame_new_ref,
@@ -7193,42 +7061,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     Ok(())
 }
 
-/// Declare and define a null-terminated C string as a module-local
-/// read-only data object. Returns the cstring's `DataId` so callers can
-/// `declare_data_in_func` it and derive a `symbol_value` pointer at
-/// codegen time. The terminating `\0` is appended here; callers pass
-/// the raw bytes.
-///
-/// `symbol_name` identifies the data in the object's symbol table and
-/// can be as long as the linker allows (hundreds of chars). `section`
-/// names the output section containing the bytes; Mach-O caps section
-/// names at **16 characters** (including the NUL), so the two must be
-/// provided separately rather than sharing a name. ELF accepts either.
-fn declare_cstring(
-    module: &mut ObjectModule,
-    symbol_name: &str,
-    section: &str,
-    bytes: &[u8],
-) -> Result<cranelift_module::DataId, String> {
-    debug_assert!(
-        section.len() < 16,
-        "Mach-O section name `{section}` exceeds the 16-char limit"
-    );
-    let id = module
-        .declare_data(symbol_name, Linkage::Local, false, false)
-        .map_err(|e| format!("declare {symbol_name}: {e}"))?;
-    let mut payload = Vec::with_capacity(bytes.len() + 1);
-    payload.extend_from_slice(bytes);
-    payload.push(0);
-    let mut data = DataDescription::new();
-    data.define(payload.into_boxed_slice());
-    data.set_segment_section(".rodata", section);
-    module
-        .define_data(id, &data)
-        .map_err(|e| format!("define {symbol_name}: {e}"))?;
-    Ok(id)
-}
-
 /// Tree-walking lowerer — plan A2 task 24.
 ///
 /// Walks a typechecked + elaborated AST and emits Cranelift IR into an
@@ -7287,45 +7119,7 @@ struct Lowerer<'a, 'b> {
 
     /// Plan B Task 57 — `declare_data_in_func` refs for the arith-
     /// panic cstrings (`"division by zero"`, `"remainder by zero"`).
-    /// No longer consumed by codegen post-Slice-2: `BinOp::Div`/`Mod`
-    /// elaborate to perform-bearing form, and the stderr banner
-    /// strings now live in the runtime-side arm fns
-    /// (`sigil_arith_error_{div,mod}_by_zero_arm`). Lowerer fields
-    /// kept under `#[allow(dead_code)]` so the 16 Lowerer
-    /// construction sites' field-init shorthand stays compiling
-    /// without a wider rename diff. Future chore drops the GVs +
-    /// the C-string declarations + the per-fn data refs entirely.
-    #[allow(dead_code)]
-    div_zero_gv: GlobalValue,
-    #[allow(dead_code)]
-    mod_zero_gv: GlobalValue,
-
     string_new_ref: FuncRef,
-    /// Plan B Task 57 — `sigil_println` is no longer called directly
-    /// by user code; `perform IO.println(s)` routes through
-    /// `sigil_perform` → `sigil_io_println_arm` (runtime-side default
-    /// arm fn). The per-fn FuncRef is still declared by
-    /// `prepare_per_fn_refs` — over-declaration is structural-only
-    /// per `PerFnRefs`'s existing comment — but no `Lowerer` method
-    /// consumes it. A future cleanup chore can drop the FuncRef +
-    /// the FuncId + the FFI declaration entirely; for now
-    /// `#[allow(dead_code)]` preserves the field-init shorthand at
-    /// the 16 Lowerer construction sites without a wider rename
-    /// diff.
-    #[allow(dead_code)]
-    println_ref: FuncRef,
-    /// Plan B Task 57 — `sigil_panic_arith_error` is no longer
-    /// called by codegen; `BinOp::Div`/`Mod` rewrite to `perform
-    /// ArithError.{div,mod}_by_zero()` at elaborate, and the
-    /// runtime-side default handler installed by the `main` shim
-    /// (`sigil_arith_error_div_by_zero_arm` / `_mod_by_zero_arm`)
-    /// preserves the Plan A2 stderr banner + exit-2 behavior. The
-    /// per-fn FuncRef is still declared by `prepare_per_fn_refs` for
-    /// the same structural-only over-declaration reason as
-    /// `println_ref` above. Future chore drops the FuncRef + FuncId +
-    /// FFI declaration entirely.
-    #[allow(dead_code)]
-    panic_arith_ref: FuncRef,
     alloc_ref: FuncRef,
 
     /// Runtime ref for `sigil_int_to_string(i64) -> *u8`. Plan A2 task
@@ -9391,21 +9185,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         }
     }
 
-    /// Cranelift representation of a semantic `Ty`. Mirrors the store/
-    /// load width choices in `lower_ctor_alloc` and `load_field_value`.
+    /// Cranelift representation of a semantic `Ty`. Delegates to the
+    /// free fn `cranelift_ty_of_ty` (Stage 6 cleanup) so the
+    /// `Ty → Cranelift Type` mapping has a single source of truth
+    /// shared with the codegen pre-pass paths that don't have a
+    /// `Lowerer` instance available.
     fn cranelift_ty_of(&self, ty: &Ty) -> Type {
-        match ty {
-            Ty::Int => types::I64,
-            Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
-            Ty::Char => types::I32,
-            Ty::String | Ty::Fn(_) | Ty::User(_, _) => self.pointer_ty,
-            // Plan B task 48: surface-AST guard at codegen entry
-            // ensures `Ty::Var` cannot reach this point. A stray
-            // var means the guard is broken.
-            Ty::Var(_) => unreachable!(
-                "codegen: Ty::Var is impossible after Plan B task 48 codegen-entry guard"
-            ),
-        }
+        cranelift_ty_of_ty(ty, self.pointer_ty)
     }
 
     /// Structural Cranelift-type predictor. Used by `lower_match` to
@@ -9598,8 +9384,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 /// elaborate to `if rhs == 0 { perform ArithError.* } else {
 /// SdivUnchecked / SremUnchecked }`, with the perform path
 /// dispatching through `sigil_perform` to the top-level handler.
-/// The 0x40 slot is reserved (no other trap reuses it) so a future
-/// trap-catalogue rework can repopulate it without churn.
+///
+/// The 0x40 slot is **reserved** (Stage 6 cleanup confirmed
+/// disposition): no other trap reuses it, so a future trap-catalogue
+/// rework can repopulate it without ABI churn. Reserved-not-deleted
+/// guards against accidental reuse-conflict if a future rework lands
+/// the slot back at the same value with different semantics; the
+/// const declaration is intentionally absent here so any reuse
+/// surfaces in code review rather than slipping through.
 const TRAP_NONEXHAUSTIVE_MATCH: u8 = 0x41;
 /// Plan B Task 55, Phase 4f — fires when the multi-effect handle's
 /// pop sequence does not return the first-pushed frame as expected.
@@ -9764,8 +9556,6 @@ const POST_ARM_K_FN_OFF: i32 = 16;
 /// the same commit as this helper lands.
 struct PerFnRefsCtx<'a> {
     string_new: cranelift_module::FuncId,
-    println: cranelift_module::FuncId,
-    panic_arith: cranelift_module::FuncId,
     alloc: cranelift_module::FuncId,
     int_to_string: cranelift_module::FuncId,
     handler_frame_new: cranelift_module::FuncId,
@@ -9791,8 +9581,6 @@ struct PerFnRefsCtx<'a> {
     user_fns: &'a BTreeMap<String, UserFnEntry>,
     string_literals: &'a [(Span, String)],
     lit_ids: &'a [cranelift_module::DataId],
-    div_zero_msg_id: cranelift_module::DataId,
-    mod_zero_msg_id: cranelift_module::DataId,
 }
 
 /// Plan B Task 55, Phase 4e — per-fn FuncRefs / DataRefs / side-table
@@ -9815,8 +9603,6 @@ struct PerFnRefsCtx<'a> {
 /// or emitted-binary impact at the three call sites.
 struct PerFnRefs {
     string_new_ref: FuncRef,
-    println_ref: FuncRef,
-    panic_arith_ref: FuncRef,
     alloc_ref: FuncRef,
     int_to_string_ref: FuncRef,
     handler_frame_new_ref: FuncRef,
@@ -9837,8 +9623,6 @@ struct PerFnRefs {
     handler_return_arm_refs_per_handle: BTreeMap<Span, FuncRef>,
     user_fn_refs: BTreeMap<String, FuncRef>,
     lit_gvs: Vec<(Span, GlobalValue, usize)>,
-    div_zero_gv: GlobalValue,
-    mod_zero_gv: GlobalValue,
 }
 
 /// Plan B Task 55, Phase 4e — declare per-fn FuncRefs + DataRefs +
@@ -9858,8 +9642,6 @@ fn prepare_per_fn_refs(
     ctx: &PerFnRefsCtx<'_>,
 ) -> PerFnRefs {
     let string_new_ref = module.declare_func_in_func(ctx.string_new, builder.func);
-    let println_ref = module.declare_func_in_func(ctx.println, builder.func);
-    let panic_arith_ref = module.declare_func_in_func(ctx.panic_arith, builder.func);
     let alloc_ref = module.declare_func_in_func(ctx.alloc, builder.func);
     let int_to_string_ref = module.declare_func_in_func(ctx.int_to_string, builder.func);
     let handler_frame_new_ref = module.declare_func_in_func(ctx.handler_frame_new, builder.func);
@@ -9935,13 +9717,8 @@ fn prepare_per_fn_refs(
             (span.clone(), gv, s.len())
         })
         .collect();
-    let div_zero_gv = module.declare_data_in_func(ctx.div_zero_msg_id, builder.func);
-    let mod_zero_gv = module.declare_data_in_func(ctx.mod_zero_msg_id, builder.func);
-
     PerFnRefs {
         string_new_ref,
-        println_ref,
-        panic_arith_ref,
         alloc_ref,
         int_to_string_ref,
         handler_frame_new_ref,
@@ -9959,8 +9736,6 @@ fn prepare_per_fn_refs(
         handler_return_arm_refs_per_handle,
         user_fn_refs,
         lit_gvs,
-        div_zero_gv,
-        mod_zero_gv,
     }
 }
 
@@ -10034,22 +9809,14 @@ fn is_simple_tail_perform_with_pure_args_body(body: &crate::ast::Block) -> bool 
     }
     match &body.tail {
         Some(crate::ast::Expr::Perform(p)) => {
-            // Plan B Task 57 — IO performs are excluded from the
-            // CPS-color classifier as a perf-preserving choice; see
-            // `[DEVIATION Task 57] IO color filter retention` in
-            // `PLAN_B_DEVIATIONS.md` for the rationale, the load-
-            // bearing shim invariant (top-level IO handler always
-            // installed), and the residual correctness gap (user
-            // discard-`k` IO handlers don't unwind Native-color
-            // helpers — pinned by `#[ignore]`'d e2e
-            // `user_discard_k_io_handler_does_not_unwind_native_-
-            // color_helper_pending_color_filter_lift`). The filter
-            // references `color::NATIVE_EFFECT` rather than the
-            // literal `"IO"` so a future builtin rename would update
-            // both sites in one place.
-            if p.effect == crate::color::NATIVE_EFFECT {
-                return false;
-            }
+            // Stage 6 cleanup: IO color filter lifted — every perform
+            // (including IO) is eligible for the CPS-color body
+            // classifier. Pre-lift, this site rejected IO performs
+            // as a perf-preserving choice with a documented
+            // residual discard-`k` correctness gap (per
+            // `[DEVIATION Task 57] IO color filter retention`).
+            // Post-lift, IO performs flow through the trampoline
+            // like any other effect; the discard-`k` gap closes.
             p.args.iter().all(expr_is_pure)
         }
         _ => false,
@@ -10214,14 +9981,10 @@ fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
     if body.stmts.len() != 1 {
         return false;
     }
-    // Plan B Task 57 — IO performs are excluded from this CPS-color
-    // classifier (same rationale + same residual correctness gap as
-    // `is_simple_tail_perform_with_pure_args_body`'s IO filter; see
-    // `[DEVIATION Task 57] IO color filter retention`). Filter
-    // references `color::NATIVE_EFFECT` to keep the builtin-name
-    // source-of-truth in one place.
+    // Stage 6 cleanup: IO color filter lifted — every perform
+    // (including IO) is eligible for the CPS-color body classifier.
     let yield_perform = match &body.stmts[0] {
-        Stmt::Perform(p) if p.effect != crate::color::NATIVE_EFFECT => p,
+        Stmt::Perform(p) => p,
         _ => return false,
     };
     if !yield_perform.args.iter().all(expr_is_pure) {
@@ -10307,14 +10070,10 @@ fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
         Stmt::Let(l) => l,
         _ => return false,
     };
-    // Plan B Task 57 — IO performs excluded for the same perf-
-    // preserving reason + same residual correctness gap documented
-    // at `is_simple_tail_perform_with_pure_args_body` and
-    // `[DEVIATION Task 57] IO color filter retention`. Filter
-    // references `color::NATIVE_EFFECT` for one-place builtin-name
-    // source-of-truth.
+    // Stage 6 cleanup: IO color filter lifted — every perform
+    // (including IO) is eligible for the CPS-color body classifier.
     let yield_perform = match &let_stmt.value {
-        Expr::Perform(p) if p.effect != crate::color::NATIVE_EFFECT => p,
+        Expr::Perform(p) => p,
         _ => return false,
     };
     if !yield_perform.args.iter().all(expr_is_pure) {
@@ -10618,11 +10377,14 @@ mod tests {
     }
 
     #[test]
-    fn io_perform_in_tail_is_not_simple_tail_perform() {
-        // IO performs use the synchronous `lower_perform` path
-        // regardless of color (special-cased; doesn't route through
-        // `sigil_perform`). The classifier returns false so codegen
-        // doesn't try to declare an IO-only fn with the CPS ABI.
+    fn io_perform_in_tail_is_simple_tail_perform_post_stage_6_cleanup() {
+        // Stage 6 cleanup: IO color filter lifted — IO performs are
+        // now eligible for the CPS-color body classifier just like
+        // any other effect. Pre-lift, this site rejected IO performs
+        // as a perf-preserving choice with a documented residual
+        // discard-`k` correctness gap (per `[DEVIATION Task 57] IO
+        // color filter retention`); post-lift, IO performs flow
+        // through the trampoline and the gap closes.
         use crate::ast::{Block, Expr, PerformExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -10636,7 +10398,7 @@ mod tests {
             })),
             span,
         };
-        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(is_simple_tail_perform_with_pure_args_body(&body));
     }
 
     #[test]
@@ -10746,9 +10508,9 @@ mod tests {
     }
 
     #[test]
-    fn yield_with_io_perform_is_not_yield_then_constant() {
-        // IO performs use the synchronous lower_perform path
-        // regardless of color; classifier rejects.
+    fn yield_with_io_perform_is_yield_then_constant_post_stage_6_cleanup() {
+        // Stage 6 cleanup: IO color filter lifted — `Stmt::Perform`
+        // with effect=IO is now eligible for the body classifier.
         use crate::ast::{Block, Expr, PerformExpr, Stmt};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -10762,7 +10524,7 @@ mod tests {
             tail: Some(Expr::IntLit(42, span.clone())),
             span,
         };
-        assert!(!is_simple_yield_then_constant_tail_body(&body));
+        assert!(is_simple_yield_then_constant_tail_body(&body));
     }
 
     // ---------------- Plan B Task 55, Phase 4e — let-yield-then-
@@ -10859,12 +10621,10 @@ mod tests {
     }
 
     #[test]
-    fn let_yield_with_io_perform_value_is_not_let_yield_then_pure() {
-        // `let s: String = perform IO.println("hi"); ...` — IO
-        // performs use the synchronous lower_perform path
-        // regardless of color; the let-yield classifier rejects.
-        // Mirrors the IO rejection from
-        // `is_simple_yield_then_constant_tail_body`.
+    fn let_yield_with_io_perform_value_is_let_yield_then_pure_post_stage_6_cleanup() {
+        // Stage 6 cleanup: IO color filter lifted — `let _ = perform
+        // IO.println(...); pure_tail` is now eligible for the
+        // let-yield classifier.
         use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -10883,7 +10643,7 @@ mod tests {
             tail: Some(Expr::IntLit(0, span.clone())),
             span,
         };
-        assert!(!is_simple_let_yield_then_pure_tail_body(&body));
+        assert!(is_simple_let_yield_then_pure_tail_body(&body));
     }
 
     #[test]
@@ -11278,6 +11038,7 @@ mod tests {
             op_ids: std::collections::BTreeMap::new(),
             handle_arm_captures: std::collections::BTreeMap::new(),
             handle_return_arm_captures: std::collections::BTreeMap::new(),
+            handle_body_ty: std::collections::BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
         let mono = MonoProgram { anf };
@@ -11352,6 +11113,7 @@ mod tests {
             op_ids: std::collections::BTreeMap::new(),
             handle_arm_captures: std::collections::BTreeMap::new(),
             handle_return_arm_captures: std::collections::BTreeMap::new(),
+            handle_body_ty: std::collections::BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
         let mono = MonoProgram { anf };

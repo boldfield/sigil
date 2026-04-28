@@ -1243,7 +1243,7 @@ fn e0120_non_exhaustive_match_names_witness_in_stderr() {
 /// which the local analysis treats as part of the IO-only row, not a
 /// non-IO body site).
 #[test]
-fn dump_color_hello_is_native_row_io() {
+fn dump_color_hello_is_cps_row_io() {
     let root = workspace_root();
     let source = root.join("examples/hello.sigil");
     let sigil_bin = sigil_binary();
@@ -1258,19 +1258,22 @@ fn dump_color_hello_is_native_row_io() {
         out.status.success(),
         "--dump-color exit; stdout={stdout:?}, stderr={stderr:?}"
     );
-    // hello.sigil declares `fn main() -> Int ![IO]`. Native row + leaf
-    // call graph + perform IO is entirely consistent with the native
-    // classification (Plan B Task 50 spec: row is `![IO]` → native).
+    // hello.sigil declares `fn main() -> Int ![IO]`. Stage 6 cleanup
+    // lifted the IO color filter — `![IO]`-rowed fns now classify
+    // as CPS-color (matching every other effect). main is special-
+    // cased to `UserFnAbi::Sync` regardless of color (per
+    // `compute_user_fn_abi`'s main entry-point contract), so the
+    // ABI is still Sync and the runtime behavior matches the shim's
+    // expectations; only the colorer's reason text changed.
     assert!(
-        stdout.contains("main native"),
-        "expected `main native ...` in dump-color output, got: {stdout}"
+        stdout.contains("main cps"),
+        "expected `main cps ...` in dump-color output, got: {stdout}"
     );
-    // The reason text is stable; pin it loosely so the test survives
-    // future tweaks to the wording but catches accidental category
-    // flips.
+    // Pin the reason text to the post-lift form so a regression
+    // re-introducing the IO color exemption surfaces here.
     assert!(
-        stdout.contains("native: row is `![IO]`"),
-        "expected reason `native: row is ![IO]`, got: {stdout}"
+        stdout.contains("cps: row contains effect `IO`"),
+        "expected reason `cps: row contains effect `IO``, got: {stdout}"
     );
 }
 
@@ -1371,28 +1374,32 @@ fn generic_map_dump_color_all_native() {
         out.status.success(),
         "exit; stdout={stdout:?}, stderr={stderr:?}"
     );
-    // All four monomorphs + main must classify as native. Pin each
+    // All four monomorphs (map / length × Int / String) must classify
+    // as native — they have row `![]` and are pure-structural. Stage 6
+    // cleanup lifted the IO color filter, so `main` (with row `![IO]`)
+    // now classifies as CPS-color (was Native pre-lift). Pin each
     // expected mangled name independently so a regression on any
     // single one (e.g. a mangling-format slip on map$$String) lands
-    // on a directed assertion rather than a opaque overall-string
+    // on a directed assertion rather than an opaque overall-string
     // diff.
     for expected in [
         "map$$Int native",
         "map$$String native",
         "length$$Int native",
         "length$$String native",
-        "main native",
+        "main cps",
     ] {
         assert!(
             stdout.contains(expected),
             "expected `{expected}` line in dump-color output, got:\n{stdout}"
         );
     }
-    // No CPS classifications should appear — this program is purely
-    // structural and should not require the trampoline.
+    // The four List-traversal monomorphs are pure-structural; only
+    // main has effects. No `cps` lines should appear OUTSIDE main.
+    let cps_lines: Vec<&str> = stdout.lines().filter(|l| l.contains(" cps ")).collect();
     assert!(
-        !stdout.contains(" cps "),
-        "no monomorph should classify as cps in this program; got:\n{stdout}"
+        cps_lines.iter().all(|l| l.starts_with("main ")),
+        "only main should classify as cps in this program; got CPS lines: {cps_lines:?}"
     );
 }
 
@@ -1864,61 +1871,24 @@ fn handle_with_one_effect_exceeding_max_handler_arms_is_rejected_at_codegen() {
     );
 }
 
-#[ignore = "Latent op_id/arm_count constraint pre-existing since Phase 4a; \
-            Phase 4f expanded the user-reachable surface but did not \
-            introduce or fix it. Resolution deferred to a separate \
-            post-Phase-4f task — see the 'Latent op_id/arm_count \
-            constraint' sub-section in `[DEVIATION Task 55] Phase 4f` \
-            in `PLAN_B_DEVIATIONS.md` for both options (1: convention \
-            fix; 2: typecheck E0142). Test asserts the future-correct \
-            option-1 behaviour."]
+/// Plan B Stage 6 cleanup — **inverted from the previously
+/// `#[ignore]`'d `partial_handler_of_multi_op_effect_aborts_at_runtime
+/// _pending_resolution`**. The latent op_id/arm_count constraint
+/// resolves via option 2 (typecheck E0142 exhaustiveness) per the
+/// trade-off in `[DEVIATION Task 55] Phase 4f` and `[Stage 6
+/// cleanup]`: compile-time rejection beats runtime abort.
+///
+/// Pre-Stage-6-cleanup: `effect Choose { left, right }` with a
+/// handle covering only `Choose.right` was syntactically accepted
+/// and would runtime-abort if `Choose.left` ever fired. Post-Stage-
+/// 6-cleanup: typecheck rejects with E0142 at compile time, naming
+/// the unhandled op (`Choose.left`).
+///
+/// The test asserts the new compile-time behaviour: invoking the
+/// sigil compiler on the partial-handler source produces a non-zero
+/// exit and stderr containing `E0142` plus the unhandled op name.
 #[test]
-fn partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution() {
-    // Plan B Task 55, Phase 4f — pinning test for the latent
-    // op_id/arm_count constraint surfaced during the Phase 4f
-    // codegen-lift mid-flight review (commit `65727c2`). Mirrors
-    // the Phase 4d MVP `discard_k_handler_does_not_abort_helper_
-    // phase_4e_pending` precedent: the test asserts the
-    // future-correct behaviour and is `#[ignore]`'d while the
-    // bug exists, so it stays grep-findable through the eventual
-    // fix.
-    //
-    // **The bug:** op_ids are assigned alphabetically per-effect at
-    // `compiler/src/typecheck.rs:792-808`, globally over the
-    // effect's full declared op set. Codegen sizes
-    // `arm_count` to the handle's arm count for that effect.
-    // Runtime bounds check `op_id < arm_count` at
-    // `runtime/src/handlers.rs:349` aborts when handlers don't
-    // cover the lowest-numbered op_ids contiguously.
-    //
-    // **Concrete failure:** `effect Choose { left, right }` with
-    // op_ids `left=0, right=1`; a handle with only
-    // `Choose.right(k) => 20` produces `arm_count=1, op_id=1` →
-    // `sigil_handler_frame_set_arm: op_id 1 out of range
-    // (arm_count=1)` and the program aborts at runtime instead of
-    // printing `20`.
-    //
-    // **Future resolution paths (one will land at the fix PR):**
-    //
-    // - **Option 1 (convention fix):** size `arm_count` to
-    //   `effects[arm.effect].ops.len()`; unhandled slots stay null
-    //   from the runtime's `sigil_handler_frame_new` zero-init.
-    //   `sigil_perform`'s null-arm-slot path
-    //   (`runtime/src/handlers.rs:706-712`) already aborts with a
-    //   clear "op X has no arm" diagnostic when a perform reaches
-    //   an unhandled op. **Under option 1, this test passes
-    //   un-`#[ignore]`'d** with `stdout = "20\n"` — the perform
-    //   targets a covered op (`Choose.right`), `op_id=1 <
-    //   arm_count=2` (now sized to the effect's declared op
-    //   count), bounds check passes, dispatch lands the matching
-    //   arm, returns 20.
-    //
-    // - **Option 2 (typecheck fix, E0142):** require handles to
-    //   be exhaustive over the matched effect's ops. Under option
-    //   2, the future fix-PR rewrites this test to assert a
-    //   compile-time E0142 rejection instead.
-    //
-    // The fix-PR un-ignores + reshapes per the chosen resolution.
+fn partial_handler_of_multi_op_effect_rejected_with_e0142() {
     let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform Choose.right()) with {\n    \
@@ -1927,23 +1897,51 @@ fn partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "partial_handler_multi_op");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "20\n", "stdout mismatch; stderr={stderr:?}");
+    let tmp = std::env::temp_dir().join(format!(
+        "partial_handler_e0142_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("partial_handler_e0142_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail with E0142 (partial handler over multi-op effect); \
+         got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("E0142") && stderr.contains("Choose.left"),
+        "stderr should reference E0142 and the unhandled op name `Choose.left`; \
+         got stderr={stderr:?}",
+    );
 }
 
-#[ignore = "Residual correctness gap from Slice 1's IO color filter \
-            retention — Native-color helpers do not unwind under \
-            user-installed discard-`k` IO handlers. Pinned per \
-            `[DEVIATION Task 57] IO color filter retention` in \
-            `PLAN_B_DEVIATIONS.md`; same structural hole Phase 4e \
-            closed for non-IO performs, deliberately left open here \
-            for the perf-preserving reason. Test asserts the future-\
-            correct (filter-lifted) behaviour. v2 task lifts \
-            `color::NATIVE_EFFECT` and the three codegen classifier \
-            filters, then un-ignores this test."]
+/// Plan B Stage 6 cleanup — **un-ignored from the previously
+/// `#[ignore]`'d
+/// `user_discard_k_io_handler_does_not_unwind_native_color_helper_-
+/// pending_color_filter_lift`**. The IO color filter retention
+/// (Task 57's perf-preserving choice) is lifted in Stage 6 cleanup:
+/// `color::NATIVE_EFFECT` deleted, three codegen body-shape
+/// classifier filters dropped, IO performs flow through the
+/// trampoline like any other effect. User-installed discard-`k`
+/// IO handlers now unwind helpers at the perform site, matching
+/// the algebraic semantics non-IO effects already enjoyed via
+/// Phase 4e captures+.
 #[test]
-fn user_discard_k_io_handler_does_not_unwind_native_color_helper_pending_color_filter_lift() {
+fn user_discard_k_io_handler_unwinds_helper_at_perform_site() {
     // Plan B Task 57 — pinning test for the residual correctness
     // gap from Slice 1's IO color filter retention. Mirrors the
     // `discard_k_handler_does_not_abort_helper_phase_4e_pending`
@@ -4782,43 +4780,29 @@ fn handle_with_nested_handle_in_return_arm_body_compiles() {
 }
 
 #[test]
-#[ignore]
-fn handle_with_bool_body_and_return_arm_uses_v_pending_proper_binding_ty() {
-    // Plan B Task 55 (Phase 4g) review-fix #3 PIN: the codegen
-    // pre-pass currently sets `HandlerReturnArmSynth.binding_ty
-    // = types::I64` as a placeholder (the pre-pass doesn't have
-    // direct access to the body's Cranelift type at AST-walk
-    // time). The synth fn binds `v` in the Lowerer env as I64,
-    // regardless of the body's actual type. When the body has
-    // type Bool (I8) and the return arm body uses `v` at narrow
-    // type (e.g., `not v`, `v && x`), the Lowerer expects v as
-    // I8 but env returns I64 — type mismatch in the lowered IR.
+fn handle_with_bool_body_and_return_arm_uses_v_at_narrow_type() {
+    // Plan B Stage 6 cleanup — **un-ignored from the previously
+    // `#[ignore]`'d `handle_with_bool_body_and_return_arm_uses_v_-
+    // pending_proper_binding_ty`**. The Phase 4g `binding_ty = I64`
+    // hardcode is resolved via option 2 (typecheck side-table):
+    // `CheckedProgram::handle_body_ty: BTreeMap<Span, Ty>` records
+    // the body type at typecheck time; codegen's return-arm pre-pass
+    // converts it to Cranelift type via `cranelift_ty_of_ty` and
+    // narrows `v` from the I64 args_ptr[0] slot to the correct
+    // type at synth-fn entry.
     //
-    // Concrete repro: `handle true with { return(v) => not v,
-    // ... }`. Body produces Bool (true); surrounding fn widens
-    // I8 → I64 for the trailing-pair packing; synth fn loads
-    // I64 from args_ptr[0] and binds `v` as I64 in env. Return
-    // arm body lowers `not v` — `not` expects I8, env has I64:
-    // verifier error.
+    // Body: `true` (BoolLit, Cranelift I8, widened to I64 for the
+    // trailing-pair packing). Return arm body: `if v { false } else
+    // { true }` — references `v` as Bool; the synth fn now loads
+    // I64, ireduce-narrows back to I8, binds `v: I8` in the Lowerer
+    // env. The `if` lowers cleanly with v: I8 cond.
     //
-    // Two resolution options for a follow-up commit:
-    //
-    //   - **Option 1 (forward):** thread body_ty from the
-    //     dispatch site (where `dfg.value_type(body_val)` is
-    //     known) into HandlerReturnArmSynth via mutable
-    //     side-table. Synth fn body emit reads the actual
-    //     binding_ty and narrows v on load.
-    //
-    //   - **Option 2 (typecheck side-table):** add
-    //     `CheckedProgram::handle_body_ty: BTreeMap<Span, Ty>`,
-    //     map Ty → Cranelift Type via existing `slot_kind_for_ty`
-    //     / `cranelift_ty_for_type_expr` family, store on
-    //     HandlerReturnArmSynth at pre-pass time.
-    //
-    // Mirrors the `discard_k_handler_does_not_abort_helper_phase_4e_pending`
-    // pin precedent (Phase 4d MVP); un-ignored at the resolution
-    // PR. This test would assert `compile_and_run` succeeds with
-    // stdout `false\n` (v=true → not v = false).
+    // Trace: handle's body produces `true` (I8). The surrounding fn
+    // widens to I64 for the trailing-pair Call to the return arm.
+    // The synth fn reads args_ptr[0] as I64, ireduces to I8, binds
+    // `v = true (I8)`. Return-arm body `if v { false } else { true }`
+    // → `false` (I8). The handle's overall = false; main's `if b`
+    // takes the else branch, prints "false\n", returns 1.
     let src = "effect Raise { fail: () -> Bool }\n\
                fn main() -> Int ![IO] {\n  \
                  let b: Bool = handle true with {\n    \
@@ -4833,7 +4817,10 @@ fn handle_with_bool_body_and_return_arm_uses_v_pending_proper_binding_ty() {
                    1\n  \
                  }\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_bool_body_v_pending_binding_ty");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    let (stdout, stderr, code) = compile_and_run(src, "stage_6_cleanup_bool_body_binding_ty");
+    assert_eq!(
+        code, 1,
+        "exit code; main returns 1 from the `if b` else branch; stderr={stderr:?}"
+    );
     assert_eq!(stdout, "false\n", "stdout mismatch; stderr={stderr:?}");
 }

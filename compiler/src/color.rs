@@ -127,39 +127,36 @@ impl ColoredProgram {
     }
 }
 
-/// The only effect treated as "pure" for native classification in
-/// Plan B v1. Post-Task-57, IO is a normal registry-driven effect
-/// at typecheck and codegen — it routes through `sigil_perform`
-/// like every other effect — but the colorer keeps it special-cased
-/// here as a **perf-preserving choice**: the top-level IO handler
-/// is always installed by the `main` shim, and `lower_perform_to_-
-/// value` wraps `sigil_perform` synchronously, so IO-only fns can
-/// stay Native-color without paying trampoline overhead per println.
-///
-/// **Residual correctness gap** (per `[DEVIATION Task 57] IO color
-/// filter retention` in `PLAN_B_DEVIATIONS.md`): a user-installed
-/// discard-`k` IO handler does not unwind a Native-color helper fn
-/// — the helper's `sigil_run_loop` synchronously returns Unit from
-/// the discard arm and execution continues past the perform site.
-/// Same hole Phase 4e closed for non-IO performs, deliberately
-/// left open here for the perf-preserving reason above. Pinned by
-/// `#[ignore]`'d e2e test `user_discard_k_io_handler_does_not_-
-/// unwind_native_color_helper_pending_color_filter_lift`. If this
-/// gap becomes user-visible (e.g. a Plan C IO override pattern
-/// requires algebraic discharge), lifting `NATIVE_EFFECT` and
-/// accepting the trampoline cost is the v2 path.
-///
-/// **Load-bearing invariant:** the top-level IO handler frame is
-/// always on the stack when user code runs (installed by
-/// `compiler/src/codegen.rs`'s `main` shim emit). If the shim
-/// regresses (wrong `effect_id`, missing `set_arm`, frame_new
-/// fails), Native-color fns doing `perform IO.println(...)` would
-/// `sigil_perform` against an unhandled effect and abort at runtime.
-/// `hello.sigil`'s e2e test exercises this end-to-end on every CI
-/// run; any regression in the shim wiring fails there immediately.
-///
-/// Anything else in the row (besides IO) makes the monomorph CPS.
-pub(crate) const NATIVE_EFFECT: &str = "IO";
+// Plan B Stage 6 cleanup — IO color filter lift (history note).
+//
+// Pre-cleanup, this module exposed `pub(crate) const NATIVE_EFFECT:
+// &str = "IO";` and three codegen body-shape classifiers carried a
+// matching IO exemption — together they kept IO-performing fns on
+// the Native-color path as a perf-preserving choice. The exemption
+// shipped with a documented residual correctness gap (per
+// `[DEVIATION Task 57] IO color filter retention`): a user-installed
+// discard-`k` IO handler did not unwind a Native-color helper fn —
+// the helper's synchronous `sigil_run_loop` returned Unit from the
+// discard arm and execution continued past the perform site (same
+// structural hole Phase 4e closed for non-IO performs).
+//
+// Stage 6 cleanup removed the exemption + the three codegen
+// classifier filters. Post-lift, IO is treated as an ordinary effect
+// by the colorer: a fn that performs IO (or has IO in its declared
+// row) classifies as CPS-color, just like any other effect. The
+// discard-`k` correctness goal is met for IO performs uniformly.
+// Perf cost is one trampoline dispatch per IO perform site
+// (typically dominated by the `sigil_println` syscall itself);
+// existing perf floors (`fib_perf <50ms`, `tree_example <500ms`,
+// `fib_cps_perf <500ms`) hold post-lift. See the inverted e2e
+// `user_discard_k_io_handler_unwinds_helper_at_perform_site` for the
+// post-lift behaviour assertion.
+//
+// Load-bearing invariant: the top-level IO handler frame installed
+// by the `main` shim covers every IO perform site that a user
+// program reaches. IO performs `sigil_perform` against an unhandled
+// effect and abort if the shim regresses. `hello.sigil`'s e2e test
+// exercises the shim end-to-end.
 
 /// Local (pre-propagation) classification of a single fn.
 #[derive(Clone, Debug)]
@@ -345,68 +342,64 @@ fn local_color(f: &FnDecl) -> LocalColor {
         return LocalColor::Cps("cps: open effect row".to_string());
     }
 
-    // (2) Any non-IO effect in the closed row → CPS. `![IO]` and `![]`
-    // are the two acceptable native shapes per Plan B's color spec.
-    for e in &f.effects {
-        if e != NATIVE_EFFECT {
-            return LocalColor::Cps(format!("cps: row contains effect `{e}`"));
-        }
+    // (2) **Stage 6 cleanup — IO color filter lifted.** Any effect in
+    // the closed row → CPS, including IO. Pre-lift, `![IO]` was the
+    // exempt row that kept fns on the Native-color path; post-lift,
+    // only `![]` (empty row, no perform sites) remains Native by
+    // virtue of having no effect to discharge. See the
+    // `NATIVE_EFFECT` lift framing above.
+    if let Some(e) = f.effects.first() {
+        return LocalColor::Cps(format!("cps: row contains effect `{e}`"));
     }
 
-    // (3) Walk the body for any `perform` of a non-IO effect. Even when
-    // the row is `![IO]`, a body that performs a non-IO effect would
-    // have been rejected by typecheck (E0042); but we still want to
-    // walk so the analysis is robust against synthetic monomorphs in
-    // tests and against future changes that loosen the typecheck rule.
-    if let Some(non_io) = find_non_io_perform_in_block(&f.body) {
-        return LocalColor::Cps(format!("cps: performs `{}.{}`", non_io.0, non_io.1));
+    // (3) Walk the body for any `perform`. Pre-lift, IO performs were
+    // exempt; post-lift, every perform site triggers CPS color. Even
+    // when the row is `![]`, a body that performs an effect would
+    // have been rejected by typecheck (E0042) — we still walk so the
+    // analysis is robust against synthetic monomorphs in tests and
+    // against future changes that loosen the typecheck rule.
+    if let Some(p) = find_any_perform_in_block(&f.body) {
+        return LocalColor::Cps(format!("cps: performs `{}.{}`", p.0, p.1));
     }
 
     // (4) Default native — pending the propagation pass.
-    LocalColor::Native(if f.effects.is_empty() {
-        "native: pure row".to_string()
-    } else {
-        "native: row is `![IO]`".to_string()
-    })
+    LocalColor::Native("native: pure row".to_string())
 }
 
 /// Walk a block's stmts and tail, descending into every nested
-/// expression, for the first `perform <effect>.<op>` whose effect is
-/// not `IO`. Returns `(effect, op)` of the first match found.
-fn find_non_io_perform_in_block(b: &Block) -> Option<(String, String)> {
+/// expression, for the first `perform <effect>.<op>`. Returns
+/// `(effect, op)` of the first match found. Stage 6 cleanup lifted
+/// the IO exemption — every perform now matches, mirroring the
+/// uniform-effect-treatment policy.
+fn find_any_perform_in_block(b: &Block) -> Option<(String, String)> {
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                if let Some(p) = find_non_io_perform_in_expr(&l.value) {
+                if let Some(p) = find_any_perform_in_expr(&l.value) {
                     return Some(p);
                 }
             }
             Stmt::Expr(e) => {
-                if let Some(p) = find_non_io_perform_in_expr(e) {
+                if let Some(p) = find_any_perform_in_expr(e) {
                     return Some(p);
                 }
             }
             Stmt::Perform(p) => {
-                if p.effect != NATIVE_EFFECT {
-                    return Some((p.effect.clone(), p.op.clone()));
-                }
-                for a in &p.args {
-                    if let Some(q) = find_non_io_perform_in_expr(a) {
-                        return Some(q);
-                    }
-                }
+                // Stage 6 cleanup: IO color filter lifted — every
+                // perform site triggers CPS color, including IO.
+                return Some((p.effect.clone(), p.op.clone()));
             }
         }
     }
     if let Some(t) = &b.tail {
-        if let Some(p) = find_non_io_perform_in_expr(t) {
+        if let Some(p) = find_any_perform_in_expr(t) {
             return Some(p);
         }
     }
     None
 }
 
-fn find_non_io_perform_in_expr(e: &Expr) -> Option<(String, String)> {
+fn find_any_perform_in_expr(e: &Expr) -> Option<(String, String)> {
     match e {
         Expr::IntLit(_, _)
         | Expr::StringLit(_, _)
@@ -415,47 +408,47 @@ fn find_non_io_perform_in_expr(e: &Expr) -> Option<(String, String)> {
         | Expr::Ident(_, _)
         | Expr::ClosureEnvLoad { .. } => None,
         Expr::Call { callee, args, .. } => {
-            if let Some(p) = find_non_io_perform_in_expr(callee) {
+            if let Some(p) = find_any_perform_in_expr(callee) {
                 return Some(p);
             }
             for a in args {
-                if let Some(p) = find_non_io_perform_in_expr(a) {
+                if let Some(p) = find_any_perform_in_expr(a) {
                     return Some(p);
                 }
             }
             None
         }
-        Expr::Perform(p) => find_non_io_perform_in_perform(p),
+        Expr::Perform(p) => find_any_perform_in_perform(p),
         Expr::Binary { lhs, rhs, .. } => {
-            find_non_io_perform_in_expr(lhs).or_else(|| find_non_io_perform_in_expr(rhs))
+            find_any_perform_in_expr(lhs).or_else(|| find_any_perform_in_expr(rhs))
         }
-        Expr::Unary { operand, .. } => find_non_io_perform_in_expr(operand),
+        Expr::Unary { operand, .. } => find_any_perform_in_expr(operand),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => find_non_io_perform_in_expr(cond)
-            .or_else(|| find_non_io_perform_in_block(then_block))
-            .or_else(|| find_non_io_perform_in_block(else_block)),
+        } => find_any_perform_in_expr(cond)
+            .or_else(|| find_any_perform_in_block(then_block))
+            .or_else(|| find_any_perform_in_block(else_block)),
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            if let Some(p) = find_non_io_perform_in_expr(scrutinee) {
+            if let Some(p) = find_any_perform_in_expr(scrutinee) {
                 return Some(p);
             }
             for MatchArm { body, .. } in arms {
-                if let Some(p) = find_non_io_perform_in_expr(body) {
+                if let Some(p) = find_any_perform_in_expr(body) {
                     return Some(p);
                 }
             }
             None
         }
-        Expr::Block(b) => find_non_io_perform_in_block(b),
-        Expr::Lambda { body, .. } => find_non_io_perform_in_expr(body),
+        Expr::Block(b) => find_any_perform_in_block(b),
+        Expr::Lambda { body, .. } => find_any_perform_in_expr(body),
         Expr::ClosureRecord { env_exprs, .. } => {
             for ex in env_exprs {
-                if let Some(p) = find_non_io_perform_in_expr(ex) {
+                if let Some(p) = find_any_perform_in_expr(ex) {
                     return Some(p);
                 }
             }
@@ -463,7 +456,7 @@ fn find_non_io_perform_in_expr(e: &Expr) -> Option<(String, String)> {
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                if let Some(p) = find_non_io_perform_in_expr(&f.value) {
+                if let Some(p) = find_any_perform_in_expr(&f.value) {
                     return Some(p);
                 }
             }
@@ -509,12 +502,12 @@ fn find_non_io_perform_in_expr(e: &Expr) -> Option<(String, String)> {
             ..
         } => {
             if let Some(ra) = return_arm {
-                if let Some(p) = find_non_io_perform_in_expr(&ra.body) {
+                if let Some(p) = find_any_perform_in_expr(&ra.body) {
                     return Some(p);
                 }
             }
             for arm in op_arms {
-                if let Some(p) = find_non_io_perform_in_expr(&arm.body) {
+                if let Some(p) = find_any_perform_in_expr(&arm.body) {
                     return Some(p);
                 }
             }
@@ -523,16 +516,10 @@ fn find_non_io_perform_in_expr(e: &Expr) -> Option<(String, String)> {
     }
 }
 
-fn find_non_io_perform_in_perform(p: &PerformExpr) -> Option<(String, String)> {
-    if p.effect != NATIVE_EFFECT {
-        return Some((p.effect.clone(), p.op.clone()));
-    }
-    for a in &p.args {
-        if let Some(q) = find_non_io_perform_in_expr(a) {
-            return Some(q);
-        }
-    }
-    None
+fn find_any_perform_in_perform(p: &PerformExpr) -> Option<(String, String)> {
+    // Stage 6 cleanup: IO color filter lifted — every perform site
+    // matches, including IO.
+    Some((p.effect.clone(), p.op.clone()))
 }
 
 /// Walk `b` and its nested expressions for top-level-fn references
@@ -875,7 +862,13 @@ mod tests {
     }
 
     #[test]
-    fn io_only_row_is_native() {
+    fn io_only_row_is_cps_post_stage_6_cleanup() {
+        // Stage 6 cleanup: IO color filter lifted — fns that perform
+        // IO (or have IO in their declared row) classify as CPS-color
+        // like any other effect. Pre-lift, `![IO]` rows kept fns on
+        // the Native-color path (the perf-preserving choice from
+        // Task 57's IO refactor); post-lift, the `discard-k IO
+        // handler doesn't unwind` correctness gap closes.
         let src = r#"
             import std.io
             fn main() -> Int ![IO] {
@@ -884,8 +877,8 @@ mod tests {
             }
         "#;
         let cp = color_from_src(src);
-        assert_eq!(color_of(&cp, "main"), Color::Native);
-        assert_eq!(reason_of(&cp, "main"), "native: row is `![IO]`");
+        assert_eq!(color_of(&cp, "main"), Color::Cps);
+        assert_eq!(reason_of(&cp, "main"), "cps: row contains effect `IO`");
     }
 
     #[test]
@@ -1155,6 +1148,7 @@ mod tests {
             op_ids: BTreeMap::new(),
             handle_arm_captures: BTreeMap::new(),
             handle_return_arm_captures: BTreeMap::new(),
+            handle_body_ty: BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
         MonoProgram { anf }
@@ -1170,10 +1164,14 @@ mod tests {
 
     #[test]
     fn non_io_effect_in_row_is_cps() {
+        // Stage 6 cleanup: IO color filter lifted — every effect in
+        // the row triggers CPS, and the reason names the FIRST effect
+        // in row order. For row `["IO", "Raise"]`, the first
+        // triggering effect is `IO`.
         let prog = synth_program(vec![synth_fn("raises", vec!["IO", "Raise"], empty_block())]);
         let cp = infer_colors(prog);
         assert_eq!(color_of(&cp, "raises"), Color::Cps);
-        assert_eq!(reason_of(&cp, "raises"), "cps: row contains effect `Raise`");
+        assert_eq!(reason_of(&cp, "raises"), "cps: row contains effect `IO`");
     }
 
     #[test]
@@ -1286,7 +1284,15 @@ mod tests {
     /// before the e2e test does — the failure points at color.rs not
     /// at codegen.
     #[test]
-    fn statement_form_non_io_perform_inside_handle_classifies_main_cps_via_bridge() {
+    fn statement_form_non_io_perform_inside_handle_classifies_main_cps() {
+        // Stage 6 cleanup: pre-lift, main with `![IO]` row was Native
+        // and inherited CPS via the bridge to `helper` (which is
+        // intrinsically CPS via `![E]`). Post-lift, main is
+        // intrinsically CPS via the `![IO]` row, so the bridge path
+        // doesn't apply for this test. The bridge mechanism itself
+        // still works for callers with empty rows that call CPS
+        // helpers — see `caller_with_empty_row_inherits_cps_via_-
+        // bridge` for the dedicated bridge-coverage test.
         let src = "effect E { op: () -> Int }\n\
                    fn helper() -> Int ![E] {\n  \
                      perform E.op();\n  \
@@ -1301,11 +1307,9 @@ mod tests {
         assert_eq!(color_of(&cp, "helper"), Color::Cps);
         assert_eq!(reason_of(&cp, "helper"), "cps: row contains effect `E`");
         assert_eq!(color_of(&cp, "main"), Color::Cps);
-        let main_reason = reason_of(&cp, "main");
-        assert!(
-            main_reason.contains("transitively calls `helper`"),
-            "got: {main_reason}"
-        );
+        // Post-lift, main's intrinsic-CPS via the IO row reason fires
+        // first; bridge-via-helper logic short-circuits.
+        assert_eq!(reason_of(&cp, "main"), "cps: row contains effect `IO`");
     }
 
     #[test]
@@ -1352,7 +1356,7 @@ mod tests {
     fn handle_body_with_only_direct_perform_keeps_caller_native_under_existing_local_rule() {
         // main() -> Int ![] { handle perform Raise.fail() with { Raise.fail(k) => 42 } }
         //
-        // Pins the `find_non_io_perform_in_expr` skip-the-handle-body
+        // Pins the `find_any_perform_in_expr` skip-the-handle-body
         // rule (line 414 in this file at HEAD). main's body has a
         // direct `perform Raise.fail()` syntactically inside the
         // handle's body; the local-walk explicitly does NOT descend
@@ -1391,7 +1395,7 @@ mod tests {
     fn handle_arm_body_performing_undischarged_effect_taints_caller_intrinsically() {
         // main() -> Int ![] { handle 0 with { Raise.fail(k) => perform Other.boom() } }
         //
-        // Pins the existing rule that `find_non_io_perform_in_expr`
+        // Pins the existing rule that `find_any_perform_in_expr`
         // **does** walk arm bodies. The arm body's perform of an
         // effect not in the handle's discharged set leaks into main's
         // intrinsic-CPS classification. Synthetic test only — typecheck
@@ -1534,10 +1538,17 @@ mod tests {
     }
 
     #[test]
-    fn perform_in_native_row_still_caught_by_body_walk() {
-        // Synthetic: declared row `![IO]` but body performs `Raise.fail`.
+    fn perform_in_empty_row_still_caught_by_body_walk() {
+        // Synthetic: declared row `![]` but body performs `Raise.fail`.
         // Real typecheck would reject this, but the body walk is the
-        // belt-and-braces classifier — we want to confirm it fires.
+        // belt-and-braces classifier — we want to confirm it fires
+        // when the row trigger doesn't.
+        //
+        // Stage 6 cleanup note: pre-lift, this test used row `![IO]`
+        // which was exempt from the row trigger; the body walk fired
+        // for the Raise perform. Post-lift, IO in the row triggers
+        // CPS immediately at the row check, masking the body walk.
+        // Use empty row `![]` to keep testing the body-walk path.
         let body = AstBlock {
             stmts: vec![Stmt::Perform(PerformExpr {
                 effect: "Raise".to_string(),
@@ -1548,7 +1559,7 @@ mod tests {
             tail: Some(Expr::IntLit(0, span())),
             span: span(),
         };
-        let prog = synth_program(vec![synth_fn("naughty", vec!["IO"], body)]);
+        let prog = synth_program(vec![synth_fn("naughty", vec![], body)]);
         let cp = infer_colors(prog);
         assert_eq!(color_of(&cp, "naughty"), Color::Cps);
         assert_eq!(reason_of(&cp, "naughty"), "cps: performs `Raise.fail`");
@@ -1556,6 +1567,8 @@ mod tests {
 
     #[test]
     fn dump_color_renders_one_line_per_fn_in_program_order() {
+        // Stage 6 cleanup: IO color filter lifted — `alpha` with
+        // `![IO]` is now CPS, mirroring `beta` with `![Raise]`.
         let a = synth_fn("alpha", vec!["IO"], empty_block());
         let b = synth_fn("beta", vec!["Raise"], empty_block());
         let prog = synth_program(vec![a, b]);
@@ -1563,14 +1576,14 @@ mod tests {
         let dump = dump_color(&cp);
         assert_eq!(
             dump,
-            "alpha native native: row is `![IO]`\nbeta cps cps: row contains effect `Raise`\n"
+            "alpha cps cps: row contains effect `IO`\nbeta cps cps: row contains effect `Raise`\n"
         );
     }
 
     #[test]
     fn lambda_body_perform_taints_parent() {
         // fn parent() -> Int ![] { let f = fn () -> Int ![] => { perform Raise.fail("x"); 0 }; 0 }
-        // The lambda body's perform is found by `find_non_io_perform_in_block`,
+        // The lambda body's perform is found by `find_any_perform_in_block`,
         // tainting the parent.
         let lambda_body = Expr::Block(Box::new(AstBlock {
             stmts: vec![Stmt::Perform(PerformExpr {
