@@ -465,6 +465,58 @@ fn fib_cps_perf_example_prints_6765_under_500ms() {
     );
 }
 
+/// Plan B Task 60 — performance floor #3: multi-shot Choose stress
+/// driver. Plan wording calls for "Multi-shot stress test (3-element
+/// Choose combinator, N=1000 iterations) in <5s on both hosts".
+///
+/// v1 ships single-binary-perform multi-shot pattern wrapped in an
+/// N=1000 recursive driver per `[DEVIATION Task 60]` — literal
+/// Cartesian-product 3-pick enumeration requires multi-perform helper
+/// bodies (chained-synth-cont extension; Plan-C-or-later territory
+/// pinned in `[DEVIATION Task 59]` for choose.sigil's two-flip pair
+/// generator). The v1 driver exercises iteration-scale multi-shot
+/// scalability (1000 fresh handler frames × 2 multi-shot k
+/// invocations per arm = 2000 multi-shot k invocations + 1000 fresh
+/// heap-reified k_closure records) rather than per-iteration
+/// combinator depth.
+///
+/// **Stress invariants:** every push/pop of a handler frame must
+/// complete cleanly across the 1000-deep sequence; every heap-
+/// reified k_closure must dispatch twice without leaking state into
+/// a later iteration's k_closure; the recursive `run(n)` driver
+/// must complete without stack overflow at N=1000 (Native ABI
+/// recursion, well within native stack capacity).
+///
+/// **Why stdout is `"0\n"`.** The driver returns 0 (run(0) = 0; the
+/// recursive case discards each iteration's handle-expression value
+/// via `let _ = ...`); main's `let _ = run(1000)` discards that too,
+/// and prints `int_to_string(0)` as a sentinel that the recursion
+/// completed successfully. Per-iteration values (1+2 = 3) don't
+/// reach stdout — the perf test focuses on dispatch throughput, not
+/// computed-value verification (the canonical Slice C 2-resume
+/// pattern is already pinned by `slice_c_choose_multi_shot_arm_-
+/// invokes_k_twice_with_different_args` and `choose_example_dual_-
+/// resume_returns_3`).
+///
+/// Invariant: stdout = "0\n", stderr = "", exit 0, wall-clock < 5s.
+#[test]
+fn multishot_perf_example_under_5s() {
+    let root = workspace_root();
+    let source = root.join("examples/multishot_perf.sigil");
+    let (stdout, stderr, code, elapsed) =
+        compile_file_and_run_timed(&source, "multishot_perf_example");
+    assert_eq!(code, 0, "multishot_perf.sigil exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "multishot_perf.sigil stdout must be exactly \"0\\n\" (sentinel \
+         indicating run(1000) completed)"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "multishot_perf.sigil wall-clock {elapsed:?} exceeds the 5s Plan B Task 60 floor (1000 iterations × 2 multi-shot resumes per arm)",
+    );
+}
+
 // ===== Plan A2 Task 24 — Stage-2 codegen additional coverage ================
 //
 // These tests use inline-source programs so the canonical
