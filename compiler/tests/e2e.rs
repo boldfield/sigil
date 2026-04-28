@@ -605,6 +605,42 @@ fn multishot_stress_example_returns_1530() {
     );
 }
 
+/// Plan B Task 59 — `examples/catch.sigil` exercises the canonical
+/// one-shot Raise + recovery pattern. Confirms that:
+///
+/// - `effect Raise { fail: () -> Int }` parses + typechecks; helper's
+///   `![Raise, IO]` row + main's `![IO]` row + the handle's
+///   `Raise.fail(k) => 42` arm discharge `Raise` cleanly;
+/// - the discard-`k` arm short-circuits `risky`'s tail (`result + input`
+///   = `42 + 7 = 49` would have been the use-`k` value); Phase 4e
+///   captures+'s colorer-handler-discharge refinement makes the arm's
+///   constant value `42` flow directly to the handle's
+///   `let recovered = ... ;` binding;
+/// - the captures-bearing helper synth-cont's closure record is
+///   allocated per the `[Phase 4e]` captures-bearing slice (the
+///   `input` user param threaded into the synth-cont's env),
+///   verifying that codegen still ALLOCATES the synth-cont path
+///   even when the arm doesn't invoke it (the synth-cont fn is
+///   defined; the arm just chooses not to dispatch into it).
+///
+/// Invariant: stdout = "42\n", stderr = "", exit 0.
+#[test]
+fn catch_example_recovers_with_42() {
+    let root = workspace_root();
+    let source = root.join("examples/catch.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "catch_example");
+    assert_eq!(code, 0, "catch exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "catch stdout mismatch (expected discard-k arm to recover with 42); \
+         stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "catch should not abort or warn; stderr should be empty"
+    );
+}
+
 /// Plan A2 task 32: a top-level user fn is direct-called from `main`.
 /// Every user fn takes a closure_ptr as its first Cranelift argument
 /// (always null for direct calls to a top-level fn with no captured
