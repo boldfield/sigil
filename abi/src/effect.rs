@@ -50,6 +50,27 @@ pub const NEXT_STEP_TAG_CALL: u32 = 1;
 /// auditing both sides.
 pub const MAX_INLINE_ARGS: u32 = 32;
 
+/// Maximum op-arms a single `HandlerFrame` can carry. Bounded by the
+/// 32-bit GC pointer-bitmap on `HandlerFrame`: arm `i`'s closure
+/// pointer lives at payload word `5 + 2*i`, so the highest reachable
+/// bit is `5 + 2*13 = 31` at `i = 13`. With `MAX_HANDLER_ARMS = 14`
+/// (i.e., `i ∈ [0, 13]`) the bitmap is fully utilised; one less and
+/// bit 31 stays empty. v1 effects ship with 1–3 ops; the cap is
+/// comfortably above realistic v1 needs.
+///
+/// Cross-boundary constant: the runtime's
+/// `sigil_handler_frame_new` overflow check
+/// (`runtime/src/handlers.rs`) and the compiler's codegen-walker
+/// per-effect arm-count cap (Plan B Task 55 Phase 4f polish round)
+/// both read this constant. Promoted to `sigil_abi::effect` from
+/// `sigil_runtime::handlers` at the Phase 4f polish-round commit so
+/// the walker can reject `MAX_HANDLER_ARMS + 1` arms-per-effect at
+/// compile time rather than runtime-aborting in
+/// `sigil_handler_frame_new`. Bumping it requires auditing both
+/// sides + the GC pointer-bitmap derivation in
+/// `runtime/src/handlers.rs::handler_frame_pointer_bitmap`.
+pub const MAX_HANDLER_ARMS: u32 = 14;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +92,14 @@ mod tests {
         // both read this constant, so a bump requires auditing both
         // sides + the GC test in `runtime/src/handlers.rs`.
         assert_eq!(MAX_INLINE_ARGS, 32);
+    }
+
+    #[test]
+    fn max_handler_arms_pinned_at_14() {
+        // Pinning the literal: the cap is structurally derived from
+        // the 32-bit GC pointer-bitmap on `HandlerFrame` (highest
+        // reachable bit = 5 + 2*13 = 31). Bumping requires growing
+        // the bitmap word size in `runtime/src/handlers.rs`.
+        assert_eq!(MAX_HANDLER_ARMS, 14);
     }
 }

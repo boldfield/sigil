@@ -104,14 +104,16 @@ type CpsFn = unsafe extern "C" fn(
     args_len: u32,
 ) -> *mut NextStep;
 
-/// Maximum op-arms a single handler frame can carry. Bounded by the
-/// 32-bit GC pointer-bitmap: arm `i`'s closure pointer lives at
-/// payload word `5 + 2*i`, so the highest reachable bit is `5 + 2*13 = 31`
-/// at `i = 13`. With `MAX_HANDLER_ARMS = 14` (i.e. `i ∈ [0, 13]`) the
-/// bitmap is fully utilised; one less and bit 31 stays empty. v1
-/// effects ship with 1–3 ops; the cap is comfortably above realistic
-/// v1 needs.
-pub const MAX_HANDLER_ARMS: u32 = 14;
+/// Maximum op-arms a single handler frame can carry. Re-exported from
+/// `sigil_abi::effect` (Plan B Task 55 Phase 4f polish round) so codegen
+/// and runtime read from the same source. Codegen-walker rejects
+/// per-effect arm counts above this at compile time
+/// (`compiler/src/codegen.rs`'s `unsupported_handle_construct`); the
+/// runtime's `sigil_handler_frame_new` retains its abort-on-overflow
+/// check as defense-in-depth. Bounded by the 32-bit GC pointer-bitmap
+/// on `HandlerFrame` (see `sigil_abi::effect::MAX_HANDLER_ARMS` for the
+/// derivation).
+pub use sigil_abi::effect::MAX_HANDLER_ARMS;
 
 /// Maximum user-arg count `sigil_perform` can carry through to a
 /// handler arm (plus the implicit `(k_closure_ptr, k_fn_ptr)` pair the

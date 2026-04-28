@@ -1001,29 +1001,257 @@ fn handle_with_two_arms_dispatches_correct_arm_by_op_id() {
 }
 
 #[test]
-fn handle_with_mixed_effect_arms_is_rejected_at_codegen() {
-    // Plan B Task 55 (Phase 4a restriction): multi-arm handlers
-    // must reference a single effect (the runtime
-    // `HandlerFrame.effect_id` is a single u32). Mixed-effect
-    // handlers need a frame-per-effect approach that lands in
-    // Phase 4e+. Until then, the codegen-entry guard rejects.
-    let src = "effect Raise { fail: () -> Int }\n\
-               effect Other { other: () -> Int }\n\
+fn handle_with_mixed_effect_arms_dispatches_correct_arm_per_effect() {
+    // Plan B Task 55 (Phase 4f) — INVERTED from
+    // `handle_with_mixed_effect_arms_is_rejected_at_codegen` (the
+    // Phase 4a-era rejection test). Multi-effect handlers now ship
+    // via the push-N-frames mechanism: the BTreeMap-grouping codegen
+    // emits one `HandlerFrame` per distinct effect with that effect's
+    // arms, pushed in BTreeMap-stable iteration order, popped in
+    // reverse at handle exit. See `[DEVIATION Task 55] Phase 4f` in
+    // `PLAN_B_DEVIATIONS.md` for the architectural rationale.
+    //
+    // Test structure: two handles, each with arms targeting BOTH
+    // declared effects. The first handle's body performs `Foo.f()`
+    // — the runtime stack walk finds the Foo frame and dispatches
+    // its arm (returns 7). The second handle's body performs
+    // `Bar.b()` — the walk finds the Bar frame and dispatches its
+    // arm (returns 11). The unused arm of each handle is set to a
+    // sentinel value (99); a misdispatch (e.g., wrong frame ordering
+    // causing an effect_id mismatch in the runtime walk) would print
+    // a non-18 result. Final assertion: stdout `18\n` (7 + 11).
+    //
+    // Bisecting hint: a regression here producing "stdout != 18"
+    // attributes to the BTreeMap-grouping loop in `Expr::Handle`
+    // codegen (each frame's arms must contain only ops belonging to
+    // that frame's effect_id; off-by-one in the partition lands a
+    // wrong arm under the wrong effect). A regression producing
+    // "TRAP_HANDLE_DISCIPLINE_VIOLATION (0x42)" attributes to the
+    // reverse-pop discipline (stray pop in body, or n_frames
+    // mismatch).
+    let src = "effect Foo { f: () -> Int }\n\
+               effect Bar { b: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle 42 with {\n    \
-                   Raise.fail(k) => 0,\n    \
-                   Other.other(k) => 1,\n  \
+                 let a: Int = handle (perform Foo.f()) with {\n    \
+                   Foo.f(k) => 7,\n    \
+                   Bar.b(k) => 99,\n  \
+                 };\n  \
+                 let b: Int = handle (perform Bar.b()) with {\n    \
+                   Foo.f(k) => 99,\n    \
+                   Bar.b(k) => 11,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(a + b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_mixed_effect_dispatches");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "18\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_two_effects_two_arms_each_dispatches_per_op() {
+    // Plan B Task 55, Phase 4f polish round — closes the per-effect-
+    // multiple-arms coverage gap left open by the inversion test
+    // (`handle_with_mixed_effect_arms_dispatches_correct_arm_per_effect`)
+    // which only exercised single-arm-per-effect groups. This test
+    // exercises 2 effects × 2 arms each: each effect's group becomes
+    // a single `HandlerFrame` with arm_count=2, populated via two
+    // `set_arm` calls before push.
+    //
+    // Four handles in main, each performing a different op of the
+    // same handle shape (all 4 arms registered every time). Sentinel
+    // values (1, 2, 3, 4) on each arm let a misdispatch announce
+    // itself loudly: a wrong-arm fire produces a non-matching int.
+    // Expected stdout: "1\n2\n3\n4\n" — one line per perform.
+    //
+    // Effects + op_ids (alphabetic):
+    //   E1.a -> op_id 0   E2.x -> op_id 0
+    //   E1.b -> op_id 1   E2.y -> op_id 1
+    // Each handle's E1 group has arm_count=2 covering op_ids [0, 2);
+    // E2 group same shape. Bounds checks all pass.
+    //
+    // Bisecting hint: `stdout != "1\n2\n3\n4\n"` attributes to
+    // BTreeMap-grouping or per-frame `set_arm` dispatch. A
+    // wrong-effect-arm landing produces e.g. "3\n2\n3\n4\n" (E1.a
+    // routing to E2's op_id 0 = x, returning 3 instead of 1).
+    let src = "effect E1 { a: () -> Int, b: () -> Int }\n\
+               effect E2 { x: () -> Int, y: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r1: Int = handle (perform E1.a()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 let r2: Int = handle (perform E1.b()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 let r3: Int = handle (perform E2.x()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 let r4: Int = handle (perform E2.y()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r1));\n  \
+                 perform IO.println(int_to_string(r2));\n  \
+                 perform IO.println(int_to_string(r3));\n  \
+                 perform IO.println(int_to_string(r4));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_2x2_dispatch");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n2\n3\n4\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_arms_in_reverse_source_order_produces_same_output() {
+    // Plan B Task 55, Phase 4f polish round — pins frame-push order
+    // to effect-id-lex-order (the BTreeMap's stable iteration), not
+    // to source-position-of-first-arm. Two handles in main with
+    // identical effects but the arms appearing in different source
+    // orders. Both must produce the same observable result.
+    //
+    // If the codegen accidentally iterated `op_arms` in source order
+    // rather than via the BTreeMap groups, the second handle's
+    // reversed-source arms would land in a different per-frame
+    // arm-slot ordering, surfacing as a misdispatch. The test
+    // catches the regression even though no bug exists today.
+    //
+    // Bisecting hint: `stdout != "7\n7\n"` attributes to source-
+    // order leaking through the BTreeMap-grouping abstraction (e.g.,
+    // a refactor that replaced the BTreeMap with a Vec).
+    let src = "effect AAA { go: () -> Int }\n\
+               effect BBB { go: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle (perform AAA.go()) with {\n    \
+                   AAA.go(k) => 7,\n    \
+                   BBB.go(k) => 99,\n  \
+                 };\n  \
+                 let b: Int = handle (perform AAA.go()) with {\n    \
+                   BBB.go(k) => 99,\n    \
+                   AAA.go(k) => 7,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_source_order_independent");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n7\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_one_effect_at_max_handler_arms_compiles_and_dispatches() {
+    // Plan B Task 55, Phase 4f polish round — verifies the per-frame
+    // arm-count cap (MAX_HANDLER_ARMS = 14, sized by the 32-bit GC
+    // pointer-bitmap on `HandlerFrame`) applies *per-effect-group*,
+    // not per-handle: this multi-effect handle has 14 Wide-effect
+    // arms (at the cap) plus 1 Other-effect arm, totalling 15 arms
+    // collectively. A per-handle cap of 14 would reject this; a per-
+    // frame cap of 14 accepts it (Wide group has 14 arms = at-cap;
+    // Other group has 1 arm = under-cap). Phase 4f's push-N-frames
+    // architecture allocates one frame per effect, so the cap
+    // applies per-frame.
+    //
+    // Performs Wide.op13 (the highest-numbered op, arm_count=14,
+    // op_id=13 → 13 < 14 satisfies the runtime bounds check) and
+    // asserts the matching arm fires.
+    //
+    // Bisecting hint: a "TRAP / abort in sigil_handler_frame_new"
+    // attributes to a per-frame cap regression introduced after this
+    // commit; "stdout != 14" attributes to dispatch landing the
+    // wrong arm.
+    let src = "effect Wide { \
+                 op00: () -> Int, op01: () -> Int, op02: () -> Int, \
+                 op03: () -> Int, op04: () -> Int, op05: () -> Int, \
+                 op06: () -> Int, op07: () -> Int, op08: () -> Int, \
+                 op09: () -> Int, op10: () -> Int, op11: () -> Int, \
+                 op12: () -> Int, op13: () -> Int }\n\
+               effect Other { only: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Wide.op13()) with {\n    \
+                   Wide.op00(k) => 0,\n    \
+                   Wide.op01(k) => 1,\n    \
+                   Wide.op02(k) => 2,\n    \
+                   Wide.op03(k) => 3,\n    \
+                   Wide.op04(k) => 4,\n    \
+                   Wide.op05(k) => 5,\n    \
+                   Wide.op06(k) => 6,\n    \
+                   Wide.op07(k) => 7,\n    \
+                   Wide.op08(k) => 8,\n    \
+                   Wide.op09(k) => 9,\n    \
+                   Wide.op10(k) => 10,\n    \
+                   Wide.op11(k) => 11,\n    \
+                   Wide.op12(k) => 12,\n    \
+                   Wide.op13(k) => 14,\n    \
+                   Other.only(k) => 99,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_at_max_handler_arms");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "14\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_one_effect_exceeding_max_handler_arms_is_rejected_at_codegen() {
+    // Plan B Task 55, Phase 4f polish round — negative case for the
+    // per-frame arm-count cap. A multi-effect handle with one
+    // effect at MAX_HANDLER_ARMS+1=15 arms must be rejected at
+    // **compile time** (clean codegen-walker diagnostic), not at
+    // runtime via `sigil_handler_frame_new`'s abort. The walker
+    // check landed in this same polish-round commit alongside the
+    // promotion of `MAX_HANDLER_ARMS` from `sigil_runtime::handlers`
+    // to `sigil_abi::effect`.
+    //
+    // Asserts a clean compile-time diagnostic mentioning
+    // `MAX_HANDLER_ARMS` and the offending effect name.
+    let src = "effect TooWide { \
+                 op00: () -> Int, op01: () -> Int, op02: () -> Int, \
+                 op03: () -> Int, op04: () -> Int, op05: () -> Int, \
+                 op06: () -> Int, op07: () -> Int, op08: () -> Int, \
+                 op09: () -> Int, op10: () -> Int, op11: () -> Int, \
+                 op12: () -> Int, op13: () -> Int, op14: () -> Int }\n\
+               effect Other { only: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 0 with {\n    \
+                   TooWide.op00(k) => 0,\n    \
+                   TooWide.op01(k) => 1,\n    \
+                   TooWide.op02(k) => 2,\n    \
+                   TooWide.op03(k) => 3,\n    \
+                   TooWide.op04(k) => 4,\n    \
+                   TooWide.op05(k) => 5,\n    \
+                   TooWide.op06(k) => 6,\n    \
+                   TooWide.op07(k) => 7,\n    \
+                   TooWide.op08(k) => 8,\n    \
+                   TooWide.op09(k) => 9,\n    \
+                   TooWide.op10(k) => 10,\n    \
+                   TooWide.op11(k) => 11,\n    \
+                   TooWide.op12(k) => 12,\n    \
+                   TooWide.op13(k) => 13,\n    \
+                   TooWide.op14(k) => 14,\n    \
+                   Other.only(k) => 99,\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_handle_mixed_effect_reject_{}.sigil",
+        "sigil_e2e_max_handler_arms_neg_{}.sigil",
         std::process::id()
     ));
     std::fs::write(&tmp, src).expect("write source");
     let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_handle_mixed_effect_reject_{}",
+        "sigil_e2e_max_handler_arms_neg_{}",
         std::process::id()
     ));
     let sigil_bin = sigil_binary();
@@ -1038,15 +1266,84 @@ fn handle_with_mixed_effect_arms_is_rejected_at_codegen() {
     let _ = std::fs::remove_file(&bin_path);
     assert!(
         !out.status.success(),
-        "compile must fail until Phase 4e ships; got success with stdout={:?} stderr={:?}",
+        "compile must fail — TooWide group has 15 arms, exceeds MAX_HANDLER_ARMS=14; \
+         got success with stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("Task 55") || stderr.contains("Phase 4") || stderr.contains("multi-effect"),
-        "error message should reference Plan B Task 55 / Phase 4 / multi-effect; got stderr={stderr:?}",
+        stderr.contains("MAX_HANDLER_ARMS") && stderr.contains("TooWide"),
+        "error should reference MAX_HANDLER_ARMS and the offending effect name; got stderr={stderr:?}",
     );
+}
+
+#[ignore = "Latent op_id/arm_count constraint pre-existing since Phase 4a; \
+            Phase 4f expanded the user-reachable surface but did not \
+            introduce or fix it. Resolution deferred to a separate \
+            post-Phase-4f task — see the 'Latent op_id/arm_count \
+            constraint' sub-section in `[DEVIATION Task 55] Phase 4f` \
+            in `PLAN_B_DEVIATIONS.md` for both options (1: convention \
+            fix; 2: typecheck E0142). Test asserts the future-correct \
+            option-1 behaviour."]
+#[test]
+fn partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution() {
+    // Plan B Task 55, Phase 4f — pinning test for the latent
+    // op_id/arm_count constraint surfaced during the Phase 4f
+    // codegen-lift mid-flight review (commit `65727c2`). Mirrors
+    // the Phase 4d MVP `discard_k_handler_does_not_abort_helper_
+    // phase_4e_pending` precedent: the test asserts the
+    // future-correct behaviour and is `#[ignore]`'d while the
+    // bug exists, so it stays grep-findable through the eventual
+    // fix.
+    //
+    // **The bug:** op_ids are assigned alphabetically per-effect at
+    // `compiler/src/typecheck.rs:792-808`, globally over the
+    // effect's full declared op set. Codegen sizes
+    // `arm_count` to the handle's arm count for that effect.
+    // Runtime bounds check `op_id < arm_count` at
+    // `runtime/src/handlers.rs:349` aborts when handlers don't
+    // cover the lowest-numbered op_ids contiguously.
+    //
+    // **Concrete failure:** `effect Choose { left, right }` with
+    // op_ids `left=0, right=1`; a handle with only
+    // `Choose.right(k) => 20` produces `arm_count=1, op_id=1` →
+    // `sigil_handler_frame_set_arm: op_id 1 out of range
+    // (arm_count=1)` and the program aborts at runtime instead of
+    // printing `20`.
+    //
+    // **Future resolution paths (one will land at the fix PR):**
+    //
+    // - **Option 1 (convention fix):** size `arm_count` to
+    //   `effects[arm.effect].ops.len()`; unhandled slots stay null
+    //   from the runtime's `sigil_handler_frame_new` zero-init.
+    //   `sigil_perform`'s null-arm-slot path
+    //   (`runtime/src/handlers.rs:706-712`) already aborts with a
+    //   clear "op X has no arm" diagnostic when a perform reaches
+    //   an unhandled op. **Under option 1, this test passes
+    //   un-`#[ignore]`'d** with `stdout = "20\n"` — the perform
+    //   targets a covered op (`Choose.right`), `op_id=1 <
+    //   arm_count=2` (now sized to the effect's declared op
+    //   count), bounds check passes, dispatch lands the matching
+    //   arm, returns 20.
+    //
+    // - **Option 2 (typecheck fix, E0142):** require handles to
+    //   be exhaustive over the matched effect's ops. Under option
+    //   2, the future fix-PR rewrites this test to assert a
+    //   compile-time E0142 rejection instead.
+    //
+    // The fix-PR un-ignores + reshapes per the chosen resolution.
+    let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Choose.right()) with {\n    \
+                   Choose.right(k) => 20,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "partial_handler_multi_op");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "20\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]
@@ -1114,18 +1411,29 @@ fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
     // Plan B Task 55 — regression for the walker recursion bug: a
     // nested `handle` appearing in another handle's body must surface
     // its own Phase-4 restrictions. Before the fix, the outer
-    // walker only recursed into arm bodies, so the inner handle's
-    // multi-effect restriction (Phase 4e) was missed and the program
-    // would have reached codegen with arms registered under the wrong
-    // `effect_id` — at runtime that crashes inside `sigil_perform`'s
+    // walker only recursed into arm bodies, so an inner handle's
+    // codegen-pending restrictions were missed and the program would
+    // have reached codegen with arms registered under unexpected
+    // shapes — at runtime that crashes inside `sigil_perform`'s
     // handler-stack walk.
-    let src = "effect A { op1: () -> Int }\n\
-               effect B { op2: () -> Int }\n\
-               effect Outer { op: () -> Int }\n\
+    //
+    // **Phase 4f update:** the original sentinel for this regression
+    // was the inner handle's multi-effect restriction. Phase 4f lifts
+    // that restriction (multi-effect handles now ship via push-N-
+    // frames), so this test swaps to the next-pending inner-handle
+    // restriction: a `return` arm, deferred to Phase 4g per
+    // `[DEVIATION Task 55] Phase 4f` concern #2's contract. The
+    // walker-recursion regression coverage is preserved — only the
+    // sentinel changed.
+    let src = "effect Inner { op_in: () -> Int }\n\
+               effect Outer { op_out: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle\n    \
-                   (handle 0 with { A.op1(k) => 1, B.op2(k) => 2 })\n  \
-                 with { Outer.op(k) => 0 };\n  \
+                   (handle 0 with {\n      \
+                     return(v) => v,\n      \
+                     Inner.op_in(k) => 1,\n    \
+                   })\n  \
+                 with { Outer.op_out(k) => 0 };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
@@ -1150,14 +1458,14 @@ fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
     let _ = std::fs::remove_file(&bin_path);
     assert!(
         !out.status.success(),
-        "compile must fail — inner nested handle is multi-effect; got success with stdout={:?} stderr={:?}",
+        "compile must fail — inner nested handle has a `return` arm (Phase 4g pending); got success with stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("multi-effect") || stderr.contains("Phase 4"),
-        "error message should reference the inner handle's multi-effect restriction; got stderr={stderr:?}",
+        stderr.contains("return") || stderr.contains("Phase 4"),
+        "error message should reference the inner handle's `return`-arm restriction; got stderr={stderr:?}",
     );
 }
 
