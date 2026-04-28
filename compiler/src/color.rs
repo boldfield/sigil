@@ -1126,6 +1126,7 @@ mod tests {
             effect_ids: BTreeMap::new(),
             op_ids: BTreeMap::new(),
             handle_arm_captures: BTreeMap::new(),
+            handle_return_arm_captures: BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
         MonoProgram { anf }

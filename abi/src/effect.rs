@@ -71,6 +71,37 @@ pub const MAX_INLINE_ARGS: u32 = 32;
 /// `runtime/src/handlers.rs::handler_frame_pointer_bitmap`.
 pub const MAX_HANDLER_ARMS: u32 = 14;
 
+/// Byte offset of `HandlerFrame::return_fn` within the `#[repr(C)]`
+/// struct (`runtime/src/handlers.rs`'s `HandlerFrame`). Pinned here so
+/// codegen (Plan B Task 55 Phase 4g) can read the slot directly off
+/// the `frame_1_ptr_snapshot` SSA Value at handle exit, rather than
+/// going through a runtime FFI accessor — Phase 4g's "no new FFI
+/// required" architectural choice (per `[DEVIATION Task 55] Phase 4g`
+/// in `PLAN_B_DEVIATIONS.md`).
+///
+/// Layout context (struct fields in declaration order):
+///
+/// ```text
+///   offset  0: effect_id        (u32, 4 bytes)
+///   offset  4: arm_count        (u32, 4 bytes)
+///   offset  8: return_fn        (*mut u8, 8 bytes)   ← here
+///   offset 16: return_closure   (*mut u8, 8 bytes)
+///   offset 24: prev             (*mut HandlerFrame)
+///   offset 32: arms[]           (variable-length)
+/// ```
+///
+/// Cross-boundary constant: `runtime/src/handlers.rs`'s
+/// `compile_assertions` test asserts this constant equals
+/// `core::mem::offset_of!(HandlerFrame, return_fn)` so a future
+/// struct reorder breaks at the test rather than silently miscompiling
+/// in codegen.
+pub const HANDLER_FRAME_RETURN_FN_OFF: i32 = 8;
+
+/// Byte offset of `HandlerFrame::return_closure` within the
+/// `#[repr(C)]` struct. Pinned for the same reason as
+/// `HANDLER_FRAME_RETURN_FN_OFF`; see that constant's docs.
+pub const HANDLER_FRAME_RETURN_CLOSURE_OFF: i32 = 16;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +132,17 @@ mod tests {
         // reachable bit = 5 + 2*13 = 31). Bumping requires growing
         // the bitmap word size in `runtime/src/handlers.rs`.
         assert_eq!(MAX_HANDLER_ARMS, 14);
+    }
+
+    #[test]
+    fn handler_frame_return_offsets_pinned() {
+        // Pinning the literal byte offsets: codegen Phase 4g reads
+        // `return_fn` and `return_closure` directly off the
+        // `frame_1_ptr_snapshot` Value at handle exit. The
+        // `compile_assertions` test in `runtime/src/handlers.rs`
+        // pairs with this one to assert the constants match
+        // `offset_of!(HandlerFrame, ...)`.
+        assert_eq!(HANDLER_FRAME_RETURN_FN_OFF, 8);
+        assert_eq!(HANDLER_FRAME_RETURN_CLOSURE_OFF, 16);
     }
 }

@@ -1417,56 +1417,39 @@ fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
     // shapes — at runtime that crashes inside `sigil_perform`'s
     // handler-stack walk.
     //
-    // **Phase 4f update:** the original sentinel for this regression
-    // was the inner handle's multi-effect restriction. Phase 4f lifts
-    // that restriction (multi-effect handles now ship via push-N-
-    // frames), so this test swaps to the next-pending inner-handle
-    // restriction: a `return` arm, deferred to Phase 4g per
-    // `[DEVIATION Task 55] Phase 4f` concern #2's contract. The
-    // walker-recursion regression coverage is preserved — only the
-    // sentinel changed.
+    // **Phase 4g update:** the prior sentinel was an inner handle
+    // with a `return` arm (Phase 4g-pending). Phase 4g lifts that —
+    // return arms are now supported. Both Phase 4f (multi-effect)
+    // and Phase 4g (return arms) sentinels are gone; this test
+    // becomes a **positive** assertion that an inner nested handle
+    // with both an op-arm and a `return(v) => body` arm compiles
+    // cleanly and runs end-to-end. The walker-recursion regression
+    // coverage is now exercised by
+    // `nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen`
+    // below — the still-rejected inner-handle restriction is a
+    // nested `Lambda` / `ClosureRecord` in an arm body.
+    //
+    // Body math: inner `handle 0 with { return(v) => v + 1, ...}`
+    // — body completes normally with value 0; return arm fires with
+    // `v = 0` and returns `0 + 1 = 1`. Outer `handle 1 with
+    // { Outer.op_out(k) => 0 }` — body produces 1, no perform fires
+    // so no op arm runs; without a return arm, the handle's overall
+    // value is the body's value = 1. main prints "1\n".
     let src = "effect Inner { op_in: () -> Int }\n\
                effect Outer { op_out: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle\n    \
                    (handle 0 with {\n      \
-                     return(v) => v,\n      \
+                     return(v) => v + 1,\n      \
                      Inner.op_in(k) => 1,\n    \
                    })\n  \
                  with { Outer.op_out(k) => 0 };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_nested_handle_walker_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_nested_handle_walker_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail — inner nested handle has a `return` arm (Phase 4g pending); got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("return") || stderr.contains("Phase 4"),
-        "error message should reference the inner handle's `return`-arm restriction; got stderr={stderr:?}",
-    );
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_nested_inner_return_arm");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 // Phase 4c lifted the Phase 3b "IntLit-only arm body" restriction; the
@@ -3710,4 +3693,404 @@ fn slice_c_multi_let_arm_body_with_different_callee_in_second_let_is_rejected_at
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+}
+
+// ============================================================
+// Plan B Task 55, Phase 4g — return arms via synth return fn
+// registered on the first-pushed frame, codegen-driven dispatch.
+// See `[DEVIATION Task 55] Phase 4g` in PLAN_B_DEVIATIONS.md.
+// ============================================================
+
+#[test]
+fn handle_with_return_arm_transforms_body_value_no_op_arms_fired() {
+    // Plan B Task 55 (Phase 4g) — happy-path: handle body completes
+    // normally (no perform), the return arm fires with the body's
+    // value bound to `v`, transforms it, and the handle's overall
+    // value is the return arm's result.
+    //
+    // `handle 5 with { return(v) => v * 2 + 1, Raise.fail(k) => -1 }`
+    // — body produces 5; no Raise.fail performed; return arm fires
+    // with v=5 and returns 5*2+1 = 11. main prints "11\n".
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 5 with {\n    \
+                   return(v) => v * 2 + 1,\n    \
+                   Raise.fail(k) => 0 - 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_return_arm_no_perform");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "11\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_return_arm_fires_on_op_arm_discharge_value() {
+    // Plan B Task 55 (Phase 4g) — semantic pin: return arms fire on
+    // the value the body **yields**, regardless of whether that
+    // value comes from the body completing normally OR from an op
+    // arm discharging the perform without invoking `k`. This
+    // matches Koka / Effekt standard algebraic-effects semantics:
+    // the return clause runs over whatever value flows out of the
+    // body (including non-resuming op-arm tail values). It is NOT
+    // the case that op-arm dispatch "skips" the return arm.
+    //
+    // `handle (perform Raise.fail()) with { Raise.fail(k) => 99,
+    //  return(v) => v * 100 }` — body performs Raise.fail; op arm
+    // fires returning 99 (without calling `k`); the 99 flows out
+    // as the body's yielded value; return arm fires with v=99
+    // → 99*100 = 9900. main prints "9900\n".
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Raise.fail()) with {\n    \
+                   Raise.fail(k) => 99,\n    \
+                   return(v) => v * 100,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_op_arm_value_via_return_arm");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "9900\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_return_arm_captures_outer_fn_local() {
+    // Plan B Task 55 (Phase 4g) — return arm body can capture
+    // outer-fn locals via the same closure-record mechanism Phase 4d
+    // shipped for op arms. typecheck-side
+    // `handle_return_arm_captures` records the captures; codegen
+    // pre-pass rewrites Idents → ClosureEnvLoad, allocates a closure
+    // record at handle entry, and passes the pointer as
+    // `closure_ptr` to `sigil_handler_frame_set_return`. The synth
+    // return fn body's `Expr::ClosureEnvLoad` resolves against
+    // `closure_ptr` at runtime.
+    //
+    // `let scale = 7; handle 4 with { return(v) => v * scale, ... }`
+    // — body produces 4; return arm fires with v=4, captures scale=7
+    // → returns 4*7 = 28.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let scale: Int = 7;\n  \
+                 let n: Int = handle 4 with {\n    \
+                   return(v) => v * scale,\n    \
+                   Raise.fail(k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_return_arm_captures");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "28\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_return_arm_in_multi_effect_handle_first_frame_contract() {
+    // Plan B Task 55 (Phase 4g) — return arm on a multi-effect
+    // handle. Per `[DEVIATION Task 55] Phase 4f` concern #2
+    // pre-commitment, the return arm registers on the **first-pushed
+    // (bottom-of-handle-group) frame**. Pushed order is BTreeMap-
+    // stable (effect-name lex order), so for effects `Foo` and `Bar`
+    // the first-pushed frame is the `Bar` group's. This test pins
+    // the semantics: regardless of which effect's group is
+    // "first-pushed", the return arm fires on Done with the body's
+    // value bound to `v`.
+    //
+    // `handle 3 with { Foo.f(k) => 100, Bar.b(k) => 200, return(v)
+    // => v * 10 }` — body produces 3 (no perform); return arm fires
+    // with v=3 → 30.
+    let src = "effect Foo { f: () -> Int }\n\
+               effect Bar { b: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 3 with {\n    \
+                   Foo.f(k) => 100,\n    \
+                   Bar.b(k) => 200,\n    \
+                   return(v) => v * 10,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_return_arm_multi_effect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "30\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_return_arm_body_performs_io() {
+    // Plan B Task 55 (Phase 4g) — return arm body can perform IO
+    // (or any effect declared in the surrounding fn's row). The
+    // synth return fn's body lowering routes through the regular
+    // Lowerer; IO performs go through the same machinery as
+    // anywhere else. Typecheck verified the return arm body
+    // type-checks under the **caller's row** (not the body's
+    // discharged row).
+    //
+    // `handle 42 with { Raise.fail(k) => 0, return(v) => { perform
+    // IO.println("done"); v } }` — body=42, no perform; return arm
+    // runs: prints "done", returns v=42. Output: "done\n42\n".
+    // Raise.fail op arm never fires (body has no perform); it
+    // exists only to satisfy parser's at-least-one-op-arm rule.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 42 with {\n    \
+                   return(v) => {\n      \
+                     perform IO.println(\"done\");\n      \
+                     v\n    \
+                   },\n    \
+                   Raise.fail(k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_return_arm_body_io");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "done\n42\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_return_arm_body_type_differs_from_body_type() {
+    // Plan B Task 55 (Phase 4g) — return arm body's type may
+    // differ from the handle body's type (typecheck binds `v:
+    // body_ty` and unifies `handler_overall == ra.body's type`).
+    // Codegen narrows the trampoline result back to the
+    // handler-overall type per `lower_perform_non_io_to_value`'s
+    // narrow-back discipline. This test exercises the narrow-back
+    // path: body type = Int (I64), return-arm body type = Bool (I8)
+    // — handle's overall type is Bool, narrowed via `ireduce` from
+    // the I64 trampoline result.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let big: Bool = handle 100 with {\n    \
+                   return(v) => v > 50,\n    \
+                   Raise.fail(k) => false,\n  \
+                 };\n  \
+                 if big {\n    \
+                   perform IO.println(\"big\");\n    \
+                   0\n  \
+                 } else {\n    \
+                   perform IO.println(\"small\");\n    \
+                   1\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_return_arm_narrow_to_bool");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "big\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_constant_return_arm_overrides_op_arm_yield() {
+    // Plan B Task 55 (Phase 4g) — combined coverage: when the
+    // return arm body is a constant (ignoring `v`), it overrides
+    // whatever value flows out of the body — including non-
+    // resuming op-arm tail values. The op arm fires (perform
+    // dispatched), yields 7; return arm body is `999` (constant);
+    // handle's overall value = 999. Pins both (a) registering both
+    // op + return arms on the same frame doesn't break op-arm
+    // dispatch (the perform path still works), and (b) the return
+    // arm runs over the op-arm-yielded value per the standard
+    // semantics demonstrated by
+    // `handle_with_return_arm_fires_on_op_arm_discharge_value`.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Raise.fail()) with {\n    \
+                   Raise.fail(k) => 7,\n    \
+                   return(v) => 999,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_constant_return_overrides_op");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "999\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen() {
+    // Plan B Task 55 (Phase 4g) — walker-recursion regression
+    // sentinel post-Phase-4g. The previous sentinel
+    // (`nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic`)
+    // used inner-handle-with-return-arm; Phase 4g lifted that. This
+    // new sentinel uses inner-handle-with-nested-Lambda-in-arm-body
+    // — still rejected per the Phase 4d closure-convert restriction
+    // (lambdas in arm bodies need a closure-convert side-table
+    // extension distinct from Phase 4d MVP). Coverage: the outer
+    // walker must recurse into the inner `handle`'s arm body and
+    // surface the Lambda rejection.
+    //
+    // The inner handle's `Outer.op_in(k) =>` arm body contains a
+    // synthetic-Lambda IIFE (the only way to introduce a lambda in
+    // expression position under Sigil v1's surface — same pattern
+    // as Phase 4c's `arm_inside_lambda_captures_outer_via_closure_env_load`).
+    let src = "effect Inner { op_in: () -> Int }\n\
+               effect Outer { op_out: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle\n    \
+                   (handle 0 with {\n      \
+                     Inner.op_in(k) => (fn (x: Int) -> Int ![] => x + 1)(0),\n    \
+                   })\n  \
+                 with { Outer.op_out(k) => 0 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase_4g_walker_recursion_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_phase_4g_walker_recursion_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail — inner nested handle has a Lambda/ClosureRecord in arm \
+         body (still pending); got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("lambda") || stderr.contains("closure") || stderr.contains("Lambda"),
+        "error message should reference the inner handle's Lambda/ClosureRecord \
+         restriction; got stderr={stderr:?}",
+    );
+}
+
+#[test]
+fn handle_with_return_arm_inside_match_arm_compiles() {
+    // Plan B Task 55 (Phase 4g) review-fix #2: regression test
+    // for the `Lowerer::type_of_expr` `Expr::Handle` arm not
+    // pre-binding `v` into preview before recursing. Prior to the
+    // fix, callers that didn't pre-bind `v` (e.g., `lower_match`'s
+    // arm-body type predictor) would recurse into an
+    // `Expr::Ident("v")` against a preview without `v` and hit the
+    // `unreachable!` ident-lookup path. The repro shape: a handle
+    // expression with a return arm that references `v` sitting
+    // inside a `match` arm body — the predictor at codegen.rs
+    // around line 8323 calls `type_of_expr(&arms[0].body, &preview)`
+    // with whatever preview was inherited from the surrounding
+    // scope, NOT pre-binding `v` itself.
+    //
+    // Without the fix, this program hits `unreachable!` at codegen
+    // time. With the fix, it compiles cleanly and prints "10\n"
+    // (match scrutinee 5, arm body is `handle 5 with { return(v)
+    // => v + 5, ... }`, return arm fires with v=5 → 5+5=10).
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let scrut: Int = 5;\n  \
+                 let n: Int = match scrut {\n    \
+                   _ => handle 5 with {\n      \
+                     return(v) => v + 5,\n      \
+                     Raise.fail(k) => 0,\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_handle_inside_match_arm");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "10\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_nested_handle_in_return_arm_body_compiles() {
+    // Plan B Task 55 (Phase 4g) — review-fix follow-up to review
+    // #1's forward observation. The deviation entry's concern #5
+    // claims nested `Expr::Handle` is allowed in return arm bodies
+    // as a freebie (Phase 4f's machinery extends transparently via
+    // `Lowerer::lower_expr`'s recursive arm; pre-pass already
+    // recurses into return arm bodies for FuncId allocation). This
+    // test pins that claim with a concrete positive case.
+    //
+    // Outer handle: `handle 4 with { return(v) => <inner-handle>,
+    // Foo.f(k) => 0 }`. The return arm body is itself a handle:
+    // `handle (v + 1) with { Bar.b(k) => 0, return(w) => w * 2 }`.
+    // No performs fire; outer body produces 4; outer return arm
+    // fires with v=4; outer return arm body = inner handle, body
+    // = v+1 = 5; inner return arm fires with w=5 → 5*2 = 10.
+    // Final: 10.
+    let src = "effect Foo { f: () -> Int }\n\
+               effect Bar { b: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 4 with {\n    \
+                   return(v) => handle (v + 1) with {\n      \
+                     return(w) => w * 2,\n      \
+                     Bar.b(k) => 0,\n    \
+                   },\n    \
+                   Foo.f(k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_nested_handle_in_return_arm");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "10\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+#[ignore]
+fn handle_with_bool_body_and_return_arm_uses_v_pending_proper_binding_ty() {
+    // Plan B Task 55 (Phase 4g) review-fix #3 PIN: the codegen
+    // pre-pass currently sets `HandlerReturnArmSynth.binding_ty
+    // = types::I64` as a placeholder (the pre-pass doesn't have
+    // direct access to the body's Cranelift type at AST-walk
+    // time). The synth fn binds `v` in the Lowerer env as I64,
+    // regardless of the body's actual type. When the body has
+    // type Bool (I8) and the return arm body uses `v` at narrow
+    // type (e.g., `not v`, `v && x`), the Lowerer expects v as
+    // I8 but env returns I64 — type mismatch in the lowered IR.
+    //
+    // Concrete repro: `handle true with { return(v) => not v,
+    // ... }`. Body produces Bool (true); surrounding fn widens
+    // I8 → I64 for the trailing-pair packing; synth fn loads
+    // I64 from args_ptr[0] and binds `v` as I64 in env. Return
+    // arm body lowers `not v` — `not` expects I8, env has I64:
+    // verifier error.
+    //
+    // Two resolution options for a follow-up commit:
+    //
+    //   - **Option 1 (forward):** thread body_ty from the
+    //     dispatch site (where `dfg.value_type(body_val)` is
+    //     known) into HandlerReturnArmSynth via mutable
+    //     side-table. Synth fn body emit reads the actual
+    //     binding_ty and narrows v on load.
+    //
+    //   - **Option 2 (typecheck side-table):** add
+    //     `CheckedProgram::handle_body_ty: BTreeMap<Span, Ty>`,
+    //     map Ty → Cranelift Type via existing `slot_kind_for_ty`
+    //     / `cranelift_ty_for_type_expr` family, store on
+    //     HandlerReturnArmSynth at pre-pass time.
+    //
+    // Mirrors the `discard_k_handler_does_not_abort_helper_phase_4e_pending`
+    // pin precedent (Phase 4d MVP); un-ignored at the resolution
+    // PR. This test would assert `compile_and_run` succeeds with
+    // stdout `false\n` (v=true → not v = false).
+    let src = "effect Raise { fail: () -> Bool }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let b: Bool = handle true with {\n    \
+                   return(v) => if v { false } else { true },\n    \
+                   Raise.fail(k) => true,\n  \
+                 };\n  \
+                 if b {\n    \
+                   perform IO.println(\"true\");\n    \
+                   0\n  \
+                 } else {\n    \
+                   perform IO.println(\"false\");\n    \
+                   1\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_bool_body_v_pending_binding_ty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "false\n", "stdout mismatch; stderr={stderr:?}");
 }

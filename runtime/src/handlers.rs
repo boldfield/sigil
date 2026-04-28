@@ -1374,6 +1374,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn handler_frame_return_offsets_match_abi_constants() {
+        // Plan B Task 55 Phase 4g: codegen reads `return_fn` and
+        // `return_closure` directly off `frame_1_ptr_snapshot` at
+        // handle exit using the offset constants in `sigil_abi::effect`.
+        // This test pins the runtime struct's `#[repr(C)]` field
+        // offsets to match those constants — a future struct reorder
+        // breaks this test rather than silently miscompiling in
+        // codegen.
+        assert_eq!(
+            core::mem::offset_of!(HandlerFrame, return_fn),
+            sigil_abi::effect::HANDLER_FRAME_RETURN_FN_OFF as usize
+        );
+        assert_eq!(
+            core::mem::offset_of!(HandlerFrame, return_closure),
+            sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF as usize
+        );
+    }
+
     // ----------------------------------------------------------------
     // 3+ deep prev chain (review item #10)
     // ----------------------------------------------------------------
