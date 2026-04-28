@@ -63,8 +63,20 @@
 // op-args. It CAN reference `r1` (the let-1 binding, present in
 // post_arm_k_1's env). The chained expression `r1 + 100` produces
 // the same 200+seed value as `arg + 200` would; the closed-form sum
-// is identical. See `examples/choose_demo.sigil`'s docstring and
-// `[DEVIATION Task 58]` for the architectural framing.
+// is identical. The walker rejects `arg2_expr` referencing user
+// op-args with a clean Slice-C-arg2 diagnostic; threading user
+// op-args INTO `post_arm_k_1`'s closure record (lifting the
+// restriction rather than diagnosing it) remains future work. See
+// `examples/choose_demo.sigil`'s docstring and `[DEVIATION Task 58]`
+// for the architectural framing.
+//
+// Note: the source-level chain `r2 = k(r1 + 100)` creates a
+// computation dependency on `r1` but does NOT couple the two
+// dispatches at the runtime level — each k(v) drives an independent
+// trampoline cycle through the helper synth-cont. The 10 distinct
+// dispatch events (5 handles × 2 resumes) execute independently;
+// only the inputs to the second dispatch in each handle are
+// computed from the first dispatch's output.
 //
 // Invariant: stdout reads `1530\n` and the program exits 0.
 

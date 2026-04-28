@@ -41,11 +41,27 @@
 // binding, which IS in `post_arm_k_1`'s env at line 6441-6442). This
 // example uses `r1 + 10` for `arg2_expr` — exercising the
 // post_arm_k_1-env-lookup path on the let-1 binding while still
-// producing distinct k inputs (15, 25). A future Slice C captures-
-// bearing extension lifts this restriction by threading user op-args
-// into `post_arm_k_1`'s closure record. Today the walker does not
-// reject `arg2_expr` referencing user op-args (latent gap; codegen
-// panics with `unknown ident \`arg\`` instead of a clean diagnostic).
+// producing distinct k inputs (15, 25). The walker rejects
+// `arg2_expr` referencing user op-args with a clean Slice-C-arg2
+// diagnostic (per `slice_c_arg2_referencing_user_op_arg_is_rejected
+// _at_codegen` at compiler/tests/e2e.rs); pre-walker-fix the panic
+// at codegen.rs:7765 was the only signal. Threading user op-args
+// INTO `post_arm_k_1`'s closure record (lifting the restriction
+// rather than diagnosing it) remains future work — see `[DEVIATION
+// Task 58]`'s "Structural fix" sub-section for the closure-point
+// framing.
+//
+// **Independence semantics, source-level vs. runtime.** The two
+// resumes `k(arg + 10)` and `k(r1 + 10)` create a source-level
+// data dependency (r2's input is computed from r1's output), but
+// at runtime the multi-shot dispatch invokes the helper synth-cont
+// independently for each k call: k(15) drives the helper to
+// completion with x=15 → 15, then k(25) drives a SECOND independent
+// dispatch with x=25 → 25. The dependency is in HOW the input is
+// computed, not in whether the dispatches are independent. A future
+// captures-bearing extension PR will lift the constraint and let
+// programs use literal-independent inputs like `k(arg + 20)` for
+// `arg2_expr`.
 //
 // Invariant: stdout reads `40\n` and the program exits 0.
 //
