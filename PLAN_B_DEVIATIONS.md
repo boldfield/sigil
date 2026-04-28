@@ -2304,4 +2304,4 @@ The selected approach is consistent with Plan B's "do not implement Stage 7+ fea
 
 3. **P20 — future chained-synth-cont extension.** Bundles with Slice C N-chain extension (multi-perform arm bodies) per [DEVIATION Task 58]. Same closure point as `examples/multishot_perf.sigil`'s "3-element Choose combinator" deferral (per [DEVIATION Task 60]).
 
-**Implementing commit(s):** Foundation `[HEAD]` (this entry + Task 60 squash-hash flip + PROGRESS Task 61 entry transition `todo` → `in-progress`); P18 / P19 / P20 appended to `spec/validation-prompts.md` at `[HEAD+1]`; closeout (PROGRESS Task 61 entry filled + this implementing-commit line backfilled) at `[HEAD+2]`.
+**Implementing commit(s):** Foundation `2c5b6b0` (this entry + Task 60 squash-hash flip + PROGRESS Task 61 entry transition `todo` → `in-progress`); P18 / P19 / P20 appended to `spec/validation-prompts.md` at `4825cc9`; closeout (PROGRESS Task 61 entry filled + this implementing-commit line backfilled) at `[HEAD]`.
