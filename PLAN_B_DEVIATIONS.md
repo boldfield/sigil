@@ -2237,3 +2237,71 @@ The selected approach is consistent with Plan B's "do not implement Stage 7+ fea
 3. **Item 4 — escape-rate assertion**: closed at this Task 60 ship for the representative case at the tighter `escape == 0` bound. Future deliberate escape-site introductions update the assertion alongside the commit message explaining why the new rate stays under the plan's 1% ceiling.
 
 **Implementing commit(s):** Foundation `e492ede` (this entry + Task 59 squash-hash flip + PROGRESS Task 60 entry transition `todo` → `in-progress`); `examples/fib_cps_perf.sigil` + `fib_cps_perf_example_prints_6765_under_500ms` e2e at `02389f5`; `examples/multishot_perf.sigil` + `multishot_perf_example_under_5s` e2e at `f510752`; `arena_escape_rate_under_one_percent` e2e at `044aa0e`; closeout (PROGRESS Task 60 entry filled + this implementing-commit line backfilled) at `[HEAD]`.
+
+## 2026-04-28 — [DEVIATION Task 61] P18 ships end-to-end; P19 / P20 ship graded-against-compiles only (per [DEVIATION Task 59] / [DEVIATION Task 60] expressibility envelope)
+
+**Context:** Plan B Task 61 calls for three new validation prompts to bring the bank to its 20-entry target:
+
+- **P18** — `Raise[String]`-based safe parser for a small grammar.
+- **P19** — `State[Int]`-based counter threaded through a list walk.
+- **P20** — multi-shot `Choose` finds all `(a, b)` pairs with `a + b == 7` and `a, b ∈ {1..6}`.
+
+P18 fits cleanly within the v1 expressibility envelope established by Phase 4d MVP / Phase 4e captures+ / Task 57 IO-as-effect / Task 58 multi-shot rigor / Task 59 demo programs. P19 and P20 each cross expressibility limits documented in earlier deviations (the same closure points pinned in `[DEVIATION Task 59]` and `[DEVIATION Task 60]`).
+
+**P18 — ships end-to-end.** A "safe parser" demonstrating `Raise` with a `String` payload is canonical Phase 4d/4e shape:
+
+```sigil
+effect Raise { fail: (String) -> Int }
+
+fn parse_token(token: Int) -> Int ![Raise, IO] {
+  match token {
+    0 => perform Raise.fail("token zero is not allowed"),
+    _ => token * 10
+  }
+}
+
+fn main() -> Int ![IO] {
+  let result: Int = handle parse_token(0) with {
+    Raise.fail(msg, k) => {
+      perform IO.println(msg);
+      -1
+    },
+  };
+  perform IO.println(int_to_string(result));
+  0
+}
+```
+
+Sigil v1's effects support `(String) -> Int` op signatures; the discipline sweep `no_user_facing_error_uses_e0001` (compiler/src/typecheck.rs) exercises the literal `effect Raise { fail: (String) -> Int }` surface alongside other catalog-coverage cases. The "small grammar" framing is conceptual — the helper performs at exactly one site (an early-fail guard), so the body shape matches `match { ... => perform; _ => N }` (Sync ABI). The arm body `{ perform IO.println(msg); -1 }` exercises the multi-stmt arm-body shape with discard-`k` semantics. P18 is graded end-to-end.
+
+**P19 — graded against "compiles" until `run_state` higher-order lift ships.** A literal "`State[Int]`-based counter threaded through a list walk" requires the classic algebraic-effects `run_state(initial, comp)` higher-order helper — the handler's `State.get` arm returns a lambda-of-state, the handler's `State.set` arm returns a lambda-of-state, and `run_state` applies the handle expression's overall result-as-lambda to the initial state. This pattern requires both `TypeExpr::Fn` parameters (deferred per `examples/higher_order.sigil` lines 15-23) AND arm-body lambdas (rejected at codegen.rs:1246-1257) — both Plan-C-or-later territory pinned in `[DEVIATION Task 59]` for `examples/state.sigil`'s dual-handle workaround.
+
+P19 ships in spec/validation-prompts.md with the literal `State[Int]`-via-`run_state` framing, but with `Oracle (notes)` marking the prompt graded only against "program compiles" until the `TypeExpr::Fn` and arm-body-lambda lifts close. The status mirrors P09 / P10 / P17 (all blocked on `TypeExpr::Fn` for higher-order param shapes). The semantic target is preserved; the run-portion of the oracle activates when the underlying machinery ships.
+
+**P20 — graded against "compiles" until chained-synth-cont extension ships.** A literal multi-shot `Choose` finding all `(a, b)` pairs with `a + b == 7` and `a, b ∈ {1..6}` requires either (a) a single helper body performing Choose twice (once per pair member; multi-perform helper bodies require the chained-synth-cont extension named at codegen.rs:10286-10290) OR (b) a 6-resume single-arm body invoking k six times to enumerate {1..6} (Slice C v1 caps at 2-let arm shape; 3+ requires the Slice C N-chain extension named in `[DEVIATION Task 58]`). Both extensions are explicitly Plan-C-or-later territory.
+
+The recursive `pick_int(low, high)` idiom from `[DEVIATION Task 55] Phase 4e captures+` line 1507 (`if perform Choose.flip() then low else pick_int(low+1, high)`) reaches arbitrary {low..high} ranges using only the v1 2-let arm shape, but the canonical pair-generator pattern (`let a = pick_int(1, 6); let b = pick_int(1, 6); if a + b == 7 then ...`) needs two performs in one helper body — which trips the "exactly one let stmt" cap. The pair-generator framing is expressible at the source level via cross-helper composition (one helper per pair member, with the outer multi-shot handler enumerating both); this works under v1 BUT the program's structure differs significantly from the canonical literature presentation, and grading against "produced exactly the 6 expected pairs" requires either result-collection scaffolding (cons-list accumulation across multi-shot resumes — itself a multi-perform body shape) or printing each pair as it's enumerated (which works but produces stderr/stdout interleaving when combined with multi-shot).
+
+P20 ships with `Oracle (notes)` marking the prompt graded only against "program compiles" until the chained-synth-cont extension closes. The semantic target is preserved; the run-portion of the oracle activates when the multi-perform helper-body extension ships, at which point the canonical pair-generator structure becomes expressible.
+
+**Three deviations summary:**
+
+| Plan wording | v1 ship | Closure point |
+|---|---|---|
+| P18 — Raise[String]-based safe parser | End-to-end gradeable; ships with full Oracle | Closed at this PR |
+| P19 — State[Int] counter via list walk | Graded against "compiles" only | Future TypeExpr::Fn lift + arm-body-lambda lift (post-Plan-B; mirrors P09/P10/P17 deferral pattern) |
+| P20 — multi-shot Choose all-pairs | Graded against "compiles" only | Future chained-synth-cont extension (multi-perform helper bodies) — bundles with Slice C N-chain extension named in [DEVIATION Task 58] |
+
+**Rationale:** Task 61 is *prompt-bank authoring*, not feature work. Each prompt expresses the plan's intent verbatim; the deferral notes mirror the established pattern (P02 deferred run-portion until `string_concat` shipped; P09/P10/P17 deferred until `TypeExpr::Fn` ships). Authoring all three prompts in their canonical literature shape — even when v1 cannot run two of them yet — preserves the spec validation surface for whenever the closure points close. Plan C's `scripts/validate-spec.sh` (Stage 9 of `2026-04-21-sigil-finish.md`) reads this file as authoritative; the prompt bank reaches its 20-entry target with this PR.
+
+The selected approach is consistent with Plan B's "do not implement Stage 7+ features" hard rule (the lifts blocking P19/P20 are all Stage-7+ feature work) and with the "expressibility envelope per task" pattern established at Phase 4d/4e/4f/4g/Task 58/Task 59/Task 60.
+
+**Closure points:**
+
+1. **P18 — closed at this PR.** End-to-end gradeable on both hosts via the existing v1 surface.
+
+2. **P19 — future `TypeExpr::Fn` lift + arm-body-lambda lift.** Same dual-lift dependency as `examples/state.sigil`'s `run_state` deferral (per [DEVIATION Task 59]). Same closure point as P09 / P10 / P17.
+
+3. **P20 — future chained-synth-cont extension.** Bundles with Slice C N-chain extension (multi-perform arm bodies) per [DEVIATION Task 58]. Same closure point as `examples/multishot_perf.sigil`'s "3-element Choose combinator" deferral (per [DEVIATION Task 60]).
+
+**Implementing commit(s):** Foundation `2c5b6b0` (this entry + Task 60 squash-hash flip + PROGRESS Task 61 entry transition `todo` → `in-progress`); P18 / P19 / P20 appended to `spec/validation-prompts.md` at `4825cc9`; closeout (PROGRESS Task 61 entry filled + this implementing-commit line backfilled) at `[HEAD]`.

@@ -661,6 +661,55 @@ fn arena_escape_count_is_zero_below_one_percent_ceiling() {
     );
 }
 
+/// Plan B Task 61 — pin P18's literal prompt source as an e2e test.
+/// Belt-and-suspenders against `spec/validation-prompts.md` drift: any
+/// change to the prompt's surface (effect declaration, helper body,
+/// arm shape, oracle) lights up here in addition to whenever Plan C's
+/// `scripts/validate-spec.sh` runs the bank.
+///
+/// The source is the literal program a fresh LLM session would
+/// produce given P18's prompt: declares `effect Raise`, defines
+/// `parse_token` with the early-fail-on-zero match, wraps a
+/// `parse_token(0)` call in a handle whose discard-`k` arm prints the
+/// failure message and returns -1 as the recovery sentinel. Stdout
+/// is the prompt's oracle exactly: `"token zero is not allowed\n-1\n"`.
+///
+/// Mirrors `effect_decl_with_no_handler_use_compiles_and_runs` shape
+/// (inline source via `compile_and_run`) — the prompt-bank sentinel
+/// pattern, distinct from the example-file e2e tests for catch /
+/// state / choose which carry their own `examples/` files.
+#[test]
+fn p18_safe_parser_example_prints_recovery_message() {
+    let src = "effect Raise { fail: (String) -> Int }\n\
+               fn parse_token(token: Int) -> Int ![Raise, IO] {\n  \
+                 match token {\n    \
+                   0 => perform Raise.fail(\"token zero is not allowed\"),\n    \
+                   _ => token * 10,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle parse_token(0) with {\n    \
+                   Raise.fail(msg, k) => {\n      \
+                     perform IO.println(msg);\n      \
+                     -1\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "p18_safe_parser");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "token zero is not allowed\n-1\n",
+        "P18 prompt oracle mismatch — recovery path should print the \
+         failure message then the sentinel `-1`. stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "P18 should not abort or warn; stderr should be empty"
+    );
+}
+
 // ===== Plan A2 Task 24 — Stage-2 codegen additional coverage ================
 //
 // These tests use inline-source programs so the canonical
