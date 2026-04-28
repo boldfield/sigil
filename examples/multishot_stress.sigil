@@ -1,0 +1,104 @@
+// examples/multishot_stress.sigil
+//
+// Plan B Task 58 — multi-shot stress: ten resumes of a `resumes:
+// many` continuation across five sequential `handle` expressions
+// with five fresh handler frames and five fresh heap-reified
+// k_closure records. Each handle invokes its arm's `k` twice with
+// different `(Int)` inputs, totalling **10 multi-shot k invocations
+// in one program** with all results pinned by closed form so the e2e
+// test can assert independence.
+//
+// **Why five sequential handles instead of one ten-resume arm body.**
+// Slice C v1 (PR #27) caps the multi-let arm body shape at exactly
+// two `let r_i = k(arg_i)` bindings per arm; the negative-coverage
+// e2e test `slice_c_multi_let_arm_body_with_three_lets_is_rejected
+// _at_codegen` (compiler/tests/e2e.rs) pins this at the codegen-
+// entry walker. Lifting the cap to N is mechanical (extends the
+// post-arm-k synth fn chain from 2 fns to N fns, each capturing
+// prior `r_i` values into its closure record) but layered work,
+// explicitly deferred from PR #27 per `[DEVIATION Task 55] Phase 4e
+// captures+` line 1503's "Deferred from Slice C v1" list.
+//
+// The v1 stress shape exercises a different invariant from the
+// literal "10+ in single arm" stress: multiple FRESH handler frames
+// each driving a fresh k_closure twice, asserting independence
+// across handles (frame allocator + GC bitmap discipline + push/pop
+// sequencing across 5 handle sites in one program). The future
+// N-chain extension's stress shape will exercise SINGLE-closure
+// reuse (one k_closure read 10× consecutively). Both shapes are
+// useful coverage; both ship coexistent. Task 60's perf floor
+// (Multi-shot stress test, 3-element Choose combinator, N=1000
+// iterations) exercises the literal-N-resume stress at much higher
+// N via the helper-recursion idiom (per `[DEVIATION Task 55] Phase
+// 4e captures+` line 1507's "Stage 9 P20 readiness analysis").
+//
+// See `[DEVIATION Task 58] Multi-shot stress shape — sequential-
+// handles workaround for Slice C v1's 2-let arm cap` in
+// `boldfield/designs/PLAN_B_DEVIATIONS.md` for the architectural
+// rationale and the property-coverage matrix.
+//
+// **Independence assertion via closed form.** For each handle:
+//   - helper(seed) performs Choose.choose(seed).
+//   - Arm: r1 = k(seed + 100); r2 = k(seed + 200); arm returns
+//     r1 + r2 = (seed + 100) + (seed + 200) = 2*seed + 300.
+//   - For seeds 1..5: h_seed = 2*seed + 300 → 302, 304, 306, 308, 310.
+//   - Total = 302 + 304 + 306 + 308 + 310 = 1530.
+//
+// **Distinct inputs across the program** — the 10 k invocations
+// receive these 10 distinct Int values:
+//   h1: k(101), k(201)    h2: k(102), k(202)    h3: k(103), k(203)
+//   h4: k(104), k(204)    h5: k(105), k(205)
+// — no two invocations share an input. If any k invocation's result
+// leaked into another's value (e.g., a stale closure capture from a
+// prior handle's k_closure record), the closed-form sum would
+// diverge from 1530.
+//
+// Invariant: stdout reads `1530\n` and the program exits 0.
+
+effect Choose resumes: many { choose: (Int) -> Int }
+
+fn helper(seed: Int) -> Int ![Choose, IO] {
+  let x: Int = perform Choose.choose(seed);
+  x
+}
+
+fn main() -> Int ![IO] {
+  let h1: Int = handle helper(1) with {
+    Choose.choose(arg, k) => {
+      let r1: Int = k(arg + 100);
+      let r2: Int = k(arg + 200);
+      r1 + r2
+    },
+  };
+  let h2: Int = handle helper(2) with {
+    Choose.choose(arg, k) => {
+      let r1: Int = k(arg + 100);
+      let r2: Int = k(arg + 200);
+      r1 + r2
+    },
+  };
+  let h3: Int = handle helper(3) with {
+    Choose.choose(arg, k) => {
+      let r1: Int = k(arg + 100);
+      let r2: Int = k(arg + 200);
+      r1 + r2
+    },
+  };
+  let h4: Int = handle helper(4) with {
+    Choose.choose(arg, k) => {
+      let r1: Int = k(arg + 100);
+      let r2: Int = k(arg + 200);
+      r1 + r2
+    },
+  };
+  let h5: Int = handle helper(5) with {
+    Choose.choose(arg, k) => {
+      let r1: Int = k(arg + 100);
+      let r2: Int = k(arg + 200);
+      r1 + r2
+    },
+  };
+  let total: Int = h1 + h2 + h3 + h4 + h5;
+  perform IO.println(int_to_string(total));
+  0
+}

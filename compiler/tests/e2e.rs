@@ -547,6 +547,64 @@ fn choose_demo_example_returns_40() {
     );
 }
 
+/// Plan B Task 58 — `examples/multishot_stress.sigil` exercises the
+/// v1 multi-shot stress shape: 5 sequential `handle` expressions × 2
+/// resumes per arm = 10 multi-shot k invocations across 5 fresh
+/// handler frames and 5 fresh heap-reified k_closure records, with
+/// 10 distinct `(Int)` inputs. Confirms that:
+///
+/// - the codegen pre-pass allocates per-handle arm FuncIds correctly
+///   when 5 distinct `Expr::Handle` sites occur in a single user fn
+///   (independent FuncId tables per `Span`-keyed `handler_arm_indices`
+///   entry);
+/// - each handle's `sigil_handler_frame_new` + `sigil_handle_push`
+///   path allocates a fresh frame; the runtime's thread-local handler
+///   stack head correctly LIFOs across 5 sequential push/pop cycles
+///   (per Phase 4f machinery);
+/// - the heap-reified k_closure record allocated by Slice C's arm-fn
+///   body emit at the perform site of one handle does NOT leak into
+///   another handle's k invocations (closed-form independence
+///   assertion: any cross-handle leak would diverge the closed-form
+///   sum from 1530);
+/// - the sequential structure of `let h_i = handle ... with { ... }`
+///   in main's body lowers cleanly with each handle expression
+///   driving its own `sigil_run_loop` invocation, returning the
+///   discharged Int to the let-binding before the next handle
+///   begins.
+///
+/// Closed-form expected output (per the example's docstring):
+///   - h_i = 2*i + 300 for i ∈ {1, 2, 3, 4, 5}
+///     → 302, 304, 306, 308, 310
+///   - total = 1530
+///
+/// **Stress-shape rationale** — the literal Task 58 wording calls for
+/// "10+ resumes within a single arm with different inputs"; that
+/// shape requires the Slice C N-chain extension explicitly deferred
+/// from PR #27 (the negative-coverage test
+/// `slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen`
+/// pins the v1 cap at exactly 2 lets). The 5-handles × 2-resumes
+/// workaround exercises a complementary invariant — fresh-frame /
+/// fresh-k_closure independence across multiple handles in one
+/// program — and ships under `[DEVIATION Task 58]`.
+///
+/// Invariant: stdout = "1530\n", stderr = "", exit 0.
+#[test]
+fn multishot_stress_example_returns_1530() {
+    let root = workspace_root();
+    let source = root.join("examples/multishot_stress.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "multishot_stress_example");
+    assert_eq!(code, 0, "multishot_stress exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1530\n",
+        "multishot_stress stdout mismatch (expected closed-form 302+304+306+308+310 \
+         = 1530); stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "multishot_stress should not abort or warn; stderr should be empty"
+    );
+}
+
 /// Plan A2 task 32: a top-level user fn is direct-called from `main`.
 /// Every user fn takes a closure_ptr as its first Cranelift argument
 /// (always null for direct calls to a top-level fn with no captured
