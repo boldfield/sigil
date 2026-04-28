@@ -3726,19 +3726,21 @@ fn handle_with_return_arm_transforms_body_value_no_op_arms_fired() {
 }
 
 #[test]
-fn handle_with_return_arm_op_arm_fires_return_arm_skipped() {
-    // Plan B Task 55 (Phase 4g) — when an op arm fires (the body
-    // performs an effect and the arm discharges it), the return arm
-    // does NOT fire. The handle's value is the op arm's result. This
-    // pins the semantics: return arm fires only on Done (body
-    // completes normally with a value), not on Call (body's perform
-    // dispatched into an op arm).
+fn handle_with_return_arm_fires_on_op_arm_discharge_value() {
+    // Plan B Task 55 (Phase 4g) — semantic pin: return arms fire on
+    // the value the body **yields**, regardless of whether that
+    // value comes from the body completing normally OR from an op
+    // arm discharging the perform without invoking `k`. This
+    // matches Koka / Effekt standard algebraic-effects semantics:
+    // the return clause runs over whatever value flows out of the
+    // body (including non-resuming op-arm tail values). It is NOT
+    // the case that op-arm dispatch "skips" the return arm.
     //
     // `handle (perform Raise.fail()) with { Raise.fail(k) => 99,
     //  return(v) => v * 100 }` — body performs Raise.fail; op arm
-    // fires returning 99; return arm SKIPPED. main prints "99\n".
-    // If the return arm were incorrectly fired with v=99, it would
-    // print "9900\n".
+    // fires returning 99 (without calling `k`); the 99 flows out
+    // as the body's yielded value; return arm fires with v=99
+    // → 99*100 = 9900. main prints "9900\n".
     let src = "effect Raise { fail: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform Raise.fail()) with {\n    \
@@ -3748,9 +3750,9 @@ fn handle_with_return_arm_op_arm_fires_return_arm_skipped() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_op_arm_fires_skips_return");
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_op_arm_value_via_return_arm");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "99\n", "stdout mismatch; stderr={stderr:?}");
+    assert_eq!(stdout, "9900\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]
@@ -3877,15 +3879,18 @@ fn handle_with_return_arm_body_type_differs_from_body_type() {
 }
 
 #[test]
-fn handle_with_return_arm_inside_op_arm_chain_runs() {
-    // Plan B Task 55 (Phase 4g) — combined coverage: handle has
-    // both an op arm (which fires) AND a return arm (which doesn't
-    // fire). Verifies that registering both on the same frame
-    // doesn't break op-arm dispatch. Mirrors the canonical
-    // op-arm-only case from
-    // `handle_with_non_io_perform_runs_arm_and_returns_value` plus a
-    // never-fired return arm. If `set_return` were corrupting the
-    // frame's arms array, this would silently misdispatch.
+fn handle_with_constant_return_arm_overrides_op_arm_yield() {
+    // Plan B Task 55 (Phase 4g) — combined coverage: when the
+    // return arm body is a constant (ignoring `v`), it overrides
+    // whatever value flows out of the body — including non-
+    // resuming op-arm tail values. The op arm fires (perform
+    // dispatched), yields 7; return arm body is `999` (constant);
+    // handle's overall value = 999. Pins both (a) registering both
+    // op + return arms on the same frame doesn't break op-arm
+    // dispatch (the perform path still works), and (b) the return
+    // arm runs over the op-arm-yielded value per the standard
+    // semantics demonstrated by
+    // `handle_with_return_arm_fires_on_op_arm_discharge_value`.
     let src = "effect Raise { fail: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform Raise.fail()) with {\n    \
@@ -3895,9 +3900,9 @@ fn handle_with_return_arm_inside_op_arm_chain_runs() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_op_and_return_coexist");
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_constant_return_overrides_op");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "7\n", "stdout mismatch; stderr={stderr:?}");
+    assert_eq!(stdout, "999\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]

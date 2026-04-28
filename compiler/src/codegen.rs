@@ -1385,11 +1385,23 @@ struct HandlerArmSynth {
     /// stay as-is).
     arg_types: Vec<Type>,
     /// Plan B Task 55 (Phase 4c) — Cranelift type of the arm body's
-    /// result. The body's lowered `Value` is widened to `I64` (matching
-    /// `sigil_next_step_done`'s signature) before the wrap call;
-    /// `lower_perform_non_io_to_value` mirror-narrows on the perform
-    /// side so the perform's `type_of_expr` (the op's declared return
-    /// type) and the actual lowered Cranelift `Value` agree.
+    /// result. Originally derived from the op's declared return type
+    /// at pre-pass time; the synthetic-fn definition pass used to
+    /// consult this value to decide how to widen the body's lowered
+    /// `Value` to `I64` before `sigil_next_step_done`. **Phase 4g
+    /// bugfix retroactively switched the widen logic to read
+    /// `dfg.value_type(body_value)` instead** (typecheck unifies
+    /// arm body type with `handler_overall`, which can differ from
+    /// the op return type — e.g., a `Raise.fail() -> Int` op whose
+    /// handle's return arm produces Bool unifies handler_overall =
+    /// Bool and the arm body's `false` lowers to I8, not I64). The
+    /// pre-stored field stays here as documentation of the op's
+    /// declared return type for future passes that need it (e.g.,
+    /// `lower_perform_non_io_to_value`'s narrow-back uses the same
+    /// derivation directly off `EffectOp.return_type`); marked
+    /// `#[allow(dead_code)]` because the body emit no longer reads
+    /// it.
+    #[allow(dead_code)]
     body_ty: Type,
     /// Plan B Task 55 (Phase 4d) — captures consumed by this arm body,
     /// in arm-local slot order matching `body`'s rewritten
@@ -5588,17 +5600,38 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ns_ptr
                 } else {
                     // --- Non-tail / no-`k` path (Phase 4c shape) ---
+                    //
+                    // Plan B Task 55 (Phase 4g) bugfix: read the
+                    // arm body's actual lowered Cranelift type via
+                    // `dfg.value_type` instead of the pre-stored
+                    // `synth.body_ty`. The pre-pass derives
+                    // `synth.body_ty` from the **op's declared
+                    // return type** (Phase 4c convention), but
+                    // typecheck unifies the arm body's type with
+                    // **handler_overall**, which can differ from
+                    // the op return type (e.g., a `Raise.fail() ->
+                    // Int` op whose handle's return arm produces
+                    // Bool unifies handler_overall = Bool and the
+                    // arm body's `false` lowers to I8). The
+                    // pre-stored body_ty is then I64 but the actual
+                    // value is I8 — Cranelift's verifier rejects
+                    // the I64 → I64 widen branch over an I8 value.
+                    // Mirrors Phase 4e Slice C's `tail_ty` fix at
+                    // codegen.rs:5260-5285 (use post-lowering
+                    // `dfg.value_type` over pre-stored type).
+                    // Latent since Phase 4c; surfaced by Phase 4g's
+                    // body-vs-handler-overall test surface.
                     let body_value = lowerer.lower_expr(&synth.body);
-                    let widened_body = if synth.body_ty == types::I64 {
+                    let body_actual_ty = lowerer.builder.func.dfg.value_type(body_value);
+                    let widened_body = if body_actual_ty == types::I64 {
                         body_value
-                    } else if synth.body_ty.is_int() && synth.body_ty.bits() < 64 {
+                    } else if body_actual_ty.is_int() && body_actual_ty.bits() < 64 {
                         lowerer.builder.ins().uextend(types::I64, body_value)
                     } else {
                         assert_eq!(
-                            synth.body_ty, pointer_ty,
+                            body_actual_ty, pointer_ty,
                             "codegen Phase 4c: unexpected arm-body Cranelift type \
-                             {:?} for sigil_next_step_done wrap",
-                            synth.body_ty
+                             {body_actual_ty:?} for sigil_next_step_done wrap"
                         );
                         body_value
                     };
