@@ -6869,15 +6869,39 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     }
 
                     // Populate this frame's arms. Op_ids are global to
-                    // the effect, not local to the handle — bounds
-                    // check at `sigil_handler_frame_set_arm`
+                    // the effect, assigned alphabetically per-effect
+                    // at `compiler/src/typecheck.rs:792-808` over the
+                    // effect's full declared op set. Bounds check at
+                    // `sigil_handler_frame_set_arm`
                     // (`runtime/src/handlers.rs:349`) requires
-                    // `op_id < arm_count`, which today's callers
-                    // satisfy by sizing arm_count to the handle's
-                    // arm count for this effect (not the effect's
-                    // declared op count). This is unchanged from the
-                    // pre-Phase-4f single-effect path; only the loop
-                    // that now wraps it is new.
+                    // `op_id < arm_count`. We size `arm_count` to the
+                    // handle's arm count for this effect — which
+                    // satisfies the bounds check **only when this
+                    // handle's arms cover the lowest-numbered op_ids
+                    // contiguously (the `[0, k)` prefix of the
+                    // effect's op_ids).** A partial handler that
+                    // matches a non-prefix subset (e.g.,
+                    // `effect E { a, b }; handle ... with { E.b(k) =>
+                    // ... }` — op_id=1, arm_count=1) trips the
+                    // runtime bounds-check abort.
+                    //
+                    // **Latent constraint, not Phase 4f-introduced.**
+                    // Pre-Phase-4f single-effect handlers had the
+                    // same shape; partial-handlers-of-multi-op-effects
+                    // weren't exercised by any test, so the bug stayed
+                    // latent. Phase 4f expands the user-reachable
+                    // surface (multi-effect handles now compile, can
+                    // include partial sub-handlers per effect). See
+                    // the "Latent op_id/arm_count constraint" sub-
+                    // section in `[DEVIATION Task 55] Phase 4f` in
+                    // `PLAN_B_DEVIATIONS.md` for both resolution
+                    // paths (option 1: size arm_count to
+                    // `effects[arm.effect].ops.len()` with null
+                    // unhandled slots; option 2: typecheck E0142
+                    // exhaustiveness rejection). Pinned in CI by the
+                    // `#[ignore]`'d test
+                    // `partial_handler_of_multi_op_effect_aborts_at_
+                    // runtime_pending_resolution`.
                     for &(orig_idx, fn_ref, synth_idx) in arms_in_effect.iter() {
                         let arm = &op_arms[orig_idx];
                         let op_id = match self.op_ids.get(&(arm.effect.clone(), arm.op.clone())) {
