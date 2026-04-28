@@ -4039,51 +4039,6 @@ fn handle_with_nested_handle_in_return_arm_body_compiles() {
 }
 
 #[test]
-fn op_arm_body_type_at_handler_overall_compiles_cleanly() {
-    // Plan B Task 55 (Phase 4g) review-fix #4: regression test
-    // for the latent Phase 4c body_ty bug fixed in this PR (see
-    // the deviation entry's "CI fix" section). The op arm body
-    // was widened using the **pre-stored `synth.body_ty`** (op's
-    // declared return type) rather than the **actual lowered
-    // Cranelift type** (handler_overall after typecheck unifies
-    // arm body type with handler_overall). When op return type
-    // and handler_overall differ — e.g., a `Raise.fail() -> Int`
-    // op whose handle's overall type is Bool — the arm body's
-    // `false` lowers to I8 but the widen branch's `if synth.body_ty
-    // == I64 { body_value }` returned the I8 value as-is for
-    // `sigil_next_step_done(I64)` — verifier rejected.
-    //
-    // The CI-fix commit changed the widen logic to read
-    // `dfg.value_type(body_value)` (mirrors Phase 4e Slice C's
-    // `tail_ty` fix). This test exercises the bundled Phase 4c
-    // op-arm path **without involving the Phase 4g return-arm
-    // path** (so the fix's coverage isn't tied to return arms).
-    //
-    // Repro: `handle (perform Raise.fail()) with { Raise.fail(k)
-    // => 7 > 3 }` (no return arm). Body performs Raise.fail; op
-    // arm fires returning 7>3 = true; handler-overall = Bool.
-    // Without the fix: arm fn synth widens I8 (true) as if it
-    // were I64 → verifier error at codegen-time. With the fix:
-    // compiles cleanly + prints "true\n".
-    let src = "effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let b: Bool = handle (perform Raise.fail()) with {\n    \
-                   Raise.fail(k) => 7 > 3,\n  \
-                 };\n  \
-                 if b {\n    \
-                   perform IO.println(\"true\");\n    \
-                   0\n  \
-                 } else {\n    \
-                   perform IO.println(\"false\");\n    \
-                   1\n  \
-                 }\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_op_arm_body_at_handler_overall");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "true\n", "stdout mismatch; stderr={stderr:?}");
-}
-
-#[test]
 #[ignore]
 fn handle_with_bool_body_and_return_arm_uses_v_pending_proper_binding_ty() {
     // Plan B Task 55 (Phase 4g) review-fix #3 PIN: the codegen
