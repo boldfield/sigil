@@ -1,0 +1,83 @@
+// examples/multishot_perf.sigil
+//
+// Plan B Task 60 — performance floor #3: multi-shot Choose stress
+// driver. Plan wording calls for "Multi-shot stress test (3-element
+// Choose combinator, N=1000 iterations) in <5s on both hosts". v1
+// ships a single-binary-perform multi-shot pattern wrapped in an
+// N=1000 recursive driver — see `[DEVIATION Task 60]` in
+// `boldfield/designs/PLAN_B_DEVIATIONS.md` for the architectural
+// framing (literal Cartesian-product 3-pick enumeration requires
+// multi-perform helper bodies, deferred to the chained-synth-cont
+// extension; same Plan-C-or-later territory pinned for choose.sigil
+// in [DEVIATION Task 59]).
+//
+// **Structure.** The driver `run(n)` recursively wraps the canonical
+// Slice C v1 multi-shot pattern (single-perform helper + 2-resume
+// arm) N times:
+//
+//   - `outcome()` performs `Choose.flip()` once, returning 1 if true
+//     else 2 (the simplest measurable LetBindThenTail body with a
+//     Bool binding).
+//   - Each iteration's `handle` wraps `outcome()` with a 2-resume
+//     arm: `{ let r1 = k(true); let r2 = k(false); r1 + r2 }` — the
+//     canonical Slice C v1 shape. r1 = 1, r2 = 2, arm returns 3.
+//   - `run(1000)` chains 1000 such handle expressions through
+//     recursion; each iteration produces 2 multi-shot k invocations
+//     for a total of 2000 k invocations across 1000 fresh handler
+//     frames + 1000 fresh heap-reified k_closure records.
+//
+// **Stress invariants exercised.** Iteration-scale multi-shot
+// scalability — every push/pop of a handler frame must complete
+// cleanly across a thousand-deep sequence; every heap-reified
+// k_closure must invoke twice without leaking state into a later
+// iteration's k_closure; the recursive driver must complete without
+// stack overflow at N=1000 (run is Native ABI, so this is a C-stack
+// recursion; 1000 frames is well within native stack capacity but
+// tests the colorer's classification of `run` against
+// effect-discharging body shapes).
+//
+// **Why N=1000 and not larger.** The plan's bound is <5s. With each
+// iteration doing ~2 k invocations + some arithmetic, ~2000 k
+// invocations should fit comfortably under 5s on both CI hosts.
+// Larger N would test the same machinery without changing what's
+// being verified; 1000 is the plan's named iteration count.
+//
+// **Sentinel print.** The driver returns 0 (the match arm 0 case
+// returns 0; the recursive `_ => { ... ; run(n-1) }` case ends at
+// run(0) returning 0). Each iteration's handle expression returns
+// 3 but those values are bound to `_` and discarded — only the
+// driver's final 0 propagates back to main's `let _ = run(1000)`.
+// main prints "0" as a sentinel that the recursion completed
+// successfully (not a perf measurement output).
+//
+// Invariant: stdout reads `0\n` and the program exits 0; e2e test
+// asserts wall-clock < 5s.
+
+effect Choose resumes: many { flip: () -> Bool }
+
+fn outcome() -> Int ![Choose, IO] {
+  let b: Bool = perform Choose.flip();
+  if b { 1 } else { 2 }
+}
+
+fn run(n: Int) -> Int ![IO] {
+  match n {
+    0 => 0,
+    _ => {
+      let _: Int = handle outcome() with {
+        Choose.flip(k) => {
+          let r1: Int = k(true);
+          let r2: Int = k(false);
+          r1 + r2
+        },
+      };
+      run(n - 1)
+    },
+  }
+}
+
+fn main() -> Int ![IO] {
+  let _: Int = run(1000);
+  perform IO.println(int_to_string(0));
+  0
+}

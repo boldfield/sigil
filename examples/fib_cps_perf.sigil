@@ -1,0 +1,87 @@
+// examples/fib_cps_perf.sigil
+//
+// Plan B Task 60 — performance floor #2: `fib(20)` forced to CPS-color
+// via a gratuitous `State` perform, computing the same 6765 result the
+// Plan A2 native fib_perf example produces but routed through the CPS
+// path. The plan's bound is **<500ms wall-clock on both hosts** (10×
+// the native floor of <50ms).
+//
+// **Why a per-call `perform State.get()` and not just `![State, IO]`
+// in the row.** The colorer (`compiler/src/color.rs`) classifies a fn
+// as CPS-color iff its body or any transitively-called fn performs a
+// non-IO effect. A row declaration that never lands at a perform site
+// leaves the colorer's classification unchanged, so the gratuitous
+// annotation alone won't trip the CPS path. Adding `let _: Int =
+// perform State.get();` at the start of fib makes every recursive
+// invocation perform a non-IO effect, which is what makes fib CPS-
+// color end-to-end.
+//
+// **Body shape and ABI selection.** fib's body is
+//
+//   `let _: Int = perform State.get(); match n { 0 => 0, 1 => 1, _ =>
+//    fib(n - 1) + fib(n - 2) }`
+//
+// The `let _ = perform; match { ... }` shape does NOT match
+// `is_simple_let_yield_then_pure_tail_body` — the match arms contain
+// recursive `fib(...)` calls, and `expr_is_pure(tail) = false`
+// rejects the shape (Expr::Call is the canonical impure form per
+// codegen.rs:10092-10130). Per `compute_user_fn_abi`
+// (codegen.rs:189-214), fib falls through to `UserFnAbi::Sync`
+// despite being colored Cps. Each perform site routes through
+// `lower_perform_to_value`'s synchronous `sigil_run_loop` driver —
+// the Phase 4d MVP shape, correct for use-`k` arms regardless of
+// body shape (the discard-`k` correctness gap closed by Phase 4e
+// specifically targeted body shapes the synth-cont machinery
+// supports; this perf demo uses use-`k` so the gap is not relevant).
+//
+// **Compute path & expected cost.** Computing fib(20) requires ~17710
+// fib invocations (the recursion tree has fib(21) - 1 nodes). Every
+// invocation performs `State.get()` once, dispatching synchronously
+// through `sigil_run_loop` to the handler arm `State.get(k) => k(0)`,
+// resuming with 0, returning to the perform site so fib's match can
+// run. ~17710 synchronous handler dispatches dominate the wall-clock
+// — that's the "trampolined arithmetic" the plan's 10× slowdown
+// ceiling is normative for.
+//
+// **Why `State` and not a fresh `Bench` effect.** `State` is the
+// effect named in Plan B Task 60's wording (`State[Int]`); using a
+// pre-existing effect declaration keeps the demo visibly tied to the
+// plan. Sigil v1's `State` is monomorphic — `effect State { get: ()
+// -> Int, set: (Int) -> Int }` without applied type parameters — per
+// `[DEVIATION Task 60]` (the `State[Int]` notation is design-doc
+// convention for the fully-instantiated form; v1 source uses `State`
+// directly).
+//
+// **Why both `get` and `set` arms in the handler.** Phase 4f latent
+// op_id/arm_count constraint (per `examples/div_recover.sigil` and
+// `examples/state.sigil` precedent): a partial handler runtime-aborts
+// when an unhandled op fires. fib only performs `get`, but registering
+// both arms keeps `arm_count` matched to the effect's 2-op
+// declaration. The `set` arm is unreachable in this program; its
+// presence is structural.
+//
+// Invariant: stdout reads `6765\n` and the program exits 0; e2e test
+// asserts wall-clock < 500ms.
+//
+// See `[DEVIATION Task 60]` in `boldfield/designs/PLAN_B_DEVIATIONS.md`
+// for the architectural framing.
+
+effect State { get: () -> Int, set: (Int) -> Int }
+
+fn fib(n: Int) -> Int ![State, IO] {
+  let _: Int = perform State.get();
+  match n {
+    0 => 0,
+    1 => 1,
+    _ => fib(n - 1) + fib(n - 2),
+  }
+}
+
+fn main() -> Int ![IO] {
+  let result: Int = handle fib(20) with {
+    State.get(k) => k(0),
+    State.set(arg, k) => k(arg),
+  };
+  perform IO.println(int_to_string(result));
+  0
+}

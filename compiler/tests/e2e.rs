@@ -412,6 +412,255 @@ fn fib_perf_example_prints_6765_under_50ms() {
     );
 }
 
+/// Plan B Task 60 — performance floor #2: `examples/fib_cps_perf.sigil`
+/// computes the same 6765 result as the native `fib_perf` example but
+/// forces fib to CPS-color via a per-call `perform State.get()`. The
+/// plan's bound is **<500ms wall-clock on both hosts** (10× the native
+/// 50ms floor — the "trampolined arithmetic" 10× slowdown ceiling
+/// per Plan B Task 60).
+///
+/// **Compute path.** fib's body is `let _: Int = perform State.get();
+/// match n { 0 => 0, 1 => 1, _ => fib(n - 1) + fib(n - 2) }`. The
+/// `let _ = perform; match { ... }` shape does not match
+/// `is_simple_let_yield_then_pure_tail_body` (match arms contain
+/// recursive non-pure `fib(...)` calls), so fib falls through to
+/// `UserFnAbi::Sync` despite being `Color::Cps`. Each perform site
+/// routes through `lower_perform_to_value`'s synchronous
+/// `sigil_run_loop` driver — the Phase 4d MVP shape. ~17710
+/// synchronous handler dispatches dominate the wall-clock; that's the
+/// "trampolined arithmetic" the 10× ceiling governs.
+///
+/// **Why both arms registered.** Phase 4f latent op_id/arm_count
+/// constraint (the `examples/div_recover.sigil` /
+/// `examples/state.sigil` precedent for multi-op effect handlers):
+/// a partial handler runtime-aborts when the unhandled op fires.
+/// fib only performs `get`, but registering both `get` and `set`
+/// arms keeps `arm_count` matched to the 2-op `State` declaration.
+///
+/// **The `State[Int]` framing.** Plan wording uses `State[Int]`
+/// (design-doc convention for the fully-instantiated form); v1
+/// source uses `State` directly per `[DEVIATION Task 60]` — the
+/// monomorphic form parses + typechecks at the AST level, while
+/// the literal generic-parameterised `effect State[T]` shape is
+/// not exercised by any existing example or e2e test. Type-
+/// parameter granularity doesn't change the colorer's CPS-coloring
+/// decision (which depends only on whether non-IO performs occur).
+///
+/// Invariant: stdout = "6765\n", stderr = "", exit 0, wall-clock <
+/// 500ms.
+#[test]
+fn fib_cps_perf_example_prints_6765_under_500ms() {
+    let root = workspace_root();
+    let source = root.join("examples/fib_cps_perf.sigil");
+    let (stdout, stderr, code, elapsed) =
+        compile_file_and_run_timed(&source, "fib_cps_perf_example");
+    assert_eq!(code, 0, "fib_cps_perf.sigil exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "6765\n",
+        "fib_cps_perf.sigil stdout must be exactly \"6765\\n\""
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "fib_cps_perf.sigil wall-clock {elapsed:?} exceeds the 500ms Plan B Task 60 floor (10× native fib_perf <50ms)",
+    );
+}
+
+/// Plan B Task 60 — performance floor #3: multi-shot Choose stress
+/// driver. Plan wording calls for "Multi-shot stress test (3-element
+/// Choose combinator, N=1000 iterations) in <5s on both hosts".
+///
+/// v1 ships single-binary-perform multi-shot pattern wrapped in an
+/// N=1000 recursive driver per `[DEVIATION Task 60]` — literal
+/// Cartesian-product 3-pick enumeration requires multi-perform helper
+/// bodies (chained-synth-cont extension; Plan-C-or-later territory
+/// pinned in `[DEVIATION Task 59]` for choose.sigil's two-flip pair
+/// generator). The v1 driver exercises iteration-scale multi-shot
+/// scalability (1000 fresh handler frames × 2 multi-shot k
+/// invocations per arm = 2000 multi-shot k invocations + 1000 fresh
+/// heap-reified k_closure records) rather than per-iteration
+/// combinator depth.
+///
+/// **Stress invariants:** every push/pop of a handler frame must
+/// complete cleanly across the 1000-deep sequence; every heap-
+/// reified k_closure must dispatch twice without leaking state into
+/// a later iteration's k_closure; the recursive `run(n)` driver
+/// must complete without stack overflow at N=1000 (Native ABI
+/// recursion, well within native stack capacity).
+///
+/// **Why stdout is `"0\n"`.** The driver returns 0 (run(0) = 0; the
+/// recursive case discards each iteration's handle-expression value
+/// via `let _ = ...`); main's `let _ = run(1000)` discards that too,
+/// and prints `int_to_string(0)` as a sentinel that the recursion
+/// completed successfully. Per-iteration values (1+2 = 3) don't
+/// reach stdout — the perf test focuses on dispatch throughput, not
+/// computed-value verification (the canonical Slice C 2-resume
+/// pattern is already pinned by `slice_c_choose_multi_shot_arm_-
+/// invokes_k_twice_with_different_args` and `choose_example_dual_-
+/// resume_returns_3`).
+///
+/// Invariant: stdout = "0\n", stderr = "", exit 0, wall-clock < 5s.
+#[test]
+fn multishot_perf_example_under_5s() {
+    let root = workspace_root();
+    let source = root.join("examples/multishot_perf.sigil");
+    let (stdout, stderr, code, elapsed) =
+        compile_file_and_run_timed(&source, "multishot_perf_example");
+    assert_eq!(code, 0, "multishot_perf.sigil exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "multishot_perf.sigil stdout must be exactly \"0\\n\" (sentinel \
+         indicating run(1000) completed)"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "multishot_perf.sigil wall-clock {elapsed:?} exceeds the 5s Plan B Task 60 floor (1000 iterations × 2 multi-shot resumes per arm)",
+    );
+}
+
+/// Plan B Task 60 — performance floor #4: arena allocator escape rate.
+/// Plan wording sets the contractual ceiling at "at most 1% of
+/// `NextStep` records escape to Boehm heap in a typical CPS-color run"
+/// — but the v1 codegen has **zero** compiler-side `sigil_arena_promote`
+/// call sites today, so the ACTUAL escape rate is 0%. This test asserts
+/// the tighter `escape_count == 0` invariant rather than the plan's
+/// looser `escape ≤ 1% × alloc` bound — a regression that introduces
+/// any escape site at all is a real change worth surfacing immediately,
+/// not silently absorbing under a 1% ceiling. The plan's 1% remains
+/// the contractual worst-acceptable; the assertion enforces the
+/// tighter actual bound and forces the test (and its commit message)
+/// to be updated alongside any deliberate escape-site introduction so
+/// the regression review is explicit.
+///
+/// "Typical CPS-color run" is defined as `examples/multishot_perf.sigil`
+/// per `[DEVIATION Task 60]` — a representative program exercising
+/// both the canonical Slice C 2-let arm (heap-reifying k_closures) and
+/// the iterated handle-frame allocation pattern at non-trivial scale
+/// (1000 iterations × 2 multi-shot resumes).
+///
+/// **How the assertion runs.** The runtime instruments
+/// `sigil_arena_alloc` (every NextStep record arena-allocation,
+/// counter `ArenaAllocCount`) and `sigil_arena_promote` (every
+/// promote-to-Boehm-heap site, counter `ArenaEscapeCount`). At the
+/// program's atexit, `sigil_counter_print_all` writes every counter
+/// to stderr in `SIGIL_COUNTER_<NAME>=<value>` format (per
+/// `runtime/src/counters.rs:104-112`), gated on
+/// `SIGIL_PRINT_STATS=1` env var. We compile multishot_perf.sigil,
+/// run with SIGIL_PRINT_STATS=1, parse the counter dump from stderr,
+/// and assert `escape == 0`.
+///
+/// **Sanity bound.** Also assert `alloc > 0` to guard against a
+/// future regression that silently disables arena allocation entirely
+/// (a 0/0 ratio would trivially pass without exercising the arena
+/// machinery).
+///
+/// **What this assertion enforces today.** No compiler-side codegen
+/// site currently invokes `sigil_arena_promote` (multi-shot k_closure
+/// records are heap-allocated directly via `sigil_alloc` rather than
+/// arena-allocated-then-promoted). The expected escape_count is 0; if
+/// it becomes nonzero, that's either (a) a real bug to fix or (b) a
+/// deliberate change that needs to be reflected here with an updated
+/// expected value and a commit message explaining why the increase
+/// stays under the plan's 1% ceiling.
+///
+/// **Stdout invariant** mirrors the multishot_perf test: the sentinel
+/// "0\n" indicates run(1000) completed. Stderr contains the counter
+/// dump (after the program's own stderr output, which should be
+/// empty for this example).
+#[test]
+fn arena_escape_count_is_zero_below_one_percent_ceiling() {
+    use std::process::Command;
+    let root = workspace_root();
+    let source = root.join("examples/multishot_perf.sigil");
+    let sigil_bin = sigil_binary();
+
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_arena_escape_rate_{}",
+        std::process::id()
+    ));
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to invoke sigil compiler");
+    assert!(
+        compile.status.success(),
+        "compile failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    let run = Command::new(&bin_path)
+        .env("SIGIL_PRINT_STATS", "1")
+        .output()
+        .expect("failed to execute compiled binary");
+
+    let _ = std::fs::remove_file(&bin_path);
+
+    let code = run.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "stdout sentinel mismatch (expected run(1000) to complete with \"0\\n\"); \
+         stderr={stderr:?}"
+    );
+
+    // Parse counter dump. Format: each line is `<NAME>=<u64>`.
+    let mut alloc: Option<u64> = None;
+    let mut escape: Option<u64> = None;
+    for line in stderr.lines() {
+        if let Some(rest) = line.strip_prefix("SIGIL_COUNTER_ARENA_ALLOC_COUNT=") {
+            alloc = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("SIGIL_COUNTER_ARENA_ESCAPE_COUNT=") {
+            escape = rest.trim().parse().ok();
+        }
+    }
+
+    let alloc = alloc.unwrap_or_else(|| {
+        panic!(
+            "ARENA_ALLOC_COUNT missing from --print-runtime-stats output; \
+             stderr={stderr:?}"
+        )
+    });
+    let escape = escape.unwrap_or_else(|| {
+        panic!(
+            "ARENA_ESCAPE_COUNT missing from --print-runtime-stats output; \
+             stderr={stderr:?}"
+        )
+    });
+
+    assert!(
+        alloc > 0,
+        "ARENA_ALLOC_COUNT = 0 — multishot_perf.sigil should exercise the \
+         arena allocator (1000 iterations × 2 multi-shot resumes); a 0/0 \
+         ratio would trivially pass the bound without verifying the \
+         machinery. stderr={stderr:?}"
+    );
+
+    // Tighter than the plan's "≤ 1% × alloc" ceiling: today's v1 codegen
+    // has zero compiler-side `sigil_arena_promote` call sites, so the
+    // actual escape rate is 0%. Asserting `escape == 0` surfaces any
+    // regression (any introduction of escape, however small) immediately
+    // — a 0.5%-introduction would silently pass `escape * 100 ≤ alloc`
+    // even though it's a real semantic change. If a future PR
+    // deliberately adds escape sites, update both the assertion and the
+    // commit message; the plan's 1% remains the contractual ceiling.
+    assert_eq!(
+        escape, 0,
+        "arena escape count is nonzero — v1 codegen has no compiler-side \
+         `sigil_arena_promote` call sites, so this is either (a) a real \
+         regression, or (b) a deliberate change that needs to update both \
+         this assertion AND the commit message explaining why the new \
+         escape rate {escape}/{alloc} stays under the plan's 1% ceiling. \
+         stderr={stderr:?}"
+    );
+}
+
 // ===== Plan A2 Task 24 — Stage-2 codegen additional coverage ================
 //
 // These tests use inline-source programs so the canonical
