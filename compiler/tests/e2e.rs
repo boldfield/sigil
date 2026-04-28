@@ -641,6 +641,55 @@ fn catch_example_recovers_with_42() {
     );
 }
 
+/// Plan B Task 59 — `examples/state.sigil` exercises both `State.get`
+/// and `State.set` ops through the dual-handle pattern (one `handle`
+/// per op). Confirms that:
+///
+/// - `effect State { get: () -> Int, set: (Int) -> Int }` parses +
+///   typechecks; the alphabetically-assigned op_ids `get=0, set=1`
+///   align with each handle's per-frame arm slot writes (per
+///   `op_ids_assigned_alphabetically_within_each_effect`);
+/// - both `handle` expressions register BOTH op arms (the v1
+///   workaround for the Phase 4f latent op_id/arm_count constraint
+///   pinned at `partial_handler_of_multi_op_effect_aborts_at_runtime
+///   _pending_resolution`); the unused arm in each handle is
+///   unreachable but its presence keeps `arm_count` matched to the
+///   effect's 2-op declaration;
+/// - the use-`k` tail-position arm shape (`State.get(k) => k(5)`,
+///   `State.set(arg, k) => k(arg)`) lowers correctly: the arm fn
+///   builds `Call(k_closure, k_fn, [arg])` and the trampoline
+///   dispatches helper's synth-cont with the bound let value;
+/// - `read_counter` flows `5` (the `k(5)` resume) into `count`,
+///   computes `count + 1 = 6`; `write_counter` flows `99` (the
+///   `k(arg)` echo) into `prev`, returns `prev = 99`. Two
+///   sequential handles produce two stdout lines.
+///
+/// Invariant: stdout = "6\n99\n", stderr = "", exit 0.
+///
+/// **Dual-handle vs. `run_state` rationale**: see `[DEVIATION Task
+/// 59]` in `boldfield/designs/PLAN_B_DEVIATIONS.md`. The classic
+/// `run_state(initial, comp)` higher-order helper requires
+/// `TypeExpr::Fn` parameters AND arm-body lambdas — both deferred
+/// to post-Plan-B / Plan-C-or-later territory. This example
+/// demonstrates the State effect's get/set surface within the
+/// v1 expressibility envelope.
+#[test]
+fn state_example_dual_handle_returns_6_then_99() {
+    let root = workspace_root();
+    let source = root.join("examples/state.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "state_example");
+    assert_eq!(code, 0, "state exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "6\n99\n",
+        "state stdout mismatch (expected read=6 from get arm k(5)+1, \
+         then write=99 from set arm k(arg)=k(99)); stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "state should not abort or warn; stderr should be empty"
+    );
+}
+
 /// Plan A2 task 32: a top-level user fn is direct-called from `main`.
 /// Every user fn takes a closure_ptr as its first Cranelift argument
 /// (always null for direct calls to a top-level fn with no captured
