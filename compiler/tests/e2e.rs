@@ -659,10 +659,13 @@ fn catch_example_recovers_with_42() {
 ///   `State.set(arg, k) => k(arg)`) lowers correctly: the arm fn
 ///   builds `Call(k_closure, k_fn, [arg])` and the trampoline
 ///   dispatches helper's synth-cont with the bound let value;
-/// - `read_counter` flows `5` (the `k(5)` resume) into `count`,
-///   computes `count + 1 = 6`; `write_counter` flows `99` (the
+/// - `read_value` flows `5` (the `k(5)` resume) into `count`,
+///   computes `count + 1 = 6`; `write_value` flows `99` (the
 ///   `k(arg)` echo) into `prev`, returns `prev = 99`. Two
-///   sequential handles produce two stdout lines.
+///   sequential handles produce two stdout lines. (Helpers are
+///   named `read_value` / `write_value` rather than `_counter` to
+///   avoid suggesting cross-call mutable state — there is no
+///   threaded counter in v1; each handle is independent.)
 ///
 /// Invariant: stdout = "6\n99\n", stderr = "", exit 0.
 ///
@@ -705,7 +708,7 @@ fn state_example_dual_handle_returns_6_then_99() {
 ///   captures-free synth-cont path with binding_ty=I8 narrowed back
 ///   from the I64 args_ptr[0] read (per existing precedent
 ///   `slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_-
-///   args` at compiler/tests/e2e.rs:3649);
+///   args` in this file);
 /// - the 2-step lambda-lifted post-arm-k chain runs end-to-end:
 ///   k(true) → synth-cont with b=true → tail returns 1 → post_arm_k_1
 ///   reads r1=1 → k(false) → synth-cont with b=false → tail returns 2

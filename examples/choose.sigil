@@ -27,7 +27,7 @@
 // — the captures-free `LetBindThenTail` shape with a Bool binding
 // (binding_ty narrowed back from I64 in the synth-cont per existing
 // e2e precedent `slice_c_choose_multi_shot_arm_invokes_k_twice_with
-// _different_args` at compiler/tests/e2e.rs:3649).
+// _different_args`).
 //
 // **Arm body.** Slice C v1 2-resume shape:
 //

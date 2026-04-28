@@ -17,12 +17,12 @@
 //
 // **Structure.** Two helpers, two handles:
 //
-//   1. `read_counter()` performs `State.get()`; helper's tail
+//   1. `read_value()` performs `State.get()`; helper's tail
 //      computes `count + 1` (the read value plus one). Handler's
 //      `get` arm resumes with `k(5)` — a fixed seed value. Result:
 //      5 + 1 = 6.
 //
-//   2. `write_counter()` performs `State.set(99)`; helper's tail
+//   2. `write_value()` performs `State.set(99)`; helper's tail
 //      is `prev` (the perform's return value, here echoed by the
 //      handler). Handler's `set` arm resumes with `k(arg)` —
 //      echoing the set value back. Result: 99.
@@ -62,22 +62,22 @@
 
 effect State { get: () -> Int, set: (Int) -> Int }
 
-fn read_counter() -> Int ![State, IO] {
+fn read_value() -> Int ![State, IO] {
   let count: Int = perform State.get();
   count + 1
 }
 
-fn write_counter() -> Int ![State, IO] {
+fn write_value() -> Int ![State, IO] {
   let prev: Int = perform State.set(99);
   prev
 }
 
 fn main() -> Int ![IO] {
-  let read: Int = handle read_counter() with {
+  let read: Int = handle read_value() with {
     State.get(k) => k(5),
     State.set(arg, k) => k(arg),
   };
-  let written: Int = handle write_counter() with {
+  let written: Int = handle write_value() with {
     State.get(k) => k(0),
     State.set(arg, k) => k(arg),
   };
