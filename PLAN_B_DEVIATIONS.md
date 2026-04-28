@@ -2152,3 +2152,83 @@ The selected option is consistent with Plan B's "do not implement Stage 7+ featu
 3. **`choose.sigil`'s "pair generator" framing**: closed at this Task 59 ship — the v1 single-flip dual-resume shape demonstrates multi-shot semantics canonically. The literal two-flip Cartesian-product pair generator becomes expressible when point 2 above closes.
 
 **Implementing commit(s):** Foundation `f8d4e5a` (this entry + Task 58 squash-hash flip + PROGRESS Task 59 entry transition `todo` → `in-progress`); `examples/catch.sigil` + `catch_example_recovers_with_42` e2e at `54f611a`; `examples/state.sigil` + `state_example_dual_handle_returns_6_then_99` e2e at `e892e66`; `examples/choose.sigil` + `choose_example_dual_resume_returns_3` e2e at `53e7a7a`; closeout (PROGRESS Task 59 entry filled + this implementing-commit line backfilled) at `[HEAD]`.
+
+## 2026-04-28 — [DEVIATION Task 60] Perf-floor verification work — v1 expressibility envelope and the literal `![State[Int]]` / "3-element Choose combinator" framings
+
+**Context:** Plan B Task 60 calls for four performance-floor verifications:
+
+1. `fib(20)` (native-color) in <50ms on both hosts.
+2. `fib(20)` forced to CPS-color via a gratuitous `![State[Int]]` annotation in <500ms on both hosts.
+3. Multi-shot stress test (3-element Choose combinator, N=1000 iterations) in <5s on both hosts.
+4. Arena allocator statistics: at most 1% of `NextStep` records escape to Boehm heap in a typical CPS-color run.
+
+The first item is already covered by the Plan A2 Task 34 e2e test `fib_perf_example_prints_6765_under_50ms` (compiler/tests/e2e.rs) using `examples/fib_perf.sigil`. Items 2-4 need new examples + e2e tests; each touches a v1 expressibility limit documented elsewhere.
+
+**Item 2 — `![State[Int]]` framing.** Plan wording calls for "a gratuitous `![State[Int]]` annotation" forcing fib to CPS-color. Two adjustments to the v1 ship:
+
+(a) **`State[Int]` → `State`.** Sigil v1's `State` effect declaration is monomorphic — `effect State { get: () -> Int, set: (Int) -> Int }` — without type-parameter generics applied at the use site. The plan's `State[Int]` notation is the design-doc convention for the fully-instantiated form; v1 source uses `State` directly. Generic-parameterised effects (`effect State[T]`) parse + typecheck at the AST level (per `compiler/src/typecheck.rs`'s `EffectDecl.generic_params` handling) but are not exercised by any existing example or e2e test; v1 ships the monomorphic form for the perf demo. The colorer's CPS-coloring decision depends only on whether the fn performs any non-IO effect — type-parameter granularity doesn't change that.
+
+(b) **The annotation alone doesn't force CPS color** — the colorer (`compiler/src/color.rs`) classifies a fn as CPS-color iff its body or any transitively-called fn performs a non-IO effect. A row declaration that doesn't lead to actual perform sites leaves the colorer's classification unchanged. So forcing fib into CPS color requires fib to actually perform something. v1 ships fib with body `let _: Int = perform State.get(); match n { 0 => 0, 1 => 1, _ => fib(n - 1) + fib(n - 2) }` — every fib invocation performs `State.get()` once at entry. The handler resumes with `k(0)` (one-shot use-`k` arm); the perform's value is bound to `_` and discarded; the match runs as before.
+
+Body-shape note: the `let _: Int = perform; match { ... }` shape does not match `is_simple_let_yield_then_pure_tail_body` (the match arms contain non-pure recursive `fib(...)` calls, so `expr_is_pure(tail) = false`). Per `compute_user_fn_abi` (codegen.rs:189-214), fib falls through to `UserFnAbi::Sync` despite being `Color::Cps`. Each perform site routes through `lower_perform_to_value`'s synchronous `sigil_run_loop` driver — the Phase 4d MVP shape. This is the path the perf bound is normative for: ~17710 synchronous perform→arm-dispatch→resume cycles to compute fib(20) = 6765, ~10× the native cost.
+
+**Item 3 — "3-element Choose combinator" framing.** Plan wording calls for "Multi-shot stress test (3-element Choose combinator, N=1000 iterations)". A literal 3-element Cartesian-product Choose enumeration would have 2^3 = 8 outcomes per iteration via three sequential `perform Choose.flip()` sites in a single helper body. Sigil v1 supports exactly one perform per helper body (per `is_simple_let_yield_then_pure_tail_body`'s "exactly one let stmt" cap at codegen.rs:10303-10305); two-perform helper bodies require the chained-synth-cont extension named at codegen.rs:10286-10290 as a future widening — same Plan-C-or-later territory pinned in `[DEVIATION Task 59]` for `choose.sigil`'s literal "two-flip pair generator" framing.
+
+v1 ships a **single-binary-perform multi-shot pattern wrapped in an N-iteration recursive driver**:
+
+```sigil
+effect Choose resumes: many { flip: () -> Bool }
+
+fn outcome() -> Int ![Choose, IO] {
+  let b: Bool = perform Choose.flip();
+  if b { 1 } else { 2 }
+}
+
+fn run(n: Int) -> Int ![IO] {
+  match n {
+    0 => 0,
+    _ => {
+      let _: Int = handle outcome() with {
+        Choose.flip(k) => {
+          let r1: Int = k(true);
+          let r2: Int = k(false);
+          r1 + r2
+        },
+      };
+      run(n - 1)
+    },
+  }
+}
+```
+
+With N=1000, this produces 2000 multi-shot k invocations across 1000 fresh handler frames + 1000 fresh heap-reified k_closure records. The literal "3-element" shape would scale this to 8000 outcomes per iteration but exercises a different invariant (single-handle multi-perform deep enumeration) which Slice C v1 doesn't support. The v1 ship exercises **iteration-scale stress** rather than **per-iteration combinator depth**; the two complementary stress shapes match the [DEVIATION Task 58] precedent for `multishot_stress.sigil`'s 5-handles vs. literal-10+-resumes choice.
+
+**Item 4 — "1% of `NextStep` records escape" framing.** Plan wording calls for "at most 1% of `NextStep` records escape to Boehm heap in a typical CPS-color run". The runtime tracks `ArenaAllocCount` (every `sigil_arena_alloc` call) and `ArenaEscapeCount` (every `sigil_arena_promote` call) atomically. The ratio `ArenaEscapeCount / ArenaAllocCount` is what the plan bound governs. v1 ships an e2e test that:
+
+(a) Compiles a representative CPS-color program (the multi-shot stress driver above) with `--print-runtime-stats`.
+(b) Runs it and parses the counter dump from stderr (each line `SIGIL_COUNTER_<NAME>=<VALUE>`, per `runtime/src/counters.rs:104-112`'s `sigil_counter_print_all`).
+(c) Asserts `escape_count * 100 ≤ alloc_count` (the integer arithmetic equivalent of `escape_count / alloc_count ≤ 1%`).
+
+"Typical CPS-color run" is the multi-shot driver — a representative program that exercises both the canonical Slice C 2-let arm (heap-reifying k_closures) and the iterated handle-frame allocation pattern. If the ratio test trips on a representative program, that's a real perf regression worth investigating; if it passes, the bound is met for the typical workload Task 60 cares about.
+
+**Three deviations summary:**
+
+| Plan wording | v1 ship | Closure point |
+|---|---|---|
+| `fib(20)` forced via `![State[Int]]` | `![State, IO]` + `let _ = perform State.get()` body shape | Type-parameter `State[Int]` is post-Plan-B (no test/example currently exercises it); the `_ = perform` workaround is permanent v1 idiom for "CPS-force a fn whose body shape doesn't already perform" |
+| 3-element Choose combinator, N=1000 | Single-binary-perform multi-shot, N=1000 driver | Future chained-synth-cont extension (multi-perform helper bodies) — bundles with Slice C N-chain extension named in [DEVIATION Task 58] |
+| 1% NextStep escape rate | `--print-runtime-stats` parse + ratio assertion against the multi-shot driver as "typical CPS-color run" | Closed at this PR; future refinements could add per-program-shape escape-rate breakouts but the v1 ship covers the representative case |
+
+**Rationale:** Task 60 is *verification work*, not feature work. Each deviation preserves the perf-floor *intent* (CPS slowdown ≤ 10×, multi-shot scalability over many iterations, arena allocator efficiency on representative programs) while sidestepping v1 expressibility limits documented in earlier deviations. None of the three deltas requires new compiler machinery; all use the existing Phase 4d/4e/4f/4g + Task 56 runtime + Task 57 IO/ArithError infrastructure.
+
+The selected approach is consistent with Plan B's "do not implement Stage 7+ features" hard rule (the chained-synth-cont and `TypeExpr::Fn` lifts both fall under feature-extension territory) and with the "expressibility envelope per task" pattern established at Phase 4d/4e/4f/4g/Task 58/Task 59.
+
+**Closure points:**
+
+1. **Item 2 — `State[Int]` parameterised effect**: post-Plan-B (no current test exercises generic-parameterised effects at codegen). The v1 monomorphic `State` form is permanently fine for this perf demo — type-parameter granularity doesn't affect the CPS-coloring decision.
+
+2. **Item 3 — 3-element Choose combinator**: future chained-synth-cont extension lifts `is_simple_let_yield_then_pure_tail_body`'s "exactly one let stmt" cap. Bundles with the Slice C N-chain extension (multi-perform arm bodies). When both close, the v1 driver test can be augmented or replaced with a literal-3-element variant.
+
+3. **Item 4 — escape-rate assertion**: closed at this Task 60 ship for the representative case. Future refinements could parameterise the assertion across multiple program shapes.
+
+**Implementing commit(s):** Foundation `[HEAD]` (this entry + Task 59 squash-hash flip + PROGRESS Task 60 entry transition `todo` → `in-progress`); `examples/fib_cps_perf.sigil` + `fib_cps_perf_example_prints_6765_under_500ms` e2e at `[HEAD+1]`; multi-shot stress driver + e2e at `[HEAD+2]`; arena-escape-rate e2e at `[HEAD+3]`; closeout (PROGRESS Task 60 entry filled + this implementing-commit line backfilled) at `[HEAD+4]`.
