@@ -1048,6 +1048,236 @@ fn handle_with_mixed_effect_arms_dispatches_correct_arm_per_effect() {
     assert_eq!(stdout, "18\n", "stdout mismatch; stderr={stderr:?}");
 }
 
+#[test]
+fn handle_with_two_effects_two_arms_each_dispatches_per_op() {
+    // Plan B Task 55, Phase 4f polish round — closes the per-effect-
+    // multiple-arms coverage gap left open by the inversion test
+    // (`handle_with_mixed_effect_arms_dispatches_correct_arm_per_effect`)
+    // which only exercised single-arm-per-effect groups. This test
+    // exercises 2 effects × 2 arms each: each effect's group becomes
+    // a single `HandlerFrame` with arm_count=2, populated via two
+    // `set_arm` calls before push.
+    //
+    // Four handles in main, each performing a different op of the
+    // same handle shape (all 4 arms registered every time). Sentinel
+    // values (1, 2, 3, 4) on each arm let a misdispatch announce
+    // itself loudly: a wrong-arm fire produces a non-matching int.
+    // Expected stdout: "1\n2\n3\n4\n" — one line per perform.
+    //
+    // Effects + op_ids (alphabetic):
+    //   E1.a -> op_id 0   E2.x -> op_id 0
+    //   E1.b -> op_id 1   E2.y -> op_id 1
+    // Each handle's E1 group has arm_count=2 covering op_ids [0, 2);
+    // E2 group same shape. Bounds checks all pass.
+    //
+    // Bisecting hint: `stdout != "1\n2\n3\n4\n"` attributes to
+    // BTreeMap-grouping or per-frame `set_arm` dispatch. A
+    // wrong-effect-arm landing produces e.g. "3\n2\n3\n4\n" (E1.a
+    // routing to E2's op_id 0 = x, returning 3 instead of 1).
+    let src = "effect E1 { a: () -> Int, b: () -> Int }\n\
+               effect E2 { x: () -> Int, y: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r1: Int = handle (perform E1.a()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 let r2: Int = handle (perform E1.b()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 let r3: Int = handle (perform E2.x()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 let r4: Int = handle (perform E2.y()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r1));\n  \
+                 perform IO.println(int_to_string(r2));\n  \
+                 perform IO.println(int_to_string(r3));\n  \
+                 perform IO.println(int_to_string(r4));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_2x2_dispatch");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n2\n3\n4\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_arms_in_reverse_source_order_produces_same_output() {
+    // Plan B Task 55, Phase 4f polish round — pins frame-push order
+    // to effect-id-lex-order (the BTreeMap's stable iteration), not
+    // to source-position-of-first-arm. Two handles in main with
+    // identical effects but the arms appearing in different source
+    // orders. Both must produce the same observable result.
+    //
+    // If the codegen accidentally iterated `op_arms` in source order
+    // rather than via the BTreeMap groups, the second handle's
+    // reversed-source arms would land in a different per-frame
+    // arm-slot ordering, surfacing as a misdispatch. The test
+    // catches the regression even though no bug exists today.
+    //
+    // Bisecting hint: `stdout != "7\n7\n"` attributes to source-
+    // order leaking through the BTreeMap-grouping abstraction (e.g.,
+    // a refactor that replaced the BTreeMap with a Vec).
+    let src = "effect AAA { go: () -> Int }\n\
+               effect BBB { go: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle (perform AAA.go()) with {\n    \
+                   AAA.go(k) => 7,\n    \
+                   BBB.go(k) => 99,\n  \
+                 };\n  \
+                 let b: Int = handle (perform AAA.go()) with {\n    \
+                   BBB.go(k) => 99,\n    \
+                   AAA.go(k) => 7,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_source_order_independent");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n7\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_one_effect_at_max_handler_arms_compiles_and_dispatches() {
+    // Plan B Task 55, Phase 4f polish round — verifies the per-frame
+    // arm-count cap (MAX_HANDLER_ARMS = 14, sized by the 32-bit GC
+    // pointer-bitmap on `HandlerFrame`) applies *per-effect-group*,
+    // not per-handle: this multi-effect handle has 14 Wide-effect
+    // arms (at the cap) plus 1 Other-effect arm, totalling 15 arms
+    // collectively. A per-handle cap of 14 would reject this; a per-
+    // frame cap of 14 accepts it (Wide group has 14 arms = at-cap;
+    // Other group has 1 arm = under-cap). Phase 4f's push-N-frames
+    // architecture allocates one frame per effect, so the cap
+    // applies per-frame.
+    //
+    // Performs Wide.op13 (the highest-numbered op, arm_count=14,
+    // op_id=13 → 13 < 14 satisfies the runtime bounds check) and
+    // asserts the matching arm fires.
+    //
+    // Bisecting hint: a "TRAP / abort in sigil_handler_frame_new"
+    // attributes to a per-frame cap regression introduced after this
+    // commit; "stdout != 14" attributes to dispatch landing the
+    // wrong arm.
+    let src = "effect Wide { \
+                 op00: () -> Int, op01: () -> Int, op02: () -> Int, \
+                 op03: () -> Int, op04: () -> Int, op05: () -> Int, \
+                 op06: () -> Int, op07: () -> Int, op08: () -> Int, \
+                 op09: () -> Int, op10: () -> Int, op11: () -> Int, \
+                 op12: () -> Int, op13: () -> Int }\n\
+               effect Other { only: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Wide.op13()) with {\n    \
+                   Wide.op00(k) => 0,\n    \
+                   Wide.op01(k) => 1,\n    \
+                   Wide.op02(k) => 2,\n    \
+                   Wide.op03(k) => 3,\n    \
+                   Wide.op04(k) => 4,\n    \
+                   Wide.op05(k) => 5,\n    \
+                   Wide.op06(k) => 6,\n    \
+                   Wide.op07(k) => 7,\n    \
+                   Wide.op08(k) => 8,\n    \
+                   Wide.op09(k) => 9,\n    \
+                   Wide.op10(k) => 10,\n    \
+                   Wide.op11(k) => 11,\n    \
+                   Wide.op12(k) => 12,\n    \
+                   Wide.op13(k) => 14,\n    \
+                   Other.only(k) => 99,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_at_max_handler_arms");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "14\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_one_effect_exceeding_max_handler_arms_is_rejected_at_codegen() {
+    // Plan B Task 55, Phase 4f polish round — negative case for the
+    // per-frame arm-count cap. A multi-effect handle with one
+    // effect at MAX_HANDLER_ARMS+1=15 arms must be rejected at
+    // **compile time** (clean codegen-walker diagnostic), not at
+    // runtime via `sigil_handler_frame_new`'s abort. The walker
+    // check landed in this same polish-round commit alongside the
+    // promotion of `MAX_HANDLER_ARMS` from `sigil_runtime::handlers`
+    // to `sigil_abi::effect`.
+    //
+    // Asserts a clean compile-time diagnostic mentioning
+    // `MAX_HANDLER_ARMS` and the offending effect name.
+    let src = "effect TooWide { \
+                 op00: () -> Int, op01: () -> Int, op02: () -> Int, \
+                 op03: () -> Int, op04: () -> Int, op05: () -> Int, \
+                 op06: () -> Int, op07: () -> Int, op08: () -> Int, \
+                 op09: () -> Int, op10: () -> Int, op11: () -> Int, \
+                 op12: () -> Int, op13: () -> Int, op14: () -> Int }\n\
+               effect Other { only: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 0 with {\n    \
+                   TooWide.op00(k) => 0,\n    \
+                   TooWide.op01(k) => 1,\n    \
+                   TooWide.op02(k) => 2,\n    \
+                   TooWide.op03(k) => 3,\n    \
+                   TooWide.op04(k) => 4,\n    \
+                   TooWide.op05(k) => 5,\n    \
+                   TooWide.op06(k) => 6,\n    \
+                   TooWide.op07(k) => 7,\n    \
+                   TooWide.op08(k) => 8,\n    \
+                   TooWide.op09(k) => 9,\n    \
+                   TooWide.op10(k) => 10,\n    \
+                   TooWide.op11(k) => 11,\n    \
+                   TooWide.op12(k) => 12,\n    \
+                   TooWide.op13(k) => 13,\n    \
+                   TooWide.op14(k) => 14,\n    \
+                   Other.only(k) => 99,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_max_handler_arms_neg_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_max_handler_arms_neg_{}",
+        std::process::id()
+    ));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail — TooWide group has 15 arms, exceeds MAX_HANDLER_ARMS=14; \
+         got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("MAX_HANDLER_ARMS") && stderr.contains("TooWide"),
+        "error should reference MAX_HANDLER_ARMS and the offending effect name; got stderr={stderr:?}",
+    );
+}
+
 #[ignore = "Latent op_id/arm_count constraint pre-existing since Phase 4a; \
             Phase 4f expanded the user-reachable surface but did not \
             introduce or fix it. Resolution deferred to a separate \

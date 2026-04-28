@@ -768,6 +768,36 @@ fn expr_unsupported_handle(
                     }
                 }
             }
+            // Plan B Task 55, Phase 4f polish round — per-effect
+            // arm-count cap. Each `HandlerFrame` can carry at most
+            // `MAX_HANDLER_ARMS` (= 14, sized by the 32-bit GC
+            // pointer-bitmap). Under Option A's push-N-frames lift,
+            // each effect's arm group becomes a single frame, so the
+            // cap applies *per-effect-group*, not per-handle. Without
+            // this check, the runtime aborts in
+            // `sigil_handler_frame_new`
+            // (`runtime/src/handlers.rs:264-269`); a clean compile-
+            // time diagnostic is strictly better UX. Reject here.
+            let mut per_effect_arm_count: std::collections::BTreeMap<&str, u32> =
+                std::collections::BTreeMap::new();
+            for arm in op_arms.iter() {
+                *per_effect_arm_count.entry(arm.effect.as_str()).or_insert(0) += 1;
+            }
+            for (effect, count) in per_effect_arm_count.iter() {
+                if *count > sigil_abi::effect::MAX_HANDLER_ARMS {
+                    return Some(format!(
+                        "`handle` expression at {:?} has {} arms for effect `{}` — \
+                         exceeds the per-frame cap MAX_HANDLER_ARMS={} (sized by \
+                         the 32-bit GC pointer-bitmap on `HandlerFrame`; see \
+                         `sigil_abi::effect::MAX_HANDLER_ARMS`). Plan B Task 55 \
+                         Phase 4f polish round.",
+                        span,
+                        count,
+                        effect,
+                        sigil_abi::effect::MAX_HANDLER_ARMS
+                    ));
+                }
+            }
             // Phase 4c: per-arm validation — no `k` references, no
             // outer-scope captures, no nested `Lambda` /
             // `ClosureRecord` shapes. The arm body is otherwise free
