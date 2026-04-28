@@ -1784,7 +1784,7 @@ The `std/io.sigil` source file stays in the tree as documentation but is not loa
 
 The trade-off: a future agent reading `tc.effects` and seeing entries that did not come from `program.items` may be briefly confused. Mitigation: the synthetic `EffectDecl`s carry a synthetic span (e.g., `Span::synthetic_builtin_effect`) so error messages distinguish them, and `Tc::new` (or a named `inject_builtin_effects` helper) is the single source of truth for what's pre-populated. The `std/io.sigil` file gains a comment header noting that the actual registration is via builtin injection in `typecheck.rs` (the file remains as forward-compat documentation for a future stdlib-loading task).
 
-**Implementing commit(s):** This commit (foundation) + Slice 1 (IO refactor) commit on `plan-b-task-57`.
+**Implementing commit(s):** Foundation (`d2828fa`) + foundation review fixups (`8311723`; added `mod_by_zero` op + reserved-low-id pin) + Slice 1 (`b98c08a`; both builtins injected, IO consumers wired).
 
 **Closure point:** Synthetic injection is permanent for Plan B. A future Plan C task may replace it with real import resolution; the v1-to-v2 swap is local to typecheck pre-pass and does not require codegen / runtime changes (effect_ids stay alphabetical; the only observable difference is whether `effect IO` declarations in user code shadow or duplicate the builtin).
 
@@ -1813,7 +1813,7 @@ Each op's declared return type is `Int` — the same type as the surrounding div
 
 3. **v2 path is clean.** When `Ty::Never` lands (separate Plan C task or post-Plan-B chore), the swap is a one-line edit per op: `() -> Int` becomes `() -> Never` in the builtin-effect injection. Existing handlers like `ArithError.div_by_zero(k) => 0` keep typechecking because the arm body's type is unified with handler-overall (the surrounding expression's expected type, `Int`), not with op-return-type. **Only programs that actually call `k(recovery_int)` break at v2** — a tightening that disallows the dubious-recovery pattern. Acceptable.
 
-**Implementing commit(s):** Slice 2 (ArithError refactor) commit on `plan-b-task-57`.
+**Implementing commit(s):** Slice 2 (`28721af`).
 
 **Closure point:** v1 ships with `() -> Int`. v2 task (post-Plan-B; tracked via `[v2]` deferral note in design doc's effects section) introduces `Ty::Never` and flips the op return type. The `examples/div_recover.sigil` test pattern (`ArithError.div_by_zero(k) => 999`) survives the v1-to-v2 swap unchanged.
 
@@ -1871,7 +1871,7 @@ User `main` is unchanged at the source level. User-installed handlers via `handl
 
 2. **Symmetry with `Expr::Handle`.** Today `Expr::Handle` codegen is the only consumer of `sigil_handler_frame_new` + `set_arm` + `push`. Reusing the exact same FFI surface from the shim — same arm fn ABI, same closure_ptr-null convention for closure-less arms, same `set_arm` offsets — keeps the runtime-side mental model uniform. The shim is simply a `Expr::Handle` whose body is `sigil_user_main` and whose arms are two C-function-pointer literals, lifted out of Sigil source and into codegen-emitted `main`.
 
-**Implementing commit(s):** Slice 1 (IO refactor) commit lands the IO frame push+pop and `sigil_io_println_arm` runtime fn; Slice 2 (ArithError refactor) lands the ArithError frame push+pop and the two `sigil_arith_error_{div,mod}_by_zero_arm` runtime fns.
+**Implementing commit(s):** Slice 1 (`b98c08a`; IO frame + `sigil_io_println_arm`) + Slice 2 (`28721af`; ArithError frame + the two `sigil_arith_error_{div,mod}_by_zero_arm` runtime fns + snapshot rename per `[DEVIATION Task 57] Slice 2 shim-snapshot rename`).
 
 **Closure point:** Both top-level handlers ship with Task 57. Future tasks may add additional builtin effects (e.g., a hypothetical `Net` or `FS`) by extending the shim's push/pop pair count and adding corresponding runtime-side arm fns; the pattern is mechanical.
 
@@ -1911,7 +1911,7 @@ The `__intrinsic_sdiv` / `__intrinsic_srem` shape is a new codegen-internal `Bin
 
 **Total: 3 source files, 5 BinOp::Div/Mod sites, 3 effect-row updates.** No other `examples/*.sigil` files use `/` or `%`. No other inline e2e Sigil sources use `/` or `%`. If Slice 2's diff requires more than 3 source-row edits, the typecheck check_binop change has bug — surface this for review.
 
-**Implementing commit(s):** Slice 2 (ArithError refactor) commit; lands the typecheck check_binop helper extension, the elaborate `Expr::Binary { op: Div | Mod, .. }` rewrite, the new `BinOp::SdivUnchecked` / `SremUnchecked` AST variants, the codegen drops, and the row updates on the 3 source files above.
+**Implementing commit(s):** Slice 2 (`28721af`); lands the typecheck check_binop helper extension via `register_effect_use`, the elaborate `Expr::Binary { op: Div | Mod, .. }` rewrite, the new `BinOp::SdivUnchecked` / `SremUnchecked` AST variants, the codegen drops (`trap_on_zero` + `TRAP_ARITH_ABORT`), and the row updates on the 3 source files (`examples/arith.sigil`, `examples/div_by_zero.sigil`, `compiler/tests/e2e.rs:446-448`).
 
 **Closure point:** Permanent for v1. Programs that do division declare `ArithError` in their row from Task 57 onward. The `examples/div_recover.sigil` example (new in Slice 2) declares `![ArithError]` on the inner fn that does division and `![]` on the outer fn that handles the effect via `handle … with { ArithError.div_by_zero(k) => … }`, demonstrating effect discharge at the type level.
 
@@ -1945,9 +1945,9 @@ The `__intrinsic_sdiv` / `__intrinsic_srem` shape is a new codegen-internal `Bin
 - *Color analysis classifies a fn doing `/` as Native instead of CPS*: post-elaborate-time-synthesis the `Expr::Perform(ArithError, div_by_zero, [])` should be visible in the AST and `find_non_io_perform_in_perform` should classify the fn as CPS. Confirm via `--dump-color` on a fn doing division — should be `cps: performs ArithError`. If still Native, the elaborate rewrite is producing the perform under a different AST shape than the colorer recognizes; look at elaborate.rs's emit and color.rs's walker.
 - *Cranelift verifier rejects the post-elaborate `BinOp::SdivUnchecked` arm*: the new codegen-internal AST variants need a `lower_expr` arm + `type_of_expr` arm. If they reach codegen as `unreachable!()` and panic, elaborate's rewrite is missing them entirely. Look at Slice 2 (codegen + elaborate).
 
-**Implementing commit(s):** Foundation (this commit) + Slice 1 + Slice 2 + Closeout, all squash-merged via PR #30 (or whatever PR number GitHub assigns).
+**Implementing commit(s):** Foundation (`d2828fa`) + foundation review fixups (`8311723`) + Slice 1 (`b98c08a`) + CI fix #1 (`29b2b5e`; stackmap test count) + Slice 1 review fixups (`2e12eaa`) + Slice 2 (`28721af`) + Closeout (`[HEAD]`). All seven commits squash-merged via PR #30.
 
-**Closure point:** PR #30 squash-merge closes Task 57. Tasks 58–61 + Stage 6 review checkpoint remain. After Task 57, `IO` is a normal effect routing through `sigil_perform`, `ArithError` is a real algebraic effect with default + override-able handlers, no `sigil_panic_arith_error` call sites remain in codegen, and the Plan A2 user-visible behavior of `examples/div_by_zero.sigil` is preserved.
+**Closure point:** PR #30 squash-merge closes Task 57. Tasks 58–61 + Stage 6 review checkpoint remain. After Task 57, `IO` is a normal effect routing through `sigil_perform`, `ArithError` is a real algebraic effect with default + override-able handlers, no `sigil_panic_arith_error` call sites remain in codegen, and the Plan A2 user-visible behavior of `examples/div_by_zero.sigil` (and the parallel `mod_by_zero` e2e test) is preserved verbatim. The five Task 57 architectural choices in deviation entries above all closed.
 
 ## 2026-04-28 — [DEVIATION Task 57] IO color filter retention (perf-preserving choice; residual discard-`k` gap)
 
@@ -1994,7 +1994,7 @@ The original foundation deviation entry's framing of "drop the filters" was aspi
 
 **Reference choice — `NATIVE_EFFECT` over `BUILTIN_EFFECT_NAMES`:** the three codegen classifier filters now reference `color::NATIVE_EFFECT` rather than the literal `"IO"` so a future builtin rename touches one source of truth. The filters' logic — "IO-color performs don't trigger CPS classification" — is semantically about Native-color status, not "is in the builtin set", so the colorer's name is the right reference (per review-2 issue #3).
 
-**Implementing commit(s):** This commit (Slice 1 review fixups). Slice 1's `b98c08a` framing of "without correctness loss" is corrected by this entry's clearer "perf-preserving with residual gap" phrasing.
+**Implementing commit(s):** Slice 1 review fixups (`2e12eaa`). Slice 1's `b98c08a` framing of "without correctness loss" is corrected by this entry's clearer "perf-preserving with residual gap" phrasing.
 
 **Pinning test:** `user_discard_k_io_handler_does_not_unwind_native_color_helper_pending_color_filter_lift` (`#[ignore]`'d e2e). Inverts to a positive test asserting only `"a"` is printed when the IO filters are lifted. Mirrors the `discard_k_handler_does_not_abort_helper_phase_4e_pending` precedent (Phase 4d MVP) and `partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution` precedent (Phase 4f).
 
@@ -2024,6 +2024,6 @@ pop → arith_frame   (verify == arith_frame_snapshot — discipline trap)
 
 **Why pre-flag rather than land alongside Slice 2:** the failure mode (a partial Slice 2 implementation that retains the Slice 1 snapshot variable) is silent in release builds (the trap is debug-gated) and easy to miss at review. Pre-flagging in this entry forces the Slice 2 reviewer's attention to the rename without requiring them to remember it from Slice 1's shim deviation entry.
 
-**Implementing commit(s):** Slice 2 (ArithError refactor) on `plan-b-task-57`. This entry's purpose is documentary — the actual rename happens in that commit.
+**Implementing commit(s):** Slice 2 (`28721af`). The actual rename + the ArithError frame push-before-IO + the two-pop discipline-check shape all land in that commit; the local sanity check on the IO pop and the discipline trap on the ArithError pop are both wired per the bullet list above.
 
-**Closure point:** When Slice 2 lands and the discipline check correctly verifies the ArithError frame's identity at the second pop. If Slice 2 fails to rename, this entry's bullet list provides the diff a fixup commit would land.
+**Closure point:** Closed at Slice 2 (`28721af`). The discipline check correctly verifies the ArithError frame's identity at the second pop; the IO pop has its own sanity check.
