@@ -1663,7 +1663,7 @@ The bisecting hint is also embedded inline at the prime-suspect code change site
 
 **Plan §:** Stage 6 / Task 55 / Phase 4g.
 
-**Status:** in-progress on `plan-b-task-55-phase-4g`. Foundation commit (this commit) lands the deviation entry + `PLAN_B_PROGRESS.md` Phase 4f post-merge hash flip + new Phase 4g `in-progress` entry. Codegen lift + walker sweep + tests + closeout ship in subsequent commits on this branch.
+**Status:** done-pending-ci on `plan-b-task-55-phase-4g`. Three commits shipped: foundation (`5b30601`, deviation entry + PROGRESS update only), codegen lift (`eabef59`, walker lift + synth return fn + handle-exit dispatch + 8 e2e tests), closeout (this commit, README + PROGRESS final flip + this status update). CI verdict pending; squash-merge after green + review.
 
 **Context — Phase 4f-shipped substrate.** PR #28 (`08d002a`) closed multi-effect handlers via Option A push-N-frames; the `Expr::Handle` lowering snapshots `frame_1_ptr_snapshot: Option<Value>` immediately after the first effect's `sigil_handler_frame_new` call (`compiler/src/codegen.rs:6878`). That snapshot serves two purposes per the Phase 4f entry's concerns #1 and #2: (1) the debug-only pop-discipline check at handle exit; (2) the durable hold that Phase 4g's return-arm registration reads against. Phase 4g's codegen lift implements directly against this contract — no additional Phase-4f work to redo, no ABI surface change.
 
