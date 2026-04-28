@@ -298,9 +298,25 @@ fn stackmap_section_parses_v0_placeholder() {
         panic!("stackmap parse failed: {e:?}");
     });
     assert_eq!(parsed.version, STACKMAP_VERSION_PLACEHOLDER);
-    // hello.sigil's main body hits four call sites: gc_init, user_main,
-    // sigil_string_new, sigil_println.
-    assert_eq!(parsed.records.len(), 4, "expected 4 placeholder records");
+    // Plan B Task 57 closeout-review observation — assert "≥1
+    // record" rather than an exact count. The exact count is
+    // mechanically derivable but brittle: every shim-touching
+    // change (Phase A2 → Slice 1 → Slice 2 was 4 → 9 → 14) requires
+    // updating it. The load-bearing invariant this test pins is
+    // **(a) the magic + version parse correctly, (b) every record
+    // is a v0 placeholder (live_count = 0, flag set)** — those are
+    // the per-record invariants the loop below verifies. The
+    // record count is currently a "non-zero records exist" sanity
+    // check; lifting it to `≥ 1` decouples this test from shim
+    // call-site drift. A future task that introduces a
+    // counter-aware test (e.g., asserting `HandlerWalkCount`
+    // increments per println) is the right home for cardinality
+    // assertions.
+    assert!(
+        !parsed.records.is_empty(),
+        "expected at least one placeholder record (got 0); shim must emit \
+         stackmap records for its FFI calls"
+    );
     for r in &parsed.records {
         assert_eq!(r.live_count, 0, "v0 invariant: live_count always 0");
         assert_eq!(
@@ -436,13 +452,18 @@ fn match_primitive_with_wildcard() {
     assert_eq!(code, 17, "n=2 hits wildcard → 17");
 }
 
-/// Modulo-by-zero takes the same runtime-trap path as division-by-zero
-/// but with a different reason string. The canonical
+/// Modulo-by-zero takes the same default-handler path as division-by-
+/// zero but with a different reason string. The canonical
 /// `examples/div_by_zero.sigil` covers the `/` path via
 /// [`div_by_zero_example_traps`]; this test covers the `%` path.
+///
+/// Plan B Task 57 — row updated from `![]` to `![ArithError]` per
+/// the elaborate-time-rewrite tracked-effect doctrine. User-visible
+/// behaviour (stderr banner + exit 2) preserved verbatim by the
+/// runtime-side `sigil_arith_error_mod_by_zero_arm` default arm fn.
 #[test]
 fn mod_by_zero_traps() {
-    let source = "fn main() -> Int ![] {\n\
+    let source = "fn main() -> Int ![ArithError] {\n\
                     let a: Int = 10;\n\
                     let b: Int = 0;\n\
                     let r: Int = a % b;\n\
@@ -453,6 +474,38 @@ fn mod_by_zero_traps() {
     assert!(
         stderr.contains("remainder by zero"),
         "stderr missing mod-zero banner: {stderr:?}"
+    );
+}
+
+/// Plan B Task 57 — `examples/div_recover.sigil` exercises algebraic
+/// recovery from a div-by-zero via a user-installed `ArithError`
+/// handler. Confirms that:
+///
+/// - typecheck accepts `![ArithError]` on the inner fn doing
+///   division, and `![IO]` on the outer fn whose handle expression
+///   discharges `ArithError`;
+/// - elaborate's `BinOp::Div` rewrite produces a perform-bearing
+///   form that flows through `sigil_perform`;
+/// - the user's `ArithError.div_by_zero(k) => 999` handler frame
+///   intercepts the perform before the top-level shim's default
+///   (the frame walk is inward-first);
+/// - the recovery value `999` flows back to the outer fn's handle
+///   expression, and the program prints `999` then exits 0.
+#[test]
+fn div_recover_example_returns_999() {
+    let root = workspace_root();
+    let source = root.join("examples/div_recover.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "div_recover_example");
+    assert_eq!(code, 0, "div_recover exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "999\n",
+        "div_recover stdout mismatch (expected user handler to recover with 999); \
+         stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "div_recover should not abort via the default ArithError arm fn; \
+         stderr should be empty"
     );
 }
 
@@ -1344,6 +1397,87 @@ fn partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution() {
     let (stdout, stderr, code) = compile_and_run(src, "partial_handler_multi_op");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "20\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[ignore = "Residual correctness gap from Slice 1's IO color filter \
+            retention — Native-color helpers do not unwind under \
+            user-installed discard-`k` IO handlers. Pinned per \
+            `[DEVIATION Task 57] IO color filter retention` in \
+            `PLAN_B_DEVIATIONS.md`; same structural hole Phase 4e \
+            closed for non-IO performs, deliberately left open here \
+            for the perf-preserving reason. Test asserts the future-\
+            correct (filter-lifted) behaviour. v2 task lifts \
+            `color::NATIVE_EFFECT` and the three codegen classifier \
+            filters, then un-ignores this test."]
+#[test]
+fn user_discard_k_io_handler_does_not_unwind_native_color_helper_pending_color_filter_lift() {
+    // Plan B Task 57 — pinning test for the residual correctness
+    // gap from Slice 1's IO color filter retention. Mirrors the
+    // `discard_k_handler_does_not_abort_helper_phase_4e_pending`
+    // (Phase 4d MVP) and `partial_handler_of_multi_op_effect_-
+    // aborts_at_runtime_pending_resolution` (Phase 4f) precedents:
+    // the test asserts the future-correct behaviour and is
+    // `#[ignore]`'d while the gap exists, so it stays grep-findable
+    // through the eventual fix.
+    //
+    // **The gap:** the colorer (`compiler/src/color.rs::NATIVE_EFFECT
+    // = "IO"`) and three parallel codegen-classifier filters keep
+    // IO-only fns Native-color. A user-installed discard-`k` IO
+    // handler intercepts the perform, but the Native-color helper's
+    // `lower_perform_to_value` synchronously calls `sigil_run_loop`,
+    // which returns Unit from the discard arm; helper continues to
+    // its post-perform code. Standard algebraic semantics expect
+    // helper to unwind at the perform site (the arm discharged `k`,
+    // so the perform never resumes).
+    //
+    // **Concrete failure:**
+    //   - helper performs IO.println once, then returns 1.
+    //   - User handler `IO.println(s, k) => 0` discards k.
+    //   - Slice 1: helper's perform returns Unit synchronously,
+    //     helper continues, returns 1. handle expression = 1.
+    //     Stdout = "1\n".
+    //   - v2 (filter lifted): helper is CPS-color, the perform
+    //     yields to the trampoline, arm returns Done(0), trampoline
+    //     observes Done. handle expression = 0 (arm body's value).
+    //     helper does NOT continue past the perform. Stdout = "0\n".
+    //
+    // The assertion below is the **future-correct (v2)** value;
+    // pre-fix the actual stdout is "1\n".
+    //
+    // **Future resolution:**
+    //
+    // - Lift `color::NATIVE_EFFECT` (drop the constant; replace its
+    //   single use with a row-membership check that includes IO).
+    // - Drop the three codegen classifier filters at
+    //   `is_simple_tail_perform_with_pure_args_body`,
+    //   `is_simple_yield_then_constant_tail_body`,
+    //   `is_simple_let_yield_then_pure_tail_body` (each references
+    //   `color::NATIVE_EFFECT` post-Slice-1, so the source-of-truth
+    //   change is local; the filter call sites become unconditional).
+    // - Un-ignore this test.
+    //
+    // The fix-PR un-ignores + verifies the assertion. No source
+    // edits to this test should be required at fix time.
+    let src = "fn helper() -> Int ![IO] {\n  \
+                 perform IO.println(\"a\");\n  \
+                 1\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   IO.println(s, k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "user_discard_k_io_handler");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Future-correct behaviour: helper unwinds at the perform site,
+    // handle expression's value is the discharger arm's body (`0`).
+    assert_eq!(
+        stdout, "0\n",
+        "expected helper to unwind at the perform site under filter-\
+         lifted v2; got stdout={stdout:?}, stderr={stderr:?}"
+    );
 }
 
 #[test]

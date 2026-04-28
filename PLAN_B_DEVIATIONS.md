@@ -1108,9 +1108,10 @@ is functionally inert today. A future GC walker that
 introspects tags can add `TAG_HANDLER_FRAME` in a single line
 without touching this allocation site.
 
-**Capacity bound:** `MAX_HANDLER_ARMS = 13`. Bounded by the
+**Capacity bound:** `MAX_HANDLER_ARMS = 14`. Bounded by the
 32-bit pointer bitmap: arm `i`'s closure_ptr lives at payload
-word `5 + 2*i`, so bit 31 corresponds to arm 13. v1 effects
+word `5 + 2*i`, so bit 31 corresponds to arm `i = 13`, giving 14
+total arms (indices 0..=13). v1 effects
 ship with 1–3 ops; the cap is comfortably above realistic v1
 needs. A future relaxation requires widening the bitmap field
 in the Sigil object header (out of scope for Plan B).
@@ -1755,4 +1756,276 @@ The walker's existing `arm_body_walk` machinery is reused with `k_name = ""` (re
   - **#9** Defensive `debug_assert!(args_len == 3)` at synth return fn entry (gated behind `cfg!(debug_assertions)`); release builds elide. Catches future codegen regressions that miscount the trailing-pair packing.
   - **Forward observation from review #1** addressed: `handle_with_nested_handle_in_return_arm_body_compiles` is the positive test demonstrating the freebie nested-handle support (deviation entry concern #5 had claimed but no test exercised it).
 
-**Closure point:** When the Phase 4g PR squash-merges, return arms close. **All Phase 4 sub-work for Task 55 is then complete** — the only remaining Plan B work is Tasks 57–61 (IO refactor + `Raise[ArithError]`, multi-shot rigor, catch/state/choose examples, perf floor, P18–P20 prompts) and the Stage 6 review checkpoint. Plan B moves to `done/` only after Stage 6 review checkpoint passes.
+**Closure point:** Phase 4g PR #29 squash-merged at `a777748` on 2026-04-28; return arms closed. **All Phase 4 sub-work for Task 55 is complete** — the only remaining Plan B work is Tasks 57–61 (IO refactor + `Raise[ArithError]`, multi-shot rigor, catch/state/choose examples, perf floor, P18–P20 prompts) and the Stage 6 review checkpoint. Plan B moves to `done/` only after Stage 6 review checkpoint passes.
+
+## 2026-04-28 — [DEVIATION Task 57] Builtin-effect injection (vs. full stdlib loading) for `IO` and `ArithError`
+
+**Context:** Plan B Task 57 says "**Refactor Stage 1's IO shortcut.** `IO` is now a normal effect, not special-cased. `perform IO.println(s)` goes through `sigil_perform`. Provide the top-level `IO` handler at program entry: a thin shim that calls `sigil_println` for `IO.println`." It also says "**Replace Plan A2's arithmetic-error panic into a proper `Raise[ArithError]` effect.** Declare `effect ArithError { div_by_zero: () -> Never }` in the stdlib."
+
+The plan body uses the word "stdlib" for both effect declarations. Today, `std/io.sigil` exists and declares `effect IO { println: (String) -> Unit, }` literally — but per the Task 57 survey, **`Item::Import(_)` is a no-op everywhere** (`compiler/src/typecheck.rs:644, 742`, `compiler/src/codegen.rs:323, 568`, `compiler/src/closure_convert.rs:107`, `compiler/src/monomorphize.rs:162, 348, 415, 1643`); `stdlib_embed::get` is called only by its own self-test. No path actually feeds `std/*.sigil` content into `tc.effects`. Wiring up real import resolution + parse-and-merge is its own engineering task.
+
+**Deviation:** For Task 57, **synthetic builtin `EffectDecl`s are injected into `tc.effects` at typecheck pre-pass start**, before walking `program.items`. The two builtins:
+
+```
+effect IO { println: (String) -> Unit }
+effect ArithError {
+  div_by_zero: () -> Int,
+  mod_by_zero: () -> Int,
+}
+```
+
+are constructed in code (no stdlib parse), pre-populated into `tc.effects` (so user-program shape `effect IO { … }` triggers the existing E0136 duplicate-effect path), and **assigned reserved low effect_ids regardless of user-effect count**: `ArithError = 0`, `IO = 1`. User effects start at id 2 in alphabetical order. Implementation: the effect_id assignment loop runs in two phases — phase 1 walks the builtin set in declaration order assigning ids 0 and 1; phase 2 walks user-declared effects in alphabetical order starting at id 2.
+
+ArithError carries **two ops**: `div_by_zero` (op_id 0) and `mod_by_zero` (op_id 1), per `[DEVIATION Task 57] Foundation review fixups (review-2 issue #1)` — preserves Plan A2's distinct `"division by zero"` vs. `"remainder by zero"` stderr messages by giving the codegen a way to dispatch the two arithmetic-error sites to different default arm fns. Op_ids assigned alphabetically per-effect: `div_by_zero` < `mod_by_zero` lexicographically gives `div_by_zero = 0` and `mod_by_zero = 1`. The shim's `set_arm` calls in `main` are hardcoded against `(ArithError = 0, div_by_zero = 0, mod_by_zero = 1, IO = 1, println = 0)` — these are stable per the reserved-id convention.
+
+The `std/io.sigil` source file stays in the tree as documentation but is not loaded by typecheck; a follow-up "stdlib loading" task can later swap the synthetic injection for a real import-resolution pipeline without touching codegen or runtime.
+
+**Rationale:** Plan B's hard rule "**Do not implement Stage 7+ features (stdlib beyond the effect declarations) — those are Plan C**" forecloses the path to a real stdlib loader inside Task 57. Synthetic injection delivers Task 57's required behavior — `perform IO.println(s)` flows through `sigil_perform` against a registered effect; `perform ArithError.div_by_zero()` flows through the same registry — without expanding scope.
+
+The trade-off: a future agent reading `tc.effects` and seeing entries that did not come from `program.items` may be briefly confused. Mitigation: the synthetic `EffectDecl`s carry a synthetic span (e.g., `Span::synthetic_builtin_effect`) so error messages distinguish them, and `Tc::new` (or a named `inject_builtin_effects` helper) is the single source of truth for what's pre-populated. The `std/io.sigil` file gains a comment header noting that the actual registration is via builtin injection in `typecheck.rs` (the file remains as forward-compat documentation for a future stdlib-loading task).
+
+**Implementing commit(s):** Foundation (`d2828fa`) + foundation review fixups (`8311723`; added `mod_by_zero` op + reserved-low-id pin) + Slice 1 (`b98c08a`; both builtins injected, IO consumers wired).
+
+**Closure point:** Synthetic injection is permanent for Plan B. A future Plan C task may replace it with real import resolution; the v1-to-v2 swap is local to typecheck pre-pass and does not require codegen / runtime changes (effect_ids stay alphabetical; the only observable difference is whether `effect IO` declarations in user code shadow or duplicate the builtin).
+
+## 2026-04-28 — [DEVIATION Task 57] ArithError op return type — `Int` (v1 simplification) instead of `Never`
+
+**Context:** Plan B Task 57 says: "Declare `effect ArithError { div_by_zero: () -> Never }` in the stdlib." The literal type is `Never` — a bottom type that unifies with anything (allowing `perform ArithError.div_by_zero()` to flow into any expression position, including `let q: Int = a / b` where the divide site lowers to `if b == 0 { perform ArithError.div_by_zero() } else { sdiv … }`).
+
+The Task 57 survey confirmed `Ty::Never` does not exist in the typechecker today. Adding it requires: a new `Ty` variant; bottom-type subsumption in the unifier (`unify_ty(Never, T) = Ok(T)` for all T); occurs-check care; principal-type preservation across HM unification; instantiation rules at perform sites; codegen emit for "perform of Never-returning op" producing a `trap` after the call (since the return value is structurally vacuous). That is exactly the class of unifier change with the highest risk of subtle regressions visible only to a PL expert reading the whole pipeline — the structural correctness gap Plan B already worries about.
+
+**Deviation:** v1 declares both ops with return type `Int`:
+
+```
+effect ArithError {
+  div_by_zero: () -> Int,
+  mod_by_zero: () -> Int,
+}
+```
+
+Each op's declared return type is `Int` — the same type as the surrounding divide / modulo site's result. The default top-level handler installed in the `main` shim never returns (each arm fn calls `exit(2)` after writing the Plan A2 banner to stderr; per-op arm fns preserve the distinct `"division by zero"` vs. `"remainder by zero"` messages); user handlers may resume `k(recovery_int)` to substitute any Int as the recovery value at the operation site. The elaborate-time rewrite (per `[DEVIATION Task 57] BinOp::Div and BinOp::Mod elaborate to perform-bearing form` below) produces `if rhs == 0 { perform ArithError.div_by_zero() } else { __intrinsic_sdiv(lhs, rhs) }` for `/` and the parallel form with `mod_by_zero` for `%`; the two branches join into the surrounding expression normally — no trap, no special handling.
+
+**Rationale:** Three reasons:
+
+1. **Structural simplicity.** Op return type is `Int`. The unifier rules are unchanged. The handler ABI (already shipped through Phase 4) handles `() -> Int` natively. The post-elaborate AST joins `perform`-result and `__intrinsic_sdiv`-result into a single SSA `Value` of type `Int` — exactly the shape today's code joins `sigil_panic_arith_error`-trap and `sdiv`-result, just with the trap replaced by a `perform` whose result feeds the join block. Cranelift's verifier passes by construction.
+
+2. **Semantic cost is zero for v1.** The only emit sites for `ArithError.div_by_zero` and `ArithError.mod_by_zero` are `BinOp::Div` and `BinOp::Mod` respectively, where the surrounding expected type is always `Int`. The handler-returns-Int recovery model composes cleanly. v1 admits one extra class of programs versus the `Never` design — a handler that resumes `k(0)` to substitute 0 as the divide result and continue execution — but div-by-zero (or mod-by-zero) recovery via continuing-the-operation-as-zero is dubious semantics anyway (it's a footgun, not a feature). Programs that want algebraic recovery use `handle (a / b) with { ArithError.div_by_zero(k) => 999 }` (discarding `k`), not `=> k(0)`. The v1-vs-`Never` distinction is invisible for the canonical use case.
+
+3. **v2 path is clean.** When `Ty::Never` lands (separate Plan C task or post-Plan-B chore), the swap is a one-line edit per op: `() -> Int` becomes `() -> Never` in the builtin-effect injection. Existing handlers like `ArithError.div_by_zero(k) => 0` keep typechecking because the arm body's type is unified with handler-overall (the surrounding expression's expected type, `Int`), not with op-return-type. **Only programs that actually call `k(recovery_int)` break at v2** — a tightening that disallows the dubious-recovery pattern. Acceptable.
+
+**v1 partial-handler contract** (per closeout-review issue #2): `effect ArithError` declares **two ops** (`div_by_zero` / `mod_by_zero`). Under the Phase 4f latent op_id/arm_count constraint (pinned by `#[ignore]`'d e2e `partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution`), user handlers MUST register both arms even when the handled expression only triggers one — a handle with `only` `div_by_zero(k) => …` runtime-aborts when `mod_by_zero` fires. `examples/div_recover.sigil` registers both arms (the `mod_by_zero` arm is unreachable in that program but keeps the `arm_count` matched to the effect's declared op count). Users copying the `div_recover` pattern should preserve the both-arms shape until the Phase 4f constraint resolves (option 1: convention fix sizing `arm_count` to `effects[arm.effect].ops.len()`; option 2: typecheck E0142 exhaustiveness rejection). This v1 contract is a temporary footgun, not a permanent design choice — same closure point as the latent constraint itself.
+
+**Implementing commit(s):** Slice 2 (`28721af`) lands the two-op effect declaration + the elaborate-time rewrite producing the appropriate per-operator perform; Slice 2 review fixup (closeout follow-up) updates `examples/div_recover.sigil` to register both arms and adds this v1-contract paragraph.
+
+**Closure point:** v1 ships with `() -> Int`. v2 task (post-Plan-B; tracked via `[v2]` deferral note in design doc's effects section) introduces `Ty::Never` and flips the op return type. The `examples/div_recover.sigil` test pattern (`ArithError.div_by_zero(k) => 999`) survives the v1-to-v2 swap unchanged. The partial-handler footgun closes alongside the Phase 4f latent op_id/arm_count constraint resolution (separate post-Phase-4f task; not Task 57's responsibility).
+
+## 2026-04-28 — [DEVIATION Task 57] Top-level handler installation in `main` shim (push at startup, pop at exit)
+
+**Context:** Plan B Task 57 says "**Provide the top-level `IO` handler at program entry**" and "**The top-level runner installs a default handler that prints to stderr and exits 2**" for ArithError. Both refactors require pushing handler frames before user `main` runs. Today the `main` shim at `compiler/src/codegen.rs:5010-5046` is generated as: `call sigil_gc_init(); call sigil_user_main(null_closure); reduce-tagged-Int-to-i32; return`. No handler frames exist outside `Expr::Handle` lowering — the survey confirmed every `sigil_handler_frame_new` / `sigil_handle_push` / `sigil_handle_pop` call site lives inside `Expr::Handle`'s codegen arm.
+
+**Deviation:** The `main` shim is extended to push two top-level handler frames between `sigil_gc_init` and `call sigil_user_main`, and pop them in reverse order before reducing the return value. The IO frame holds 1 arm (`println`); the ArithError frame holds 2 arms (`div_by_zero` at op_id 0; `mod_by_zero` at op_id 1) per the foundation review fixup:
+
+```
+call sigil_gc_init()
+
+// IO handler:
+io_frame = sigil_handler_frame_new(/*effect_id=*/1 /* IO */, /*arm_count=*/1)
+sigil_handler_frame_set_arm(io_frame, /*op_id=*/0, &sigil_io_println_arm, /*closure_ptr=*/null)
+sigil_handle_push(io_frame)
+io_first_frame_snapshot = io_frame   // for shim discipline check (debug builds only)
+
+// ArithError handler:
+arith_frame = sigil_handler_frame_new(/*effect_id=*/0 /* ArithError */, /*arm_count=*/2)
+sigil_handler_frame_set_arm(arith_frame, /*op_id=*/0, &sigil_arith_error_div_by_zero_arm, null)
+sigil_handler_frame_set_arm(arith_frame, /*op_id=*/1, &sigil_arith_error_mod_by_zero_arm, null)
+sigil_handle_push(arith_frame)
+
+call sigil_user_main(null_closure_ptr)
+
+popped_arith = sigil_handle_pop()  // ArithError frame
+popped_io    = sigil_handle_pop()  // IO frame
+
+// Shim discipline check (cfg!(debug_assertions) only):
+debug_assert(popped_io == io_first_frame_snapshot, TRAP_HANDLE_DISCIPLINE_VIOLATION)
+
+reduce + return
+```
+
+The effect_ids `0` (ArithError) and `1` (IO) are stable per the reserved-low-id convention pinned in the Builtin-effect-injection entry above; user effects start at id 2.
+
+All three arm fns are runtime-side C functions in `runtime/src/handlers.rs` (or a new `runtime/src/builtin_arms.rs`) conforming to the CPS arm fn ABI `extern "C" fn(closure_ptr, in_args: *const u64, args_len: u32) -> *mut NextStep` already pinned by Phase 4 (Slice A's trailing-pair convention: `in_args = [user_args..., k_closure, k_fn]`). The two distinct buffers — *inbound* `in_args` read by the arm fn vs. *outbound* args slots written into a freshly-built `NextStep::Call` — get distinct names below to avoid the `args_ptr[0]` overload that confused the foundation's first draft:
+
+- **`sigil_io_println_arm`**: reads `in_args[0]` as the heap-string pointer the user passed to `IO.println`, calls `sigil_println(heap_ptr)`, then builds `NextStep::Call(k_closure=in_args[1], k_fn=in_args[2], arg_count=1)`. Writes the unit value (`i64 0`) into the outbound NextStep's arg slot 0 via `sigil_next_step_args_ptr(ns)[0] = unit_value`. The trampoline dispatches to `k`, which (under default IO usage) is `sigil_continuation_identity` — `Done(unit)` then unwinds to `lower_perform_to_value`'s `sigil_run_loop` callsite, which narrows the `i64` back to `Unit`. User code receives unit, identical to the old synchronous `sigil_println` path semantically.
+
+- **`sigil_arith_error_div_by_zero_arm`**: writes `"sigil: arithmetic error: division by zero\n"` to stderr, then calls `std::process::exit(2)`. Function never returns — the `*mut NextStep` return type is structurally unreachable. Reads no fields from `in_args` (op takes no user args; trailing-pair `(k_closure, k_fn)` at `in_args[0..2]` is irrelevant since exit never resumes).
+
+- **`sigil_arith_error_mod_by_zero_arm`**: identical shape to `sigil_arith_error_div_by_zero_arm` except the message is `"sigil: arithmetic error: remainder by zero\n"`. The two arms share an internal helper writing the banner-and-exit-2 sequence parameterised on the message string, but ship as two separate `extern "C"` symbols since the runtime ABI passes no op_id to arm fns (per the Phase 4 ABI constraint; arm dispatch is keyed by the `set_arm` slot, not by op_id read at fn entry).
+
+Together the two arm fns preserve Plan A2's `examples/div_by_zero.sigil` and the parallel `mod_by_zero` e2e test verbatim — same stderr banner per operator, same exit code 2.
+
+**Shim discipline check parity (debug-only, per foundation review concern #3):** Phase 4f added a `cfg!(debug_assertions)`-gated `TRAP_HANDLE_DISCIPLINE_VIOLATION = 0x42` icmp+brif at every `Expr::Handle` exit, snapshotting the first-pushed frame's pointer at push and comparing against the last `sigil_handle_pop()`'s return at handle exit. The shim's two-frame push/pop is a bespoke codegen path, not an `Expr::Handle`, so the `lower_expr` Handle-arm machinery does not apply. The shim adds the same shape: snapshot `io_frame` (first-pushed) into a Cranelift stack local, compare against `popped_io` (the second `sigil_handle_pop` return) at shim exit, trap on mismatch. The check costs four instructions and is debug-only; the consistency win — same discipline applied uniformly across `Expr::Handle` and the shim — is non-zero. Mismatch in the shim implies a codegen bug in the shim itself (push/pop count drift) or runtime corruption of the handler stack head Cell, both of which warrant a hard fail.
+
+User `main` is unchanged at the source level. User-installed handlers via `handle … with { IO.println(s, k) => …, ArithError.div_by_zero(k) => … }` walk the handler stack inward-first, finding the user's frame before the top-level default — so user override works for free.
+
+**Rationale:** Two reasons:
+
+1. **The shim is the only context where "before main" exists.** Effect rows on user `main` would normally require declaring `![IO, ArithError]`, which the existing examples do (with at least `![IO]`). The shim is conceptually the "discharge environment" for those effects: it installs handlers that catch them with default behavior. The row check is satisfied because the user's `main` body declares `![IO]` (and post-Task-57, `![ArithError]` if it does division — see Q1 in the planning round); the discharge is implicit at the shim level via the pushed frames.
+
+2. **Symmetry with `Expr::Handle`.** Today `Expr::Handle` codegen is the only consumer of `sigil_handler_frame_new` + `set_arm` + `push`. Reusing the exact same FFI surface from the shim — same arm fn ABI, same closure_ptr-null convention for closure-less arms, same `set_arm` offsets — keeps the runtime-side mental model uniform. The shim is simply a `Expr::Handle` whose body is `sigil_user_main` and whose arms are two C-function-pointer literals, lifted out of Sigil source and into codegen-emitted `main`.
+
+**Implementing commit(s):** Slice 1 (`b98c08a`; IO frame + `sigil_io_println_arm`) + Slice 2 (`28721af`; ArithError frame + the two `sigil_arith_error_{div,mod}_by_zero_arm` runtime fns + snapshot rename per `[DEVIATION Task 57] Slice 2 shim-snapshot rename`).
+
+**Closure point:** Both top-level handlers ship with Task 57. Future tasks may add additional builtin effects (e.g., a hypothetical `Net` or `FS`) by extending the shim's push/pop pair count and adding corresponding runtime-side arm fns; the pattern is mechanical.
+
+## 2026-04-28 — [DEVIATION Task 57] `BinOp::Div` and `BinOp::Mod` elaborate to perform-bearing form (per foundation review forward concern #1; supersedes codegen-time synthesis sketch)
+
+**Context:** The foundation commit's first draft proposed synthesizing `perform ArithError.div_by_zero()` at **codegen time** — i.e., the existing `trap_on_zero` helper at `compiler/src/codegen.rs:8750-8781` would be rewritten to emit a `sigil_perform` call instead of a `sigil_panic_arith_error` call. Foundation review concern #1 raised a structural objection: the colorer (`compiler/src/color.rs::find_non_io_perform_in_perform`) walks the AST/elaborated IR, not Cranelift IR. A codegen-time-synthesized perform is invisible to the colorer; a fn doing `/` would not get reclassified as CPS-color even though it performs at runtime. That contradicts Phase 4e's discard-`k` correctness gate.
+
+**Deviation:** Synthesize the perform at **elaborate time**, not codegen time. The elaboration pass rewrites every `Expr::Binary { op: Div | Mod, lhs, rhs, .. }` into the if-perform-else AST shape:
+
+```
+let lhs_eval = <lhs>;
+let rhs_eval = <rhs>;
+if rhs_eval == 0 {
+  perform ArithError.div_by_zero()    // for Div; ArithError.mod_by_zero for Mod
+} else {
+  __intrinsic_sdiv(lhs_eval, rhs_eval)  // for Div; __intrinsic_srem for Mod
+}
+```
+
+The `__intrinsic_sdiv` / `__intrinsic_srem` shape is a new codegen-internal `BinOp` variant (`BinOp::SdivUnchecked` / `BinOp::SremUnchecked`) — produced only by elaborate's rewrite, never by surface syntax — that codegen lowers as a plain `sdiv` / `srem` without the zero check. The existing `BinOp::Div` / `BinOp::Mod` codegen arms are unreachable post-elaborate (they `unreachable!()` in `lower_expr` and `type_of_expr` since elaborate handles all surface-level Div/Mod cases).
+
+**Rationale:** Three reasons (this is the architectural reformulation of the original tracked-effect-vs-unchecked-effect entry):
+
+1. **Colorer sees the perform structurally.** Once elaborate produces an `Expr::Perform(ArithError, div_by_zero, [])` in the AST, every downstream pass (monomorphize, color, closure_convert, codegen) handles it via the existing perform machinery. `find_non_io_perform_in_perform` already returns `Some(("ArithError", "div_by_zero"))` for that AST shape. Fns doing `/` or `%` get classified as CPS-color automatically, with `--dump-color` emitting `cps: performs ArithError`. No new colorer special-case for BinOp::Div / Mod is needed — and crucially, no risk of the colorer drifting from codegen's actual emit behavior.
+
+2. **Typecheck row introduction is mechanical.** Typecheck runs *before* elaborate in the pipeline (`lex → parse → resolve → typecheck → elaborate → ...`), so it sees the original `BinOp::Div` / `BinOp::Mod` and cannot rely on elaborate's rewrite to introduce the row. **Typecheck still needs a one-line check_binop addition** that calls a small `register_effect_use("ArithError")` helper (also called by `check_perform`) when op is `Div` or `Mod` — adding `ArithError` to the surrounding fn's row, triggering closed-row rejection (E0042) for fns declared `![]` or `![IO]`. The helper unifies the row-introduction logic across `check_perform` and `check_binop`'s arithmetic arm. This is structurally cleaner than the original sketch's "introduce ArithError into the row at the BinOp::Div typecheck site" because the helper is the single source of truth — it cannot drift from the elaborate rewrite (the rewrite produces a perform; the helper handles the row introduction; both register the same effect_use).
+
+3. **Codegen drops the `trap_on_zero` helper entirely.** Post-elaborate, no Div/Mod codegen arm exists (handled via the if-perform-else AST). The `panic_arith_ref` / `div_zero_msg_id` / `mod_zero_msg_id` / `trap_on_zero` machinery in `compiler/src/codegen.rs` deletes wholesale. The `sigil_panic_arith_error` runtime fn deletes from `runtime/src/arith.rs`. The Slice 2 diff is largely deletions on the codegen side, additions on the elaborate side — easier to review.
+
+**Tracked-vs-unchecked decision (preserved from the original entry):** the choice remains option (a) tracked effect over option (b) unchecked. Sigil's "fight-the-priors" doctrine treats arithmetic-fallibility as a real effect that the type system should make legible. Programs doing division declare `![ArithError]` (or include it in a row variable's residual). Option (b) would require the typechecker to special-case `/` and `%` as "performs an effect but doesn't track it" — exactly the meet-the-priors hack the language is designed to fight. Once option (b)'s door is opened, future authors reach for the same hack for the next "tracked but not really tracked" effect, eroding the row system's value.
+
+**Quantified breakage** (per foundation review issue #3, verified against `main` at `a777748`):
+
+- `examples/arith.sigil` (3 sites: `n / 2`, `n % 10`, `n % 2 == 0`) — row `![]` → `![ArithError]`.
+- `examples/div_by_zero.sigil` (1 site: `a / b`) — row `![]` → `![ArithError]`.
+- `compiler/tests/e2e.rs` line 446-448 (1 inline source: `let r: Int = a % b;` in the existing `mod_by_zero_traps` test) — row `![]` → `![ArithError]`.
+
+**Total: 3 source files, 5 BinOp::Div/Mod sites, 3 effect-row updates.** No other `examples/*.sigil` files use `/` or `%`. No other inline e2e Sigil sources use `/` or `%`. If Slice 2's diff requires more than 3 source-row edits, the typecheck check_binop change has bug — surface this for review.
+
+**Implementing commit(s):** Slice 2 (`28721af`); lands the typecheck check_binop helper extension via `register_effect_use`, the elaborate `Expr::Binary { op: Div | Mod, .. }` rewrite, the new `BinOp::SdivUnchecked` / `SremUnchecked` AST variants, the codegen drops (`trap_on_zero` + `TRAP_ARITH_ABORT`), and the row updates on the 3 source files (`examples/arith.sigil`, `examples/div_by_zero.sigil`, `compiler/tests/e2e.rs:446-448`).
+
+**Closure point:** Permanent for v1. Programs that do division declare `ArithError` in their row from Task 57 onward. The `examples/div_recover.sigil` example (new in Slice 2) declares `![ArithError]` on the inner fn that does division and `![]` on the outer fn that handles the effect via `handle … with { ArithError.div_by_zero(k) => … }`, demonstrating effect discharge at the type level.
+
+## 2026-04-28 — [DEVIATION Task 57] Single PR with two commit slices (IO refactor → ArithError refactor → closeout)
+
+**Context:** Plan B Task 57 groups two refactors under one task ID. Per-phase-PR cadence (established for Phases 4b–4g of Task 55) suggests one PR per task. The two refactors are independent — the IO refactor touches `lower_perform`, the four IO-special-case sites in codegen, and the typecheck `check_perform` IO branch; the ArithError refactor touches `BinOp::Div` / `Mod`, `trap_on_zero`, the example file rows, and the runtime arith module. Splitting into two PRs would let each get its own review cycle.
+
+**Deviation:** Single PR (`plan-b-task-57` against `main`) with **two commit slices**:
+
+- *Foundation* (`d2828fa`) — original deviation entries + PROGRESS Phase 4g squash-hash flip + Task 57 in-progress entry. No source code changes.
+- *Foundation review fixups* (this commit) — addresses 7 items from the foundation mid-flight reviews: ArithError gains `mod_by_zero` op (review-2 issue #1; preserves Plan A2's distinct `%`-vs-`/` stderr message); reserved-low-id convention pinned (review-2 issue #2; `ArithError = 0`, `IO = 1` regardless of user-effect count); elaborate-time synthesis adopted over codegen-time (review-1 forward concern #1; colorer sees the perform structurally); e2e row-update count quantified (review-2 issue #3; 3 source files); shim discipline check parity adopted (review-1 forward concern #3); inbound-vs-outbound `args_ptr` references renamed (review-2 issue #5); inherited `MAX_HANDLER_ARMS = 13` → 14 drift fixed in PROGRESS + DEVIATIONS (review-2 issue #6). One stale-line-number claim from the review (review-2 issue #4) examined and rejected: `:644, :742` and `:2144` match current `main` at `a777748`; the reviewer's claim of `:624, :722, :2114` was incorrect for the current file state. Numbers stay; will be refreshed if Slice 1 touches typecheck.rs lines around the citations.
+- *Slice 1: IO refactor* — synthetic builtin `effect IO` injection in typecheck pre-pass + 4 codegen IO-special-case sites + typecheck IO hard-wire deletion + `main` shim IO frame push/pop + `sigil_io_println_arm` runtime fn + `Stmt::Perform` and `Expr::Perform` IO branch deletion + comment cleanup at codegen `:3798`, typecheck `:2144`, `std/io.sigil`. New e2e tests pinning that `perform IO.println(s)` flows through `sigil_perform` (via `--print-runtime-stats` or behavior verification). **Atomic application:** Slice 1 lands as one commit; intermediate WIP states between the typecheck-pre-pass injection and the codegen-special-case deletions are not CI-checked. CI runs against the slice's HEAD only (per foundation review forward concern #4 — process discipline note).
+- *Slice 2: ArithError refactor* — synthetic builtin `effect ArithError { div_by_zero, mod_by_zero }` injection + typecheck `check_binop` row introduction via shared `register_effect_use` helper + elaborate `Expr::Binary { op: Div | Mod, .. }` rewrite to if-perform-else AST shape + new codegen-internal `BinOp::SdivUnchecked` / `SremUnchecked` AST variants for the post-elaborate sdiv/srem paths + codegen `BinOp::Div` / `Mod` arms become `unreachable!()` post-elaborate + `trap_on_zero` / `panic_arith_ref` / `div_zero_msg_id` / `mod_zero_msg_id` deletion + `sigil_panic_arith_error` runtime fn deletion + `main` shim ArithError frame push/pop with 2-arm count + `sigil_arith_error_div_by_zero_arm` and `sigil_arith_error_mod_by_zero_arm` runtime fns (each preserves Plan A2 banner verbatim for its operator) + 3 source-file row updates (`examples/arith.sigil`, `examples/div_by_zero.sigil`, `compiler/tests/e2e.rs:446-448`) to `![ArithError]` + new `examples/div_recover.sigil` + e2e test for div_recover (positive: handler returns 999) + e2e test for div_by_zero (preserved: stderr banner + exit 2) + e2e test for mod_by_zero (preserved: distinct stderr banner + exit 2). **Atomic application:** Slice 2 lands as one commit for the same reason as Slice 1.
+- *Closeout* — README "Verification limits" Plan A1 IO comment row flipped to "Closed at PR #30"; PROGRESS Task 57 entry filled with implementing-commit list (`done-pending-ci`); deviation entry implementing-commit lines back-filled.
+
+**Rationale:** Three reasons:
+
+1. **Plan B groups them.** Task 57 in `2026-04-21-sigil-effects.md` is one task with two paragraphs. Splitting deviates from the plan structure without an obvious payoff — the two refactors share the same builtin-effect-injection mechanism, the same shim push/pop machinery, and the same architectural rationale. Reviewing them as one bundle preserves that context.
+
+2. **Cadence consistency.** Per-phase-PR cadence has been one PR per phase number; Task 57 is one task. Splitting into two PRs deviates without an obvious reviewability win.
+
+3. **Bisect granularity is preserved by commit hygiene, not PR-splitting.** Two clean commit slices (IO, then ArithError), each pod-verified independently, give a bisecting agent the same granularity as two separate PRs would. The mitigation against bundle-masking-bugs is small focused commits, not separate PRs.
+
+**Bisecting hints (failure-mode-and-architectural-surface attribution):**
+
+- *IO `perform` synchronously crashes* in a program that compiles: the IO refactor's `lower_perform` deletion or `main` shim IO frame push is wrong. Look at Slice 1.
+- *Division by zero produces unexpected stderr or exit code* (Plan A2 regression for `/`): the ArithError refactor's `sigil_arith_error_div_by_zero_arm` runtime fn or shim ArithError frame push (or its 2-arm count) is wrong. Look at Slice 2.
+- *Modulo by zero produces "division by zero" stderr instead of "remainder by zero"* (review-2 issue #1 regression): the shim's op_id 1 set_arm wiring or `sigil_arith_error_mod_by_zero_arm` is wrong, or elaborate's BinOp::Mod rewrite produced a `div_by_zero` perform instead of `mod_by_zero`. Look at Slice 2.
+- *`examples/arith.sigil` fails to typecheck with E0042 "ArithError not in row"*: either the row update on the example file is missing, or the typecheck `check_binop` row introduction (`register_effect_use("ArithError")` for Div/Mod) is wrong. Look at Slice 2.
+- *`examples/div_recover.sigil` doesn't return 999*: the user-installed handler's frame push or arm fn dispatch through the Phase 4d/4e CPS pipeline is wrong, OR elaborate's BinOp::Div rewrite produced a malformed if-perform-else AST. Look at Slice 2 (start with elaborate output via `--dump-elaborate` if it exists, else inspect post-elaborate AST in a unit test).
+- *Color analysis classifies a fn doing `/` as Native instead of CPS*: post-elaborate-time-synthesis the `Expr::Perform(ArithError, div_by_zero, [])` should be visible in the AST and `find_non_io_perform_in_perform` should classify the fn as CPS. Confirm via `--dump-color` on a fn doing division — should be `cps: performs ArithError`. If still Native, the elaborate rewrite is producing the perform under a different AST shape than the colorer recognizes; look at elaborate.rs's emit and color.rs's walker.
+- *Cranelift verifier rejects the post-elaborate `BinOp::SdivUnchecked` arm*: the new codegen-internal AST variants need a `lower_expr` arm + `type_of_expr` arm. If they reach codegen as `unreachable!()` and panic, elaborate's rewrite is missing them entirely. Look at Slice 2 (codegen + elaborate).
+
+**Implementing commit(s):** Foundation (`d2828fa`) + foundation review fixups (`8311723`) + Slice 1 (`b98c08a`) + CI fix #1 (`29b2b5e`; stackmap test count) + Slice 1 review fixups (`2e12eaa`) + Slice 2 (`28721af`) + Closeout (`[HEAD]`). All seven commits squash-merged via PR #30.
+
+**Closure point:** PR #30 squash-merge closes Task 57. Tasks 58–61 + Stage 6 review checkpoint remain. After Task 57, `IO` is a normal effect routing through `sigil_perform`, `ArithError` is a real algebraic effect with default + override-able handlers, no `sigil_panic_arith_error` call sites remain in codegen, and the Plan A2 user-visible behavior of `examples/div_by_zero.sigil` (and the parallel `mod_by_zero` e2e test) is preserved verbatim. The five Task 57 architectural choices in deviation entries above all closed.
+
+## 2026-04-28 — [DEVIATION Task 57] IO color filter retention (perf-preserving choice; residual discard-`k` gap)
+
+**Context:** Task 57's IO refactor moves `IO` from a synchronous-shortcut special case to a registry-driven effect at typecheck and codegen — every `perform IO.println(s)` now flows through `sigil_perform` → `sigil_io_println_arm` → `sigil_println` → trampoline → narrow-back to Unit, identical to the runtime path of any non-IO effect.
+
+The Slice 1 implementation **does NOT** lift the colorer's IO-skip filter at `compiler/src/color.rs::NATIVE_EFFECT` and the three parallel codegen-classifier filters (`is_simple_tail_perform_with_pure_args_body`, `is_simple_yield_then_constant_tail_body`, `is_simple_let_yield_then_pure_tail_body`). The filters keep IO out of the CPS-color classification — fns whose only effect is `IO` stay Native-color and pay no trampoline overhead per println.
+
+The original foundation deviation entry's framing of "drop the filters" was aspirational; the Slice 1 commit (`b98c08a`)'s decision to retain them — and the commit message's "without correctness loss" claim — is more nuanced than the foundation entry anticipated. This entry corrects the framing and pins the residual gap.
+
+**Deviation:** Retain IO-skip filters in the colorer + 3 codegen classifiers. The choice is **perf-preserving with a documented residual correctness gap**, not "without correctness loss":
+
+- *Perf preservation:* lifting `NATIVE_EFFECT` would force every fn doing `perform IO.println(...)` to become CPS-color. Trampoline overhead would propagate up the call graph (Native callers of an IO-using callee themselves become CPS-color via the colorer's transitive rule), making every print-bearing fn pay the trampoline cost on every invocation.
+
+- *Residual correctness gap:* a user-installed discard-`k` IO handler does **not** unwind a Native-color helper fn. Concrete failure case:
+
+  ```sigil
+  fn helper() ![IO] {
+    perform IO.println("a");          // discard-k handler in caller
+                                       // would normally unwind here
+    let x = expensive_computation();   // ... but this still runs
+    perform IO.println("b");          // ... and so does this
+  }
+
+  fn main() ![IO] {
+    handle helper() with {
+      IO.println(s, k) => Unit       // discards k
+    };
+  }
+  ```
+
+  Under standard algebraic-effects semantics, after the first perform fires inside `helper`, the discharging arm in `main` runs, returns Unit, and `helper` does NOT continue past the perform. Phase 4e closed exactly this gap for non-IO performs by reclassifying helpers whose performs reach a discharging handler as CPS-color, so the discard propagates as a `NextStep::Done` that unwinds through the trampoline. The IO filter retains the Native-color synchronous shape for `helper`: `lower_perform_to_value`'s `sigil_run_loop` returns Unit from the discard arm and `helper` continues to `expensive_computation` and the second perform, both of which run despite user intent.
+
+  This is the **same structural hole** Phase 4e closed for non-IO; deliberately left open here for the perf-preserving reason above.
+
+**Load-bearing invariant:** the top-level IO handler frame is always on the stack when user code runs (installed by `compiler/src/codegen.rs`'s `main` shim emit between `sigil_gc_init` and `call sigil_user_main`). If the shim regresses (wrong `effect_id`, missing `set_arm`, frame_new fails), Native-color fns doing `perform IO.println(...)` would `sigil_perform` against an unhandled effect and abort at runtime. `examples/hello.sigil`'s e2e test exercises this end-to-end on every CI run; any shim-wiring regression fails there immediately. The `builtin_effects_present_in_every_program` typecheck unit test pins `IO = 1` against the registry for the source-of-truth side; the shim's hardcoded `effect_id = 1` for the IO frame matches.
+
+**Rationale:** Three reasons:
+
+1. **Perf cost is real and viral.** Even programs with rare prints would pay the trampoline cost on every invocation of any fn in their call tree that prints. The trampoline overhead Phase 4e accepted for non-IO performs is justified by algebraic-correctness for user-installed handlers; for IO, the canonical use case is `println` flowing to stdout, not user-installed handlers. Preserving the synchronous shape for the canonical case is the right perf trade-off until concrete user demand appears for algebraic IO.
+
+2. **Residual gap is bounded and documented.** The gap fires only when a user installs a discard-`k` IO handler and expects it to unwind a Native-color helper. Under v1, no such pattern is canonical — the IO effect is overwhelmingly used to call `println` on the default top-level handler. A user who genuinely wants algebraic IO can wrap their helpers in `![IO | e]` rows that include a non-IO effect to force CPS-color reclassification, or wait for the v2 path below.
+
+3. **v2 path is clean.** Lifting `NATIVE_EFFECT = "IO"` (one constant; the three codegen classifier filters reference it) reclassifies every IO-using fn as CPS-color. Existing programs continue to work — IO performs route through the same `sigil_perform` machinery either way; the v1-vs-v2 difference is whether the surrounding fn synchronously calls `lower_perform_to_value` or returns `NextStep::Call` to its caller's trampoline. The pinning test (`user_discard_k_io_handler_does_not_unwind_native_color_helper_pending_color_filter_lift`) inverts to a positive test (asserting only "a" is printed) when `NATIVE_EFFECT` is removed and the codegen filters are dropped.
+
+**Reference choice — `NATIVE_EFFECT` over `BUILTIN_EFFECT_NAMES`:** the three codegen classifier filters now reference `color::NATIVE_EFFECT` rather than the literal `"IO"` so a future builtin rename touches one source of truth. The filters' logic — "IO-color performs don't trigger CPS classification" — is semantically about Native-color status, not "is in the builtin set", so the colorer's name is the right reference (per review-2 issue #3).
+
+**Implementing commit(s):** Slice 1 review fixups (`2e12eaa`). Slice 1's `b98c08a` framing of "without correctness loss" is corrected by this entry's clearer "perf-preserving with residual gap" phrasing.
+
+**Pinning test:** `user_discard_k_io_handler_does_not_unwind_native_color_helper_pending_color_filter_lift` (`#[ignore]`'d e2e). Inverts to a positive test asserting only `"a"` is printed when the IO filters are lifted. Mirrors the `discard_k_handler_does_not_abort_helper_phase_4e_pending` precedent (Phase 4d MVP) and `partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution` precedent (Phase 4f).
+
+**Closure point:** v2 task (post-Plan-B; tracked via "v2 IO color filter lift" in the plan's deferred-items list when it lands, or as a separate follow-up PR if user demand surfaces during Plan C). Lifts `NATIVE_EFFECT = "IO"`, drops the three codegen classifier filters, un-ignores the pinning test. The change is local: typecheck + codegen + runtime are all already uniform.
+
+## 2026-04-28 — [DEVIATION Task 57] Slice 2 shim-snapshot rename (pre-flag for review)
+
+**Context:** Slice 1's `main` shim emit installs a single top-level IO handler frame (effect_id = 1) and snapshots `io_frame_ptr` for the discipline-check trap (debug-only, mirrors Phase 4f's `Expr::Handle`-exit check shape). The single pop verifies against the snapshot.
+
+Slice 2 will add the ArithError handler frame **before** the IO frame in install order:
+
+```
+push arith_frame   ← first-pushed; gets the discipline trap
+push io_frame
+... user_main ...
+pop → io_frame      (verify == io_frame_ptr — local sanity check)
+pop → arith_frame   (verify == arith_frame_snapshot — discipline trap)
+```
+
+**Pre-flag:** Slice 2's shim emit MUST move the `frame_snapshot` capture from `io_frame_ptr` (Slice 1) to `arith_frame_ptr` (first-pushed in the LIFO order). The discipline trap fires at the **second** pop (after both frames have been removed from the stack). The first pop gets a local sanity check (`popped_io == io_frame_ptr`) since drift between push order and the LIFO assumption would surface even before the trap site fires.
+
+**Why this matters:** under LIFO, the first-pushed frame is last-popped, and the discipline check's whole point is to catch a runtime corruption / shim emit regression where push/pop pairs drift. The check must verify the longest-lived frame's identity at unwind. Slice 2's review should specifically verify:
+
+1. The `frame_snapshot` Cranelift `Value` captures `arith_frame_ptr` (the first `frame_new`'s result), not `io_frame_ptr`.
+2. The trap site is after the second pop (the ArithError pop), not the first.
+3. The IO pop has its own sanity check (`popped_io == io_frame_ptr`) for the LIFO assumption.
+
+**Why pre-flag rather than land alongside Slice 2:** the failure mode (a partial Slice 2 implementation that retains the Slice 1 snapshot variable) is silent in release builds (the trap is debug-gated) and easy to miss at review. Pre-flagging in this entry forces the Slice 2 reviewer's attention to the rename without requiring them to remember it from Slice 1's shim deviation entry.
+
+**Implementing commit(s):** Slice 2 (`28721af`). The actual rename + the ArithError frame push-before-IO + the two-pop discipline-check shape all land in that commit; the local sanity check on the IO pop and the discipline trap on the ArithError pop are both wired per the bullet list above.
+
+**Closure point:** Closed at Slice 2 (`28721af`). The discipline check correctly verifies the ArithError frame's identity at the second pop; the IO pop has its own sanity check.

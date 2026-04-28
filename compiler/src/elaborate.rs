@@ -180,6 +180,67 @@ impl Elaborator {
                 hoisted.extend(h1);
                 let (rhs_e, h2) = self.elab_expr(*rhs, true);
                 hoisted.extend(h2);
+                // Plan B Task 57 — `BinOp::Div` and `BinOp::Mod`
+                // rewrite to `if rhs == 0 { perform ArithError.{div,
+                // mod}_by_zero() } else { Sdiv/Srem-Unchecked(...) }`
+                // at elaborate. Per `[DEVIATION Task 57] BinOp::Div
+                // and BinOp::Mod elaborate to perform-bearing form`
+                // in `PLAN_B_DEVIATIONS.md`. The unchecked codegen-
+                // internal variant is dispatched directly without
+                // the zero check; the perform-bearing branch flows
+                // through `sigil_perform` to the top-level ArithError
+                // handler. Both lhs and rhs are already trivial after
+                // the hoists above, so the cond / then / else
+                // branches reuse them without re-evaluating.
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    let perform_op = if matches!(op, BinOp::Div) {
+                        "div_by_zero"
+                    } else {
+                        "mod_by_zero"
+                    };
+                    let unchecked_op = if matches!(op, BinOp::Div) {
+                        BinOp::SdivUnchecked
+                    } else {
+                        BinOp::SremUnchecked
+                    };
+                    let cond = Expr::Binary {
+                        op: BinOp::Eq,
+                        lhs: Box::new(rhs_e.clone()),
+                        rhs: Box::new(Expr::IntLit(0, span.clone())),
+                        span: span.clone(),
+                    };
+                    let perform = Expr::Perform(PerformExpr {
+                        effect: "ArithError".to_string(),
+                        op: perform_op.to_string(),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    });
+                    let unchecked = Expr::Binary {
+                        op: unchecked_op,
+                        lhs: Box::new(lhs_e),
+                        rhs: Box::new(rhs_e),
+                        span: span.clone(),
+                    };
+                    let then_block = Block {
+                        stmts: Vec::new(),
+                        tail: Some(perform),
+                        span: span.clone(),
+                    };
+                    let else_block = Block {
+                        stmts: Vec::new(),
+                        tail: Some(unchecked),
+                        span: span.clone(),
+                    };
+                    let if_expr = Expr::If {
+                        cond: Box::new(cond),
+                        then_block: Box::new(then_block),
+                        else_block: Box::new(else_block),
+                        span,
+                    };
+                    let (rewritten, more_hoisted) = self.elab_expr(if_expr, need_trivial);
+                    hoisted.extend(more_hoisted);
+                    return (rewritten, hoisted);
+                }
                 let new = Expr::Binary {
                     op,
                     lhs: Box::new(lhs_e),
@@ -523,7 +584,13 @@ fn block_to_expr(b: Block) -> Expr {
 
 fn binop_result_type(op: BinOp, span: Span) -> TypeExpr {
     let name = match op {
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => "Int",
+        BinOp::Add
+        | BinOp::Sub
+        | BinOp::Mul
+        | BinOp::Div
+        | BinOp::Mod
+        | BinOp::SdivUnchecked
+        | BinOp::SremUnchecked => "Int",
         BinOp::Eq
         | BinOp::NotEq
         | BinOp::Lt

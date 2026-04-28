@@ -1,17 +1,27 @@
 // examples/div_by_zero.sigil
 //
 // Test-only Stage 2 program (plan A2 task 26): triggers the runtime
-// division-by-zero trap. Running this program writes
-// `sigil: arithmetic error: division by zero` to stderr and exits with
-// status 2. Error code: **E0401** (runtime arith abort; v1-only
-// surface, Plan B replaces with a `Raise[ArithError]` effect that the
-// language can catch with a handler).
+// division-by-zero default handler. Running this program writes
+// `sigil: arithmetic error: division by zero` to stderr and exits
+// with status 2.
 //
-// This file exists specifically so the compiler's e2e test suite can
-// assert the trap fires. Do not run it from `smoke.sh` as a
-// success-path example; it is expected to abort.
+// Plan B Task 57 — Plan A2's `sigil_panic_arith_error` runtime fn
+// was retired; `BinOp::Div` now elaborates to `if rhs == 0 {
+// perform ArithError.div_by_zero() } else { ... }` and the perform
+// dispatches through `sigil_perform` to the top-level handler
+// installed by the `main` shim. The default arm fn
+// (`sigil_arith_error_div_by_zero_arm` in `runtime/src/handlers.rs`)
+// preserves the Plan A2 stderr banner + exit-2 user-visible
+// behaviour verbatim. Programs that wrap the divide site in
+// `handle ... with { ArithError.div_by_zero(k) => ... }` can
+// recover algebraically — see `examples/div_recover.sigil`. The
+// row is now `![ArithError]` per the tracked-effect doctrine.
+//
+// This file exists specifically so the compiler's e2e test suite
+// can assert the default arm fn fires. Do not run it from
+// `smoke.sh` as a success-path example; it is expected to abort.
 
-fn main() -> Int ![] {
+fn main() -> Int ![ArithError] {
   let a: Int = 10;
   let b: Int = 0;
   let q: Int = a / b;

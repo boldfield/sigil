@@ -1,82 +1,35 @@
-//! Arithmetic runtime primitives — plan A2 task 25.
+//! Arithmetic runtime primitives — plan A2 task 25, Plan B Task 57.
 //!
-//! Stage 2 of Plan A2 introduces runtime support for integer arithmetic
-//! that the compiler emits inline (iadd/isub/imul/sdiv/srem) plus the
-//! three surfaces that cannot be done inline:
+//! Plan A2's `sigil_panic_arith_error` was retired in Plan B Task 57.
+//! Codegen no longer emits a branch to a panic-by-stderr-message
+//! function on `sdiv` / `srem` sites with a zero divisor; instead,
+//! `BinOp::Div` / `BinOp::Mod` elaborate to a perform-bearing form
+//! (`if rhs == 0 { perform ArithError.{div,mod}_by_zero() } else
+//! { … }`), and the perform routes through `sigil_perform` to the
+//! top-level ArithError handler installed by the `main` shim. The
+//! default arm fns (`sigil_arith_error_div_by_zero_arm` /
+//! `sigil_arith_error_mod_by_zero_arm` in `runtime/src/handlers.rs`)
+//! preserve Plan A2's exact stderr banner + exit-2 user-visible
+//! behavior; user programs that wrap arithmetic in
+//! `handle ... with { ArithError.div_by_zero(k) => ... }` can now
+//! recover from div-by-zero rather than aborting. See
+//! `[DEVIATION Task 57] BinOp::Div and BinOp::Mod elaborate to
+//! perform-bearing form` and `[DEVIATION Task 57] Top-level handler
+//! installation in main shim` in
+//! `boldfield/designs/PLAN_B_DEVIATIONS.md`.
 //!
-//! 1. **Zero-check trap for `sdiv`/`srem`.** Codegen emits a branch to
-//!    `sigil_panic_arith_error` when the divisor is zero. The runtime
-//!    prints a one-line message to stderr and exits the process with
-//!    status 2. Error code reserved: `E0401`; see the compiler's error
-//!    catalog for the user-facing explanation.
+//! Surface this module still owns:
 //!
-//! 2. **`sigil_int_to_string`.** Formats an `Int` as a heap-allocated
+//! 1. **`sigil_int_to_string`.** Formats an `Int` as a heap-allocated
 //!    `String`. Exposed to the language as `int_to_string(n: Int) ->
-//!    String` once Stage 3's user function calls (plan A2 task 29)
-//!    land. The runtime symbol exists in Stage 2 so downstream linking
-//!    works and tests can verify the formatting contract.
+//!    String`. Unchanged by Task 57.
 //!
-//! 3. **Checked-overflow primitives.** `sigil_checked_add`,
+//! 2. **Checked-overflow primitives.** `sigil_checked_add`,
 //!    `sigil_checked_sub`, `sigil_checked_mul` return `(result,
-//!    overflowed)` so that a future `checked_add(a: Int, b: Int) ->
-//!    Option[Int]` wrapper (plan A3 when sum types land) can surface
-//!    overflow to the user. The C ABI uses a `#[repr(C)]` struct
-//!    return, which Cranelift lowers by convention to register-pair
-//!    returns on every supported host.
-//!
-//! # libc::exit vs std::process::exit
-//!
-//! The plan's task-25 text specifies `libc::exit(2)` for the arith
-//! panic. The runtime crate does not depend on `libc` (not in plan A1
-//! or A2's dep allow-list); `std::process::exit(2)` delegates to the
-//! same `exit(3)` on Unix and Windows, flushing `stdout`/`stderr` and
-//! running C `atexit` handlers exactly like `libc::exit` does. The
-//! observed behaviour is identical — atexit-installed counter prints
-//! still fire on panic.
-
-use std::ffi::{c_char, CStr};
-use std::io::Write;
+//!    overflowed)` for a future `checked_add(a: Int, b: Int) ->
+//!    Option[Int]` wrapper. Unchanged by Task 57.
 
 use crate::gc::sigil_string_new;
-
-/// Arithmetic-abort runtime error. Codegen branches to this function
-/// from every `sdiv`/`srem` site where the divisor is zero. Writes
-/// `"sigil: arithmetic error: <reason>\n"` to stderr then exits the
-/// process with status 2.
-///
-/// Error code: **E0401** (runtime arith abort; v1-only surface, Plan B
-/// replaces this with a `Raise[ArithError]` effect).
-///
-/// # Safety
-///
-/// `reason` must be either null or a valid null-terminated UTF-8 C
-/// string. Codegen always passes a static read-only C string, so the
-/// null-pointer branch is defensive rather than reached in practice.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_panic_arith_error(reason: *const c_char) -> ! {
-    let msg = if reason.is_null() {
-        "<null reason>"
-    } else {
-        // SAFETY: caller contract is "null-terminated UTF-8 C string"; any
-        // bytes that decode as non-UTF-8 are reported as a fallback rather
-        // than panicking on the invalid-UTF-8 path. Not an interior
-        // pointer — the returned `&CStr` borrows from read-only data that
-        // outlives the call.
-        CStr::from_ptr(reason)
-            .to_str()
-            .unwrap_or("<invalid utf-8 reason>")
-    };
-
-    let mut stderr = std::io::stderr().lock();
-    // Ignore write errors — the process is about to exit anyway.
-    let _ = writeln!(stderr, "sigil: arithmetic error: {msg}");
-    let _ = stderr.flush();
-    drop(stderr);
-
-    // process::exit flushes stdout and invokes the same `exit(3)` the
-    // plan names; atexit-registered counter prints still fire.
-    std::process::exit(2);
-}
 
 /// Format an `Int` as a decimal Sigil `String` and return a heap-header
 /// pointer suitable for tagging via `value::from_heap`. The returned
@@ -279,13 +232,12 @@ mod tests {
         );
     }
 
-    // `sigil_panic_arith_error` exits the process on every call, so a
-    // direct unit test would abort the test runner. Its behaviour is
-    // exercised end-to-end by the `div_by_zero.sigil` e2e test (plan
-    // A2 task 26) instead: the spawned child process is expected to
-    // exit with code 2 and print the arith-error banner on stderr.
-    //
-    // The function is small enough that visual review is sufficient
-    // for the Stage-2 cut; Plan B's effect-handler rewrite drops this
-    // surface entirely.
+    // Plan A2's `sigil_panic_arith_error` was retired in Plan B
+    // Task 57; the e2e tests `div_by_zero.sigil` and the inline
+    // `mod_by_zero_traps` test now exercise the runtime-side arm
+    // fns `sigil_arith_error_div_by_zero_arm` and `sigil_arith_-
+    // error_mod_by_zero_arm` (defined in `runtime/src/handlers.rs`),
+    // which preserve the Plan A2 stderr banner + exit-2 behaviour.
+    // Direct unit tests for the arm fns would still abort the test
+    // runner; the e2e suite is the authoritative cross-check.
 }

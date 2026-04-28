@@ -4,6 +4,13 @@
 // `*`, `/`, `%`, integer comparison, unary negation, and `if`/`else`.
 // Computes the process exit code from a small formula.
 //
+// Plan B Task 57 — `/` and `%` introduce `ArithError` into the
+// surrounding fn's effect row (per `[DEVIATION Task 57] BinOp::Div
+// and BinOp::Mod elaborate to perform-bearing form` in
+// `boldfield/designs/PLAN_B_DEVIATIONS.md`). The row updated from
+// `![]` to `![ArithError]`. Programs that don't divide are
+// unaffected; programs that do declare `ArithError` explicitly.
+//
 // Invariant: running this program exits with status 26.
 //   n = 42
 //   half = n / 2            = 21
@@ -11,7 +18,7 @@
 //   boosted = half + rem + 3 = 26
 //   n is even, so the `if` selects `boosted` over `-boosted`.
 
-fn main() -> Int ![] {
+fn main() -> Int ![ArithError] {
   let n: Int = 42;
   let half: Int = n / 2;
   let rem: Int = n % 10;
