@@ -285,11 +285,22 @@ fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
 
 /// Plan B Stage 6 cleanup — Cranelift type for a typecheck `Ty`.
 ///
-/// Free-fn variant of `Lowerer::cranelift_ty_of` (codegen.rs:9407)
-/// usable at the codegen pre-pass where no `Lowerer` instance is
-/// available (e.g., the return-arm synth pre-pass that consumes
-/// `CheckedProgram::handle_body_ty` to size the `v` binding's
-/// Cranelift type).
+/// Free-fn shared by `Lowerer::cranelift_ty_of` (which delegates to
+/// this fn) and the codegen pre-pass paths where no `Lowerer`
+/// instance is available (e.g., the return-arm synth pre-pass that
+/// consumes `CheckedProgram::handle_body_ty` to size the `v`
+/// binding's Cranelift type).
+///
+/// `Ty::Var` is unreachable at codegen — typecheck either resolves
+/// every var through unification or rejects the program with E0132
+/// (ambiguous type), and the codegen-entry guard
+/// `contains_apply_or_generic_ref` rejects un-monomorphized AST. A
+/// stray `Ty::Var` arriving here would silently bind a value at the
+/// wrong width (e.g. a Bool body falling through to `pointer_ty`
+/// would bind `v: I64` while the consumer lowers `if v {...}`
+/// expecting I8 — exactly the verifier-error class Stage 6 cleanup's
+/// A.3 commit closed). Panic loudly so the bug surfaces at the
+/// codegen call site rather than as a downstream verifier error.
 fn cranelift_ty_of_ty(ty: &crate::typecheck::Ty, pointer_ty: Type) -> Type {
     use crate::typecheck::Ty;
     match ty {
@@ -297,13 +308,12 @@ fn cranelift_ty_of_ty(ty: &crate::typecheck::Ty, pointer_ty: Type) -> Type {
         Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
         Ty::Char => types::I32,
         Ty::String | Ty::Fn(_) | Ty::User(_, _) => pointer_ty,
-        // Surface-AST guard at codegen entry (`contains_apply_or_-
-        // generic_ref`) ensures `Ty::Var` cannot reach codegen for
-        // monomorphized programs; if a stray var arrives here, fall
-        // back to pointer_ty defensively rather than panic — the
-        // worst-case behaviour is the binding gets an extra-wide
-        // slot, which at least doesn't miscompile.
-        Ty::Var(_) => pointer_ty,
+        Ty::Var(id) => unreachable!(
+            "codegen: Ty::Var({id}) reached cranelift_ty_of_ty — \
+             typecheck must resolve every var through unification \
+             before codegen runs (or reject with E0132); a stray var \
+             here would silently bind a value at the wrong width"
+        ),
     }
 }
 
@@ -2710,11 +2720,25 @@ fn collect_handle_arms_in_expr(
                 // narrow-back at the surrounding fn happens via
                 // `Lowerer::type_of_expr(&ra.body, &preview)` at
                 // dispatch time, same as before.
+                // typecheck's `check_handle` populates `handle_body_ty`
+                // for every `Expr::Handle` whose body type resolves
+                // (which is every handle that reaches codegen — pipeline
+                // gates on typecheck err-list emptiness). A missing
+                // entry would silently re-introduce the Phase 4g
+                // I64 hardcode this cleanup is removing — `expect` so
+                // the invariant is load-bearing rather than papered
+                // over.
                 let binding_ty = ctx
                     .handle_body_ty
                     .get(span)
                     .map(|ty| cranelift_ty_of_ty(ty, ctx.pointer_ty))
-                    .unwrap_or(types::I64);
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen: handle_body_ty missing for Expr::Handle at {span:?} — \
+                             check_handle's body walk must populate this side-table for every \
+                             handle expression that reaches codegen"
+                        )
+                    });
                 out.return_synth.push(HandlerReturnArmSynth {
                     func_id,
                     body: rewritten_body,
@@ -9161,21 +9185,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         }
     }
 
-    /// Cranelift representation of a semantic `Ty`. Mirrors the store/
-    /// load width choices in `lower_ctor_alloc` and `load_field_value`.
+    /// Cranelift representation of a semantic `Ty`. Delegates to the
+    /// free fn `cranelift_ty_of_ty` (Stage 6 cleanup) so the
+    /// `Ty → Cranelift Type` mapping has a single source of truth
+    /// shared with the codegen pre-pass paths that don't have a
+    /// `Lowerer` instance available.
     fn cranelift_ty_of(&self, ty: &Ty) -> Type {
-        match ty {
-            Ty::Int => types::I64,
-            Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
-            Ty::Char => types::I32,
-            Ty::String | Ty::Fn(_) | Ty::User(_, _) => self.pointer_ty,
-            // Plan B task 48: surface-AST guard at codegen entry
-            // ensures `Ty::Var` cannot reach this point. A stray
-            // var means the guard is broken.
-            Ty::Var(_) => unreachable!(
-                "codegen: Ty::Var is impossible after Plan B task 48 codegen-entry guard"
-            ),
-        }
+        cranelift_ty_of_ty(ty, self.pointer_ty)
     }
 
     /// Structural Cranelift-type predictor. Used by `lower_match` to

@@ -1243,7 +1243,7 @@ fn e0120_non_exhaustive_match_names_witness_in_stderr() {
 /// which the local analysis treats as part of the IO-only row, not a
 /// non-IO body site).
 #[test]
-fn dump_color_hello_is_native_row_io() {
+fn dump_color_hello_is_cps_row_io() {
     let root = workspace_root();
     let source = root.join("examples/hello.sigil");
     let sigil_bin = sigil_binary();

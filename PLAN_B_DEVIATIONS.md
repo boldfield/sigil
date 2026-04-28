@@ -2334,9 +2334,7 @@ The selected approach is consistent with Plan B's "do not implement Stage 7+ fea
 
 **Why not bundle in the architectural lifts (B.1 — Slice C N-chain extension; B.2 — chained-synth-cont; B.3 — TypeExpr::Fn; B.4 — arm-body-lambda; B.5 — generic-parameterised effects codegen):** those are **Plan-C-or-later territory** per `[DEVIATION Task 59]` and `[DEVIATION Task 61]`. Plan B's "Do not implement Stage 7+ features. Do not start Plan C." hard rules exclude them from this PR. They ship in Plan C foundation work where the scope is appropriate.
 
-**Closure point:** closed at this PR for the 9 named items. The architectural lifts (B above) remain Plan-C-or-later; the prompt-bank run-portion deferrals (D, the 6 `Oracle (notes)` markers in `spec/validation-prompts.md`) close mechanically when the corresponding architectural lifts land in Plan C.
-
-**Rationale for ordering within the PR:** A.1 (typecheck E0142 partial-handler exhaustiveness) lands first because it's typecheck-only and self-contained. A.3 / Phase 4g binding_ty resolution lands second because it shares the side-table pattern with A.1's typecheck work. A.2 / IO color filter lift lands third because it has the broadest blast radius (touches color.rs, codegen.rs, runtime/handlers.rs) and benefits from the Phase-4f-scope_id and Phase 4g-body_ty-cleanup landing first. The Task 57 cleanup chores land last as pure refactors with no behavior change.
+**Closure point:** closed at this PR for 8 of the 9 named items. scope_id deferred — see framing immediately below. The architectural lifts (B above) remain Plan-C-or-later; the prompt-bank run-portion deferrals (D, the 6 `Oracle (notes)` markers in `spec/validation-prompts.md`) close mechanically when the corresponding architectural lifts land in Plan C.
 
 **scope_id deferral (item 4 in the original list).** The Phase 4f `scope_id` per-frame field was originally enumerated alongside the other 8 cleanup items in this PR's scope. After implementing the rest, scope_id was reassessed and deferred:
 

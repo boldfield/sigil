@@ -127,47 +127,37 @@ impl ColoredProgram {
     }
 }
 
-/// The only effect treated as "pure" for native classification in
-/// Plan B v1. Post-Task-57, IO is a normal registry-driven effect
-/// at typecheck and codegen — it routes through `sigil_perform`
-/// like every other effect — but the colorer keeps it special-cased
-/// here as a **perf-preserving choice**: the top-level IO handler
-/// is always installed by the `main` shim, and `lower_perform_to_-
-/// value` wraps `sigil_perform` synchronously, so IO-only fns can
-/// stay Native-color without paying trampoline overhead per println.
-///
-/// **Residual correctness gap** (per `[DEVIATION Task 57] IO color
-/// **Stage 6 cleanup — IO color filter lift.** The previous
-/// `NATIVE_EFFECT = "IO"` exemption that kept IO-performing fns on
-/// the Native-color path was removed in Stage 6 cleanup along with
-/// the three codegen body-shape classifier filters that paired with
-/// it. Post-lift, IO is treated as an ordinary effect by the
-/// colorer: a fn that performs IO (or has IO in its declared row)
-/// classifies as CPS-color, just like any other effect.
-///
-/// **Why the lift.** The exemption shipped as a "perf-preserving
-/// choice with a documented residual correctness gap" in
-/// `[DEVIATION Task 57] IO color filter retention`: a user-installed
-/// discard-`k` IO handler did not unwind a Native-color helper fn
-/// (the helper's synchronous `sigil_run_loop` returned Unit from
-/// the discard arm and execution continued past the perform site —
-/// the same hole Phase 4e closed for non-IO performs). The Stage 6
-/// cleanup PR retires the gap; user IO-handler discard-`k` semantics
-/// now matches non-IO behaviour. Perf cost is one trampoline
-/// dispatch per IO perform site (typically dominated by the
-/// `sigil_println` syscall itself); the existing perf floors
-/// (`fib_perf <50ms`, `tree_example <500ms`, `fib_cps_perf <500ms`)
-/// hold post-lift.
-///
-/// **Load-bearing invariant (still applies):** the top-level IO
-/// handler frame installed by the `main` shim covers every IO
-/// perform site that a user program reaches. Post-lift, IO performs
-/// flow through `sigil_perform` → trampoline → shim's
-/// `sigil_io_println_arm` like any other effect. If the shim
-/// regresses, IO performs `sigil_perform` against an unhandled
-/// effect and abort. `hello.sigil`'s e2e test exercises the shim
-/// end-to-end.
-///
+// Plan B Stage 6 cleanup — IO color filter lift (history note).
+//
+// Pre-cleanup, this module exposed `pub(crate) const NATIVE_EFFECT:
+// &str = "IO";` and three codegen body-shape classifiers carried a
+// matching IO exemption — together they kept IO-performing fns on
+// the Native-color path as a perf-preserving choice. The exemption
+// shipped with a documented residual correctness gap (per
+// `[DEVIATION Task 57] IO color filter retention`): a user-installed
+// discard-`k` IO handler did not unwind a Native-color helper fn —
+// the helper's synchronous `sigil_run_loop` returned Unit from the
+// discard arm and execution continued past the perform site (same
+// structural hole Phase 4e closed for non-IO performs).
+//
+// Stage 6 cleanup removed the exemption + the three codegen
+// classifier filters. Post-lift, IO is treated as an ordinary effect
+// by the colorer: a fn that performs IO (or has IO in its declared
+// row) classifies as CPS-color, just like any other effect. The
+// discard-`k` correctness goal is met for IO performs uniformly.
+// Perf cost is one trampoline dispatch per IO perform site
+// (typically dominated by the `sigil_println` syscall itself);
+// existing perf floors (`fib_perf <50ms`, `tree_example <500ms`,
+// `fib_cps_perf <500ms`) hold post-lift. See the inverted e2e
+// `user_discard_k_io_handler_unwinds_helper_at_perform_site` for the
+// post-lift behaviour assertion.
+//
+// Load-bearing invariant: the top-level IO handler frame installed
+// by the `main` shim covers every IO perform site that a user
+// program reaches. IO performs `sigil_perform` against an unhandled
+// effect and abort if the shim regresses. `hello.sigil`'s e2e test
+// exercises the shim end-to-end.
+
 /// Local (pre-propagation) classification of a single fn.
 #[derive(Clone, Debug)]
 enum LocalColor {
@@ -377,8 +367,10 @@ fn local_color(f: &FnDecl) -> LocalColor {
 }
 
 /// Walk a block's stmts and tail, descending into every nested
-/// expression, for the first `perform <effect>.<op>` whose effect is
-/// not `IO`. Returns `(effect, op)` of the first match found.
+/// expression, for the first `perform <effect>.<op>`. Returns
+/// `(effect, op)` of the first match found. Stage 6 cleanup lifted
+/// the IO exemption — every perform now matches, mirroring the
+/// uniform-effect-treatment policy.
 fn find_any_perform_in_block(b: &Block) -> Option<(String, String)> {
     for s in &b.stmts {
         match s {
