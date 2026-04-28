@@ -3966,3 +3966,176 @@ fn nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen() {
          restriction; got stderr={stderr:?}",
     );
 }
+
+#[test]
+fn handle_with_return_arm_inside_match_arm_compiles() {
+    // Plan B Task 55 (Phase 4g) review-fix #2: regression test
+    // for the `Lowerer::type_of_expr` `Expr::Handle` arm not
+    // pre-binding `v` into preview before recursing. Prior to the
+    // fix, callers that didn't pre-bind `v` (e.g., `lower_match`'s
+    // arm-body type predictor) would recurse into an
+    // `Expr::Ident("v")` against a preview without `v` and hit the
+    // `unreachable!` ident-lookup path. The repro shape: a handle
+    // expression with a return arm that references `v` sitting
+    // inside a `match` arm body — the predictor at codegen.rs
+    // around line 8323 calls `type_of_expr(&arms[0].body, &preview)`
+    // with whatever preview was inherited from the surrounding
+    // scope, NOT pre-binding `v` itself.
+    //
+    // Without the fix, this program hits `unreachable!` at codegen
+    // time. With the fix, it compiles cleanly and prints "10\n"
+    // (match scrutinee 5, arm body is `handle 5 with { return(v)
+    // => v + 5, ... }`, return arm fires with v=5 → 5+5=10).
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let scrut: Int = 5;\n  \
+                 let n: Int = match scrut {\n    \
+                   _ => handle 5 with {\n      \
+                     return(v) => v + 5,\n      \
+                     Raise.fail(k) => 0,\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_handle_inside_match_arm");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "10\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_nested_handle_in_return_arm_body_compiles() {
+    // Plan B Task 55 (Phase 4g) — review-fix follow-up to review
+    // #1's forward observation. The deviation entry's concern #5
+    // claims nested `Expr::Handle` is allowed in return arm bodies
+    // as a freebie (Phase 4f's machinery extends transparently via
+    // `Lowerer::lower_expr`'s recursive arm; pre-pass already
+    // recurses into return arm bodies for FuncId allocation). This
+    // test pins that claim with a concrete positive case.
+    //
+    // Outer handle: `handle 4 with { return(v) => <inner-handle>,
+    // Foo.f(k) => 0 }`. The return arm body is itself a handle:
+    // `handle (v + 1) with { Bar.b(k) => 0, return(w) => w * 2 }`.
+    // No performs fire; outer body produces 4; outer return arm
+    // fires with v=4; outer return arm body = inner handle, body
+    // = v+1 = 5; inner return arm fires with w=5 → 5*2 = 10.
+    // Final: 10.
+    let src = "effect Foo { f: () -> Int }\n\
+               effect Bar { b: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 4 with {\n    \
+                   return(v) => handle (v + 1) with {\n      \
+                     return(w) => w * 2,\n      \
+                     Bar.b(k) => 0,\n    \
+                   },\n    \
+                   Foo.f(k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_nested_handle_in_return_arm");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "10\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn op_arm_body_type_at_handler_overall_compiles_cleanly() {
+    // Plan B Task 55 (Phase 4g) review-fix #4: regression test
+    // for the latent Phase 4c body_ty bug fixed in this PR (see
+    // the deviation entry's "CI fix" section). The op arm body
+    // was widened using the **pre-stored `synth.body_ty`** (op's
+    // declared return type) rather than the **actual lowered
+    // Cranelift type** (handler_overall after typecheck unifies
+    // arm body type with handler_overall). When op return type
+    // and handler_overall differ — e.g., a `Raise.fail() -> Int`
+    // op whose handle's overall type is Bool — the arm body's
+    // `false` lowers to I8 but the widen branch's `if synth.body_ty
+    // == I64 { body_value }` returned the I8 value as-is for
+    // `sigil_next_step_done(I64)` — verifier rejected.
+    //
+    // The CI-fix commit changed the widen logic to read
+    // `dfg.value_type(body_value)` (mirrors Phase 4e Slice C's
+    // `tail_ty` fix). This test exercises the bundled Phase 4c
+    // op-arm path **without involving the Phase 4g return-arm
+    // path** (so the fix's coverage isn't tied to return arms).
+    //
+    // Repro: `handle (perform Raise.fail()) with { Raise.fail(k)
+    // => 7 > 3 }` (no return arm). Body performs Raise.fail; op
+    // arm fires returning 7>3 = true; handler-overall = Bool.
+    // Without the fix: arm fn synth widens I8 (true) as if it
+    // were I64 → verifier error at codegen-time. With the fix:
+    // compiles cleanly + prints "true\n".
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let b: Bool = handle (perform Raise.fail()) with {\n    \
+                   Raise.fail(k) => 7 > 3,\n  \
+                 };\n  \
+                 if b {\n    \
+                   perform IO.println(\"true\");\n    \
+                   0\n  \
+                 } else {\n    \
+                   perform IO.println(\"false\");\n    \
+                   1\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_op_arm_body_at_handler_overall");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "true\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+#[ignore]
+fn handle_with_bool_body_and_return_arm_uses_v_pending_proper_binding_ty() {
+    // Plan B Task 55 (Phase 4g) review-fix #3 PIN: the codegen
+    // pre-pass currently sets `HandlerReturnArmSynth.binding_ty
+    // = types::I64` as a placeholder (the pre-pass doesn't have
+    // direct access to the body's Cranelift type at AST-walk
+    // time). The synth fn binds `v` in the Lowerer env as I64,
+    // regardless of the body's actual type. When the body has
+    // type Bool (I8) and the return arm body uses `v` at narrow
+    // type (e.g., `not v`, `v && x`), the Lowerer expects v as
+    // I8 but env returns I64 — type mismatch in the lowered IR.
+    //
+    // Concrete repro: `handle true with { return(v) => not v,
+    // ... }`. Body produces Bool (true); surrounding fn widens
+    // I8 → I64 for the trailing-pair packing; synth fn loads
+    // I64 from args_ptr[0] and binds `v` as I64 in env. Return
+    // arm body lowers `not v` — `not` expects I8, env has I64:
+    // verifier error.
+    //
+    // Two resolution options for a follow-up commit:
+    //
+    //   - **Option 1 (forward):** thread body_ty from the
+    //     dispatch site (where `dfg.value_type(body_val)` is
+    //     known) into HandlerReturnArmSynth via mutable
+    //     side-table. Synth fn body emit reads the actual
+    //     binding_ty and narrows v on load.
+    //
+    //   - **Option 2 (typecheck side-table):** add
+    //     `CheckedProgram::handle_body_ty: BTreeMap<Span, Ty>`,
+    //     map Ty → Cranelift Type via existing `slot_kind_for_ty`
+    //     / `cranelift_ty_for_type_expr` family, store on
+    //     HandlerReturnArmSynth at pre-pass time.
+    //
+    // Mirrors the `discard_k_handler_does_not_abort_helper_phase_4e_pending`
+    // pin precedent (Phase 4d MVP); un-ignored at the resolution
+    // PR. This test would assert `compile_and_run` succeeds with
+    // stdout `false\n` (v=true → not v = false).
+    let src = "effect Raise { fail: () -> Bool }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let b: Bool = handle true with {\n    \
+                   return(v) => if v { false } else { true },\n    \
+                   Raise.fail(k) => true,\n  \
+                 };\n  \
+                 if b {\n    \
+                   perform IO.println(\"true\");\n    \
+                   0\n  \
+                 } else {\n    \
+                   perform IO.println(\"false\");\n    \
+                   1\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_bool_body_v_pending_binding_ty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "false\n", "stdout mismatch; stderr={stderr:?}");
+}

@@ -1455,11 +1455,17 @@ struct HandlerArmSynth {
 /// `binding_name`, lowers `body` via `lower_expr`, widens the result
 /// to I64, and emits `Call(post_handle_k_closure_loaded,
 /// post_handle_k_fn_loaded, [widened, null, identity_fn_addr])` via
-/// the trailing-pair convention so a future caller could compose a
-/// post-handle continuation. The handle-exit dispatch from the
+/// the trailing-pair convention. The handle-exit dispatch from the
 /// surrounding fn always passes `(null, &sigil_continuation_identity)`
-/// as the trailing pair (Phase 4g MVP doesn't lambda-lift surrounding
-/// computation past the handle expression).
+/// as the trailing pair, so the trampoline's outbound chain
+/// collapses to `Done(widened)`. The synth fn hard-codes
+/// `(null, identity)` as its OWN outbound trailing pair — a future
+/// caller wanting to compose a real post-handle continuation would
+/// need to thread its trailing pair through `args_ptr[1..3]` rather
+/// than re-emitting the synth fn (today's structure clobbers the
+/// inbound trailing pair). The hard-code is a Phase 4g MVP choice;
+/// lambda-lifting surrounding computation past the handle
+/// expression is deferred to a future phase.
 ///
 /// See `[DEVIATION Task 55] Phase 4g` in `PLAN_B_DEVIATIONS.md` for
 /// the architectural rationale + the bisecting hint pattern.
@@ -5739,7 +5745,36 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 let closure_ptr = block_params[0];
                 let args_ptr = block_params[1];
-                let _args_len = block_params[2];
+                let args_len = block_params[2];
+
+                // Plan B Task 55 (Phase 4g) review-fix #9: defensive
+                // arity check. The handle-exit dispatch always
+                // packs 3 slots `[v, post_handle_k_closure,
+                // post_handle_k_fn]` per the Phase 4e Slice A
+                // trailing-pair convention. `args_len = 3` is
+                // pinned by the surrounding fn's
+                // `sigil_next_step_call(_, _, /*arg_count=*/3)`. A
+                // future caller that miscounts (passing 1 or 4
+                // slots) would silently corrupt the trailing-pair
+                // reads or skip the `v` unpack; this check
+                // localizes the bug to the synth fn entry. Gated on
+                // `debug_assertions` (release builds elide; the
+                // miscount would be a codegen regression that
+                // wouldn't slip past CI).
+                if cfg!(debug_assertions) {
+                    let three_v = builder.ins().iconst(types::I32, 3);
+                    let mismatch = builder.ins().icmp(IntCC::NotEqual, args_len, three_v);
+                    let ok = builder.create_block();
+                    let bad = builder.create_block();
+                    builder.ins().brif(mismatch, bad, &[], ok, &[]);
+                    builder.switch_to_block(bad);
+                    builder.seal_block(bad);
+                    builder
+                        .ins()
+                        .trap(TrapCode::unwrap_user(TRAP_HANDLE_DISCIPLINE_VIOLATION));
+                    builder.switch_to_block(ok);
+                    builder.seal_block(ok);
+                }
 
                 // Unpack `v` from args_ptr[0] as I64; narrow per
                 // binding_ty. The pre-pass currently sets
@@ -7971,9 +8006,31 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
                     // Read return_fn / return_closure off the
                     // first-pushed frame (snapshotted at push time).
-                    // The frame stays Boehm-rooted via the snapshot
-                    // SSA Value through codegen's stackmap discipline,
-                    // so post-pop reads against snapshot remain valid.
+                    //
+                    // **GC-rooting (review-fix #5 audit):** under
+                    // Boehm conservative scan, `snap` (a Cranelift
+                    // Value holding a *mut HandlerFrame) is held in
+                    // a register or stack spill slot across the
+                    // post-pop window; Boehm's conservative scan of
+                    // the runtime thread stack finds it and roots
+                    // the heap allocation. After the loads,
+                    // `return_fn_v` / `return_closure_v` similarly
+                    // live in registers / spill slots until
+                    // `sigil_next_step_call` consumes them; Boehm's
+                    // scan covers the spills. **The
+                    // sigil_handle_pop calls between push and these
+                    // loads do not deallocate the frame** —
+                    // `sigil_handle_pop` only unlinks the frame
+                    // from the thread-local handler stack head; the
+                    // frame allocation persists until no live
+                    // reference remains (codegen's `snap` hold
+                    // continues that liveness through this dispatch
+                    // path). No `stackmap.push_placeholder` is
+                    // required here because (a) `load.i64` is not
+                    // a safepoint under Boehm and (b) a future
+                    // precise-GC pass would need to add stackmap
+                    // entries at every call site live across this
+                    // load anyway, not at the load itself.
                     let return_fn_v = self.builder.ins().load(
                         self.pointer_ty,
                         MemFlags::trusted(),
@@ -9250,7 +9307,30 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Handle {
                 body, return_arm, ..
             } => match return_arm {
-                Some(ra) => self.type_of_expr(&ra.body, preview),
+                Some(ra) => {
+                    // Plan B Task 55 (Phase 4g) review-fix #2:
+                    // pre-bind `v` into a forked preview before
+                    // recursing. Without this, callers that don't
+                    // pre-bind `v` (e.g., `lower_match`'s arm-body
+                    // type predictor at codegen.rs:8323-8325; any
+                    // path that reaches `type_of_expr` against a
+                    // handle expression nested inside another shape
+                    // — `match scrut { _ => handle ... with {
+                    // return(v) => v, ... } }`) would recurse into
+                    // an `Expr::Ident("v")` against a preview
+                    // without `v` and trip the `unreachable!`
+                    // ident-lookup path at codegen.rs around line
+                    // 9020. The Phase 4g handle-exit dispatch site
+                    // (codegen.rs:8060) already inserts `v: body_ty`
+                    // before this same call; the fix here makes
+                    // the preview-injection self-contained inside
+                    // `type_of_expr` so every other caller is safe
+                    // by construction.
+                    let body_ty = self.type_of_expr(body, preview);
+                    let mut p2 = preview.clone();
+                    p2.insert(ra.binding.clone(), body_ty);
+                    self.type_of_expr(&ra.body, &p2)
+                }
                 None => self.type_of_expr(body, preview),
             },
         }
