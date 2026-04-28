@@ -2029,3 +2029,48 @@ pop → arith_frame   (verify == arith_frame_snapshot — discipline trap)
 **Implementing commit(s):** Slice 2 (`28721af`). The actual rename + the ArithError frame push-before-IO + the two-pop discipline-check shape all land in that commit; the local sanity check on the IO pop and the discipline trap on the ArithError pop are both wired per the bullet list above.
 
 **Closure point:** Closed at Slice 2 (`28721af`). The discipline check correctly verifies the ArithError frame's identity at the second pop; the IO pop has its own sanity check.
+
+## 2026-04-28 — [DEVIATION Task 58] Multi-shot stress shape — sequential-handles workaround for Slice C v1's 2-let arm cap
+
+**Context:** Plan B Task 58 calls for two example programs:
+
+- `examples/choose_demo.sigil` using `effect Choose resumes: many { choose: (Int) -> Int }` — "a handler invokes `k` twice and collects both results".
+- `examples/multishot_stress.sigil` — "resume a continuation 10+ times with different inputs; assert results are independent".
+
+The first example matches the v1 multi-shot machinery exactly: Slice C's `arm_body_multi_let_then_pure_tail_shape` recognises `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }` and emits the 2-step lambda-lifted post-arm-k chain. The second example's literal "10+ resumes" wording would require a single arm body with 10+ `let r_i = k(arg_i)` bindings — a shape Slice C v1 explicitly does NOT accept. See `[DEVIATION Task 55] Phase 4e captures+` line 1503's *"Deferred from Slice C v1 (future captures-bearing extension)"* item:
+
+> More than 2 `k` invocations (3+ requires generalising the chain to N — straightforward but layered; v1 commits to the minimum that demonstrates multi-shot).
+
+The negative coverage test `slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen` (compiler/tests/e2e.rs:3667) pins the cap at exactly 2 lets at the codegen-entry walker. Lifting the cap to N is mechanical (the post-arm-k synth-fn chain extends from 2 fns to N fns, each capturing the previous lets' results) but layered work that wasn't in Phase 4e's MVP scope.
+
+**Deviation:** Task 58 v1 ships:
+
+1. **`examples/choose_demo.sigil`** with the literal `effect Choose resumes: many { choose: (Int) -> Int }` declaration and the canonical 2-resume arm body shape `{ let r1: Int = k(arg1); let r2: Int = k(arg2); r1 + r2 }`. This matches the plan's first-example wording verbatim — "a handler invokes `k` twice and collects both results".
+
+2. **`examples/multishot_stress.sigil`** with FIVE sequential `handle` expressions chained in a sum, each a 2-resume Choose handler invoked over an `(Int) -> Int` op with independent `arg` values. Each handle drives `k` twice with different inputs (`k(arg + 100)` and `k(arg + 200)`), so the program runs 10 multi-shot continuation invocations total across 5 fresh handler frames. Independence is assertable via the closed-form expected-output value: each handle returns `(seed + arg + 100) + (seed + arg + 200)` for its own `seed`; the final sum across 5 handles is a fixed integer the e2e test pins exactly.
+
+The structural difference between the literal-shape Task 58 wants and the v1-shape Task 58 ships:
+
+| Property | Plan literal "10+ in single arm" | Task 58 v1 ship |
+|---|---|---|
+| Multi-shot k invocations | 10+ in one arm | 10 across 5 arms (2 per arm) |
+| Distinct handler frames | 1 | 5 |
+| Distinct k_closure heap records | 1 (reused 10×) | 5 (reused 2× each) |
+| Tests "k_closure stays valid across N reads" | Yes (single record reused 10×) | Partially (single record reused 2×) |
+| Tests "fresh-frame multi-shot is independent across handles" | No (single frame) | Yes (5 fresh frames) |
+
+The two property sets are complementary, not equivalent. The literal shape is the harder reuse-stress test for the heap-allocated k_closure record; the v1 shape is the harder fresh-frame-handler test for the runtime's frame allocator + GC bitmap discipline + push/pop sequencing across multiple handles in one program. Both are useful coverage. **Task 60's perf floor work** (`Multi-shot stress test (3-element Choose combinator, N=1000 iterations) in <5s on both hosts`) will exercise the literal-shape stress at much higher N via the canonical helper-recursion idiom (per `[DEVIATION Task 55] Phase 4e captures+` line 1507's "Stage 9 P20 readiness analysis": `pick_int(low, high)` recurses with `if perform Choose.flip() then low else pick_int(low+1, high)`); the recursion-driven N can reach 32+ leaves with N=5 levels of helper recursion, all using only the Slice C v1 2-let arm shape. Task 58's v1 ship does the *correctness rigor* (multi-shot semantics work end-to-end with `(Int) -> Int` ops, fresh-frame independence) at a representative scale; Task 60 does the *throughput stress* via the recursion idiom.
+
+**Rationale:** Three options were considered:
+
+1. **Land the Slice C N-chain extension as part of Task 58.** This is real codegen work — extending the post-arm-k synth-fn chain from 2 fns to N fns, each capturing prior `let r_i` results into its closure record. The work is mechanical but layered: the pre-pass needs to allocate N-1 synth-fn FuncIds per matching arm (vs. exactly 1 today for `LetBindThenTail`); each post-arm-k synth fn needs its own captures list; the closure-record allocation discipline at the arm-fn body emit site needs to thread (k_closure, k_fn) plus all prior `r_i` results into each step's record. Out of scope for Task 58 (which is a *test rigor* task, not a *codegen-feature* task).
+
+2. **Land Task 58 with `examples/multishot_stress.sigil` deferred until the Slice C N-chain extension ships.** This option keeps the literal plan wording intact but pushes Task 58 closure to an unknown future date and leaves Stage 6's "multi-shot rigor" coverage incomplete in the interim. Task 60's perf-floor target depends on the multi-shot machinery being exercised at scale; without Task 58's stress example landing, Task 60's verification has nothing to point at as a representative correctness baseline.
+
+3. **(Selected.)** Land Task 58 with the v1-permitted stress shape (5 sequential handles totalling 10 k invocations) and a deviation entry naming the literal-shape shipment as future Slice C N-chain extension territory. This matches the established Plan B precedent — Phase 4d MVP shipped under literal-Phase-4 wording with a deviation entry naming the captures+ extension closure point; Phase 4e captures+ shipped the captures+ extension under a separate deviation entry pinning the 2-let cap; Task 58 ships the *correctness rigor* under the same pattern, with the *literal-N stress* shape pinned for a future captures-bearing extension.
+
+The selected option is consistent with the plan's "do not paper over correctness failures" hard rule (Task 58 v1 produces correct multi-shot semantics; the v1 shape just doesn't exercise the literal "10+ in single arm" stress) and with the "do not weaken to unrestricted continuations" rule (the v1 shape is canonical 2-let-arm Slice C; no semantic relaxation).
+
+**Closure point:** future Slice C N-chain extension (a separate post-Task-58, post-Phase-4e chore with its own PR). The extension lifts the cap on `arm_body_multi_let_then_pure_tail_shape` from 2 lets to N lets; un-ignores `slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen` and inverts it to a positive test asserting the N-chain dispatches correctly; ships an `examples/multishot_stress_n.sigil` (or upgrades `multishot_stress.sigil`) with 10+ resumes in a single arm. Task 58 v1's `multishot_stress.sigil` continues to serve as the fresh-frame-independence coverage; the N-chain version adds the single-frame-reuse coverage. Both ship coexistent.
+
+**Implementing commit(s):** Foundation `[HEAD]` (this entry + Task 57 squash-hash flip + PROGRESS Task 58 entry transition `todo` → `in-progress`); subsequent commits implement `examples/choose_demo.sigil` + `examples/multishot_stress.sigil` + e2e tests.
