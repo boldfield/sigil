@@ -1864,61 +1864,24 @@ fn handle_with_one_effect_exceeding_max_handler_arms_is_rejected_at_codegen() {
     );
 }
 
-#[ignore = "Latent op_id/arm_count constraint pre-existing since Phase 4a; \
-            Phase 4f expanded the user-reachable surface but did not \
-            introduce or fix it. Resolution deferred to a separate \
-            post-Phase-4f task — see the 'Latent op_id/arm_count \
-            constraint' sub-section in `[DEVIATION Task 55] Phase 4f` \
-            in `PLAN_B_DEVIATIONS.md` for both options (1: convention \
-            fix; 2: typecheck E0142). Test asserts the future-correct \
-            option-1 behaviour."]
+/// Plan B Stage 6 cleanup — **inverted from the previously
+/// `#[ignore]`'d `partial_handler_of_multi_op_effect_aborts_at_runtime
+/// _pending_resolution`**. The latent op_id/arm_count constraint
+/// resolves via option 2 (typecheck E0142 exhaustiveness) per the
+/// trade-off in `[DEVIATION Task 55] Phase 4f` and `[Stage 6
+/// cleanup]`: compile-time rejection beats runtime abort.
+///
+/// Pre-Stage-6-cleanup: `effect Choose { left, right }` with a
+/// handle covering only `Choose.right` was syntactically accepted
+/// and would runtime-abort if `Choose.left` ever fired. Post-Stage-
+/// 6-cleanup: typecheck rejects with E0142 at compile time, naming
+/// the unhandled op (`Choose.left`).
+///
+/// The test asserts the new compile-time behaviour: invoking the
+/// sigil compiler on the partial-handler source produces a non-zero
+/// exit and stderr containing `E0142` plus the unhandled op name.
 #[test]
-fn partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution() {
-    // Plan B Task 55, Phase 4f — pinning test for the latent
-    // op_id/arm_count constraint surfaced during the Phase 4f
-    // codegen-lift mid-flight review (commit `65727c2`). Mirrors
-    // the Phase 4d MVP `discard_k_handler_does_not_abort_helper_
-    // phase_4e_pending` precedent: the test asserts the
-    // future-correct behaviour and is `#[ignore]`'d while the
-    // bug exists, so it stays grep-findable through the eventual
-    // fix.
-    //
-    // **The bug:** op_ids are assigned alphabetically per-effect at
-    // `compiler/src/typecheck.rs:792-808`, globally over the
-    // effect's full declared op set. Codegen sizes
-    // `arm_count` to the handle's arm count for that effect.
-    // Runtime bounds check `op_id < arm_count` at
-    // `runtime/src/handlers.rs:349` aborts when handlers don't
-    // cover the lowest-numbered op_ids contiguously.
-    //
-    // **Concrete failure:** `effect Choose { left, right }` with
-    // op_ids `left=0, right=1`; a handle with only
-    // `Choose.right(k) => 20` produces `arm_count=1, op_id=1` →
-    // `sigil_handler_frame_set_arm: op_id 1 out of range
-    // (arm_count=1)` and the program aborts at runtime instead of
-    // printing `20`.
-    //
-    // **Future resolution paths (one will land at the fix PR):**
-    //
-    // - **Option 1 (convention fix):** size `arm_count` to
-    //   `effects[arm.effect].ops.len()`; unhandled slots stay null
-    //   from the runtime's `sigil_handler_frame_new` zero-init.
-    //   `sigil_perform`'s null-arm-slot path
-    //   (`runtime/src/handlers.rs:706-712`) already aborts with a
-    //   clear "op X has no arm" diagnostic when a perform reaches
-    //   an unhandled op. **Under option 1, this test passes
-    //   un-`#[ignore]`'d** with `stdout = "20\n"` — the perform
-    //   targets a covered op (`Choose.right`), `op_id=1 <
-    //   arm_count=2` (now sized to the effect's declared op
-    //   count), bounds check passes, dispatch lands the matching
-    //   arm, returns 20.
-    //
-    // - **Option 2 (typecheck fix, E0142):** require handles to
-    //   be exhaustive over the matched effect's ops. Under option
-    //   2, the future fix-PR rewrites this test to assert a
-    //   compile-time E0142 rejection instead.
-    //
-    // The fix-PR un-ignores + reshapes per the chosen resolution.
+fn partial_handler_of_multi_op_effect_rejected_with_e0142() {
     let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform Choose.right()) with {\n    \
@@ -1927,9 +1890,36 @@ fn partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "partial_handler_multi_op");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "20\n", "stdout mismatch; stderr={stderr:?}");
+    let tmp = std::env::temp_dir().join(format!(
+        "partial_handler_e0142_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("partial_handler_e0142_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail with E0142 (partial handler over multi-op effect); \
+         got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("E0142") && stderr.contains("Choose.left"),
+        "stderr should reference E0142 and the unhandled op name `Choose.left`; \
+         got stderr={stderr:?}",
+    );
 }
 
 #[ignore = "Residual correctness gap from Slice 1's IO color filter \

@@ -3108,6 +3108,64 @@ impl Tc {
             });
         }
 
+        // ---------- Phase 1.5: exhaustiveness check (E0142) ----------
+        // Stage 6 cleanup (option 2 from `[DEVIATION Task 55] Phase 4f`):
+        // a handle that lists any arm for `Effect` must cover every op
+        // declared on `Effect`. The body's effect row treats `Effect`
+        // as discharged, so any op NOT covered would runtime-abort if
+        // performed. We surface this at compile time via E0142.
+        //
+        // Iterate `discharged` (the effects that have at least one
+        // valid op-resolving arm — entries are added inside the
+        // E0139-success branch above, so unknown-effect arms aren't
+        // included). For each effect, check every declared op against
+        // `seen_arms`'s `(effect, op)` keys. Missing op names are
+        // collected and reported in alphabetical order (matches the
+        // op_id assignment order; deterministic across runs).
+        for eff_name in &discharged {
+            let eff_decl = match self.effects.get(eff_name).cloned() {
+                Some(d) => d,
+                None => continue,
+            };
+            let mut missing: Vec<String> = Vec::new();
+            for op in &eff_decl.ops {
+                let key = (eff_name.clone(), op.name.clone());
+                if !seen_arms.contains_key(&key) {
+                    missing.push(op.name.clone());
+                }
+            }
+            if !missing.is_empty() {
+                // Anchor the diagnostic on the first arm targeting
+                // this effect so the user sees where to add the
+                // missing arms. seen_arms holds the first-arm span
+                // per (effect, op) — pick the alphabetically-first
+                // op's first-arm span as the anchor.
+                let anchor_span = seen_arms
+                    .iter()
+                    .find(|((e, _), _)| e == eff_name)
+                    .map(|(_, span)| span.clone())
+                    .unwrap_or_else(|| handle_span.clone());
+                let listed = if missing.len() == 1 {
+                    format!("`{}.{}`", eff_name, missing[0])
+                } else {
+                    let parts: Vec<String> = missing
+                        .iter()
+                        .map(|op| format!("`{eff_name}.{op}`"))
+                        .collect();
+                    parts.join(", ")
+                };
+                self.push_error(
+                    "E0142",
+                    anchor_span,
+                    format!(
+                        "handler arms cover effect `{eff_name}` but do not exhaust its declared operations; \
+                         missing arm(s) for {listed}. Add an arm for each unhandled op (use `=> k(default)` \
+                         or `=> constant` for ops you don't expect to fire but need structurally present)",
+                    ),
+                );
+            }
+        }
+
         // ---------- Phase 2: body walk ----------
         // body_row = caller's literal effects ∪ discharged effects.
         // The contains check above already prevents duplicates from
@@ -7531,6 +7589,85 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0141"), "expected E0141: {errs:?}");
+    }
+
+    #[test]
+    fn handle_single_op_effect_with_single_arm_no_e0142() {
+        // Stage 6 cleanup: E0142 fires only for multi-op effects with
+        // partial coverage. A single-op effect with a single arm is
+        // exhaustive by construction; no E0142.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Raise.fail(k) => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0142"),
+            "single-op effect single-arm handler is exhaustive; \
+             E0142 should not fire: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_multi_op_effect_with_full_coverage_no_e0142() {
+        // Stage 6 cleanup: a multi-op effect with arms covering every
+        // declared op is exhaustive; no E0142.
+        let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Choose.left(k) => 1,\n\
+                       Choose.right(k) => 2,\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0142"),
+            "multi-op effect with full coverage is exhaustive; \
+             E0142 should not fire: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn handle_multi_op_effect_with_partial_coverage_emits_e0142() {
+        // Stage 6 cleanup: a multi-op effect with arms covering only
+        // a subset of declared ops emits E0142 naming the unhandled
+        // op(s). Mirrors the option-2 resolution from the Phase 4f
+        // latent op_id/arm_count constraint deviation.
+        let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with { Choose.right(k) => 2 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0142"), "expected E0142: {errs:?}");
+        let msg = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0142")
+            .map(|e| e.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("Choose.left"),
+            "E0142 message should name the unhandled op `Choose.left`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn handle_multi_op_effect_with_no_arms_for_unrelated_effect_no_e0142() {
+        // Stage 6 cleanup: E0142 only fires for effects that have AT
+        // LEAST ONE arm in the handler. A multi-op effect that the
+        // handler doesn't target at all is not "discharged" — the
+        // body's row keeps the effect open, no exhaustiveness check
+        // applies.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   effect Choose { left: () -> Int, right: () -> Int }\n\
+                   fn main() -> Int ![Choose] {\n\
+                     handle 0 with { Raise.fail(k) => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0142"),
+            "Choose has no arms in the handler — exhaustiveness check should \
+             not apply to Choose; E0142 should not fire: {errs:?}"
+        );
     }
 
     #[test]
