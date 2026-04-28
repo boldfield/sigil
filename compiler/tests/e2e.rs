@@ -1258,19 +1258,22 @@ fn dump_color_hello_is_native_row_io() {
         out.status.success(),
         "--dump-color exit; stdout={stdout:?}, stderr={stderr:?}"
     );
-    // hello.sigil declares `fn main() -> Int ![IO]`. Native row + leaf
-    // call graph + perform IO is entirely consistent with the native
-    // classification (Plan B Task 50 spec: row is `![IO]` → native).
+    // hello.sigil declares `fn main() -> Int ![IO]`. Stage 6 cleanup
+    // lifted the IO color filter — `![IO]`-rowed fns now classify
+    // as CPS-color (matching every other effect). main is special-
+    // cased to `UserFnAbi::Sync` regardless of color (per
+    // `compute_user_fn_abi`'s main entry-point contract), so the
+    // ABI is still Sync and the runtime behavior matches the shim's
+    // expectations; only the colorer's reason text changed.
     assert!(
-        stdout.contains("main native"),
-        "expected `main native ...` in dump-color output, got: {stdout}"
+        stdout.contains("main cps"),
+        "expected `main cps ...` in dump-color output, got: {stdout}"
     );
-    // The reason text is stable; pin it loosely so the test survives
-    // future tweaks to the wording but catches accidental category
-    // flips.
+    // Pin the reason text to the post-lift form so a regression
+    // re-introducing the IO color exemption surfaces here.
     assert!(
-        stdout.contains("native: row is `![IO]`"),
-        "expected reason `native: row is ![IO]`, got: {stdout}"
+        stdout.contains("cps: row contains effect `IO`"),
+        "expected reason `cps: row contains effect `IO``, got: {stdout}"
     );
 }
 
@@ -1371,28 +1374,32 @@ fn generic_map_dump_color_all_native() {
         out.status.success(),
         "exit; stdout={stdout:?}, stderr={stderr:?}"
     );
-    // All four monomorphs + main must classify as native. Pin each
+    // All four monomorphs (map / length × Int / String) must classify
+    // as native — they have row `![]` and are pure-structural. Stage 6
+    // cleanup lifted the IO color filter, so `main` (with row `![IO]`)
+    // now classifies as CPS-color (was Native pre-lift). Pin each
     // expected mangled name independently so a regression on any
     // single one (e.g. a mangling-format slip on map$$String) lands
-    // on a directed assertion rather than a opaque overall-string
+    // on a directed assertion rather than an opaque overall-string
     // diff.
     for expected in [
         "map$$Int native",
         "map$$String native",
         "length$$Int native",
         "length$$String native",
-        "main native",
+        "main cps",
     ] {
         assert!(
             stdout.contains(expected),
             "expected `{expected}` line in dump-color output, got:\n{stdout}"
         );
     }
-    // No CPS classifications should appear — this program is purely
-    // structural and should not require the trampoline.
+    // The four List-traversal monomorphs are pure-structural; only
+    // main has effects. No `cps` lines should appear OUTSIDE main.
+    let cps_lines: Vec<&str> = stdout.lines().filter(|l| l.contains(" cps ")).collect();
     assert!(
-        !stdout.contains(" cps "),
-        "no monomorph should classify as cps in this program; got:\n{stdout}"
+        cps_lines.iter().all(|l| l.starts_with("main ")),
+        "only main should classify as cps in this program; got CPS lines: {cps_lines:?}"
     );
 }
 

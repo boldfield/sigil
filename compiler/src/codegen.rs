@@ -191,6 +191,49 @@ fn compute_user_fn_abi(
     body: &crate::ast::Block,
     colored: &ColoredProgram,
 ) -> UserFnAbi {
+    // Plan B Stage 6 cleanup — `main` is structurally the entry
+    // point and is always emitted with `UserFnAbi::Sync`. The shim
+    // calls user_main with the Sync calling convention
+    // (`(closure_ptr) -> i32`) and treats the return value as the
+    // process exit code; there is no enclosing trampoline above the
+    // shim that could consume a `NextStep` record, so a Cps-ABI
+    // main has no useful caller and would simply trip Cranelift's
+    // verifier on the shim's Sync call site.
+    //
+    // **Why this is structural, not a workaround.** Pre-Stage-6-
+    // cleanup, main was already always Sync — `![IO]`-rowed main
+    // classified as `Color::Native` (the IO color exemption that
+    // Stage 6 cleanup removed), and main with any non-IO effect in
+    // row is rejected at typecheck (only `![IO]` and `![]` reach
+    // codegen for main). So the runtime behavior of main has never
+    // actually been Cps-ABI; the IO color filter lift made the
+    // colorer label it Cps without the rest of the pipeline being
+    // ready for that label at the entry point. Forcing Sync here
+    // re-establishes the pre-lift invariant at the ABI-selection
+    // layer rather than re-introducing the IO exemption at the
+    // colorer layer (which would reopen the discard-`k` correctness
+    // gap that A.2 closed for non-main fns).
+    //
+    // **The IO discard-`k` correctness goal still holds.** The
+    // lift's purpose was: user-installed discard-`k` IO handlers
+    // unwind helpers at the perform site. That correctness gap is
+    // about helpers called from main with discard-`k` handlers in
+    // scope (helpers are non-main; they remain Cps-color +
+    // potentially Cps-ABI post-lift). Main isn't wrapped in a
+    // user discard-`k` handler; it's wrapped in the shim's standard
+    // print/exit arm. Forcing main to Sync doesn't reopen the gap
+    // because `lower_perform_to_value` goes through `sigil_perform`
+    // synchronously — discard-`k` arms still fire correctly via
+    // run_loop dispatch from the perform site.
+    //
+    // If a future optimization needs Cps-ABI main (e.g., to share
+    // NextStep records with helper fns via a single arena), that
+    // PR ships the shim-side run_loop driver alongside the ABI
+    // change — same shape as scope_id's "deferred until concrete
+    // motivation" pattern.
+    if name == "main" {
+        return UserFnAbi::Sync;
+    }
     if !colored.needs_cps_transform(name) {
         return UserFnAbi::Sync;
     }
@@ -10318,11 +10361,14 @@ mod tests {
     }
 
     #[test]
-    fn io_perform_in_tail_is_not_simple_tail_perform() {
-        // IO performs use the synchronous `lower_perform` path
-        // regardless of color (special-cased; doesn't route through
-        // `sigil_perform`). The classifier returns false so codegen
-        // doesn't try to declare an IO-only fn with the CPS ABI.
+    fn io_perform_in_tail_is_simple_tail_perform_post_stage_6_cleanup() {
+        // Stage 6 cleanup: IO color filter lifted — IO performs are
+        // now eligible for the CPS-color body classifier just like
+        // any other effect. Pre-lift, this site rejected IO performs
+        // as a perf-preserving choice with a documented residual
+        // discard-`k` correctness gap (per `[DEVIATION Task 57] IO
+        // color filter retention`); post-lift, IO performs flow
+        // through the trampoline and the gap closes.
         use crate::ast::{Block, Expr, PerformExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -10336,7 +10382,7 @@ mod tests {
             })),
             span,
         };
-        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(is_simple_tail_perform_with_pure_args_body(&body));
     }
 
     #[test]
@@ -10446,9 +10492,9 @@ mod tests {
     }
 
     #[test]
-    fn yield_with_io_perform_is_not_yield_then_constant() {
-        // IO performs use the synchronous lower_perform path
-        // regardless of color; classifier rejects.
+    fn yield_with_io_perform_is_yield_then_constant_post_stage_6_cleanup() {
+        // Stage 6 cleanup: IO color filter lifted — `Stmt::Perform`
+        // with effect=IO is now eligible for the body classifier.
         use crate::ast::{Block, Expr, PerformExpr, Stmt};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -10462,7 +10508,7 @@ mod tests {
             tail: Some(Expr::IntLit(42, span.clone())),
             span,
         };
-        assert!(!is_simple_yield_then_constant_tail_body(&body));
+        assert!(is_simple_yield_then_constant_tail_body(&body));
     }
 
     // ---------------- Plan B Task 55, Phase 4e — let-yield-then-
@@ -10559,12 +10605,10 @@ mod tests {
     }
 
     #[test]
-    fn let_yield_with_io_perform_value_is_not_let_yield_then_pure() {
-        // `let s: String = perform IO.println("hi"); ...` — IO
-        // performs use the synchronous lower_perform path
-        // regardless of color; the let-yield classifier rejects.
-        // Mirrors the IO rejection from
-        // `is_simple_yield_then_constant_tail_body`.
+    fn let_yield_with_io_perform_value_is_let_yield_then_pure_post_stage_6_cleanup() {
+        // Stage 6 cleanup: IO color filter lifted — `let _ = perform
+        // IO.println(...); pure_tail` is now eligible for the
+        // let-yield classifier.
         use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -10583,7 +10627,7 @@ mod tests {
             tail: Some(Expr::IntLit(0, span.clone())),
             span,
         };
-        assert!(!is_simple_let_yield_then_pure_tail_body(&body));
+        assert!(is_simple_let_yield_then_pure_tail_body(&body));
     }
 
     #[test]
