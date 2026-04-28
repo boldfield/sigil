@@ -1702,11 +1702,11 @@ Phase 4g loads `return_fn` from offset 8 and `return_closure` from offset 16 dir
 
 **Walker restrictions for Phase 4g.** Return arm bodies must satisfy:
 
-- **No nested `Expr::Handle`.** Defer nested-handle-in-return-arm-body to a future Phase 4g-cleanup. The arm-body equivalent restriction was lifted in PR #28 Phase 4f (which added recursion through arm bodies); the return-arm equivalent inherits the same lift retroactively for op arms but rejects for return arms in this PR. Reasoning: nested handle inside a return arm body is structurally novel (the return arm itself fires after the outer handle's body completes; nesting another handle inside the return arm body composes two handle scopes in a way Phase 4g hasn't exercised). Defer until concrete motivation — likely covered by Phase 4f-cleanup or a separate task, not Phase 4g MVP.
 - **No `k` references.** Return arms have no continuation binding; the walker enforces this even though typecheck wouldn't bind `k` in a return arm body. Defensive symmetry with op arms.
-- **No nested `Lambda` / `ClosureRecord`.** Same restriction as op-arm bodies (Phase 4d).
+- **No nested `Lambda` / `ClosureRecord`.** Same restriction as op-arm bodies (Phase 4d). Closure-record allocation for arbitrary nested lambdas requires the same closure-convert side-table extension Phase 4d MVP deferred for op arms.
+- **Nested `Expr::Handle` ALLOWED.** The pre-pass walker already recurses into return arm bodies (parallel to op arm body recursion); the synth return fn body is lowered through the regular `Lowerer::lower_expr` which routes `Expr::Handle` through Phase 4f's machinery (allocate frames, push, lower body, pop, return-arm dispatch). Nested handles inside return arm bodies "just work" — no additional codegen surface required. The walker's existing nested-handle recursion pattern (per-handle `expr_unsupported_handle` recursion) extends to return arm bodies via the same shape.
 
-The walker's existing `arm_body_walk` machinery is reused with a `is_return_arm: bool` parameter that flips the `k`-reference rule (always reject for return arms; only reject in non-tail position for op arms).
+The walker's existing `arm_body_walk` machinery is reused with `k_name = ""` (return arms have no continuation binding so the k-related branches of the walker are inert) and a single scope frame containing the `v` binding name. The walker's nested-`Expr::Handle` arm walks the inner shapes' bodies / arm bodies / return arm bodies recursively under their own scopes (mirrors the op-arm path).
 
 **Bisecting hint pattern (three Phase 4g failure modes a future bisecting agent should attribute to this PR vs Phase 4f or earlier):**
 
@@ -1724,7 +1724,7 @@ The walker's existing `arm_body_walk` machinery is reused with a `is_return_arm:
 
 4. **Return arm body row vs caller row.** Typecheck (`check_handle` lines 3030-3050) walks the return arm body under the **caller's row** (the discharged effects are NOT in scope inside the return arm body). Codegen mirrors this: the return arm synth fn body lowers as if it lived in caller scope (the surrounding fn's effect row drives the colorer, not the discharged row). E0042 / E0043 / IO performs in return arm bodies all behave identically to the surrounding fn's row — no special handling needed at codegen.
 
-5. **Nested handle in return arm body deferred.** Walker rejects with a Phase-4g-cleanup-pointing diagnostic. Pinned by an `#[ignore]`'d test mirroring the Phase 4d-MVP / Phase 4f patterns.
+5. **Nested handle in return arm body — supported as a freebie.** Phase 4f's machinery (push-N-frames + first-pushed-frame contract) extends transparently to return arm bodies via `Lowerer::lower_expr`'s recursive `Expr::Handle` arm. The pre-pass already recurses into return arm bodies for FuncId allocation, so nested handles inside return arm bodies have their synth fn FuncIds allocated correctly. No additional codegen surface required; concrete coverage lands as part of the closeout test sweep (e.g., a multi-shot Choose handle whose return arm body wraps the result in another handle).
 
 **User's hard conditions for Phase 4g (mirroring Phase 4d/4e/4f patterns):**
 

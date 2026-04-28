@@ -709,12 +709,6 @@ fn expr_unsupported_handle(
             //     lambdas to ClosureRecords; both shapes need
             //     captures support to lower correctly inside an
             //     arm fn — same closure point as the capture gate)
-            //   - no return arm (Phase 4g lifts via a synthetic
-            //     return-fn registered via
-            //     sigil_handler_frame_set_return; per
-            //     [DEVIATION Task 55] Phase 4f concern #2,
-            //     return arm registers on the first-pushed frame
-            //     of the handle's frame group)
             //   - body's non-IO performs only target arms'
             //     declared effects (typecheck enforces this;
             //     codegen doesn't add an extra check)
@@ -730,14 +724,20 @@ fn expr_unsupported_handle(
             // `PLAN_B_DEVIATIONS.md` for the architectural
             // rationale (Option A push-N-frames; reversibility-
             // led; concerns 1–5 pre-registered).
-            if return_arm.is_some() {
-                return Some(format!(
-                    "`handle` expression at {:?} has a `return` arm — `return` \
-                     arms are not yet supported in codegen (Plan B Task 55, in \
-                     progress; arrives in Phase 4g)",
-                    span
-                ));
-            }
+            // Phase 4g LIFTED: handle expressions may have a
+            // `return(v) => body` arm. Codegen synthesises a
+            // CPS-color return-arm fn (uniform calling convention
+            // mirroring op-arm fns), allocates a per-handle FuncId
+            // in the pre-pass, registers it via
+            // `sigil_handler_frame_set_return` against the
+            // first-pushed frame (per the Phase 4f deviation
+            // entry's concern #2 contract), and dispatches at
+            // handle exit via the codegen-side trailing-pair
+            // convention through `sigil_run_loop`. See
+            // `[DEVIATION Task 55] Phase 4g` in
+            // `PLAN_B_DEVIATIONS.md` for the architectural
+            // rationale (Option A codegen-driven dispatch; no
+            // new FFI; concerns 1–5 pre-registered).
             if op_arms.is_empty() {
                 // Defensive: parser guarantees at least one arm,
                 // but codegen requires at least one to drive the
@@ -813,6 +813,34 @@ fn expr_unsupported_handle(
                     ));
                 }
             }
+            // Plan B Task 55 (Phase 4g) — return-arm body validation.
+            // Apply the same nested-Lambda / ClosureRecord restriction
+            // as op-arm bodies (these need closure-record machinery
+            // distinct from Phase 4d MVP). Mirrors
+            // `arm_body_walk` with `k_name = ""` (return arms have
+            // no continuation binding so the k-related branches in
+            // the walker are inert) and a single scope frame
+            // containing the `v` binding name.
+            if let Some(ra) = return_arm {
+                let mut return_scopes: Vec<std::collections::BTreeSet<String>> = Vec::new();
+                let mut binding_scope: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                binding_scope.insert(ra.binding.clone());
+                return_scopes.push(binding_scope);
+                if let Some(msg) = arm_body_walk(
+                    &ra.body,
+                    &mut return_scopes,
+                    "",
+                    globals,
+                    /* tail = */ false,
+                ) {
+                    return Some(format!(
+                        "`handle` expression at {:?} has `return({})` body that {} \
+                         (Plan B Task 55, Phase 4g)",
+                        span, ra.binding, msg
+                    ));
+                }
+            }
             // Recurse into the body itself so a nested handle inside
             // the body (e.g. `handle (handle ... with { ... }) with
             // { ... }`) surfaces its own diagnostics. Without this,
@@ -827,6 +855,16 @@ fn expr_unsupported_handle(
             // the AST surface their own diagnostics.
             for arm in op_arms {
                 if let Some(msg) = expr_unsupported_handle(&arm.body, globals, effects_resumes_many)
+                {
+                    return Some(msg);
+                }
+            }
+            // Plan B Task 55 (Phase 4g) — recurse into return arm body
+            // so nested handles inside the return arm body surface
+            // their own diagnostics (parallel to op-arm body
+            // recursion above).
+            if let Some(ra) = return_arm {
+                if let Some(msg) = expr_unsupported_handle(&ra.body, globals, effects_resumes_many)
                 {
                     return Some(msg);
                 }
@@ -1394,6 +1432,77 @@ struct HandlerArmSynth {
     /// `None` for arms whose body doesn't match the multi-let
     /// shape OR whose effect isn't `resumes: many`.
     post_arm_k_chain: Option<MultiLetPostArmKChain>,
+}
+
+/// Plan B Task 55 (Phase 4g) — per-`Expr::Handle` return-arm synthetic
+/// CPS fn metadata. One entry per handle expression that has a
+/// `return(v) => body` arm. The fn signature is the uniform CPS
+/// calling convention `extern "C" fn(closure_ptr, args_ptr, args_len)
+/// -> *mut NextStep`. The fn body unpacks `v` from `args_ptr[0]`
+/// (narrowed per `binding_ty`), binds it in the Lowerer env under
+/// `binding_name`, lowers `body` via `lower_expr`, widens the result
+/// to I64, and emits `Call(post_handle_k_closure_loaded,
+/// post_handle_k_fn_loaded, [widened, null, identity_fn_addr])` via
+/// the trailing-pair convention so a future caller could compose a
+/// post-handle continuation. The handle-exit dispatch from the
+/// surrounding fn always passes `(null, &sigil_continuation_identity)`
+/// as the trailing pair (Phase 4g MVP doesn't lambda-lift surrounding
+/// computation past the handle expression).
+///
+/// See `[DEVIATION Task 55] Phase 4g` in `PLAN_B_DEVIATIONS.md` for
+/// the architectural rationale + the bisecting hint pattern.
+#[derive(Debug)]
+struct HandlerReturnArmSynth {
+    /// FuncId allocated by the codegen pre-pass; defined later by the
+    /// return-arm synth fn definition pass at the bottom of
+    /// `emit_object`. Linker symbol is
+    /// `sigil_handler_return_arm_<global_index>`.
+    func_id: cranelift_module::FuncId,
+    /// The return-arm body, post-rewrite for closure captures (every
+    /// reference to a name in `captures` is replaced with an
+    /// `Expr::ClosureEnvLoad { index, kind, name, .. }` reading from
+    /// the synth fn's `closure_ptr` at the return-arm-local slot
+    /// index given by the position of `name` in `captures`).
+    /// References to `binding_name` (the `v` binding) and to globals
+    /// (top-level fn / ctor / `int_to_string`) pass through unchanged.
+    body: crate::ast::Expr,
+    /// The return-arm's `v` binding name (per `return(v) => body`).
+    /// Used by the synth fn definition pass to bind the unpacked
+    /// value into the Lowerer's env so the body can reference it.
+    binding_name: String,
+    /// Cranelift type of the `v` binding — equal to the handle body's
+    /// type (unify_ty pinned `v_ty == body_ty` at typecheck). Used to
+    /// narrow the I64-widened slot value back to the original
+    /// Cranelift type at fn entry (`I8` for Bool/Byte/Unit via
+    /// `ireduce`, `I32` for Char via `ireduce`, `I64` and pointer-
+    /// typed values stay as-is).
+    binding_ty: Type,
+    /// Cranelift type of the return-arm body's result. Currently
+    /// unused — the synth fn body's actual type is read via
+    /// `dfg.value_type` after lowering (Slice C's pattern), and the
+    /// handle-exit dispatch in `Expr::Handle` reads the narrow-back
+    /// type via `Lowerer::type_of_expr(&ra.body, &preview)`. Kept
+    /// here as a forward-compat slot in case a future commit wants
+    /// to pre-resolve `body_ty` at the pre-pass (mirroring the way
+    /// `HandlerArmSynth::body_ty` is pre-resolved). Marked
+    /// `#[allow(dead_code)]` to silence the unused-field warning
+    /// without losing the documentation slot.
+    #[allow(dead_code)]
+    body_ty: Type,
+    /// Captures consumed by this return-arm body, in return-arm-local
+    /// slot order matching `body`'s rewritten `Expr::ClosureEnvLoad
+    /// { index }` references. Each entry is the captured name plus
+    /// its `EnvSlotKind` (used for the closure record's GC bitmap and
+    /// for the per-slot load/store widening shape). The corresponding
+    /// env-expr — the value to write into the closure record's slot —
+    /// is built at `Expr::Handle` codegen time by looking up the name
+    /// in the surrounding `Lowerer.env` (or, when the surrounding fn
+    /// is a closure_convert-lifted lambda, by emitting a
+    /// `lower_closure_env_load` against the outer fn's `closure_ptr`).
+    /// Empty for return-arm bodies with no outer-scope references;
+    /// codegen passes `null` as the return-arm's `closure_ptr` in
+    /// that case (no allocation needed).
+    captures: Vec<ArmCapture>,
 }
 
 /// Plan B Task 55, Phase 4e captures+ Slice C — synthetic post-arm-k
@@ -1972,6 +2081,15 @@ struct ArmSynthCtx<'a> {
     /// `Expr::ClosureEnvLoad` references in the arm body into
     /// arm-local-indexed `Expr::ClosureEnvLoad` slots.
     handle_arm_captures: &'a BTreeMap<Span, Vec<Vec<(String, crate::typecheck::Ty)>>>,
+    /// Plan B Task 55 (Phase 4g): typecheck-side per-handle return-arm
+    /// captures map. Keyed by handle span; absent ⇒ no return arm OR
+    /// no captures need recording (codegen treats empty == absent).
+    /// Empty Vec ⇒ return arm with no outer-scope captures. Used by
+    /// the pre-pass to size the return-arm closure record and to
+    /// rewrite captured-name `Expr::Ident` / `Expr::ClosureEnvLoad`
+    /// references in the return-arm body into return-arm-local-indexed
+    /// `Expr::ClosureEnvLoad` slots.
+    handle_return_arm_captures: &'a BTreeMap<Span, Vec<(String, crate::typecheck::Ty)>>,
 }
 
 fn collect_handle_arms_in_block(
@@ -1980,25 +2098,59 @@ fn collect_handle_arms_in_block(
     ctx: &ArmSynthCtx<'_>,
     synth: &mut Vec<HandlerArmSynth>,
     indices: &mut BTreeMap<Span, Vec<usize>>,
+    return_synth: &mut Vec<HandlerReturnArmSynth>,
+    return_indices: &mut BTreeMap<Span, usize>,
 ) -> Result<(), String> {
     use crate::ast::Stmt;
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                collect_handle_arms_in_expr(&l.value, module, ctx, synth, indices)?;
+                collect_handle_arms_in_expr(
+                    &l.value,
+                    module,
+                    ctx,
+                    synth,
+                    indices,
+                    return_synth,
+                    return_indices,
+                )?;
             }
             Stmt::Expr(e) => {
-                collect_handle_arms_in_expr(e, module, ctx, synth, indices)?;
+                collect_handle_arms_in_expr(
+                    e,
+                    module,
+                    ctx,
+                    synth,
+                    indices,
+                    return_synth,
+                    return_indices,
+                )?;
             }
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    collect_handle_arms_in_expr(a, module, ctx, synth, indices)?;
+                    collect_handle_arms_in_expr(
+                        a,
+                        module,
+                        ctx,
+                        synth,
+                        indices,
+                        return_synth,
+                        return_indices,
+                    )?;
                 }
             }
         }
     }
     if let Some(tail) = &b.tail {
-        collect_handle_arms_in_expr(tail, module, ctx, synth, indices)?;
+        collect_handle_arms_in_expr(
+            tail,
+            module,
+            ctx,
+            synth,
+            indices,
+            return_synth,
+            return_indices,
+        )?;
     }
     Ok(())
 }
@@ -2009,6 +2161,8 @@ fn collect_handle_arms_in_expr(
     ctx: &ArmSynthCtx<'_>,
     synth: &mut Vec<HandlerArmSynth>,
     indices: &mut BTreeMap<Span, Vec<usize>>,
+    return_synth: &mut Vec<HandlerReturnArmSynth>,
+    return_indices: &mut BTreeMap<Span, usize>,
 ) -> Result<(), String> {
     use crate::ast::Expr;
     match e {
@@ -2020,63 +2174,201 @@ fn collect_handle_arms_in_expr(
         | Expr::ClosureEnvLoad { .. }
         | Expr::Perform(_) => Ok(()),
         Expr::Binary { lhs, rhs, .. } => {
-            collect_handle_arms_in_expr(lhs, module, ctx, synth, indices)?;
-            collect_handle_arms_in_expr(rhs, module, ctx, synth, indices)
+            collect_handle_arms_in_expr(
+                lhs,
+                module,
+                ctx,
+                synth,
+                indices,
+                return_synth,
+                return_indices,
+            )?;
+            collect_handle_arms_in_expr(
+                rhs,
+                module,
+                ctx,
+                synth,
+                indices,
+                return_synth,
+                return_indices,
+            )
         }
-        Expr::Unary { operand, .. } => {
-            collect_handle_arms_in_expr(operand, module, ctx, synth, indices)
-        }
+        Expr::Unary { operand, .. } => collect_handle_arms_in_expr(
+            operand,
+            module,
+            ctx,
+            synth,
+            indices,
+            return_synth,
+            return_indices,
+        ),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
         } => {
-            collect_handle_arms_in_expr(cond, module, ctx, synth, indices)?;
-            collect_handle_arms_in_block(then_block, module, ctx, synth, indices)?;
-            collect_handle_arms_in_block(else_block, module, ctx, synth, indices)
+            collect_handle_arms_in_expr(
+                cond,
+                module,
+                ctx,
+                synth,
+                indices,
+                return_synth,
+                return_indices,
+            )?;
+            collect_handle_arms_in_block(
+                then_block,
+                module,
+                ctx,
+                synth,
+                indices,
+                return_synth,
+                return_indices,
+            )?;
+            collect_handle_arms_in_block(
+                else_block,
+                module,
+                ctx,
+                synth,
+                indices,
+                return_synth,
+                return_indices,
+            )
         }
-        Expr::Block(b) => collect_handle_arms_in_block(b, module, ctx, synth, indices),
+        Expr::Block(b) => collect_handle_arms_in_block(
+            b,
+            module,
+            ctx,
+            synth,
+            indices,
+            return_synth,
+            return_indices,
+        ),
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            collect_handle_arms_in_expr(scrutinee, module, ctx, synth, indices)?;
+            collect_handle_arms_in_expr(
+                scrutinee,
+                module,
+                ctx,
+                synth,
+                indices,
+                return_synth,
+                return_indices,
+            )?;
             for a in arms {
-                collect_handle_arms_in_expr(&a.body, module, ctx, synth, indices)?;
+                collect_handle_arms_in_expr(
+                    &a.body,
+                    module,
+                    ctx,
+                    synth,
+                    indices,
+                    return_synth,
+                    return_indices,
+                )?;
             }
             Ok(())
         }
         Expr::Call { callee, args, .. } => {
-            collect_handle_arms_in_expr(callee, module, ctx, synth, indices)?;
+            collect_handle_arms_in_expr(
+                callee,
+                module,
+                ctx,
+                synth,
+                indices,
+                return_synth,
+                return_indices,
+            )?;
             for a in args {
-                collect_handle_arms_in_expr(a, module, ctx, synth, indices)?;
+                collect_handle_arms_in_expr(
+                    a,
+                    module,
+                    ctx,
+                    synth,
+                    indices,
+                    return_synth,
+                    return_indices,
+                )?;
             }
             Ok(())
         }
-        Expr::Lambda { body, .. } => collect_handle_arms_in_expr(body, module, ctx, synth, indices),
+        Expr::Lambda { body, .. } => collect_handle_arms_in_expr(
+            body,
+            module,
+            ctx,
+            synth,
+            indices,
+            return_synth,
+            return_indices,
+        ),
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
-                collect_handle_arms_in_expr(ee, module, ctx, synth, indices)?;
+                collect_handle_arms_in_expr(
+                    ee,
+                    module,
+                    ctx,
+                    synth,
+                    indices,
+                    return_synth,
+                    return_indices,
+                )?;
             }
             Ok(())
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                collect_handle_arms_in_expr(&f.value, module, ctx, synth, indices)?;
+                collect_handle_arms_in_expr(
+                    &f.value,
+                    module,
+                    ctx,
+                    synth,
+                    indices,
+                    return_synth,
+                    return_indices,
+                )?;
             }
             Ok(())
         }
         Expr::Handle {
             body,
+            return_arm,
             op_arms,
             span,
-            ..
         } => {
-            // Recurse into body + arm bodies so nested handles also
-            // surface. Then allocate FuncIds for this handle's arms.
-            collect_handle_arms_in_expr(body, module, ctx, synth, indices)?;
+            // Recurse into body + arm bodies + return-arm body so
+            // nested handles also surface. Then allocate FuncIds for
+            // this handle's arms (op arms + return arm if present).
+            collect_handle_arms_in_expr(
+                body,
+                module,
+                ctx,
+                synth,
+                indices,
+                return_synth,
+                return_indices,
+            )?;
             for arm in op_arms {
-                collect_handle_arms_in_expr(&arm.body, module, ctx, synth, indices)?;
+                collect_handle_arms_in_expr(
+                    &arm.body,
+                    module,
+                    ctx,
+                    synth,
+                    indices,
+                    return_synth,
+                    return_indices,
+                )?;
+            }
+            if let Some(ra) = return_arm {
+                collect_handle_arms_in_expr(
+                    &ra.body,
+                    module,
+                    ctx,
+                    synth,
+                    indices,
+                    return_synth,
+                    return_indices,
+                )?;
             }
             // Allocate one synthetic CPS fn per arm. Linker symbol
             // is `sigil_handler_arm_<global_index>` to keep names
@@ -2317,6 +2609,150 @@ fn collect_handle_arms_in_expr(
                 });
                 arm_indices.push(global_idx);
             }
+            // Plan B Task 55 (Phase 4g) — allocate the FuncId for
+            // the return arm's synth fn (when present). Mirrors the
+            // op-arm pre-pass shape above; the return arm's body
+            // type is the handler-overall type, but typecheck doesn't
+            // expose handler-overall directly through the AST — we
+            // recover it from `body.type_of_expr` at the synth-fn
+            // definition pass via Lowerer's lowering, exactly the
+            // same pattern Slice B's `tail_ty` uses
+            // (`dfg.value_type` post-lowering). The pre-pass needs
+            // only `binding_ty` (= the handle body's type, equal to
+            // typecheck's `v_ty` binding), not `handler_overall`.
+            //
+            // For Phase 4g MVP: we encode `binding_ty` from the
+            // handle's body's type via `Lowerer::type_of_expr`-style
+            // resolution — but this requires walking the body AST,
+            // which depends on type-aware machinery the pre-pass
+            // doesn't have. Instead, leave `binding_ty` as a
+            // placeholder (`I64` widened) and let the synth-fn body
+            // emit pass narrow on read using the post-lowered body's
+            // actual Cranelift type (mirroring how
+            // `lower_perform_non_io_to_value` narrows the run_loop
+            // result). Concretely: synth fn unpacks `v` from
+            // `args_ptr[0]` as I64 and the surrounding fn passes
+            // body_val widened to I64; the synth fn body then can
+            // bind `v` as an I64 in the Lowerer env. **This is
+            // structurally simpler than op arms** because op arms
+            // have multiple typed user args (each declared in the
+            // EffectOp) and need narrow-back per arg; return arms
+            // have a single value that flows in and out as I64
+            // through the trailing-pair convention.
+            //
+            // Captures collection mirrors op-arm path: the typecheck
+            // side-table `handle_return_arm_captures` provides the
+            // names + types in declaration order; codegen
+            // `find_closure_env_load_lambda_source` resolves whether
+            // each name comes from the surrounding lambda's closure
+            // env (Slice D pattern) or local env.
+            if let Some(ra) = return_arm {
+                let global_idx = return_synth.len();
+                let mangled = format!("sigil_handler_return_arm_{global_idx}");
+                let func_id = module
+                    .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
+                    .map_err(|e| format!("declare {mangled}: {e}"))?;
+
+                // Captures: typecheck-side `handle_return_arm_captures`
+                // is keyed by handle span and holds the return arm's
+                // capture list (or absent if no captures / no return
+                // arm). We've established here that the AST has a
+                // return arm, so the side-table entry exists for
+                // well-formed programs (typecheck populates it
+                // unconditionally for any return arm seen at
+                // `check_handle`).
+                let captures_typed: &[(String, crate::typecheck::Ty)] = ctx
+                    .handle_return_arm_captures
+                    .get(span)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let captures: Vec<ArmCapture> = captures_typed
+                    .iter()
+                    .map(|(name, ty)| {
+                        let lambda_source = find_closure_env_load_lambda_source(&ra.body, name);
+                        ArmCapture {
+                            name: name.clone(),
+                            kind: crate::closure_convert::slot_kind_for_ty(ty),
+                            lambda_source,
+                        }
+                    })
+                    .collect();
+                // Rewrite the return arm body so every captured-name
+                // reference loads from `closure_ptr` at a return-arm-
+                // local slot index. Op-arm rewrite uses
+                // `rewrite_arm_body_with_captures(body, captures,
+                // arg_names, k_name)`; return arms have a single
+                // user arg (`binding_name`) and no `k`, so we pass
+                // `[binding_name]` as `arg_names` and an empty
+                // string as `k_name`. The rewriter only consults
+                // `arg_names` and `k_name` to avoid mis-classifying
+                // a name that's actually an op-arg or `k` reference;
+                // for return arms there's no `k`, and `binding_name`
+                // is the sole local — so a captured-name match
+                // requires the name to NOT be in arg_names AND NOT
+                // be `k_name`. The empty string for `k_name` works
+                // because no real binding can have an empty name
+                // (parser rejects empty identifiers).
+                let arg_names = vec![ra.binding.clone()];
+                let rewritten_body = rewrite_arm_body_with_captures(
+                    &ra.body, &captures, &arg_names, /* k_name = */ "",
+                );
+
+                // binding_ty = body type. We don't have direct access
+                // to the body's Cranelift type here (the pre-pass
+                // doesn't run type inference); we leave I64 as a
+                // placeholder and let the synth fn body emit pass
+                // recover the actual type via `dfg.value_type` on
+                // the lowered body value at the surrounding fn's
+                // dispatch site. The synth fn unpacks `v` from
+                // args_ptr[0] as I64 (the surrounding fn widens body
+                // value to I64 before packing) and binds it in the
+                // Lowerer env as I64; if the return arm body
+                // observes `v` at a narrower type, the lowering
+                // would surface a type mismatch — but in practice
+                // typecheck's `v: body_ty` binding flows through to
+                // the Lowerer via the `Expr::Ident` lookup in the
+                // env, so as long as we narrow at fn entry per
+                // `body_ty`, the env's `v` has the correct
+                // Cranelift type. We compute body_ty here from a
+                // walk of the handle body's outer type via the same
+                // Lowerer's `cranelift_ty_for_type_expr`-equivalent
+                // recovery — or, more simply, defer body_ty
+                // resolution to the synth-fn definition pass which
+                // has access to the typecheck-side info via
+                // `match_scrut_tys` / typecheck artifacts. For Phase
+                // 4g MVP we encode `binding_ty = I64` (universal
+                // widened slot) and `body_ty = I64` (synth fn widens
+                // result to I64 before the trailing-pair Call) —
+                // narrow-back happens at the surrounding fn after
+                // run_loop returns, mirroring
+                // `lower_perform_non_io_to_value`'s post-run_loop
+                // narrow.
+                //
+                // For type-aware narrow-back at the surrounding fn
+                // we still need `body_ty` (the return arm body's
+                // declared Cranelift type). We don't expose it here
+                // — Lowerer's `type_of_expr` provides it post-
+                // lowering. The handle-exit dispatch in
+                // `Expr::Handle` will compute `handler_overall_ty`
+                // via `type_of_expr(&ra.body, &mut preview)` at
+                // dispatch time. Defer to that site.
+                return_synth.push(HandlerReturnArmSynth {
+                    func_id,
+                    body: rewritten_body,
+                    binding_name: ra.binding.clone(),
+                    binding_ty: types::I64,
+                    body_ty: types::I64,
+                    captures,
+                });
+                let prev_ret = return_indices.insert(span.clone(), global_idx);
+                debug_assert!(
+                    prev_ret.is_none(),
+                    "codegen pre-pass: duplicate handle span {span:?} for return-arm \
+                     index — pre-pass invariant violated"
+                );
+            }
+
             // The pre-pass walks each fn body exactly once and is
             // the only writer to `indices`. A duplicate span here
             // means the AST contains two `Expr::Handle` nodes that
@@ -3508,6 +3944,30 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_handler_frame_set_arm: {e}"))?;
 
+    // Plan B Task 55 (Phase 4g) — sigil_handler_frame_set_return(
+    //     frame: *mut HandlerFrame, fn_ptr: *mut u8, closure_ptr: *mut u8)
+    // Codegen calls this once per `Expr::Handle` whose AST has a
+    // `return_arm`, against the **first-pushed (bottom-of-handle-group)
+    // frame** per `[DEVIATION Task 55] Phase 4g` concern #2 inheriting
+    // from the Phase 4f deviation entry's first-pushed-frame contract.
+    let mut handler_frame_set_return_sig = Signature::new(isa_call_conv(&module));
+    handler_frame_set_return_sig
+        .params
+        .push(AbiParam::new(pointer_ty)); // frame
+    handler_frame_set_return_sig
+        .params
+        .push(AbiParam::new(pointer_ty)); // fn_ptr
+    handler_frame_set_return_sig
+        .params
+        .push(AbiParam::new(pointer_ty)); // closure_ptr
+    let handler_frame_set_return = module
+        .declare_function(
+            "sigil_handler_frame_set_return",
+            Linkage::Import,
+            &handler_frame_set_return_sig,
+        )
+        .map_err(|e| format!("declare sigil_handler_frame_set_return: {e}"))?;
+
     // sigil_perform(effect_id: u32, op_id: u32,
     //               args_ptr: *const u64, args_len: u32,
     //               k_closure_ptr: *mut u8, k_fn_ptr: *mut u8)
@@ -3801,6 +4261,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // simple (no nested-builder gymnastics).
     let mut handler_arm_synth: Vec<HandlerArmSynth> = Vec::new();
     let mut handler_arm_indices: BTreeMap<Span, Vec<usize>> = BTreeMap::new();
+    // Plan B Task 55 (Phase 4g) — per-handle return-arm synth side-tables.
+    // Parallel to `handler_arm_synth` / `handler_arm_indices` but flat
+    // because each handle has at most one return arm.
+    let mut handler_return_arm_synth: Vec<HandlerReturnArmSynth> = Vec::new();
+    let mut handler_return_arm_indices: BTreeMap<Span, usize> = BTreeMap::new();
     {
         let cps_arm_sig = cps_signature(pointer_ty, &module);
         let arm_synth_ctx = ArmSynthCtx {
@@ -3809,6 +4274,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             effects: &checked.effects,
             pointer_ty,
             handle_arm_captures: &checked.handle_arm_captures,
+            handle_return_arm_captures: &checked.handle_return_arm_captures,
         };
         for item in &checked.program.items {
             if let crate::ast::Item::Fn(f) = item {
@@ -3818,6 +4284,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     &arm_synth_ctx,
                     &mut handler_arm_synth,
                     &mut handler_arm_indices,
+                    &mut handler_return_arm_synth,
+                    &mut handler_return_arm_indices,
                 )?;
             }
         }
@@ -3892,6 +4360,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         handle_push,
         handle_pop,
         handler_frame_set_arm,
+        handler_frame_set_return,
         perform_func,
         run_loop,
         next_step_done,
@@ -3900,6 +4369,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         continuation_identity,
         handler_arm_indices: &handler_arm_indices,
         handler_arm_synth: &handler_arm_synth,
+        handler_return_arm_synth: &handler_return_arm_synth,
+        handler_return_arm_indices: &handler_return_arm_indices,
         user_fns: &user_fns,
         string_literals,
         lit_ids: &lit_ids,
@@ -3943,13 +4414,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handle_push_ref,
                 handle_pop_ref,
                 handler_frame_set_arm_ref,
+                handler_frame_set_return_ref,
                 perform_ref,
                 run_loop_ref,
                 next_step_done_ref: _,
-                next_step_call_ref: _,
-                next_step_args_ptr_ref: _,
+                next_step_call_ref,
+                next_step_args_ptr_ref,
                 continuation_identity_ref,
                 handler_arm_refs_per_handle,
+                handler_return_arm_refs_per_handle,
                 user_fn_refs,
                 lit_gvs,
                 div_zero_gv,
@@ -4321,11 +4794,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handle_push_ref,
                     handle_pop_ref,
                     handler_frame_set_arm_ref,
+                    handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
+                    next_step_call_ref,
+                    next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
                     handler_arm_synth: &handler_arm_synth,
                     handler_arm_indices: &handler_arm_indices,
+                    handler_return_arm_refs_per_handle,
+                    handler_return_arm_synth: &handler_return_arm_synth,
+                    handler_return_arm_indices: &handler_return_arm_indices,
                     continuation_identity_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
@@ -4449,11 +4928,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handle_push_ref,
                 handle_pop_ref,
                 handler_frame_set_arm_ref,
+                handler_frame_set_return_ref,
                 perform_ref,
                 run_loop_ref,
+                next_step_call_ref,
+                next_step_args_ptr_ref,
                 handler_arm_refs_per_handle,
                 handler_arm_synth: &handler_arm_synth,
                 handler_arm_indices: &handler_arm_indices,
+                handler_return_arm_refs_per_handle,
+                handler_return_arm_synth: &handler_return_arm_synth,
+                handler_return_arm_indices: &handler_return_arm_indices,
                 continuation_identity_ref,
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
@@ -4598,6 +5083,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handle_push_ref,
                     handle_pop_ref,
                     handler_frame_set_arm_ref,
+                    handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
                     next_step_done_ref,
@@ -4605,6 +5091,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
                     handler_arm_refs_per_handle,
+                    handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
                     div_zero_gv,
@@ -4706,11 +5193,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handle_push_ref,
                     handle_pop_ref,
                     handler_frame_set_arm_ref,
+                    handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
+                    next_step_call_ref,
+                    next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
                     handler_arm_synth: &handler_arm_synth,
                     handler_arm_indices: &handler_arm_indices,
+                    handler_return_arm_refs_per_handle,
+                    handler_return_arm_synth: &handler_return_arm_synth,
+                    handler_return_arm_indices: &handler_return_arm_indices,
                     continuation_identity_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
@@ -5131,6 +5624,258 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         }
     }
 
+    // Plan B Task 55, Phase 4g — synthetic return-arm fn definition
+    // pass. For each `Expr::Handle` with a `return(v) => body` arm,
+    // emit the return-arm synth fn body. Uniform CPS calling convention
+    // (`fn(closure_ptr, args_ptr, args_len) -> *mut NextStep`).
+    //
+    // Body structure:
+    //   - Read `v` from `args_ptr[0]` as I64; narrow per `binding_ty`.
+    //   - Bind `v` in the Lowerer env under `binding_name`.
+    //   - Read `post_handle_k_closure` from `args_ptr[1]` and
+    //     `post_handle_k_fn` from `args_ptr[2]` (Phase 4e Slice A's
+    //     trailing-pair convention).
+    //   - Lower the rewritten return arm body via `Lowerer::lower_expr`.
+    //   - Widen the body's value to I64 (matching the trampoline's
+    //     u64 dispatch slot).
+    //   - Build `Call(post_handle_k_closure, post_handle_k_fn, 3)`
+    //     with args `[widened, null_post_handle_k_closure_2,
+    //     identity_fn_addr]` per the trailing-pair convention. The
+    //     surrounding fn's handle-exit dispatch always passes
+    //     `(null, &sigil_continuation_identity)` as the trailing
+    //     pair, so the trampoline calls identity which returns
+    //     `Done(widened)`; `sigil_run_loop` returns the value to
+    //     the surrounding fn for narrowing.
+    //   - Return the NextStep ptr.
+    //
+    // The pass mirrors the synth-arm-fn body emit's shape (op-args
+    // unpacking + body lowering + trailing-pair Call) but is
+    // structurally simpler because the return arm has a single user
+    // arg (`v`) instead of N op-args, and never has a `k` binding
+    // to trampoline into. See `[DEVIATION Task 55] Phase 4g` in
+    // `PLAN_B_DEVIATIONS.md` for the architectural rationale.
+    {
+        let cps_arm_sig = cps_signature(pointer_ty, &module);
+        for synth in &handler_return_arm_synth {
+            ctx.func.signature = cps_arm_sig.clone();
+            ctx.func.name = UserFuncName::user(0, synth.func_id.as_u32());
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+                let block = builder.create_block();
+                builder.append_block_params_for_function_params(block);
+                builder.switch_to_block(block);
+                builder.seal_block(block);
+
+                // Per-fn FuncRefs via shared helper. The return-arm
+                // synth fn's body uses ALL refs (next_step_call_ref +
+                // next_step_args_ptr_ref for the trailing-pair Call;
+                // every other ref is available for the body's lowered
+                // expressions, which can use any expression over `v` +
+                // captures + globals).
+                let PerFnRefs {
+                    string_new_ref,
+                    println_ref,
+                    panic_arith_ref,
+                    alloc_ref,
+                    int_to_string_ref,
+                    handler_frame_new_ref,
+                    handle_push_ref,
+                    handle_pop_ref,
+                    handler_frame_set_arm_ref,
+                    handler_frame_set_return_ref,
+                    perform_ref,
+                    run_loop_ref,
+                    next_step_done_ref: _,
+                    next_step_call_ref,
+                    next_step_args_ptr_ref,
+                    continuation_identity_ref,
+                    handler_arm_refs_per_handle,
+                    handler_return_arm_refs_per_handle,
+                    user_fn_refs,
+                    lit_gvs,
+                    div_zero_gv,
+                    mod_zero_gv,
+                } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
+
+                // Block params: 0 = closure_ptr, 1 = args_ptr,
+                // 2 = args_len (unused — arity fixed at 3 by the
+                // surrounding fn's dispatch). The closure_ptr is
+                // null when the return arm has no captures, or
+                // points at the alloc'd closure record otherwise
+                // (Phase 4d's `alloc_arm_closure_record` shape).
+                let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                let closure_ptr = block_params[0];
+                let args_ptr = block_params[1];
+                let _args_len = block_params[2];
+
+                // Unpack `v` from args_ptr[0] as I64; narrow per
+                // binding_ty. The pre-pass currently sets
+                // binding_ty = I64 (we don't have body's Cranelift
+                // type at pre-pass time; the surrounding-fn dispatch
+                // widens body_val to I64 before packing). The narrow
+                // here is a no-op for I64; future commits that
+                // resolve binding_ty more precisely will activate
+                // the narrower paths via `ireduce`.
+                let widened_v = builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    args_ptr,
+                    /* offset = */ 0,
+                );
+                let v_value = if synth.binding_ty == types::I64 {
+                    widened_v
+                } else if synth.binding_ty.is_int() && synth.binding_ty.bits() < 64 {
+                    builder.ins().ireduce(synth.binding_ty, widened_v)
+                } else {
+                    assert_eq!(
+                        synth.binding_ty, pointer_ty,
+                        "codegen Phase 4g: unexpected return-arm binding Cranelift \
+                         type {:?} unpacking from args_ptr",
+                        synth.binding_ty
+                    );
+                    widened_v
+                };
+
+                let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                env.insert(synth.binding_name.clone(), v_value);
+
+                // Load post_handle_k trailing pair from args_ptr[1..3].
+                let post_handle_k_closure_v = builder.ins().load(
+                    pointer_ty,
+                    MemFlags::trusted(),
+                    args_ptr,
+                    POST_ARM_K_CLOSURE_OFF,
+                );
+                let post_handle_k_fn_v = builder.ins().load(
+                    pointer_ty,
+                    MemFlags::trusted(),
+                    args_ptr,
+                    POST_ARM_K_FN_OFF,
+                );
+
+                let mut lowerer = Lowerer {
+                    builder,
+                    stackmap: &mut stackmap,
+                    env,
+                    pointer_ty,
+                    closure_ptr,
+                    lit_gvs,
+                    div_zero_gv,
+                    mod_zero_gv,
+                    string_new_ref,
+                    println_ref,
+                    panic_arith_ref,
+                    alloc_ref,
+                    int_to_string_ref,
+                    handler_frame_new_ref,
+                    handle_push_ref,
+                    handle_pop_ref,
+                    handler_frame_set_arm_ref,
+                    handler_frame_set_return_ref,
+                    perform_ref,
+                    run_loop_ref,
+                    next_step_call_ref,
+                    next_step_args_ptr_ref,
+                    handler_arm_refs_per_handle,
+                    handler_return_arm_refs_per_handle,
+                    handler_arm_synth: &handler_arm_synth,
+                    handler_arm_indices: &handler_arm_indices,
+                    handler_return_arm_synth: &handler_return_arm_synth,
+                    handler_return_arm_indices: &handler_return_arm_indices,
+                    continuation_identity_ref,
+                    effect_ids: &checked.effect_ids,
+                    op_ids: &checked.op_ids,
+                    effects: &checked.effects,
+                    user_fn_refs,
+                    user_fns: &user_fns,
+                    type_layouts: &type_layouts,
+                    ctor_index: &ctor_index,
+                    match_scrut_tys: &checked.match_scrut_tys,
+                };
+
+                let body_value = lowerer.lower_expr(&synth.body);
+                let body_actual_ty = lowerer.builder.func.dfg.value_type(body_value);
+
+                // Widen the body value to I64 for the trailing-pair
+                // arg slot. The synth fn's return is always
+                // `*mut NextStep`; the body's actual Cranelift type
+                // (whatever it is) gets widened to I64 here.
+                let widened_body = if body_actual_ty == types::I64 {
+                    body_value
+                } else if body_actual_ty.is_int() && body_actual_ty.bits() < 64 {
+                    lowerer.builder.ins().uextend(types::I64, body_value)
+                } else {
+                    assert_eq!(
+                        body_actual_ty, pointer_ty,
+                        "codegen Phase 4g: unexpected return-arm body Cranelift \
+                         type {body_actual_ty:?} widening for trailing-pair Call \
+                         — Phase 4g supports I64 (Int), I32 (Char), I8 \
+                         (Bool/Byte/Unit), and pointer_ty (String / user-type \
+                         pointers)"
+                    );
+                    body_value
+                };
+
+                // Build Call(post_handle_k_closure, post_handle_k_fn,
+                // 3) carrying the trailing-pair payload [widened, null,
+                // identity]. Mirrors the tail-`k` arm body path's
+                // trailing-pair shape — the post-handle-k-fn ends up
+                // being identity (the surrounding fn's dispatch
+                // always passes identity), so the trampoline
+                // collapses to `Done(widened)`.
+                let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                let call_ns = lowerer.builder.ins().call(
+                    next_step_call_ref,
+                    &[post_handle_k_closure_v, post_handle_k_fn_v, three_v],
+                );
+                lowerer
+                    .stackmap
+                    .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+
+                let argp_call = lowerer
+                    .builder
+                    .ins()
+                    .call(next_step_args_ptr_ref, &[ns_ptr]);
+                lowerer
+                    .stackmap
+                    .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
+                let argp_v = lowerer.builder.inst_results(argp_call)[0];
+
+                lowerer.builder.ins().store(
+                    MemFlags::trusted(),
+                    widened_body,
+                    argp_v,
+                    POST_ARM_K_ARG_OFF,
+                );
+                let null_post_handle_k_closure_2 = lowerer.builder.ins().iconst(pointer_ty, 0);
+                lowerer.builder.ins().store(
+                    MemFlags::trusted(),
+                    null_post_handle_k_closure_2,
+                    argp_v,
+                    POST_ARM_K_CLOSURE_OFF,
+                );
+                let identity_fn_addr = lowerer
+                    .builder
+                    .ins()
+                    .func_addr(pointer_ty, lowerer.continuation_identity_ref);
+                lowerer.builder.ins().store(
+                    MemFlags::trusted(),
+                    identity_fn_addr,
+                    argp_v,
+                    POST_ARM_K_FN_OFF,
+                );
+
+                lowerer.builder.ins().return_(&[ns_ptr]);
+                lowerer.builder.finalize();
+            }
+            module
+                .define_function(synth.func_id, &mut ctx)
+                .map_err(|e| format!("define handler return-arm fn: {e}"))?;
+            module.clear_context(&mut ctx);
+        }
+    }
+
     // Plan B Task 55, Phase 4e captures+ Slice B — post-arm-k synth
     // fn definition pass. For each `HandlerArmSynth` whose pre-pass
     // detected the non-tail-`k(arg); pure_tail` shape via
@@ -5222,13 +5967,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handle_push_ref,
                 handle_pop_ref,
                 handler_frame_set_arm_ref,
+                handler_frame_set_return_ref,
                 perform_ref,
                 run_loop_ref,
                 next_step_done_ref,
-                next_step_call_ref: _,
-                next_step_args_ptr_ref: _,
+                next_step_call_ref,
+                next_step_args_ptr_ref,
                 continuation_identity_ref,
                 handler_arm_refs_per_handle,
+                handler_return_arm_refs_per_handle,
                 user_fn_refs,
                 lit_gvs,
                 div_zero_gv,
@@ -5254,11 +6001,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handle_push_ref,
                 handle_pop_ref,
                 handler_frame_set_arm_ref,
+                handler_frame_set_return_ref,
                 perform_ref,
                 run_loop_ref,
+                next_step_call_ref,
+                next_step_args_ptr_ref,
                 handler_arm_refs_per_handle,
                 handler_arm_synth: &handler_arm_synth,
                 handler_arm_indices: &handler_arm_indices,
+                handler_return_arm_refs_per_handle,
+                handler_return_arm_synth: &handler_return_arm_synth,
+                handler_return_arm_indices: &handler_return_arm_indices,
                 continuation_identity_ref,
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
@@ -5402,6 +6155,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handle_push_ref,
                     handle_pop_ref,
                     handler_frame_set_arm_ref,
+                    handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
                     next_step_done_ref: _,
@@ -5409,6 +6163,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
                     handler_arm_refs_per_handle,
+                    handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
                     div_zero_gv,
@@ -5436,11 +6191,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handle_push_ref,
                     handle_pop_ref,
                     handler_frame_set_arm_ref,
+                    handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
+                    next_step_call_ref,
+                    next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
                     handler_arm_synth: &handler_arm_synth,
                     handler_arm_indices: &handler_arm_indices,
+                    handler_return_arm_refs_per_handle,
+                    handler_return_arm_synth: &handler_return_arm_synth,
+                    handler_return_arm_indices: &handler_return_arm_indices,
                     continuation_identity_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
@@ -5659,13 +6420,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handle_push_ref,
                     handle_pop_ref,
                     handler_frame_set_arm_ref,
+                    handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
                     next_step_done_ref,
-                    next_step_call_ref: _,
-                    next_step_args_ptr_ref: _,
+                    next_step_call_ref,
+                    next_step_args_ptr_ref,
                     continuation_identity_ref,
                     handler_arm_refs_per_handle,
+                    handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
                     div_zero_gv,
@@ -5690,11 +6453,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handle_push_ref,
                     handle_pop_ref,
                     handler_frame_set_arm_ref,
+                    handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
+                    next_step_call_ref,
+                    next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
                     handler_arm_synth: &handler_arm_synth,
                     handler_arm_indices: &handler_arm_indices,
+                    handler_return_arm_refs_per_handle,
+                    handler_return_arm_synth: &handler_return_arm_synth,
+                    handler_return_arm_indices: &handler_return_arm_indices,
                     continuation_identity_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
@@ -5988,13 +6757,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handle_push_ref,
                             handle_pop_ref,
                             handler_frame_set_arm_ref,
+                            handler_frame_set_return_ref,
                             perform_ref,
                             run_loop_ref,
                             next_step_done_ref: _,
-                            next_step_call_ref: _,
-                            next_step_args_ptr_ref: _,
+                            next_step_call_ref,
+                            next_step_args_ptr_ref,
                             continuation_identity_ref,
                             handler_arm_refs_per_handle,
+                            handler_return_arm_refs_per_handle,
                             user_fn_refs,
                             lit_gvs,
                             div_zero_gv,
@@ -6020,11 +6791,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handle_push_ref,
                             handle_pop_ref,
                             handler_frame_set_arm_ref,
+                            handler_frame_set_return_ref,
                             perform_ref,
                             run_loop_ref,
+                            next_step_call_ref,
+                            next_step_args_ptr_ref,
                             handler_arm_refs_per_handle,
                             handler_arm_synth: &handler_arm_synth,
                             handler_arm_indices: &handler_arm_indices,
+                            handler_return_arm_refs_per_handle,
+                            handler_return_arm_synth: &handler_return_arm_synth,
+                            handler_return_arm_indices: &handler_return_arm_indices,
                             continuation_identity_ref,
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
@@ -6220,6 +6997,14 @@ struct Lowerer<'a, 'b> {
     /// runtime ref. Called once per arm during `Expr::Handle`
     /// lowering with `(frame, op_id, fn_ptr, null_closure_ptr)`.
     handler_frame_set_arm_ref: FuncRef,
+    /// Plan B Task 55 (Phase 4g) — `sigil_handler_frame_set_return`
+    /// runtime ref. Called once per `Expr::Handle` whose AST has a
+    /// `return_arm`, immediately after that handle's first-pushed
+    /// frame's `sigil_handler_frame_set_arm` calls. Per the Phase 4f
+    /// deviation entry's concern #2 contract, the return arm
+    /// registers on the **first-pushed (bottom-of-handle-group)
+    /// frame**.
+    handler_frame_set_return_ref: FuncRef,
     /// Plan B Task 55 (Phase 3b) — `sigil_perform` runtime ref.
     /// `lower_perform_non_io_to_value` calls this for non-IO
     /// effects; the result is a `*mut NextStep` of tag `CALL`
@@ -6251,6 +7036,32 @@ struct Lowerer<'a, 'b> {
     /// `handler_arm_refs_per_handle`. Used to walk an
     /// `Expr::Handle`'s arms without re-walking the AST.
     handler_arm_indices: &'b BTreeMap<Span, Vec<usize>>,
+    /// Plan B Task 55 (Phase 4g) — `sigil_next_step_call` runtime
+    /// ref. Phase 4g's handle-exit dispatch builds a `NextStep::Call`
+    /// for the return arm fn via this helper before driving the
+    /// trampoline.
+    next_step_call_ref: FuncRef,
+    /// Plan B Task 55 (Phase 4g) — `sigil_next_step_args_ptr`
+    /// runtime ref. Used at the handle-exit dispatch to retrieve
+    /// the args buffer of the just-built `NextStep::Call` so
+    /// `body_val` and the trailing-pair `(null, identity)` slots
+    /// can be written before driving the trampoline.
+    next_step_args_ptr_ref: FuncRef,
+    /// Plan B Task 55 (Phase 4g) — global `HandlerReturnArmSynth`
+    /// slice from the codegen pre-pass. Used by `Expr::Handle`
+    /// codegen to look up the return arm's `captures` list and
+    /// `body_ty` for closure-record allocation + dispatch
+    /// narrow-back. Indexed via `handler_return_arm_indices`.
+    handler_return_arm_synth: &'b [HandlerReturnArmSynth],
+    /// Plan B Task 55 (Phase 4g) — per-handle-span return-arm
+    /// `FuncRef` (when present). Used by `Expr::Handle` codegen to
+    /// emit `func_addr` for `sigil_handler_frame_set_return` and the
+    /// handle-exit dispatch. Absent ⇒ the handle has no return arm.
+    handler_return_arm_refs_per_handle: BTreeMap<Span, FuncRef>,
+    /// Plan B Task 55 (Phase 4g) — per-handle-span return-arm index
+    /// into `handler_return_arm_synth`. Mirrors the keys of
+    /// `handler_return_arm_refs_per_handle`. Absent ⇒ no return arm.
+    handler_return_arm_indices: &'b BTreeMap<Span, usize>,
     /// Plan B Task 55 (Phase 4d) — `sigil_continuation_identity`
     /// runtime intrinsic. `lower_perform_non_io_to_value` emits
     /// `func_addr(continuation_identity_ref)` as the `k_fn_ptr` arg
@@ -6771,9 +7582,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             }
             Expr::Handle {
                 body,
+                return_arm,
                 op_arms,
                 span,
-                ..
             } => {
                 // Plan B Task 55 (Phase 4f): multi-effect handles via
                 // push-N-frames. Group `op_arms` by `arm.effect` using
@@ -6876,7 +7687,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // through the body via Cranelift SSA / register
                 // allocator; no explicit stack slot needed.)
                 let mut frame_1_ptr_snapshot: Option<Value> = None;
-                for (effect_name, arms_in_effect) in groups.iter() {
+                for (groups_iter_index, (effect_name, arms_in_effect)) in groups.iter().enumerate()
+                {
+                    let is_first_frame = groups_iter_index == 0;
                     let effect_id = match self.effect_ids.get(effect_name) {
                         Some(id) => *id,
                         None => unreachable!(
@@ -6962,6 +7775,63 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             .push_placeholder(function_code_offset(&self.builder, set_call));
                     }
 
+                    // Plan B Task 55 (Phase 4g): register the synth
+                    // return fn against the **first-pushed (bottom-of-
+                    // handle-group) frame** when the handle has a
+                    // return arm. Per `[DEVIATION Task 55] Phase 4f`
+                    // concern #2, the first-pushed-frame contract is
+                    // the durable anchor for return-on-body-Done
+                    // semantics — Phase 4g implements against this
+                    // pin. For single-effect handles (n_frames=1)
+                    // this is trivially the only frame; for multi-
+                    // effect handles (n_frames>=2) the first iteration
+                    // of the BTreeMap loop is `is_first_frame`.
+                    if is_first_frame {
+                        if let Some(_ra) = return_arm.as_deref() {
+                            let ret_fn_ref = self
+                                .handler_return_arm_refs_per_handle
+                                .get(span)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    unreachable!(
+                                        "codegen Phase 4g: handler_return_arm_refs_per_handle \
+                                         missing entry for handle span {span:?}; pre-pass \
+                                         should have allocated when the AST has a return arm"
+                                    )
+                                });
+                            let ret_fn_ptr_v =
+                                self.builder.ins().func_addr(self.pointer_ty, ret_fn_ref);
+                            // Build the return-arm's closure record
+                            // when it has captures, else null. Mirrors
+                            // the op-arm `arm_closure_ptr` shape.
+                            let synth_idx = self
+                                .handler_return_arm_indices
+                                .get(span)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    unreachable!(
+                                        "codegen Phase 4g: handler_return_arm_indices missing \
+                                         entry for handle span {span:?}"
+                                    )
+                                });
+                            let ret_captures =
+                                self.handler_return_arm_synth[synth_idx].captures.clone();
+                            let ret_closure_ptr = if ret_captures.is_empty() {
+                                null_ptr
+                            } else {
+                                self.alloc_arm_closure_record(&ret_captures)
+                            };
+                            let set_return_call = self.builder.ins().call(
+                                self.handler_frame_set_return_ref,
+                                &[frame_ptr, ret_fn_ptr_v, ret_closure_ptr],
+                            );
+                            self.stackmap.push_placeholder(function_code_offset(
+                                &self.builder,
+                                set_return_call,
+                            ));
+                        }
+                    }
+
                     let push_call = self.builder.ins().call(self.handle_push_ref, &[frame_ptr]);
                     self.stackmap
                         .push_placeholder(function_code_offset(&self.builder, push_call));
@@ -7022,6 +7892,158 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
                     self.builder.switch_to_block(ok);
                     self.builder.seal_block(ok);
+                }
+
+                // Plan B Task 55 (Phase 4g): if the handle has a
+                // return arm, dispatch it now. Read `return_fn` and
+                // `return_closure` off `frame_1_ptr_snapshot` at the
+                // pinned offsets (`HANDLER_FRAME_RETURN_FN_OFF`,
+                // `HANDLER_FRAME_RETURN_CLOSURE_OFF` from
+                // `sigil_abi::effect`); build a `NextStep::Call`
+                // carrying `[body_val_widened, null,
+                // identity_fn_addr]` per Phase 4e Slice A's trailing-
+                // pair convention; drive the trampoline via
+                // `sigil_run_loop`; narrow the result back to the
+                // handler-overall type (= the return arm body's
+                // Cranelift type). When no return arm is declared,
+                // fall through to the original `body_val` path
+                // (Phase 4f shape).
+                if let Some(ra) = return_arm.as_deref() {
+                    let snap = frame_1_ptr_snapshot.unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen Phase 4g: frame_1_ptr_snapshot must be set \
+                             when groups is non-empty (return arm dispatch)"
+                        )
+                    });
+
+                    // Widen body_val to I64 for the trailing-pair
+                    // arg slot — mirrors `lower_perform_non_io_to_value`'s
+                    // perform-side widening at codegen.rs:6504-6543.
+                    let body_ty = self.builder.func.dfg.value_type(body_val);
+                    let body_val_widened = if body_ty == types::I64 {
+                        body_val
+                    } else if body_ty.is_int() && body_ty.bits() < 64 {
+                        self.builder.ins().uextend(types::I64, body_val)
+                    } else {
+                        assert_eq!(
+                            body_ty, self.pointer_ty,
+                            "codegen Phase 4g: unexpected handle-body Cranelift \
+                             type {body_ty:?} widening for return-arm dispatch — \
+                             Phase 4g supports I64 (Int), I32 (Char), I8 \
+                             (Bool/Byte/Unit), and pointer_ty (String / user-type \
+                             pointers)"
+                        );
+                        body_val
+                    };
+
+                    // Read return_fn / return_closure off the
+                    // first-pushed frame (snapshotted at push time).
+                    // The frame stays Boehm-rooted via the snapshot
+                    // SSA Value through codegen's stackmap discipline,
+                    // so post-pop reads against snapshot remain valid.
+                    let return_fn_v = self.builder.ins().load(
+                        self.pointer_ty,
+                        MemFlags::trusted(),
+                        snap,
+                        sigil_abi::effect::HANDLER_FRAME_RETURN_FN_OFF,
+                    );
+                    let return_closure_v = self.builder.ins().load(
+                        self.pointer_ty,
+                        MemFlags::trusted(),
+                        snap,
+                        sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
+                    );
+
+                    // Build NextStep::Call(return_closure, return_fn, 3)
+                    // — the synth return fn unpacks v from
+                    // args_ptr[0] and the trailing pair from
+                    // args_ptr[1..3] per the trailing-pair convention.
+                    let three_v = self.builder.ins().iconst(types::I32, 3);
+                    let call_ns = self.builder.ins().call(
+                        self.next_step_call_ref,
+                        &[return_closure_v, return_fn_v, three_v],
+                    );
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, call_ns));
+                    let ns_ptr = self.builder.inst_results(call_ns)[0];
+
+                    let argp_call = self
+                        .builder
+                        .ins()
+                        .call(self.next_step_args_ptr_ref, &[ns_ptr]);
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, argp_call));
+                    let argp_v = self.builder.inst_results(argp_call)[0];
+
+                    // Trailing-pair slot writes: [body_val, null, identity].
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        body_val_widened,
+                        argp_v,
+                        POST_ARM_K_ARG_OFF,
+                    );
+                    let null_post_handle_k_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        null_post_handle_k_closure,
+                        argp_v,
+                        POST_ARM_K_CLOSURE_OFF,
+                    );
+                    let identity_fn_addr = self
+                        .builder
+                        .ins()
+                        .func_addr(self.pointer_ty, self.continuation_identity_ref);
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        identity_fn_addr,
+                        argp_v,
+                        POST_ARM_K_FN_OFF,
+                    );
+
+                    // Drive the trampoline. `sigil_run_loop`
+                    // dispatches the Call to the synth return fn,
+                    // which lowers the return arm body and emits
+                    // Call(post_handle_k_closure_loaded,
+                    // post_handle_k_fn_loaded, [tail_widened, ...])
+                    // — the trailing pair is (null, identity), so
+                    // the trampoline calls identity which returns
+                    // Done(tail_widened); run_loop returns the value
+                    // as u64.
+                    let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns_ptr]);
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, run_loop_call));
+                    let widened_handle_val = self.builder.inst_results(run_loop_call)[0];
+
+                    // Narrow back to the return arm body's Cranelift
+                    // type. We compute it via type_of_expr against
+                    // the post-rewrite `ra.body` (shapes are
+                    // preserved through the capture rewrite); the
+                    // synth return fn widens its body's value to I64
+                    // before the trailing-pair Call, mirroring
+                    // `lower_perform_non_io_to_value`'s narrow-back
+                    // discipline. Build a preview map binding `v`
+                    // to body_ty so any `Expr::Ident("v")` in the
+                    // return arm body resolves correctly.
+                    let mut preview: BTreeMap<String, Type> = BTreeMap::new();
+                    preview.insert(ra.binding.clone(), body_ty);
+                    let handler_overall_ty = self.type_of_expr(&ra.body, &preview);
+                    return if handler_overall_ty == types::I64 {
+                        widened_handle_val
+                    } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
+                        self.builder
+                            .ins()
+                            .ireduce(handler_overall_ty, widened_handle_val)
+                    } else {
+                        assert_eq!(
+                            handler_overall_ty, self.pointer_ty,
+                            "codegen Phase 4g: unexpected handler-overall \
+                             Cranelift type {handler_overall_ty:?} narrowing run_loop \
+                             result — Phase 4g supports I64 (Int), I32 (Char), \
+                             I8 (Bool/Byte/Unit), and pointer_ty (String / \
+                             user-type pointers)"
+                        );
+                        widened_handle_val
+                    };
                 }
 
                 body_val
@@ -8187,10 +9209,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             // `unsupported_handle_construct` enforces this). The
             // handle's Cranelift type is therefore the body's type;
             // typecheck has already verified all arms unify with the
-            // body via E0044/E0065. Phase 3+ will replace this with
-            // a handler-overall computation reading from a typecheck-
-            // populated side-table.
-            Expr::Handle { body, .. } => self.type_of_expr(body, preview),
+            // body via E0044/E0065. Phase 4g extends this with the
+            // return-arm path: when the handle has a `return(v) =>
+            // ra_body` arm, the handle's overall type is the return
+            // arm body's type (typecheck unify_ty's `handler_overall`
+            // against `ra_body`'s type, with `v: body_ty`).
+            Expr::Handle {
+                body, return_arm, ..
+            } => match return_arm {
+                Some(ra) => self.type_of_expr(&ra.body, preview),
+                None => self.type_of_expr(body, preview),
+            },
         }
     }
 }
@@ -8371,6 +9400,7 @@ struct PerFnRefsCtx<'a> {
     handle_push: cranelift_module::FuncId,
     handle_pop: cranelift_module::FuncId,
     handler_frame_set_arm: cranelift_module::FuncId,
+    handler_frame_set_return: cranelift_module::FuncId,
     perform_func: cranelift_module::FuncId,
     run_loop: cranelift_module::FuncId,
     next_step_done: cranelift_module::FuncId,
@@ -8379,6 +9409,13 @@ struct PerFnRefsCtx<'a> {
     continuation_identity: cranelift_module::FuncId,
     handler_arm_indices: &'a BTreeMap<Span, Vec<usize>>,
     handler_arm_synth: &'a [HandlerArmSynth],
+    /// Plan B Task 55 (Phase 4g) — per-handle return-arm `FuncId` if
+    /// the handle has a return arm; absent otherwise. Keyed by handle
+    /// span. Mirrors `handler_arm_indices` (one entry per handle that
+    /// has a return arm; `prepare_per_fn_refs` builds parallel
+    /// `handler_return_arm_refs_per_handle` of `FuncRef`s).
+    handler_return_arm_synth: &'a [HandlerReturnArmSynth],
+    handler_return_arm_indices: &'a BTreeMap<Span, usize>,
     user_fns: &'a BTreeMap<String, UserFnEntry>,
     string_literals: &'a [(Span, String)],
     lit_ids: &'a [cranelift_module::DataId],
@@ -8414,6 +9451,7 @@ struct PerFnRefs {
     handle_push_ref: FuncRef,
     handle_pop_ref: FuncRef,
     handler_frame_set_arm_ref: FuncRef,
+    handler_frame_set_return_ref: FuncRef,
     perform_ref: FuncRef,
     run_loop_ref: FuncRef,
     next_step_done_ref: FuncRef,
@@ -8421,6 +9459,10 @@ struct PerFnRefs {
     next_step_args_ptr_ref: FuncRef,
     continuation_identity_ref: FuncRef,
     handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>>,
+    /// Plan B Task 55 (Phase 4g) — per-handle return-arm `FuncRef` if
+    /// the handle has a return arm; absent otherwise. Keyed by handle
+    /// span. Mirrors `handler_arm_refs_per_handle` shape.
+    handler_return_arm_refs_per_handle: BTreeMap<Span, FuncRef>,
     user_fn_refs: BTreeMap<String, FuncRef>,
     lit_gvs: Vec<(Span, GlobalValue, usize)>,
     div_zero_gv: GlobalValue,
@@ -8453,6 +9495,8 @@ fn prepare_per_fn_refs(
     let handle_pop_ref = module.declare_func_in_func(ctx.handle_pop, builder.func);
     let handler_frame_set_arm_ref =
         module.declare_func_in_func(ctx.handler_frame_set_arm, builder.func);
+    let handler_frame_set_return_ref =
+        module.declare_func_in_func(ctx.handler_frame_set_return, builder.func);
     let perform_ref = module.declare_func_in_func(ctx.perform_func, builder.func);
     let run_loop_ref = module.declare_func_in_func(ctx.run_loop, builder.func);
     let next_step_done_ref = module.declare_func_in_func(ctx.next_step_done, builder.func);
@@ -8476,6 +9520,19 @@ fn prepare_per_fn_refs(
                 })
                 .collect();
             (span.clone(), refs)
+        })
+        .collect();
+
+    // Plan B Task 55 (Phase 4g) — per-handle return-arm FuncRef
+    // (when present). Built from `handler_return_arm_indices` (one
+    // entry per handle that has a return arm).
+    let handler_return_arm_refs_per_handle: BTreeMap<Span, FuncRef> = ctx
+        .handler_return_arm_indices
+        .iter()
+        .map(|(span, &idx)| {
+            let func_ref = module
+                .declare_func_in_func(ctx.handler_return_arm_synth[idx].func_id, builder.func);
+            (span.clone(), func_ref)
         })
         .collect();
 
@@ -8519,6 +9576,7 @@ fn prepare_per_fn_refs(
         handle_push_ref,
         handle_pop_ref,
         handler_frame_set_arm_ref,
+        handler_frame_set_return_ref,
         perform_ref,
         run_loop_ref,
         next_step_done_ref,
@@ -8526,6 +9584,7 @@ fn prepare_per_fn_refs(
         next_step_args_ptr_ref,
         continuation_identity_ref,
         handler_arm_refs_per_handle,
+        handler_return_arm_refs_per_handle,
         user_fn_refs,
         lit_gvs,
         div_zero_gv,
@@ -9821,6 +10880,7 @@ mod tests {
             effect_ids: std::collections::BTreeMap::new(),
             op_ids: std::collections::BTreeMap::new(),
             handle_arm_captures: std::collections::BTreeMap::new(),
+            handle_return_arm_captures: std::collections::BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
         let mono = MonoProgram { anf };
@@ -9894,6 +10954,7 @@ mod tests {
             effect_ids: std::collections::BTreeMap::new(),
             op_ids: std::collections::BTreeMap::new(),
             handle_arm_captures: std::collections::BTreeMap::new(),
+            handle_return_arm_captures: std::collections::BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
         let mono = MonoProgram { anf };

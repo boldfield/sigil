@@ -391,6 +391,25 @@ pub struct CheckedProgram {
     /// explicitly so codegen can pass `null` as the arm's closure_ptr
     /// (no allocation needed) without re-deriving emptiness.
     pub handle_arm_captures: BTreeMap<Span, Vec<Vec<(String, Ty)>>>,
+
+    /// Plan B Task 55 (Phase 4g) — per-`Expr::Handle` return-arm
+    /// captures, parallel to `handle_arm_captures` but a single Vec
+    /// (not Vec-of-Vec) since each handle has at most one return arm.
+    /// `None` (key absent) means the handle has no return arm; an
+    /// empty Vec means a return arm with no outer-scope captures
+    /// (codegen passes null `closure_ptr` to
+    /// `sigil_handler_frame_set_return`); a non-empty Vec records the
+    /// names + types in arm-local slot order matching the rewritten
+    /// arm body's `Expr::ClosureEnvLoad { index }` references.
+    ///
+    /// Mirrors the Phase 4d capture-collection convention (see
+    /// `handle_arm_captures` doc): collected against the saved env
+    /// (the surrounding fn's lexical scope at the handle expression,
+    /// before the return-arm `v` binding installs); top-level fn /
+    /// ctor / builtin names that resolve outside the env are NOT
+    /// captures (codegen resolves them through the user-fn / ctor /
+    /// builtin tables).
+    pub handle_return_arm_captures: BTreeMap<Span, Vec<(String, Ty)>>,
 }
 
 /// Where a constructor is registered. Indexes a `TypeDecl` in the
@@ -556,6 +575,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         effects,
         handler_scopes: Vec::new(),
         handle_arm_captures: BTreeMap::new(),
+        handle_return_arm_captures: BTreeMap::new(),
     };
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
@@ -821,6 +841,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             effect_ids,
             op_ids,
             handle_arm_captures: tc.handle_arm_captures,
+            handle_return_arm_captures: tc.handle_return_arm_captures,
         },
         tc.errors,
     )
@@ -997,6 +1018,17 @@ struct Tc {
     /// surrounding fn would observe at the handle expression's
     /// position.
     handle_arm_captures: BTreeMap<Span, Vec<Vec<(String, Ty)>>>,
+    /// Plan B Task 55 (Phase 4g) — per-handle return-arm captures
+    /// (parallel to `handle_arm_captures`; each handle has at most
+    /// one return arm so this is a flat `Vec<(String, Ty)>`, not a
+    /// `Vec<Vec<...>>`). Populated during `check_handle`'s return-
+    /// arm walk against the saved env (the surrounding fn's lexical
+    /// scope at the handle expression, before the return-arm `v`
+    /// binding installs). Codegen reads this via
+    /// `CheckedProgram::handle_return_arm_captures` to allocate the
+    /// closure record passed as `closure_ptr` to
+    /// `sigil_handler_frame_set_return`.
+    handle_return_arm_captures: BTreeMap<Span, Vec<(String, Ty)>>,
 }
 
 /// Plan B task 54 — one handler's effect-instantiation cache.
@@ -3037,6 +3069,45 @@ impl Tc {
                     .clone()
                     .unwrap_or_else(|| Ty::Var(self.fresh_ty_var()));
                 let saved_env = self.env.clone();
+
+                // Plan B Task 55 (Phase 4g): collect this return arm
+                // body's free-variable captures *before* installing
+                // the `v` binding, so an `Ident` referencing `v`
+                // doesn't get mis-classified as a capture. Mirrors
+                // the Phase 4d op-arm capture collection at
+                // `handle_arm_caps_accum.push(arm_captures)` below.
+                // Names that resolve to top-level fns / ctors /
+                // builtins (not in `saved_env`) pass through; codegen
+                // resolves those via the user-fn / ctor / builtin
+                // tables, not via closure env.
+                let outer_names: std::collections::BTreeSet<String> =
+                    saved_env.keys().cloned().collect();
+                let mut binding_set: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                binding_set.insert(ra.binding.clone());
+                let mut capture_names: Vec<String> = Vec::new();
+                collect_free_vars(&ra.body, &outer_names, &binding_set, &mut capture_names);
+                // Filter to names actually in `saved_env` (the
+                // surrounding fn's lexical scope at the handle
+                // expression). Mirrors the Phase 4d op-arm filter
+                // (`capture_names.retain(|n| saved_env.contains_key(n))`).
+                capture_names.retain(|n| saved_env.contains_key(n));
+                let ra_captures: Vec<(String, Ty)> = capture_names
+                    .into_iter()
+                    .map(|name| {
+                        let ty = saved_env.get(&name).cloned().unwrap_or_else(|| {
+                            unreachable!(
+                                "typecheck Phase 4g: retained return-arm capture \
+                                 `{name}` must be in saved_env (filtered above by \
+                                 `saved_env.contains_key`)"
+                            )
+                        });
+                        (name, self.deref(&ty))
+                    })
+                    .collect();
+                self.handle_return_arm_captures
+                    .insert(handle_span.clone(), ra_captures);
+
                 // Direct insert (not env_insert): the return-arm
                 // binding is a fresh inner scope and may shadow an
                 // outer name. The env_insert debug-assert exists for
@@ -6655,6 +6726,7 @@ mod tests {
             effects: BTreeMap::new(),
             handler_scopes: Vec::new(),
             handle_arm_captures: BTreeMap::new(),
+            handle_return_arm_captures: BTreeMap::new(),
         }
     }
 
