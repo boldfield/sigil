@@ -298,9 +298,24 @@ fn stackmap_section_parses_v0_placeholder() {
         panic!("stackmap parse failed: {e:?}");
     });
     assert_eq!(parsed.version, STACKMAP_VERSION_PLACEHOLDER);
-    // hello.sigil's main body hits four call sites: gc_init, user_main,
-    // sigil_string_new, sigil_println.
-    assert_eq!(parsed.records.len(), 4, "expected 4 placeholder records");
+    // Plan B Task 57 — hello.sigil's compile produces 9 placeholder
+    // stackmap records:
+    //   - 6 in the `main` C shim (per `[DEVIATION Task 57] Top-level
+    //     handler installation in main shim`):
+    //       sigil_gc_init, sigil_handler_frame_new, sigil_handler_-
+    //       frame_set_arm, sigil_handle_push, sigil_user_main,
+    //       sigil_handle_pop.
+    //   - 3 in the user `main` body emitting `perform IO.println(
+    //     "Hello, world!")`:
+    //       sigil_string_new (the literal), sigil_perform (the
+    //       perform), sigil_run_loop (the trampoline driver in
+    //       lower_perform_to_value).
+    //
+    // Pre-Task-57 (synchronous IO shortcut) this number was 4 —
+    // gc_init + user_main + sigil_string_new + sigil_println — but
+    // the IO frame push/pop in the shim and the perform → run_loop
+    // path in user code added 5 net call sites.
+    assert_eq!(parsed.records.len(), 9, "expected 9 placeholder records");
     for r in &parsed.records {
         assert_eq!(r.live_count, 0, "v0 invariant: live_count always 0");
         assert_eq!(
