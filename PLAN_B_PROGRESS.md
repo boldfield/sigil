@@ -229,9 +229,9 @@ Pending — request human review of row-unification, let-generalization, color i
     | P20 — multi-shot `Choose` all-pairs (a + b == 7) | Multi-shot Choose machinery + multi-perform helper body + N-resume single-arm body | Graded "compiles" only | Future chained-synth-cont extension + Slice C N-chain extension (bundles via shared chained-closure-record discipline; same closure point as Task 60's "3-element Choose combinator" deferral) |
   - **Plan B prompt bank now reaches 20 entries** (P01–P20). Plan C's `scripts/validate-spec.sh` becomes runnable for the full bank after Plan B closes; today only P01–P18 + the in-scope subset of P09 / P10 / P17 / P19 / P20 (the "compiles" portion) are gradeable. Future closure points unblock the run portions of P02, P09, P10, P17, P19, P20 in two waves (TypeExpr::Fn lift unblocks P09 / P10 / P17 / P19's run portions; chained-synth-cont + Slice C N-chain unblock P20's run portion).
 - Stage 6 cleanup — `#[ignore]`-test resolutions + Phase 4f / 4g / Task 57 cleanup chores
-  - status: done-pending-ci
-  - commits: [b818584, f99f42d, b9ed6f7, 5c00eb0, fd321d2, 23d61d3, HEAD]
-  - notes: PR `plan-b-stage-6-cleanup` off `main` at `93d0777` per per-phase-PR cadence convention. Ships before the Stage 6 review checkpoint to retire deferred items pinned across [DEVIATION Task 55] Phase 4f / Phase 4g, [DEVIATION Task 57], and the three `#[ignore]`'d e2e tests so the review checkpoint reads against a clean post-task-61 state. **8 of 9 cleanup items shipped; Phase 4f scope_id deferred with documentation** (see closure-point reframing below). 7 commits squash-merged:
+  - status: done (squash-merged at `59f4c7e` on 2026-04-28 as PR #35)
+  - commits: [b818584, f99f42d, b9ed6f7, 5c00eb0, fd321d2, 23d61d3, 2d6de05, 4fbaaf2, b3539c1, squash → 59f4c7e]
+  - notes: PR `plan-b-stage-6-cleanup` off `main` at `93d0777` per per-phase-PR cadence convention. Ships before the Stage 6 review checkpoint to retire deferred items pinned across [DEVIATION Task 55] Phase 4f / Phase 4g, [DEVIATION Task 57], and the three `#[ignore]`'d e2e tests so the review checkpoint reads against a clean post-task-61 state. **8 of 9 cleanup items shipped; Phase 4f scope_id deferred with documentation** (see closure-point reframing below). 9 commits squash-merged (foundation → 5 cleanup commits → closeout → CI fix → final review fixups):
     - **Foundation** (`b818584`) — Task 61 squash-hash flip (`done-pending-ci` → `done` at `93d0777` on 2026-04-28) + `[Stage 6 cleanup]` deviation entry. No source changes.
     - **A.1 E0142** (`f99f42d`) — typecheck partial-handler exhaustiveness (option 2 from `[DEVIATION Task 55] Phase 4f`). New Phase 1.5 in `Tc::check_handle` rejects partial coverage of multi-op effects with E0142 naming the unhandled op(s). Inverted `partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution` to `partial_handler_of_multi_op_effect_rejected_with_e0142`. 4 new typecheck unit tests cover the exhaustiveness surface.
     - **A.3 binding_ty** (`b9ed6f7`) — Phase 4g return-arm `binding_ty = I64` hardcode resolved via typecheck side-table `CheckedProgram::handle_body_ty: BTreeMap<Span, Ty>`. Codegen pre-pass reads it via new `cranelift_ty_of_ty(ty, pointer_ty)` free fn; synth fn binds `v` at the correct narrow type. Inverted `handle_with_bool_body_and_return_arm_uses_v_pending_proper_binding_ty` to `handle_with_bool_body_and_return_arm_uses_v_at_narrow_type`.
@@ -255,4 +255,21 @@ Pending — request human review of row-unification, let-generalization, color i
 
 ### Stage 6 review checkpoint
 
-Pending — request human review of linearity, handler stack semantics, multi-shot correctness, IO refactor, arena correctness, color decisions before declaring Plan B complete.
+**Complete — 2026-04-28.** Human review of the cumulative Stage 6 surface (Tasks 53–61 + Stage 6 cleanup) signed off. Coverage of the plan-defined review items:
+
+- **One-shot linearity check (E0220):** verified accepts legitimate one-shot uses and rejects multi-use paths. Closed at Task 54.
+- **Handler stack walk and capture semantics:** verified across Phase 4d / 4e / 4e captures+ / 4f / 4g; pinned by 78+ e2e tests.
+- **Multi-shot correctness under nested handlers:** verified via `slice_c_choose_multi_shot_*` tests + `multishot_stress.sigil` (5 fresh frames × 2 resumes each, closed-form Σ = 1530).
+- **IO shortcut fully refactored away:** Plan A1 IO synchronous shortcut deleted at Task 57; Stage 6 cleanup A.2 lifted the residual color filter retention so user discard-`k` IO handlers now unwind helpers at the perform site (matches non-IO algebraic semantics).
+- **Arena allocator correctness under stress:** verified via `arena_escape_count_is_zero_below_one_percent_ceiling` (escape rate = 0% on the multi-shot driver, well under the plan's 1% ceiling).
+- **Selective CPS color decisions:** verified by 37 color unit tests + `--dump-color` against canonical examples; Stage 6 cleanup tightened the colorer's IO classification to match non-IO uniformly.
+
+Plan B is **done**. The plan file moves from `/repos/designs/in-progress/2026-04-21-sigil-effects.md` to `/repos/designs/done/`.
+
+## Plan B summary
+
+- **9 numbered Stage 6 tasks shipped** (Tasks 53–61) across 13 PRs (#22 Task 55 Phase 3a → #35 Stage 6 cleanup).
+- **Stage 5 Tasks 47–52 shipped** earlier in Plan B (parametric polymorphism + monomorphization + color inference).
+- **Prompt bank reaches 20/20 entries** (P01–P20) in `spec/validation-prompts.md`. 14 of 20 graded end-to-end today; 6 deferred to "compiles only" pending future architectural lifts (B.1 / B.2 / B.3 / B.4 — see closure points in `PLAN_B_DEVIATIONS.md`).
+- **Stage 6 cleanup PR #35** retired 8 of 9 deferred items (`#[ignore]`'d e2e test inversions, Phase 4f / 4g cleanup chores, Task 57 codegen cleanup, IO color filter lift closing the residual discard-`k` correctness gap from Task 57).
+- **Deferred to Plan C foundation work** (closure points pinned in deviation entries): Slice C N-chain extension, chained-synth-cont extension, TypeExpr::Fn lift, arm-body-lambda lift, scope_id per-frame field. These ship as Plan C tasks where the scope is appropriate; Plan B's "Do not implement Stage 7+ features. Do not start Plan C." rule is honored.
