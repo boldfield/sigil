@@ -690,6 +690,57 @@ fn state_example_dual_handle_returns_6_then_99() {
     );
 }
 
+/// Plan B Task 59 — `examples/choose.sigil` exercises the canonical
+/// Slice C v1 2-resume multi-shot Choose pattern, framed as a binary
+/// outcome enumerator. Confirms that:
+///
+/// - `effect Choose resumes: many { flip: () -> Bool }` parses +
+///   typechecks; the `resumes: many` annotation enables the multi-shot
+///   path through `arm_body_multi_let_then_pure_tail_shape`'s
+///   resumes-many gate (one-shot effects are walker-rejected on the
+///   2-let arm shape per `slice_c_multi_let_arm_body_with_resumes_one
+///   _effect_is_rejected_at_codegen`);
+/// - helper's `LetBindThenTail` body with a Bool binding (`let b: Bool
+///   = perform Choose.flip(); if b { 1 } else { 2 }`) lowers via the
+///   captures-free synth-cont path with binding_ty=I8 narrowed back
+///   from the I64 args_ptr[0] read (per existing precedent
+///   `slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_-
+///   args` at compiler/tests/e2e.rs:3649);
+/// - the 2-step lambda-lifted post-arm-k chain runs end-to-end:
+///   k(true) → synth-cont with b=true → tail returns 1 → post_arm_k_1
+///   reads r1=1 → k(false) → synth-cont with b=false → tail returns 2
+///   → post_arm_k_2 reads r2=2, reads r1=1 from closure record,
+///   returns r1+r2=3;
+/// - the SAME heap-reified k_closure record is invoked twice (multi-
+///   shot capability of `resumes: many`); cross-resume independence
+///   is asserted by the closed-form expected output 3.
+///
+/// Invariant: stdout = "3\n", stderr = "", exit 0.
+///
+/// **Pair-generator framing rationale**: see `[DEVIATION Task 59]` in
+/// `boldfield/designs/PLAN_B_DEVIATIONS.md`. The literal Cartesian-
+/// product two-flip pair generator (with 4 outcomes: (T,T)/(T,F)/
+/// (F,T)/(F,F)) requires both the chained-synth-cont extension
+/// (multi-perform helper bodies) and the Slice C N-chain extension —
+/// both Plan-C-or-later territory. v1's "pair" is the (r1, r2) tuple
+/// at the arm-level resume-result space, summed for stdout.
+#[test]
+fn choose_example_dual_resume_returns_3() {
+    let root = workspace_root();
+    let source = root.join("examples/choose.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "choose_example");
+    assert_eq!(code, 0, "choose exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3\n",
+        "choose stdout mismatch (expected r1=1 from k(true) + r2=2 from \
+         k(false) = 3); stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "choose should not abort or warn; stderr should be empty"
+    );
+}
+
 /// Plan A2 task 32: a top-level user fn is direct-called from `main`.
 /// Every user fn takes a closure_ptr as its first Cranelift argument
 /// (always null for direct calls to a top-level fn with no captured

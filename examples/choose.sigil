@@ -1,0 +1,94 @@
+// examples/choose.sigil
+//
+// Plan B Task 59 — multi-shot Choose: a binary outcome enumerator
+// where the handler invokes the captured continuation `k` twice (once
+// with `true`, once with `false`) and combines both branches' results
+// at the arm level.
+//
+// **Why "binary outcome enumerator" instead of literal "two-flip pair
+// generator".** A literal pair generator would have `helper()` perform
+// `Choose.flip()` twice (once per pair member) and the multi-shot
+// handler would enumerate all 2×2 = 4 combinations. That helper-body
+// shape requires the chained-synth-cont extension named at
+// codegen.rs:10289 as a future widening of `is_simple_let_yield_then_-
+// pure_tail_body`'s "exactly one let stmt" cap (which v1 caps at
+// exactly one perform per helper). So v1 helper bodies have one
+// perform; the multi-shot semantic surface is exercised at the ARM
+// level via the canonical Slice C v1 2-let shape (PR #27 captures+).
+// See `[DEVIATION Task 59]` in `boldfield/designs/PLAN_B_DEVIATIONS.md`
+// for the architectural framing — the "pair" v1 ships is the
+// (true_outcome, false_outcome) tuple at the resume-result level.
+//
+// **Structure.** `effect Choose resumes: many { flip: () -> Bool }`;
+// helper performs `Choose.flip()` once with body
+//
+//   `let b: Bool = perform Choose.flip(); if b { 1 } else { 2 }`
+//
+// — the captures-free `LetBindThenTail` shape with a Bool binding
+// (binding_ty narrowed back from I64 in the synth-cont per existing
+// e2e precedent `slice_c_choose_multi_shot_arm_invokes_k_twice_with
+// _different_args` at compiler/tests/e2e.rs:3649).
+//
+// **Arm body.** Slice C v1 2-resume shape:
+//
+//   `Choose.flip(k) => { let r1: Int = k(true); let r2: Int = k(false);
+//                        r1 + r2 }`
+//
+// Recognised by `arm_body_multi_let_then_pure_tail_shape`. The arm fn
+// emits the 2-step lambda-lifted post-arm-k chain (per `[DEVIATION
+// Task 55] Phase 4e captures+`):
+//
+//   - `k(true)` packs `Call(k_closure, k_fn, [true, post_arm_k_1_-
+//     closure, post_arm_k_1_fn])` with the heap-reified k_closure
+//     record allocated at the handle expression's lowering site.
+//   - helper synth-cont reads `b=true`, computes the tail
+//     (`if b { 1 } else { 2 }` → 1), dispatches `Call(post_arm_k_1, [1])`.
+//   - post_arm_k_1 reads r1=1, reads (k_closure, k_fn) from its
+//     closure_ptr (Slice C v1: post_arm_k_1's closure record captures
+//     only (k_closure, k_fn); user op-args from the parent arm fn are
+//     NOT threaded — see `[DEVIATION Task 58]` for the latent gap),
+//     allocates post_arm_k_2's closure with r1=1, packs
+//     `Call(k_closure, k_fn, [false, post_arm_k_2_closure,
+//     post_arm_k_2_fn])`.
+//   - helper synth-cont reads `b=false`, computes 2, dispatches
+//     `Call(post_arm_k_2, [2])`.
+//   - post_arm_k_2 reads r2=2, reads r1=1 from closure_ptr, computes
+//     `r1 + r2` = 3, returns Done(3).
+//
+// **Independence.** Both `k(true)` and `k(false)` invocations drive
+// the SAME heap-reified k_closure record (the multi-shot capability
+// of `resumes: many`); each invocation produces an independent
+// helper synth-cont dispatch with the boolean argument bound to the
+// `b` let-binding. Cross-resume independence is asserted via the
+// closed-form expected output: arm sums to 1 + 2 = 3 unconditionally.
+// Any cross-resume leak (e.g., r2 reading the wrong closure slot)
+// would diverge the sum.
+//
+// **The "pair generator" framing.** The (r1, r2) tuple at the arm
+// level IS the binary pair: r1 is the true-branch outcome, r2 the
+// false-branch outcome. Summing them collapses the pair into a single
+// Int for stdout printing. A literal Cartesian-product two-flip pair
+// generator (with 4 outcomes: (T,T)/(T,F)/(F,T)/(F,F)) is the future
+// chained-synth-cont + Slice C N-chain ship; v1 demonstrates the
+// 2-outcome pair at the canonical surface.
+//
+// Invariant: stdout reads `3\n` and the program exits 0.
+
+effect Choose resumes: many { flip: () -> Bool }
+
+fn outcome() -> Int ![Choose, IO] {
+  let b: Bool = perform Choose.flip();
+  if b { 1 } else { 2 }
+}
+
+fn main() -> Int ![IO] {
+  let total: Int = handle outcome() with {
+    Choose.flip(k) => {
+      let r1: Int = k(true);
+      let r2: Int = k(false);
+      r1 + r2
+    },
+  };
+  perform IO.println(int_to_string(total));
+  0
+}
