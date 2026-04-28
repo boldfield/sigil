@@ -1,0 +1,93 @@
+// examples/choose_demo.sigil
+//
+// Plan B Task 58 — multi-shot rigor: canonical demonstration of a
+// `resumes: many` continuation invoked twice from a single handler
+// arm. The plan's literal wording is exercised: "a handler invokes
+// `k` twice and collects both results" via the canonical 2-let
+// arm-body shape `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }`
+// recognised by `arm_body_multi_let_then_pure_tail_shape` (codegen.rs).
+//
+// Effect declaration uses the literal Task 58 wording:
+//   `effect Choose resumes: many { choose: (Int) -> Int }`
+// — distinct from the existing Slice C e2e test surface
+// (`Choose resumes: many { flip: () -> Bool }`); this example is
+// the first program to exercise multi-shot dispatch with an
+// `(Int) -> Int` op signature, covering Phase 4b's perform-side
+// args-buffer packing and Phase 4c's arm-side arg unpacking on the
+// pointer-typeless Int width path under the multi-shot trampoline
+// chain.
+//
+// Trace:
+//   - `helper(5)` performs `Choose.choose(5)`; helper's body is the
+//     `LetBindThenTail` shape (`let x: Int = perform Choose.choose(
+//     seed); x`).
+//   - The arm receives `arg = 5` (the perform's user arg packed by
+//     codegen and unpacked by `sigil_handler_arm_<idx>` from
+//     args_ptr[0] at fn entry).
+//   - First `k(arg + 10) = k(15)` drives the helper synth-cont with
+//     x=15; the synth-cont's tail (`x`) returns 15 → r1 = 15.
+//   - Second `k(r1 + 10) = k(25)` drives the SAME helper synth-cont
+//     a second time with x=25 (heap-reified k_closure record reused
+//     per `[DEVIATION Task 55] Phase 4e captures+ Slice C`); returns
+//     25 → r2 = 25.
+//   - Arm returns r1 + r2 = 40 to the handle expression.
+//
+// **Why `arg` does not appear in `arg2_expr`.** Slice C v1's
+// `post_arm_k_1` synth fn captures only `(k_closure, k_fn)` into its
+// TAG_CLOSURE record (line 5480-5485 of `compiler/src/codegen.rs`).
+// User op-args from the parent arm fn are NOT threaded into
+// `post_arm_k_1`'s env, so `arg2_expr` (lowered inside `post_arm_k_1`)
+// cannot reference user op-args. It CAN reference `r1` (the let-1
+// binding, which IS in `post_arm_k_1`'s env at line 6441-6442). This
+// example uses `r1 + 10` for `arg2_expr` — exercising the
+// post_arm_k_1-env-lookup path on the let-1 binding while still
+// producing distinct k inputs (15, 25). The walker rejects
+// `arg2_expr` referencing user op-args with a clean Slice-C-arg2
+// diagnostic (per `slice_c_arg2_referencing_user_op_arg_is_rejected
+// _at_codegen` at compiler/tests/e2e.rs); pre-walker-fix the panic
+// at codegen.rs:7765 was the only signal. Threading user op-args
+// INTO `post_arm_k_1`'s closure record (lifting the restriction
+// rather than diagnosing it) remains future work — see `[DEVIATION
+// Task 58]`'s "Structural fix" sub-section for the closure-point
+// framing.
+//
+// **Independence semantics, source-level vs. runtime.** The two
+// resumes `k(arg + 10)` and `k(r1 + 10)` create a source-level
+// data dependency (r2's input is computed from r1's output), but
+// at runtime the multi-shot dispatch invokes the helper synth-cont
+// independently for each k call: k(15) drives the helper to
+// completion with x=15 → 15, then k(25) drives a SECOND independent
+// dispatch with x=25 → 25. The dependency is in HOW the input is
+// computed, not in whether the dispatches are independent. A future
+// captures-bearing extension PR will lift the constraint and let
+// programs use literal-independent inputs like `k(arg + 20)` for
+// `arg2_expr`.
+//
+// Invariant: stdout reads `40\n` and the program exits 0.
+//
+// See `[DEVIATION Task 58] Multi-shot stress shape` in
+// `boldfield/designs/PLAN_B_DEVIATIONS.md` for the architectural
+// framing (why the literal "10+ resumes within a single arm" stress
+// shape lives in `examples/multishot_stress.sigil` via the v1
+// 5-handle workaround instead, and why the N-chain extension
+// landing inside a single arm is deferred to a future Slice C
+// captures-bearing extension).
+
+effect Choose resumes: many { choose: (Int) -> Int }
+
+fn helper(seed: Int) -> Int ![Choose, IO] {
+  let x: Int = perform Choose.choose(seed);
+  x
+}
+
+fn main() -> Int ![IO] {
+  let total: Int = handle helper(5) with {
+    Choose.choose(arg, k) => {
+      let r1: Int = k(arg + 10);
+      let r2: Int = k(r1 + 10);
+      r1 + r2
+    },
+  };
+  perform IO.println(int_to_string(total));
+  0
+}

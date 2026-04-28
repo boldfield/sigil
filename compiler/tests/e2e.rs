@@ -509,6 +509,102 @@ fn div_recover_example_returns_999() {
     );
 }
 
+/// Plan B Task 58 — `examples/choose_demo.sigil` exercises the
+/// canonical `resumes: many` multi-shot continuation with the
+/// `(Int) -> Int` op signature. Confirms that:
+///
+/// - typecheck accepts `effect Choose resumes: many { choose: (Int)
+///   -> Int }` and the 2-let arm body `{ let r1: Int = k(arg + 10);
+///   let r2: Int = k(arg + 20); r1 + r2 }`;
+/// - codegen's `arm_body_multi_let_then_pure_tail_shape` matches the
+///   arm body, allocates two post-arm-k synth fns per Slice C v1, and
+///   routes the continuation reification through the heap-reified
+///   k_closure path (TAG_CLOSURE record);
+/// - Phase 4b's perform-side args-buffer packing and Phase 4c's
+///   arm-side arg unpacking work end-to-end with an `(Int) -> Int`
+///   op (the existing Slice C e2e tests use `() -> Bool`; this
+///   example is the first multi-shot dispatch with non-zero op arity
+///   on the Int path);
+/// - the same heap-reified k_closure dispatches into the helper
+///   synth-cont twice with different args (15, then 25), each
+///   producing an independent result (15, 25) that combine to 40.
+///
+/// Invariant: stdout = "40\n", stderr = "", exit 0.
+#[test]
+fn choose_demo_example_returns_40() {
+    let root = workspace_root();
+    let source = root.join("examples/choose_demo.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "choose_demo_example");
+    assert_eq!(code, 0, "choose_demo exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "40\n",
+        "choose_demo stdout mismatch (expected k(15)=15 + k(25)=25 = 40); \
+         stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "choose_demo should not abort or warn; stderr should be empty"
+    );
+}
+
+/// Plan B Task 58 — `examples/multishot_stress.sigil` exercises the
+/// v1 multi-shot stress shape: 5 sequential `handle` expressions × 2
+/// resumes per arm = 10 multi-shot k invocations across 5 fresh
+/// handler frames and 5 fresh heap-reified k_closure records, with
+/// 10 distinct `(Int)` inputs. Confirms that:
+///
+/// - the codegen pre-pass allocates per-handle arm FuncIds correctly
+///   when 5 distinct `Expr::Handle` sites occur in a single user fn
+///   (independent FuncId tables per `Span`-keyed `handler_arm_indices`
+///   entry);
+/// - each handle's `sigil_handler_frame_new` + `sigil_handle_push`
+///   path allocates a fresh frame; the runtime's thread-local handler
+///   stack head correctly LIFOs across 5 sequential push/pop cycles
+///   (per Phase 4f machinery);
+/// - the heap-reified k_closure record allocated by Slice C's arm-fn
+///   body emit at the perform site of one handle does NOT leak into
+///   another handle's k invocations (closed-form independence
+///   assertion: any cross-handle leak would diverge the closed-form
+///   sum from 1530);
+/// - the sequential structure of `let h_i = handle ... with { ... }`
+///   in main's body lowers cleanly with each handle expression
+///   driving its own `sigil_run_loop` invocation, returning the
+///   discharged Int to the let-binding before the next handle
+///   begins.
+///
+/// Closed-form expected output (per the example's docstring):
+///   - h_i = 2*i + 300 for i ∈ {1, 2, 3, 4, 5}
+///     → 302, 304, 306, 308, 310
+///   - total = 1530
+///
+/// **Stress-shape rationale** — the literal Task 58 wording calls for
+/// "10+ resumes within a single arm with different inputs"; that
+/// shape requires the Slice C N-chain extension explicitly deferred
+/// from PR #27 (the negative-coverage test
+/// `slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen`
+/// pins the v1 cap at exactly 2 lets). The 5-handles × 2-resumes
+/// workaround exercises a complementary invariant — fresh-frame /
+/// fresh-k_closure independence across multiple handles in one
+/// program — and ships under `[DEVIATION Task 58]`.
+///
+/// Invariant: stdout = "1530\n", stderr = "", exit 0.
+#[test]
+fn multishot_stress_example_returns_1530() {
+    let root = workspace_root();
+    let source = root.join("examples/multishot_stress.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "multishot_stress_example");
+    assert_eq!(code, 0, "multishot_stress exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1530\n",
+        "multishot_stress stdout mismatch (expected closed-form 302+304+306+308+310 \
+         = 1530); stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "multishot_stress should not abort or warn; stderr should be empty"
+    );
+}
+
 /// Plan A2 task 32: a top-level user fn is direct-called from `main`.
 /// Every user fn takes a closure_ptr as its first Cranelift argument
 /// (always null for direct calls to a top-level fn with no captured
@@ -3660,6 +3756,82 @@ fn slice_c_multi_let_arm_body_with_resumes_one_effect_is_rejected_at_codegen() {
          stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen() {
+    // Plan B Task 58 — walker-side check converting an internal-
+    // compiler-error panic into a clean compile diagnostic. Slice C
+    // v1's post_arm_k_1 captures only (k_closure, k_fn) into its
+    // TAG_CLOSURE record (codegen.rs:5480-5485); user op-args from
+    // the parent arm fn are NOT threaded in. Pre-Task-58, an arm
+    // body whose `arg2_expr` referenced a user op-arg compiled
+    // through to the codegen-time panic
+    // `unreachable!("codegen: unknown ident \`arg\`")` at
+    // codegen.rs:7765 (lower_expr's Expr::Ident arm, post_arm_k_1's
+    // env lookup miss). The walker check (codegen.rs:944-994 added
+    // at this PR) reuses the existing Slice B/C tail-free-vars
+    // walker on `arg2_expr` with `extra_bindings = {}` (no
+    // binding_name_2 since it doesn't exist yet at the post_arm_k_1
+    // lowering site) and wraps the diagnostic with arg2-specific
+    // Slice C framing.
+    //
+    // Closure point: future Slice C captures-bearing extension PR
+    // threads user op-args into post_arm_k_1's closure record (and
+    // post_arm_k_2's via inheritance). When that lands, this test
+    // becomes a positive test (or moves to a separate accept-shape
+    // test); the walker check stays in place but the diagnostic's
+    // "deferred to future Slice C captures-bearing extension PR"
+    // wording is updated to "Closed at PR #X".
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(arg + 10);\n      \
+                     let r2: Int = k(arg + 20);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "slice_c_reject_arg2_op_arg_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_c_reject_arg2_op_arg_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: arg2 of multi-let arm references user op-arg `arg` \
+         (Slice C v1 doesn't thread op-args into post_arm_k_1's closure record). \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // Pin the Slice-C-arg2 diagnostic framing (so a future commit
+    // that lifts the restriction inverts this test's diagnostic-
+    // string assertion alongside the success-status one).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Slice C: arg2 of multi-let arm body"),
+        "expected Slice C arg2 framing in diagnostic; stderr={stderr:?}"
     );
 }
 
