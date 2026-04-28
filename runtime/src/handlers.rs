@@ -689,6 +689,12 @@ pub unsafe extern "C" fn sigil_io_println_arm(
     // heap-string pointer the user passed to `IO.println`; slots 1..3
     // are the trailing-pair continuation.
     let heap_ptr = *in_args as *const u8;
+    debug_assert!(
+        !heap_ptr.is_null(),
+        "sigil_io_println_arm: heap_ptr (in_args[0]) must be non-null \
+         (caller's `lower_perform_to_value` lowered a String arg, which \
+         flows through `sigil_string_new` returning a non-null heap header)"
+    );
     let k_closure = *in_args.add(1) as *mut u8;
     let k_fn = *in_args.add(2) as *mut u8;
     crate::io::sigil_println(heap_ptr);

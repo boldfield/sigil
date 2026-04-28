@@ -9852,18 +9852,19 @@ fn is_simple_tail_perform_with_pure_args_body(body: &crate::ast::Block) -> bool 
     match &body.tail {
         Some(crate::ast::Expr::Perform(p)) => {
             // Plan B Task 57 — IO performs are excluded from the
-            // CPS-color classifier as a perf-preserving choice. Post-
-            // Task-57 every effect routes through `sigil_perform`,
-            // but `lower_perform_to_value` wraps `sigil_perform` +
-            // `sigil_run_loop` synchronously for Native-color
-            // callers — so IO-only fns can stay Native-color
-            // without correctness loss (the top-level IO handler
-            // installed at the `main` shim is always on the stack
-            // when user code runs). Lifting this filter would
-            // promote IO-only fns into the CPS-ABI, which adds
-            // trampoline overhead on every println for no semantic
-            // benefit. The filter stays.
-            if p.effect == "IO" {
+            // CPS-color classifier as a perf-preserving choice; see
+            // `[DEVIATION Task 57] IO color filter retention` in
+            // `PLAN_B_DEVIATIONS.md` for the rationale, the load-
+            // bearing shim invariant (top-level IO handler always
+            // installed), and the residual correctness gap (user
+            // discard-`k` IO handlers don't unwind Native-color
+            // helpers — pinned by `#[ignore]`'d e2e
+            // `user_discard_k_io_handler_does_not_unwind_native_-
+            // color_helper_pending_color_filter_lift`). The filter
+            // references `color::NATIVE_EFFECT` rather than the
+            // literal `"IO"` so a future builtin rename would update
+            // both sites in one place.
+            if p.effect == crate::color::NATIVE_EFFECT {
                 return false;
             }
             p.args.iter().all(expr_is_pure)
@@ -10031,16 +10032,13 @@ fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
         return false;
     }
     // Plan B Task 57 — IO performs are excluded from this CPS-color
-    // classifier (same rationale as `is_simple_tail_perform_with_-
-    // pure_args_body`'s IO filter): IO-only fns stay Native-color
-    // post-Task-57 because the top-level IO handler at the `main`
-    // shim is always installed and `lower_perform_to_value`'s
-    // synchronous wrapping preserves the perf characteristics of the
-    // pre-refactor IO shortcut. The filter is perf-preserving, not
-    // correctness-bearing; lifting it would only add trampoline
-    // overhead on synchronous-Unit IO performs.
+    // classifier (same rationale + same residual correctness gap as
+    // `is_simple_tail_perform_with_pure_args_body`'s IO filter; see
+    // `[DEVIATION Task 57] IO color filter retention`). Filter
+    // references `color::NATIVE_EFFECT` to keep the builtin-name
+    // source-of-truth in one place.
     let yield_perform = match &body.stmts[0] {
-        Stmt::Perform(p) if p.effect != "IO" => p,
+        Stmt::Perform(p) if p.effect != crate::color::NATIVE_EFFECT => p,
         _ => return false,
     };
     if !yield_perform.args.iter().all(expr_is_pure) {
@@ -10127,12 +10125,13 @@ fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
         _ => return false,
     };
     // Plan B Task 57 — IO performs excluded for the same perf-
-    // preserving reason documented at `is_simple_tail_perform_with_-
-    // pure_args_body`: IO-only fns stay Native-color, the top-level
-    // IO handler at the shim handles the println synchronously via
-    // `lower_perform_to_value`'s wrapping, no trampoline overhead.
+    // preserving reason + same residual correctness gap documented
+    // at `is_simple_tail_perform_with_pure_args_body` and
+    // `[DEVIATION Task 57] IO color filter retention`. Filter
+    // references `color::NATIVE_EFFECT` for one-place builtin-name
+    // source-of-truth.
     let yield_perform = match &let_stmt.value {
-        Expr::Perform(p) if p.effect != "IO" => p,
+        Expr::Perform(p) if p.effect != crate::color::NATIVE_EFFECT => p,
         _ => return false,
     };
     if !yield_perform.args.iter().all(expr_is_pure) {

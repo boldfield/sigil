@@ -131,14 +131,35 @@ impl ColoredProgram {
 /// Plan B v1. Post-Task-57, IO is a normal registry-driven effect
 /// at typecheck and codegen — it routes through `sigil_perform`
 /// like every other effect — but the colorer keeps it special-cased
-/// here as a perf-preserving choice: the top-level IO handler is
-/// always installed by the `main` shim, and `lower_perform_to_value`
-/// wraps `sigil_perform` synchronously, so IO-only fns can stay
-/// Native-color without correctness loss. Lifting this constant
-/// would force every fn doing `perform IO.println(...)` into the
-/// CPS-ABI with trampoline overhead per println call. Anything else
-/// in the row makes the monomorph CPS.
-const NATIVE_EFFECT: &str = "IO";
+/// here as a **perf-preserving choice**: the top-level IO handler
+/// is always installed by the `main` shim, and `lower_perform_to_-
+/// value` wraps `sigil_perform` synchronously, so IO-only fns can
+/// stay Native-color without paying trampoline overhead per println.
+///
+/// **Residual correctness gap** (per `[DEVIATION Task 57] IO color
+/// filter retention` in `PLAN_B_DEVIATIONS.md`): a user-installed
+/// discard-`k` IO handler does not unwind a Native-color helper fn
+/// — the helper's `sigil_run_loop` synchronously returns Unit from
+/// the discard arm and execution continues past the perform site.
+/// Same hole Phase 4e closed for non-IO performs, deliberately
+/// left open here for the perf-preserving reason above. Pinned by
+/// `#[ignore]`'d e2e test `user_discard_k_io_handler_does_not_-
+/// unwind_native_color_helper_pending_color_filter_lift`. If this
+/// gap becomes user-visible (e.g. a Plan C IO override pattern
+/// requires algebraic discharge), lifting `NATIVE_EFFECT` and
+/// accepting the trampoline cost is the v2 path.
+///
+/// **Load-bearing invariant:** the top-level IO handler frame is
+/// always on the stack when user code runs (installed by
+/// `compiler/src/codegen.rs`'s `main` shim emit). If the shim
+/// regresses (wrong `effect_id`, missing `set_arm`, frame_new
+/// fails), Native-color fns doing `perform IO.println(...)` would
+/// `sigil_perform` against an unhandled effect and abort at runtime.
+/// `hello.sigil`'s e2e test exercises this end-to-end on every CI
+/// run; any regression in the shim wiring fails there immediately.
+///
+/// Anything else in the row (besides IO) makes the monomorph CPS.
+pub(crate) const NATIVE_EFFECT: &str = "IO";
 
 /// Local (pre-propagation) classification of a single fn.
 #[derive(Clone, Debug)]

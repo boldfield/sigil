@@ -1361,6 +1361,87 @@ fn partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution() {
     assert_eq!(stdout, "20\n", "stdout mismatch; stderr={stderr:?}");
 }
 
+#[ignore = "Residual correctness gap from Slice 1's IO color filter \
+            retention — Native-color helpers do not unwind under \
+            user-installed discard-`k` IO handlers. Pinned per \
+            `[DEVIATION Task 57] IO color filter retention` in \
+            `PLAN_B_DEVIATIONS.md`; same structural hole Phase 4e \
+            closed for non-IO performs, deliberately left open here \
+            for the perf-preserving reason. Test asserts the future-\
+            correct (filter-lifted) behaviour. v2 task lifts \
+            `color::NATIVE_EFFECT` and the three codegen classifier \
+            filters, then un-ignores this test."]
+#[test]
+fn user_discard_k_io_handler_does_not_unwind_native_color_helper_pending_color_filter_lift() {
+    // Plan B Task 57 — pinning test for the residual correctness
+    // gap from Slice 1's IO color filter retention. Mirrors the
+    // `discard_k_handler_does_not_abort_helper_phase_4e_pending`
+    // (Phase 4d MVP) and `partial_handler_of_multi_op_effect_-
+    // aborts_at_runtime_pending_resolution` (Phase 4f) precedents:
+    // the test asserts the future-correct behaviour and is
+    // `#[ignore]`'d while the gap exists, so it stays grep-findable
+    // through the eventual fix.
+    //
+    // **The gap:** the colorer (`compiler/src/color.rs::NATIVE_EFFECT
+    // = "IO"`) and three parallel codegen-classifier filters keep
+    // IO-only fns Native-color. A user-installed discard-`k` IO
+    // handler intercepts the perform, but the Native-color helper's
+    // `lower_perform_to_value` synchronously calls `sigil_run_loop`,
+    // which returns Unit from the discard arm; helper continues to
+    // its post-perform code. Standard algebraic semantics expect
+    // helper to unwind at the perform site (the arm discharged `k`,
+    // so the perform never resumes).
+    //
+    // **Concrete failure:**
+    //   - helper performs IO.println once, then returns 1.
+    //   - User handler `IO.println(s, k) => 0` discards k.
+    //   - Slice 1: helper's perform returns Unit synchronously,
+    //     helper continues, returns 1. handle expression = 1.
+    //     Stdout = "1\n".
+    //   - v2 (filter lifted): helper is CPS-color, the perform
+    //     yields to the trampoline, arm returns Done(0), trampoline
+    //     observes Done. handle expression = 0 (arm body's value).
+    //     helper does NOT continue past the perform. Stdout = "0\n".
+    //
+    // The assertion below is the **future-correct (v2)** value;
+    // pre-fix the actual stdout is "1\n".
+    //
+    // **Future resolution:**
+    //
+    // - Lift `color::NATIVE_EFFECT` (drop the constant; replace its
+    //   single use with a row-membership check that includes IO).
+    // - Drop the three codegen classifier filters at
+    //   `is_simple_tail_perform_with_pure_args_body`,
+    //   `is_simple_yield_then_constant_tail_body`,
+    //   `is_simple_let_yield_then_pure_tail_body` (each references
+    //   `color::NATIVE_EFFECT` post-Slice-1, so the source-of-truth
+    //   change is local; the filter call sites become unconditional).
+    // - Un-ignore this test.
+    //
+    // The fix-PR un-ignores + verifies the assertion. No source
+    // edits to this test should be required at fix time.
+    let src = "fn helper() -> Int ![IO] {\n  \
+                 perform IO.println(\"a\");\n  \
+                 1\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   IO.println(s, k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "user_discard_k_io_handler");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Future-correct behaviour: helper unwinds at the perform site,
+    // handle expression's value is the discharger arm's body (`0`).
+    assert_eq!(
+        stdout, "0\n",
+        "expected helper to unwind at the perform site under filter-\
+         lifted v2; got stdout={stdout:?}, stderr={stderr:?}"
+    );
+}
+
 #[test]
 fn statement_form_non_io_perform_inside_handle_compiles_and_runs() {
     // Plan B Task 55 (Phase 3b) — regression for the `Stmt::Perform`

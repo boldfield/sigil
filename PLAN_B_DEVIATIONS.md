@@ -1948,3 +1948,82 @@ The `__intrinsic_sdiv` / `__intrinsic_srem` shape is a new codegen-internal `Bin
 **Implementing commit(s):** Foundation (this commit) + Slice 1 + Slice 2 + Closeout, all squash-merged via PR #30 (or whatever PR number GitHub assigns).
 
 **Closure point:** PR #30 squash-merge closes Task 57. Tasks 58–61 + Stage 6 review checkpoint remain. After Task 57, `IO` is a normal effect routing through `sigil_perform`, `ArithError` is a real algebraic effect with default + override-able handlers, no `sigil_panic_arith_error` call sites remain in codegen, and the Plan A2 user-visible behavior of `examples/div_by_zero.sigil` is preserved.
+
+## 2026-04-28 — [DEVIATION Task 57] IO color filter retention (perf-preserving choice; residual discard-`k` gap)
+
+**Context:** Task 57's IO refactor moves `IO` from a synchronous-shortcut special case to a registry-driven effect at typecheck and codegen — every `perform IO.println(s)` now flows through `sigil_perform` → `sigil_io_println_arm` → `sigil_println` → trampoline → narrow-back to Unit, identical to the runtime path of any non-IO effect.
+
+The Slice 1 implementation **does NOT** lift the colorer's IO-skip filter at `compiler/src/color.rs::NATIVE_EFFECT` and the three parallel codegen-classifier filters (`is_simple_tail_perform_with_pure_args_body`, `is_simple_yield_then_constant_tail_body`, `is_simple_let_yield_then_pure_tail_body`). The filters keep IO out of the CPS-color classification — fns whose only effect is `IO` stay Native-color and pay no trampoline overhead per println.
+
+The original foundation deviation entry's framing of "drop the filters" was aspirational; the Slice 1 commit (`b98c08a`)'s decision to retain them — and the commit message's "without correctness loss" claim — is more nuanced than the foundation entry anticipated. This entry corrects the framing and pins the residual gap.
+
+**Deviation:** Retain IO-skip filters in the colorer + 3 codegen classifiers. The choice is **perf-preserving with a documented residual correctness gap**, not "without correctness loss":
+
+- *Perf preservation:* lifting `NATIVE_EFFECT` would force every fn doing `perform IO.println(...)` to become CPS-color. Trampoline overhead would propagate up the call graph (Native callers of an IO-using callee themselves become CPS-color via the colorer's transitive rule), making every print-bearing fn pay the trampoline cost on every invocation.
+
+- *Residual correctness gap:* a user-installed discard-`k` IO handler does **not** unwind a Native-color helper fn. Concrete failure case:
+
+  ```sigil
+  fn helper() ![IO] {
+    perform IO.println("a");          // discard-k handler in caller
+                                       // would normally unwind here
+    let x = expensive_computation();   // ... but this still runs
+    perform IO.println("b");          // ... and so does this
+  }
+
+  fn main() ![IO] {
+    handle helper() with {
+      IO.println(s, k) => Unit       // discards k
+    };
+  }
+  ```
+
+  Under standard algebraic-effects semantics, after the first perform fires inside `helper`, the discharging arm in `main` runs, returns Unit, and `helper` does NOT continue past the perform. Phase 4e closed exactly this gap for non-IO performs by reclassifying helpers whose performs reach a discharging handler as CPS-color, so the discard propagates as a `NextStep::Done` that unwinds through the trampoline. The IO filter retains the Native-color synchronous shape for `helper`: `lower_perform_to_value`'s `sigil_run_loop` returns Unit from the discard arm and `helper` continues to `expensive_computation` and the second perform, both of which run despite user intent.
+
+  This is the **same structural hole** Phase 4e closed for non-IO; deliberately left open here for the perf-preserving reason above.
+
+**Load-bearing invariant:** the top-level IO handler frame is always on the stack when user code runs (installed by `compiler/src/codegen.rs`'s `main` shim emit between `sigil_gc_init` and `call sigil_user_main`). If the shim regresses (wrong `effect_id`, missing `set_arm`, frame_new fails), Native-color fns doing `perform IO.println(...)` would `sigil_perform` against an unhandled effect and abort at runtime. `examples/hello.sigil`'s e2e test exercises this end-to-end on every CI run; any shim-wiring regression fails there immediately. The `builtin_effects_present_in_every_program` typecheck unit test pins `IO = 1` against the registry for the source-of-truth side; the shim's hardcoded `effect_id = 1` for the IO frame matches.
+
+**Rationale:** Three reasons:
+
+1. **Perf cost is real and viral.** Even programs with rare prints would pay the trampoline cost on every invocation of any fn in their call tree that prints. The trampoline overhead Phase 4e accepted for non-IO performs is justified by algebraic-correctness for user-installed handlers; for IO, the canonical use case is `println` flowing to stdout, not user-installed handlers. Preserving the synchronous shape for the canonical case is the right perf trade-off until concrete user demand appears for algebraic IO.
+
+2. **Residual gap is bounded and documented.** The gap fires only when a user installs a discard-`k` IO handler and expects it to unwind a Native-color helper. Under v1, no such pattern is canonical — the IO effect is overwhelmingly used to call `println` on the default top-level handler. A user who genuinely wants algebraic IO can wrap their helpers in `![IO | e]` rows that include a non-IO effect to force CPS-color reclassification, or wait for the v2 path below.
+
+3. **v2 path is clean.** Lifting `NATIVE_EFFECT = "IO"` (one constant; the three codegen classifier filters reference it) reclassifies every IO-using fn as CPS-color. Existing programs continue to work — IO performs route through the same `sigil_perform` machinery either way; the v1-vs-v2 difference is whether the surrounding fn synchronously calls `lower_perform_to_value` or returns `NextStep::Call` to its caller's trampoline. The pinning test (`user_discard_k_io_handler_does_not_unwind_native_color_helper_pending_color_filter_lift`) inverts to a positive test (asserting only "a" is printed) when `NATIVE_EFFECT` is removed and the codegen filters are dropped.
+
+**Reference choice — `NATIVE_EFFECT` over `BUILTIN_EFFECT_NAMES`:** the three codegen classifier filters now reference `color::NATIVE_EFFECT` rather than the literal `"IO"` so a future builtin rename touches one source of truth. The filters' logic — "IO-color performs don't trigger CPS classification" — is semantically about Native-color status, not "is in the builtin set", so the colorer's name is the right reference (per review-2 issue #3).
+
+**Implementing commit(s):** This commit (Slice 1 review fixups). Slice 1's `b98c08a` framing of "without correctness loss" is corrected by this entry's clearer "perf-preserving with residual gap" phrasing.
+
+**Pinning test:** `user_discard_k_io_handler_does_not_unwind_native_color_helper_pending_color_filter_lift` (`#[ignore]`'d e2e). Inverts to a positive test asserting only `"a"` is printed when the IO filters are lifted. Mirrors the `discard_k_handler_does_not_abort_helper_phase_4e_pending` precedent (Phase 4d MVP) and `partial_handler_of_multi_op_effect_aborts_at_runtime_pending_resolution` precedent (Phase 4f).
+
+**Closure point:** v2 task (post-Plan-B; tracked via "v2 IO color filter lift" in the plan's deferred-items list when it lands, or as a separate follow-up PR if user demand surfaces during Plan C). Lifts `NATIVE_EFFECT = "IO"`, drops the three codegen classifier filters, un-ignores the pinning test. The change is local: typecheck + codegen + runtime are all already uniform.
+
+## 2026-04-28 — [DEVIATION Task 57] Slice 2 shim-snapshot rename (pre-flag for review)
+
+**Context:** Slice 1's `main` shim emit installs a single top-level IO handler frame (effect_id = 1) and snapshots `io_frame_ptr` for the discipline-check trap (debug-only, mirrors Phase 4f's `Expr::Handle`-exit check shape). The single pop verifies against the snapshot.
+
+Slice 2 will add the ArithError handler frame **before** the IO frame in install order:
+
+```
+push arith_frame   ← first-pushed; gets the discipline trap
+push io_frame
+... user_main ...
+pop → io_frame      (verify == io_frame_ptr — local sanity check)
+pop → arith_frame   (verify == arith_frame_snapshot — discipline trap)
+```
+
+**Pre-flag:** Slice 2's shim emit MUST move the `frame_snapshot` capture from `io_frame_ptr` (Slice 1) to `arith_frame_ptr` (first-pushed in the LIFO order). The discipline trap fires at the **second** pop (after both frames have been removed from the stack). The first pop gets a local sanity check (`popped_io == io_frame_ptr`) since drift between push order and the LIFO assumption would surface even before the trap site fires.
+
+**Why this matters:** under LIFO, the first-pushed frame is last-popped, and the discipline check's whole point is to catch a runtime corruption / shim emit regression where push/pop pairs drift. The check must verify the longest-lived frame's identity at unwind. Slice 2's review should specifically verify:
+
+1. The `frame_snapshot` Cranelift `Value` captures `arith_frame_ptr` (the first `frame_new`'s result), not `io_frame_ptr`.
+2. The trap site is after the second pop (the ArithError pop), not the first.
+3. The IO pop has its own sanity check (`popped_io == io_frame_ptr`) for the LIFO assumption.
+
+**Why pre-flag rather than land alongside Slice 2:** the failure mode (a partial Slice 2 implementation that retains the Slice 1 snapshot variable) is silent in release builds (the trap is debug-gated) and easy to miss at review. Pre-flagging in this entry forces the Slice 2 reviewer's attention to the rename without requiring them to remember it from Slice 1's shim deviation entry.
+
+**Implementing commit(s):** Slice 2 (ArithError refactor) on `plan-b-task-57`. This entry's purpose is documentary — the actual rename happens in that commit.
+
+**Closure point:** When Slice 2 lands and the discipline check correctly verifies the ArithError frame's identity at the second pop. If Slice 2 fails to rename, this entry's bullet list provides the diff a fixup commit would land.
