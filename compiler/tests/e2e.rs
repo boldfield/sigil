@@ -1922,18 +1922,19 @@ fn partial_handler_of_multi_op_effect_rejected_with_e0142() {
     );
 }
 
-#[ignore = "Residual correctness gap from Slice 1's IO color filter \
-            retention — Native-color helpers do not unwind under \
-            user-installed discard-`k` IO handlers. Pinned per \
-            `[DEVIATION Task 57] IO color filter retention` in \
-            `PLAN_B_DEVIATIONS.md`; same structural hole Phase 4e \
-            closed for non-IO performs, deliberately left open here \
-            for the perf-preserving reason. Test asserts the future-\
-            correct (filter-lifted) behaviour. v2 task lifts \
-            `color::NATIVE_EFFECT` and the three codegen classifier \
-            filters, then un-ignores this test."]
+/// Plan B Stage 6 cleanup — **un-ignored from the previously
+/// `#[ignore]`'d
+/// `user_discard_k_io_handler_does_not_unwind_native_color_helper_-
+/// pending_color_filter_lift`**. The IO color filter retention
+/// (Task 57's perf-preserving choice) is lifted in Stage 6 cleanup:
+/// `color::NATIVE_EFFECT` deleted, three codegen body-shape
+/// classifier filters dropped, IO performs flow through the
+/// trampoline like any other effect. User-installed discard-`k`
+/// IO handlers now unwind helpers at the perform site, matching
+/// the algebraic semantics non-IO effects already enjoyed via
+/// Phase 4e captures+.
 #[test]
-fn user_discard_k_io_handler_does_not_unwind_native_color_helper_pending_color_filter_lift() {
+fn user_discard_k_io_handler_unwinds_helper_at_perform_site() {
     // Plan B Task 57 — pinning test for the residual correctness
     // gap from Slice 1's IO color filter retention. Mirrors the
     // `discard_k_handler_does_not_abort_helper_phase_4e_pending`

@@ -10086,22 +10086,14 @@ fn is_simple_tail_perform_with_pure_args_body(body: &crate::ast::Block) -> bool 
     }
     match &body.tail {
         Some(crate::ast::Expr::Perform(p)) => {
-            // Plan B Task 57 — IO performs are excluded from the
-            // CPS-color classifier as a perf-preserving choice; see
-            // `[DEVIATION Task 57] IO color filter retention` in
-            // `PLAN_B_DEVIATIONS.md` for the rationale, the load-
-            // bearing shim invariant (top-level IO handler always
-            // installed), and the residual correctness gap (user
-            // discard-`k` IO handlers don't unwind Native-color
-            // helpers — pinned by `#[ignore]`'d e2e
-            // `user_discard_k_io_handler_does_not_unwind_native_-
-            // color_helper_pending_color_filter_lift`). The filter
-            // references `color::NATIVE_EFFECT` rather than the
-            // literal `"IO"` so a future builtin rename would update
-            // both sites in one place.
-            if p.effect == crate::color::NATIVE_EFFECT {
-                return false;
-            }
+            // Stage 6 cleanup: IO color filter lifted — every perform
+            // (including IO) is eligible for the CPS-color body
+            // classifier. Pre-lift, this site rejected IO performs
+            // as a perf-preserving choice with a documented
+            // residual discard-`k` correctness gap (per
+            // `[DEVIATION Task 57] IO color filter retention`).
+            // Post-lift, IO performs flow through the trampoline
+            // like any other effect; the discard-`k` gap closes.
             p.args.iter().all(expr_is_pure)
         }
         _ => false,
@@ -10266,14 +10258,10 @@ fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
     if body.stmts.len() != 1 {
         return false;
     }
-    // Plan B Task 57 — IO performs are excluded from this CPS-color
-    // classifier (same rationale + same residual correctness gap as
-    // `is_simple_tail_perform_with_pure_args_body`'s IO filter; see
-    // `[DEVIATION Task 57] IO color filter retention`). Filter
-    // references `color::NATIVE_EFFECT` to keep the builtin-name
-    // source-of-truth in one place.
+    // Stage 6 cleanup: IO color filter lifted — every perform
+    // (including IO) is eligible for the CPS-color body classifier.
     let yield_perform = match &body.stmts[0] {
-        Stmt::Perform(p) if p.effect != crate::color::NATIVE_EFFECT => p,
+        Stmt::Perform(p) => p,
         _ => return false,
     };
     if !yield_perform.args.iter().all(expr_is_pure) {
@@ -10359,14 +10347,10 @@ fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
         Stmt::Let(l) => l,
         _ => return false,
     };
-    // Plan B Task 57 — IO performs excluded for the same perf-
-    // preserving reason + same residual correctness gap documented
-    // at `is_simple_tail_perform_with_pure_args_body` and
-    // `[DEVIATION Task 57] IO color filter retention`. Filter
-    // references `color::NATIVE_EFFECT` for one-place builtin-name
-    // source-of-truth.
+    // Stage 6 cleanup: IO color filter lifted — every perform
+    // (including IO) is eligible for the CPS-color body classifier.
     let yield_perform = match &let_stmt.value {
-        Expr::Perform(p) if p.effect != crate::color::NATIVE_EFFECT => p,
+        Expr::Perform(p) => p,
         _ => return false,
     };
     if !yield_perform.args.iter().all(expr_is_pure) {
