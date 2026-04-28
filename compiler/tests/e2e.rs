@@ -518,8 +518,18 @@ fn multishot_perf_example_under_5s() {
 }
 
 /// Plan B Task 60 — performance floor #4: arena allocator escape rate.
-/// Plan wording calls for "at most 1% of `NextStep` records escape to
-/// Boehm heap in a typical CPS-color run".
+/// Plan wording sets the contractual ceiling at "at most 1% of
+/// `NextStep` records escape to Boehm heap in a typical CPS-color run"
+/// — but the v1 codegen has **zero** compiler-side `sigil_arena_promote`
+/// call sites today, so the ACTUAL escape rate is 0%. This test asserts
+/// the tighter `escape_count == 0` invariant rather than the plan's
+/// looser `escape ≤ 1% × alloc` bound — a regression that introduces
+/// any escape site at all is a real change worth surfacing immediately,
+/// not silently absorbing under a 1% ceiling. The plan's 1% remains
+/// the contractual worst-acceptable; the assertion enforces the
+/// tighter actual bound and forces the test (and its commit message)
+/// to be updated alongside any deliberate escape-site introduction so
+/// the regression review is explicit.
 ///
 /// "Typical CPS-color run" is defined as `examples/multishot_perf.sigil`
 /// per `[DEVIATION Task 60]` — a representative program exercising
@@ -536,27 +546,28 @@ fn multishot_perf_example_under_5s() {
 /// `runtime/src/counters.rs:104-112`), gated on
 /// `SIGIL_PRINT_STATS=1` env var. We compile multishot_perf.sigil,
 /// run with SIGIL_PRINT_STATS=1, parse the counter dump from stderr,
-/// and assert `escape * 100 <= alloc` (integer arithmetic equivalent
-/// of escape ratio ≤ 1%).
+/// and assert `escape == 0`.
 ///
 /// **Sanity bound.** Also assert `alloc > 0` to guard against a
 /// future regression that silently disables arena allocation entirely
-/// (a 0/0 ratio would trivially pass `escape * 100 <= alloc` without
-/// exercising the arena machinery).
+/// (a 0/0 ratio would trivially pass without exercising the arena
+/// machinery).
 ///
-/// **What the bound means today.** No compiler-side site currently
-/// invokes `sigil_arena_promote` (escape sites are runtime-driven, and
-/// the v1 codegen doesn't trigger any). The expected escape_count is
-/// 0; the assertion is structural insurance against any future
-/// regression that introduces escape sites without tracking them
-/// against the 1% bound.
+/// **What this assertion enforces today.** No compiler-side codegen
+/// site currently invokes `sigil_arena_promote` (multi-shot k_closure
+/// records are heap-allocated directly via `sigil_alloc` rather than
+/// arena-allocated-then-promoted). The expected escape_count is 0; if
+/// it becomes nonzero, that's either (a) a real bug to fix or (b) a
+/// deliberate change that needs to be reflected here with an updated
+/// expected value and a commit message explaining why the increase
+/// stays under the plan's 1% ceiling.
 ///
 /// **Stdout invariant** mirrors the multishot_perf test: the sentinel
 /// "0\n" indicates run(1000) completed. Stderr contains the counter
 /// dump (after the program's own stderr output, which should be
 /// empty for this example).
 #[test]
-fn arena_escape_rate_under_one_percent() {
+fn arena_escape_count_is_zero_below_one_percent_ceiling() {
     use std::process::Command;
     let root = workspace_root();
     let source = root.join("examples/multishot_perf.sigil");
@@ -631,17 +642,22 @@ fn arena_escape_rate_under_one_percent() {
          machinery. stderr={stderr:?}"
     );
 
-    // Integer arithmetic equivalent of `escape / alloc <= 1%`:
-    //   escape * 100 <= alloc
-    // Saturating multiply guards against overflow if a future regression
-    // produces an extreme escape count.
-    assert!(
-        escape.saturating_mul(100) <= alloc,
-        "arena escape rate exceeds 1% Plan B Task 60 floor: \
-         escape_count={escape}, alloc_count={alloc} \
-         (ratio = {escape}/{alloc} ≈ {pct}%, bound = 1%); \
-         stderr={stderr:?}",
-        pct = (escape as f64 / alloc as f64) * 100.0
+    // Tighter than the plan's "≤ 1% × alloc" ceiling: today's v1 codegen
+    // has zero compiler-side `sigil_arena_promote` call sites, so the
+    // actual escape rate is 0%. Asserting `escape == 0` surfaces any
+    // regression (any introduction of escape, however small) immediately
+    // — a 0.5%-introduction would silently pass `escape * 100 ≤ alloc`
+    // even though it's a real semantic change. If a future PR
+    // deliberately adds escape sites, update both the assertion and the
+    // commit message; the plan's 1% remains the contractual ceiling.
+    assert_eq!(
+        escape, 0,
+        "arena escape count is nonzero — v1 codegen has no compiler-side \
+         `sigil_arena_promote` call sites, so this is either (a) a real \
+         regression, or (b) a deliberate change that needs to update both \
+         this assertion AND the commit message explaining why the new \
+         escape rate {escape}/{alloc} stays under the plan's 1% ceiling. \
+         stderr={stderr:?}"
     );
 }
 

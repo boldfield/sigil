@@ -2203,13 +2203,18 @@ fn run(n: Int) -> Int ![IO] {
 
 With N=1000, this produces 2000 multi-shot k invocations across 1000 fresh handler frames + 1000 fresh heap-reified k_closure records. The literal "3-element" shape would scale this to 8000 outcomes per iteration but exercises a different invariant (single-handle multi-perform deep enumeration) which Slice C v1 doesn't support. The v1 ship exercises **iteration-scale stress** rather than **per-iteration combinator depth**; the two complementary stress shapes match the [DEVIATION Task 58] precedent for `multishot_stress.sigil`'s 5-handles vs. literal-10+-resumes choice.
 
-**Item 4 — "1% of `NextStep` records escape" framing.** Plan wording calls for "at most 1% of `NextStep` records escape to Boehm heap in a typical CPS-color run". The runtime tracks `ArenaAllocCount` (every `sigil_arena_alloc` call) and `ArenaEscapeCount` (every `sigil_arena_promote` call) atomically. The ratio `ArenaEscapeCount / ArenaAllocCount` is what the plan bound governs. v1 ships an e2e test that:
+**Item 4 — "1% of `NextStep` records escape" framing.** Plan wording sets the contractual ceiling at "at most 1% of `NextStep` records escape to Boehm heap in a typical CPS-color run". The runtime tracks `ArenaAllocCount` (every `sigil_arena_alloc` call) and `ArenaEscapeCount` (every `sigil_arena_promote` call) atomically. The ratio `ArenaEscapeCount / ArenaAllocCount` is what the plan bound governs.
 
-(a) Compiles a representative CPS-color program (the multi-shot stress driver above) with `--print-runtime-stats`.
-(b) Runs it and parses the counter dump from stderr (each line `SIGIL_COUNTER_<NAME>=<VALUE>`, per `runtime/src/counters.rs:104-112`'s `sigil_counter_print_all`).
-(c) Asserts `escape_count * 100 ≤ alloc_count` (the integer arithmetic equivalent of `escape_count / alloc_count ≤ 1%`).
+**v1 ships a tighter assertion than the plan's 1% ceiling: `escape_count == 0`.** Today's v1 codegen has zero compiler-side `sigil_arena_promote` call sites — multi-shot k_closure records are heap-allocated directly via `sigil_alloc` (TAG_CLOSURE) rather than arena-allocated-then-promoted. So the actual escape rate is 0%, not just "≤ 1%". Asserting equality with the actual current state forces any regression — even a sub-1% introduction of escape sites — to surface immediately and triggers explicit review of whether the change is deliberate. The plan's 1% remains the contractual worst-acceptable for *future* deliberate escape-site introductions; the test enforces the tighter actual bound and updates alongside any deliberate change.
 
-"Typical CPS-color run" is the multi-shot driver — a representative program that exercises both the canonical Slice C 2-let arm (heap-reifying k_closures) and the iterated handle-frame allocation pattern. If the ratio test trips on a representative program, that's a real perf regression worth investigating; if it passes, the bound is met for the typical workload Task 60 cares about.
+The e2e test:
+
+(a) Compiles a representative CPS-color program (the multi-shot stress driver above) directly (no `--print-runtime-stats` flag).
+(b) Runs the compiled binary with `SIGIL_PRINT_STATS=1` env var, which the runtime reads at startup and uses to register an atexit hook calling `sigil_counter_print_all`.
+(c) Parses the counter dump from stderr (each line `SIGIL_COUNTER_<NAME>=<VALUE>`, per `runtime/src/counters.rs:104-112`).
+(d) Asserts `escape_count == 0` (tighter than plan's 1% ceiling) AND `alloc_count > 0` (sanity guard against a 0/0 ratio that would trivially pass any escape-rate assertion without exercising the arena machinery).
+
+"Typical CPS-color run" is the multi-shot driver — a representative program that exercises both the canonical Slice C 2-let arm (heap-reifying k_closures) and the iterated handle-frame allocation pattern. If the assertion trips, that's either a real bug to fix or a deliberate change that needs to update both the assertion AND the commit message explaining why the new escape rate stays under the plan's 1% ceiling.
 
 **Three deviations summary:**
 
@@ -2217,7 +2222,7 @@ With N=1000, this produces 2000 multi-shot k invocations across 1000 fresh handl
 |---|---|---|
 | `fib(20)` forced via `![State[Int]]` | `![State, IO]` + `let _ = perform State.get()` body shape | Type-parameter `State[Int]` is post-Plan-B (no test/example currently exercises it); the `_ = perform` workaround is permanent v1 idiom for "CPS-force a fn whose body shape doesn't already perform" |
 | 3-element Choose combinator, N=1000 | Single-binary-perform multi-shot, N=1000 driver | Future chained-synth-cont extension (multi-perform helper bodies) — bundles with Slice C N-chain extension named in [DEVIATION Task 58] |
-| 1% NextStep escape rate | `--print-runtime-stats` parse + ratio assertion against the multi-shot driver as "typical CPS-color run" | Closed at this PR; future refinements could add per-program-shape escape-rate breakouts but the v1 ship covers the representative case |
+| 1% NextStep escape rate | `escape == 0` assertion (tighter than plan's 1% ceiling — actual current state) against multi-shot driver as "typical CPS-color run" | Closed at this PR; future deliberate escape-site introductions update the assertion alongside the commit message explaining why the new rate stays under 1% |
 
 **Rationale:** Task 60 is *verification work*, not feature work. Each deviation preserves the perf-floor *intent* (CPS slowdown ≤ 10×, multi-shot scalability over many iterations, arena allocator efficiency on representative programs) while sidestepping v1 expressibility limits documented in earlier deviations. None of the three deltas requires new compiler machinery; all use the existing Phase 4d/4e/4f/4g + Task 56 runtime + Task 57 IO/ArithError infrastructure.
 
@@ -2229,6 +2234,6 @@ The selected approach is consistent with Plan B's "do not implement Stage 7+ fea
 
 2. **Item 3 — 3-element Choose combinator**: future chained-synth-cont extension lifts `is_simple_let_yield_then_pure_tail_body`'s "exactly one let stmt" cap. Bundles with the Slice C N-chain extension (multi-perform arm bodies). When both close, the v1 driver test can be augmented or replaced with a literal-3-element variant.
 
-3. **Item 4 — escape-rate assertion**: closed at this Task 60 ship for the representative case. Future refinements could parameterise the assertion across multiple program shapes.
+3. **Item 4 — escape-rate assertion**: closed at this Task 60 ship for the representative case at the tighter `escape == 0` bound. Future deliberate escape-site introductions update the assertion alongside the commit message explaining why the new rate stays under the plan's 1% ceiling.
 
 **Implementing commit(s):** Foundation `e492ede` (this entry + Task 59 squash-hash flip + PROGRESS Task 60 entry transition `todo` → `in-progress`); `examples/fib_cps_perf.sigil` + `fib_cps_perf_example_prints_6765_under_500ms` e2e at `02389f5`; `examples/multishot_perf.sigil` + `multishot_perf_example_under_5s` e2e at `f510752`; `arena_escape_rate_under_one_percent` e2e at `044aa0e`; closeout (PROGRESS Task 60 entry filled + this implementing-commit line backfilled) at `[HEAD]`.
