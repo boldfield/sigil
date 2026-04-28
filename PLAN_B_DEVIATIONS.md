@@ -1557,3 +1557,80 @@ e) **`resumes_many` gating in pre-pass, not in walker.** The arm-body walker rej
 - *Arm body inside lambda crashes / reads wrong capture* — Slice D. The typecheck side-table's lambda-frame source annotation or codegen's read-from-lambda-`closure_ptr` lowering is the prime suspect.
 
 The bisecting hint is also embedded inline at the prime-suspect code change sites for each failure mode, mirroring the comprehensive entry's pattern.
+
+## 2026-04-28 — [DEVIATION Task 55] Phase 4f — multi-effect handlers via push-N-frames
+
+**Context:** Phase 4e (closed at `3affced` via PR #27 squash-merge on 2026-04-28) shipped the algebraic-semantics correctness gate: discard-`k` across function-call boundaries, non-tail `k`, multi-shot `k`, and surrounding-lambda closure captures into arm bodies. Phase 4f is the residual feature-breadth work for **multi-effect handlers** — `handle expr with { E1.op1(k) => …, E2.op2(k) => …, … }` where arms target more than one declared effect. Currently rejected at codegen entry by `unsupported_handle_construct` at `compiler/src/codegen.rs:744` ("`handle` expression at … has arms targeting different effects (`{}` and `{}`) — multi-effect handlers are not yet supported in codegen (Plan B Task 55, in progress; arrives in Phase 4e via frame-per-effect)" — note the stale "Phase 4e" reference, addressed by hard condition #4 below). Typecheck already accepts multi-effect handles (Task 54's `check_handle` registry dispatch enumerates arms across effects without restriction); the gap is purely codegen-side.
+
+**Deviation:** Phase 4f ships as one focused PR off `main` per the per-phase-PR cadence (`plan-b-task-55-phase-4f` branch). Architecture is **Option A — push N frames at handle entry** (one `HandlerFrame` per distinct effect, sharing arm-fn allocation pattern; `sigil_handler_frame_new(effect_id, arm_count)` called once per effect; pushed in BTreeMap-stable iteration order; popped in reverse at handle exit). The runtime ABI (`HandlerFrame`, `sigil_perform`, the GC bitmap derivation, `MAX_HANDLER_ARMS = 14`, `sigil-abi`) stays unchanged. Only `compiler/src/codegen.rs` and the codegen-entry walker change at the user-visible level; `runtime/src/handlers.rs` is touched only for any new debug-assert or test additions, not for layout.
+
+**Why Option A over Option B (extend `HandlerFrame` to carry multiple `effect_id`s):**
+
+The lead reason is **architectural reversibility**. Option A keeps the runtime ABI stable while Phase 4f / 4g / Plan C work continues. If Phase 4f's actual usage data reveals A is wrong — walk-depth inflation matters for Stage 9 demo perf, return-arm coordination becomes painful, the diagnostic enumerates N frames in a way that confuses LLM authors — **B can be layered on top as a Phase 4f-2 commit** with a clean ABI version bump. The ABI bump is cheaper to do *later* with concrete motivation than *now* on speculation. With B, the ABI bump ships unconditionally; reversing to A means a second ABI bump (and the cross-crate ripple of a second ABI version constant in `sigil-abi`). Phase 4f is itself an architectural exploration — there is no production data on what multi-effect handlers actually look like in practice yet. A is the conservative learning choice; B is a pre-commitment to a more invasive change before that data exists.
+
+Supporting reasons (de-emphasized — soundness rather than load-bearing):
+- *Zero ABI surface change.* The `HandlerFrame` 32-byte header (`effect_id` u32 + `arm_count` u32 + `return_fn` ptr + `return_closure` ptr + `prev` ptr) stays untouched. The precise GC bitmap derivation (Task 56's `handler_frame_pointer_bitmap`) stays untouched. The `MAX_HANDLER_ARMS = 14` cap derivation (set by the 32-bit bitmap) stays untouched.
+- *Composes with Phase 4g's return-arm work.* Return arm registers on a single per-handle frame; Phase 4f's frame-grouping decision (concern #2 below) pins which one — the first-pushed (bottom-of-handle-group) frame.
+- *Only observable inflation is the (non-budget-pinned) walk-depth counter.* Verified concretely below as concern #4.
+
+**Phase 4f-2 escape valve:** Option A is a deliberate choice, not the only choice considered. If Phase 4g's return-arm coordination or walk-depth diagnostic complexity surfaces unexpected friction, Phase-4f-2 layering of B on top is the documented escape valve — future designers should know this was negotiated at scope time, not stumbled into.
+
+**Approach:**
+
+At every `Expr::Handle` codegen site:
+
+- Group `op_arms` by `arm.effect` using `BTreeMap<String, Vec<&HandleOpArm>>` (BTreeMap-stable iteration order — preserves the existing determinism discipline that drives all of Plan B).
+- For each distinct effect (in the BTreeMap's iteration order — the *push order*):
+  - Allocate one `HandlerFrame` via the existing `sigil_handler_frame_new(effect_id, arm_count)` FFI. `arm_count` matches the existing single-effect convention exactly (no semantic change — the convention is what it is).
+  - Populate that frame's arms via `set_arm` for every arm in this effect's group. Arm-fn `FuncRef` lookup uses the existing `handler_arm_refs_per_handle` side-table; the per-arm `closure_ptr` is computed via the existing `alloc_arm_closure_record` Phase 4d machinery (untouched).
+  - Push via `sigil_handle_push(frame)`.
+- Body lowering: unchanged.
+- At handle exit: pop N frames via N `sigil_handle_pop()` calls in reverse push order (LIFO discipline matches the runtime stack contract).
+- Walker (`unsupported_handle_construct` at `compiler/src/codegen.rs:744`): drop the "all arms reference the same effect" rejection; replace the rejection with a positive path. The walker still validates `op_arms.len() > 0` and the per-(effect, op) duplicate-arm rejection (typecheck E0140 already covers the latter; codegen guards defensively).
+
+The single-effect path becomes a special case of the multi-effect path (one BTreeMap entry → one frame). To avoid regressing the 99% case, the codegen lowering is structured so the single-effect path emits literally the same Cranelift IR as today (the BTreeMap-grouping loop runs once and produces the existing alloc-set-push sequence), not just behaves the same.
+
+**Pre-registered concerns (1–5):**
+
+1. **Frame stack discipline at multi-effect handle exit.** Single-frame discipline has a structural "one push = one pop" guarantee; Option A relaxes to "N pushes = N pops" and any miscount corrupts stack state. PR #21's frame-leak-on-body-unwind concern (the [DEVIATION Task 55] entry titled "Handler frame leaks on body unwind; depends on Task 57 to surface" earlier in this file) gets amplified proportionally — today's leak is 1 frame per unwound handle; under Option A it's N frames per unwound multi-effect handle. Same Task 57 closure point; the magnitude grows linearly with effect count. **Mitigation in Phase 4f:** emit a `#[debug_assert]` at handle exit that captures the runtime handler-stack head pointer before the first push, and verifies it equals the head after the Nth pop. Catches any miscount in debug builds without affecting release codegen.
+
+2. **Return arm coordination (Phase 4g).** Pin the rule **now** so Phase 4g implements against a documented contract rather than a hand-wave: register the synth return fn on the **first-pushed (bottom-of-handle-group) frame**, since that is the natural "outermost" frame for the handle. Decline "register on every frame and last-matched-wins" — semantically ambiguous and harder to reason about. Decline "register on the last-pushed frame" — the bottom-of-group frame is the one that survives across the body's entire scope, so it's the durable anchor for return-on-body-Done semantics. Phase 4g's PR will reference this contract by anchor: "per the [DEVIATION Task 55] Phase 4f entry's concern #2, return-arm registers on the first-pushed frame."
+
+3. **`sigil_perform` walk diagnostics for unhandled ops — deferred to Phase 4f-cleanup.** Today's diagnostic ("effect E not handled by any frame on the stack") works perfectly under 1:1 frame-to-handle correspondence. Under Option A, an unhandled op fired inside a multi-effect handle scope walks past N frames belonging to the same handle on the way to an outer handler — the diagnostic enumerates them, which is imperfect but not catastrophic. A clean fix requires a per-frame `scope_id` (or `handle_span` u32 hash) field so the diagnostic can attribute "effect E not handled by the surrounding handle at <span>" rather than enumerate frames. **`scope_id` cannot be added without an ABI change** — the `HandlerFrame` 32-byte header (`effect_id` u32 + `arm_count` u32 + `return_fn` ptr + `return_closure` ptr + `prev` ptr) is fully packed; adding `scope_id` would either grow the struct (shifts arms array offset → changes per-arm GC bitmap derivation → real ABI change), require packed encoding (low 16 bits `arm_count` + high 16 bits `scope_id`, since `MAX_HANDLER_ARMS = 14` fits in 4 bits), or replace an existing field's encoding. All three contradict Option A's "zero ABI surface change" pitch. **Phase 4f-cleanup ships `scope_id` when concrete motivation surfaces** (Stage 9 prompt produces a confusing diagnostic, etc.) — same reversibility logic that drove A over B at the parent level.
+
+4. **`HandlerWalkDepthSum` counter inflation — verified non-blocking.** Concrete check before shipping A: Task 60's perf floors are `fib(20)` native <50ms, `fib(20)` CPS-forced <500ms, multi-shot Choose (N=1000) <5s, arena escape ≤1%. None pin walk depth. `HandlerWalkCount` and `_DepthSum` are tracked counters surfaced via `--print-runtime-stats` but not perf-budget-gated. Option A's depth inflation (linear in effect count per multi-effect handle) is therefore observable but not regression-causing.
+
+5. **`scope_id` deferred to Phase 4f-cleanup** (see concern #3 for full reasoning). Pre-registered explicitly here so a future implementer / reviewer / bisecting agent understands the scope_id absence is deliberate rather than an oversight. Today's diagnostic enumerates N frames of the same handle under multi-effect; quality-of-life improvement requires an ABI consideration (packed encoding or struct grow); deferred until concrete motivation surfaces.
+
+**User's hard conditions for Phase 4f (mirroring the Phase 4d/4e entries' pattern):**
+
+1. The walker rejection-test `handle_with_mixed_effect_arms_is_rejected_at_codegen` (currently at `compiler/tests/e2e.rs` around line 1003) inverts to a positive `handle_with_mixed_effect_arms_dispatches_correct_arm_per_effect` test asserting that a `perform` of an op from each effect dispatches the correct arm. Test inversion lands at the codegen-lift commit.
+2. `README.md` "Verification limits" section closes the multi-effect row and reframes with **Phase 4g (return arms) as the remaining feature-breadth work**. The closeout commit lands the README change in the same PR.
+3. `PLAN_B_PROGRESS.md` Phase 4f entry — added at the foundation commit (this commit; status `in-progress`), filled with implementing-commit list at the closeout commit (`done-pending-ci`), updated with squash-hash post-merge.
+4. **Walker / codegen stale-reference sweep** — every `Phase 4e` reference in source code that *was* about multi-effect (i.e., the renumbered work — "arrives in Phase 4e via frame-per-effect" at `compiler/src/codegen.rs:744`, similar walker comments in `arm_body_unsupported_construct`, etc.) gets superseded by Phase 4f reframings. Mirrors PR #27's `0b61935` closeout pattern: walker diagnostic strings rewritten so what's still pending points at `Phase 4f` / `Phase 4g`, what's already closed loses its forward-pointing language entirely. Stale `Phase 4e` references that were *correctly* about Phase 4e (now-closed correctness work) lose their forward-pointing language only — they don't get rewritten to "Phase 4f" because the work isn't deferred to 4f, it's already done.
+
+**Tests not pre-committed as hard conditions but expected in the polish round** (per the recent PR cadence's "comprehensive coverage in polish round, then no-context reviewer flags gaps" discipline):
+
+- Classifier + walker unit tests at the diagnostic boundary: BTreeMap grouping invariants (deterministic order across runs given the same input; correct per-effect arm counts in the grouped output; empty-effect and single-arm-per-effect edge cases).
+- Multi-effect dispatch e2e with at least two effects × two arms each (single-arm-per-effect doesn't exercise per-frame arm-slot population fully).
+- Per-effect arm-count edge case: one effect with `MAX_HANDLER_ARMS` arms in a multi-effect handle; verifies the cap applies per-frame, not per-handle (i.e., a multi-effect handle can collectively have up to `MAX_HANDLER_ARMS × N_effects` arms, not just `MAX_HANDLER_ARMS` total).
+
+**Phased commit organisation within the PR:**
+
+- *Foundation* (this commit): deviation entry (this entry) + `PLAN_B_PROGRESS.md` Phase 4e captures+ status cleanup (the merged PR #27 stale "(awaiting review + squash-merge)" suffix becomes the squash-hash) + new Phase 4f entry (`status: in-progress`, references Phase 4g/return-arm contract from concern #2). No source code changes.
+- *Codegen lift* — drop the `op_arms[0].effect` consistency check in `unsupported_handle_construct`; rewrite `Expr::Handle` lowering to group arms by effect and emit alloc-set-push per effect. Inverts the rejection test per hard condition #1. Adds the `#[debug_assert]` from concern #1 at handle exit.
+- *Walker stale-reference sweep* — per hard condition #4. Codegen comments at `:744` and `arm_body_unsupported_construct`'s Phase-4e references rewritten or removed.
+- *Polish round* — classifier + walker unit tests, multi-effect dispatch e2e (2×2), per-effect arm-count edge case (one effect with `MAX_HANDLER_ARMS` arms in a multi-effect handle).
+- *Closeout* — README "Verification limits" closes multi-effect row, reframes with Phase 4g remaining; PROGRESS Phase 4f flips to `done-pending-ci`.
+
+**Bisecting hint pattern** (three Phase 4f failure modes a future bisecting agent should attribute to this PR vs Phase 4e):
+
+- *Multi-effect handle dispatches the wrong effect's arm at runtime* — frame-grouping bug; surfaces Phase 4f, not Phase 4e. The BTreeMap-grouping loop's per-frame `set_arm` calls are the prime suspect; verify each frame's arms array contains only ops belonging to that frame's `effect_id`.
+- *Handler stack head pointer mismatched at handle exit (debug-assert fires)* — N-pop discipline regression (concern #1). The handle-exit pop-loop count or order is the prime suspect; verify it pops exactly `BTreeMap::len()` times in reverse-push order.
+- *Unhandled-op diagnostic enumerates N frames of the same handle* — expected behaviour under Option A pre-Phase-4f-cleanup (concern #5); not a regression. The fix (scope_id) is deferred. A bisecting agent investigating this should land on this entry's concern #5 and conclude "deferred, not regressed."
+
+The bisecting hint is also embedded inline at the prime-suspect code change sites for each failure mode, mirroring the precedent set by the comprehensive Phase 4e entry.
+
+**Implementing commit(s):** [HEAD] (this commit lands the deviation entry + PROGRESS update only; subsequent commits implement codegen lift → walker sweep → polish → closeout).
+
+**Closure point:** When the Phase 4f PR squash-merges, multi-effect handlers close. The remaining Plan B Task 55 work is **Phase 4g** (return arms) — see concern #2 above for the return-arm-on-first-pushed-frame contract Phase 4g implements against. After Phase 4g, Tasks 57–61 close Stage 6.
