@@ -1113,18 +1113,29 @@ fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
     // Plan B Task 55 — regression for the walker recursion bug: a
     // nested `handle` appearing in another handle's body must surface
     // its own Phase-4 restrictions. Before the fix, the outer
-    // walker only recursed into arm bodies, so the inner handle's
-    // multi-effect restriction (Phase 4e) was missed and the program
-    // would have reached codegen with arms registered under the wrong
-    // `effect_id` — at runtime that crashes inside `sigil_perform`'s
+    // walker only recursed into arm bodies, so an inner handle's
+    // codegen-pending restrictions were missed and the program would
+    // have reached codegen with arms registered under unexpected
+    // shapes — at runtime that crashes inside `sigil_perform`'s
     // handler-stack walk.
-    let src = "effect A { op1: () -> Int }\n\
-               effect B { op2: () -> Int }\n\
-               effect Outer { op: () -> Int }\n\
+    //
+    // **Phase 4f update:** the original sentinel for this regression
+    // was the inner handle's multi-effect restriction. Phase 4f lifts
+    // that restriction (multi-effect handles now ship via push-N-
+    // frames), so this test swaps to the next-pending inner-handle
+    // restriction: a `return` arm, deferred to Phase 4g per
+    // `[DEVIATION Task 55] Phase 4f` concern #2's contract. The
+    // walker-recursion regression coverage is preserved — only the
+    // sentinel changed.
+    let src = "effect Inner { op_in: () -> Int }\n\
+               effect Outer { op_out: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle\n    \
-                   (handle 0 with { A.op1(k) => 1, B.op2(k) => 2 })\n  \
-                 with { Outer.op(k) => 0 };\n  \
+                   (handle 0 with {\n      \
+                     return(v) => v,\n      \
+                     Inner.op_in(k) => 1,\n    \
+                   })\n  \
+                 with { Outer.op_out(k) => 0 };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
@@ -1149,14 +1160,14 @@ fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
     let _ = std::fs::remove_file(&bin_path);
     assert!(
         !out.status.success(),
-        "compile must fail — inner nested handle is multi-effect; got success with stdout={:?} stderr={:?}",
+        "compile must fail — inner nested handle has a `return` arm (Phase 4g pending); got success with stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("multi-effect") || stderr.contains("Phase 4"),
-        "error message should reference the inner handle's multi-effect restriction; got stderr={stderr:?}",
+        stderr.contains("return") || stderr.contains("Phase 4"),
+        "error message should reference the inner handle's `return`-arm restriction; got stderr={stderr:?}",
     );
 }
 
