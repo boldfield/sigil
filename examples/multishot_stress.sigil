@@ -39,9 +39,12 @@
 //
 // **Independence assertion via closed form.** For each handle:
 //   - helper(seed) performs Choose.choose(seed).
-//   - Arm: r1 = k(seed + 100); r2 = k(seed + 200); arm returns
-//     r1 + r2 = (seed + 100) + (seed + 200) = 2*seed + 300.
-//   - For seeds 1..5: h_seed = 2*seed + 300 → 302, 304, 306, 308, 310.
+//   - Arm: r1 = k(arg + 100); r2 = k(r1 + 100); arm returns r1 + r2.
+//     Since k drives the LetBindThenTail helper to its identity tail
+//     (`x`), k(v) = v. So r1 = arg + 100; r2 = r1 + 100 = arg + 200;
+//     arm returns r1 + r2 = (arg + 100) + (arg + 200) = 2*arg + 300.
+//   - For seeds 1..5 (arg=seed): h_seed = 2*seed + 300 → 302, 304,
+//     306, 308, 310.
 //   - Total = 302 + 304 + 306 + 308 + 310 = 1530.
 //
 // **Distinct inputs across the program** — the 10 k invocations
@@ -52,6 +55,16 @@
 // leaked into another's value (e.g., a stale closure capture from a
 // prior handle's k_closure record), the closed-form sum would
 // diverge from 1530.
+//
+// **Why `arg2_expr` references `r1` instead of `arg`.** Slice C v1
+// captures only `(k_closure, k_fn)` into `post_arm_k_1`'s closure
+// record; user op-args are NOT threaded into post_arm_k_1's env. So
+// `arg2_expr` (lowered inside post_arm_k_1) cannot reference user
+// op-args. It CAN reference `r1` (the let-1 binding, present in
+// post_arm_k_1's env). The chained expression `r1 + 100` produces
+// the same 200+seed value as `arg + 200` would; the closed-form sum
+// is identical. See `examples/choose_demo.sigil`'s docstring and
+// `[DEVIATION Task 58]` for the architectural framing.
 //
 // Invariant: stdout reads `1530\n` and the program exits 0.
 
@@ -66,35 +79,35 @@ fn main() -> Int ![IO] {
   let h1: Int = handle helper(1) with {
     Choose.choose(arg, k) => {
       let r1: Int = k(arg + 100);
-      let r2: Int = k(arg + 200);
+      let r2: Int = k(r1 + 100);
       r1 + r2
     },
   };
   let h2: Int = handle helper(2) with {
     Choose.choose(arg, k) => {
       let r1: Int = k(arg + 100);
-      let r2: Int = k(arg + 200);
+      let r2: Int = k(r1 + 100);
       r1 + r2
     },
   };
   let h3: Int = handle helper(3) with {
     Choose.choose(arg, k) => {
       let r1: Int = k(arg + 100);
-      let r2: Int = k(arg + 200);
+      let r2: Int = k(r1 + 100);
       r1 + r2
     },
   };
   let h4: Int = handle helper(4) with {
     Choose.choose(arg, k) => {
       let r1: Int = k(arg + 100);
-      let r2: Int = k(arg + 200);
+      let r2: Int = k(r1 + 100);
       r1 + r2
     },
   };
   let h5: Int = handle helper(5) with {
     Choose.choose(arg, k) => {
       let r1: Int = k(arg + 100);
-      let r2: Int = k(arg + 200);
+      let r2: Int = k(r1 + 100);
       r1 + r2
     },
   };
