@@ -1001,52 +1001,51 @@ fn handle_with_two_arms_dispatches_correct_arm_by_op_id() {
 }
 
 #[test]
-fn handle_with_mixed_effect_arms_is_rejected_at_codegen() {
-    // Plan B Task 55 (Phase 4a restriction): multi-arm handlers
-    // must reference a single effect (the runtime
-    // `HandlerFrame.effect_id` is a single u32). Mixed-effect
-    // handlers need a frame-per-effect approach that lands in
-    // Phase 4e+. Until then, the codegen-entry guard rejects.
-    let src = "effect Raise { fail: () -> Int }\n\
-               effect Other { other: () -> Int }\n\
+fn handle_with_mixed_effect_arms_dispatches_correct_arm_per_effect() {
+    // Plan B Task 55 (Phase 4f) — INVERTED from
+    // `handle_with_mixed_effect_arms_is_rejected_at_codegen` (the
+    // Phase 4a-era rejection test). Multi-effect handlers now ship
+    // via the push-N-frames mechanism: the BTreeMap-grouping codegen
+    // emits one `HandlerFrame` per distinct effect with that effect's
+    // arms, pushed in BTreeMap-stable iteration order, popped in
+    // reverse at handle exit. See `[DEVIATION Task 55] Phase 4f` in
+    // `PLAN_B_DEVIATIONS.md` for the architectural rationale.
+    //
+    // Test structure: two handles, each with arms targeting BOTH
+    // declared effects. The first handle's body performs `Foo.f()`
+    // — the runtime stack walk finds the Foo frame and dispatches
+    // its arm (returns 7). The second handle's body performs
+    // `Bar.b()` — the walk finds the Bar frame and dispatches its
+    // arm (returns 11). The unused arm of each handle is set to a
+    // sentinel value (99); a misdispatch (e.g., wrong frame ordering
+    // causing an effect_id mismatch in the runtime walk) would print
+    // a non-18 result. Final assertion: stdout `18\n` (7 + 11).
+    //
+    // Bisecting hint: a regression here producing "stdout != 18"
+    // attributes to the BTreeMap-grouping loop in `Expr::Handle`
+    // codegen (each frame's arms must contain only ops belonging to
+    // that frame's effect_id; off-by-one in the partition lands a
+    // wrong arm under the wrong effect). A regression producing
+    // "TRAP_HANDLE_DISCIPLINE_VIOLATION (0x42)" attributes to the
+    // reverse-pop discipline (stray pop in body, or n_frames
+    // mismatch).
+    let src = "effect Foo { f: () -> Int }\n\
+               effect Bar { b: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle 42 with {\n    \
-                   Raise.fail(k) => 0,\n    \
-                   Other.other(k) => 1,\n  \
+                 let a: Int = handle (perform Foo.f()) with {\n    \
+                   Foo.f(k) => 7,\n    \
+                   Bar.b(k) => 99,\n  \
                  };\n  \
-                 perform IO.println(int_to_string(n));\n  \
+                 let b: Int = handle (perform Bar.b()) with {\n    \
+                   Foo.f(k) => 99,\n    \
+                   Bar.b(k) => 11,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(a + b));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_handle_mixed_effect_reject_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_handle_mixed_effect_reject_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail until Phase 4e ships; got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("Task 55") || stderr.contains("Phase 4") || stderr.contains("multi-effect"),
-        "error message should reference Plan B Task 55 / Phase 4 / multi-effect; got stderr={stderr:?}",
-    );
+    let (stdout, stderr, code) = compile_and_run(src, "handle_mixed_effect_dispatches");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "18\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]

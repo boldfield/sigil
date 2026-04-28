@@ -709,53 +709,44 @@ fn expr_unsupported_handle(
             //     lambdas to ClosureRecords; both shapes need
             //     captures support to lower correctly inside an
             //     arm fn — same closure point as the capture gate)
-            //   - no return arm (Phase 4f lifts via a synthetic
+            //   - no return arm (Phase 4g lifts via a synthetic
             //     return-fn registered via
-            //     sigil_handler_frame_set_return)
-            //   - all arms reference the same effect (Phase 4e
-            //     lifts via frame-per-effect)
-            //   - body's non-IO performs only target the arm's
-            //     effect (typecheck enforces this; codegen doesn't
-            //     add an extra check)
+            //     sigil_handler_frame_set_return; per
+            //     [DEVIATION Task 55] Phase 4f concern #2,
+            //     return arm registers on the first-pushed frame
+            //     of the handle's frame group)
+            //   - body's non-IO performs only target arms'
+            //     declared effects (typecheck enforces this;
+            //     codegen doesn't add an extra check)
             // Phase 4c LIFTED: arm bodies may be any expression
             // over op-args and globals (top-level fns, ctors,
             // builtins) — lowered through the regular `Lowerer`
             // with op-args bound from `args_ptr` at fn entry.
+            // Phase 4f LIFTED: arms may target different effects.
+            // Codegen groups arms by effect via BTreeMap and
+            // emits one HandlerFrame per distinct effect, pushed
+            // in BTreeMap-stable iteration order. See
+            // `[DEVIATION Task 55] Phase 4f` in
+            // `PLAN_B_DEVIATIONS.md` for the architectural
+            // rationale (Option A push-N-frames; reversibility-
+            // led; concerns 1–5 pre-registered).
             if return_arm.is_some() {
                 return Some(format!(
                     "`handle` expression at {:?} has a `return` arm — `return` \
                      arms are not yet supported in codegen (Plan B Task 55, in \
-                     progress)",
+                     progress; arrives in Phase 4g)",
                     span
                 ));
             }
             if op_arms.is_empty() {
                 // Defensive: parser guarantees at least one arm,
-                // but codegen indexes op_arms[0] for the single-arm
-                // path so guard explicitly.
+                // but codegen requires at least one to drive the
+                // BTreeMap-grouping loop.
                 return Some(format!(
                     "`handle` expression at {:?} has no op-arms — codegen \
                      requires at least one (Plan B Task 55)",
                     span
                 ));
-            }
-            // Phase 4a: multi-arm handles are now supported, but
-            // all arms must reference the same effect (the runtime
-            // `HandlerFrame`'s `effect_id` is a single u32 — multi-
-            // effect handles need a frame-per-effect approach that
-            // lands in Phase 4e). Reject mixed-effect handles
-            // here with a clean diagnostic.
-            let first_effect = &op_arms[0].effect;
-            for arm in op_arms.iter().skip(1) {
-                if &arm.effect != first_effect {
-                    return Some(format!(
-                        "`handle` expression at {:?} has arms targeting different \
-                         effects (`{}` and `{}`) — multi-effect handlers are \
-                         not yet supported in codegen (Plan B Task 55, in \
-                         progress; arrives in Phase 4e via frame-per-effect)",
-                        span, first_effect, arm.effect
-                    ));
-                }
             }
             // Phase 4a: also reject duplicate (effect, op) arm pairs
             // — the runtime frame's per-op slot is single-valued, so
@@ -6754,37 +6745,38 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 span,
                 ..
             } => {
-                // Plan B Task 55 (Phase 3b): allocate a handler
-                // frame, populate each arm slot with the synthetic
-                // CPS fn's pointer (`func_addr`), push the frame,
-                // evaluate the body inline (which may call
-                // `sigil_perform` for non-IO effects), and pop the
-                // frame. Frame's `closure_ptr` for each arm is null
-                // (Phase 3b restricts arm bodies to literal
-                // expressions with no captures).
-                let effect_name = &op_arms[0].effect;
-                let effect_id = match self.effect_ids.get(effect_name) {
-                    Some(id) => *id,
-                    None => unreachable!(
-                        "codegen: effect `{effect_name}` missing from effect_ids \
-                         map; typecheck-time E0138 should have caught this"
-                    ),
-                };
-                let arm_count = op_arms.len() as u32;
-                let effect_id_v = self.builder.ins().iconst(types::I32, effect_id as i64);
-                let arm_count_v = self.builder.ins().iconst(types::I32, arm_count as i64);
-                let frame_call = self
-                    .builder
-                    .ins()
-                    .call(self.handler_frame_new_ref, &[effect_id_v, arm_count_v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, frame_call));
-                let frame_ptr = self.builder.inst_results(frame_call)[0];
-
-                // Populate each arm slot with the synthetic CPS fn's
-                // pointer. The pre-pass allocated one `FuncRef` per
-                // arm in declaration order; pair them with the AST
-                // arms to compute op_ids.
+                // Plan B Task 55 (Phase 4f): multi-effect handles via
+                // push-N-frames. Group `op_arms` by `arm.effect` using
+                // a BTreeMap (stable iteration order — preserves
+                // determinism). For each distinct effect: allocate one
+                // HandlerFrame, populate it with that effect's arms
+                // via `sigil_handler_frame_set_arm`, push via
+                // `sigil_handle_push`. After the body: pop N frames in
+                // reverse push order. The first frame pushed is
+                // snapshotted into a Cranelift stack-local Value
+                // (`frame_1_ptr_snapshot`); concern #1's pop-discipline
+                // debug-assert compares the last `sigil_handle_pop()`
+                // return against this snapshot in debug builds. The
+                // same snapshot is the contract Phase 4g's return-arm
+                // registration reads against (concern #2).
+                //
+                // See `[DEVIATION Task 55] Phase 4f` in
+                // `PLAN_B_DEVIATIONS.md` for the architectural
+                // rationale (Option A push-N-frames; reversibility
+                // argument; Phase 4f-2 escape valve) and the bisecting
+                // hint pattern for failure modes specific to this
+                // commit.
+                //
+                // Bisecting hint: regressions producing
+                // "multi-effect handle dispatches the wrong effect's
+                // arm at runtime" attribute to the BTreeMap-grouping
+                // loop below — verify each frame's arms array
+                // contains only ops belonging to that frame's
+                // `effect_id`. Regressions producing "handler stack
+                // head pointer mismatched at handle exit (debug-assert
+                // fires)" attribute to the N-pop discipline; verify
+                // `pops.len() == groups.len()` and the last pop
+                // returns `frame_1_ptr_snapshot`.
                 let arm_refs = self
                     .handler_arm_refs_per_handle
                     .get(span)
@@ -6796,29 +6788,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         )
                     })
                     .clone();
-                // Plan B Task 55 (Phase 4d): build a per-arm closure
-                // record when the arm body has captures; pass null
-                // `closure_ptr` when it doesn't.
-                //
-                // Captures are computed at typecheck time and stored
-                // in `HandlerArmSynth.captures` (parallel to the arm
-                // body's rewritten `Expr::ClosureEnvLoad { index }`
-                // references). For each capture, look up the value in
-                // the surrounding fn's `Lowerer.env` (the
-                // closure-conversion pass already rewrote any
-                // enclosing-fn-capture Idents into `ClosureEnvLoad`
-                // nodes that resolve via `lower_closure_env_load`,
-                // which the rewrite pass re-indexed to the arm's slot
-                // — we just lower them in the outer Lowerer here
-                // since we're still inside the surrounding fn).
-                //
-                // Bisecting hint (Phase 4d MVP, see PLAN_B_DEVIATIONS):
-                // a regression at this site producing a wrong-typed
-                // capture or a missing GC bitmap bit is the prime
-                // suspect for "captured outer-scope binding reads zero
-                // / wrong-typed value at arm runtime" failures. The
-                // bitmap is computed inside `alloc_arm_closure_record`
-                // from each capture's `EnvSlotKind::is_pointer()`.
                 let arm_indices_for_handle = self
                     .handler_arm_indices
                     .get(span)
@@ -6835,47 +6804,172 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     op_arms.len(),
                     "codegen Phase 4d: arm_indices length must match op_arms"
                 );
-                let null_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
-                for ((arm, fn_ref), &synth_idx) in op_arms
+                debug_assert_eq!(
+                    arm_refs.len(),
+                    op_arms.len(),
+                    "codegen Phase 4f: arm_refs length must match op_arms"
+                );
+
+                // Group arms by effect. Each group entry carries
+                // tuples of (original op_arms index, per-arm `FuncRef`
+                // for the synth fn, per-arm `synth_idx` into
+                // `handler_arm_synth`). The key is the effect name;
+                // BTreeMap's stable iteration pins push order to
+                // effect-id-lex-order, not source position — verified
+                // by the polish-round source-order independence test.
+                let mut groups: std::collections::BTreeMap<String, Vec<(usize, FuncRef, usize)>> =
+                    std::collections::BTreeMap::new();
+                for (orig_idx, ((arm, fn_ref), &synth_idx)) in op_arms
                     .iter()
                     .zip(arm_refs.iter())
                     .zip(arm_indices_for_handle.iter())
+                    .enumerate()
                 {
-                    let op_id = match self.op_ids.get(&(arm.effect.clone(), arm.op.clone())) {
+                    groups
+                        .entry(arm.effect.clone())
+                        .or_default()
+                        .push((orig_idx, *fn_ref, synth_idx));
+                }
+                debug_assert!(
+                    !groups.is_empty(),
+                    "codegen Phase 4f: groups must be non-empty when op_arms is \
+                     non-empty (walker rejects empty op_arms)"
+                );
+
+                let null_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
+                let n_frames = groups.len();
+
+                // Step 1: alloc-set-push per effect. Snapshot the
+                // first allocated frame's pointer into a Cranelift
+                // Value for the discipline check + Phase 4g return-
+                // arm contract. (The pointer Value naturally lives
+                // through the body via Cranelift SSA / register
+                // allocator; no explicit stack slot needed.)
+                let mut frame_1_ptr_snapshot: Option<Value> = None;
+                for (effect_name, arms_in_effect) in groups.iter() {
+                    let effect_id = match self.effect_ids.get(effect_name) {
                         Some(id) => *id,
                         None => unreachable!(
-                            "codegen: op_id missing for `{}.{}`; typecheck-time \
-                             E0138/E0139 should have caught this",
-                            arm.effect, arm.op
+                            "codegen: effect `{effect_name}` missing from effect_ids \
+                             map; typecheck-time E0138 should have caught this"
                         ),
                     };
-                    let op_id_v = self.builder.ins().iconst(types::I32, op_id as i64);
-                    let fn_ptr_v = self.builder.ins().func_addr(self.pointer_ty, *fn_ref);
-
-                    // Phase 4d: build closure record from captures, or
-                    // pass null when the arm has none.
-                    let captures = self.handler_arm_synth[synth_idx].captures.clone();
-                    let arm_closure_ptr = if captures.is_empty() {
-                        null_ptr
-                    } else {
-                        self.alloc_arm_closure_record(&captures)
-                    };
-
-                    let set_call = self.builder.ins().call(
-                        self.handler_frame_set_arm_ref,
-                        &[frame_ptr, op_id_v, fn_ptr_v, arm_closure_ptr],
-                    );
+                    let arm_count = arms_in_effect.len() as u32;
+                    let effect_id_v = self.builder.ins().iconst(types::I32, effect_id as i64);
+                    let arm_count_v = self.builder.ins().iconst(types::I32, arm_count as i64);
+                    let frame_call = self
+                        .builder
+                        .ins()
+                        .call(self.handler_frame_new_ref, &[effect_id_v, arm_count_v]);
                     self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, set_call));
+                        .push_placeholder(function_code_offset(&self.builder, frame_call));
+                    let frame_ptr = self.builder.inst_results(frame_call)[0];
+                    if frame_1_ptr_snapshot.is_none() {
+                        frame_1_ptr_snapshot = Some(frame_ptr);
+                    }
+
+                    // Populate this frame's arms. Op_ids are global to
+                    // the effect, not local to the handle — bounds
+                    // check at `sigil_handler_frame_set_arm`
+                    // (`runtime/src/handlers.rs:349`) requires
+                    // `op_id < arm_count`, which today's callers
+                    // satisfy by sizing arm_count to the handle's
+                    // arm count for this effect (not the effect's
+                    // declared op count). This is unchanged from the
+                    // pre-Phase-4f single-effect path; only the loop
+                    // that now wraps it is new.
+                    for &(orig_idx, fn_ref, synth_idx) in arms_in_effect.iter() {
+                        let arm = &op_arms[orig_idx];
+                        let op_id = match self.op_ids.get(&(arm.effect.clone(), arm.op.clone())) {
+                            Some(id) => *id,
+                            None => unreachable!(
+                                "codegen: op_id missing for `{}.{}`; typecheck-time \
+                                 E0138/E0139 should have caught this",
+                                arm.effect, arm.op
+                            ),
+                        };
+                        let op_id_v = self.builder.ins().iconst(types::I32, op_id as i64);
+                        let fn_ptr_v = self.builder.ins().func_addr(self.pointer_ty, fn_ref);
+
+                        // Phase 4d: build closure record from captures,
+                        // or pass null when the arm has none.
+                        let captures = self.handler_arm_synth[synth_idx].captures.clone();
+                        let arm_closure_ptr = if captures.is_empty() {
+                            null_ptr
+                        } else {
+                            self.alloc_arm_closure_record(&captures)
+                        };
+
+                        let set_call = self.builder.ins().call(
+                            self.handler_frame_set_arm_ref,
+                            &[frame_ptr, op_id_v, fn_ptr_v, arm_closure_ptr],
+                        );
+                        self.stackmap
+                            .push_placeholder(function_code_offset(&self.builder, set_call));
+                    }
+
+                    let push_call = self.builder.ins().call(self.handle_push_ref, &[frame_ptr]);
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, push_call));
                 }
 
-                let push_call = self.builder.ins().call(self.handle_push_ref, &[frame_ptr]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, push_call));
+                // Step 2: lower the body. May contain `sigil_perform`
+                // calls that walk the handler stack; the topmost
+                // matching frame's arm runs.
                 let body_val = self.lower_expr(body);
-                let pop_call = self.builder.ins().call(self.handle_pop_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, pop_call));
+
+                // Step 3: pop N frames in reverse push order. Capture
+                // the last pop's return value for the concern #1
+                // discipline check (debug builds only).
+                let mut last_popped: Option<Value> = None;
+                for _ in 0..n_frames {
+                    let pop_call = self.builder.ins().call(self.handle_pop_ref, &[]);
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, pop_call));
+                    last_popped = Some(self.builder.inst_results(pop_call)[0]);
+                }
+
+                // Step 4 (debug builds only): assert the last-popped
+                // frame ptr equals `frame_1_ptr_snapshot`. Under
+                // LIFO discipline with `n_frames` pushes and
+                // `n_frames` pops, the last pop must return the
+                // first-pushed frame. A mismatch indicates an
+                // under-pop somewhere in the body (a stray pop
+                // consumed one of this handle's frames). Over-pop is
+                // caught by `sigil_handle_pop`'s underflow abort at
+                // `runtime/src/handlers.rs:442`. Per
+                // `[DEVIATION Task 55] Phase 4f` concern #1: the
+                // mechanism uses the frame_1 pointer snapshot already
+                // required by concern #2's return-arm contract — one
+                // snapshot, two purposes.
+                if cfg!(debug_assertions) {
+                    let snap = frame_1_ptr_snapshot.unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen Phase 4f: frame_1_ptr_snapshot must be set \
+                             when groups is non-empty (debug-assertions)"
+                        )
+                    });
+                    let last = last_popped.unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen Phase 4f: last_popped must be set when n_frames \
+                             >= 1 (debug-assertions)"
+                        )
+                    });
+                    let mismatch = self.builder.ins().icmp(IntCC::NotEqual, last, snap);
+                    let ok = self.builder.create_block();
+                    let bad = self.builder.create_block();
+                    self.builder.ins().brif(mismatch, bad, &[], ok, &[]);
+
+                    self.builder.switch_to_block(bad);
+                    self.builder.seal_block(bad);
+                    self.builder
+                        .ins()
+                        .trap(TrapCode::unwrap_user(TRAP_HANDLE_DISCIPLINE_VIOLATION));
+
+                    self.builder.switch_to_block(ok);
+                    self.builder.seal_block(ok);
+                }
+
                 body_val
             }
         }
@@ -8052,6 +8146,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 /// runtime has a richer trap catalogue.
 const TRAP_ARITH_ABORT: u8 = 0x40;
 const TRAP_NONEXHAUSTIVE_MATCH: u8 = 0x41;
+/// Plan B Task 55, Phase 4f — fires when the multi-effect handle's
+/// pop sequence does not return the first-pushed frame as expected.
+/// Catches an under-pop (a stray pop somewhere inside the body
+/// consumed one of this handle's frames) at the handle's exit.
+/// Over-pop is caught by `sigil_handle_pop`'s underflow abort
+/// (`runtime/src/handlers.rs:442`). Emitted only in debug builds
+/// of the sigil compiler (gated by `cfg!(debug_assertions)`); see
+/// `[DEVIATION Task 55] Phase 4f` concern #1 in
+/// `PLAN_B_DEVIATIONS.md`.
+const TRAP_HANDLE_DISCIPLINE_VIOLATION: u8 = 0x42;
 
 /// Best-effort PC-offset approximation for Stage 1's placeholder stackmap.
 /// Cranelift's real stack-map API ships in Plan B; the number here is a
