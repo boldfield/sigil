@@ -1,0 +1,87 @@
+// examples/state.sigil
+//
+// Plan B Task 59 — `State[Int]` counter via dual-handle pattern.
+//
+// **Why dual-handle, not `run_state`.** The classic algebraic-effects
+// `run_state(initial, comp)` higher-order helper requires both
+// (a) `TypeExpr::Fn` parameters (a `comp: () -> Int ![State, IO]`
+// argument shape; deferred per `examples/higher_order.sigil` lines
+// 15-23 — Plan A2 deferred to Plan A3, Plan A3 closed without it,
+// remains post-Plan-B), and (b) handler arm bodies returning
+// lambdas-of-state (rejected at codegen.rs:1246-1257). Both lifts
+// are post-Plan-B / Plan-C-or-later; v1 ships the demonstration
+// intent — exercising `State.get` and `State.set` through `handle`
+// dispatch — via two sequential `handle` expressions, one per op.
+// See `[DEVIATION Task 59]` in `boldfield/designs/PLAN_B_DEVIATIONS
+// .md` for the architectural framing.
+//
+// **Structure.** Two helpers, two handles:
+//
+//   1. `read_value()` performs `State.get()`; helper's tail
+//      computes `count + 1` (the read value plus one). Handler's
+//      `get` arm resumes with `k(5)` — a fixed seed value. Result:
+//      5 + 1 = 6.
+//
+//   2. `write_value()` performs `State.set(99)`; helper's tail
+//      is `prev` (the perform's return value, here echoed by the
+//      handler). Handler's `set` arm resumes with `k(arg)` —
+//      echoing the set value back. Result: 99.
+//
+// Both handles register BOTH `get` and `set` arms (Phase 4f latent
+// op_id/arm_count constraint: a partial handler runtime-aborts when
+// the unhandled op fires; the `examples/div_recover.sigil`
+// precedent of registering all declared ops applies here for the
+// 2-op `State` effect). The unused arm in each handle is
+// unreachable in this program; its presence keeps `arm_count`
+// matched to the effect's declared op count (pinned by `#[ignore]`
+// 'd e2e `partial_handler_of_multi_op_effect_aborts_at_runtime_-
+// pending_resolution`; closes in a future post-Phase-4f task).
+//
+// **Helper body shapes.** Both helpers use the captures-free
+// `LetBindThenTail` shape (codegen.rs:10301) — single `let` of a
+// perform, pure tail referencing only the binding (no user-param
+// captures). Helper arity is 0 in both cases.
+//
+// **Why two helpers and not one.** A single helper with two
+// performs (`let count = perform State.get(); let prev = perform
+// State.set(count + 1); count + prev`) would need the chained-
+// synth-cont extension named at codegen.rs:10289 as a future
+// widening of `is_simple_let_yield_then_pure_tail_body`'s "exactly
+// one let stmt" cap. v1 supports exactly one perform per helper
+// body; sequencing the two ops requires sequencing two HELPERS
+// each with one perform. The dual-handle pattern is the v1
+// expressibility of state-bearing State usage.
+//
+// **Independence asserted at the source level.** The two handles
+// use independent values (read returns 6, write returns 99); the
+// e2e test pins both lines of stdout. Any cross-handle leak (e.g.,
+// state from the first handle's get arm bleeding into the second
+// handle's set arm) would change the printed digits.
+//
+// Invariant: stdout reads `6\n99\n` (two lines, exit 0).
+
+effect State { get: () -> Int, set: (Int) -> Int }
+
+fn read_value() -> Int ![State, IO] {
+  let count: Int = perform State.get();
+  count + 1
+}
+
+fn write_value() -> Int ![State, IO] {
+  let prev: Int = perform State.set(99);
+  prev
+}
+
+fn main() -> Int ![IO] {
+  let read: Int = handle read_value() with {
+    State.get(k) => k(5),
+    State.set(arg, k) => k(arg),
+  };
+  let written: Int = handle write_value() with {
+    State.get(k) => k(0),
+    State.set(arg, k) => k(arg),
+  };
+  perform IO.println(int_to_string(read));
+  perform IO.println(int_to_string(written));
+  0
+}

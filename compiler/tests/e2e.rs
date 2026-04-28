@@ -605,6 +605,145 @@ fn multishot_stress_example_returns_1530() {
     );
 }
 
+/// Plan B Task 59 — `examples/catch.sigil` exercises the canonical
+/// one-shot Raise + recovery pattern. Confirms that:
+///
+/// - `effect Raise { fail: () -> Int }` parses + typechecks; helper's
+///   `![Raise, IO]` row + main's `![IO]` row + the handle's
+///   `Raise.fail(k) => 42` arm discharge `Raise` cleanly;
+/// - the discard-`k` arm short-circuits `risky`'s tail (`result + input`
+///   = `42 + 7 = 49` would have been the use-`k` value); Phase 4e
+///   captures+'s colorer-handler-discharge refinement makes the arm's
+///   constant value `42` flow directly to the handle's
+///   `let recovered = ... ;` binding;
+/// - the captures-bearing helper synth-cont's closure record is
+///   allocated per the `[Phase 4e]` captures-bearing slice (the
+///   `input` user param threaded into the synth-cont's env),
+///   verifying that codegen still ALLOCATES the synth-cont path
+///   even when the arm doesn't invoke it (the synth-cont fn is
+///   defined; the arm just chooses not to dispatch into it).
+///
+/// Invariant: stdout = "42\n", stderr = "", exit 0.
+#[test]
+fn catch_example_recovers_with_42() {
+    let root = workspace_root();
+    let source = root.join("examples/catch.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "catch_example");
+    assert_eq!(code, 0, "catch exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "catch stdout mismatch (expected discard-k arm to recover with 42); \
+         stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "catch should not abort or warn; stderr should be empty"
+    );
+}
+
+/// Plan B Task 59 — `examples/state.sigil` exercises both `State.get`
+/// and `State.set` ops through the dual-handle pattern (one `handle`
+/// per op). Confirms that:
+///
+/// - `effect State { get: () -> Int, set: (Int) -> Int }` parses +
+///   typechecks; the alphabetically-assigned op_ids `get=0, set=1`
+///   align with each handle's per-frame arm slot writes (per
+///   `op_ids_assigned_alphabetically_within_each_effect`);
+/// - both `handle` expressions register BOTH op arms (the v1
+///   workaround for the Phase 4f latent op_id/arm_count constraint
+///   pinned at `partial_handler_of_multi_op_effect_aborts_at_runtime
+///   _pending_resolution`); the unused arm in each handle is
+///   unreachable but its presence keeps `arm_count` matched to the
+///   effect's 2-op declaration;
+/// - the use-`k` tail-position arm shape (`State.get(k) => k(5)`,
+///   `State.set(arg, k) => k(arg)`) lowers correctly: the arm fn
+///   builds `Call(k_closure, k_fn, [arg])` and the trampoline
+///   dispatches helper's synth-cont with the bound let value;
+/// - `read_value` flows `5` (the `k(5)` resume) into `count`,
+///   computes `count + 1 = 6`; `write_value` flows `99` (the
+///   `k(arg)` echo) into `prev`, returns `prev = 99`. Two
+///   sequential handles produce two stdout lines. (Helpers are
+///   named `read_value` / `write_value` rather than `_counter` to
+///   avoid suggesting cross-call mutable state — there is no
+///   threaded counter in v1; each handle is independent.)
+///
+/// Invariant: stdout = "6\n99\n", stderr = "", exit 0.
+///
+/// **Dual-handle vs. `run_state` rationale**: see `[DEVIATION Task
+/// 59]` in `boldfield/designs/PLAN_B_DEVIATIONS.md`. The classic
+/// `run_state(initial, comp)` higher-order helper requires
+/// `TypeExpr::Fn` parameters AND arm-body lambdas — both deferred
+/// to post-Plan-B / Plan-C-or-later territory. This example
+/// demonstrates the State effect's get/set surface within the
+/// v1 expressibility envelope.
+#[test]
+fn state_example_dual_handle_returns_6_then_99() {
+    let root = workspace_root();
+    let source = root.join("examples/state.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "state_example");
+    assert_eq!(code, 0, "state exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "6\n99\n",
+        "state stdout mismatch (expected read=6 from get arm k(5)+1, \
+         then write=99 from set arm k(arg)=k(99)); stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "state should not abort or warn; stderr should be empty"
+    );
+}
+
+/// Plan B Task 59 — `examples/choose.sigil` exercises the canonical
+/// Slice C v1 2-resume multi-shot Choose pattern, framed as a binary
+/// outcome enumerator. Confirms that:
+///
+/// - `effect Choose resumes: many { flip: () -> Bool }` parses +
+///   typechecks; the `resumes: many` annotation enables the multi-shot
+///   path through `arm_body_multi_let_then_pure_tail_shape`'s
+///   resumes-many gate (one-shot effects are walker-rejected on the
+///   2-let arm shape per `slice_c_multi_let_arm_body_with_resumes_one
+///   _effect_is_rejected_at_codegen`);
+/// - helper's `LetBindThenTail` body with a Bool binding (`let b: Bool
+///   = perform Choose.flip(); if b { 1 } else { 2 }`) lowers via the
+///   captures-free synth-cont path with binding_ty=I8 narrowed back
+///   from the I64 args_ptr[0] read (per existing precedent
+///   `slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_-
+///   args` in this file);
+/// - the 2-step lambda-lifted post-arm-k chain runs end-to-end:
+///   k(true) → synth-cont with b=true → tail returns 1 → post_arm_k_1
+///   reads r1=1 → k(false) → synth-cont with b=false → tail returns 2
+///   → post_arm_k_2 reads r2=2, reads r1=1 from closure record,
+///   returns r1+r2=3;
+/// - the SAME heap-reified k_closure record is invoked twice (multi-
+///   shot capability of `resumes: many`); cross-resume independence
+///   is asserted by the closed-form expected output 3.
+///
+/// Invariant: stdout = "3\n", stderr = "", exit 0.
+///
+/// **Pair-generator framing rationale**: see `[DEVIATION Task 59]` in
+/// `boldfield/designs/PLAN_B_DEVIATIONS.md`. The literal Cartesian-
+/// product two-flip pair generator (with 4 outcomes: (T,T)/(T,F)/
+/// (F,T)/(F,F)) requires both the chained-synth-cont extension
+/// (multi-perform helper bodies) and the Slice C N-chain extension —
+/// both Plan-C-or-later territory. v1's "pair" is the (r1, r2) tuple
+/// at the arm-level resume-result space, summed for stdout.
+#[test]
+fn choose_example_dual_resume_returns_3() {
+    let root = workspace_root();
+    let source = root.join("examples/choose.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "choose_example");
+    assert_eq!(code, 0, "choose exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3\n",
+        "choose stdout mismatch (expected r1=1 from k(true) + r2=2 from \
+         k(false) = 3); stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "choose should not abort or warn; stderr should be empty"
+    );
+}
+
 /// Plan A2 task 32: a top-level user fn is direct-called from `main`.
 /// Every user fn takes a closure_ptr as its first Cranelift argument
 /// (always null for direct calls to a top-level fn with no captured
