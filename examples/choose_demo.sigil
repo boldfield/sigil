@@ -1,0 +1,62 @@
+// examples/choose_demo.sigil
+//
+// Plan B Task 58 — multi-shot rigor: canonical demonstration of a
+// `resumes: many` continuation invoked twice from a single handler
+// arm. The plan's literal wording is exercised: "a handler invokes
+// `k` twice and collects both results" via the canonical 2-let
+// arm-body shape `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }`
+// recognised by `arm_body_multi_let_then_pure_tail_shape` (codegen.rs).
+//
+// Effect declaration uses the literal Task 58 wording:
+//   `effect Choose resumes: many { choose: (Int) -> Int }`
+// — distinct from the existing Slice C e2e test surface
+// (`Choose resumes: many { flip: () -> Bool }`); this example is
+// the first program to exercise multi-shot dispatch with an
+// `(Int) -> Int` op signature, covering Phase 4b's perform-side
+// args-buffer packing and Phase 4c's arm-side arg unpacking on the
+// pointer-typeless Int width path under the multi-shot trampoline
+// chain.
+//
+// Trace:
+//   - `helper(5)` performs `Choose.choose(5)`; helper's body is the
+//     `LetBindThenTail` shape (`let x: Int = perform Choose.choose(
+//     seed); x`).
+//   - The arm receives `arg = 5` (the perform's user arg packed by
+//     codegen and unpacked by `sigil_handler_arm_<idx>` from
+//     args_ptr[0] at fn entry).
+//   - First `k(arg + 10) = k(15)` drives the helper synth-cont with
+//     x=15; the synth-cont's tail (`x`) returns 15 → r1 = 15.
+//   - Second `k(arg + 20) = k(25)` drives the SAME helper synth-cont
+//     a second time with x=25 (heap-reified k_closure record reused
+//     per `[DEVIATION Task 55] Phase 4e captures+ Slice C`); returns
+//     25 → r2 = 25.
+//   - Arm returns r1 + r2 = 40 to the handle expression.
+//
+// Invariant: stdout reads `40\n` and the program exits 0.
+//
+// See `[DEVIATION Task 58] Multi-shot stress shape` in
+// `boldfield/designs/PLAN_B_DEVIATIONS.md` for the architectural
+// framing (why the literal "10+ resumes within a single arm" stress
+// shape lives in `examples/multishot_stress.sigil` via the v1
+// 5-handle workaround instead, and why the N-chain extension
+// landing inside a single arm is deferred to a future Slice C
+// captures-bearing extension).
+
+effect Choose resumes: many { choose: (Int) -> Int }
+
+fn helper(seed: Int) -> Int ![Choose, IO] {
+  let x: Int = perform Choose.choose(seed);
+  x
+}
+
+fn main() -> Int ![IO] {
+  let total: Int = handle helper(5) with {
+    Choose.choose(arg, k) => {
+      let r1: Int = k(arg + 10);
+      let r2: Int = k(arg + 20);
+      r1 + r2
+    },
+  };
+  perform IO.println(int_to_string(total));
+  0
+}

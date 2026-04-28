@@ -509,6 +509,44 @@ fn div_recover_example_returns_999() {
     );
 }
 
+/// Plan B Task 58 — `examples/choose_demo.sigil` exercises the
+/// canonical `resumes: many` multi-shot continuation with the
+/// `(Int) -> Int` op signature. Confirms that:
+///
+/// - typecheck accepts `effect Choose resumes: many { choose: (Int)
+///   -> Int }` and the 2-let arm body `{ let r1: Int = k(arg + 10);
+///   let r2: Int = k(arg + 20); r1 + r2 }`;
+/// - codegen's `arm_body_multi_let_then_pure_tail_shape` matches the
+///   arm body, allocates two post-arm-k synth fns per Slice C v1, and
+///   routes the continuation reification through the heap-reified
+///   k_closure path (TAG_CLOSURE record);
+/// - Phase 4b's perform-side args-buffer packing and Phase 4c's
+///   arm-side arg unpacking work end-to-end with an `(Int) -> Int`
+///   op (the existing Slice C e2e tests use `() -> Bool`; this
+///   example is the first multi-shot dispatch with non-zero op arity
+///   on the Int path);
+/// - the same heap-reified k_closure dispatches into the helper
+///   synth-cont twice with different args (15, then 25), each
+///   producing an independent result (15, 25) that combine to 40.
+///
+/// Invariant: stdout = "40\n", stderr = "", exit 0.
+#[test]
+fn choose_demo_example_returns_40() {
+    let root = workspace_root();
+    let source = root.join("examples/choose_demo.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "choose_demo_example");
+    assert_eq!(code, 0, "choose_demo exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "40\n",
+        "choose_demo stdout mismatch (expected k(15)=15 + k(25)=25 = 40); \
+         stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "choose_demo should not abort or warn; stderr should be empty"
+    );
+}
+
 /// Plan A2 task 32: a top-level user fn is direct-called from `main`.
 /// Every user fn takes a closure_ptr as its first Cranelift argument
 /// (always null for direct calls to a top-level fn with no captured
