@@ -3769,21 +3769,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_string_new", Linkage::Import, &string_new_sig)
         .map_err(|e| format!("declare sigil_string_new: {e}"))?;
 
-    let mut println_sig = Signature::new(isa_call_conv(&module));
-    println_sig.params.push(AbiParam::new(pointer_ty));
-    let println = module
-        .declare_function("sigil_println", Linkage::Import, &println_sig)
-        .map_err(|e| format!("declare sigil_println: {e}"))?;
-
-    // Plan A2: arithmetic-abort panic. `sigil_panic_arith_error(*const
-    // c_char) -> !`. Cranelift doesn't know the noreturn — we emit a
-    // `trap` after the call to satisfy Cranelift's terminator
-    // invariant; the runtime exits the process before the trap runs.
-    let mut panic_arith_sig = Signature::new(isa_call_conv(&module));
-    panic_arith_sig.params.push(AbiParam::new(pointer_ty));
-    let panic_arith = module
-        .declare_function("sigil_panic_arith_error", Linkage::Import, &panic_arith_sig)
-        .map_err(|e| format!("declare sigil_panic_arith_error: {e}"))?;
+    // Plan B Stage 6 cleanup — `sigil_println` and
+    // `sigil_panic_arith_error` FFI declarations removed. Both are
+    // Plan-A1/A2-era runtime fns that Task 57's IO-as-effect refactor
+    // (`[DEVIATION Task 57]`) made unreachable from compiler-emitted
+    // code: `perform IO.println(s)` now routes through `sigil_perform`
+    // → `sigil_io_println_arm` (runtime-side default arm fn), and
+    // `BinOp::Div`/`Mod` rewrite at elaborate to `perform
+    // ArithError.{div,mod}_by_zero()` dispatching to runtime-side
+    // `sigil_arith_error_{div,mod}_by_zero_arm`. The shipped runtime
+    // crate still exports `sigil_println` for the arm fn's internal
+    // use, but codegen no longer declares it as an import.
 
     // Plan A2 task 32: `sigil_alloc(header: u64, payload_bytes: usize)
     // -> *mut u8`. Heap allocation for closure records (and any future
@@ -4302,18 +4298,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // Symbol names describe the content for the linker's symbol table;
     // Mach-O section names (third arg) are capped at 16 chars and use
     // abbreviated forms. Keep the two independent.
-    let div_zero_msg_id = declare_cstring(
-        &mut module,
-        "sigil_arith_msg_div_zero",
-        "_sigil_amsg_dz",
-        b"division by zero",
-    )?;
-    let mod_zero_msg_id = declare_cstring(
-        &mut module,
-        "sigil_arith_msg_mod_zero",
-        "_sigil_amsg_mz",
-        b"remainder by zero",
-    )?;
+    // Plan B Stage 6 cleanup — `sigil_arith_msg_div_zero` /
+    // `sigil_arith_msg_mod_zero` C-string declarations removed.
+    // Task 57's BinOp::Div/Mod elaborate-time rewrite to
+    // `perform ArithError.{div,mod}_by_zero()` makes the codegen-side
+    // C-strings unreachable; the user-visible stderr banner now lives
+    // in runtime-side `sigil_arith_error_{div,mod}_by_zero_arm`.
 
     // --- define every user fn (original + synthetic $lambda_N) ----------
     //
@@ -4335,8 +4325,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // added in `f7d4a64` is removed at this commit.
     let per_fn_refs_ctx = PerFnRefsCtx {
         string_new,
-        println,
-        panic_arith,
         alloc,
         int_to_string,
         handler_frame_new,
@@ -4357,8 +4345,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         user_fns: &user_fns,
         string_literals,
         lit_ids: &lit_ids,
-        div_zero_msg_id,
-        mod_zero_msg_id,
     };
 
     let mut ctx = module.make_context();
@@ -4389,8 +4375,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // the emitted object code is unaffected.
             let PerFnRefs {
                 string_new_ref,
-                println_ref,
-                panic_arith_ref,
                 alloc_ref,
                 int_to_string_ref,
                 handler_frame_new_ref,
@@ -4408,8 +4392,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
                 lit_gvs,
-                div_zero_gv,
-                mod_zero_gv,
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
             // Plan B Task 55, Phase 4e — branch on the per-fn ABI
@@ -4766,11 +4748,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -4900,11 +4878,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 pointer_ty,
                 closure_ptr,
                 lit_gvs,
-                div_zero_gv,
-                mod_zero_gv,
                 string_new_ref,
-                println_ref,
-                panic_arith_ref,
                 alloc_ref,
                 int_to_string_ref,
                 handler_frame_new_ref,
@@ -5213,8 +5187,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // `next_step_args_ptr_ref`).
                 let PerFnRefs {
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -5232,8 +5204,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 // Block params: 0 = closure_ptr (null in Phase 4c),
@@ -5320,11 +5290,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -5833,8 +5799,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // captures + globals).
                 let PerFnRefs {
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -5852,8 +5816,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 // Block params: 0 = closure_ptr, 1 = args_ptr,
@@ -5953,11 +5915,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -6152,8 +6110,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
             let PerFnRefs {
                 string_new_ref,
-                println_ref,
-                panic_arith_ref,
                 alloc_ref,
                 int_to_string_ref,
                 handler_frame_new_ref,
@@ -6171,8 +6127,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
                 lit_gvs,
-                div_zero_gv,
-                mod_zero_gv,
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
             let closure_ptr = block_params[0];
@@ -6183,11 +6137,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 pointer_ty,
                 closure_ptr,
                 lit_gvs,
-                div_zero_gv,
-                mod_zero_gv,
                 string_new_ref,
-                println_ref,
-                panic_arith_ref,
                 alloc_ref,
                 int_to_string_ref,
                 handler_frame_new_ref,
@@ -6340,8 +6290,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 let PerFnRefs {
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -6359,8 +6307,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 let mut env: BTreeMap<String, Value> = BTreeMap::new();
@@ -6373,11 +6319,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr: post_arm_k_1_closure_ptr,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -6605,8 +6547,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 let PerFnRefs {
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -6624,8 +6564,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 let mut lowerer = Lowerer {
@@ -6635,11 +6573,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr: post_arm_k_2_closure_ptr,
                     lit_gvs,
-                    div_zero_gv,
-                    mod_zero_gv,
                     string_new_ref,
-                    println_ref,
-                    panic_arith_ref,
                     alloc_ref,
                     int_to_string_ref,
                     handler_frame_new_ref,
@@ -6942,8 +6876,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // emitting relocations.
                         let PerFnRefs {
                             string_new_ref,
-                            println_ref,
-                            panic_arith_ref,
                             alloc_ref,
                             int_to_string_ref,
                             handler_frame_new_ref,
@@ -6961,8 +6893,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_return_arm_refs_per_handle,
                             user_fn_refs,
                             lit_gvs,
-                            div_zero_gv,
-                            mod_zero_gv,
                         } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                         let closure_ptr = block_params[0];
@@ -6973,11 +6903,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             pointer_ty,
                             closure_ptr,
                             lit_gvs,
-                            div_zero_gv,
-                            mod_zero_gv,
                             string_new_ref,
-                            println_ref,
-                            panic_arith_ref,
                             alloc_ref,
                             int_to_string_ref,
                             handler_frame_new_ref,
@@ -7068,42 +6994,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     Ok(())
 }
 
-/// Declare and define a null-terminated C string as a module-local
-/// read-only data object. Returns the cstring's `DataId` so callers can
-/// `declare_data_in_func` it and derive a `symbol_value` pointer at
-/// codegen time. The terminating `\0` is appended here; callers pass
-/// the raw bytes.
-///
-/// `symbol_name` identifies the data in the object's symbol table and
-/// can be as long as the linker allows (hundreds of chars). `section`
-/// names the output section containing the bytes; Mach-O caps section
-/// names at **16 characters** (including the NUL), so the two must be
-/// provided separately rather than sharing a name. ELF accepts either.
-fn declare_cstring(
-    module: &mut ObjectModule,
-    symbol_name: &str,
-    section: &str,
-    bytes: &[u8],
-) -> Result<cranelift_module::DataId, String> {
-    debug_assert!(
-        section.len() < 16,
-        "Mach-O section name `{section}` exceeds the 16-char limit"
-    );
-    let id = module
-        .declare_data(symbol_name, Linkage::Local, false, false)
-        .map_err(|e| format!("declare {symbol_name}: {e}"))?;
-    let mut payload = Vec::with_capacity(bytes.len() + 1);
-    payload.extend_from_slice(bytes);
-    payload.push(0);
-    let mut data = DataDescription::new();
-    data.define(payload.into_boxed_slice());
-    data.set_segment_section(".rodata", section);
-    module
-        .define_data(id, &data)
-        .map_err(|e| format!("define {symbol_name}: {e}"))?;
-    Ok(id)
-}
-
 /// Tree-walking lowerer — plan A2 task 24.
 ///
 /// Walks a typechecked + elaborated AST and emits Cranelift IR into an
@@ -7162,45 +7052,7 @@ struct Lowerer<'a, 'b> {
 
     /// Plan B Task 57 — `declare_data_in_func` refs for the arith-
     /// panic cstrings (`"division by zero"`, `"remainder by zero"`).
-    /// No longer consumed by codegen post-Slice-2: `BinOp::Div`/`Mod`
-    /// elaborate to perform-bearing form, and the stderr banner
-    /// strings now live in the runtime-side arm fns
-    /// (`sigil_arith_error_{div,mod}_by_zero_arm`). Lowerer fields
-    /// kept under `#[allow(dead_code)]` so the 16 Lowerer
-    /// construction sites' field-init shorthand stays compiling
-    /// without a wider rename diff. Future chore drops the GVs +
-    /// the C-string declarations + the per-fn data refs entirely.
-    #[allow(dead_code)]
-    div_zero_gv: GlobalValue,
-    #[allow(dead_code)]
-    mod_zero_gv: GlobalValue,
-
     string_new_ref: FuncRef,
-    /// Plan B Task 57 — `sigil_println` is no longer called directly
-    /// by user code; `perform IO.println(s)` routes through
-    /// `sigil_perform` → `sigil_io_println_arm` (runtime-side default
-    /// arm fn). The per-fn FuncRef is still declared by
-    /// `prepare_per_fn_refs` — over-declaration is structural-only
-    /// per `PerFnRefs`'s existing comment — but no `Lowerer` method
-    /// consumes it. A future cleanup chore can drop the FuncRef +
-    /// the FuncId + the FFI declaration entirely; for now
-    /// `#[allow(dead_code)]` preserves the field-init shorthand at
-    /// the 16 Lowerer construction sites without a wider rename
-    /// diff.
-    #[allow(dead_code)]
-    println_ref: FuncRef,
-    /// Plan B Task 57 — `sigil_panic_arith_error` is no longer
-    /// called by codegen; `BinOp::Div`/`Mod` rewrite to `perform
-    /// ArithError.{div,mod}_by_zero()` at elaborate, and the
-    /// runtime-side default handler installed by the `main` shim
-    /// (`sigil_arith_error_div_by_zero_arm` / `_mod_by_zero_arm`)
-    /// preserves the Plan A2 stderr banner + exit-2 behavior. The
-    /// per-fn FuncRef is still declared by `prepare_per_fn_refs` for
-    /// the same structural-only over-declaration reason as
-    /// `println_ref` above. Future chore drops the FuncRef + FuncId +
-    /// FFI declaration entirely.
-    #[allow(dead_code)]
-    panic_arith_ref: FuncRef,
     alloc_ref: FuncRef,
 
     /// Runtime ref for `sigil_int_to_string(i64) -> *u8`. Plan A2 task
@@ -9473,8 +9325,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 /// elaborate to `if rhs == 0 { perform ArithError.* } else {
 /// SdivUnchecked / SremUnchecked }`, with the perform path
 /// dispatching through `sigil_perform` to the top-level handler.
-/// The 0x40 slot is reserved (no other trap reuses it) so a future
-/// trap-catalogue rework can repopulate it without churn.
+///
+/// The 0x40 slot is **reserved** (Stage 6 cleanup confirmed
+/// disposition): no other trap reuses it, so a future trap-catalogue
+/// rework can repopulate it without ABI churn. Reserved-not-deleted
+/// guards against accidental reuse-conflict if a future rework lands
+/// the slot back at the same value with different semantics; the
+/// const declaration is intentionally absent here so any reuse
+/// surfaces in code review rather than slipping through.
 const TRAP_NONEXHAUSTIVE_MATCH: u8 = 0x41;
 /// Plan B Task 55, Phase 4f — fires when the multi-effect handle's
 /// pop sequence does not return the first-pushed frame as expected.
@@ -9639,8 +9497,6 @@ const POST_ARM_K_FN_OFF: i32 = 16;
 /// the same commit as this helper lands.
 struct PerFnRefsCtx<'a> {
     string_new: cranelift_module::FuncId,
-    println: cranelift_module::FuncId,
-    panic_arith: cranelift_module::FuncId,
     alloc: cranelift_module::FuncId,
     int_to_string: cranelift_module::FuncId,
     handler_frame_new: cranelift_module::FuncId,
@@ -9666,8 +9522,6 @@ struct PerFnRefsCtx<'a> {
     user_fns: &'a BTreeMap<String, UserFnEntry>,
     string_literals: &'a [(Span, String)],
     lit_ids: &'a [cranelift_module::DataId],
-    div_zero_msg_id: cranelift_module::DataId,
-    mod_zero_msg_id: cranelift_module::DataId,
 }
 
 /// Plan B Task 55, Phase 4e — per-fn FuncRefs / DataRefs / side-table
@@ -9690,8 +9544,6 @@ struct PerFnRefsCtx<'a> {
 /// or emitted-binary impact at the three call sites.
 struct PerFnRefs {
     string_new_ref: FuncRef,
-    println_ref: FuncRef,
-    panic_arith_ref: FuncRef,
     alloc_ref: FuncRef,
     int_to_string_ref: FuncRef,
     handler_frame_new_ref: FuncRef,
@@ -9712,8 +9564,6 @@ struct PerFnRefs {
     handler_return_arm_refs_per_handle: BTreeMap<Span, FuncRef>,
     user_fn_refs: BTreeMap<String, FuncRef>,
     lit_gvs: Vec<(Span, GlobalValue, usize)>,
-    div_zero_gv: GlobalValue,
-    mod_zero_gv: GlobalValue,
 }
 
 /// Plan B Task 55, Phase 4e — declare per-fn FuncRefs + DataRefs +
@@ -9733,8 +9583,6 @@ fn prepare_per_fn_refs(
     ctx: &PerFnRefsCtx<'_>,
 ) -> PerFnRefs {
     let string_new_ref = module.declare_func_in_func(ctx.string_new, builder.func);
-    let println_ref = module.declare_func_in_func(ctx.println, builder.func);
-    let panic_arith_ref = module.declare_func_in_func(ctx.panic_arith, builder.func);
     let alloc_ref = module.declare_func_in_func(ctx.alloc, builder.func);
     let int_to_string_ref = module.declare_func_in_func(ctx.int_to_string, builder.func);
     let handler_frame_new_ref = module.declare_func_in_func(ctx.handler_frame_new, builder.func);
@@ -9810,13 +9658,8 @@ fn prepare_per_fn_refs(
             (span.clone(), gv, s.len())
         })
         .collect();
-    let div_zero_gv = module.declare_data_in_func(ctx.div_zero_msg_id, builder.func);
-    let mod_zero_gv = module.declare_data_in_func(ctx.mod_zero_msg_id, builder.func);
-
     PerFnRefs {
         string_new_ref,
-        println_ref,
-        panic_arith_ref,
         alloc_ref,
         int_to_string_ref,
         handler_frame_new_ref,
@@ -9834,8 +9677,6 @@ fn prepare_per_fn_refs(
         handler_return_arm_refs_per_handle,
         user_fn_refs,
         lit_gvs,
-        div_zero_gv,
-        mod_zero_gv,
     }
 }
 
