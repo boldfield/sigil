@@ -448,3 +448,148 @@ travel through composition rather than absorbing into the trivial
 endo-functor case. Like P09/P10's status, the underlying generics
 machinery is shipped (Plan B Stage 5); only the function-type
 surface syntax blocks end-to-end execution.
+
+## P18 — Raise[String]-based safe parser for a small grammar
+
+**Prompt:** Write a Sigil program that declares `effect Raise { fail:
+(String) -> Int }`, defines `fn parse_token(token: Int) -> Int
+![Raise, IO]` whose body uses `match token { 0 => perform Raise.fail(
+"token zero is not allowed"), _ => token * 10 }` (treating `0` as the
+"invalid grammar" case for the toy parser, and any other `Int` as a
+successfully parsed token whose value is `token * 10`). In `main`,
+wrap a call to `parse_token(0)` in a `handle ... with { Raise.fail(
+msg, k) => { perform IO.println(msg); -1 } }` arm so that the
+recovery path prints the failure message via `perform IO.println`
+and the handle expression evaluates to `-1`. Then `perform IO.println(
+int_to_string(handled_value))` to print the recovered sentinel, and
+return `0`.
+
+**Oracle (stdout):**
+```
+token zero is not allowed
+-1
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises Plan B Stage 6 algebraic effects end-
+to-end: `effect ... { fail: (String) -> Int }` declaration with a
+`String`-payload op (Phase 4b perform-side args-buffer packing for
+pointer-typed args + Phase 4c arm-side arg unpacking on the
+pointer-typeless path), `match` body shape with one branch that
+performs and one that doesn't (Sync ABI synchronous run_loop driver
+per Phase 4d MVP since `match` doesn't match
+`is_simple_let_yield_then_pure_tail_body`), multi-stmt arm body `{
+perform IO.println(msg); -1 }` with discard-`k` semantics where the
+arm value (-1) flows to the handle expression's binding rather than
+through `parse_token`'s tail (Phase 4e captures+ colorer-handler-
+discharge refinement for use-`k`-or-discard-`k` arms across function-
+call boundaries). The "small grammar" framing is conceptual — `0` is
+the only invalid token in this minimum prompt; v2 prompts may extend
+to larger grammars once string-character-level primitives ship.
+Independent of the Stage-6-prerequisite checks: the arm-body's
+`perform IO.println(msg)` exercises that the top-level IO handler
+(installed by Task 57's main shim) is reachable from inside a
+nested user handler frame.
+
+## P19 — State[Int]-based counter threaded through a list walk
+
+**Prompt:** Declare `effect State { get: () -> Int, set: (Int) ->
+Int }` and a cons-list type `type IntList = | Nil | Cons(Int,
+IntList)`. Define `fn count_elements(xs: IntList) -> Int ![State, IO]`
+that walks the list and increments the State counter once per `Cons`
+cell via `let cur: Int = perform State.get(); let _: Int = perform
+State.set(cur + 1); count_elements(rest)`, returning `0` at the
+`Nil` base case. Define a higher-order helper `fn run_state(
+initial: Int, comp: () -> Int ![State, IO]) -> Int ![IO]` that
+discharges State by maintaining the threaded counter through
+handler arms returning lambdas-of-state (the canonical Koka/Effekt
+shape: `State.get(k) => fn(s) { k(s)(s) }`, `State.set(s', k) =>
+fn(_) { k(())(s') }`, `return(v) => fn(_) { v }`, applied to
+`initial`). In `main`, build a 5-element `IntList` (e.g., `Cons(10,
+Cons(20, Cons(30, Cons(40, Cons(50, Nil)))))`), `let final_count:
+Int = run_state(0, fn () -> Int ![State, IO] => count_elements(
+list))`, then `perform IO.println(int_to_string(final_count))`,
+return `0`.
+
+**Oracle (stdout):**
+```
+5
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** The literal algebraic-effects `run_state` higher-
+order helper requires both `TypeExpr::Fn` parameter types (the `comp:
+() -> Int ![State, IO]` shape) AND arm-body lambdas (the lambdas-of-
+state returned from `State.get` / `State.set` / `return` arms).
+`TypeExpr::Fn` is deferred (same status as P09 / P10 / P17 —
+Plan A2 → A3 → currently unscheduled for v1); arm-body lambdas are
+rejected at codegen.rs:1246-1257 with a Phase-4d-MVP-pointing
+diagnostic. Both lifts are post-Plan-B / Plan-C-or-later territory
+per `[DEVIATION Task 59]` and `[DEVIATION Task 61]`. Until both ship,
+this prompt is graded only against "program compiles"; the run
+portion of the oracle (stdout `"5"`, exit 0) is deferred. The
+underlying `State` effect dispatch + `count_elements` recursion +
+list walk all work in v1 — the deferral is specifically the higher-
+order `run_state` helper. A v1-expressible variant (the dual-handle
+pattern from `examples/state.sigil`, which doesn't thread state
+across calls but does exercise both `get` and `set` ops) is shipped
+as a working example; this prompt preserves the canonical literature
+shape for grading once the closure points close.
+
+## P20 — multi-shot Choose finds all (a, b) pairs with a + b == 7
+
+**Prompt:** Declare `effect Choose resumes: many { pick: (Int, Int)
+-> Int }` whose `pick(low, high)` op nondeterministically yields an
+`Int` in the inclusive range `[low, high]`. Define `fn pairs() ->
+Int ![Choose, IO]` that picks `let a: Int = perform Choose.pick(1,
+6); let b: Int = perform Choose.pick(1, 6);` and tests whether `a +
+b == 7`, printing the matching pair via `perform IO.println(int_to_-
+string(a * 10 + b))` (encoding `(a, b)` as a 2-digit decimal so the
+six expected pairs print as exactly `16`, `25`, `34`, `43`, `52`,
+`61`). Returns `0`. In `main`, wrap a call to `pairs()` in a
+`handle ... with { Choose.pick(low, high, k) => ... }` arm whose
+body iterates `k(v)` for `v ∈ [low, high]` (six resumes per pick
+site) and combines the results so the multi-shot enumeration
+exhausts all 36 `(a, b)` combinations, only six of which satisfy
+the `a + b == 7` predicate. Return `0`.
+
+**Oracle (stdout):**
+```
+16
+25
+34
+43
+52
+61
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Requires both (a) **multi-perform helper bodies**
+— `pairs()` performs `Choose.pick(...)` twice (once per pair member),
+which trips `is_simple_let_yield_then_pure_tail_body`'s "exactly one
+let stmt" cap at codegen.rs:10303-10305 and requires the chained-
+synth-cont extension named at codegen.rs:10286-10290; and (b) **N-
+resume arm body** — the `Choose.pick(low, high, k)` arm body needs
+to invoke `k` six times to enumerate `[1, 6]`, which trips Slice C
+v1's 2-let cap (negative-coverage e2e test
+`slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen`)
+and requires the Slice C N-chain extension named in `[DEVIATION
+Task 58]`. Both extensions are explicitly Plan-C-or-later territory;
+they bundle naturally because both share the chained-closure-record
+discipline. Until both ship, this prompt is graded only against
+"program compiles"; the run portion of the oracle (six pair lines on
+stdout, exit 0) is deferred per `[DEVIATION Task 61]`. The
+underlying multi-shot `Choose` machinery + recursive helpers + bool-
+to-Int conversion all work in v1 — the deferral is specifically
+the multi-perform-body and N-resume-arm shapes that the canonical
+all-pairs pattern requires. A v1-expressible variant via helper-
+recursion (the `pick_int(low, high)` idiom from `[DEVIATION Task 55]
+Phase 4e captures+` line 1507, recursing with `if perform Choose
+.flip() then low else pick_int(low+1, high)` to reach arbitrary
+`[low, high]` ranges using only the 2-let arm shape) ships as the
+basis for `examples/multishot_perf.sigil`; this prompt preserves
+the canonical literature shape for grading once the closure points
+close.
