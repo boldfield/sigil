@@ -942,6 +942,56 @@ fn arm_body_unsupported_construct(
             // Fall through; regular walker surfaces the specific
             // yield-able sub-shape in tail.
         } else {
+            // Plan B Task 58 — `arg2_expr` is lowered inside
+            // `post_arm_k_1`'s body (codegen.rs:6485). post_arm_k_1's
+            // env at construction (codegen.rs:6441-6442) only has
+            // `binding_name_1` (=r1); user op-args from the parent
+            // arm fn are NOT threaded into post_arm_k_1's closure
+            // record (which captures only (k_closure, k_fn) per the
+            // layout comment at codegen.rs:5480-5485). So
+            // `arg2_expr` referencing a user op-arg, an outer-scope
+            // capture, or any name other than `binding_name_1` /
+            // globals would panic at lower_expr's `Expr::Ident` arm
+            // (codegen.rs:7765 — `unreachable!("codegen: unknown
+            // ident...")`). Pre-Task-58 the gap was unreachable in
+            // practice (existing Slice C e2e tests use
+            // `Choose.flip: () -> Bool` — zero user op-args); Task
+            // 58's first `(Int) -> Int` multi-shot example surfaced
+            // it as an internal-compiler-error panic. This walker
+            // check converts the panic into a clean compile
+            // diagnostic pointing at the closure point.
+            //
+            // Reuse the Slice B/C tail free-var walker with
+            // extra_bindings = empty (no `binding_name_2` since it
+            // doesn't exist yet at the post_arm_k_1 lowering site).
+            // The walker's diagnostic strings reference "post-`k`
+            // tail" framing — wrap the diagnostic here with
+            // arg2-specific Slice C framing so the user knows the
+            // failing site.
+            let no_extras: BTreeSet<String> = BTreeSet::new();
+            if let Some(inner) = arm_body_post_arm_k_tail_free_vars_ok(
+                shape.arg2_expr,
+                shape.binding_name_1,
+                &arm.k_name,
+                globals,
+                &no_extras,
+            ) {
+                return Some(format!(
+                    "Slice C: arg2 of multi-let arm body (the second `{k}(arg2)` \
+                     call) references a name unavailable in `post_arm_k_1`'s env. \
+                     post_arm_k_1's closure record (per `[DEVIATION Task 55] Phase \
+                     4e captures+` Slice C v1) captures only (k_closure, k_fn), \
+                     plus its own arg `{r1}` from args_ptr[0]; user op-args from \
+                     the parent arm fn and outer-scope captures are NOT threaded \
+                     in. Reference `{r1}` (the let-1 binding) or globals only, or \
+                     defer to the future Slice C captures-bearing extension PR \
+                     (named in `[DEVIATION Task 58]` as the closure point for \
+                     threading user op-args into post_arm_k_1's closure record). \
+                     Underlying free-var diagnostic: {inner}",
+                    k = arm.k_name,
+                    r1 = shape.binding_name_1,
+                ));
+            }
             // Multi-let tail can reference both binding names.
             // Reuse Slice B's free-var walker with binding_name =
             // name_1 and extra_bindings = {name_2}.
