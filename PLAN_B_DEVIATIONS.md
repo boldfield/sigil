@@ -2261,7 +2261,7 @@ fn parse_token(token: Int) -> Int ![Raise, IO] {
 }
 
 fn main() -> Int ![IO] {
-  let result: Int = handle parse_token(5) with {
+  let result: Int = handle parse_token(0) with {
     Raise.fail(msg, k) => {
       perform IO.println(msg);
       -1
@@ -2272,7 +2272,7 @@ fn main() -> Int ![IO] {
 }
 ```
 
-Sigil v1's effects support `(String) -> Int` op signatures; the existing typecheck tests `effect_with_string_op_param_arg_typechecks_for_int_arg` and friends pin this surface. The "small grammar" framing is conceptual — the helper performs at exactly one site (an early-fail guard), so the body shape matches `match { ... => perform; _ => N }` (Sync ABI). The arm body `{ perform IO.println(msg); -1 }` exercises the multi-stmt arm-body shape with discard-`k` semantics. P18 is graded end-to-end.
+Sigil v1's effects support `(String) -> Int` op signatures; the discipline sweep `no_user_facing_error_uses_e0001` (compiler/src/typecheck.rs) exercises the literal `effect Raise { fail: (String) -> Int }` surface alongside other catalog-coverage cases. The "small grammar" framing is conceptual — the helper performs at exactly one site (an early-fail guard), so the body shape matches `match { ... => perform; _ => N }` (Sync ABI). The arm body `{ perform IO.println(msg); -1 }` exercises the multi-stmt arm-body shape with discard-`k` semantics. P18 is graded end-to-end.
 
 **P19 — graded against "compiles" until `run_state` higher-order lift ships.** A literal "`State[Int]`-based counter threaded through a list walk" requires the classic algebraic-effects `run_state(initial, comp)` higher-order helper — the handler's `State.get` arm returns a lambda-of-state, the handler's `State.set` arm returns a lambda-of-state, and `run_state` applies the handle expression's overall result-as-lambda to the initial state. This pattern requires both `TypeExpr::Fn` parameters (deferred per `examples/higher_order.sigil` lines 15-23) AND arm-body lambdas (rejected at codegen.rs:1246-1257) — both Plan-C-or-later territory pinned in `[DEVIATION Task 59]` for `examples/state.sigil`'s dual-handle workaround.
 
