@@ -517,6 +517,134 @@ fn multishot_perf_example_under_5s() {
     );
 }
 
+/// Plan B Task 60 — performance floor #4: arena allocator escape rate.
+/// Plan wording calls for "at most 1% of `NextStep` records escape to
+/// Boehm heap in a typical CPS-color run".
+///
+/// "Typical CPS-color run" is defined as `examples/multishot_perf.sigil`
+/// per `[DEVIATION Task 60]` — a representative program exercising
+/// both the canonical Slice C 2-let arm (heap-reifying k_closures) and
+/// the iterated handle-frame allocation pattern at non-trivial scale
+/// (1000 iterations × 2 multi-shot resumes).
+///
+/// **How the assertion runs.** The runtime instruments
+/// `sigil_arena_alloc` (every NextStep record arena-allocation,
+/// counter `ArenaAllocCount`) and `sigil_arena_promote` (every
+/// promote-to-Boehm-heap site, counter `ArenaEscapeCount`). At the
+/// program's atexit, `sigil_counter_print_all` writes every counter
+/// to stderr in `SIGIL_COUNTER_<NAME>=<value>` format (per
+/// `runtime/src/counters.rs:104-112`), gated on
+/// `SIGIL_PRINT_STATS=1` env var. We compile multishot_perf.sigil,
+/// run with SIGIL_PRINT_STATS=1, parse the counter dump from stderr,
+/// and assert `escape * 100 <= alloc` (integer arithmetic equivalent
+/// of escape ratio ≤ 1%).
+///
+/// **Sanity bound.** Also assert `alloc > 0` to guard against a
+/// future regression that silently disables arena allocation entirely
+/// (a 0/0 ratio would trivially pass `escape * 100 <= alloc` without
+/// exercising the arena machinery).
+///
+/// **What the bound means today.** No compiler-side site currently
+/// invokes `sigil_arena_promote` (escape sites are runtime-driven, and
+/// the v1 codegen doesn't trigger any). The expected escape_count is
+/// 0; the assertion is structural insurance against any future
+/// regression that introduces escape sites without tracking them
+/// against the 1% bound.
+///
+/// **Stdout invariant** mirrors the multishot_perf test: the sentinel
+/// "0\n" indicates run(1000) completed. Stderr contains the counter
+/// dump (after the program's own stderr output, which should be
+/// empty for this example).
+#[test]
+fn arena_escape_rate_under_one_percent() {
+    use std::process::Command;
+    let root = workspace_root();
+    let source = root.join("examples/multishot_perf.sigil");
+    let sigil_bin = sigil_binary();
+
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_arena_escape_rate_{}",
+        std::process::id()
+    ));
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to invoke sigil compiler");
+    assert!(
+        compile.status.success(),
+        "compile failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    let run = Command::new(&bin_path)
+        .env("SIGIL_PRINT_STATS", "1")
+        .output()
+        .expect("failed to execute compiled binary");
+
+    let _ = std::fs::remove_file(&bin_path);
+
+    let code = run.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "stdout sentinel mismatch (expected run(1000) to complete with \"0\\n\"); \
+         stderr={stderr:?}"
+    );
+
+    // Parse counter dump. Format: each line is `<NAME>=<u64>`.
+    let mut alloc: Option<u64> = None;
+    let mut escape: Option<u64> = None;
+    for line in stderr.lines() {
+        if let Some(rest) = line.strip_prefix("SIGIL_COUNTER_ARENA_ALLOC_COUNT=") {
+            alloc = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("SIGIL_COUNTER_ARENA_ESCAPE_COUNT=") {
+            escape = rest.trim().parse().ok();
+        }
+    }
+
+    let alloc = alloc.unwrap_or_else(|| {
+        panic!(
+            "ARENA_ALLOC_COUNT missing from --print-runtime-stats output; \
+             stderr={stderr:?}"
+        )
+    });
+    let escape = escape.unwrap_or_else(|| {
+        panic!(
+            "ARENA_ESCAPE_COUNT missing from --print-runtime-stats output; \
+             stderr={stderr:?}"
+        )
+    });
+
+    assert!(
+        alloc > 0,
+        "ARENA_ALLOC_COUNT = 0 — multishot_perf.sigil should exercise the \
+         arena allocator (1000 iterations × 2 multi-shot resumes); a 0/0 \
+         ratio would trivially pass the bound without verifying the \
+         machinery. stderr={stderr:?}"
+    );
+
+    // Integer arithmetic equivalent of `escape / alloc <= 1%`:
+    //   escape * 100 <= alloc
+    // Saturating multiply guards against overflow if a future regression
+    // produces an extreme escape count.
+    assert!(
+        escape.saturating_mul(100) <= alloc,
+        "arena escape rate exceeds 1% Plan B Task 60 floor: \
+         escape_count={escape}, alloc_count={alloc} \
+         (ratio = {escape}/{alloc} ≈ {pct}%, bound = 1%); \
+         stderr={stderr:?}",
+        pct = (escape as f64 / alloc as f64) * 100.0
+    );
+}
+
 // ===== Plan A2 Task 24 — Stage-2 codegen additional coverage ================
 //
 // These tests use inline-source programs so the canonical
