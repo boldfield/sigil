@@ -412,6 +412,59 @@ fn fib_perf_example_prints_6765_under_50ms() {
     );
 }
 
+/// Plan B Task 60 — performance floor #2: `examples/fib_cps_perf.sigil`
+/// computes the same 6765 result as the native `fib_perf` example but
+/// forces fib to CPS-color via a per-call `perform State.get()`. The
+/// plan's bound is **<500ms wall-clock on both hosts** (10× the native
+/// 50ms floor — the "trampolined arithmetic" 10× slowdown ceiling
+/// per Plan B Task 60).
+///
+/// **Compute path.** fib's body is `let _: Int = perform State.get();
+/// match n { 0 => 0, 1 => 1, _ => fib(n - 1) + fib(n - 2) }`. The
+/// `let _ = perform; match { ... }` shape does not match
+/// `is_simple_let_yield_then_pure_tail_body` (match arms contain
+/// recursive non-pure `fib(...)` calls), so fib falls through to
+/// `UserFnAbi::Sync` despite being `Color::Cps`. Each perform site
+/// routes through `lower_perform_to_value`'s synchronous
+/// `sigil_run_loop` driver — the Phase 4d MVP shape. ~17710
+/// synchronous handler dispatches dominate the wall-clock; that's the
+/// "trampolined arithmetic" the 10× ceiling governs.
+///
+/// **Why both arms registered.** Phase 4f latent op_id/arm_count
+/// constraint (the `examples/div_recover.sigil` /
+/// `examples/state.sigil` precedent for multi-op effect handlers):
+/// a partial handler runtime-aborts when the unhandled op fires.
+/// fib only performs `get`, but registering both `get` and `set`
+/// arms keeps `arm_count` matched to the 2-op `State` declaration.
+///
+/// **The `State[Int]` framing.** Plan wording uses `State[Int]`
+/// (design-doc convention for the fully-instantiated form); v1
+/// source uses `State` directly per `[DEVIATION Task 60]` — the
+/// monomorphic form parses + typechecks at the AST level, while
+/// the literal generic-parameterised `effect State[T]` shape is
+/// not exercised by any existing example or e2e test. Type-
+/// parameter granularity doesn't change the colorer's CPS-coloring
+/// decision (which depends only on whether non-IO performs occur).
+///
+/// Invariant: stdout = "6765\n", stderr = "", exit 0, wall-clock <
+/// 500ms.
+#[test]
+fn fib_cps_perf_example_prints_6765_under_500ms() {
+    let root = workspace_root();
+    let source = root.join("examples/fib_cps_perf.sigil");
+    let (stdout, stderr, code, elapsed) =
+        compile_file_and_run_timed(&source, "fib_cps_perf_example");
+    assert_eq!(code, 0, "fib_cps_perf.sigil exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "6765\n",
+        "fib_cps_perf.sigil stdout must be exactly \"6765\\n\""
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "fib_cps_perf.sigil wall-clock {elapsed:?} exceeds the 500ms Plan B Task 60 floor (10× native fib_perf <50ms)",
+    );
+}
+
 // ===== Plan A2 Task 24 — Stage-2 codegen additional coverage ================
 //
 // These tests use inline-source programs so the canonical
