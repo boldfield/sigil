@@ -1014,6 +1014,21 @@ impl<'a> Parser<'a> {
             TokenKind::Match => self.parse_match_expr(),
             TokenKind::Fn => self.parse_lambda_expr(),
             TokenKind::Handle => self.parse_handle_expr(),
+            // Plan B Task 55, Phase 4e captures+ Slice B — a brace-
+            // delimited block at expression position parses as
+            // `Expr::Block(parse_block())`. Required for arm bodies
+            // of shape `Effect.op(k) => { let r: Ty = k(arg);
+            // pure_tail }` where the lambda-lifted post-arm-k
+            // continuation needs the `let` form to bind the k-call's
+            // result. Block expressions also parse cleanly in any
+            // other expression position (let-binding RHS, match-arm
+            // body, lambda body, parenthesised contexts) because
+            // `parse_expr` consistently dispatches through here.
+            // Fn bodies and if/else branches continue to call
+            // `parse_block` directly via dedicated parsers
+            // (`parse_fn_decl` / `parse_if_expr`), unaffected by
+            // this addition.
+            TokenKind::LBrace => self.parse_block().map(|b| Expr::Block(Box::new(b))),
             _ => {
                 self.err(tok.span.clone(), "expected an expression");
                 None
@@ -3097,5 +3112,63 @@ mod tests {
         assert_eq!(prog.items.len(), 2);
         assert!(matches!(prog.items[0], Item::Effect(_)));
         assert!(matches!(prog.items[1], Item::Fn(_)));
+    }
+
+    #[test]
+    fn block_parses_as_primary_expression_at_let_binding_rhs() {
+        // Plan B Task 55, Phase 4e captures+ Slice B — `parse_primary`
+        // accepts `TokenKind::LBrace` and produces `Expr::Block`. The
+        // change is broader than its motivating use case (arm body
+        // shape `Effect.op(k) => { let r = k(arg); pure_tail }`):
+        // block expressions parse cleanly in any expression position.
+        // This test pins one such non-arm-body context — a let-binding
+        // RHS — so a future grammar change that silently regresses
+        // block-as-expression in other positions fires here.
+        //
+        // Pre-Slice-B, this would error with "expected an expression"
+        // because `parse_primary` had no `LBrace` arm.
+        let prog = parse_clean(
+            "fn test() -> Int ![] {\n  \
+               let r: Int = { let y: Int = 1; y + 1 };\n  \
+               r\n\
+             }\n",
+        );
+        assert_eq!(prog.items.len(), 1);
+        let f = match &prog.items[0] {
+            Item::Fn(f) => f,
+            other => panic!("expected fn, got {other:?}"),
+        };
+        // The let RHS is the Block expression `{ let y = 1; y + 1 }`.
+        let r_let = match &f.body.stmts[0] {
+            crate::ast::Stmt::Let(l) => l,
+            other => panic!("expected Stmt::Let, got {other:?}"),
+        };
+        match &r_let.value {
+            Expr::Block(_) => {}
+            other => panic!("expected Expr::Block at let RHS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_parses_as_primary_expression_at_arm_body() {
+        // Slice B's motivating use case — `Effect.op(k) => { let r =
+        // k(arg); tail }` shape. Pin that the arm body's `Expr` is a
+        // Block carrying a Stmt::Let with a k-call value.
+        let prog = parse_clean(
+            "effect Raise { fail: () -> Int }\n\
+             fn main() -> Int ![IO] {\n  \
+               let n: Int = handle 42 with {\n    \
+                 Raise.fail(k) => { let r: Int = k(99); r + 1 },\n  \
+               };\n  \
+               perform IO.println(int_to_string(n));\n  \
+               0\n\
+             }\n",
+        );
+        // Items: effect Raise + fn main. fn main's body has `let n: Int
+        // = handle ... with { Raise.fail(k) => { ... } }; ...`. We just
+        // need to confirm the program parsed cleanly with the arm body
+        // shape we expect — full-AST navigation is overkill for the
+        // pin's purpose (catch grammar regression).
+        assert_eq!(prog.items.len(), 2);
     }
 }

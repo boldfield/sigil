@@ -1877,35 +1877,51 @@ fn arm_captures_outer_scope_returns_value() {
 }
 
 #[test]
-fn arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen_phase_4e_pending() {
-    // Plan B Task 55 (Phase 4d MVP) — Phase 4e closure point:
-    // captures from the surrounding fn's *closure record* (handle
-    // inside a synthetic lambda fn) stay rejected. Phase 4d MVP's
-    // closure-record allocation reads values out of `Lowerer.env`
-    // by name; a name only present as a `ClosureEnvLoad` slot on
-    // the surrounding fn's closure_ptr is invisible to that lookup.
-    // Closing this requires extending closure_convert with a per-
-    // synthetic-fn (name, kind, index) side-table so codegen can
-    // emit a `lower_closure_env_load` against the surrounding fn's
-    // closure_ptr to source the env_expr. That extension lifts
-    // alongside Phase 4e's calling-convention shift (colorer's
-    // handler-discharge refinement) per the deviation entry.
+fn arm_inside_lambda_captures_outer_via_closure_env_load_returns_value() {
+    // Plan B Task 55, Phase 4e captures+ Slice D — `Expr::Handle`
+    // inside a `Lambda` whose body captures outer-scope names.
     //
-    // Test inverts to a positive test (returns 7) when Phase 4e
-    // ships. Walker diagnostic now points at Phase 4e (NOT 4d).
-    // This is `arm_captures_outer_scope_returns_value`'s sibling for
-    // the closure-of-surrounding-lambda case.
+    // This is the inversion of the Phase 4d MVP `#[ignore]`'d test
+    // `arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen_phase_4e_pending`.
+    // Pre-Slice-D the walker rejected `Expr::ClosureEnvLoad` in
+    // arm bodies with a "Phase 4e captures-of-surrounding-lambda"
+    // diagnostic; post-Slice-D the walker accepts the shape and
+    // codegen sources the capture's value via
+    // `lower_closure_env_load(idx, kind)` against the lambda's
+    // `closure_ptr` (in scope at handle codegen time because the
+    // surrounding fn IS the lifted lambda).
+    //
+    // Trace:
+    // - `let x: Int = 7;` in main.
+    // - The lambda `fn (_d: Int) -> Int ![IO] => handle ...` captures
+    //   `x` from main's scope. closure_convert lifts it into a
+    //   synthetic top-level fn with a closure record holding `x`.
+    //   References to `x` inside the lambda body get rewritten to
+    //   `Expr::ClosureEnvLoad { name: "x", index: <lambda_slot>, .. }`.
+    // - The arm body `E.op(k) => x` becomes `E.op(k) =>
+    //   ClosureEnvLoad { name: "x", index: <lambda_slot>, .. }` after
+    //   closure_convert. Slice D pre-pass scans this for matching
+    //   names per arm capture and populates `ArmCapture::lambda_source =
+    //   Some((<lambda_slot>, <kind>))`.
+    // - The IIFE invocation `(fn ... => ...)(0)` triggers the
+    //   handle expression. The arm fires (E.op is performed in the
+    //   handle body); at handle codegen time inside the lifted
+    //   lambda, the ARM's closure record alloc sources `x`'s value
+    //   via `lower_closure_env_load(<lambda_slot>, Int)` against the
+    //   lambda's `closure_ptr` (which holds `[7]` at runtime). The
+    //   value 7 is stored at the arm's closure-record slot 0.
+    // - The arm fn at runtime reads `x` from the arm's closure_ptr
+    //   slot 0 (via `rewrite_arm_body_with_captures`'s ARM-LOCAL
+    //   re-indexing) and returns it.
+    //
+    // Expected stdout: `"7\n"`.
     //
     // Sigil v1's `TypeExpr::Fn` surface syntax is deferred (see
     // examples/higher_order.sigil's preamble note + the Plan A2 Task
-    // 30 carryover), so the lambda has to be invoked as an IIFE
-    // rather than let-bound and called by name.
-    // Sigil v1's `TypeExpr::Fn` surface syntax is deferred (see
-    // examples/higher_order.sigil's preamble note + the Plan A2 Task
-    // 30 carryover), so the lambda has to be invoked as an IIFE
-    // rather than let-bound and called by name. The closure_convert
-    // rewrite of the captured `x` → `ClosureEnvLoad` happens the
-    // same way for an IIFE'd lambda as for a let-bound one.
+    // 30 carryover), so the lambda is invoked as an IIFE rather
+    // than let-bound and called by name. The closure_convert rewrite
+    // of the captured `x` → `ClosureEnvLoad` happens the same way
+    // for an IIFE'd lambda as for a let-bound one.
     let src = "effect E { op: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let x: Int = 7;\n  \
@@ -1915,39 +1931,13 @@ fn arm_inside_lambda_captures_outer_via_closure_env_load_is_rejected_at_codegen_
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4c_closure_env_load_reject_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4c_closure_env_load_reject_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail — arm body captures `x` via ClosureEnvLoad after \
-         closure_convert; got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("ClosureEnvLoad")
-            || stderr.contains("surrounding fn's closure record")
-            || stderr.contains("Phase 4e"),
-        "error message should reference closure-env-load / surrounding-fn closure / \
-         Phase 4e; got stderr={stderr:?}",
+    let (stdout, stderr, code) = compile_and_run(src, "slice_d_arm_inside_lambda_captures_outer");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "Slice D: arm body inside a synthetic lambda fn captures `x` from \
+         the lambda's closure record via `lower_closure_env_load`. Arm fires \
+         on `perform E.op()`, returns `x = 7`. stderr={stderr:?}"
     );
 }
 
@@ -2835,4 +2825,581 @@ fn arm_body_with_inner_block_and_outer_capture_works() {
         compile_and_run(src, "phase4d_arm_body_nested_block_outer_capture");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "12\n", "expected 5 + 7; stderr={stderr:?}");
+}
+
+#[test]
+fn slice_b_arm_body_let_then_pure_tail_post_arm_k_synth_fn_fires() {
+    // Plan B Task 55, Phase 4e captures+ Slice B — non-tail `k` use
+    // in arm bodies via lambda-lifted post-arm-k synth fn.
+    //
+    // The arm body `Raise.fail(k) => let r: Int = k(99); r + 1`
+    // matches `arm_body_let_then_pure_tail_shape` and the pre-pass
+    // allocates a separate FuncId for the post-arm-k synth fn. The
+    // post-arm-k synth fn body lowers `r + 1`, returning `Done(r+1)`.
+    //
+    // Runtime trace:
+    //   - main calls helper() via the native↔CPS interop wrapper.
+    //   - helper performs Raise.fail with k_fn = its own synth-cont.
+    //   - Arm fires `let r = k(99); r + 1`:
+    //       Call(helper_synth_cont, [99, null, post_arm_k_addr])
+    //   - Trampoline dispatches helper_synth_cont:
+    //       reads x=99 from args_ptr[0],
+    //       reads post_arm_k pair from args_ptr[1..3],
+    //       lowers helper's tail `x` → 99,
+    //       dispatches Call(null, post_arm_k_addr, [99]).
+    //   - Trampoline dispatches post-arm-k synth fn:
+    //       reads r=99 from args_ptr[0],
+    //       lowers `r + 1` → 100,
+    //       returns Done(100).
+    //   - run_loop returns 100 to main.
+    //
+    // Expected stdout: "100\n".
+    //
+    // A regression here would surface as:
+    //   - `99` printed: post-arm-k synth fn never fired (helper's
+    //     synth-cont didn't dispatch the trailing pair, OR the arm
+    //     fn packed args_len=1 instead of 3, OR identity was reached
+    //     with args_len=1 directly).
+    //   - Crash inside post-arm-k synth fn: bad binding read (wrong
+    //     offset / wrong type narrow) OR tail expression lowering
+    //     mismatch.
+    //   - Crash on `args_len == 1 || args_len == 3` assert: codegen
+    //     emitted an unexpected args shape.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let r: Int = k(99);\n      \
+                     r + 1\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_b_post_arm_k_let_then_pure");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "100\n",
+        "Slice B let-then-pure-tail: post-arm-k synth fn fires after \
+         helper's synth-cont, computes r + 1 = 99 + 1 = 100. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_b_arm_body_let_then_pure_tail_with_non_trivial_pure_arg() {
+    // Slice B coverage variation (PR #27 mid-flight at e5991a9
+    // review item 7): `arg_expr` is a pure compound expression
+    // (`99 + 1`), not just a literal. Exercises the arg lowerer's
+    // widen path under a Binary expression. Expected stdout: "101"
+    // (= (99 + 1) + 1).
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => { let r: Int = k(99 + 1); r + 1 },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_b_post_arm_k_non_trivial_arg");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "101\n",
+        "Slice B non-trivial arg: arg = 99 + 1 = 100; r = 100; r + 1 = 101. \
+         stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_b_arm_body_let_then_pure_tail_with_global_in_tail() {
+    // Slice B coverage variation: `tail_expr` references the
+    // `int_to_string` global (along with `r`). Exercises the
+    // free-var walker's `globals.contains` branch beyond the
+    // `r`-only path. The tail's overall result type is String,
+    // exercising the binding_ty=Int but tail_ty=String code paths
+    // (per the post-arm-k synth fn's I64 widen).
+    //
+    // Note: `int_to_string` is an Int->String fn; helper's tail
+    // type is Int, so `r` is bound as Int; the post-arm-k tail
+    // calls `int_to_string(r)` which is a Call expression — not
+    // pure per `expr_is_pure`. So this shape is NOT directly
+    // accepted by Slice B's classifier today (Calls are rejected
+    // by purity). This rejection is correct: a future captures-
+    // bearing or purity-relaxing extension would lift it.
+    //
+    // The variation we CAN test today is a tail computation that
+    // uses a global as a value, e.g. an Ident reference. Sigil
+    // doesn't currently have global Int constants, so we approximate
+    // by using a top-level fn name as a value (also a global) — but
+    // that's not a useful runtime computation. Instead, defer this
+    // coverage variation to the captures-bearing extension that
+    // permits Calls in tails. The unit test
+    // `arm_body_post_arm_k_tail_free_vars_accepts_binding_plus_globals`
+    // pins the walker's globals-membership branch directly.
+    //
+    // No e2e test is added here because no parseable shape exercises
+    // it under Slice B's purity restriction. Documenting the gap.
+}
+
+#[test]
+fn slice_b_arm_body_post_arm_k_tail_referencing_op_arg_is_rejected_at_codegen() {
+    // Slice B negative coverage (PR #27 mid-flight at e5991a9
+    // review item 6): tail references an op-arg, which is outside
+    // `{r} ∪ globals`. Walker rejects with the captures-bearing-
+    // extension-pointing diagnostic.
+    //
+    // Op `Raise.fail(n: Int)` takes one arg `n`; arm body
+    // `Raise.fail(n, k) => { let r: Int = k(99); r + n }` references
+    // `n` (op-arg) in the post-arm-k tail. Future captures-bearing
+    // extension would alloc a closure record at the arm-fn body
+    // emit and read it in the post-arm-k synth fn.
+    let src = "effect Raise { fail: (Int) -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail(7);\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(arg, k) => { let r: Int = k(99); r + arg },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "slice_b_reject_op_arg_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_b_reject_op_arg_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: post-arm-k tail references op-arg `arg`. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("captures-bearing extension") || stderr.contains("`arg`"),
+        "diagnostic should point at the captures-bearing extension or name `arg`; \
+         got stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_b_arm_body_post_arm_k_tail_referencing_k_is_rejected_at_codegen() {
+    // Slice B negative coverage: tail references the continuation
+    // `k` directly. Walker rejects with the Slice-C-pointing
+    // diagnostic (multi-shot / further-non-tail uses).
+    //
+    // arm body `Raise.fail(k) => { let r: Int = k(99); k }` would
+    // try to use `k` as a value in tail position. Slice B rejects.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => { let r: Int = k(99); k },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp =
+        std::env::temp_dir().join(format!("slice_b_reject_k_ref_{}.sigil", std::process::id()));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_b_reject_k_ref_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: post-arm-k tail references `k`. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn slice_b_post_arm_k_synth_fn_lowered_tail_type_differs_from_op_return_type() {
+    // Pins the Slice B post_arm_k synth fn's "actual lowered tail
+    // Cranelift type vs. pre-stored op return type" fix from
+    // `113b7da`. Without this regression test, a future refactor
+    // that re-introduces a pre-stored `tail_ty = body_ty` (op's
+    // declared return type) would silently break only when the
+    // arm's tail expression type differs from the op's return type.
+    //
+    // Slice B's original e2e tests all used `Raise.fail: () -> Int`
+    // with arm tail also Int — `body_ty` (= op return type) matched
+    // the tail's lowered type so the bug never surfaced. Slice C's
+    // `Choose.flip: () -> Bool` incidentally exposed it.
+    //
+    // To force the divergence at Slice B's path specifically, we
+    // need:
+    //   - Op return type: Bool (=> body_ty = I8 in the pre-pass).
+    //   - Arm tail type: Int (=> actual lowered Cranelift type = I64).
+    //
+    // The continuation `k`'s type is `T_op_ret -> T_helper_ret`, so
+    // we want `T_op_ret = Bool` (the perform's value passed to k)
+    // and `T_helper_ret = Int` (what the handle expression produces,
+    // = `r`'s declared type in the arm body).
+    //
+    //   effect Raise { fail: () -> Bool }     // T_op_ret = Bool
+    //   fn helper() -> Int ![Raise, IO] {     // T_helper_ret = Int
+    //     let b: Bool = perform Raise.fail();
+    //     if b { 1 } else { 0 }
+    //   }
+    //   arm: Raise.fail(k) => {
+    //     let r: Int = k(true);               // r: Int (= T_helper_ret)
+    //     r + 1                               // tail returns Int
+    //   }
+    //
+    // Pre-fix: post_arm_k synth fn compared the pre-stored
+    // `tail_ty == body_ty == I8` against I64, took the `< 64`
+    // branch, and emitted `uextend.i64 v_i64` — Cranelift's
+    // verifier rejects (uextend requires source < target).
+    //
+    // Post-fix: synth fn reads `dfg.value_type(tail_value) == I64`,
+    // skips the widen, ships terminal `Done(2)`.
+    //
+    // Runtime trace:
+    // - main calls helper.
+    // - helper performs Raise.fail() with k_fn = helper's synth-cont.
+    // - arm fires: k(true) → Call(helper_synth_cont, [true_widened_to_I64,
+    //   null, post_arm_k_addr]).
+    // - helper synth-cont reads b=true (narrows I64 → I8), lowers tail
+    //   `if b { 1 } else { 0 }` → 1, dispatches Call(post_arm_k_addr, [1]).
+    // - post_arm_k synth fn reads r=1 from args_ptr[0], lowers `r + 1`
+    //   → 2, returns Done(2).
+    let src = "effect Raise { fail: () -> Bool }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let b: Bool = perform Raise.fail();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let r: Int = k(true);\n      \
+                     r + 1\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_b_post_arm_k_body_ty_neq_tail_ty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "2\n",
+        "Slice B body_ty != tail_ty: op returns Bool, helper/handle/arm \
+         returns Int. k(true) → helper continues with b=true → tail = 1 \
+         → r = 1 → r + 1 = 2. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_args() {
+    // Plan B Task 55, Phase 4e captures+ Slice C — multi-shot `k`
+    // via the multi-let arm body shape `{ let r1 = k(arg1); let
+    // r2 = k(arg2); pure_tail }` for a `resumes: many` effect.
+    //
+    // The arm body invokes `k` twice with different args; each
+    // invocation drives the helper's synth-cont independently and
+    // produces a separate result. The pure tail combines both.
+    //
+    // helper:
+    //   `let b: Bool = perform Choose.flip(); if b then 1 else 0`
+    //   helper's body is the LetBindThenTail shape from PR #26's
+    //   `a5ee4c6` slice. helper synth-cont reads b from args_ptr[0],
+    //   computes the tail (1 if b, else 0), dispatches
+    //   Call(post_arm_k_*, [tail_value]).
+    //
+    // arm body:
+    //   `Choose.flip(k) => { let r1: Int = k(true); let r2: Int =
+    //                        k(false); r1 + r2 }`
+    //   - arm fn invokes k(true): packs Call(k_closure, k_fn, [true,
+    //     post_arm_k_1_closure, post_arm_k_1_fn]) where
+    //     post_arm_k_1_closure captures (k_closure, k_fn).
+    //   - helper synth-cont reads b=true, returns 1, dispatches
+    //     Call(post_arm_k_1, [1]).
+    //   - post_arm_k_1 reads r1=1, reads (k_closure, k_fn) from its
+    //     closure_ptr, allocates post_arm_k_2's closure with r1=1,
+    //     packs Call(k_closure, k_fn, [false, post_arm_k_2_closure,
+    //     post_arm_k_2_fn]).
+    //   - helper synth-cont reads b=false, returns 0, dispatches
+    //     Call(post_arm_k_2, [0]).
+    //   - post_arm_k_2 reads r2=0, reads r1=1 from closure_ptr,
+    //     computes r1 + r2 = 1, returns Done(1).
+    //
+    // Expected stdout: "1\n".
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_choose_multi_shot");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1\n",
+        "Slice C multi-shot: arm invokes k(true) → r1=1 (helper's tail with \
+         b=true), then k(false) → r2=0 (helper's tail with b=false); arm \
+         returns r1+r2 = 1. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_c_multi_let_arm_body_with_resumes_one_effect_is_rejected_at_codegen() {
+    // Slice C negative coverage: multi-let arm body shape is
+    // accepted only when the effect is declared `resumes: many`.
+    // For default `resumes: one` effects, the walker rejects with
+    // a Slice-C-pointing diagnostic.
+    //
+    // The typecheck E0220 linearity gate already rejects multi-`k`
+    // invocation in `resumes: one` arms; the codegen-side gate
+    // here mirrors it so the diagnostic surfaces with both the
+    // typecheck framing AND the Slice C framing.
+    let src = "effect Raise { fail: () -> Bool }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let b: Bool = perform Raise.fail();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "slice_c_reject_resumes_one_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_c_reject_resumes_one_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: multi-let arm on `resumes: one` effect. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen() {
+    // Slice C negative coverage: shape detector requires exactly 2
+    // `Stmt::Let`s. 3+ Lets are deferred to a future captures-bearing
+    // extension that generalises the chain to N.
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     let r3: Int = k(true);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "slice_c_reject_three_lets_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_c_reject_three_lets_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: 3-let arm body (Slice C v1 supports only 2). \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn slice_c_choose_multi_shot_with_string_chain_threads_pointer_through_closures() {
+    // Slice C pointer-typed chain variant. The reviewer flagged
+    // (PR #27 mid-flight at 113b7da) that the Slice C e2e test
+    // uses Int + Bool, which doesn't exercise the pointer-typed
+    // path at any of the three SSA-live-across-arena-allocs sites:
+    //   1. arm-fn body emit: `widened_arg1` lives across post_arm_k_1's
+    //      closure-record alloc + next_step_call.
+    //   2. arm-fn body emit: `post_arm_k_1_closure_ptr` (freshly
+    //      heap-alloc'd) lives across next_step_call.
+    //   3. post_arm_k_1 body: `widened_arg2` lives across
+    //      post_arm_k_2's closure-record alloc + next_step_call.
+    //
+    // This test forces String values through the chain by:
+    //   - helper returns String (so r1 and r2 are pointer-typed).
+    //   - r1's binding_kind_1 is `EnvSlotKind::String` → bitmap bit
+    //     1 set in post_arm_k_2's closure record (r1 is GC-rooted).
+    //   - tail returns `r2` (a String).
+    //
+    // If Boehm-precise GC is missing a root at any of the three
+    // sites, the String pointer would dangle after a GC sweep —
+    // either a crash or wrong output. Today the test passes because
+    // the strings are static literals (sigil_string_new returns
+    // pooled refs that don't get collected); a future test
+    // exercising fresh heap String allocations across the chain
+    // would harden this further.
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> String ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { \"yes\" } else { \"no\" }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: String = k(true);\n      \
+                     let r2: String = k(false);\n      \
+                     r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_choose_multi_shot_string");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "no\n",
+        "Slice C String-typed chain: r1=\"yes\" (helper(true)), r2=\"no\" \
+         (helper(false)); tail returns r2 = \"no\". stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_c_multi_let_arm_body_with_different_callee_in_second_let_is_rejected_at_codegen() {
+    // Slice C negative coverage: when the multi-let arm body's
+    // second `Stmt::Let` invokes a callee OTHER than the captured
+    // continuation `k`, the multi-let shape detector returns None
+    // (because both Lets must invoke the same k_name), and the
+    // regular arm-body walker fires instead — rejecting the first
+    // non-tail `k` call with the existing "non-tail k" diagnostic.
+    //
+    // This e2e pins the walker-level fall-through. The detector-level
+    // rejection is covered by
+    // `arm_body_multi_let_then_pure_tail_shape_rejects_different_k_names_in_lets`
+    // (unit test); this test pins the integration: source like
+    //
+    //   Choose.flip(k) => {
+    //     let r1: Int = k(true);
+    //     let r2: Int = different_fn(false);  // callee is NOT `k`
+    //     r1 + r2
+    //   }
+    //
+    // is rejected at codegen, even though the detector silently
+    // declines to match (so the rejection diagnostic comes from
+    // the non-tail-`k` walker, not from a multi-let-specific path).
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn different_fn(b: Bool) -> Int ![] { if b { 1 } else { 0 } }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = different_fn(false);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "slice_c_reject_diff_callee_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("slice_c_reject_diff_callee_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail: multi-let with non-`k` callee in 2nd Let — \
+         detector returns None; regular walker rejects 1st non-tail `k` call. \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
 }
