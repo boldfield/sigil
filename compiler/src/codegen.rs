@@ -13153,7 +13153,10 @@ mod tests {
             handle_body_ty: std::collections::BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
-        let mono = MonoProgram { anf };
+        let mono = MonoProgram {
+            anf,
+            lambda_captures_resolved: std::collections::BTreeMap::new(),
+        };
         let colored = crate::color::infer_colors(mono);
         assert_eq!(
             compute_user_fn_abi("f", &body, &[], &colored),
@@ -13229,7 +13232,10 @@ mod tests {
             handle_body_ty: std::collections::BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
-        let mono = MonoProgram { anf };
+        let mono = MonoProgram {
+            anf,
+            lambda_captures_resolved: std::collections::BTreeMap::new(),
+        };
         // Build ColoredProgram manually with `colors[("f")] = Native`,
         // overriding what `infer_colors` would have returned. This is
         // the test setup that pins the short-circuit; reordering the
@@ -13495,7 +13501,10 @@ mod tests {
                 handle_body_ty: std::collections::BTreeMap::new(),
             };
             let anf = crate::elaborate::AnfProgram { checked };
-            let mono = crate::monomorphize::MonoProgram { anf };
+            let mono = crate::monomorphize::MonoProgram {
+                anf,
+                lambda_captures_resolved: std::collections::BTreeMap::new(),
+            };
             crate::color::infer_colors(mono)
         };
 

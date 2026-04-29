@@ -128,6 +128,13 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
     // the rewriter can consume it without tangling borrows with the item
     // list below. The field is not read by any downstream pass.
     let all_captures = std::mem::take(&mut colored.mono.anf.checked.lambda_captures);
+    // Plan B' Stage 6.8 Phase C++ — per-clone resolved
+    // `lambda_captures` from monomorphize. When non-empty, takes
+    // precedence over `all_captures` for `(fn_name, span)` keys
+    // present here; falls back to `all_captures` (typecheck side-
+    // table, identity-substituted) for entries not in the per-clone
+    // map (non-generic programs, fn lambdas not yet seen by mono).
+    let lambda_captures_resolved = std::mem::take(&mut colored.mono.lambda_captures_resolved);
     let original_items = std::mem::take(&mut colored.mono.anf.checked.program.items);
 
     // Pre-scan for user fn names that would collide with `$lambda_N`
@@ -166,6 +173,8 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
 
     let mut conv = Converter {
         all_captures,
+        lambda_captures_resolved,
+        current_fn_name: None,
         counter: 0,
         hoisted: Vec::new(),
         hoisted_captures: BTreeMap::new(),
@@ -185,7 +194,12 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
             Item::Fn(mut f) => {
                 let param_names: BTreeSet<String> =
                     f.params.iter().map(|p| p.name.clone()).collect();
+                // Plan B' Stage 6.8 Phase C++ — set current_fn_name
+                // so `capture_at` can consult the per-clone
+                // `lambda_captures_resolved` map.
+                conv.current_fn_name = Some(f.name.clone());
                 f.body = conv.rewrite_block(f.body, &param_names, &[]);
+                conv.current_fn_name = None;
                 new_items.push(Item::Fn(f));
             }
         }
@@ -239,6 +253,19 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
 
 struct Converter {
     all_captures: Vec<(Span, Vec<(String, Ty)>)>,
+    /// Plan B' Stage 6.8 Phase C++ — per-clone-resolved
+    /// `lambda_captures` from monomorphize. Keyed by
+    /// `(current_fn_name, lambda_span)`. `capture_at` consults this
+    /// map first; falls back to `all_captures` when the key is
+    /// absent. For non-generic programs (mono fast path), this map
+    /// is empty and the fallback handles every lambda.
+    lambda_captures_resolved: BTreeMap<(String, Span), Vec<(String, Ty)>>,
+    /// Plan B' Stage 6.8 Phase C++ — name of the fn whose body is
+    /// currently being rewritten. Set in `convert()`'s outer fn
+    /// loop before `rewrite_block(f.body, ...)`. Used by
+    /// `capture_at` to key the per-clone `lambda_captures_resolved`
+    /// lookup.
+    current_fn_name: Option<String>,
     counter: usize,
     hoisted: Vec<Item>,
     /// Per-synthetic-lambda capture list, keyed by the synth fn's
@@ -293,6 +320,18 @@ struct ArmKContext {
 
 impl Converter {
     fn capture_at(&self, span: &Span) -> Vec<(String, Ty)> {
+        // Plan B' Stage 6.8 Phase C++ — prefer the per-clone
+        // resolved entry when current_fn_name is set and the key
+        // exists. Fall back to the typecheck side-table for
+        // non-generic programs / lambdas not yet seen by mono.
+        if let Some(fn_name) = &self.current_fn_name {
+            if let Some(caps) = self
+                .lambda_captures_resolved
+                .get(&(fn_name.clone(), span.clone()))
+            {
+                return caps.clone();
+            }
+        }
         self.all_captures
             .iter()
             .find(|(s, _)| s == span)

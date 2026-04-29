@@ -1152,7 +1152,10 @@ mod tests {
             handle_body_ty: BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
-        MonoProgram { anf }
+        MonoProgram {
+            anf,
+            lambda_captures_resolved: BTreeMap::new(),
+        }
     }
 
     #[test]

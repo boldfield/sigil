@@ -105,9 +105,23 @@ use crate::elaborate::AnfProgram;
 use crate::errors::Span;
 use crate::typecheck::{GenericInstantiation, Scheme, Ty};
 
+/// Plan B' Stage 6.8 Phase C++ — per-clone resolved
+/// `lambda_captures`. See `MonoProgram::lambda_captures_resolved`.
+pub type LambdaCapturesResolved = BTreeMap<(String, Span), Vec<(String, Ty)>>;
+
 #[derive(Clone, Debug)]
 pub struct MonoProgram {
     pub anf: AnfProgram,
+    /// Plan B' Stage 6.8 Phase C++ — per-clone resolved
+    /// `lambda_captures` keyed by (clone_fn_name, lambda_span).
+    /// closure_convert consumes this to source captures' Tys post-
+    /// monomorphize-substitution. For non-generic programs (the
+    /// fast-path skip), this map is empty and closure_convert
+    /// falls back to `CheckedProgram.lambda_captures` (the
+    /// pre-mono typecheck side-table); for generic programs each
+    /// fn clone populates per-(fn_name, span) entries with
+    /// `Ty::Var` resolved through the active substitution.
+    pub lambda_captures_resolved: LambdaCapturesResolved,
 }
 
 /// Run monomorphization on the post-elaborate IR. Returns the input
@@ -117,12 +131,15 @@ pub struct MonoProgram {
 pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
     let needs_mono = program_has_generics(&anf.checked.program);
     if !needs_mono {
-        return MonoProgram { anf };
+        return MonoProgram {
+            anf,
+            lambda_captures_resolved: BTreeMap::new(),
+        };
     }
 
-    let new_items = {
+    let (new_items, lambda_captures_resolved) = {
         let mono = Monomorphizer::new(&anf.checked);
-        mono.run()
+        mono.run_with_lambda_captures()
     };
 
     // Replace the AST and rebuild the types registry from the new
@@ -136,7 +153,10 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
         }
     }
     anf.checked.types = new_types;
-    MonoProgram { anf }
+    MonoProgram {
+        anf,
+        lambda_captures_resolved,
+    }
 }
 
 /// Quick check: does the program contain any generic decls? Skipping
@@ -349,6 +369,28 @@ struct Monomorphizer<'a> {
     output_fns: Vec<FnDecl>,
     /// Fully-cloned type decls in production order.
     output_types: Vec<TypeDecl>,
+    /// Plan B' Stage 6.8 Phase C++ — typecheck's per-Lambda-span
+    /// captures table. Read at clone time to populate
+    /// `lambda_captures_resolved` per (clone_fn_name, span). The
+    /// original is retained because non-generic fn paths (and the
+    /// fast-path skip for non-generic programs) consult it
+    /// directly via closure_convert; the per-clone resolved view
+    /// only matters for generic clones whose captures contain
+    /// `Ty::Var` references that need substitution.
+    lambda_captures: &'a Vec<(Span, Vec<(String, Ty)>)>,
+    /// Plan B' Stage 6.8 Phase C++ — per-clone resolved
+    /// `lambda_captures` keyed by (clone_fn_name, lambda_span).
+    /// Each entry's `Vec<(String, Ty)>` has the substitution
+    /// applied — for non-generic clones this is identity-equal to
+    /// the original entry; for generic clones it resolves
+    /// `Ty::Var(_)` to the concrete type-arg.
+    lambda_captures_resolved: LambdaCapturesResolved,
+    /// Plan B' Stage 6.8 Phase C++ — set in `clone_fn` before
+    /// rewriting the body, cleared after. The Lambda arm of
+    /// `rewrite_expr` reads this to record (current_clone_fn_name,
+    /// lambda_span) → resolved-captures entries in
+    /// `lambda_captures_resolved`.
+    current_clone_fn_name: Option<String>,
 }
 
 impl<'a> Monomorphizer<'a> {
@@ -391,10 +433,24 @@ impl<'a> Monomorphizer<'a> {
             type_seen: BTreeSet::new(),
             output_fns: Vec::new(),
             output_types: Vec::new(),
+            lambda_captures: &checked.lambda_captures,
+            lambda_captures_resolved: BTreeMap::new(),
+            current_clone_fn_name: None,
         }
     }
 
-    fn run(mut self) -> Vec<Item> {
+    /// Plan B' Stage 6.8 Phase C++ — same as `run` but also returns
+    /// the per-clone-resolved `lambda_captures` map populated during
+    /// fn cloning. Used by the slow path of `monomorphize()` so the
+    /// downstream `closure_convert` pass can read substituted Tys
+    /// for each clone's lambdas.
+    fn run_with_lambda_captures(self) -> (Vec<Item>, LambdaCapturesResolved) {
+        let mut this = self;
+        let items = this.run_inner_borrowed();
+        (items, this.lambda_captures_resolved)
+    }
+
+    fn run_inner_borrowed(&mut self) -> Vec<Item> {
         // Seed the worklist with main (zero type-args; main is non-
         // generic by construction — typecheck E0040 guards an absent
         // main). Main's reachability transitively pulls in every
@@ -438,10 +494,10 @@ impl<'a> Monomorphizer<'a> {
                 _ => {}
             }
         }
-        for td in self.output_types {
+        for td in std::mem::take(&mut self.output_types) {
             out.push(Item::Type(Box::new(td)));
         }
-        for f in self.output_fns {
+        for f in std::mem::take(&mut self.output_fns) {
             out.push(Item::Fn(Box::new(f)));
         }
         out
@@ -522,6 +578,11 @@ impl<'a> Monomorphizer<'a> {
         let subst = self.fn_subst(name, type_args);
         let mangled_name = mangle_fn(name, type_args);
 
+        // Plan B' Stage 6.8 Phase C++ — track the current clone's
+        // fn name so the Lambda arm of `rewrite_expr` can record
+        // resolved captures keyed by (mangled_name, lambda_span).
+        let saved_clone_name = self.current_clone_fn_name.replace(mangled_name.clone());
+
         let new_params: Vec<Param> = original
             .params
             .iter()
@@ -533,6 +594,8 @@ impl<'a> Monomorphizer<'a> {
             .collect();
         let new_return = self.rewrite_type_expr(&original.return_type, &subst);
         let new_body = self.rewrite_block(&original.body, &subst);
+
+        self.current_clone_fn_name = saved_clone_name;
 
         // Generic-params on the clone become empty — it's no longer
         // generic. Effect row variable is preserved per Plan B v1
@@ -816,21 +879,41 @@ impl<'a> Monomorphizer<'a> {
                 effect_row_var,
                 body,
                 span,
-            } => Expr::Lambda {
-                params: params
-                    .iter()
-                    .map(|p| Param {
-                        name: p.name.clone(),
-                        ty: self.rewrite_type_expr(&p.ty, subst),
-                        span: p.span.clone(),
-                    })
-                    .collect(),
-                return_type: self.rewrite_type_expr(return_type, subst),
-                effects: effects.clone(),
-                effect_row_var: effect_row_var.clone(),
-                body: Box::new(self.rewrite_expr(body, subst)),
-                span: span.clone(),
-            },
+            } => {
+                // Plan B' Stage 6.8 Phase C++ — record per-clone-
+                // resolved captures for this lambda. closure_convert
+                // consumes via `lambda_captures_resolved[(fn_name,
+                // span)]` so generic clones see substituted Tys
+                // instead of the original `Ty::Var`s recorded by
+                // typecheck.
+                if let Some(fn_name) = &self.current_clone_fn_name {
+                    if let Some((_, original_caps)) =
+                        self.lambda_captures.iter().find(|(s, _)| s == span)
+                    {
+                        let resolved_caps: Vec<(String, Ty)> = original_caps
+                            .iter()
+                            .map(|(n, t)| (n.clone(), subst.apply_to_ty(t)))
+                            .collect();
+                        self.lambda_captures_resolved
+                            .insert((fn_name.clone(), span.clone()), resolved_caps);
+                    }
+                }
+                Expr::Lambda {
+                    params: params
+                        .iter()
+                        .map(|p| Param {
+                            name: p.name.clone(),
+                            ty: self.rewrite_type_expr(&p.ty, subst),
+                            span: p.span.clone(),
+                        })
+                        .collect(),
+                    return_type: self.rewrite_type_expr(return_type, subst),
+                    effects: effects.clone(),
+                    effect_row_var: effect_row_var.clone(),
+                    body: Box::new(self.rewrite_expr(body, subst)),
+                    span: span.clone(),
+                }
+            }
             Expr::ClosureRecord {
                 code_fn_name,
                 env_exprs,

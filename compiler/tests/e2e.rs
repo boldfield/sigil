@@ -4561,6 +4561,38 @@ fn nested_handle_with_inner_lambda_in_arm_body_compiles() {
     );
 }
 
+/// Plan B' Stage 6.8 Phase C++ — generic surrounding fn with
+/// fn-typed captures. compose's body lambda captures f and g whose
+/// `Ty::Fn` types contain `Ty::Var(A)`/`Ty::Var(B)`/`Ty::Var(C)`
+/// before monomorphize. Phase C++ extends monomorphize's clone
+/// routine to populate `lambda_captures_resolved` keyed by
+/// `(clone_fn_name, lambda_span)` with substitution applied;
+/// closure_convert reads from that map first, falling back to the
+/// pre-mono typecheck side-table for non-generic fns.
+///
+/// `compose[A=Int, B=Int, C=Int](id_int, id_int)(42)` =
+/// id_int(id_int(42)) = 42.
+#[test]
+fn compose_body_via_closure_env_callees_returns_42() {
+    let src = "fn id_int(x: Int) -> Int ![] { x }\n\
+               fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] ![] {\n  \
+                 fn (x: A) -> C ![] => f(g(x))\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let composed: (Int) -> Int ![] = compose(id_int, id_int);\n  \
+                 let r: Int = composed(42);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "compose_body");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "compose body: lifted lambda dispatches f(g(x)) via two \
+         ClosureEnvLoad-callees → 42. stderr={stderr:?}"
+    );
+}
+
 /// Plan B' Stage 6.8 Task 107 (B.4 Phase A) — arm body IIFE that
 /// invokes a lambda inline (Task 108 example #2: `Raise.fail(k) =>
 /// (fn (n) => n + 1)(42)`). The lambda doesn't capture `k`, so
