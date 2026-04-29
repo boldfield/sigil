@@ -1589,19 +1589,76 @@ fn arm_body_walk(
             }
             None
         }
-        Expr::Lambda { .. } => Some(
-            "contains a nested lambda — lambdas in arm bodies require a \
-             closure-convert side-table extension distinct from Phase 4d MVP \
-             (closure point: future phase, beyond 4e's calling-convention shift)"
-                .to_string(),
-        ),
-        Expr::ClosureRecord { .. } => Some(
-            "contains a nested ClosureRecord (lambda lifted by closure_convert) — \
-             closures in arm bodies require a closure-convert side-table \
-             extension distinct from Phase 4d MVP (closure point: future phase, \
-             beyond 4e's calling-convention shift)"
-                .to_string(),
-        ),
+        Expr::Lambda { .. } => {
+            // Plan B' Stage 6.8 Task 107 (B.4 Phase A): closure_convert
+            // hoists every Lambda to a synthetic top-level fn before
+            // codegen runs. Reaching this arm means a pass-order
+            // invariant broke (closure_convert skipped a Lambda).
+            // Treat as defensive — same shape as Phase C+ Part 1's
+            // walker rejection of Lambda callees.
+            Some(
+                "contains an un-hoisted nested Lambda — closure_convert \
+                 should have rewritten this to ClosureRecord before codegen. \
+                 Invariant break, file a bug."
+                    .to_string(),
+            )
+        }
+        Expr::ClosureRecord {
+            code_fn_name,
+            env_exprs,
+            ..
+        } => {
+            // Plan B' Stage 6.8 Task 107 (B.4 Phase A): allow nested
+            // closure records (lifted lambdas) inside arm bodies,
+            // EXCEPT when the lambda captures the arm's continuation
+            // `k`. Capturing-and-calling-`k` is the canonical
+            // run_state shape from Plan B' Task 108, but it requires
+            // either materializing `k` as a real closure (with k_fn
+            // patched into code_ptr at arm prologue) OR splitting `k`
+            // into separate k_closure / k_fn slots in the lifted
+            // lambda's closure record. Both are Phase B work
+            // (Task 108's run_state-shape support); for Phase A,
+            // reject lambdas that capture `k` with a clearer
+            // diagnostic.
+            //
+            // The check: walk the ClosureRecord's env_exprs. If any
+            // env_expr is `Ident(k_name)` (capturing k via the
+            // surrounding arm body's lexical scope), reject. Other
+            // captures (op-args, outer-fn captures) are fine — they
+            // resolve to ordinary values that the lifted lambda's
+            // closure record stores at fixed offsets.
+            for env_expr in env_exprs {
+                match env_expr {
+                    Expr::Ident(name, _) if name == k_name => {
+                        return Some(format!(
+                            "contains a nested ClosureRecord (lifted lambda \
+                             `{code_fn_name}`) that captures continuation \
+                             `{k_name}` — Sigil v1 supports lambdas inside \
+                             arm bodies (Phase A) but capturing the arm's \
+                             continuation requires splitting `k` into \
+                             k_closure / k_fn slots in the lifted lambda's \
+                             closure record (deferred to Phase B / Plan B' \
+                             Task 108 run_state shape). As a workaround, \
+                             extract `k`'s usage to the arm body itself \
+                             rather than capturing it inside a lambda."
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            // Recurse into the env_exprs themselves so nested-shapes
+            // that violate other constraints still surface. The
+            // synth fn's body is a separate Item::Fn appended to
+            // `program.items`; its body is walked separately if
+            // unsupported_handle_construct walks it (it does — synth
+            // fns are walked alongside user fns).
+            for env_expr in env_exprs {
+                if let Some(r) = arm_body_walk(env_expr, scopes, k_name, globals, false) {
+                    return Some(r);
+                }
+            }
+            None
+        }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
                 if let Some(r) = arm_body_walk(&f.value, scopes, k_name, globals, false) {

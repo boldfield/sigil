@@ -4532,22 +4532,15 @@ fn handle_with_constant_return_arm_overrides_op_arm_yield() {
 }
 
 #[test]
-fn nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen() {
-    // Plan B Task 55 (Phase 4g) — walker-recursion regression
-    // sentinel post-Phase-4g. The previous sentinel
-    // (`nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic`)
-    // used inner-handle-with-return-arm; Phase 4g lifted that. This
-    // new sentinel uses inner-handle-with-nested-Lambda-in-arm-body
-    // — still rejected per the Phase 4d closure-convert restriction
-    // (lambdas in arm bodies need a closure-convert side-table
-    // extension distinct from Phase 4d MVP). Coverage: the outer
-    // walker must recurse into the inner `handle`'s arm body and
-    // surface the Lambda rejection.
-    //
-    // The inner handle's `Outer.op_in(k) =>` arm body contains a
-    // synthetic-Lambda IIFE (the only way to introduce a lambda in
-    // expression position under Sigil v1's surface — same pattern
-    // as Phase 4c's `arm_inside_lambda_captures_outer_via_closure_env_load`).
+fn nested_handle_with_inner_lambda_in_arm_body_compiles() {
+    // Plan B' Stage 6.8 Task 107 (B.4 Phase A) — INVERTED from the
+    // prior `..._is_rejected_at_codegen` rejection. Phase A drops
+    // the arm-body-Lambda / arm-body-ClosureRecord rejection in
+    // `arm_body_walk` for shapes that don't capture continuation `k`.
+    // The inner `Inner.op_in(k) => (fn (x) => x + 1)(0)` IIFE is
+    // discard-k and doesn't capture `k`, so it now compiles cleanly;
+    // both inner and outer `handle` bodies are `0` (no perform), so
+    // arms never fire — overall returns 0.
     let src = "effect Inner { op_in: () -> Int }\n\
                effect Outer { op_out: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
@@ -4559,13 +4552,73 @@ fn nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "phase4g_walker_recursion_inverted");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "B.4 Phase A: inner-handle-with-arm-body-IIFE compiles and runs; \
+         no perform → arm never fires → both handles return 0. stderr={stderr:?}"
+    );
+}
+
+/// Plan B' Stage 6.8 Task 107 (B.4 Phase A) — arm body IIFE that
+/// invokes a lambda inline (Task 108 example #2: `Raise.fail(k) =>
+/// (fn (n) => n + 1)(42)`). The lambda doesn't capture `k`, so
+/// Phase A's walker accepts; closure-convert hoists the lambda;
+/// codegen lowers the IIFE call as a direct dispatch.
+///
+/// `Raise.fail` is one-shot; the arm discards `k` (failure means
+/// no resume), returning 43 (= (n+1)(42)).
+#[test]
+fn arm_body_iife_returns_43() {
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle\n    \
+                   (perform Raise.fail()) + 100\n  \
+                 with {\n    \
+                   Raise.fail(k) => (fn (n: Int) -> Int ![] => n + 1)(42),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "arm_body_iife");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "43\n",
+        "B.4 Phase A: arm body IIFE — Raise.fail discards k, runs \
+         `(fn (n) => n+1)(42)` = 43. stderr={stderr:?}"
+    );
+}
+
+/// Plan B' Stage 6.8 Task 107 (B.4 Phase A) — rejection test for
+/// the k-capture shape that Phase B (Task 108 run_state) will lift.
+/// `Choose.flip(k) => fn (b: Bool) -> Int ![] => k(true)` returns
+/// a lambda that captures and calls `k`. After closure-convert, the
+/// arm body's ClosureRecord has `env_exprs: [Ident("k")]`; Phase A's
+/// walker rejects this with a Phase B-pointing diagnostic. Pin the
+/// rejection so Phase B inverts a known-state diff.
+#[test]
+fn arm_body_lambda_capturing_k_is_rejected_until_phase_b() {
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn run() -> Int ![IO] {\n  \
+                 let r: (Bool) -> Int ![] = handle\n    \
+                   fn (b: Bool) -> Int ![] => 0\n  \
+                 with {\n    \
+                   Choose.flip(k) => fn (b: Bool) -> Int ![] => k(true),\n  \
+                 };\n  \
+                 r(true)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _: Int = run();\n  \
+                 0\n\
+               }\n";
     let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase_4g_walker_recursion_{}.sigil",
+        "sigil_e2e_arm_lambda_captures_k_{}.sigil",
         std::process::id()
     ));
     std::fs::write(&tmp, src).expect("write source");
     let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase_4g_walker_recursion_{}",
+        "sigil_e2e_arm_lambda_captures_k_{}",
         std::process::id()
     ));
     let sigil_bin = sigil_binary();
@@ -4573,23 +4626,22 @@ fn nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen() {
         .arg(&tmp)
         .arg("-o")
         .arg(&bin_path)
-        .arg("--human-errors")
         .output()
         .expect("invoke sigil");
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&bin_path);
     assert!(
         !out.status.success(),
-        "compile must fail — inner nested handle has a Lambda/ClosureRecord in arm \
-         body (still pending); got success with stdout={:?} stderr={:?}",
+        "arm-body lambda capturing k must fail to compile until Phase B \
+         (run_state) ships; got success with stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("lambda") || stderr.contains("closure") || stderr.contains("Lambda"),
-        "error message should reference the inner handle's Lambda/ClosureRecord \
-         restriction; got stderr={stderr:?}",
+        stderr.contains("captures continuation"),
+        "expected Phase B-pointing diagnostic mentioning `captures continuation`; \
+         got stderr={stderr:?}"
     );
 }
 
