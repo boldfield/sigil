@@ -92,3 +92,27 @@ The bug is the **bind direction**. With two unbound vars, the existing logic alw
 **Failure mode.** A future test relying on the OLD non-deterministic bind direction would surface as a regression. None of the existing 552 tests do; the discipline sweep + Plan B Task 51's coverage tests pin the correct surface.
 
 **Implementing commit(s).** [HEAD+1] (this commit lands the deviation entry; the next commit lands the fix and Task 63).
+
+## 2026-04-29 — [DEVIATION Task 64] for_each deferred to v2; remaining list helpers ship under closed `![]` rows
+
+**Context.** Plan C Task 64's `std/list.sigil` enumerates eight helpers: `map`, `filter`, `fold`, `length`, `reverse`, `append`, `range`, `for_each`. Seven of the eight ship cleanly under closed `![]` effect rows — they're pure transformations that operate on a list and return a list / int / generic value. `for_each` is structurally different: it iterates and calls a side-effecting function for each element, with the per-element callback's effects threading through the iteration.
+
+A useful `for_each` requires three Sigil v1 surface features that are not currently expressible together:
+
+1. **A `Unit` literal expression.** The empty-list arm `Nil => ???` needs to produce a `Unit` value. Sigil v1 has `Ty::Unit` and uses it as the return type of `perform IO.println`, but no surface syntax constructs a `Unit` value directly. Today's only Unit-producing expressions are calls whose return type is Unit (e.g., `perform IO.println(...)`). With no element to operate on in the `Nil` arm, there's nothing to call.
+2. **Sequencing in match arm bodies.** The `Cons(h, t)` arm needs to do two things: invoke `f(h)` (for its side effect, discarding the Unit), then recurse via `for_each(t, f)`. Sigil v1 parses match arm bodies as expressions, not blocks; `=> { let _: Unit = f(h); for_each(t, f) }` is not accepted (the `{` after `=>` is a parse error per Plan B's `parse_handle_op_arm` / `parse_match_arm` shape).
+3. **Row-polymorphic fn-typed parameters.** Even with the above two solved, `f: (A) -> Unit ![]` (the closed-row form) is useless — pure-row callbacks can't print, mutate state, etc. A useful surface needs `f: (A) -> Unit ![ | e]` with the row variable threaded through `for_each`'s own row. This shape may parse today (top-level fn declarations support `![IO | e]`) but the cross-product with fn-typed-parameter typing isn't exercised in any existing test.
+
+The combined surface (Unit literal + arm-body sequencing + row-poly fn-typed params) is a genuine Plan C scope ask not enumerated by any of Plans A1–B'. Each of the three pieces is independently small; together they widen the language surface in ways that risk Plan C's "Do not change language semantics" guardrail.
+
+**Why accepted.** Shipping seven of eight list helpers immediately is strictly more useful than blocking on `for_each`. Callers needing per-element effects can write a direct recursive `match` helper today (the same shape these helpers use internally — see e.g. how `length` recurses). The seven shipped helpers cover the `range` / fold / map / filter / append / reverse / length surface that the spec validation prompts (Stage 9) actually exercise; `for_each` is a v2 ergonomics ask, not a Stage 9 blocker.
+
+**Closure path.** Closed when one of the three feature gaps lands and unlocks a useful `for_each`. Three orderings are viable:
+
+- **Path A (cheapest):** Add a `Unit` literal expression at the parser/elaborate layer (purely surface; Ty::Unit already exists). Combined with a separate sequencing primitive (e.g., a `seq` builtin that takes `(Unit, T)` and returns `T`), this lets `for_each` ship under closed `![IO]` row. Useful for the dominant printing-each-element case.
+- **Path B (cleaner):** Allow blocks as match arm bodies. Larger parser change but matches v2's intent.
+- **Path C (most general):** Row-polymorphic fn-typed parameter syntax. Needed regardless for full v2 effect ergonomics.
+
+**Failure mode.** None — the documentation on `std/list.sigil` is explicit that `for_each` is intentionally absent and points users at the "write a recursive match helper" workaround.
+
+**Implementing commit(s).** [HEAD] (this entry); shipped alongside `std/list.sigil` and the seven non-`for_each` helpers in [HEAD+1].
