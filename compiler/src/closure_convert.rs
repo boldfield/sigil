@@ -147,16 +147,16 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
     // Original user fns have empty capture lists at this layer (lambda
     // captures are attached to the `ClosureRecord` nodes inside their
     // bodies); synthetic `$lambda_N` fns report their captured names,
-    // indexed into the rewriter's side-table by the `N` from the name.
+    // looked up by name directly in `hoisted_captures` (Phase C+ Part 2
+    // R4 fixup: previously reverse-parsed `$lambda_N` → counter; the
+    // direct cross-reference avoids a silent failure mode if synth-fn
+    // naming changes).
     let captures: Vec<(String, Vec<String>)> = new_items
         .iter()
         .filter_map(|it| match it {
             Item::Fn(f) => {
-                let caps_names = f
-                    .name
-                    .strip_prefix("$lambda_")
-                    .and_then(|n_str| n_str.parse::<usize>().ok())
-                    .and_then(|n| hoisted_captures.get(&n))
+                let caps_names = hoisted_captures
+                    .get(&f.name)
                     .map(|v| v.iter().map(|(s, _)| s.clone()).collect())
                     .unwrap_or_default();
                 Some((f.name.clone(), caps_names))
@@ -165,23 +165,12 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
         })
         .collect();
 
-    // Plan B' Stage 6.8 Phase C+ Part 2 — build the typed captures
-    // map for codegen consumption. Keyed by synth fn name so the
-    // synth-fn Lowerer entry can look up its captures' Tys without
-    // re-walking the AST. Original user fns aren't synth and have no
-    // entry (their captures are nominally empty at this layer).
-    let captures_typed: BTreeMap<String, Vec<(String, Ty)>> = new_items
-        .iter()
-        .filter_map(|it| match it {
-            Item::Fn(f) => f
-                .name
-                .strip_prefix("$lambda_")
-                .and_then(|n_str| n_str.parse::<usize>().ok())
-                .and_then(|n| hoisted_captures.get(&n))
-                .map(|v| (f.name.clone(), v.clone())),
-            _ => None,
-        })
-        .collect();
+    // Plan B' Stage 6.8 Phase C+ Part 2 — typed captures map for
+    // codegen consumption. The `hoisted_captures` map is already
+    // keyed by synth fn name (R4 fixup), so this is a direct
+    // ownership transfer rather than a rebuild — original user fns
+    // aren't in the map (no synth entry was inserted for them).
+    let captures_typed: BTreeMap<String, Vec<(String, Ty)>> = hoisted_captures;
 
     colored.mono.anf.checked.program.items = new_items;
 
@@ -196,14 +185,13 @@ struct Converter {
     all_captures: Vec<(Span, Vec<(String, Ty)>)>,
     counter: usize,
     hoisted: Vec<Item>,
-    /// Per-synthetic-lambda capture list, keyed by the counter value
-    /// chosen for `$lambda_<N>`. A `BTreeMap` rather than a `Vec`
-    /// because `allocate_counter` skips values reserved by user-
-    /// defined `__lambda_N` top-level fns, so the index space is
-    /// potentially sparse. The program-level summary built at the end
-    /// of `convert` looks up each synthetic fn's `N` by parsing the
-    /// name and reading this map.
-    hoisted_captures: BTreeMap<usize, Vec<(String, Ty)>>,
+    /// Per-synthetic-lambda capture list, keyed by the synth fn's
+    /// name (`$lambda_<N>`). A `BTreeMap` keyed by name rather than
+    /// counter so the program-level summary at the end of `convert`
+    /// (and Phase C+ Part 2's typed-captures map) can look up by
+    /// fn name directly without reverse-parsing `$lambda_<N>` —
+    /// avoids a silent failure mode if synth-fn naming changes.
+    hoisted_captures: BTreeMap<String, Vec<(String, Ty)>>,
     /// Counter values that mangle to the same linker symbol as a
     /// user-defined top-level fn (`__lambda_N`). `allocate_counter`
     /// skips past any value in this set so synthetic names stay unique
@@ -476,7 +464,7 @@ impl Converter {
                     span: span.clone(),
                 };
                 self.hoisted.push(Item::Fn(Box::new(synthetic)));
-                self.hoisted_captures.insert(counter, caps);
+                self.hoisted_captures.insert(fn_name.clone(), caps);
 
                 Expr::ClosureRecord {
                     code_fn_name: fn_name,

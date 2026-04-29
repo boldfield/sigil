@@ -205,3 +205,42 @@ This catches the "test fails for the wrong reason" class of bug. The 3 tests tha
 **Closure path:** Plan C's spec validation work touches a lot of negative-shape coverage; folding the discipline retrofit into that work is the natural seam. New negative tests landing in Stage 6.8+ should include the E-code check.
 
 **Implementing commit(s):** R3 fixup commit documents this deviation; new tests already follow the discipline (`closure_env_load_callee_is_e0138_until_phase_c_plus` from R2 / `0baaa15`). Existing 9 tests deferred.
+
+## 2026-04-29 — [DEVIATION p17_compose blocker analysis] Two distinct issues, only one a real codegen surface
+
+**Context:** Plan B' Stage 6.8 PR #38 R4 review (Finding 5) flagged that the `p17_compose_source_rejects_until_typeexpr_fn_ships` rejection test stays asserting compile-fail even after Phase C+ Part 2 closes the ClosureEnvLoad-callee surface. The R4 reviewer asked: *"What additional surface? Phase C+ Part 2 covers ClosureEnvLoad-callees; compose's body shape `fn (x) => f(g(x))` should compose cleanly."*
+
+**Investigation:** compose's source has two distinct blockers, neither of which the R4 review's "additional generic surfaces" framing captured precisely:
+
+```sigil
+fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] {
+  fn (x: A) -> C ![] => f(g(x))
+}
+fn main() -> Int ![IO] {
+  let inc_then_format: (Int) -> String ![] =
+    compose(int_to_string, fn (n: Int) -> Int ![] => n + 1);
+  perform IO.println(inc_then_format(41));
+  0
+}
+```
+
+**Blocker 1 — per-arrow `![..]` syntax**. The line `fn compose[A, B, C](...) -> (A) -> C ![] {` only carries one `![..]` (for the inner returned `(A) -> C` fn-type). compose's own outer effect row needs a second `![..]` per the per-arrow discipline (see `[DEVIATION Task 103]` per-arrow effect-row entry). Without the second `![..]`, the parser surfaces an "expected `!` before effect row" error on the outer fn-decl. **Fix:** rewrite to `(A) -> C ![] ![]` — first `![]` for the inner fn-type, second for compose's row.
+
+**Blocker 2 — `int_to_string`-as-value**. `compose(int_to_string, ...)` passes the builtin `int_to_string` as a fn-typed argument. Phase C v1's closure-convert materializes `Ident(top_level_user_fn)` to `ClosureRecord`, but `int_to_string` is a builtin (seeded into typecheck's `fn_env`, not declared as `Item::Fn`), so it's NOT in `top_level_fn_names`. closure-convert leaves it as `Ident("int_to_string")`, and codegen's `lower_expr(Ident)` panics with "unknown ident" (via the `_` arm at codegen.rs:8657 since `int_to_string` isn't in `env`, isn't a registered ctor, and the user-fn closure record materialization branch only fires for user-defined fns).
+
+**Why accepted in v1:** Blocker 2 requires extending the closure-convert materialization path to cover builtins — either (a) seed `top_level_fn_names` with builtin names + add a synthetic ClosureRecord wrapper that codegen renders as a builtin call, or (b) at typecheck or earlier, rewrite `Ident(builtin)` in fn-value position to a wrapper fn. Both are post-v1 surfaces. Plan C's stdlib work would naturally close this when builtins migrate to user-Sigil shapes.
+
+**Workaround for compose's literal shape:** wrap `int_to_string` with a thin user-side fn:
+
+```sigil
+fn its(n: Int) -> String ![] { int_to_string(n) }
+// then: compose(its, ...)
+```
+
+This makes compose work end-to-end with Phase C v1 + Phase C+ surfaces.
+
+**Failure mode:** the existing `p17_compose_source_rejects_until_typeexpr_fn_ships` test continues to assert compile-fail. With the per-arrow fix alone (Blocker 1) the program reaches the `lower_expr(Ident("int_to_string"))` panic; the `assert!(!out.status.success())` still passes but for the wrong reason (per the R3 Finding 1 discipline gap). Task 109's example update should rewrite the prompt-bank P17 example to use a user-side wrapper instead of bare `int_to_string`.
+
+**Closure path:** Plan C's stdlib + builtin-as-fn-value work closes Blocker 2; Task 109 closes Blocker 1 (rewrite source) and inverts the rejection test once the rewritten source compiles cleanly via the Phase C+ surfaces.
+
+**Implementing commit(s):** R4 fixup commit (this commit) documents the analysis; Task 109 will rewrite the source to use the per-arrow-correct + user-wrapper-`its` shape and invert the rejection test.

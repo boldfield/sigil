@@ -705,33 +705,42 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
 }
 
 /// Plan B' Stage 6.8 Task 104 (R2 finding 1) — typed-diagnostic
-/// rejection of indirect-call callee shapes that Phase C v1 doesn't
-/// support. Walks the post-CC program. Returns `Some(msg)` when a
-/// `Call` whose callee is one of the unsupported shapes is found.
+/// rejection of indirect-call callee shapes that Phase C v1 +
+/// Phase C+ Parts 1 + 2 don't support. Walks the post-CC program.
+/// Returns `Some(msg)` when a `Call` whose callee is one of the
+/// unsupported shapes is found.
 ///
-/// **Phase C v1 supports:**
+/// **Currently supported callee shapes (post Phase C+ Part 2):**
 /// - `Call { callee: Ident(name), .. }` — direct dispatch (top-level
 ///   fn) or indirect (Ident-of-fn-typed-local, where `local_fn_types`
 ///   resolves the signature).
 /// - `Call { callee: ClosureRecord { .. }, .. }` — lambda IIFE / fn-
 ///   as-value at the call site, dispatched directly via the
 ///   ClosureRecord's `code_fn_name`.
+/// - `Call { callee: Call(..), .. }` — Phase C+ Part 1: call
+///   returning a fn-typed value (e.g., `make_adder(5)(7)`). Resolved
+///   via `call_callee_tys[call_span]` from typecheck.
+/// - `Call { callee: ClosureEnvLoad { .. }, .. }` — Phase C+ Part 2:
+///   captured fn-typed value invoked inside a synth lambda fn (e.g.,
+///   `compose`'s body `f(g(x))` where `f`/`g` are captured).
+///   Resolved via the synth fn's `captured_fn_sigs` map (sourced
+///   from `cc.captures_typed`).
 ///
-/// **Phase C v1 rejects (with E0138):**
-/// - `Call { callee: Call(..), .. }` — call returning a fn-typed
-///   value (e.g., `make_adder(5)(7)`). Needs recursive callee-type
-///   resolution (Phase C+).
-/// - `Call { callee: ClosureEnvLoad { .. }, .. }` — captured fn-typed
-///   value invoked inside a synth lambda fn (e.g., `compose`'s body
-///   `f(g(x))` where `f`/`g` are captured). Phase C+ extends
-///   `lower_call` to walk ClosureEnvLoad-callees.
+/// **Currently rejects (with E0138):**
+/// - `Call { callee: Lambda { .. }, .. }` — closure_convert should
+///   have rewritten any Lambda to ClosureRecord before this walker
+///   runs. Reaching this arm signals an invariant break.
+/// - Other callee shapes (Block, If, Match, Perform, Handle, …) are
+///   structurally not fn-valued at typecheck-accepted programs, so
+///   reaching this arm via a well-typed program is unreachable.
+///   The catchall stays as belt-and-braces.
 ///
 /// Pre-Phase-C, `lower_call`'s catchall `unreachable!()` was
 /// guarded by "Plan A2 cannot reach this arm from a well-typed
 /// program because TypeExpr::Fn is deferred." Phase A unlocked the
-/// surface; Phase C v1's `unreachable!()` becomes user-reachable
-/// for the unsupported shapes. This walker converts the panic into
-/// a typed Sigil diagnostic with the unsupported-callee span.
+/// surface; Phase C+ closes every shape we know how to handle. This
+/// walker converts any leftover panic into a typed Sigil diagnostic
+/// with the unsupported-callee span.
 pub(crate) fn unsupported_indirect_call_shape(program: &crate::ast::Program) -> Option<String> {
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
@@ -813,8 +822,11 @@ fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
                 }
                 _ => Some(format!(
                     "[E0138] {file}:{line}:{col}: indirect call through an \
-                     unsupported callee shape; Phase C v1 supports `Ident`, \
-                     `ClosureRecord`, and `Call(...)` callees only.",
+                     unsupported callee shape. Currently supported callee \
+                     shapes (Phase C v1 + Phase C+): `Ident`, \
+                     `ClosureRecord`, `Call(...)`, `ClosureEnvLoad`. \
+                     Reaching this arm via a well-typed program signals a \
+                     codegen invariant break — file a bug.",
                     file = span.file,
                     line = span.line,
                     col = span.column

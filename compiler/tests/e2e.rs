@@ -5254,3 +5254,83 @@ fn closure_env_load_callee_returns_42() {
          lambda → 42. stderr={stderr:?}"
     );
 }
+
+/// R4 finding 4 — Phase C+ Part 2 with a multi-param captured fn.
+/// Exercises the args-loop in `lower_call`'s sig builder via the
+/// ClosureEnvLoad path (Part 1 already exercises it via Ident path).
+#[test]
+fn closure_env_load_callee_multi_param_returns_7() {
+    let src = "fn add(a: Int, b: Int) -> Int ![] { a + b }\n\
+               fn caller(f: (Int, Int) -> Int ![]) -> Int ![] {\n  \
+                 let g: (Int, Int) -> Int ![] = fn (a: Int, b: Int) -> Int ![] => f(a, b);\n  \
+                 g(3, 4)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = caller(add);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "closure_env_load_multi_param");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "ClosureEnvLoad multi-param dispatch: caller(add) calls captured \
+         `f(a, b)` → 7. stderr={stderr:?}"
+    );
+}
+
+/// R4 finding 4 — Phase C+ Part 2 with an effect-bearing captured
+/// fn. Pins effect-row threading through the closure-record + indirect
+/// call when the captured value carries effects.
+#[test]
+fn closure_env_load_callee_effect_row_returns_42() {
+    let src = "fn announce(n: Int) -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 n\n\
+               }\n\
+               fn caller(f: (Int) -> Int ![IO]) -> Int ![IO] {\n  \
+                 let g: (Int) -> Int ![IO] = fn (x: Int) -> Int ![IO] => f(x);\n  \
+                 g(42)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _: Int = caller(announce);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "closure_env_load_effect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "ClosureEnvLoad effect-bearing capture: caller(announce) prints 42 \
+         via captured fn-typed value. stderr={stderr:?}"
+    );
+}
+
+/// R4 finding 4 (most load-bearing) — Phase C+ Part 2 with mixed
+/// capture kinds: a fn-typed capture `f` AND a non-fn capture `n`.
+/// The synth fn body uses both: `f(n) + n`. Pins that the
+/// `captures_typed` filter `if let Ty::Fn(sig) = cty` correctly
+/// keeps `n` in the env layout (so reads from offset 16 + 8*1 give
+/// the right value) WITHOUT putting `n` into `captured_fn_sigs`.
+/// If the filter mishandles iteration order, env slot offsets
+/// diverge between codegen's view and the synth fn's reads.
+#[test]
+fn closure_env_load_mixed_capture_kinds_returns_47() {
+    let src = "fn double(n: Int) -> Int ![] { n + n }\n\
+               fn caller(f: (Int) -> Int ![], n: Int) -> Int ![] {\n  \
+                 let g: (Int) -> Int ![] = fn (x: Int) -> Int ![] => f(x) + n;\n  \
+                 g(20)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = caller(double, 7);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "closure_env_load_mixed");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "47\n",
+        "Mixed-capture-kinds: lambda captures fn-typed `f` AND Int `n`. \
+         g(20) = f(20) + n = double(20) + 7 = 40 + 7 = 47. \
+         stderr={stderr:?}"
+    );
+}
