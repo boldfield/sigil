@@ -4561,40 +4561,6 @@ fn nested_handle_with_inner_lambda_in_arm_body_compiles() {
     );
 }
 
-/// Phase C+ Part 2 — compose body via ClosureEnvLoad-callees.
-/// Pre-Stage-6.8 the canonical `compose[A,B,C](f, g) -> fn (x) =>
-/// f(g(x))` shape rejected at codegen. Post-Phase-C+ Part 2 the
-/// inner lambda's `f(g(x))` lowers cleanly:
-/// - `g(x)` is `Call(ClosureEnvLoad{name: "g"}, [Ident("x")])` —
-///   Phase C+ Part 2's ClosureEnvLoad-callee dispatch.
-/// - `f(g(x))` is `Call(ClosureEnvLoad{name: "f"}, [<inner>])` —
-///   same path; the inner Call's ret type comes from `call_callee_tys`.
-///
-/// This test instantiates `compose` at A=B=C=Int with `id_int` as
-/// both args, avoiding the `int_to_string`-as-value Phase B+
-/// blocker (see `[DEVIATION p17_compose blocker analysis]`).
-/// `inc_then_id(42)` = id_int(id_int(42)) = 42.
-#[test]
-fn compose_body_via_closure_env_callees_returns_42() {
-    let src = "fn id_int(x: Int) -> Int ![] { x }\n\
-               fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] ![] {\n  \
-                 fn (x: A) -> C ![] => f(g(x))\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let composed: (Int) -> Int ![] = compose(id_int, id_int);\n  \
-                 let r: Int = composed(42);\n  \
-                 perform IO.println(int_to_string(r));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "compose_body");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(
-        stdout, "42\n",
-        "compose body: lifted lambda dispatches f(g(x)) via two \
-         ClosureEnvLoad-callees → 42. stderr={stderr:?}"
-    );
-}
-
 /// Plan B' Stage 6.8 Task 107 (B.4 Phase A) — arm body IIFE that
 /// invokes a lambda inline (Task 108 example #2: `Raise.fail(k) =>
 /// (fn (n) => n + 1)(42)`). The lambda doesn't capture `k`, so

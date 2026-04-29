@@ -264,3 +264,23 @@ This makes compose work end-to-end with Phase C v1 + Phase C+ surfaces.
 **Closure path:** Phase B follow-up commit closes both routes' design questions and ships one of them. Plan B' Stage 6.8 review checkpoint should surface the route decision before Phase B's implementation begins.
 
 **Implementing commit(s):** Task 107 Phase A (`703c011`) ships the arm-body-lambda lift for non-k-capturing shapes; Phase B + Task 108 examples #1 and #3 + Task 109's full state.sigil run_state rewrite all defer to a future commit pending the route decision.
+
+## 2026-04-29 — [DEVIATION Phase C+ Part 2 generic + fn-typed-capture] Generic lambda captures with fn-typed Ty::Var crash codegen
+
+**Context:** Phase C+ Part 2 (`a5ab4f9`) wired `cc.captures_typed` from closure_convert through to a new `Lowerer.captured_fn_sigs: BTreeMap<String, FnSig>` field. The map is populated at synth fn Lowerer init from the captures' typed metadata; codegen reads it for ClosureEnvLoad-callee dispatch.
+
+**The gap.** `lambda_captures` is populated by typecheck at the lambda's check-site, where generic params (declared on the surrounding fn) appear as `Ty::Var(_)` (not yet substituted to concrete types). For non-generic surrounding fns this is fine — no `Ty::Var` ever appears. For generic surrounding fns (e.g., `fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] ![] { fn (x: A) -> C ![] => f(g(x)) }`), the inner lambda's captures `f` and `g` carry `Ty::Fn(FnSig{params: [Ty::Var(A)], ret: Ty::Var(B), ...})`.
+
+**Why monomorphize doesn't fix it.** Monomorphize clones the generic fn for each concrete instantiation (e.g., `compose$$Int$$Int$$Int`) and rewrites the cloned AST with concrete TypeExprs. But `lambda_captures` is a typecheck-side side-table consumed by closure_convert *after* monomorphize; it's NOT rewritten per clone. closure_convert builds `captures_typed` directly from `lambda_captures` (via `hoisted_captures` which inherits the Tys verbatim), so `captures_typed` for a generic compose's clone still has `Ty::Var`.
+
+**The crash.** When codegen lowers an indirect call inside the lifted lambda's body, it calls `cranelift_ty_of_ty(&fty.ret, pointer_ty)` on the FnSig's params/ret. `cranelift_ty_of_ty`'s `Ty::Var(_)` arm is `unreachable!()` ("typecheck must resolve every var through unification before codegen runs"). Result: codegen panics.
+
+**Concrete failure.** A speculative `compose_body_via_closure_env_callees_returns_42` e2e test (committed as `4d272db`, reverted in this fixup commit) tripped the panic with `Ty::Var(7) reached cranelift_ty_of_ty`. Test source: `fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] ![] { fn (x: A) -> C ![] => f(g(x)) }` then `compose(id_int, id_int)(42)`. The lifted lambda's f/g captures have `Ty::Var(A)`, `Ty::Var(B)`, `Ty::Var(C)` since closure_convert sees the typecheck side-table directly.
+
+**Why accepted in v1:** non-generic `closure_env_load_callee_returns_42` and the multi-param/effect-row/mixed-kinds e2e tests (Phase C+ Part 2) all pass — the gap is generic-only. The canonical generic higher-order pattern (compose) needs Phase C++ work: monomorphize must rewrite `lambda_captures` (or its post-CC analog `captures_typed`) per clone with substitution applied, OR closure_convert must consume post-mono concrete TypeExprs and convert to FnSig at that point (rather than reading typecheck's pre-mono lambda_captures).
+
+**Failure mode:** programs declaring generic top-level fns whose body contains a lambda capturing fn-typed param/let bindings panic at codegen with `Ty::Var(N) reached cranelift_ty_of_ty`. Workaround: avoid generic context for fn-typed captures (use a non-generic wrapper fn).
+
+**Closure path:** Phase C++ work — either (a) monomorphize rebuilds `captures_typed` per clone applying the substitution, OR (b) closure_convert consumes post-mono TypeExprs from the FnDecl's params and converts via `ty_from_type_expr` at clone time, OR (c) at codegen time the synth fn's Lowerer applies the active substitution at lookup. Each route has trade-offs in pass-order coupling.
+
+**Implementing commit(s):** Phase C+ Part 2 (`a5ab4f9`) shipped the non-generic surface; the speculative `compose_body_via_closure_env_callees_returns_42` test in `4d272db` exposed the gap; this fixup commit reverts the test and documents the deviation. Phase C++ closure deferred to follow-up commit pending the route decision.
