@@ -1006,7 +1006,7 @@ fn catch_example_recovers_with_42() {
 /// - Stage-6.8-followup Layer 3c: trailing-triple `(k_closure,
 ///   k_fn, frame_ptr)` + handler frame re-push in lower_k_pair_call
 ///   + DISCHARGED preservation through outer_post_arm_k routing +
-///   closure_convert k-index two-pass.
+///     closure_convert k-index two-pass.
 ///
 /// **Trace.** See file header for the full algebraic trace.
 ///

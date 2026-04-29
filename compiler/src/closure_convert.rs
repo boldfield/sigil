@@ -618,11 +618,9 @@ impl Converter {
                     let mut k_ty_opt: Option<Ty> = None;
                     let mut filtered: Vec<(String, Ty)> = Vec::with_capacity(raw_caps.len());
                     for (cname, cty) in &raw_caps {
-                        if cname == arm_k {
-                            if matches!(cty, Ty::Fn(_)) {
-                                k_ty_opt = Some(cty.clone());
-                                continue;
-                            }
+                        if cname == arm_k && matches!(cty, Ty::Fn(_)) {
+                            k_ty_opt = Some(cty.clone());
+                            continue;
                         }
                         filtered.push((cname.clone(), cty.clone()));
                     }

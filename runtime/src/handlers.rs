@@ -853,7 +853,6 @@ pub unsafe extern "C" fn sigil_next_step_discharged(value: u64) -> *mut NextStep
 /// Safe to call. Returned pointer is valid until the next
 /// `sigil_arena_reset`.
 #[no_mangle]
-#[no_mangle]
 pub unsafe extern "C" fn sigil_next_step_call(
     closure_ptr: *mut u8,
     fn_ptr: *mut u8,
