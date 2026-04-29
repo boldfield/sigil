@@ -1,87 +1,85 @@
 // examples/state.sigil
 //
-// Plan B Task 59 — `State[Int]` counter via dual-handle pattern.
+// Plan B' Stage 6.8 Task 109 — `State[Int]` counter via the
+// canonical `run_state(initial, comp)` higher-order helper.
 //
-// **Why dual-handle, not `run_state`.** The classic algebraic-effects
-// `run_state(initial, comp)` higher-order helper requires both
-// (a) `TypeExpr::Fn` parameters (a `comp: () -> Int ![State, IO]`
-// argument shape; deferred per `examples/higher_order.sigil` lines
-// 15-23 — Plan A2 deferred to Plan A3, Plan A3 closed without it,
-// remains post-Plan-B), and (b) handler arm bodies returning
-// lambdas-of-state (rejected at codegen.rs:1246-1257). Both lifts
-// are post-Plan-B / Plan-C-or-later; v1 ships the demonstration
-// intent — exercising `State.get` and `State.set` through `handle`
-// dispatch — via two sequential `handle` expressions, one per op.
-// See `[DEVIATION Task 59]` in `boldfield/designs/PLAN_B_DEVIATIONS
-// .md` for the architectural framing.
+// **History.** Plan B Task 59 shipped this example as a dual-
+// handle workaround: two `handle` expressions, one per op,
+// because the literal `run_state` shape required two compiler
+// surfaces deferred to post-Plan-B territory:
+//   1. `TypeExpr::Fn` parameters (a `comp: () -> Int ![State]`
+//      argument shape) — closed by Plan B' Stage 6.8 B.3.
+//   2. Handler arm bodies returning lambdas-of-state — closed
+//      by Plan B' Stage 6.8 B.4 (Phase A: arm-body lambdas;
+//      Phase B: k-capturing lambdas via the trailing-pair
+//      convention).
+// With B.3 + B.4 shipped, the literal-literature shape works.
 //
-// **Structure.** Two helpers, two handles:
+// **Shape.** The classic CPS encoding of `State[Int]` over
+// algebraic effects: the handler folds the State effect into
+// a single fn-of-state. Each arm returns a `(Int) -> Int ![]`
+// lambda; the top-level `state_fn(initial)` applies the chain
+// against the seed, threading state through the chain of
+// continuations.
 //
-//   1. `read_value()` performs `State.get()`; helper's tail
-//      computes `count + 1` (the read value plus one). Handler's
-//      `get` arm resumes with `k(5)` — a fixed seed value. Result:
-//      5 + 1 = 6.
+// - `return(v) => fn (s) => v` — terminal: ignore final state,
+//   yield the computation's value.
+// - `State.get(k) => fn (s) => k(s)(s)` — feed s back as the
+//   read value (k(s)) AND keep s as the threaded state for the
+//   suspended computation's next resume.
+// - `State.set(arg, k) => fn (s) => k(arg)(arg)` — discard
+//   s; resume with arg as the set-call's return value AND
+//   thread arg as the new state.
 //
-//   2. `write_value()` performs `State.set(99)`; helper's tail
-//      is `prev` (the perform's return value, here echoed by the
-//      handler). Handler's `set` arm resumes with `k(arg)` —
-//      echoing the set value back. Result: 99.
+// **Why this shape exercises both lifts.**
+//   - `comp: () -> Int ![State]` — fn-typed parameter (B.3).
+//   - `comp` passed by name (`run_state(0, comp)`) —
+//     fn-as-value of a top-level user fn (Phase C v1).
+//   - Each arm body is a lambda capturing `k` (and `arg` for
+//     the set arm) — B.4 Phase B trailing-pair convention.
+//   - `k(s)(s)` — Phase C+ Part 1's recursive Call-of-Call
+//     dispatch on a fn-typed value returned from k.
+//   - The handle's overall result type is `(Int) -> Int ![]`
+//     — first-class fn-typed value flowing through let.
 //
-// Both handles register BOTH `get` and `set` arms (Phase 4f latent
-// op_id/arm_count constraint: a partial handler runtime-aborts when
-// the unhandled op fires; the `examples/div_recover.sigil`
-// precedent of registering all declared ops applies here for the
-// 2-op `State` effect). The unused arm in each handle is
-// unreachable in this program; its presence keeps `arm_count`
-// matched to the effect's declared op count (pinned by `#[ignore]`
-// 'd e2e `partial_handler_of_multi_op_effect_aborts_at_runtime_-
-// pending_resolution`; closes in a future post-Phase-4f task).
+// **Computation.** `comp` first sets state to 5, then reads
+// state, then returns state + 1. Tracing:
+//   - run_state(0, comp): state_fn = handle comp() with {...}
+//   - comp performs State.set(5) — set arm: returns
+//     fn (s) => k(5)(5). state_fn(0) drives this: applies
+//     to s=0 → k(5)(5).
+//   - k(5) resumes comp at the set call site with value 5
+//     (the set's return). comp continues, performs
+//     State.get() — get arm: returns fn (s) => k(s)(s).
+//     But this fn was built with the inner k, and we apply
+//     it to 5 (from k(5)(5)'s second arg). So inner-k(5)(5).
+//   - inner-k(5) resumes comp with state=5 (the get's return).
+//     comp computes 5 + 1 = 6 and returns naturally.
+//     return arm fires: fn (s) => 6. inner-k(5) returned this
+//     fn; apply to 5 → 6.
+//   - state_fn(0) = 6. main prints "6\n".
 //
-// **Helper body shapes.** Both helpers use the captures-free
-// `LetBindThenTail` shape (codegen.rs:10301) — single `let` of a
-// perform, pure tail referencing only the binding (no user-param
-// captures). Helper arity is 0 in both cases.
-//
-// **Why two helpers and not one.** A single helper with two
-// performs (`let count = perform State.get(); let prev = perform
-// State.set(count + 1); count + prev`) would need the chained-
-// synth-cont extension named at codegen.rs:10289 as a future
-// widening of `is_simple_let_yield_then_pure_tail_body`'s "exactly
-// one let stmt" cap. v1 supports exactly one perform per helper
-// body; sequencing the two ops requires sequencing two HELPERS
-// each with one perform. The dual-handle pattern is the v1
-// expressibility of state-bearing State usage.
-//
-// **Independence asserted at the source level.** The two handles
-// use independent values (read returns 6, write returns 99); the
-// e2e test pins both lines of stdout. Any cross-handle leak (e.g.,
-// state from the first handle's get arm bleeding into the second
-// handle's set arm) would change the printed digits.
-//
-// Invariant: stdout reads `6\n99\n` (two lines, exit 0).
+// Invariant: stdout = "6\n", exit 0.
 
 effect State { get: () -> Int, set: (Int) -> Int }
 
-fn read_value() -> Int ![State, IO] {
-  let count: Int = perform State.get();
-  count + 1
+fn comp() -> Int ![State] {
+  let _: Int = perform State.set(5);
+  let n: Int = perform State.get();
+  n + 1
 }
 
-fn write_value() -> Int ![State, IO] {
-  let prev: Int = perform State.set(99);
-  prev
+fn run_state(initial: Int, c: () -> Int ![State]) -> Int ![] {
+  let state_fn: (Int) -> Int ![] = handle c() with {
+    return(v) => fn (s: Int) -> Int ![] => v,
+    State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),
+    State.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),
+  };
+  state_fn(initial)
 }
 
 fn main() -> Int ![IO] {
-  let read: Int = handle read_value() with {
-    State.get(k) => k(5),
-    State.set(arg, k) => k(arg),
-  };
-  let written: Int = handle write_value() with {
-    State.get(k) => k(0),
-    State.set(arg, k) => k(arg),
-  };
-  perform IO.println(int_to_string(read));
-  perform IO.println(int_to_string(written));
+  let result: Int = run_state(0, comp);
+  perform IO.println(int_to_string(result));
   0
 }
