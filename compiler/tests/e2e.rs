@@ -4443,7 +4443,8 @@ fn handle_with_op_arm_discharge_skips_return_arm() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_bug2_discharge_skips_return");
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_bug2_discharge_skips_return");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "99\n", "stdout mismatch; stderr={stderr:?}");
 }
@@ -4609,7 +4610,8 @@ fn handle_returning_fn_typed_value_with_op_arm_discharge_runs() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_bug2_fn_typed_handle_discharge");
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_bug2_fn_typed_handle_discharge");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "107\n", "stdout mismatch; stderr={stderr:?}");
 }
@@ -4686,8 +4688,7 @@ fn cps_effected_fn_typed_parameter_indirect_call_returns_correct_value() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "stage_6_8_followup_layer3b_cps_indirect");
+    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_layer3b_cps_indirect");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "42\n", "stdout mismatch; stderr={stderr:?}");
 }
@@ -4726,8 +4727,7 @@ fn handle_with_eager_resume_arms_chains_let_yield_correctly() {
                  perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "stage_6_8_followup_layer3b_eager_chain");
+    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_layer3b_eager_chain");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "6\n", "stdout mismatch; stderr={stderr:?}");
 }
@@ -4854,7 +4854,8 @@ fn run_state_canonical_higher_order_helper_returns_threaded_value() {
                  perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_layer3_canonical_run_state");
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_layer3_canonical_run_state");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "11\n", "stdout mismatch; stderr={stderr:?}");
 }
@@ -4926,7 +4927,10 @@ fn handle_with_op_arm_discharge_skips_constant_return_arm() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_bug2_discharge_skips_constant_return");
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "stage_6_8_followup_bug2_discharge_skips_constant_return",
+    );
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "7\n", "stdout mismatch; stderr={stderr:?}");
 }

@@ -4762,7 +4762,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // `sigil_last_terminal_tag` and skips return-arm dispatch on
     // discharge per algebraic-effects semantics.
     let mut next_step_discharged_sig = Signature::new(isa_call_conv(&module));
-    next_step_discharged_sig.params.push(AbiParam::new(types::I64));
+    next_step_discharged_sig
+        .params
+        .push(AbiParam::new(types::I64));
     next_step_discharged_sig
         .returns
         .push(AbiParam::new(pointer_ty));
@@ -4784,7 +4786,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // tag == NEXT_STEP_TAG_DONE, the body completed normally and the
     // return arm dispatch fires (body_val passed as `v`).
     let mut last_terminal_tag_sig = Signature::new(isa_call_conv(&module));
-    last_terminal_tag_sig.returns.push(AbiParam::new(types::I32));
+    last_terminal_tag_sig
+        .returns
+        .push(AbiParam::new(types::I32));
     let last_terminal_tag = module
         .declare_function(
             "sigil_last_terminal_tag",
@@ -4823,7 +4827,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // trampoline's terminal u64 in `LAST_TERMINAL_VALUE` so codegen
     // can recover it when the tag indicates DISCHARGED.
     let mut last_terminal_value_sig = Signature::new(isa_call_conv(&module));
-    last_terminal_value_sig.returns.push(AbiParam::new(types::I64));
+    last_terminal_value_sig
+        .returns
+        .push(AbiParam::new(types::I64));
     let last_terminal_value = module
         .declare_function(
             "sigil_last_terminal_value",
@@ -6430,12 +6436,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let frame_ptr_v = if arm_needs_frame_ptr {
                     let captures_count = synth.captures.len();
                     let offset: i32 = 16 + 8 * captures_count as i32;
-                    Some(builder.ins().load(
-                        pointer_ty,
-                        MemFlags::trusted(),
-                        closure_ptr,
-                        offset,
-                    ))
+                    Some(
+                        builder
+                            .ins()
+                            .load(pointer_ty, MemFlags::trusted(), closure_ptr, offset),
+                    )
                 } else {
                     None
                 };
@@ -8778,16 +8783,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             .stack_store(identity_addr, slot, k_fn_offset(user_arg_count));
 
         let args_ptr = builder.ins().stack_addr(pointer_ty, slot, 0);
-        let args_len_v = builder
-            .ins()
-            .iconst(types::I32, user_arg_count as i64);
+        let args_len_v = builder.ins().iconst(types::I32, user_arg_count as i64);
 
         // Call the underlying Cps fn.
         let cps_fn_ref = module.declare_func_in_func(entry.func_id, builder.func);
-        let cps_call =
-            builder
-                .ins()
-                .call(cps_fn_ref, &[closure_ptr_v, args_ptr, args_len_v]);
+        let cps_call = builder
+            .ins()
+            .call(cps_fn_ref, &[closure_ptr_v, args_ptr, args_len_v]);
         let next_step = builder.inst_results(cps_call)[0];
 
         // Drive the trampoline.
@@ -9781,12 +9783,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         } else {
                             None
                         };
-                        let arm_closure_ptr =
-                            if captures.is_empty() && frame_ptr_for_arm.is_none() {
-                                null_ptr
-                            } else {
-                                self.alloc_arm_closure_record(&captures, frame_ptr_for_arm)
-                            };
+                        let arm_closure_ptr = if captures.is_empty() && frame_ptr_for_arm.is_none()
+                        {
+                            null_ptr
+                        } else {
+                            self.alloc_arm_closure_record(&captures, frame_ptr_for_arm)
+                        };
 
                         let set_call = self.builder.ins().call(
                             self.handler_frame_set_arm_ref,
@@ -10002,10 +10004,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // DONE (dispatch return arm) or DISCHARGED (skip
                     // return arm — discharged value IS handle's
                     // overall per algebraic-effects semantics).
-                    let tag_call = self
-                        .builder
-                        .ins()
-                        .call(self.last_terminal_tag_ref, &[]);
+                    let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
                     self.stackmap
                         .push_placeholder(function_code_offset(&self.builder, tag_call));
                     let tag_v = self.builder.inst_results(tag_call)[0];
@@ -10014,7 +10013,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
                     );
                     let is_discharged =
-                        self.builder.ins().icmp(IntCC::Equal, tag_v, discharged_const);
+                        self.builder
+                            .ins()
+                            .icmp(IntCC::Equal, tag_v, discharged_const);
 
                     // Pre-compute handler_overall_ty so both branches
                     // of the conditional produce values of the same
@@ -10059,10 +10060,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // body_val is body's tail value, NOT the discharged
                     // arm's value — the runtime preserves the latter
                     // in `LAST_TERMINAL_VALUE`.
-                    let lv_call = self
-                        .builder
-                        .ins()
-                        .call(self.last_terminal_value_ref, &[]);
+                    let lv_call = self.builder.ins().call(self.last_terminal_value_ref, &[]);
                     self.stackmap
                         .push_placeholder(function_code_offset(&self.builder, lv_call));
                     let last_terminal_v_u64 = self.builder.inst_results(lv_call)[0];
@@ -10070,9 +10068,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // Narrow u64 → handler_overall_ty.
                     let discharge_val = if handler_overall_ty == types::I64 {
                         last_terminal_v_u64
-                    } else if handler_overall_ty.is_int()
-                        && handler_overall_ty.bits() < 64
-                    {
+                    } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
                         self.builder
                             .ins()
                             .ireduce(handler_overall_ty, last_terminal_v_u64)
@@ -10286,10 +10282,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     body_val
                 };
 
-                let tag_call = self
-                    .builder
-                    .ins()
-                    .call(self.last_terminal_tag_ref, &[]);
+                let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, tag_call));
                 let tag_v = self.builder.inst_results(tag_call)[0];
@@ -10297,8 +10290,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     types::I32,
                     sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
                 );
-                let is_discharged =
-                    self.builder.ins().icmp(IntCC::Equal, tag_v, discharged_const);
+                let is_discharged = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::Equal, tag_v, discharged_const);
 
                 // For no-return-arm, handle's overall type = body's
                 // type B (no return arm to widen / change type).
@@ -10320,10 +10315,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // Discharge block: read LAST_TERMINAL_VALUE, narrow.
                 self.builder.switch_to_block(discharge_block_nra);
                 self.builder.seal_block(discharge_block_nra);
-                let lv_call = self
-                    .builder
-                    .ins()
-                    .call(self.last_terminal_value_ref, &[]);
+                let lv_call = self.builder.ins().call(self.last_terminal_value_ref, &[]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, lv_call));
                 let lv_u64 = self.builder.inst_results(lv_call)[0];
@@ -10346,9 +10338,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.switch_to_block(normal_block_nra);
                 self.builder.seal_block(normal_block_nra);
                 let _ = body_val_widened;
-                self.builder
-                    .ins()
-                    .jump(merge_block_nra, &[body_val.into()]);
+                self.builder.ins().jump(merge_block_nra, &[body_val.into()]);
 
                 self.builder.switch_to_block(merge_block_nra);
                 self.builder.seal_block(merge_block_nra);
@@ -10570,16 +10560,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // a synth-cont when body has post-perform code, so the run_loop
         // here drives synth-cont and respects natural completion vs
         // discharge.
-        let final_widened = if let Some(idx) =
-            self.handler_return_arm_indices.get(&info.handle_span).copied()
+        let final_widened = if let Some(idx) = self
+            .handler_return_arm_indices
+            .get(&info.handle_span)
+            .copied()
         {
             let _synth = &self.handler_return_arm_synth[idx];
             {
                 // Query terminal tag and branch.
-                let tag_call = self
-                    .builder
-                    .ins()
-                    .call(self.last_terminal_tag_ref, &[]);
+                let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, tag_call));
                 let tag_v = self.builder.inst_results(tag_call)[0];
@@ -10587,8 +10576,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     types::I32,
                     sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
                 );
-                let is_discharged =
-                    self.builder.ins().icmp(IntCC::Equal, tag_v, discharged_const);
+                let is_discharged = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::Equal, tag_v, discharged_const);
 
                 let skip_block = self.builder.create_block();
                 let apply_block = self.builder.create_block();
@@ -11383,9 +11374,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 )
             });
             let frame_ptr_offset: i32 = 16 + 8 * info.frame_ptr_idx as i32;
-            self.builder
-                .ins()
-                .store(MemFlags::trusted(), frame_ptr_v, closure_ptr, frame_ptr_offset);
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                frame_ptr_v,
+                closure_ptr,
+                frame_ptr_offset,
+            );
         }
 
         closure_ptr
@@ -12347,9 +12341,7 @@ fn arm_body_has_k_pair_lambda(
             .iter()
             .any(|f| arm_body_has_k_pair_lambda(&f.value, arm_k_pair_captures)),
         Expr::Lambda { .. } => false,
-        Expr::Handle {
-            body, op_arms, ..
-        } => {
+        Expr::Handle { body, op_arms, .. } => {
             arm_body_has_k_pair_lambda(body, arm_k_pair_captures)
                 || op_arms
                     .iter()
