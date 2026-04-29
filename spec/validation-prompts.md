@@ -206,16 +206,16 @@ return `0` as the process exit status.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Requires `TypeExpr::Fn` surface syntax — the
-ability to declare `(Int) -> Int ![]` as a user-fn return type and as
-a `let`-binding's declared type — which Plan A2 defers to Plan A3.
-Until Plan A3 lands, this prompt is graded only against "program
-compiles"; the run portion of the oracle is deferred. The semantic
-target is that closure conversion preserves the captured `x` through
-a synthetic `$lambda_0` whose env is `[x: Int]`, and codegen's
-`sigil_alloc` + `call_indirect` path (Plan A3 fills in the
-`unreachable!` arm deferred from Task 32) wires the application site
-to the heap-allocated closure record.
+**Oracle (notes):** Graded end-to-end as of Plan B' Stage 6.8
+(PR #38 / commit `4bb38ad`). `TypeExpr::Fn` surface syntax shipped
+under B.3 (Phase A → C+ Part 2): function types in user-fn return
+positions and `let`-binding types are accepted; closure conversion
+preserves the captured `x` through a synthetic `$lambda_N` whose env
+is `[x: Int]`; codegen's `sigil_alloc` + `call_indirect` path wires
+the application site to the heap-allocated closure record. The e2e
+test `make_adder_returns_12` exercises the same canonical shape
+(`make_adder(5)(7) → 12`) end-to-end through Phase C+ Part 1's
+recursive Call-of-Call dispatch.
 
 ## P10 — compose two lambdas
 
@@ -233,13 +233,16 @@ lambda `fn (x: Int) -> Int ![] => f(g(x))`. In `main`, call
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Requires `TypeExpr::Fn` surface syntax on
-parameter, return, and `let`-binding positions. Deferred to Plan A3
-on the same terms as P09. The semantic target exercises two-level
-closure capture (`compose`'s body-lambda captures both `f` and `g`)
-and a call-of-a-call at the application site. A valid A2-only
-approximation using nested IIFEs is not accepted because it doesn't
-define `compose` as a first-class higher-order function.
+**Oracle (notes):** Graded end-to-end as of Plan B' Stage 6.8
+(PR #38 / commit `4bb38ad`). `TypeExpr::Fn` surface syntax in
+parameter, return, and `let`-binding positions is shipped under B.3.
+Two-level closure capture (`compose`'s body-lambda captures both `f`
+and `g`) flows through Phase C+ Part 2's `ClosureEnvLoad`-callee
+dispatch — the inner lambda's `f(g(x))` invokes `g` then `f` via
+captured-fn-typed-value indirect calls. The e2e test
+`compose_body_via_closure_env_callees_returns_42` exercises the
+generic-context analog (compose with `Ty::Var`-bearing fn-typed
+captures, resolved per-clone via Phase C++).
 
 ## P11 — length of a cons-list via recursive match
 
@@ -419,10 +422,14 @@ unspecialized `id`).
 ## P17 — compose two unary functions across types
 
 **Prompt:** Declare `fn compose[A, B, C](f: (B) -> C ![], g: (A) ->
-B ![]) -> (A) -> C ![]` whose body is the lambda `fn (x: A) -> C
-![] => f(g(x))`. In `main`, bind `let inc_then_format: (Int) ->
-String ![] = compose(int_to_string, fn (n: Int) -> Int ![] => n +
-1);`, then `perform IO.println(inc_then_format(41))`. Return `0`.
+B ![]) -> (A) -> C ![] ![]` whose body is the lambda `fn (x: A) ->
+C ![] => f(g(x))`. Declare a thin user-side wrapper `fn its(n: Int)
+-> String ![] { int_to_string(n) }` so `int_to_string` is not used
+as a fn-as-value directly (Plan B' v1 closes user-fn-as-value but
+defers builtin-as-fn-value to Plan C). In `main`, bind `let
+inc_then_format: (Int) -> String ![] = compose(its, fn (n: Int) ->
+Int ![] => n + 1);`, then `perform IO.println(inc_then_format(41))`.
+Return `0`.
 
 **Oracle (stdout):**
 ```
@@ -431,23 +438,30 @@ String ![] = compose(int_to_string, fn (n: Int) -> Int ![] => n +
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Requires `TypeExpr::Fn` surface syntax — the
-ability to declare `(B) -> C ![]` as a parameter type, a return
-type, and a `let`-binding type. P09 and P10 already deferred this
-to Plan A3; A3 did not deliver it (deferred again, currently
-unscheduled for v1). Until `TypeExpr::Fn` ships, this prompt is
-graded only against "program compiles"; the run portion of the
-oracle is deferred. The semantic target is that compose is generic
-in three types (`A`, `B`, `C`), the inferred instantiation here is
-`(A=Int, B=Int, C=String)`, and Task 49's reachability-bounded
-specialization produces exactly one `compose` monomorph clone
-mangled `compose$$Int$$Int$$String`. P10 exercised the same shape at
-a single concrete `(Int, Int, Int)` triple; P17's distinguishing
-addition is `A != C`, which forces the result type to genuinely
-travel through composition rather than absorbing into the trivial
-endo-functor case. Like P09/P10's status, the underlying generics
-machinery is shipped (Plan B Stage 5); only the function-type
-surface syntax blocks end-to-end execution.
+**Oracle (notes):** Graded end-to-end as of Plan B' Stage 6.8
+(PR #38 / commit `4bb38ad`). `TypeExpr::Fn` surface syntax in
+parameter, return, and `let`-binding positions is shipped under
+B.3; the per-arrow `![..]` discipline applies (the outer return
+type's two `![..]` markers — first for the inner `(A) -> C` fn-
+type, second for `compose`'s own effect row — per
+`[DEVIATION Task 103]`). The semantic target: `compose` is generic
+in three types (`A`, `B`, `C`), inferred instantiation
+`(A=Int, B=Int, C=String)`, monomorphized to one clone mangled
+`compose$$Int$$Int$$String`. The `its` user wrapper sidesteps the
+builtin-as-fn-value blocker named in `[DEVIATION p17_compose
+blocker analysis]` (Blocker 2): `int_to_string` is seeded into
+typecheck's `fn_env` as a builtin and is absent from the
+`top_level_fn_names` set that closure-convert's fn-as-value
+materialization consults, so closure-convert leaves bare
+`Ident("int_to_string")` unrewritten and codegen panics on
+unknown-ident in fn-value position. Wrapping it in a user-declared
+`its` makes it a `top_level_fn_name` for which closure-convert
+emits a captureless ClosureRecord materialization. P10 exercises
+the same generic-compose shape at a single concrete `(Int, Int,
+Int)` triple via the canonical e2e
+`compose_body_via_closure_env_callees_returns_42`; P17's
+distinguishing addition is `A != C`, forcing the result type to
+genuinely travel through composition.
 
 ## P18 — Raise[String]-based safe parser for a small grammar
 
@@ -519,24 +533,23 @@ return `0`.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** The literal algebraic-effects `run_state` higher-
-order helper requires both `TypeExpr::Fn` parameter types (the `comp:
-() -> Int ![State, IO]` shape) AND arm-body lambdas (the lambdas-of-
-state returned from `State.get` / `State.set` / `return` arms).
-`TypeExpr::Fn` is deferred (same status as P09 / P10 / P17 —
-Plan A2 → A3 → currently unscheduled for v1); arm-body lambdas are
-rejected at codegen.rs:1246-1257 with a Phase-4d-MVP-pointing
-diagnostic. Both lifts are post-Plan-B / Plan-C-or-later territory
-per `[DEVIATION Task 59]` and `[DEVIATION Task 61]`. Until both ship,
-this prompt is graded only against "program compiles"; the run
-portion of the oracle (stdout `"5"`, exit 0) is deferred. The
-underlying `State` effect dispatch + `count_elements` recursion +
-list walk all work in v1 — the deferral is specifically the higher-
-order `run_state` helper. A v1-expressible variant (the dual-handle
-pattern from `examples/state.sigil`, which doesn't thread state
-across calls but does exercise both `get` and `set` ops) is shipped
-as a working example; this prompt preserves the canonical literature
-shape for grading once the closure points close.
+**Oracle (notes):** Graded end-to-end as of Plan B' Stage 6.8
+(PR #38 / commit `4bb38ad` for the language-surface lifts +
+PR #39 / commit `cf358bb` for the runtime chain integration). The
+literal algebraic-effects `run_state` higher-order helper composes
+every Stage 6.8 surface in one program: `TypeExpr::Fn` parameter
+types (the `comp: () -> Int ![State, IO]` shape, B.3); fn-as-value
+of a top-level user fn (`comp` passed by name, Plan B' Phase C v1
+Task 104); arm-body lambdas (B.4 Phase A); k-capturing arm-body
+lambdas (B.4 Phase B trailing-pair convention); recursive Call-of-
+Call dispatch on the fn returned by `k(s)(s)` (Phase C+ Part 1);
+trailing-triple `(k_closure, k_fn, frame_ptr)` for the lifted
+lambda's escape from its handle (PR #39 Layer 3c); Sync-ABI shim
+for the Cps-effected `comp` parameter at fn-as-value materialization
+(PR #39 Layer 3b). The e2e tests
+`run_state_canonical_higher_order_helper_returns_threaded_value`
+and `state_example_canonical_run_state_returns_11` pin the shape
+(both pass deterministically across all CI lanes).
 
 ## P20 — multi-shot Choose finds all (a, b) pairs with a + b == 7
 
@@ -567,29 +580,21 @@ the `a + b == 7` predicate. Return `0`.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Requires both (a) **multi-perform helper bodies**
-— `pairs()` performs `Choose.pick(...)` twice (once per pair member),
-which trips `is_simple_let_yield_then_pure_tail_body`'s "exactly one
-let stmt" cap at codegen.rs:10303-10305 and requires the chained-
-synth-cont extension named at codegen.rs:10286-10290; and (b) **N-
-resume arm body** — the `Choose.pick(low, high, k)` arm body needs
-to invoke `k` six times to enumerate `[1, 6]`, which trips Slice C
-v1's 2-let cap (negative-coverage e2e test
-`slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen`)
-and requires the Slice C N-chain extension named in `[DEVIATION
-Task 58]`. Both extensions are explicitly Plan-C-or-later territory;
-they bundle naturally because both share the chained-closure-record
-discipline. Until both ship, this prompt is graded only against
-"program compiles"; the run portion of the oracle (six pair lines on
-stdout, exit 0) is deferred per `[DEVIATION Task 61]`. The
-underlying multi-shot `Choose` machinery + recursive helpers + bool-
-to-Int conversion all work in v1 — the deferral is specifically
-the multi-perform-body and N-resume-arm shapes that the canonical
-all-pairs pattern requires. A v1-expressible variant via helper-
-recursion (the `pick_int(low, high)` idiom from `[DEVIATION Task 55]
-Phase 4e captures+` line 1507, recursing with `if perform Choose
-.flip() then low else pick_int(low+1, high)` to reach arbitrary
-`[low, high]` ranges using only the 2-let arm shape) ships as the
-basis for `examples/multishot_perf.sigil`; this prompt preserves
-the canonical literature shape for grading once the closure points
-close.
+**Oracle (notes):** Graded end-to-end as of Plan B' Stage 6.7
+(PR #37 / commit `a5e92e7`). The two surfaces this prompt requires —
+(a) **multi-perform helper bodies** (the chained-synth-cont
+extension, B.2) and (b) **N-resume arm bodies** (the Slice C
+N-chain extension, B.1) — both shipped under Stage 6.7 with the
+chained-closure-record discipline shared between them. Tasks 93–96
+(B.2) extended `is_simple_let_yield_then_pure_tail_body`'s "exactly
+one let stmt" cap to N stmts and added the
+`CpsContinuationKind::ChainedLetBindThenTail` synth-cont chain;
+Tasks 97–100 (B.1) extended `arm_body_multi_let_then_pure_tail_-
+shape`'s 2-let cap to N lets and added the `PostArmKChain` /
+`PostArmKStep` data shapes. Multi-shot composition (the outer
+post_arm_k stack pushing per-`sigil_perform` and routing on Done)
+landed in `b7063b0`. The e2e test `choose_example_pair_generator_-
+returns_10` (canonical 2-flip pair generator, closed form
+(1+2)+(3+4) = 10) covers the same shape at smaller scale; P20's
+6-resume `[low, high]` enumeration extends the same machinery
+without requiring further surface lifts.
