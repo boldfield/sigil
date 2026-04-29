@@ -1148,15 +1148,24 @@ fn ty_from_type_expr_under_subst(te: &TypeExpr, subst: &BTreeMap<String, Ty>) ->
                 .map(|a| ty_from_type_expr_under_subst(a, subst))
                 .collect(),
         ),
-        // Plan B' Stage 6.8 Task 102 — Phase B (Task 103) wires the
-        // `TypeExpr::Fn` → `Ty::Fn` integration. Until then this
-        // path is unreachable: typecheck rejects `TypeExpr::Fn` at
-        // `check_type_expr_known` with E0136.
-        TypeExpr::Fn(_) => unreachable!(
-            "monomorphize::ty_from_type_expr_under_subst: TypeExpr::Fn \
-             reached resolution — typecheck E0136 should have rejected \
-             this site (Phase B / Task 103 lands the integration)"
-        ),
+        // Plan B' Stage 6.8 Task 103 — TypeExpr::Fn → Ty::Fn under
+        // monomorphize's substitution. Closed rows only in v1
+        // (typecheck E0137 rejects row-variable-bearing fn-types),
+        // so `effect_row_var` is always None here.
+        TypeExpr::Fn(fty) => {
+            let params = fty
+                .params
+                .iter()
+                .map(|p| ty_from_type_expr_under_subst(p, subst))
+                .collect();
+            let ret = ty_from_type_expr_under_subst(&fty.ret, subst);
+            Ty::Fn(Box::new(crate::typecheck::FnSig {
+                params,
+                ret,
+                effects: fty.effects.clone(),
+                effect_row_var: None,
+            }))
+        }
     }
 }
 
@@ -1249,14 +1258,25 @@ fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
                  this site"
             )
         }
-        Ty::Fn(_) => {
-            // Symmetric with `canon_ty`'s `Ty::Fn` arm — `TypeExpr::Fn`
-            // surface is out of scope for Plan B v1.
-            unreachable!(
-                "monomorphize::ty_to_type_expr: Ty::Fn reached TypeExpr \
-                 rendering — first-class function types are out of scope \
-                 for Plan B v1"
-            )
+        Ty::Fn(sig) => {
+            // Plan B' Stage 6.8 Task 103 — render Ty::Fn back into
+            // TypeExpr::Fn so a generic-parameter substitution that
+            // binds `A` to a fn-typed concrete still produces a
+            // valid surface. Closed rows only in v1 (typecheck
+            // E0137 rejects row-var-bearing fn-types upstream).
+            let params = sig
+                .params
+                .iter()
+                .map(|p| ty_to_type_expr(p, span))
+                .collect();
+            let ret = ty_to_type_expr(&sig.ret, span);
+            TypeExpr::Fn(Box::new(crate::ast::FnTypeExpr {
+                params,
+                ret,
+                effects: sig.effects.clone(),
+                effect_row_var: None,
+                span: span.clone(),
+            }))
         }
     }
 }
@@ -1278,13 +1298,19 @@ fn type_expr_to_ty(te: &TypeExpr) -> Ty {
         TypeExpr::Apply { name, args, .. } => {
             Ty::User(name.clone(), args.iter().map(type_expr_to_ty).collect())
         }
-        // Plan B' Stage 6.8 Task 102 — Phase B (Task 103) wires the
-        // surface → `Ty::Fn` resolution. Until then unreachable
-        // (typecheck E0136 rejects).
-        TypeExpr::Fn(_) => unreachable!(
-            "monomorphize::type_expr_to_ty: TypeExpr::Fn reached — \
-             Phase B / Task 103 lands the integration"
-        ),
+        // Plan B' Stage 6.8 Task 103 — TypeExpr::Fn → Ty::Fn for
+        // already-rewritten (no Apply, no generic-param refs)
+        // surfaces. Closed rows only (typecheck E0137 enforces).
+        TypeExpr::Fn(fty) => {
+            let params = fty.params.iter().map(type_expr_to_ty).collect();
+            let ret = type_expr_to_ty(&fty.ret);
+            Ty::Fn(Box::new(crate::typecheck::FnSig {
+                params,
+                ret,
+                effects: fty.effects.clone(),
+                effect_row_var: None,
+            }))
+        }
     }
 }
 

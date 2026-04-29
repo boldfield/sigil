@@ -1731,24 +1731,27 @@ impl Tc {
                 }
             }
             TypeExpr::Fn(fty) => {
-                // Plan B' Stage 6.8 Task 102 — fn-type surface is
-                // accepted for parsing/storage but not yet wired into
-                // ty_from_type_expr_here (Phase B / Task 103). Reject
-                // with a clear "not yet implemented" until Phase B
-                // lands. Recurse into components first so any nested
-                // unknown-type / Apply errors still surface.
+                // Plan B' Stage 6.8 Task 103 — recurse into params +
+                // ret so any nested unknown-type / Apply errors
+                // still surface against the inner spans. The Fn
+                // surface itself maps to Ty::Fn at
+                // `ty_from_type_expr` (closed rows only in v1; row-
+                // variable-bearing fn-types reject via E0137 below).
                 for p in &fty.params {
                     self.check_type_expr_known(p);
                 }
                 self.check_type_expr_known(&fty.ret);
-                self.push_error(
-                    "E0136",
-                    t.span(),
-                    "first-class function type `(...) -> R ![..]` is parsed but \
-                     not yet usable (Plan B' Stage 6.8 Task 103 lands the \
-                     typecheck integration)"
-                        .to_string(),
-                );
+                if fty.effect_row_var.is_some() {
+                    self.push_error(
+                        "E0137",
+                        t.span(),
+                        "row-variable-bearing first-class function types \
+                         (`(...) -> R ![..|r]`) are not yet supported in v1; \
+                         use a closed row (e.g. `![]` or `![IO]`) — \
+                         Plan B' Stage 6.8 Task 103 limits"
+                            .to_string(),
+                    );
+                }
             }
         }
     }
@@ -4323,12 +4326,30 @@ pub(crate) fn ty_from_type_expr(
             }
             Some(Ty::User(name.to_string(), resolved_args))
         }
-        // Plan B' Stage 6.8 Task 102 — fn-type surface accepted at
-        // parse time but typecheck integration lands in Phase B
-        // (Task 103). Returning None here causes the caller's
-        // E0112 / E0136 path to surface an error before the program
-        // reaches downstream passes.
-        TypeExpr::Fn(_) => None,
+        // Plan B' Stage 6.8 Task 103 — first-class function type
+        // surface maps to Ty::Fn under HM. Closed rows only in v1
+        // (row-variable-bearing fn-types are rejected at
+        // `check_type_expr_known` with E0137); the surface still
+        // *parses* with a row var but typecheck cannot resolve it
+        // here (no row-var allocator in this `&` context), so we
+        // return None and let the E0137 path provide the user
+        // diagnostic.
+        TypeExpr::Fn(fty) => {
+            if fty.effect_row_var.is_some() {
+                return None;
+            }
+            let mut params = Vec::with_capacity(fty.params.len());
+            for p in &fty.params {
+                params.push(ty_from_type_expr(p, types, generic_subst)?);
+            }
+            let ret = ty_from_type_expr(&fty.ret, types, generic_subst)?;
+            Some(Ty::Fn(Box::new(FnSig {
+                params,
+                ret,
+                effects: fty.effects.clone(),
+                effect_row_var: None,
+            })))
+        }
     }
 }
 
@@ -8267,5 +8288,129 @@ mod tests {
             has_code(&errs, "E0044"),
             "k call with wrong arg type must E0044 (k has Fn(op_ret_ty) -> handler_overall): {errs:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Plan B' Stage 6.8 Task 103 — TypeExpr::Fn typecheck integration
+    // ----------------------------------------------------------------
+
+    /// Helper: pipeline that returns the inferred Ty of `fn f`'s
+    /// only parameter. Asserts no errors. Used by the Phase B tests
+    /// to verify TypeExpr::Fn maps to Ty::Fn. The src is augmented
+    /// with a stub `fn main` so typecheck doesn't trip E0040.
+    fn fn_param0_ty(src_fn_f: &str) -> Ty {
+        let src = format!("{src_fn_f}fn main() -> Int ![] {{ 0 }}\n");
+        let (toks, _) = lex("t.sigil", &src);
+        let (prog, _) = parse("t.sigil", &toks);
+        let (rp, _) = resolve(prog);
+        let (tc, errs) = typecheck(rp.program);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let scheme = tc
+            .fn_schemes
+            .get("f")
+            .unwrap_or_else(|| panic!("fn `f` not found in schemes"));
+        let Ty::Fn(sig) = &scheme.body else {
+            panic!("expected scheme body Ty::Fn, got {:?}", scheme.body)
+        };
+        sig.params[0].clone()
+    }
+
+    #[test]
+    fn fn_type_zero_param_in_param_position_resolves_to_ty_fn() {
+        let src = "fn f(g: () -> Int ![]) -> Int ![] { 0 }\n";
+        let ty = fn_param0_ty(src);
+        let Ty::Fn(sig) = ty else {
+            panic!("expected Ty::Fn for fn-typed param, got {ty:?}")
+        };
+        assert!(sig.params.is_empty());
+        assert_eq!(sig.ret, Ty::Int);
+        assert!(sig.effects.is_empty());
+        assert!(sig.effect_row_var.is_none());
+    }
+
+    #[test]
+    fn fn_type_one_param_with_effect_resolves_to_ty_fn() {
+        let src = "fn f(g: (Int) -> String ![IO]) -> Int ![] { 0 }\n";
+        let ty = fn_param0_ty(src);
+        let Ty::Fn(sig) = ty else {
+            panic!("expected Ty::Fn, got {ty:?}")
+        };
+        assert_eq!(sig.params, vec![Ty::Int]);
+        assert_eq!(sig.ret, Ty::String);
+        assert_eq!(sig.effects, vec!["IO".to_string()]);
+    }
+
+    #[test]
+    fn fn_type_with_generic_param_resolves_to_ty_fn_with_var() {
+        let src = "fn f[A](g: (A) -> A ![]) -> Int ![] { 0 }\n";
+        let ty = fn_param0_ty(src);
+        let Ty::Fn(sig) = ty else {
+            panic!("expected Ty::Fn, got {ty:?}")
+        };
+        // params[0] and ret are both Ty::Var(_) — same id since `A`
+        // resolves to the same fresh var across both positions.
+        let Ty::Var(p_id) = &sig.params[0] else {
+            panic!("expected Ty::Var for `A` param, got {:?}", sig.params[0])
+        };
+        let Ty::Var(r_id) = &sig.ret else {
+            panic!("expected Ty::Var for `A` return, got {:?}", sig.ret)
+        };
+        assert_eq!(p_id, r_id, "shared `A` must resolve to the same Ty::Var");
+    }
+
+    #[test]
+    fn fn_type_with_row_variable_is_e0137() {
+        let src = "fn f(g: (Int) -> Int ![IO | r]) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0137"),
+            "row-var-bearing fn-type must E0137: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_in_let_binding_position_typechecks() {
+        // The let RHS is the same fn `id_fn`, so its scheme matches
+        // the let-binding's annotated type.
+        let src = "fn id_fn(x: Int) -> Int ![] { x }\n\
+                   fn main() -> Int ![] { let f: (Int) -> Int ![] = id_fn; 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "fn-typed let binding must typecheck cleanly: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_let_binding_mismatch_is_e0044() {
+        // Annotated as `(Int) -> String` but RHS returns Int.
+        let src = "fn id_fn(x: Int) -> Int ![] { x }\n\
+                   fn main() -> Int ![] { let f: (Int) -> String ![] = id_fn; 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "fn-typed let mismatch must E0044: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_nested_fn_in_param_resolves() {
+        // `((Int) -> Int ![]) -> Int ![]` — the param is itself a
+        // fn-type. Unify: outer Ty::Fn whose params[0] is inner
+        // Ty::Fn(Int -> Int).
+        let src = "fn f(g: ((Int) -> Int ![]) -> Int ![]) -> Int ![] { 0 }\n";
+        // fn_param0_ty appends fn main; this src has the fn-type in
+        // the param position of the outer fn `f`.
+        let ty = fn_param0_ty(src);
+        let Ty::Fn(outer_sig) = ty else {
+            panic!("expected outer Ty::Fn, got {ty:?}")
+        };
+        let Ty::Fn(inner_sig) = &outer_sig.params[0] else {
+            panic!("expected inner Ty::Fn, got {:?}", outer_sig.params[0])
+        };
+        assert_eq!(inner_sig.params, vec![Ty::Int]);
+        assert_eq!(inner_sig.ret, Ty::Int);
+        assert_eq!(outer_sig.ret, Ty::Int);
     }
 }
