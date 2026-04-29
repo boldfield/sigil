@@ -845,57 +845,39 @@ fn choose_demo_example_returns_40() {
     );
 }
 
-/// Plan B Task 58 — `examples/multishot_stress.sigil` exercises the
-/// v1 multi-shot stress shape: 5 sequential `handle` expressions × 2
-/// resumes per arm = 10 multi-shot k invocations across 5 fresh
-/// handler frames and 5 fresh heap-reified k_closure records, with
-/// 10 distinct `(Int)` inputs. Confirms that:
+/// Plan B' Stage 6.7 Task 101 — `examples/multishot_stress.sigil`
+/// exercises the natural multi-shot stress shape: 10 resumes of a
+/// `resumes: many` continuation within a SINGLE arm body. Replaces
+/// the pre-Stage-6.7 5-handles × 2-resumes workaround that PR #27
+/// shipped under `[DEVIATION Task 58]`.
 ///
-/// - the codegen pre-pass allocates per-handle arm FuncIds correctly
-///   when 5 distinct `Expr::Handle` sites occur in a single user fn
-///   (independent FuncId tables per `Span`-keyed `handler_arm_indices`
-///   entry);
-/// - each handle's `sigil_handler_frame_new` + `sigil_handle_push`
-///   path allocates a fresh frame; the runtime's thread-local handler
-///   stack head correctly LIFOs across 5 sequential push/pop cycles
-///   (per Phase 4f machinery);
-/// - the heap-reified k_closure record allocated by Slice C's arm-fn
-///   body emit at the perform site of one handle does NOT leak into
-///   another handle's k invocations (closed-form independence
-///   assertion: any cross-handle leak would diverge the closed-form
-///   sum from 1530);
-/// - the sequential structure of `let h_i = handle ... with { ... }`
-///   in main's body lowers cleanly with each handle expression
-///   driving its own `sigil_run_loop` invocation, returning the
-///   discharged Int to the let-binding before the next handle
-///   begins.
+/// What the natural shape exercises (post-Plan-B' Task 100b):
 ///
-/// Closed-form expected output (per the example's docstring):
-///   - h_i = 2*i + 300 for i ∈ {1, 2, 3, 4, 5}
-///     → 302, 304, 306, 308, 310
-///   - total = 1530
+/// - **N-let arm-body chain (N=10)**: 10 sequential `let r_i = k(arg
+///   +i)` bindings drive 10 distinct trampoline cycles through the
+///   helper synth-cont. Each step's `post_arm_k_i` synth fn dispatches
+///   the next `k(arg+i+1)` call; chained closure records thread
+///   `(k_closure, k_fn) + captures + prior_bindings` forward across
+///   9 Middle steps to the Final step.
 ///
-/// **Stress-shape rationale** — the literal Task 58 wording calls for
-/// "10+ resumes within a single arm with different inputs"; that
-/// shape requires the Slice C N-chain extension explicitly deferred
-/// from PR #27 (the negative-coverage test
-/// `slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen`
-/// pins the v1 cap at exactly 2 lets). The 5-handles × 2-resumes
-/// workaround exercises a complementary invariant — fresh-frame /
-/// fresh-k_closure independence across multiple handles in one
-/// program — and ships under `[DEVIATION Task 58]`.
+/// - **op-arg capture threading**: `arg` is referenced by every
+///   `arg_i` expression. Task 100b's captures-bearing extension
+///   threads `arg` through every chain step's closure record.
 ///
-/// Invariant: stdout = "1530\n", stderr = "", exit 0.
+/// Closed form: helper(0); arm dispatched with arg=0; r_i = k(0+i)
+/// = i. Tail = 1+2+...+10 = 55.
+///
+/// Invariant: stdout = "55\n", stderr = "", exit 0.
 #[test]
-fn multishot_stress_example_returns_1530() {
+fn multishot_stress_example_returns_55() {
     let root = workspace_root();
     let source = root.join("examples/multishot_stress.sigil");
     let (stdout, stderr, code) = compile_file_and_run(&source, "multishot_stress_example");
     assert_eq!(code, 0, "multishot_stress exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "1530\n",
-        "multishot_stress stdout mismatch (expected closed-form 302+304+306+308+310 \
-         = 1530); stderr={stderr:?}"
+        stdout, "55\n",
+        "multishot_stress stdout mismatch (expected closed-form 1+2+...+10 \
+         = 55); stderr={stderr:?}"
     );
     assert_eq!(
         stderr, "",
@@ -991,50 +973,34 @@ fn state_example_dual_handle_returns_6_then_99() {
     );
 }
 
-/// Plan B Task 59 — `examples/choose.sigil` exercises the canonical
-/// Slice C v1 2-resume multi-shot Choose pattern, framed as a binary
-/// outcome enumerator. Confirms that:
+/// Plan B' Stage 6.7 Task 101 — `examples/choose.sigil` exercises
+/// the natural literal-two-flip-pair-generator shape: helper performs
+/// `Choose.flip()` TWICE (B.2 chained-let-yield helper body); arm
+/// invokes `k` twice with `true`/`false` for the FIRST flip, helper
+/// drives the 2nd flip recursively under each branch, dispatching the
+/// nested arm with both branches again. Total 2×2 = 4 leaf outcomes.
 ///
-/// - `effect Choose resumes: many { flip: () -> Bool }` parses +
-///   typechecks; the `resumes: many` annotation enables the multi-shot
-///   path through `arm_body_multi_let_then_pure_tail_shape`'s
-///   resumes-many gate (one-shot effects are walker-rejected on the
-///   2-let arm shape per `slice_c_multi_let_arm_body_with_resumes_one
-///   _effect_is_rejected_at_codegen`);
-/// - helper's `LetBindThenTail` body with a Bool binding (`let b: Bool
-///   = perform Choose.flip(); if b { 1 } else { 2 }`) lowers via the
-///   captures-free synth-cont path with binding_ty=I8 narrowed back
-///   from the I64 args_ptr[0] read (per existing precedent
-///   `slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_-
-///   args` in this file);
-/// - the 2-step lambda-lifted post-arm-k chain runs end-to-end:
-///   k(true) → synth-cont with b=true → tail returns 1 → post_arm_k_1
-///   reads r1=1 → k(false) → synth-cont with b=false → tail returns 2
-///   → post_arm_k_2 reads r2=2, reads r1=1 from closure record,
-///   returns r1+r2=3;
-/// - the SAME heap-reified k_closure record is invoked twice (multi-
-///   shot capability of `resumes: many`); cross-resume independence
-///   is asserted by the closed-form expected output 3.
+/// Closed form: outer-arm-tail = inner-tail(b1=t) + inner-tail(b1=f)
+/// = (1+2) + (3+4) = 3 + 7 = 10. The 4 leaf outcomes (1, 2, 3, 4)
+/// correspond to (b1, b2) ∈ {(t,t), (t,f), (f,t), (f,f)}.
 ///
-/// Invariant: stdout = "3\n", stderr = "", exit 0.
+/// Replaces the pre-Stage-6.7 single-flip "binary outcome enumerator"
+/// (sum=3) shape that Plan B Task 59 shipped under `[DEVIATION Task
+/// 59]`'s deferred-pair-generator framing. The Stage-6.7 lifts (B.2
+/// chained-let-yield + B.1 N-let arm-body chain + Task 100b op-arg
+/// captures) close that deferral.
 ///
-/// **Pair-generator framing rationale**: see `[DEVIATION Task 59]` in
-/// `boldfield/designs/PLAN_B_DEVIATIONS.md`. The literal Cartesian-
-/// product two-flip pair generator (with 4 outcomes: (T,T)/(T,F)/
-/// (F,T)/(F,F)) requires both the chained-synth-cont extension
-/// (multi-perform helper bodies) and the Slice C N-chain extension —
-/// both Plan-C-or-later territory. v1's "pair" is the (r1, r2) tuple
-/// at the arm-level resume-result space, summed for stdout.
+/// Invariant: stdout = "10\n", stderr = "", exit 0.
 #[test]
-fn choose_example_dual_resume_returns_3() {
+fn choose_example_pair_generator_returns_10() {
     let root = workspace_root();
     let source = root.join("examples/choose.sigil");
     let (stdout, stderr, code) = compile_file_and_run(&source, "choose_example");
     assert_eq!(code, 0, "choose exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "3\n",
-        "choose stdout mismatch (expected r1=1 from k(true) + r2=2 from \
-         k(false) = 3); stderr={stderr:?}"
+        stdout, "10\n",
+        "choose stdout mismatch (expected pair-generator sum 1+2+3+4 = 10); \
+         stderr={stderr:?}"
     );
     assert_eq!(
         stderr, "",

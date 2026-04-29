@@ -33,21 +33,25 @@ Goal: close B.1 + B.2. Generalize the 2-step Slice C chain (arm-side) and the 1-
   - commits: [HEAD~2, HEAD~1, HEAD]
   - notes: Pulled forward per R3 review's showstopper finding ("no e2e test coverage for N>=2 chains"). Six e2e tests cover: N=2 simple, N=3 simple (Middle->Middle->Final), forward-data-dependency, user-param capture (single capture in tail), capture in perform-arg AND tail, pointer-typed binding (String). The R3 follow-up commit (HEAD~1) adds the classifier-side cap check (chain length cap at MAX_CLOSURE_ENV_SLOTS=31; over-cap chains fall through to Sync ABI cleanly), an improved pre-pass assert message for the captures+chain edge case (R3 finding 1), a unit test for the cap-check, and two new deviation entries (quadratic forward-copy cost + cap-check rationale, both in PLAN_B_PRIME_DEVIATIONS.md). Phase D (HEAD) deletes the structurally dead `LetBindThenTail` variant + emit pass + `is_simple_let_yield_then_pure_tail_body` + `collect_synth_cont_captures` + dead unit tests (-520 LOC net after retargeting captures tests to `collect_chained_synth_cont_captures`). All commits pod-verify clean.
 - Task 97 — B.1 Phase A: classifier + data-shape refactor (`arm_body_multi_let_then_pure_tail_shape` 2-let cap → N lets; `MultiLetPostArmKChain` 9 hardcoded fields → `Vec<ChainStep>`).
+  - status: done
+  - commits: [3d8e4d7]
+  - notes: New types `PostArmKChain` / `PostArmKStep` / `PostArmKStepRole` / `PostArmKPriorBinding` + new classifier `arm_body_n_let_then_pure_tail_shape` (accepts N >= 2). 7 unit tests cover the accept/reject matrix. Legacy types kept `#[allow(dead_code)]` until Task 100a Phase D-equivalent.
+- Task 98 — B.1 Phase B: post_arm_k synth fn definition pass (N synth fns; each step's closure carries `(k_closure, k_fn) + r_1..r_step_idx`).
+  - status: done
+  - commits: [639ac98, 96f834a (ANF fixup), 2daf60c (walker lift)]
+  - notes: Walker + pre-pass + arm-fn body emit + post-arm-k synth-fn definition pass all switched to `PostArmKChain`. Two CI-driven fixups: ANF intermediate lets in compound tails (`r1+r2+r3` flattens to `let $elab_t0 = r1+r2; $elab_t0+r3`) — classifier accepts the prefix of k-call lets and synthesises a Block tail. Slice B's post-`k` tail walker (`arm_body_post_arm_k_tail_free_vars_ok_block`) extended to allow inner-let bindings, threading binding names through `extra_bindings` (was rejecting them per the original Slice B first-commit restriction).
+- Task 99 — B.1 acceptance e2e tests (3/5-let arm bodies; `arg_step_expr` references prior `r_*`; `tail_expr` references all bindings).
+  - status: done
+  - commits: [e62aa30]
+  - notes: 3 e2e tests: N=3 simple Choose chain; N=5 simple chain (Middle->Middle->Middle->Middle->Final transition); N=3 with forward data dependency (Gen.next: (Int) -> Int with `k(r1)`, `k(r1+r2)`).
+- Task 100 — Invert pinning tests (`slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen` → positive; `slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen` → positive).
+  - status: done
+  - commits: [1baf7b1 (Task 100a), e22ef1b (Task 100b)]
+  - notes: Split into two commits per `[DEVIATION Task 100]`. Task 100a: inversion #1 (3-let test deleted; positive coverage in Task 99) + Phase D-equivalent for B.1 (legacy `MultiLetPostArmKChain` + `arm_body_multi_let_then_pure_tail_shape` + `ArmBodyMultiLetThenPureTailMatch` + 6 legacy unit tests deleted). Task 100b: captures-bearing extension (chain step closures carry op-args alongside (k_closure, k_fn) + prior_bindings) + inversion #2 (`slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen` → `slice_c_chain_arg_referencing_user_op_arg_runs`, positive runtime test).
+- Task 101 — Update existing examples to natural shapes (`multishot_stress.sigil` literal "10+ resumes"; `choose.sigil` literal two-flip pair generator; `multishot_perf.sigil` literal "3-element Choose combinator").
   - status: done-pending-ci
   - commits: [HEAD]
-  - notes: Following the B.2 Phase A pattern, this commit adds the new types + classifier alongside the legacy and marks them `#[allow(dead_code)]` until Phase B (Task 98) wires them into the pre-pass + emit. New types: `PostArmKChain { first_arg_expr, steps: Vec<PostArmKStep> }`, `PostArmKStep { func_id, binding_name, binding_ty, binding_kind, prior_bindings, role }`, `PostArmKStepRole` enum (`Middle { next_arg_expr, next_step_func_id }` vs `Final { tail_expr }`), `PostArmKPriorBinding { name, ty, kind }`. New classifier `arm_body_n_let_then_pure_tail_shape` accepts arbitrary `N >= 2` (the legacy `arm_body_multi_let_then_pure_tail_shape` only accepts `N == 2`); returns `ArmBodyNLetThenPureTailMatch` with vecs of binding names + types + arg exprs. 7 unit tests cover the accept/reject matrix: N=2/3/5 accept; N=1 reject (Slice B's territory); missing tail reject; non-k-call value mid-chain reject; mixed k-names reject. Legacy types and classifier remain untouched. Pod-verify clean.
-- Task 98 — B.1 Phase B: post_arm_k synth fn definition pass (N synth fns; each step's closure carries `(k_closure, k_fn) + r_1..r_step_idx`).
-  - status: todo
-  - commits: []
-- Task 99 — B.1 acceptance e2e tests (3/5-let arm bodies; `arg_step_expr` references prior `r_*`; `tail_expr` references all bindings).
-  - status: todo
-  - commits: []
-- Task 100 — Invert pinning tests (`slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen` → positive; `slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen` → positive).
-  - status: todo
-  - commits: []
-- Task 101 — Update existing examples to natural shapes (`multishot_stress.sigil` literal "10+ resumes"; `choose.sigil` literal two-flip pair generator; `multishot_perf.sigil` literal "3-element Choose combinator").
-  - status: todo
-  - commits: []
+  - notes: All three examples rewritten to natural shapes. multishot_stress.sigil: 10-resume single-arm body (replaces 5-handles × 2-resumes workaround); closed form 1+2+...+10 = 55; e2e renamed `multishot_stress_example_returns_55`. choose.sigil: literal two-flip pair generator; helper performs Choose.flip twice (B.2 chained-let-yield); multi-shot 2-resume arm enumerates 4 outcomes; closed form (1+2)+(3+4) = 10; e2e renamed `choose_example_pair_generator_returns_10`. multishot_perf.sigil: literal 3-element Choose combinator; helper performs Choose.flip three times; multi-shot 2-resume arm enumerates 8 outcomes; iteration count reduced from N=1000 to N=300 to stay under 5s wall-clock floor (3-flip combinator does ~7 arm dispatches per iteration vs. ~3 for 1-flip).
 
 ### Stage 6.7 review checkpoint
 
