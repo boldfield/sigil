@@ -3598,6 +3598,16 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
 /// restriction. `Stmt::Let` extends the allowed set with its name
 /// for the rest of the block (mirrors normal lexical scoping);
 /// `Stmt::Perform` is rejected (already excluded by purity gate).
+///
+/// **Plan B' Stage 6.7 Task 98 lift:** previously rejected any
+/// inner `Stmt::Let` to keep the Slice B surface narrow. Now extends
+/// the allowed set with each let-binding's name as the walker
+/// descends — needed for the N-let arm-body chain whose synthesised
+/// Final-step tail wraps ANF intermediate lets (e.g., `let $elab_t0
+/// = r1+r2; $elab_t0+r3`) inside a fresh Block. The let-binding's
+/// *value* is still subject to the outer free-var restriction (it
+/// must reference only `binding_name`, prior `extra_bindings`,
+/// globals, and earlier inner-let bindings).
 fn arm_body_post_arm_k_tail_free_vars_ok_block(
     b: &crate::ast::Block,
     binding_name: &str,
@@ -3606,25 +3616,24 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
     extra_bindings: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     use crate::ast::Stmt;
-    // For Slice B's first commit, we restrict to one binding name
-    // (the outer `let r`) — extending the allowed set to include
-    // inner `let`s would require threading a mutable set through
-    // the recursion. Inner `let`s in the tail are pure (per
-    // `expr_is_pure`'s `block_is_pure`), so the inner-let value's
-    // free vars are still subject to the outer `{r, globals}`
-    // restriction; an inner-let-bound name then appears as a free
-    // Ident in the inner-let's continuation, which we'd want to
-    // permit. Defer the multi-let-in-tail support until a future
-    // slice; for Slice B's surface, reject any inner Stmt::Let.
+    let mut extras_extended: std::collections::BTreeSet<String> = extra_bindings.clone();
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                return Some(format!(
-                    "Slice B: post-`k` tail of arm body contains an inner \
-                     `let {}` — multi-binding tails arrive in a future captures-bearing \
-                     extension; today's surface is one outer let with a pure tail",
-                    l.name
-                ));
+                // Walk the let's value with the extras-so-far (the
+                // let's own name isn't in scope inside its own RHS).
+                if let Some(d) = arm_body_post_arm_k_tail_free_vars_ok(
+                    &l.value,
+                    binding_name,
+                    k_name,
+                    globals,
+                    &extras_extended,
+                ) {
+                    return Some(d);
+                }
+                // Bring the let-binding into scope for subsequent
+                // stmts and the tail.
+                extras_extended.insert(l.name.clone());
             }
             Stmt::Expr(e) => {
                 if let Some(d) = arm_body_post_arm_k_tail_free_vars_ok(
@@ -3632,7 +3641,7 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
                     binding_name,
                     k_name,
                     globals,
-                    extra_bindings,
+                    &extras_extended,
                 ) {
                     return Some(d);
                 }
@@ -3652,7 +3661,7 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
             binding_name,
             k_name,
             globals,
-            extra_bindings,
+            &extras_extended,
         );
     }
     None
@@ -12861,7 +12870,15 @@ mod tests {
     }
 
     #[test]
-    fn arm_body_post_arm_k_tail_free_vars_rejects_inner_let_in_block_tail() {
+    fn arm_body_post_arm_k_tail_free_vars_accepts_inner_let_in_block_tail() {
+        // Plan B' Stage 6.7 Task 98 lift: inner `Stmt::Let` in the
+        // post-`k` tail Block is now ACCEPTED. Each let-binding's
+        // value is walked under the current extras set; the binding
+        // name is added to extras for subsequent stmts and the tail.
+        // This is needed so the N-let chain's synthesised Final-step
+        // tail (which wraps ANF intermediate lets in a fresh Block)
+        // passes the free-var check. Inverted from the previous
+        // pinning of the old restriction.
         use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
         use crate::errors::Span;
         use std::collections::BTreeSet;
@@ -12876,17 +12893,17 @@ mod tests {
             tail: Some(Expr::Ident("y".to_string(), span.clone())),
             span: span.clone(),
         }));
-        let diag = arm_body_post_arm_k_tail_free_vars_ok(
+        let result = arm_body_post_arm_k_tail_free_vars_ok(
             &tail,
             "r",
             "k",
             &BTreeSet::new(),
             &BTreeSet::new(),
-        )
-        .expect("rejected");
+        );
         assert!(
-            diag.contains("inner") && diag.contains("let"),
-            "diagnostic points at inner-let restriction: {diag}"
+            result.is_none(),
+            "expected None (accept) for `let y = r; y` Block tail with r as \
+             binding_name; got {result:?}"
         );
     }
 
