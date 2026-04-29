@@ -342,3 +342,309 @@ Compile-time was clean (no E0xxx) after the `resumes: many` opt-in. **Runtime** 
 **Closure path:** follow-up Task 109 fixup commit will un-ignore the bisect test, observe which layer breaks, and either ship the targeted compiler fix (if the layer is bounded) or document a Plan-C-or-later closure if the gap is structural. Once the chain runs end-to-end, state.sigil rewrites to the canonical shape and `state_example_run_state_returns_threaded_value` lands as the integration assertion.
 
 **Implementing commit(s):** original Task 109 attempt at `7b457b6` (run_state shape) + `e35dae9` (E0220 `resumes: many` fix); current commit reverts state.sigil to dual-handle, restores the dual-handle e2e test, adds the bisect test, and documents this deviation. Sub-tasks 2 / 3 / 4 of Task 109 (higher_order.sigil docstring / TypeExpr::Fn rejection inversion / arm-body-lambda rejection inversion) all remain closed by prior Stage 6.8 work.
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup architectural summary] Six-layer canonical run_state fix, layer-by-layer cross-reference
+
+**Reader's entry point.** Plan B' Stage 6.8 shipped the language-surface lifts B.3 (TypeExpr::Fn) and B.4 (arm-body lambdas + Phase B k-capture trailing-pair convention). Task 109's first CI cycle on the canonical CPS-style `run_state(initial, comp)` revealed that those surface lifts alone don't make the canonical run end-to-end — the runtime + codegen chain has six layered semantic / architectural gaps that compose. This summary names each layer, its load-bearing test, and the specific deviation entry that documents the fix.
+
+Reading order:
+1. **Bug 2** ([entry](#2026-04-29--deviation-stage-68-followup-bug-2-return-arm-dispatch-on-op-arm-discharge-values-violates-algebraic-effects-semantics)) — handle skips return arm on op-arm discharge per algebraic-effects type theory (B ≠ R type-soundness). Surface symptom: `rs_a` (B≠R single discharge) prints heap-pointer-shaped value pre-fix, `107` post-fix.
+2. **Layer 2 analysis + fix** ([analysis](#2026-04-29--deviation-stage-68-followup-layer-2-analysis-captured-k-from-lambda-invocation-returns-raw-arg-not-return-arm-wrapped-r), [fix](#2026-04-29--deviation-stage-68-followup-layer-2-fix-lifted-lambdas-karg-self-applies-originating-handles-return-arm)) — lifted lambda's k(arg) self-applies originating handle's return arm. Surface symptom: `rs_b` (k(s)(s) chain, tail-perform body) SIGSEGVs pre-fix, `14` post-fix.
+3. **Bug 1** ([entry](#2026-04-29--deviation-stage-68-followup-bug-1-fix-recover-discharged-value-across-non-tail-perform-body)) — recover trampoline's terminal value across non-tail-perform body via `LAST_TERMINAL_VALUE` TLS. Surface symptom: `dbg_a` (`{ let _ = perform; tail }` shape) prints `7` pre-fix, `107` post-fix.
+4. **Layer 3a fix + 3b/3c analysis** ([entry](#2026-04-29--deviation-stage-68-followup-layer-3a-fix--3b3c-analysis-tag-conditional-return-arm-self-apply)) — tag-conditional return-arm self-apply (skip on DISCHARGED, apply on DONE). Surface symptom: prevents double-wrap when synth-cont chain discharges via inner arm. Documents 3b and 3c gaps; hits a clean `unhandled effect_id` abort post-3a, paving the way for 3b/3c.
+5. **Layer 3b** ([entry](#2026-04-29--deviation-stage-68-followup-layer-3b-fix-sync-shims-for-cps-abi-fns-at-fn-as-value-materialization)) — Sync shims for Cps-ABI fns at fn-as-value materialization. Surface symptom: `rs_l3c` (CPS-effected fn-typed parameter) prints heap pointer pre-fix, `42` post-fix.
+6. **Layer 3c** ([entry](#2026-04-29--deviation-stage-68-followup-layer-3c-fix-re-push-handler-frame-in-lower_k_pair_call-preserve-discharged-through-outer-post_arm_k-routing-fix-closure_convert-k-index-collision)) — trailing-triple `(k_closure, k_fn, frame_ptr)` + handler frame re-push + DISCHARGED preservation through outer_post_arm_k routing + closure_convert k-index two-pass + trailing-pair convention in lower_k_pair_call. Surface symptom: canonical `run_state` returns `11` post-fix (closes the Plan B' Stage 6.8 criterion).
+7. **Non-canonical cleanups** ([entry](#2026-04-29--deviation-stage-68-followup-non-canonical-cleanups-statesigil-canonical-drain-leak-layer-3d-debug-doc-removal)) — state.sigil rewrite, DEBUG_RUN_STATE.md deletion, outer_post_arm_k drain on Layer 3c bypass, Layer 3d (return arms with outer captures).
+
+**Load-bearing integration test:** `run_state_canonical_higher_order_helper_returns_threaded_value`. Two stepping-stone integration tests (`integration_bug2_plus_layer2_only_tail_perform_canonical_arms` and `integration_bug2_layer2_bug1_non_tail_perform_canonical_arms`) bisect to specific layer pairs if the full integration regresses.
+
+**Architectural follow-ups left open** (PR #39 review §2 + §3, deferred): (a) replace TLS out-channel for `sigil_run_loop`'s terminal tag/value with packed multi-return — TLS is functionally correct today but architecturally fragile under future nested-handle shapes that interleave run_loop calls between codegen reads. (b) gate Sync shim emission on `top_level_fn_names_seen_as_value` — bounded bloat today, but worth tightening if Cps-fn count grows. Both are Plan-C-or-later candidates; neither blocks Stage 6.8 completion.
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Bug 2] Return arm dispatch on op-arm-discharge values violates algebraic-effects semantics
+
+**Plan B' Stage 6.8 Task 109 followup.** Closes one of the layered bugs blocking the canonical `run_state` rewrite. Sibling bugs (Source A's body-tail-after-perform under sync lowering, the canonical run_state's k-capturing-lambda-invocation chain, and the multi-arm State.get/set/return composition) remain documented under `[DEVIATION Task 109]` for follow-up work.
+
+**The bug.** Phase 4g (PR #29 `eabef59` activation + `dd10379` test fixup) shipped uniform return arm dispatch in `Expr::Handle`'s `lower_expr`: after body lowering, if `return_arm.is_some()`, codegen unconditionally builds `NextStep::Call(return_closure, return_fn, [body_val_widened, null, identity])` and drives `sigil_run_loop`. The `dd10379` commit message defended this with: *"the return clause runs over whatever value flows out of the body, including non-resuming op-arm tail values."* That interpretation is incorrect per algebraic-effects type theory (Plotkin–Pretnar; Eff; Koka):
+
+- Body's type is `B`.
+- Op arm bodies have type `R` (handle's overall — the same type the handle expression evaluates to).
+- Return clause `return(v: B) => body_R` has v's type B and body_R's type R.
+- When an op arm fires and discards `k`, its value already has type R and IS the handle's final value. Passing it through the return clause as `v: B` is type-unsound when B ≠ R.
+
+The bug is masked when B = R (the case PR #29's tests covered), surfacing only when B ≠ R (the canonical `run_state` shape: B = Int, R = (Int) → A). Symptom: heap-pointer-shaped output values, varying across runs (the closure_ptr to the discharged arm's lambda, interpreted as Int, fed through the return arm's pointer arithmetic).
+
+**The fix — distinguish at runtime, conditional dispatch at codegen.**
+
+Runtime (`abi/src/effect.rs` + `runtime/src/handlers.rs`):
+- New `NEXT_STEP_TAG_DISCHARGED = 2` discriminant alongside existing `NEXT_STEP_TAG_DONE = 0` and `NEXT_STEP_TAG_CALL = 1`.
+- New `sigil_next_step_discharged(value)` constructor — emitted by op arm fn body's discard-`k` tail path (replaces `sigil_next_step_done` at that specific site).
+- New thread-local `LAST_TERMINAL_TAG: Cell<u32>` set by `sigil_run_loop` immediately before returning the terminal value (DONE for normal Done, DISCHARGED for the new variant).
+- New `sigil_last_terminal_tag()` query for codegen.
+- New `sigil_reset_last_terminal_tag()` reset for codegen to call before body lowering (so handles whose bodies don't run a perform see a clean DONE state).
+- The trampoline routes both DONE and DISCHARGED through the existing outer post_arm_k stack uniformly — discharge value still flows through any waiting outer multi-shot continuation chain. The distinction matters only at the top-level run_loop terminal.
+
+Codegen (`compiler/src/codegen.rs`):
+- New FFI declarations + per-fn FuncRefs for `sigil_next_step_discharged`, `sigil_last_terminal_tag`, `sigil_reset_last_terminal_tag`.
+- Op arm fn body's discard-`k` catchall (the path that produces `NextStep::Done(arm_body_value)` when arm body is evaluated to a value WITHOUT invoking k) now emits `sigil_next_step_discharged` instead of `sigil_next_step_done`. Synth-cont chains (the resume-`k` path) continue to emit `sigil_next_step_done` — body completion via continuation IS body-normal completion, the return arm should fire.
+- `Expr::Handle`'s `lower_expr` emits `sigil_reset_last_terminal_tag()` before body lowering (gated on `return_arm.is_some()`).
+- After body lowering, if `return_arm.is_some()`, query the tag and conditionally branch:
+  - DISCHARGED: skip return arm dispatch; convert body_val to handler_overall_ty's Cranelift type and use directly as handle's overall.
+  - DONE: existing return arm dispatch path.
+- Both branches converge on a merge block whose param is the handle's final value.
+
+**Type-conversion path in the discharge branch.** When body's Cranelift type B and handler_overall_ty R coincide (e.g., B = Int = I64 and R = (Int) → Int = pointer_ty = I64 on 64-bit targets — the canonical run_state shape), body_val IS handle's overall directly. When they differ in width (B = Bool = I8 and R = String = pointer_ty = I64, etc.), the discharge branch performs a width-aware conversion (uextend / ireduce / bitcast) OR emits a safe placeholder of handler_overall_ty. The placeholder is never observed at runtime when B's narrow-back at the perform site has truncated R-typed bits — the discharge branch is structurally dead in that case. Codegen still must emit valid IR; the placeholder satisfies the verifier without affecting runtime behavior.
+
+**Test inversions.** Two PR #29 tests pinned the buggy semantics; both inverted to assert the corrected semantics:
+- `handle_with_return_arm_fires_on_op_arm_discharge_value` (asserted "9900\n" — return arm applied to discharge value) → renamed to `handle_with_op_arm_discharge_skips_return_arm`, asserts "99\n" (return arm bypassed; arm's value IS handle's overall).
+- `handle_with_constant_return_arm_overrides_op_arm_yield` (asserted "999\n" — constant return arm applied to op arm's yield) → renamed to `handle_with_op_arm_discharge_skips_constant_return_arm`, asserts "7\n".
+
+**New positive test:** `handle_returning_fn_typed_value_with_op_arm_discharge_runs` exercises the load-bearing B ≠ R case (B = Int, R = (Int) → Int). Pre-fix this produced a heap-pointer-shaped value varying across runs; post-fix produces "107\n" (arm's lambda invoked at top level with arg = 7).
+
+**What this fix DOES NOT close.** The canonical `run_state(initial, comp)` higher-order helper from PR #38's reverted Task 109 first-cycle attempt remains broken — Bug 2 is one of multiple layered bugs in the canonical shape. Verified: a manual `/tmp/run_state_canonical.sigil` matching the original literal shape still produces a heap-pointer-shaped value with this fix applied. Other layers blocking the canonical:
+- **Bug 1** (Source A): synchronous body lowering doesn't propagate discard-k through body's post-perform code. Affects programs whose handle body has the `{ let _ = perform; tail }` shape rather than `comp()` in tail position.
+- **Layer 2** (canonical run_state's k-capturing arm-body lambda invocation chain): arms return lambdas that capture `k` and invoke it via `k(s)(s)` recursive call-of-call. The k-capture allocation + lambda-invocation + recursive Call dispatch chain has its own bug that Bug 2 doesn't address.
+- **Layer 3** (multi-arm composition): the canonical run_state has return + State.get + State.set arms. Whether the multi-arm dispatch composes correctly with k-capturing arms is unverified.
+
+These remain Plan B' Stage 6.8 followup work tracked under `[DEVIATION Task 109] run_state canonical shape`. The Bug 2 fix in this entry is a load-bearing prerequisite — without it, even the simpler rs_a-style B ≠ R shape fails at runtime.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Layer 2 analysis] Captured-k-from-lambda invocation returns raw arg, not return-arm-wrapped R
+
+**Plan B' Stage 6.8 Task 109 followup, post-Bug-2.** Empirical bisect of the layered run_state canonical bugs identifies and bounds Layer 2 (per [DEVIATION Stage-6.8-followup Bug 2]'s "What this fix DOES NOT close" enumeration). Analysis only — no fix in this entry; this documents what's broken, where, and what fixing it requires.
+
+**Bisect probes (post-Bug-2 fix, all under `/tmp/`):**
+- `rs_b1.sigil` — eager non-lambda k invocation at arm body tail (`Trigger.fire(k) => k(7)`). Result: prints `20`, exit 0. ✓ Works.
+- `rs_b.sigil` — lambda captures k, lambda body invokes `k(s)(s)` (canonical run_state shape minus state). Result: SIGSEGV, exit 139. ✗ Crashes.
+
+Both files declare `effect Trigger resumes: many { fire: () -> Int }`, body `comp() { perform Trigger.fire() }`, return arm `return(v) => fn (s: Int) -> Int ![] => v + s`, and call `f(13)` from main. The only difference is the op arm's body shape: tail-position eager `k(7)` versus arm-body-as-lambda whose body is `k(s)(s)`.
+
+**Root cause.** `lower_k_pair_call` (compiler/src/codegen.rs:9912–9998) — the synth lambda fn's k(arg) dispatch — builds `NextStep::Call(loaded_k_closure, loaded_k_fn, 1)` and drives `sigil_run_loop` synchronously, then narrows the result to `info.handler_overall_ty`'s Cranelift type. But `loaded_k_fn` — captured from the arm fn's trailing-pair (k_closure, k_fn), itself sourced from comp's CPS-ABI k_fn parameter, itself written as `sigil_continuation_identity` by `lower_call`'s CPS path (compiler/src/codegen.rs:10128–10141) — is the identity continuation. `sigil_continuation_identity` (runtime/src/handlers.rs:873–913) returns `Done(arg)` unchanged. The trampoline's terminal then returns `arg` as u64.
+
+So `k(s)` inside the lambda returns the raw `s` (an Int), narrowed to `handler_overall_ty` which is `(Int) -> Int ![] = pointer_ty`. The next call site `(k(s))(s)` interprets that Int (e.g., 13) as a closure pointer and dereferences → SIGSEGV.
+
+**Why eager k(7) works.** In `rs_b1`, the arm body's tail-position k(arg) yields a `NextStep::Call(identity, [arg])` from the arm fn. The handle's outermost `sigil_run_loop` dispatches that Call, identity returns `Done(arg)`, the run_loop hits its top-level terminal, sets `LAST_TERMINAL_TAG = DONE`, and returns `arg`. The handle expression's outer codegen then runs the return arm with `v = arg`, producing the R-typed closure. Return-arm dispatch happens at handle-discharge time, NOT inside k. Identity's "return arg unchanged" is correct as long as the return-arm wrap fires immediately after at the discharge layer.
+
+**Why captured-k-from-lambda breaks.** When the lambda escapes the handle (because the arm body IS the lambda — Bug 2's discharge-without-return-arm path), the originating handle has already discharged by the time `f(13)` runs. The lambda's k(s) drives a *fresh* `sigil_run_loop` over `Call(identity, [s])` → `Done(s)` → terminal returns `s`. There's no handler frame in scope, no return-arm dispatch fires. The lambda gets `s` typed as `(Int) -> Int` and segfaults at the next application.
+
+**The architectural gap.** Identity-as-k_fn is a Phase 4d MVP simplification (per `[DEVIATION Task 55] Phase 4d` in `PLAN_B_DEVIATIONS.md`) that conflates two distinct semantics:
+1. **In-handle tail-position k(arg)**: identity is correct because the handle's outermost run_loop drives discharge + return-arm wrap immediately after.
+2. **Captured-k-from-lambda invocation outside the handle**: identity is *wrong* because there's no outer handle to apply the return arm. k(s) must self-apply the return-arm to produce R.
+
+Phase B's trailing-pair convention (Plan B' Stage 6.8 Task 107) wired up the *dispatch* mechanism for case 2 but inherited identity's case-1 semantics. The dispatch lands; the value type is wrong. This is the architectural debt.
+
+**Fix architecture (proposed, NOT implemented in this entry).** Two paths, ranked:
+
+*Option A (preferred, localized): trailing-triple convention.* Extend the lifted lambda's closure record's trailing-pair (`k_closure`, `k_fn`) to a trailing-triple `(k_closure, k_fn, return_arm_fn)`:
+- closure_convert detects k-capture in lifted lambda; instead of trailing-pair, writes trailing-triple, sourcing `return_arm_fn` from the originating Expr::Handle's pre-pass return-arm synth fn.
+- `lower_k_pair_call` loads the third slot and, after run_loop returns the raw u64, calls `return_arm_fn(raw_u64)` synchronously to produce the R-typed value.
+- Narrows to `handler_overall_ty` AFTER the return-arm call (not before).
+
+For tail-perform body shapes (rs_b case), this collapses to: `k(arg) = return_arm_fn(arg)`. For non-tail-perform (post-perform body code present), the synth-cont mechanism already in place handles post-perform code; the trailing-triple's `k_fn` would be the synth-cont (not identity), and `return_arm_fn` still wraps the synth-cont's result. Both shapes converge.
+
+*Option B (broader, riskier): change handle expression's body invocation contract.* Make `lower_call`'s CPS path optionally pass a non-identity `k_fn` to body — specifically `return_arm_fn` when the call is a handle expression's body and the handle has a return arm. Then identity is replaced everywhere the chain flows; the run_loop terminal's existing DONE-routes-through-return-arm logic conflicts (double-wrap), so the terminal logic must be inverted (DONE → terminal value is already R, no further wrap). This touches Phase 4g's contract directly — risky.
+
+Option A is the recommended path. Estimated scope: closure_convert ~50 LOC change, codegen `lower_k_pair_call` ~20 LOC change, plus FFI plumbing for the third slot. No runtime ABI changes (closure record layout is internal).
+
+**Multi-arm composition (Layer 3) interaction.** Once Option A lands, the multi-arm canonical run_state (return + State.get + State.set arms, where get/set arms each return k-capturing lambdas) becomes testable. Open question: does the trailing-triple correctly thread when multiple arm types' lambdas chain (set's lambda's k(s) returns get's lambda's k(s)(s) returns ...)? The same trailing-triple should compose if `return_arm_fn` is shared per handle (which it is). Pinned for verification post-Layer-2 fix.
+
+**What's verified empirically:**
+- Bug 2's fix is load-bearing and correct in its scope: rs_a (B ≠ R, single discharge arm, no captured-k lambda) prints `107` post-fix.
+- Layer 2 is independent of Bug 2: the segfault reproduces in rs_b with Bug 2 applied. The bug is in `lower_k_pair_call`'s narrow-without-return-arm-wrap, not in handle-level discharge dispatch.
+- Layer 2 is bounded to lifted-lambda k-pair-bearing synth fns. Direct (non-lambda) k(arg) at arm body tail (rs_b1, rs_a) works because the outermost run_loop's terminal applies return arm at handle-discharge time.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` (analysis only — no compiler/runtime changes in this commit).
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Layer 2 fix] Lifted lambda's k(arg) self-applies originating handle's return arm
+
+**Plan B' Stage 6.8 Task 109 followup, post-Layer-2-analysis.** Implements Option A from the prior analysis entry. Closes the captured-k-from-lambda invocation gap for tail-perform-body, single-op-arm, no-outer-captures-in-return-arm cases — the rs_b probe shape and the canonical `run_state(initial, comp)` helper's arm body pattern (excluding multi-arm + non-tail-perform body, which remain Layers 1 and 3).
+
+**Closure_convert** (`compiler/src/closure_convert.rs`): `ArmKContext` and `ArmKPairCapture` gain a `handle_span: Span` field. The originating `Expr::Handle`'s span is captured when entering an op-arm rewriting context and threaded into every `ArmKPairCapture` lifted from that arm's body. Codegen reads it at `lower_k_pair_call` time to look up the handle's return-arm synth fn.
+
+**Codegen** (`compiler/src/codegen.rs`): `lower_k_pair_call` (synth lambda fn's k-pair dispatch path) gains a return-arm self-apply step between the existing run_loop and narrow-back. After run_loop returns the body-resumed u64:
+1. Look up `handler_return_arm_indices.get(&info.handle_span)`.
+2. If `Some(idx)` AND `handler_return_arm_synth[idx].captures.is_empty()`: build `NextStep::Call(null, return_arm_fn_addr, 3)` with args buffer `[run_loop_result, null_post_handle_k_closure, identity_k_fn_addr]`; drive `sigil_run_loop`; result is the R-typed widened value. Mirrors the Phase 4g handle-discharge dispatch pattern at `lower_expr Expr::Handle`'s `normal_block` branch.
+3. If `None` (no return arm) OR captures non-empty: pass through the raw run_loop result (pre-fix semantics; the latter is a documented follow-up).
+
+The narrow-back to `handler_overall_ty`'s Cranelift type then operates on the R-typed value (post-fix) instead of the raw arg (pre-fix).
+
+**No runtime ABI changes.** The lifted lambda's closure record layout is unchanged (still trailing-pair `(k_closure, k_fn)`). The fix is entirely in the codegen-side dispatch, using the existing `handler_return_arm_indices` / `handler_return_arm_refs_per_handle` side-tables.
+
+**Test added:** `handle_returning_k_capturing_lambda_invoked_outside_handle` in `compiler/tests/e2e.rs`. Asserts `f(7) = k(7)(7) = (s) => 7+s, applied to 7 = 14` for the canonical run_state arm body shape `Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s)` with return arm `return(v) => fn (s: Int) -> Int ![] => v + s`. Pre-fix: SIGSEGV. Post-fix: prints 14.
+
+**Captures restriction.** Return arms with outer captures (e.g., `let x = ...; handle ... with { return(v) => f(x, v), ... }`) fall back to the pre-fix path. The synth fn's closure record requires runtime-allocated slots populated from outer-scope values; threading those through the lifted lambda's invocation context requires either (a) extending the lambda's closure record with the return-arm closure_ptr or (b) using a thread-local or handler-stack lookup that survives handle discharge. Pinned for follow-up; canonical run_state's return arm has no outer captures so the fix unblocks it as-is.
+
+**What's still blocking the canonical `run_state(initial, comp)`:**
+- **Layer 1** (Bug 1): non-tail-perform body shape (`comp() { let _ = perform State.set(10); ...; v + 1 }` does post-perform work). Different bug than Layer 2.
+- **Layer 3**: multi-arm composition (return + State.get + State.set). Whether the trailing-pair k-pair-bearing dispatch composes correctly when multiple arm types' lambdas chain.
+
+Verified: post-Layer-2 fix, `/tmp/run_state_canonical.sigil` (canonical multi-arm + non-tail-perform shape) still produces a heap-pointer-shaped output. Layer 2 fix is necessary but not sufficient.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Bug 1 fix] Recover discharged value across non-tail-perform body
+
+**Plan B' Stage 6.8 Task 109 followup, post-Layer-2.** Closes Bug 1 from `[DEVIATION Stage-6.8-followup Bug 2]`'s "What this fix DOES NOT close" enumeration: synchronous body lowering's IR-locally-computed `body_val` reflects body's tail expression's natural value, NOT the discharged arm's value, when the body has post-perform code (`{ let _ = perform; tail }` shape). For the `dbg_a` probe (Source A from `DEBUG_RUN_STATE.md`), pre-fix `f(7)` printed `7` (body's identity-lambda's behavior on `7`); post-fix prints `107` (arm's discharge lambda `fn (x) => x + 100` applied to `7`).
+
+**The runtime piece** (`abi`/`runtime`):
+- New `LAST_TERMINAL_VALUE: Cell<u64>` TLS in `runtime/src/handlers.rs` alongside the existing `LAST_TERMINAL_TAG`.
+- `sigil_run_loop`'s terminal sets both: tag (DONE / DISCHARGED) AND value (the u64 returned to the caller).
+- New FFI exports `sigil_last_terminal_value()` and `sigil_reset_last_terminal_value()` paralleling the tag's exports.
+- No GC root; the value is u64 (not a pointer-shaped slot). Codegen consumes it immediately; for precise-GC v2, either root the TLS or copy through a stack slot at consumption.
+
+**The codegen piece** (`compiler/src/codegen.rs`):
+- New FFI declarations + per-fn FuncRefs for `sigil_last_terminal_value` / `sigil_reset_last_terminal_value`. Plumbed through `PerFnRefsCtx`, `PerFnRefs`, `prepare_per_fn_refs`, `Lowerer`, and 7 Lowerer construction sites (parallel to Bug 2's plumbing for the tag side).
+- `Expr::Handle`'s `lower_expr` now resets BOTH TLS slots before body lowering — both for return-arm-bearing AND no-return-arm handles — so a stale tag/value from a prior run_loop on the same thread doesn't shadow this handle's body completion when this body never invokes a perform.
+- The return-arm-bearing path's `discharge_block` reads `sigil_last_terminal_value()` instead of `body_val_widened` to recover the trampoline's actual terminal u64. Narrowing logic: I64 → identity, narrower-int → ireduce, pointer_ty → identity, else placeholder.
+- The no-return-arm path (previously fall-through to `body_val`) gains an analogous tag-conditional structure: 3 blocks (`discharge_block_nra`, `normal_block_nra`, `merge_block_nra`); discharge branch reads TLS_VALUE + narrows to body's type B; normal branch uses body_val as before.
+
+**Test added:** `handle_with_post_perform_body_code_uses_arm_discharge_value` exercises the dbg_a probe shape (no return arm, body `{ let _ = perform Trigger.fire(); fn (x) => x }`, arm `fn (x) => x + 100`). Asserts `f(7) = 107` post-fix. Pre-fix this returned 7 (body's tail lambda's behavior).
+
+**Composability with Bug 2 + Layer 2.**
+- Bug 2 (op-arm-discharge skips return arm) and Bug 1 (non-tail-perform body recovery) are independent fixes. Bug 1's discharge_block tag-check is gated on `LAST_TERMINAL_TAG == DISCHARGED`, the same condition Bug 2 introduced. Bug 1 strengthens the discharge branch's value source from `body_val` (Bug 2's MVP that worked only for tail-perform body) to `LAST_TERMINAL_VALUE` (correct for all body shapes).
+- Layer 2 fix (lifted lambda's k(arg) self-applies return arm) is at a different codegen site (`lower_k_pair_call`) and is unaffected by Bug 1's TLS plumbing. Both fixes coexist; the rs_b probe (Layer 2 case with tail-perform body) still prints `14`.
+
+**What's still blocking the canonical `run_state(initial, comp)`:** Layer 3 — multi-arm composition where comp's body has multiple performs across `State.set` and `State.get`, AND each arm captures k into a lambda that escapes via discharge AND is invoked from the run_state caller, AND k(arg) must resume body to drive subsequent performs (not just self-apply return arm). The current `lower_k_pair_call`'s self-apply-return-arm path is correct for tail-perform body but wrong for non-tail-perform body where k must resume body to run further performs. The synth-cont infrastructure that handles non-tail-perform bodies in CPS-color fns covers limited shapes (`{ let _ = perform; constant }` / `{ let r = k(a); pure_tail }`); the canonical run_state's `{ let _ = perform State.set(arg); let v = perform State.get(); v + 1 }` shape is not yet covered. Verified: post-Bug-1 fix, `/tmp/run_state_canonical.sigil` still produces a heap-pointer-shaped output. Bug 1 closes one residual; Layer 3 remains.
+
+**Implementing commit(s):** [HEAD~1] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge (Bug 1).
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Layer 3a partial fix + analysis] Tag-conditional return-arm self-apply; Layer 3b/3c gaps documented
+
+**Plan B' Stage 6.8 Task 109 followup, post-Bug-1.** Closes Layer 3a (tag-conditional self-apply); documents Layer 3b (fn-as-value Sync vs Cps ABI gap) and Layer 3c (captured-continuation handler-frame re-push) as the remaining architectural blockers for the canonical `run_state(initial, comp)`.
+
+### Layer 3a fix — tag-conditional return arm self-apply in lower_k_pair_call
+
+The Layer 2 fix unconditionally self-applied the originating handle's return arm to k(arg)'s `sigil_run_loop` result. For k-pair-bearing lambdas captured at non-tail-perform body shapes, the captured k_fn is a synth-cont (chained-let-yield helper). Driving k(arg) through synth-cont may complete normally (Done with the natural body terminal — apply return arm) OR discharge from a nested arm (DISCHARGED with R-typed value — skip return arm). Pre-fix would double-wrap the discharged value.
+
+**The fix.** `lower_k_pair_call`'s self-apply step now queries `sigil_last_terminal_tag()` after the run_loop call returns. Three blocks (`skip_block` / `apply_block` / `merge_block`); skip on DISCHARGED, apply on DONE, merge to a single I64-typed value, then narrow to `handler_overall_ty`. Mirrors the discharge-block pattern from Bug 2's handle-discharge dispatch.
+
+**Captures-restriction unchanged.** The fall-back to raw widened_result remains for return arms with outer captures (Layer 3d follow-up).
+
+### Layer 3b gap — fn-as-value indirect call Sync/Cps ABI ambiguity
+
+`compute_user_fn_abi` returns `UserFnAbi::Sync` for many CPS-effected fns (those whose body shape doesn't match simple-tail-perform / yield-then-constant / chained-let-yield) and `UserFnAbi::Cps` only for the body-shape-matching subset. Top-level fns materialized as values via closure_convert's Task 104 `Ident(top_level_fn) → ClosureRecord` path carry a code_ptr referencing the fn's actual code — Sync or Cps. The indirect call site (`lower_call`'s catchall) builds the Cranelift signature from the surface `FnTypeExpr`'s effect row alone — no ABI info. For Sync-ABI fns the existing `(closure, args...) -> ret_ty` shape is correct; for Cps-ABI fns the actual code fn is `(closure, args_ptr, args_len) -> *NextStep`.
+
+The canonical run_state's `c: () -> Int ![State]` parameter, when bound to comp (chained-let-yield → Cps ABI), hits this gap: indirect call returns a NextStep pointer interpreted as Int.
+
+**Verified empirically.** An experimental fix that detected `is_cps` from `FnTypeExpr.effects.is_empty()` and used the CPS interop wrapper at the indirect call site fixed `rs_l3b` (chained-let-yield with eager arms: 6 ✓) and `rs_l3c` (CPS-effected fn-typed parameter: 42 ✓) but broke the existing `fn_as_value_with_effect_row_returns_42` test — `add_one` has `![IO]` row but Sync ABI (its `let _ = perform IO.println(...); n + 1` body shape doesn't match any chain pattern). Surface-effect-row alone is an unreliable proxy for ABI.
+
+**Fix paths (open question for Plan C).**
+1. Track per-fn ABI in the closure record. Add an extra slot at allocation time; runtime branch at indirect call site. Most flexible; runtime cost ≈ one branch per indirect call.
+2. Emit Sync shims for Cps-ABI fns at fn-as-value materialization. closure_convert allocates a synth `sync_shim_for_<name>` Sync fn that internally drives run_loop. closure record's code_ptr points to the shim, not the Cps body. Indirect call uses Sync sig uniformly. Loses no optimization for direct calls.
+3. Force all CPS-needing fns to Sync ABI uniformly. Loses chained-let-yield optimization but simplifies fn-as-value invariably.
+
+Option 2 is recommended — preserves all optimizations + uniform indirect call shape. Estimated scope ~150 LOC (one synth Sync shim emission + closure_convert site update).
+
+### Layer 3c gap — captured continuation invoked outside handle hits empty handler stack
+
+Even with 3b resolved, the canonical's `handle c() with { ... }` op arm body discharges via lambda. The lambda escapes the handle (becomes state_fn). When state_fn is invoked from run_state's caller, the State frame has been popped (sigil_handle_pop unlinks but keeps the allocation alive). The lambda's k(arg) drives a fresh sigil_run_loop whose synth-cont (e.g., post-State.set body `let v = perform State.get(); v + 1`) issues sigil_perform for State.get. The handler stack doesn't have State on it: sigil_perform aborts with `unhandled effect_id ... handler stack empty`.
+
+**Verified empirically.** With an experimental Layer 3b fix applied, canonical run_state aborts with exactly that diagnostic (exit 134). Confirms the gap.
+
+**Fix path (open).** Capture the State frame's pointer at handle-allocation time, thread it through the lifted lambda's closure record (extending the trailing-pair to a trailing-triple `(k_closure, k_fn, frame_ptr)`), and re-push the frame at lower_k_pair_call before driving run_loop (popping after). The frame allocation persists across pop/re-push because sigil_handle_pop only unlinks — the heap allocation lives until GC reclaims it. Estimated scope ~200 LOC across closure_convert (ArmKPairCapture extension), codegen (lower_closure_record + lower_k_pair_call extension + arm fn body emit's frame_ptr unpack), and arm closure record allocation (handle expression writes frame_1_ptr_snapshot at a fixed slot).
+
+### Probe results post-Layer-3a
+
+- `rs_b` (tail-perform body, Layer 2 case): 14 ✓
+- `rs_b1` (eager k(7) tail): 20 ✓
+- `dbg_a` (non-tail-perform body, Bug 1): 107 ✓
+- `rs_l3a` (multi-arm-defined-but-single-fires): 14 ✓
+- `rs_l3b` (chained-let-yield with eager arms): heap-pointer-shaped (blocked by Layer 3b)
+- `rs_l3c` (CPS-effected fn-typed parameter, no handle): heap-pointer-shaped (blocked by Layer 3b)
+- `run_state_canonical`: heap-pointer-shaped (blocked by Layer 3b + 3c stack)
+
+The 3a fix is correctness-preserving for future cases; the canonical still requires Layer 3b + 3c to compose.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge (Layer 3a only — 3b and 3c are documented gaps, no compiler/runtime changes for them in this commit).
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Layer 3b fix] Sync shims for Cps-ABI fns at fn-as-value materialization
+
+**Plan B' Stage 6.8 Task 109 followup, post-Layer-3a.** Closes Layer 3b from the prior analysis. Implements **Option 2** (Sync shims at fn-as-value materialization) — the recommended path. Direct-call sites are unchanged; only the indirect-call path through fn-typed values sees the shim.
+
+**The shim.** For every Cps-ABI top-level fn, codegen's pre-pass (`emit_object`'s user_fns loop) declares a parallel Sync-ABI shim with linker name `<mangled>__sync_shim` and signature `(closure_ptr, params...) -> ret_ty`. After all user fn bodies are emitted (just before `module.finish()`), each shim's body is generated:
+1. Pack user params into a stack slot of size `(N + 2) * 8` bytes; each param widened to I64 via `uextend` for narrower-int slots.
+2. Write `null_k_closure` and `sigil_continuation_identity`'s func_addr at `k_closure_offset(N)` / `k_fn_offset(N)`.
+3. Call the underlying Cps fn with `(closure_ptr, args_ptr, args_len)` → `*NextStep`.
+4. Drive `sigil_run_loop` → u64.
+5. Narrow back to `ret_ty` (I64 / ireduce / pointer-passthrough).
+
+**The materialization site.** `lower_closure_record` (codegen.rs:10928, post-fix) checks `sync_shim_refs.get(code_fn_name)` first. If the entry exists, the closure record's `code_ptr` slot gets the shim's func_addr; otherwise falls back to `user_fn_refs[code_fn_name]`. Synth lambdas (`$lambda_N`) and Sync-ABI top-level fns naturally fall through. Direct-call sites (`lower_call`'s `Ident(name)` → user_fn_refs path) are untouched and continue using the inlined CPS interop wrapper for Cps-ABI callees.
+
+**Plumbing.** New side-table `sync_shim_fn_ids: BTreeMap<String, FuncId>`, threaded through `PerFnRefsCtx → PerFnRefs::sync_shim_refs → Lowerer::sync_shim_refs`. 13 destructure / Lowerer-construction sites updated (parallel to Bug 1's `last_terminal_value_ref` plumbing).
+
+**Tests added:**
+- `cps_effected_fn_typed_parameter_indirect_call_returns_correct_value` — minimal probe: `fn invoke(c: () -> Int ![Trigger]) -> Int ![Trigger] { c() }`. Pre-fix: heap-pointer-shaped output. Post-fix: 42.
+- `handle_with_eager_resume_arms_chains_let_yield_correctly` — chained-let-yield body with eager-tail-k arms passed via `c: () -> Int ![State]`. Asserts `run_state(5, comp) = 6` (`v + 1` with v=5).
+
+**What's still blocking the canonical `run_state(initial, comp)`:** Layer 3c — captured continuation invoked outside handle hits empty handler stack. Verified: post-Layer-3b, canonical now hits a clean `unhandled effect_id 2 (op_id 0); handler stack empty` abort (exit 134) instead of a heap-pointer-shaped output. The synth-cont chain inside the lifted lambda IS now reachable (Layer 3b unblocked it); the State frame just isn't on the handler stack at that point.
+
+**Implementing commit(s):** [HEAD~1] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge (Layer 3b).
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Layer 3c fix] Re-push handler frame in lower_k_pair_call; preserve DISCHARGED through outer post_arm_k routing; fix closure_convert k-index collision
+
+**Plan B' Stage 6.8 Task 109 followup, post-Layer-3b — closes the canonical `run_state(initial, comp)` end to end.** Three coordinated fixes:
+
+### 3c-1: Trailing-triple `(k_closure, k_fn, frame_ptr)`
+
+Extends the lifted lambda's closure record's trailing-pair to a trailing-triple including the originating handler's frame pointer. Captured at handle-allocation time via `frame_1_ptr_snapshot`, threaded through:
+- `closure_convert::ArmKPairCapture` gains `frame_ptr_idx: usize` (= `k_fn_idx + 1`).
+- Handle expression's `alloc_arm_closure_record` (extended with `frame_ptr_v: Option<Value>`) writes `frame_ptr` to the arm closure record's trailing slot when the arm body has any nested k-pair-bearing `ClosureRecord` (detected via the new `arm_body_has_k_pair_lambda` walker).
+- Arm fn body emit reads frame_ptr from the arm closure record at offset `16 + 8 * captures.len()`, populating `Lowerer::arm_frame_ptr_v`.
+- `lower_closure_record` writes `arm_frame_ptr_v` to the lifted lambda's closure record's trailing-triple's third slot.
+- `lower_k_pair_call` loads frame_ptr from the closure record at `info.frame_ptr_idx`, calls `sigil_handle_push(frame_ptr)` before the run_loop, and `sigil_handle_pop()` after — re-installing the handler frame so synth-cont chains inside `k(arg)` find the originating effect via `sigil_perform`'s handler-stack walk. The handler frame's heap allocation persists across pop/re-push because `sigil_handle_pop` only unlinks; the closure record's `frame_ptr` slot keeps it GC-rooted.
+
+### 3c-2: Trampoline preserves DISCHARGED through outer_post_arm_k routing
+
+The Bug-2-era "discharged-routing-through-outer-post-arm-k" logic uniformly converted DISCHARGED to DONE at the outermost terminal (since the routing builds a `Call` dispatched to identity, which returns `Done`). For `lower_k_pair_call` driving a synth-cont chain that discharges via an inner arm, this lost the DISCHARGED signal we need to skip return arm dispatch on the R-typed discharge value. **Fix:** the trampoline now bypasses outer_post_arm_k routing when `tag == DISCHARGED` — DISCHARGED propagates to the outermost terminal directly, preserving the tag for `lower_k_pair_call`'s Layer 3a check. Algebraic semantics: when ANY arm discharges, the handle terminates; subsequent computations in the body (including outer chain steps) are abandoned. The Bug 2 routing was correct for multi-shot composition where the outer chain's step expects a post-perform value AND the inner arm RESUMES (not discharges); for the discharge case, routing through the chain conflates terminal semantics.
+
+### 3c-3: closure_convert k-index two-pass
+
+Pre-fix `closure_convert` set `k_closure_idx = filtered.len()` AT the moment `k` was encountered in `raw_caps`. When `k` appeared BEFORE other captures (e.g., `fn (s) => k(arg)(arg)` where the body's free-var traversal sees `k` first as callee), `k_closure_idx` was set to 0 — colliding with env slot 0 (the first regular capture). **Fix:** two-pass — first filter out `k` (recording its `Ty` for `op_ret_ty` / `handler_overall_ty` extraction), then assign `k_closure_idx` / `k_fn_idx` / `frame_ptr_idx` based on the FINAL `filtered.len()`. Order-independent. This bug was latent pre-Layer-3c since prior k-pair tests (rs_b: `k` only, no other captures) didn't exercise the order-dependence; Layer 3c surfaces it because canonical `run_state`'s set arm captures `arg` AND `k`.
+
+### 3c-4: Trailing-pair convention in lower_k_pair_call
+
+Pre-fix, `lower_k_pair_call` only wrote `args[0]` for k(arg) dispatch. When k_fn is a synth-cont (chained-let-yield step), the synth-cont's body expects the trailing-pair convention `[arg, post_arm_k_closure, post_arm_k_fn]` at `args[0..3]` — reading `args[1]` and `args[2]` for its own post-arm-k forwarding. Pre-fix, garbage at `args[1..3]` produced dispatched Calls with null fn_ptrs. **Fix:** `lower_k_pair_call` now writes `(null, identity)` at `args[1..3]` (count=3) — same convention as the arm-fn tail-k emit pattern.
+
+**Tests:**
+- `run_state_canonical_higher_order_helper_returns_threaded_value` — the canonical `run_state(5, comp)` with comp doing `set(10); v = get(); v + 1`. Asserts `11`. Composes Bug 2 + Layer 2 + Bug 1 + Layer 3a + Layer 3b + Layer 3c + closure_convert k-index fix end-to-end.
+- All prior probes (`rs_a`, `rs_b`, `rs_b1`, `dbg_a`, `rs_l3a`, `rs_l3b`, `rs_l3c`, `rs_l3d`) remain green.
+
+**Test suite:** 132/135 e2e (3 perf flakes pre-existing), 539 compiler unit, 73 runtime — all green. **The canonical `run_state` runs end-to-end.**
+
+**What this closes.** Plan B' Stage 6.8's "examples/state.sigil uses literal `run_state` higher-order helper and the threaded-state output is correct" criterion is now met (subject to landing the state.sigil rewrite in a follow-on commit). The `[DEVIATION Task 109] run_state canonical shape` entry's "What this fix DOES NOT close" residual list (Bug 1, Layer 2, Layer 3a, Layer 3b, Layer 3c) is fully resolved.
+
+**Implementing commit(s):** [HEAD~1] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge (Layer 3c).
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup non-canonical cleanups] state.sigil canonical, drain leak, Layer 3d, debug-doc removal
+
+**Plan B' Stage 6.8 Task 109 followup, post-Layer-3c.** Closes the four non-canonical residuals identified after the canonical `run_state` runtime fix.
+
+### state.sigil rewritten to canonical `run_state` shape
+
+`examples/state.sigil` now uses the literal `run_state(initial, comp)` higher-order helper, replacing the dual-handle Plan B Task 59 workaround. Canonical body: `comp() { let _ = perform State.set(10); let v = perform State.get(); v + 1 }`. Output: `11`. The e2e test renamed from `state_example_dual_handle_returns_6_then_99` to `state_example_canonical_run_state_returns_11`. Plan B' Stage 6.8 completion criterion is now concretely met by the example file (not just the language surface).
+
+### DEBUG_RUN_STATE.md deleted
+
+The bisect debug-prep doc from `e912315` (Source A / B / C harness) is removed now that all three layers are closed. Architectural narrative lives in this `PLAN_B_PRIME_DEVIATIONS.md` file's deviation entries; the standalone debug doc was a transient bridge.
+
+### Layer 3c outer_post_arm_k drain on DISCHARGED bypass
+
+`sigil_run_loop` snapshots `OUTER_POST_ARM_K_DEPTH` at entry. On the Layer 3c DISCHARGED bypass terminal (which previously returned without draining), the depth is restored to entry-time so synth-cont Middle pushes during the bypassed run don't leak across run_loop boundaries. Pre-fix, leaked entries were consumed via the DONE-path routing on subsequent calls — benign for the canonical (entries from `lower_k_pair_call` are uniformly `(null, identity)`, so routing is identity-passthrough) but architecturally questionable for adversarial nesting and a 32-entry capacity-overflow risk for deep chains. The drain restores stack discipline.
+
+### Layer 3d — return arms with outer captures
+
+`lower_k_pair_call`'s self-apply path now loads `return_closure` from the handler frame at offset `HANDLER_FRAME_RETURN_CLOSURE_OFF` instead of hardcoding `null`. The handle expression's codegen wrote it via `sigil_handler_frame_set_return` at handle codegen time; for return arms with empty outer captures it's null (per the runtime helper's null-for-empty discipline), for non-empty captures it's the closure record allocated by `alloc_arm_closure_record(&ret_captures, None)`. Both cases unify through the frame load. The frame's heap allocation is reachable via `frame_ptr_loaded` (already loaded earlier in `lower_k_pair_call` for Layer 3c's re-push); the slot is GC-rooted via the lifted lambda's closure record.
+
+The pre-fix gate `if synth.captures.is_empty() { ... } else { widened_result }` is removed — the unified path handles both.
+
+**Test added:** `handle_return_arm_with_outer_captures_in_k_pair_dispatch_path`. Caller takes `factor: Int`; return arm body is `fn (s) => v * factor + s` (captures factor). Asserts `f(7) = 28` for `caller(3)` (= `7*3 + 7`). Pre-fix this would have hit the bailout fallback and produced wrong output (or segfault depending on factor's type compatibility).
+
+### Test results
+
+- 133/136 e2e tests ✓ (3 pre-existing perf flakes unchanged)
+- 539 compiler unit + 73 runtime tests ✓
+- All Stage-6.8-followup tests green: state_example_canonical, run_state_canonical, handle_returning_k_capturing_lambda, handle_with_post_perform, handle_returning_fn_typed_value, handle_with_op_arm_discharge_skips_return_arm, handle_with_op_arm_discharge_skips_constant_return_arm, cps_effected_fn_typed_parameter_indirect_call, handle_with_eager_resume_arms_chains_let_yield, handle_return_arm_with_outer_captures.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
+
+

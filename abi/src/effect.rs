@@ -36,6 +36,31 @@ pub const NEXT_STEP_TAG_DONE: u32 = 0;
 /// closure with the carried argument list, then dispatch on the result.
 pub const NEXT_STEP_TAG_CALL: u32 = 1;
 
+/// `NextStep` discriminant: terminal-from-arm — the carrying op arm
+/// body's discard-`k` tail emitted this. Trampoline propagates the
+/// value identically to `NEXT_STEP_TAG_DONE` (including routing
+/// through the outer post_arm_k stack), but records the
+/// "from-arm-discharge" state in `sigil_last_terminal_tag` so the
+/// handle expression's outer codegen logic can skip return arm
+/// dispatch — the discharged arm's value is the handle's final
+/// value directly per algebraic-effects semantics, not subject to
+/// the return clause's wrapper.
+///
+/// **Why distinct from `DONE`:** Phase 4g shipped uniform return arm
+/// dispatch (PR #29 `dd10379`) on the assumption that "the return
+/// clause runs over whatever value flows out of the body". That
+/// interpretation produces type-unsoundness when the body's type
+/// `B` differs from the handle's overall type `R`: the discharged
+/// arm value has type `R` but is passed through the return clause
+/// expecting type `B`. Symptom: `examples/state.sigil`'s canonical
+/// `run_state` shape produces a heap-pointer-shaped value when
+/// invoked, because the discharge value (a closure record pointer
+/// at type `R`) is passed as `v: B` (which is `Int`) into the
+/// return arm, which then computes pointer arithmetic. The fix:
+/// distinguish the discharge path so the handle's outer logic
+/// skips return arm when the body terminates via discharge.
+pub const NEXT_STEP_TAG_DISCHARGED: u32 = 2;
+
 /// Maximum user-arg count a `perform` site can pack into the inline args
 /// buffer (plus the implicit `(k_closure_ptr, k_fn_ptr)` pair the runtime
 /// appends, so the trampoline-side cap is `MAX_INLINE_ARGS + 2` total
@@ -91,10 +116,10 @@ pub const MAX_HANDLER_ARMS: u32 = 14;
 /// ```
 ///
 /// Cross-boundary constant: `runtime/src/handlers.rs`'s
-/// `compile_assertions` test asserts this constant equals
-/// `core::mem::offset_of!(HandlerFrame, return_fn)` so a future
-/// struct reorder breaks at the test rather than silently miscompiling
-/// in codegen.
+/// `handler_frame_return_offsets_match_abi_constants` test asserts
+/// this constant equals `core::mem::offset_of!(HandlerFrame,
+/// return_fn)` so a future struct reorder breaks at the test
+/// rather than silently miscompiling in codegen.
 pub const HANDLER_FRAME_RETURN_FN_OFF: i32 = 8;
 
 /// Byte offset of `HandlerFrame::return_closure` within the
@@ -114,7 +139,10 @@ mod tests {
         // break that needs an audit on both sides.
         assert_eq!(NEXT_STEP_TAG_DONE, 0);
         assert_eq!(NEXT_STEP_TAG_CALL, 1);
+        assert_eq!(NEXT_STEP_TAG_DISCHARGED, 2);
         assert_ne!(NEXT_STEP_TAG_DONE, NEXT_STEP_TAG_CALL);
+        assert_ne!(NEXT_STEP_TAG_DONE, NEXT_STEP_TAG_DISCHARGED);
+        assert_ne!(NEXT_STEP_TAG_CALL, NEXT_STEP_TAG_DISCHARGED);
     }
 
     #[test]
@@ -139,9 +167,9 @@ mod tests {
         // Pinning the literal byte offsets: codegen Phase 4g reads
         // `return_fn` and `return_closure` directly off the
         // `frame_1_ptr_snapshot` Value at handle exit. The
-        // `compile_assertions` test in `runtime/src/handlers.rs`
-        // pairs with this one to assert the constants match
-        // `offset_of!(HandlerFrame, ...)`.
+        // `handler_frame_return_offsets_match_abi_constants` test in
+        // `runtime/src/handlers.rs` pairs with this one to assert the
+        // constants match `offset_of!(HandlerFrame, ...)`.
         assert_eq!(HANDLER_FRAME_RETURN_FN_OFF, 8);
         assert_eq!(HANDLER_FRAME_RETURN_CLOSURE_OFF, 16);
     }

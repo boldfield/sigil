@@ -4752,6 +4752,106 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_next_step_done", Linkage::Import, &next_step_done_sig)
         .map_err(|e| format!("declare sigil_next_step_done: {e}"))?;
 
+    // sigil_next_step_discharged(value: u64) -> *mut NextStep
+    //
+    // Stage-6.8-followup Bug 2 fix: emitted by op arm fn bodies on the
+    // discard-`k` tail path (replaces sigil_next_step_done at that
+    // specific site). Trampoline propagates the value identically to
+    // Done; LAST_TERMINAL_TAG records the source so the handle
+    // expression's outer codegen logic queries
+    // `sigil_last_terminal_tag` and skips return-arm dispatch on
+    // discharge per algebraic-effects semantics.
+    let mut next_step_discharged_sig = Signature::new(isa_call_conv(&module));
+    next_step_discharged_sig
+        .params
+        .push(AbiParam::new(types::I64));
+    next_step_discharged_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
+    let next_step_discharged = module
+        .declare_function(
+            "sigil_next_step_discharged",
+            Linkage::Import,
+            &next_step_discharged_sig,
+        )
+        .map_err(|e| format!("declare sigil_next_step_discharged: {e}"))?;
+
+    // sigil_last_terminal_tag() -> u32
+    //
+    // Stage-6.8-followup Bug 2 fix: queried by the handle expression's
+    // outer codegen logic immediately after `sigil_run_loop` returns
+    // body_val. If tag == NEXT_STEP_TAG_DISCHARGED, the body
+    // terminated via op arm body's discard-`k` tail and the return
+    // arm dispatch is bypassed (body_val IS handle's overall). If
+    // tag == NEXT_STEP_TAG_DONE, the body completed normally and the
+    // return arm dispatch fires (body_val passed as `v`).
+    let mut last_terminal_tag_sig = Signature::new(isa_call_conv(&module));
+    last_terminal_tag_sig
+        .returns
+        .push(AbiParam::new(types::I32));
+    let last_terminal_tag = module
+        .declare_function(
+            "sigil_last_terminal_tag",
+            Linkage::Import,
+            &last_terminal_tag_sig,
+        )
+        .map_err(|e| format!("declare sigil_last_terminal_tag: {e}"))?;
+
+    // sigil_reset_last_terminal_tag() -> ()
+    //
+    // Stage-6.8-followup Bug 2 fix: emitted by handle expression's
+    // outer codegen logic at the start of each handle lowering,
+    // before body lowering. Resets the per-thread `LAST_TERMINAL_TAG`
+    // to `NEXT_STEP_TAG_DONE` so handles whose bodies do not invoke
+    // `sigil_run_loop` see a clean DONE state when querying after
+    // body lowering. Without this reset, the tag would carry over
+    // from any prior run_loop on the same thread, producing
+    // spurious return-arm-skips for handles whose bodies don't
+    // discharge.
+    let reset_last_terminal_tag_sig = Signature::new(isa_call_conv(&module));
+    let reset_last_terminal_tag = module
+        .declare_function(
+            "sigil_reset_last_terminal_tag",
+            Linkage::Import,
+            &reset_last_terminal_tag_sig,
+        )
+        .map_err(|e| format!("declare sigil_reset_last_terminal_tag: {e}"))?;
+
+    // sigil_last_terminal_value() -> u64
+    //
+    // Stage-6.8-followup Bug 1 fix: queried by the handle expression's
+    // outer codegen logic in the discharge_block when the body has
+    // post-perform code. Body's IR-locally-computed body_val reflects
+    // body's natural terminal (the value of body's tail expression),
+    // NOT the discharged arm's value. The runtime stores the
+    // trampoline's terminal u64 in `LAST_TERMINAL_VALUE` so codegen
+    // can recover it when the tag indicates DISCHARGED.
+    let mut last_terminal_value_sig = Signature::new(isa_call_conv(&module));
+    last_terminal_value_sig
+        .returns
+        .push(AbiParam::new(types::I64));
+    let last_terminal_value = module
+        .declare_function(
+            "sigil_last_terminal_value",
+            Linkage::Import,
+            &last_terminal_value_sig,
+        )
+        .map_err(|e| format!("declare sigil_last_terminal_value: {e}"))?;
+
+    // sigil_reset_last_terminal_value() -> ()
+    //
+    // Stage-6.8-followup Bug 1 fix: emitted alongside
+    // `sigil_reset_last_terminal_tag` at the entry of each handle
+    // lowering so a stale value from a prior run isn't observable.
+    let reset_last_terminal_value_sig = Signature::new(isa_call_conv(&module));
+    let reset_last_terminal_value = module
+        .declare_function(
+            "sigil_reset_last_terminal_value",
+            Linkage::Import,
+            &reset_last_terminal_value_sig,
+        )
+        .map_err(|e| format!("declare sigil_reset_last_terminal_value: {e}"))?;
+
     // sigil_run_loop(initial: *mut NextStep) -> u64. Drives the CPS
     // trampoline to a terminal NextStep::Done and returns its value.
     // Phase 3b uses this to dispatch the NextStep::Call that
@@ -4906,6 +5006,22 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     let mut cps_continuation_synth: Vec<CpsContinuationSynth> = Vec::new();
     let mut cps_continuation_synth_indices: BTreeMap<String, usize> = BTreeMap::new();
 
+    // Stage-6.8-followup Layer 3b — Sync shims for Cps-ABI user fns.
+    // For every fn whose body shape selects `UserFnAbi::Cps`, declare
+    // a parallel Sync-ABI shim fn. The shim has the standard closure-
+    // convention signature `(closure_ptr, params...) -> ret_ty`; its
+    // body packs args into a stack slot with trailing `(null, identity)`,
+    // calls the underlying Cps fn, drives `sigil_run_loop`, and narrows
+    // back. Used at fn-as-value materialization (closure_convert's Task
+    // 104 `Ident(top_level_fn) -> ClosureRecord`): `lower_closure_record`
+    // writes the shim's func_addr into the closure record's code_ptr
+    // slot so an indirect call through the resulting fn-typed value
+    // sees a uniform Sync calling convention regardless of the
+    // underlying fn's ABI. Direct-call sites (lower_call's
+    // `Ident(name)` → user_fn_refs path) bypass the shim and call
+    // the Cps fn through the inlined CPS interop wrapper.
+    let mut sync_shim_fn_ids: BTreeMap<String, cranelift_module::FuncId> = BTreeMap::new();
+
     let mut user_fns: BTreeMap<String, UserFnEntry> = BTreeMap::new();
     for item in &checked.program.items {
         if let crate::ast::Item::Fn(f) = item {
@@ -4967,6 +5083,27 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     abi,
                 },
             );
+
+            // Stage-6.8-followup Layer 3b — declare Sync shim for
+            // Cps-ABI fns. Sig: `(closure_ptr, params...) -> ret_ty`
+            // (Sync). Body emitted at the bottom of `emit_object`,
+            // mirrors the shape of `lower_call`'s CPS-interop wrapper.
+            if abi == UserFnAbi::Cps {
+                let mut shim_sig = Signature::new(isa_call_conv(&module));
+                shim_sig.params.push(AbiParam::new(pointer_ty));
+                for p in &f.params {
+                    shim_sig
+                        .params
+                        .push(AbiParam::new(cranelift_ty_for_type_expr(&p.ty, pointer_ty)));
+                }
+                let ret_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+                shim_sig.returns.push(AbiParam::new(ret_ty));
+                let shim_name = format!("{mangled}__sync_shim");
+                let shim_id = module
+                    .declare_function(&shim_name, Linkage::Local, &shim_sig)
+                    .map_err(|e| format!("declare {shim_name}: {e}"))?;
+                sync_shim_fn_ids.insert(f.name.clone(), shim_id);
+            }
 
             // Plan B Task 55 (Phase 4e) + Plan B' Stage 6.7 Tasks
             // 94+95 (B.2 Phase B+C) — if the fn matches a synth-
@@ -5251,6 +5388,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         outer_post_arm_k_push,
         run_loop,
         next_step_done,
+        next_step_discharged,
+        last_terminal_tag,
+        reset_last_terminal_tag,
+        last_terminal_value,
+        reset_last_terminal_value,
         next_step_call,
         next_step_args_ptr,
         continuation_identity,
@@ -5259,6 +5401,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         handler_return_arm_synth: &handler_return_arm_synth,
         handler_return_arm_indices: &handler_return_arm_indices,
         user_fns: &user_fns,
+        sync_shim_fn_ids: &sync_shim_fn_ids,
         string_literals,
         lit_ids: &lit_ids,
     };
@@ -5302,12 +5445,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 next_step_done_ref: _,
+                next_step_discharged_ref: _,
+                last_terminal_tag_ref,
+                reset_last_terminal_tag_ref,
+                last_terminal_value_ref,
+                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
+                sync_shim_refs,
                 lit_gvs,
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -5685,6 +5834,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
+                    last_terminal_tag_ref,
+                    reset_last_terminal_tag_ref,
+                    last_terminal_value_ref,
+                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
@@ -5698,6 +5851,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
                     user_fn_refs,
+                    sync_shim_refs,
                     user_fns: &user_fns,
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
@@ -5707,6 +5861,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     captured_fn_sigs: BTreeMap::new(),
                     arm_k_closure_v: None,
                     arm_k_fn_v: None,
+                    arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
@@ -5822,6 +5977,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_return_ref,
                 perform_ref,
                 run_loop_ref,
+                last_terminal_tag_ref,
+                reset_last_terminal_tag_ref,
+                last_terminal_value_ref,
+                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 handler_arm_refs_per_handle,
@@ -5835,6 +5994,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
                 user_fn_refs,
+                sync_shim_refs,
                 user_fns: &user_fns,
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
@@ -5872,6 +6032,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 },
                 arm_k_closure_v: None,
                 arm_k_fn_v: None,
+                arm_frame_ptr_v: None,
                 arm_k_pair_self: cc.arm_k_pair_captures.get(&f.name).cloned(),
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
             };
@@ -6166,13 +6327,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     perform_ref,
                     outer_post_arm_k_push_ref: _,
                     run_loop_ref,
-                    next_step_done_ref,
+                    next_step_done_ref: _,
+                    next_step_discharged_ref,
+                    last_terminal_tag_ref,
+                    reset_last_terminal_tag_ref,
+                    last_terminal_value_ref,
+                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
+                    sync_shim_refs,
                     lit_gvs,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -6253,6 +6420,31 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ((n_user_args + 1) * 8) as i32,
                 );
 
+                // Stage-6.8-followup Layer 3c — load frame_ptr from
+                // arm closure_ptr at offset `16 + 8*captures.len()`
+                // when the arm body has any k-pair-bearing nested
+                // ClosureRecord. The handle expression at
+                // `alloc_arm_closure_record` time wrote frame_ptr to
+                // this slot iff the same condition holds. Conditional
+                // load: when the arm body has no k-pair-bearing child,
+                // the closure record was allocated without the slot
+                // (or as null_ptr if captures was also empty), and
+                // reading would access invalid memory.
+                let arm_body_for_scan = &synth.body;
+                let arm_needs_frame_ptr =
+                    arm_body_has_k_pair_lambda(arm_body_for_scan, &cc.arm_k_pair_captures);
+                let frame_ptr_v = if arm_needs_frame_ptr {
+                    let captures_count = synth.captures.len();
+                    let offset: i32 = 16 + 8 * captures_count as i32;
+                    Some(
+                        builder
+                            .ins()
+                            .load(pointer_ty, MemFlags::trusted(), closure_ptr, offset),
+                    )
+                } else {
+                    None
+                };
+
                 let mut lowerer = Lowerer {
                     builder,
                     stackmap: &mut stackmap,
@@ -6270,6 +6462,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
+                    last_terminal_tag_ref,
+                    reset_last_terminal_tag_ref,
+                    last_terminal_value_ref,
+                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
@@ -6283,6 +6479,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
                     user_fn_refs,
+                    sync_shim_refs,
                     user_fns: &user_fns,
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
@@ -6298,6 +6495,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // inside the arm body.
                     arm_k_closure_v: Some(k_closure_v),
                     arm_k_fn_v: Some(k_fn_v),
+                    arm_frame_ptr_v: frame_ptr_v,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
@@ -6743,17 +6941,36 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         assert_eq!(
                             body_actual_ty, pointer_ty,
                             "codegen Phase 4c: unexpected arm-body Cranelift type \
-                             {body_actual_ty:?} for sigil_next_step_done wrap"
+                             {body_actual_ty:?} for sigil_next_step_discharged wrap"
                         );
                         body_value
                     };
+                    // Stage-6.8-followup Bug 2 fix: emit
+                    // `sigil_next_step_discharged` instead of
+                    // `sigil_next_step_done`. This is the op arm fn
+                    // body's discard-`k` tail path: arm body
+                    // evaluated to `widened_body` WITHOUT invoking
+                    // `k`, so per algebraic-effects semantics this
+                    // value IS the handle's final value (not subject
+                    // to the return clause's wrapper). The trampoline
+                    // records DISCHARGED in `LAST_TERMINAL_TAG`; the
+                    // handle expression's outer codegen logic
+                    // queries `sigil_last_terminal_tag` and skips the
+                    // return arm dispatch. Pre-Stage-6.8-followup,
+                    // this site emitted `next_step_done`, which let
+                    // the unconditional return arm dispatch in the
+                    // handle's outer logic apply the return clause
+                    // to a value of type R (handle's overall) as if
+                    // it were type B (body's type) — type-unsound
+                    // when B ≠ R, surfacing as a heap-pointer-shaped
+                    // value in run_state-style programs.
                     let done_call = lowerer
                         .builder
                         .ins()
-                        .call(next_step_done_ref, &[widened_body]);
+                        .call(next_step_discharged_ref, &[widened_body]);
                     // Stackmap entry: any pointer-typed op-args bound in
                     // env (String / user-type) are GC roots live across
-                    // this `sigil_next_step_done` arena allocation.
+                    // this `sigil_next_step_discharged` arena allocation.
                     lowerer
                         .stackmap
                         .push_placeholder(function_code_offset(&lowerer.builder, done_call));
@@ -6830,12 +7047,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     outer_post_arm_k_push_ref: _,
                     run_loop_ref,
                     next_step_done_ref: _,
+                    next_step_discharged_ref: _,
+                    last_terminal_tag_ref,
+                    reset_last_terminal_tag_ref,
+                    last_terminal_value_ref,
+                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
+                    sync_shim_refs,
                     lit_gvs,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -6946,6 +7169,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
+                    last_terminal_tag_ref,
+                    reset_last_terminal_tag_ref,
+                    last_terminal_value_ref,
+                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
@@ -6959,6 +7186,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
                     user_fn_refs,
+                    sync_shim_refs,
                     user_fns: &user_fns,
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
@@ -6968,6 +7196,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     captured_fn_sigs: BTreeMap::new(),
                     arm_k_closure_v: None,
                     arm_k_fn_v: None,
+                    arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
@@ -7149,12 +7378,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 next_step_done_ref,
+                next_step_discharged_ref: _,
+                last_terminal_tag_ref,
+                reset_last_terminal_tag_ref,
+                last_terminal_value_ref,
+                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
+                sync_shim_refs,
                 lit_gvs,
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -7176,6 +7411,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_return_ref,
                 perform_ref,
                 run_loop_ref,
+                last_terminal_tag_ref,
+                reset_last_terminal_tag_ref,
+                last_terminal_value_ref,
+                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 handler_arm_refs_per_handle,
@@ -7189,6 +7428,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
                 user_fn_refs,
+                sync_shim_refs,
                 user_fns: &user_fns,
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
@@ -7198,6 +7438,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 captured_fn_sigs: BTreeMap::new(),
                 arm_k_closure_v: None,
                 arm_k_fn_v: None,
+                arm_frame_ptr_v: None,
                 arm_k_pair_self: None,
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
             };
@@ -7418,12 +7659,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         outer_post_arm_k_push_ref: _,
                         run_loop_ref,
                         next_step_done_ref,
+                        next_step_discharged_ref: _,
+                        last_terminal_tag_ref,
+                        reset_last_terminal_tag_ref,
+                        last_terminal_value_ref,
+                        reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
                         continuation_identity_ref,
                         handler_arm_refs_per_handle,
                         handler_return_arm_refs_per_handle,
                         user_fn_refs,
+                        sync_shim_refs,
                         lit_gvs,
                     } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -7444,6 +7691,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_frame_set_return_ref,
                         perform_ref,
                         run_loop_ref,
+                        last_terminal_tag_ref,
+                        reset_last_terminal_tag_ref,
+                        last_terminal_value_ref,
+                        reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
                         handler_arm_refs_per_handle,
@@ -7457,6 +7708,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
                         user_fn_refs,
+                        sync_shim_refs,
                         user_fns: &user_fns,
                         type_layouts: &type_layouts,
                         ctor_index: &ctor_index,
@@ -7466,6 +7718,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         captured_fn_sigs: BTreeMap::new(),
                         arm_k_closure_v: None,
                         arm_k_fn_v: None,
+                        arm_frame_ptr_v: None,
                         arm_k_pair_self: None,
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
                     };
@@ -8047,12 +8300,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             outer_post_arm_k_push_ref,
                             run_loop_ref,
                             next_step_done_ref: _,
+                            next_step_discharged_ref: _,
+                            last_terminal_tag_ref,
+                            reset_last_terminal_tag_ref,
+                            last_terminal_value_ref,
+                            reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             continuation_identity_ref,
                             handler_arm_refs_per_handle,
                             handler_return_arm_refs_per_handle,
                             user_fn_refs,
+                            sync_shim_refs,
                             lit_gvs,
                         } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -8074,6 +8333,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_return_ref,
                             perform_ref,
                             run_loop_ref,
+                            last_terminal_tag_ref,
+                            reset_last_terminal_tag_ref,
+                            last_terminal_value_ref,
+                            reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             handler_arm_refs_per_handle,
@@ -8087,6 +8350,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
                             user_fn_refs,
+                            sync_shim_refs,
                             user_fns: &user_fns,
                             type_layouts: &type_layouts,
                             ctor_index: &ctor_index,
@@ -8096,6 +8360,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             captured_fn_sigs: BTreeMap::new(),
                             arm_k_closure_v: None,
                             arm_k_fn_v: None,
+                            arm_frame_ptr_v: None,
                             arm_k_pair_self: None,
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
                         };
@@ -8411,6 +8676,178 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         }
     }
 
+    // Stage-6.8-followup Layer 3b — emit Sync shim bodies for every
+    // Cps-ABI user fn. Each shim:
+    //   1. Receives `(closure_ptr, params...)` via Sync calling
+    //      convention (matches `lower_closure_record`'s indirect-
+    //      call signature when this shim's func_addr is the
+    //      closure record's code_ptr).
+    //   2. Packs the user params + trailing `(null, identity)` pair
+    //      into a stack slot.
+    //   3. Calls the underlying Cps fn with the CPS calling
+    //      convention `(closure_ptr, args_ptr, args_len)` →
+    //      `*mut NextStep`.
+    //   4. Drives `sigil_run_loop` to a terminal Done/Discharged.
+    //   5. Narrows the u64 result back to the user-declared ret
+    //      type and returns it.
+    //
+    // **Identity-as-k_fn constraint** (PR #39 review §4). The shim
+    // hardcodes the post-arm-k pair as `(null, sigil_continuation_
+    // identity)`. This means a Cps fn used as a fn-as-value can only
+    // perform effects whose handler is on the live handler stack at
+    // shim invocation time — `identity` round-trips the perform's
+    // value back through the Sync caller's frame, so any unhandled
+    // effect inside the Cps fn aborts via `sigil_perform`'s
+    // "unhandled effect_id; handler stack empty" path. The canonical
+    // run_state shape satisfies this (the `c()` invocation inside
+    // `run_state` happens under the State `handle`); a future call
+    // site like `let f: () -> Int ![Effect] = my_cps_fn; f()` outside
+    // any `handle` for `Effect` would unhandled-abort inside the
+    // shim's `run_loop`. That diagnostic is correct and load-
+    // bearing — typecheck's effect-row inference rejects this shape
+    // statically (an `![Effect]`-rowed call without a surrounding
+    // handler fails E0042 at the call site), so the shim's runtime
+    // abort is the unreachable belt-and-braces fallback. Future
+    // first-class continuations (v2) would replace this hardcode
+    // with a real reified continuation; the shim emit is a Phase 4d
+    // MVP simplification matched to identity's return-Done semantics.
+    //
+    // **Always-emit policy** (PR #39 review §3). The shim is emitted
+    // unconditionally for every Cps-ABI fn, even those never used as
+    // a fn-as-value. Bloat is bounded (one ~100-byte shim per Cps
+    // fn) and the alternative — gating emission on
+    // `top_level_fn_names_seen_as_value` from closure_convert — adds
+    // a side-table dependency without a measured size win. Pinned
+    // for re-evaluation if Cps-fn count grows or binary size
+    // matters; today no one tracks the difference.
+    for (fn_name, &shim_id) in sync_shim_fn_ids.iter() {
+        let entry = match user_fns.get(fn_name) {
+            Some(e) => e,
+            None => unreachable!(
+                "codegen Layer 3b: sync_shim_fn_ids entry for `{fn_name}` has no \
+                 matching user_fns entry"
+            ),
+        };
+        debug_assert_eq!(
+            entry.abi,
+            UserFnAbi::Cps,
+            "codegen Layer 3b: sync_shim declared for `{fn_name}` but its abi is \
+             {:?} (expected Cps)",
+            entry.abi
+        );
+        // Build the shim's signature on demand (matches the one
+        // declared at user_fns insertion time).
+        let mut shim_sig = Signature::new(isa_call_conv(&module));
+        shim_sig.params.push(AbiParam::new(pointer_ty));
+        // entry.param_tys[0] is closure_ptr; user params start at [1].
+        // For Cps fns we used cps_signature so param_tys is
+        // [pointer_ty (closure_ptr), pointer_ty (args_ptr), I32 (args_len)].
+        // The shim's param types come from the source fn's `f.params`
+        // — we look those up via the shim_param_tys side-table built
+        // alongside the shim declaration.
+        let f = match checked.program.items.iter().find_map(|it| match it {
+            crate::ast::Item::Fn(f) if f.name == *fn_name => Some(f),
+            _ => None,
+        }) {
+            Some(f) => f,
+            None => unreachable!(
+                "codegen Layer 3b: sync_shim_fn_ids entry for `{fn_name}` has no \
+                 matching FnDecl in program items"
+            ),
+        };
+        let mut user_param_tys: Vec<Type> = Vec::with_capacity(f.params.len());
+        for p in &f.params {
+            let t = cranelift_ty_for_type_expr(&p.ty, pointer_ty);
+            shim_sig.params.push(AbiParam::new(t));
+            user_param_tys.push(t);
+        }
+        let ret_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+        shim_sig.returns.push(AbiParam::new(ret_ty));
+
+        ctx.func.signature = shim_sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+
+        let block_params: Vec<Value> = builder.block_params(entry_block).to_vec();
+        let closure_ptr_v = block_params[0];
+        let user_args: Vec<Value> = block_params[1..].to_vec();
+        let user_arg_count = user_args.len();
+
+        // Pack args + trailing pair into a stack slot of size
+        // `(N + 2) * 8` bytes.
+        let slot_bytes = ((user_arg_count + 2) * 8) as u32;
+        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            slot_bytes,
+            3,
+        ));
+
+        for (i, (arg_v, arg_ty)) in user_args.iter().zip(user_param_tys.iter()).enumerate() {
+            let widened = if *arg_ty == types::I64 {
+                *arg_v
+            } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                builder.ins().uextend(types::I64, *arg_v)
+            } else {
+                debug_assert_eq!(
+                    *arg_ty, pointer_ty,
+                    "codegen Layer 3b sync_shim: unexpected param Cranelift type \
+                     {arg_ty:?} for `{fn_name}`"
+                );
+                *arg_v
+            };
+            builder.ins().stack_store(widened, slot, (i * 8) as i32);
+        }
+
+        let null_k_closure = builder.ins().iconst(pointer_ty, 0);
+        let identity_ref = module.declare_func_in_func(continuation_identity, builder.func);
+        let identity_addr = builder.ins().func_addr(pointer_ty, identity_ref);
+        builder
+            .ins()
+            .stack_store(null_k_closure, slot, k_closure_offset(user_arg_count));
+        builder
+            .ins()
+            .stack_store(identity_addr, slot, k_fn_offset(user_arg_count));
+
+        let args_ptr = builder.ins().stack_addr(pointer_ty, slot, 0);
+        let args_len_v = builder.ins().iconst(types::I32, user_arg_count as i64);
+
+        // Call the underlying Cps fn.
+        let cps_fn_ref = module.declare_func_in_func(entry.func_id, builder.func);
+        let cps_call = builder
+            .ins()
+            .call(cps_fn_ref, &[closure_ptr_v, args_ptr, args_len_v]);
+        let next_step = builder.inst_results(cps_call)[0];
+
+        // Drive the trampoline.
+        let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
+        let run_loop_call = builder.ins().call(run_loop_ref, &[next_step]);
+        let raw_u64 = builder.inst_results(run_loop_call)[0];
+
+        // Narrow to ret_ty.
+        let ret_v = if ret_ty == types::I64 {
+            raw_u64
+        } else if ret_ty.is_int() && ret_ty.bits() < 64 {
+            builder.ins().ireduce(ret_ty, raw_u64)
+        } else {
+            debug_assert_eq!(
+                ret_ty, pointer_ty,
+                "codegen Layer 3b sync_shim: unexpected ret_ty {ret_ty:?} for `{fn_name}`"
+            );
+            raw_u64
+        };
+
+        builder.ins().return_(&[ret_v]);
+        builder.finalize();
+        module
+            .define_function(shim_id, &mut ctx)
+            .map_err(|e| format!("define sync_shim for `{fn_name}`: {e}"))?;
+        module.clear_context(&mut ctx);
+    }
+
     // --- finish and add the stackmap section ----------------------------
     let mut product = module.finish();
 
@@ -8541,6 +8978,27 @@ struct Lowerer<'a, 'b> {
     /// `sigil_perform`. Returns the final `NextStep::Done`'s value
     /// as u64; native code uses this directly.
     run_loop_ref: FuncRef,
+    /// Stage-6.8-followup Bug 2 fix — `sigil_last_terminal_tag`
+    /// runtime ref. Queried by handle expression's lower_expr
+    /// immediately after `sigil_run_loop` returns body_val to
+    /// branch on whether the body terminated via DONE (dispatch
+    /// return arm) or DISCHARGED (skip return arm; body_val IS
+    /// handle's overall).
+    last_terminal_tag_ref: FuncRef,
+    /// Stage-6.8-followup Bug 2 fix — `sigil_reset_last_terminal_tag`
+    /// runtime ref. Emitted by handle expression's lower_expr
+    /// before body lowering so handles whose bodies don't run a
+    /// perform start with a clean DONE tag state.
+    reset_last_terminal_tag_ref: FuncRef,
+    /// Stage-6.8-followup Bug 1 fix — `sigil_last_terminal_value`
+    /// FuncRef. Read in the handle expression's discharge_block to
+    /// recover the trampoline's terminal value when body has post-
+    /// perform code.
+    last_terminal_value_ref: FuncRef,
+    /// Stage-6.8-followup Bug 1 fix — `sigil_reset_last_terminal_value`
+    /// FuncRef. Emitted alongside `reset_last_terminal_tag_ref` at
+    /// each handle lowering's entry.
+    reset_last_terminal_value_ref: FuncRef,
     /// Plan B Task 55 (Phase 3b) — per-handle-span synthetic arm fn
     /// refs. Used by `Expr::Handle` codegen to emit `func_addr`
     /// pointers for `sigil_handler_frame_set_arm`. Keyed by the
@@ -8614,6 +9072,12 @@ struct Lowerer<'a, 'b> {
     /// populating a `ClosureRecord`'s `code_ptr` slot.
     user_fn_refs: BTreeMap<String, FuncRef>,
 
+    /// Stage-6.8-followup Layer 3b — per-Cps-ABI-fn Sync shim FuncRef.
+    /// Read by `lower_closure_record` when materializing a fn-as-value
+    /// to choose between the Cps fn's func_addr (Cps ABI) and the
+    /// shim's func_addr (Sync ABI). Empty for fully-Sync programs.
+    sync_shim_refs: BTreeMap<String, FuncRef>,
+
     /// Shared user-fn registry (FuncId + signature). Immutable over a
     /// fn's lowering — the Lowerer only reads return types and param
     /// types to size signature lookups.
@@ -8685,6 +9149,15 @@ struct Lowerer<'a, 'b> {
     /// non-arm-fn Lowerers.
     arm_k_closure_v: Option<Value>,
     arm_k_fn_v: Option<Value>,
+    /// Stage-6.8-followup Layer 3c — when this Lowerer is for a synth
+    /// arm fn whose body contains a k-pair-bearing lifted lambda, this
+    /// holds the originating handler's frame_ptr (loaded from arm
+    /// closure_ptr at offset `16 + 8 * captures.len()`). `lower_closure_
+    /// record` writes this Value to the trailing-triple's third slot
+    /// when allocating the lifted lambda's closure record. None for
+    /// non-arm-fn Lowerers and arm fns whose body has no k-pair-bearing
+    /// children.
+    arm_frame_ptr_v: Option<Value>,
 
     /// Plan B' Stage 6.8 Task 107 Phase B — when this Lowerer is for
     /// a k-pair-bearing synth lambda fn (lifted from an arm body that
@@ -9324,11 +9797,27 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
                         // Phase 4d: build closure record from captures,
                         // or pass null when the arm has none.
+                        // Stage-6.8-followup Layer 3c — if the arm body
+                        // has any k-pair-bearing nested ClosureRecord
+                        // (lifted lambda capturing this arm's k), the
+                        // arm closure record gains a frame_ptr slot at
+                        // the end so `lower_k_pair_call` can re-push
+                        // the handler frame when the lambda's k(arg)
+                        // is invoked outside the handle.
                         let captures = self.handler_arm_synth[synth_idx].captures.clone();
-                        let arm_closure_ptr = if captures.is_empty() {
+                        let arm_body_ref = &self.handler_arm_synth[synth_idx].body;
+                        let needs_frame_ptr =
+                            arm_body_has_k_pair_lambda(arm_body_ref, self.arm_k_pair_captures);
+                        let frame_ptr_for_arm = if needs_frame_ptr {
+                            Some(frame_ptr)
+                        } else {
+                            None
+                        };
+                        let arm_closure_ptr = if captures.is_empty() && frame_ptr_for_arm.is_none()
+                        {
                             null_ptr
                         } else {
-                            self.alloc_arm_closure_record(&captures)
+                            self.alloc_arm_closure_record(&captures, frame_ptr_for_arm)
                         };
 
                         let set_call = self.builder.ins().call(
@@ -9383,7 +9872,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             let ret_closure_ptr = if ret_captures.is_empty() {
                                 null_ptr
                             } else {
-                                self.alloc_arm_closure_record(&ret_captures)
+                                self.alloc_arm_closure_record(&ret_captures, None)
                             };
                             let set_return_call = self.builder.ins().call(
                                 self.handler_frame_set_return_ref,
@@ -9404,6 +9893,35 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // Step 2: lower the body. May contain `sigil_perform`
                 // calls that walk the handler stack; the topmost
                 // matching frame's arm runs.
+                //
+                // Stage-6.8-followup Bug 2 fix: emit
+                // `sigil_reset_last_terminal_tag()` before body
+                // lowering. If the body invokes `sigil_run_loop`
+                // (any perform site under synchronous lowering), the
+                // trampoline writes either DONE or DISCHARGED at
+                // terminal. If the body has no perform (e.g.,
+                // `handle 5 with { ... }`), the tag stays at the
+                // reset DONE so the post-body check at handle exit
+                // dispatches the return arm correctly.
+                // Stage-6.8-followup Bug 1 fix: reset both
+                // LAST_TERMINAL_TAG and LAST_TERMINAL_VALUE before
+                // body lowering. Both return-arm-bearing AND
+                // no-return-arm handles need the reset so a prior
+                // run_loop's discharge tag/value doesn't shadow this
+                // handle's body completion when this body never runs
+                // a perform.
+                let reset_tag_call = self
+                    .builder
+                    .ins()
+                    .call(self.reset_last_terminal_tag_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, reset_tag_call));
+                let reset_v_call = self
+                    .builder
+                    .ins()
+                    .call(self.reset_last_terminal_value_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, reset_v_call));
                 let body_val = self.lower_expr(body);
 
                 // Step 3: pop N frames in reverse push order. Capture
@@ -9472,6 +9990,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // Cranelift type). When no return arm is declared,
                 // fall through to the original `body_val` path
                 // (Phase 4f shape).
+                //
+                // **Stage-6.8-followup Bug 2 fix:** dispatch is now
+                // CONDITIONAL on the body's terminal tag (queried
+                // via `sigil_last_terminal_tag` after body lowering).
+                // If the body terminated via op arm body's discard-
+                // `k` tail (DISCHARGED), per algebraic-effects
+                // semantics the discharged arm's value IS the
+                // handle's final value — return arm dispatch is
+                // bypassed. If the body completed normally (DONE),
+                // the existing return arm dispatch fires (body_val
+                // passed as `v`).
                 if let Some(ra) = return_arm.as_deref() {
                     let snap = frame_1_ptr_snapshot.unwrap_or_else(|| {
                         unreachable!(
@@ -9499,6 +10028,133 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         );
                         body_val
                     };
+
+                    // Stage-6.8-followup Bug 2 fix: query the terminal
+                    // tag and branch on whether body terminated via
+                    // DONE (dispatch return arm) or DISCHARGED (skip
+                    // return arm — discharged value IS handle's
+                    // overall per algebraic-effects semantics).
+                    let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, tag_call));
+                    let tag_v = self.builder.inst_results(tag_call)[0];
+                    let discharged_const = self.builder.ins().iconst(
+                        types::I32,
+                        sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
+                    );
+                    let is_discharged =
+                        self.builder
+                            .ins()
+                            .icmp(IntCC::Equal, tag_v, discharged_const);
+
+                    // Pre-compute handler_overall_ty so both branches
+                    // of the conditional produce values of the same
+                    // Cranelift type (the merge block's param type).
+                    let mut preview: BTreeMap<String, Type> = BTreeMap::new();
+                    preview.insert(ra.binding.clone(), body_ty);
+                    let handler_overall_ty = self.type_of_expr(&ra.body, &preview);
+
+                    // Three blocks: discharge (skip return arm),
+                    // normal (existing return arm dispatch), merge
+                    // (single result value).
+                    let discharge_block = self.builder.create_block();
+                    let normal_block = self.builder.create_block();
+                    let merge_block = self.builder.create_block();
+                    self.builder
+                        .append_block_param(merge_block, handler_overall_ty);
+                    self.builder
+                        .ins()
+                        .brif(is_discharged, discharge_block, &[], normal_block, &[]);
+
+                    // Discharge block: body_val IS handle's overall.
+                    // The Cranelift type of body_val (body's type B)
+                    // and handler_overall_ty (handle's overall R)
+                    // share Cranelift width in run_state-shaped
+                    // programs (B=Int=I64, R=(Int)->Int=pointer_ty=I64).
+                    // For mismatched cases, convert body_val to fit
+                    // handler_overall_ty's Cranelift type. When the
+                    // body has no perform, the discharge branch is
+                    // dead at runtime — codegen still must emit valid
+                    // IR for it, hence the unconditional conversion
+                    // even when the conversion path is structurally
+                    // unreachable.
+                    self.builder.switch_to_block(discharge_block);
+                    self.builder.seal_block(discharge_block);
+                    // Stage-6.8-followup Bug 1 fix: read the trampoline's
+                    // terminal value from `sigil_last_terminal_value`
+                    // instead of using body_val. body_val reflects body's
+                    // IR-locally-computed terminal expression (correct
+                    // only for tail-perform body where body's value IS
+                    // perform's return value). For body shapes with
+                    // post-perform code (`{ let _ = perform; tail }`),
+                    // body_val is body's tail value, NOT the discharged
+                    // arm's value — the runtime preserves the latter
+                    // in `LAST_TERMINAL_VALUE`.
+                    //
+                    // SAFETY (Round-3 review §7): the TLS slot
+                    // `LAST_TERMINAL_VALUE` may hold a heap-allocated
+                    // closure-record / handler-frame pointer at terminal
+                    // time. The discipline (declared at the TLS site
+                    // in `runtime/src/handlers.rs`'s `LAST_TERMINAL_VALUE`
+                    // doc) requires consuming the read into a Cranelift
+                    // SSA Value before any allocation that could trigger
+                    // GC — Boehm's conservative scan must find the
+                    // pointer in a register or spill slot. The
+                    // `inst_results(lv_call)[0]` capture below is that
+                    // SSA Value; Cranelift's regalloc threads it through
+                    // the merge_block param and into any subsequent
+                    // narrow / store / call without dropping the
+                    // reference. Inserting an alloc-triggering call
+                    // (e.g., `sigil_alloc`, another `next_step_call`)
+                    // between this load and `last_terminal_v_u64`'s
+                    // first user would silently break this invariant —
+                    // a future regression that adds such a call MUST
+                    // route the value through a stack slot or
+                    // explicitly stackmap-root the SSA value first.
+                    let lv_call = self.builder.ins().call(self.last_terminal_value_ref, &[]);
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, lv_call));
+                    let last_terminal_v_u64 = self.builder.inst_results(lv_call)[0];
+
+                    // Narrow u64 → handler_overall_ty.
+                    let discharge_val = if handler_overall_ty == types::I64 {
+                        last_terminal_v_u64
+                    } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
+                        self.builder
+                            .ins()
+                            .ireduce(handler_overall_ty, last_terminal_v_u64)
+                    } else if handler_overall_ty == self.pointer_ty {
+                        // pointer_ty == I64 on supported targets; the
+                        // u64 IS bit-identical to the pointer value.
+                        last_terminal_v_u64
+                    } else {
+                        // Float / 32-bit-target port would land here.
+                        // Round-3 review §6: panic at codegen instead
+                        // of emitting a wrong-domain zero placeholder
+                        // that propagates through optimization. The
+                        // Cranelift verifier would accept the
+                        // placeholder, but a future port must add a
+                        // dedicated branch (bitcast for floats,
+                        // ireduce/uextend for 32-bit pointer_ty); the
+                        // panic ensures that work happens loudly
+                        // rather than silently producing wrong-domain
+                        // IR.
+                        unreachable!(
+                            "Bug 2 discharge_block: unsupported \
+                             handler_overall_ty {:?} (Bug 2 + Layer 3d \
+                             support I64, I8 / I32 narrower-int, and \
+                             pointer_ty == I64). Float / 32-bit-target \
+                             port needs a dedicated narrow branch here.",
+                            handler_overall_ty
+                        )
+                    };
+                    self.builder
+                        .ins()
+                        .jump(merge_block, &[discharge_val.into()]);
+
+                    // Normal block: existing return arm dispatch.
+                    self.builder.switch_to_block(normal_block);
+                    self.builder.seal_block(normal_block);
 
                     // Read return_fn / return_closure off the
                     // first-pushed frame (snapshotted at push time).
@@ -9601,19 +10257,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     let widened_handle_val = self.builder.inst_results(run_loop_call)[0];
 
                     // Narrow back to the return arm body's Cranelift
-                    // type. We compute it via type_of_expr against
-                    // the post-rewrite `ra.body` (shapes are
-                    // preserved through the capture rewrite); the
-                    // synth return fn widens its body's value to I64
-                    // before the trailing-pair Call, mirroring
-                    // `lower_perform_to_value`'s narrow-back
-                    // discipline. Build a preview map binding `v`
-                    // to body_ty so any `Expr::Ident("v")` in the
-                    // return arm body resolves correctly.
-                    let mut preview: BTreeMap<String, Type> = BTreeMap::new();
-                    preview.insert(ra.binding.clone(), body_ty);
-                    let handler_overall_ty = self.type_of_expr(&ra.body, &preview);
-                    return if handler_overall_ty == types::I64 {
+                    // type. The synth return fn widens its body's
+                    // value to I64 before the trailing-pair Call,
+                    // mirroring `lower_perform_to_value`'s narrow-back
+                    // discipline. handler_overall_ty was pre-computed
+                    // above (before the conditional) so both branches
+                    // produce the same Cranelift type for the merge
+                    // block param.
+                    let normal_val = if handler_overall_ty == types::I64 {
                         widened_handle_val
                     } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
                         self.builder
@@ -9630,9 +10281,124 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         );
                         widened_handle_val
                     };
+                    self.builder.ins().jump(merge_block, &[normal_val.into()]);
+
+                    // Merge block: yields the conditional's final
+                    // value. The block param's type is
+                    // handler_overall_ty (pre-computed); both
+                    // discharge_block and normal_block jump here with
+                    // values of that type.
+                    self.builder.switch_to_block(merge_block);
+                    self.builder.seal_block(merge_block);
+                    return self.builder.block_params(merge_block)[0];
                 }
 
-                body_val
+                // No return arm declared. Stage-6.8-followup Bug 1
+                // fix (no-return-arm variant): even without a return
+                // arm, body's IR-locally-computed body_val can be
+                // wrong when the body has post-perform code AND an
+                // op arm fires with discard-k. The arm's discharge
+                // value flows back through the trampoline's terminal
+                // (preserved in `LAST_TERMINAL_VALUE`); body's
+                // synchronous lowering then continues past the
+                // perform site and produces a different terminal in
+                // body_val. Algebraic semantics says the discharged
+                // value IS handle's overall when an arm discharges.
+                //
+                // The pre-body TLS reset above (Bug 1's
+                // unconditional reset emit at the handle expression's
+                // entry, gated only on group setup, not on
+                // `return_arm.is_some()`) covers BOTH return-arm-
+                // bearing AND no-return-arm handles. Reaching this
+                // point means body has been lowered; tag/value at the
+                // run_loop terminal correctly reflect THIS body's
+                // completion (or, when body has no perform, the
+                // pre-body reset's DONE / 0 — body_val is then the
+                // natural terminal). The post-body tag-check below
+                // is sound under both shapes.
+                let body_ty = self.builder.func.dfg.value_type(body_val);
+                let body_val_widened = if body_ty == types::I64 {
+                    body_val
+                } else if body_ty.is_int() && body_ty.bits() < 64 {
+                    self.builder.ins().uextend(types::I64, body_val)
+                } else {
+                    assert_eq!(
+                        body_ty, self.pointer_ty,
+                        "codegen no-return-arm Bug 1: unexpected body Cranelift \
+                         type {body_ty:?} widening for discharge query"
+                    );
+                    body_val
+                };
+
+                let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, tag_call));
+                let tag_v = self.builder.inst_results(tag_call)[0];
+                let discharged_const = self.builder.ins().iconst(
+                    types::I32,
+                    sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
+                );
+                let is_discharged = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::Equal, tag_v, discharged_const);
+
+                // For no-return-arm, handle's overall type = body's
+                // type B (no return arm to widen / change type).
+                let handler_overall_ty = body_ty;
+
+                let discharge_block_nra = self.builder.create_block();
+                let normal_block_nra = self.builder.create_block();
+                let merge_block_nra = self.builder.create_block();
+                self.builder
+                    .append_block_param(merge_block_nra, handler_overall_ty);
+                self.builder.ins().brif(
+                    is_discharged,
+                    discharge_block_nra,
+                    &[],
+                    normal_block_nra,
+                    &[],
+                );
+
+                // Discharge block: read LAST_TERMINAL_VALUE, narrow.
+                self.builder.switch_to_block(discharge_block_nra);
+                self.builder.seal_block(discharge_block_nra);
+                let lv_call = self.builder.ins().call(self.last_terminal_value_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, lv_call));
+                let lv_u64 = self.builder.inst_results(lv_call)[0];
+                let discharge_val = if handler_overall_ty == types::I64 {
+                    lv_u64
+                } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
+                    self.builder.ins().ireduce(handler_overall_ty, lv_u64)
+                } else if handler_overall_ty == self.pointer_ty {
+                    lv_u64
+                } else {
+                    // Round-3 review §6: panic at codegen instead of
+                    // emitting wrong-domain zero placeholders. Same
+                    // rationale as the return-arm-bearing branch's
+                    // discharge_block above.
+                    unreachable!(
+                        "Bug 1 no-return-arm discharge_block: unsupported \
+                         handler_overall_ty {:?} (Bug 1 supports I64, I8 / \
+                         I32 narrower-int, and pointer_ty == I64). Float / \
+                         32-bit-target port needs a dedicated narrow branch.",
+                        handler_overall_ty
+                    )
+                };
+                self.builder
+                    .ins()
+                    .jump(merge_block_nra, &[discharge_val.into()]);
+
+                // Normal block: body_val IS handle's overall.
+                self.builder.switch_to_block(normal_block_nra);
+                self.builder.seal_block(normal_block_nra);
+                let _ = body_val_widened;
+                self.builder.ins().jump(merge_block_nra, &[body_val.into()]);
+
+                self.builder.switch_to_block(merge_block_nra);
+                self.builder.seal_block(merge_block_nra);
+                self.builder.block_params(merge_block_nra)[0]
             }
         }
     }
@@ -9674,6 +10440,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // slot indices set by closure_convert.
         let k_closure_offset: i32 = 16 + 8 * info.k_closure_idx as i32;
         let k_fn_offset: i32 = 16 + 8 * info.k_fn_idx as i32;
+        let frame_ptr_offset: i32 = 16 + 8 * info.frame_ptr_idx as i32;
         let k_closure = self.builder.ins().load(
             self.pointer_ty,
             MemFlags::trusted(),
@@ -9686,6 +10453,28 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.closure_ptr,
             k_fn_offset,
         );
+        // Stage-6.8-followup Layer 3c — frame_ptr at trailing-triple's
+        // third slot. Re-pushed onto the handler stack before driving
+        // run_loop so synth-cont chains inside k(arg) can find the
+        // originating handler when invoked outside the handle.
+        let frame_ptr_loaded = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.closure_ptr,
+            frame_ptr_offset,
+        );
+
+        // Push the originating handler frame back onto the thread-local
+        // handler stack. sigil_handle_pop didn't deallocate it; the
+        // closure record's frame_ptr slot kept it GC-rooted. Re-pushing
+        // overwrites frame.prev with the current head, threading it
+        // back into the live stack.
+        let push_call = self
+            .builder
+            .ins()
+            .call(self.handle_push_ref, &[frame_ptr_loaded]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, push_call));
 
         // Lower the arg, widen to I64 for the args buffer.
         let arg_v = self.lower_expr(&args[0]);
@@ -9702,8 +10491,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             arg_v
         };
 
-        // sigil_next_step_call(k_closure, k_fn, 1) → *mut NextStep
-        let arg_count_v = self.builder.ins().iconst(types::I32, 1);
+        // sigil_next_step_call(k_closure, k_fn, 3) → *mut NextStep
+        //
+        // Stage-6.8-followup Layer 3c — args buffer follows the
+        // Phase 4e captures+ Slice A trailing-pair convention: 3
+        // slots `[arg, post_arm_k_closure, post_arm_k_fn]`. When
+        // k_fn is `sigil_continuation_identity`, identity returns
+        // `Done(args[0])` ignoring the trailing pair (its
+        // `args_len == 3` branch is explicitly tolerated). When
+        // k_fn is a synth-cont (chained-let-yield step), the
+        // synth-cont's body emit unpacks args[1..3] as its
+        // post_arm_k pair to forward via `next_step_call(post_arm_k
+        // _closure, post_arm_k_fn, [tail])` after computing its
+        // own value. Pre-fix, this emit only wrote args[0]; synth-
+        // cont steps that expected the trailing-pair read garbage
+        // at args[1..3] and built dispatched Calls with null
+        // fn_ptrs (= the v+1 path's "fn=null, arg_count=1, args=[8]"
+        // failure mode observed in rs_l3d's debug trace).
+        let arg_count_v = self.builder.ins().iconst(types::I32, 3);
         let next_step_call = self
             .builder
             .ins()
@@ -9712,7 +10517,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .push_placeholder(function_code_offset(&self.builder, next_step_call));
         let ns = self.builder.inst_results(next_step_call)[0];
 
-        // sigil_next_step_args_ptr(ns) → *mut u64; write arg at slot 0.
+        // sigil_next_step_args_ptr(ns) → *mut u64; write trailing-
+        // pair convention `[widened_arg, null_post_arm_k_closure,
+        // identity_fn_addr]` at offsets 0 / 8 / 16.
         let args_ptr_call = self.builder.ins().call(self.next_step_args_ptr_ref, &[ns]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, args_ptr_call));
@@ -9720,6 +10527,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlags::trusted(), widened_arg, args_buf, 0);
+        let null_post_arm_k_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), null_post_arm_k_closure, args_buf, 8);
+        let identity_fn_addr_for_post_arm_k = self
+            .builder
+            .ins()
+            .func_addr(self.pointer_ty, self.continuation_identity_ref);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            identity_fn_addr_for_post_arm_k,
+            args_buf,
+            16,
+        );
 
         // sigil_run_loop(ns) → u64
         let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns]);
@@ -9727,18 +10548,212 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let widened_result = self.builder.inst_results(run_loop_call)[0];
 
+        // Stage-6.8-followup Layer 3c — pop the originating handler
+        // frame we re-pushed before run_loop. This restores the
+        // handler stack to its pre-k(arg) state so subsequent
+        // sigil_perform calls see the correct stack discipline. The
+        // pop's return value (the popped frame's pointer) is unused
+        // here; debug-build invariant: it equals frame_ptr_loaded.
+        let pop_call = self.builder.ins().call(self.handle_pop_ref, &[]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, pop_call));
+        let _popped = self.builder.inst_results(pop_call)[0];
+
+        // Stage-6.8-followup Layer 2 fix: apply the originating handle's
+        // return arm to widened_result. The lifted lambda may be invoked
+        // outside the originating handle (the canonical run_state shape:
+        // op arm body IS the lambda, lambda is the handle's discharge
+        // value, lambda is invoked from the handle's caller). The captured
+        // (k_closure=null, k_fn=identity) above just round-trips arg
+        // unchanged; without the return-arm wrap here, k(arg) returns the
+        // raw B-typed body value where the source-language type is R
+        // (handler_overall_ty), and the next call site `(k(arg))(...)`
+        // dereferences a non-pointer as a closure → SIGSEGV.
+        //
+        // Implementation mirrors the Phase 4g handle-discharge dispatch
+        // (lower_expr Expr::Handle's normal_block branch): build
+        // NextStep::Call(null, return_arm_fn, 3); write [body_val, null,
+        // identity] at args buffer offsets POST_ARM_K_ARG_OFF /
+        // POST_ARM_K_CLOSURE_OFF / POST_ARM_K_FN_OFF; drive sigil_run_loop;
+        // get widened R-typed value.
+        //
+        // **Captures.** Stage-6.8-followup Layer 3d — return arms with
+        // outer captures are now handled. The handle expression's
+        // codegen path (`sigil_handler_frame_set_return`) writes the
+        // return-arm synth fn's closure_ptr into the handler frame's
+        // `return_closure` slot at frame offset
+        // `HANDLER_FRAME_RETURN_CLOSURE_OFF`. Layer 3c's frame_ptr_loaded
+        // (loaded above from the lifted lambda's trailing-triple) is
+        // a valid pointer to the heap-allocated handler frame; we read
+        // `return_closure` from it and pass that as the Call's
+        // closure_ptr. For return arms with empty outer captures the
+        // frame's `return_closure` is null (per
+        // `sigil_handler_frame_set_return`'s null-for-empty discipline);
+        // for non-empty captures it's the closure record pointer
+        // allocated at handle codegen time. Both cases unify here.
+        // Stage-6.8-followup Layer 3 fix: gate the self-apply-return-
+        // arm step on the trampoline's terminal tag. The k_fn captured
+        // at the perform site may be:
+        //   - identity (tail-perform body): k(arg) → run_loop → Done(arg).
+        //     tag = DONE → apply return arm to wrap arg into R.
+        //   - synth-cont (non-tail-perform body): k(arg) → run_loop →
+        //     synth-cont runs post-perform body → may complete normally
+        //     (Done with body's natural terminal, tag = DONE → apply
+        //     return arm) or discharge from a nested arm (DISCHARGED
+        //     with R-typed value, tag = DISCHARGED → SKIP return arm
+        //     because the discharged value IS R already).
+        //
+        // Pre-Layer-3 Layer 2 fix unconditionally self-applied; for
+        // canonical run_state (multi-arm + non-tail-perform body) the
+        // unconditional apply double-wrapped a discharged R-typed
+        // value, producing a non-sensical closure-of-closure pointer.
+        // The tag-conditional path here is the algebraically correct
+        // contract: return arm fires iff body completed normally.
+        //
+        // The synth-cont machinery (`CpsContinuationKind::ChainedLetBindStep`)
+        // already lambda-lifts post-perform body code for chained-let-
+        // yield shapes; the k_fn captured by the lifted lambda will be
+        // a synth-cont when body has post-perform code, so the run_loop
+        // here drives synth-cont and respects natural completion vs
+        // discharge.
+        let final_widened = if let Some(idx) = self
+            .handler_return_arm_indices
+            .get(&info.handle_span)
+            .copied()
+        {
+            let _synth = &self.handler_return_arm_synth[idx];
+            {
+                // Query terminal tag and branch.
+                let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, tag_call));
+                let tag_v = self.builder.inst_results(tag_call)[0];
+                let discharged_const = self.builder.ins().iconst(
+                    types::I32,
+                    sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
+                );
+                let is_discharged = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::Equal, tag_v, discharged_const);
+
+                let skip_block = self.builder.create_block();
+                let apply_block = self.builder.create_block();
+                let merge_block = self.builder.create_block();
+                self.builder.append_block_param(merge_block, types::I64);
+                self.builder
+                    .ins()
+                    .brif(is_discharged, skip_block, &[], apply_block, &[]);
+
+                // skip_block: body's run terminated via discharge.
+                // The widened_result IS R-typed already; pass through.
+                self.builder.switch_to_block(skip_block);
+                self.builder.seal_block(skip_block);
+                self.builder
+                    .ins()
+                    .jump(merge_block, &[widened_result.into()]);
+
+                // apply_block: body completed normally. Wrap via return arm.
+                self.builder.switch_to_block(apply_block);
+                self.builder.seal_block(apply_block);
+                let ret_fn_ref = *self
+                    .handler_return_arm_refs_per_handle
+                    .get(&info.handle_span)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen Layer 2: handler_return_arm_refs_per_handle missing \
+                             entry for handle span {:?}; pre-pass should populate it \
+                             alongside handler_return_arm_indices",
+                            info.handle_span
+                        )
+                    });
+                let ret_fn_addr = self.builder.ins().func_addr(self.pointer_ty, ret_fn_ref);
+                // Stage-6.8-followup Layer 3d — load the return arm's
+                // closure_ptr from the handler frame at offset
+                // HANDLER_FRAME_RETURN_CLOSURE_OFF. The handle
+                // expression's codegen wrote it via
+                // sigil_handler_frame_set_return; for return arms
+                // with empty outer captures it's null, for non-empty
+                // it's the closure record allocated at handle
+                // codegen time. Both cases unify through this load.
+                let ret_closure = self.builder.ins().load(
+                    self.pointer_ty,
+                    MemFlags::trusted(),
+                    frame_ptr_loaded,
+                    sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
+                );
+                let three_v = self.builder.ins().iconst(types::I32, 3);
+                let call_ns = self.builder.ins().call(
+                    self.next_step_call_ref,
+                    &[ret_closure, ret_fn_addr, three_v],
+                );
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call_ns));
+                let ns_ptr = self.builder.inst_results(call_ns)[0];
+
+                let argp_call = self
+                    .builder
+                    .ins()
+                    .call(self.next_step_args_ptr_ref, &[ns_ptr]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, argp_call));
+                let argp_v = self.builder.inst_results(argp_call)[0];
+
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    widened_result,
+                    argp_v,
+                    POST_ARM_K_ARG_OFF,
+                );
+                let null_post = self.builder.ins().iconst(self.pointer_ty, 0);
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    null_post,
+                    argp_v,
+                    POST_ARM_K_CLOSURE_OFF,
+                );
+                let identity_fn_addr = self
+                    .builder
+                    .ins()
+                    .func_addr(self.pointer_ty, self.continuation_identity_ref);
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    identity_fn_addr,
+                    argp_v,
+                    POST_ARM_K_FN_OFF,
+                );
+
+                let run_loop_call_2 = self.builder.ins().call(self.run_loop_ref, &[ns_ptr]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, run_loop_call_2));
+                let wrapped = self.builder.inst_results(run_loop_call_2)[0];
+                self.builder.ins().jump(merge_block, &[wrapped.into()]);
+
+                self.builder.switch_to_block(merge_block);
+                self.builder.seal_block(merge_block);
+                self.builder.block_params(merge_block)[0]
+            }
+        } else {
+            // No return arm registered for this handle — pass through
+            // (matches pre-Stage-6.8-followup behavior: identity-as-k_fn
+            // round-trips arg unchanged, narrow_back to handler_overall_ty
+            // is then a type-erasing narrow which is sound only when B = R
+            // by coincidence).
+            widened_result
+        };
+
         // Narrow back to handler_overall_ty's Cranelift type.
         let target_ty = cranelift_ty_of_ty(&info.handler_overall_ty, self.pointer_ty);
         if target_ty == types::I64 {
-            widened_result
+            final_widened
         } else if target_ty.is_int() && target_ty.bits() < 64 {
-            self.builder.ins().ireduce(target_ty, widened_result)
+            self.builder.ins().ireduce(target_ty, final_widened)
         } else {
             assert_eq!(
                 target_ty, self.pointer_ty,
                 "lower_k_pair_call: unexpected handler_overall_ty Cranelift type {target_ty:?}"
             );
-            widened_result
+            final_widened
         }
     }
 
@@ -10125,11 +11140,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// arm-fn's `func_addr`). It's stored as null to keep the layout
     /// uniform with user-level closures and avoid a divergent GC
     /// bitmap shape.
-    fn alloc_arm_closure_record(&mut self, captures: &[ArmCapture]) -> Value {
+    fn alloc_arm_closure_record(
+        &mut self,
+        captures: &[ArmCapture],
+        frame_ptr_v: Option<Value>,
+    ) -> Value {
         let env_len = captures.len();
+        let frame_slot_count = if frame_ptr_v.is_some() { 1 } else { 0 };
         assert!(
-            env_len > 0,
-            "alloc_arm_closure_record on empty captures — caller should pass null directly"
+            env_len > 0 || frame_slot_count > 0,
+            "alloc_arm_closure_record on empty captures and no frame_ptr — caller should pass null directly"
         );
         assert!(
             env_len < MAX_CLOSURE_ENV_SLOTS,
@@ -10142,9 +11162,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 bitmap |= 1u32 << (i + 1);
             }
         }
-        let count: u8 = 1 + env_len as u8;
+        // Stage-6.8-followup Layer 3c — frame_ptr at slot env_len when
+        // present. HandlerFrame is heap-allocated (sigil_handler_frame_new
+        // returns a TAG_HANDLER_FRAME pointer); mark it in the bitmap
+        // so the GC scans it.
+        if frame_ptr_v.is_some() {
+            bitmap |= 1u32 << (env_len + 1);
+        }
+        let total_slots = env_len + frame_slot_count;
+        let count: u8 = 1 + total_slots as u8;
         let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
-        let payload_bytes: i64 = 8 + 8 * env_len as i64;
+        let payload_bytes: i64 = 8 + 8 * total_slots as i64;
 
         // Lower env values FIRST, in source order — same discipline
         // as `lower_closure_record`. Two source paths:
@@ -10222,6 +11250,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 .store(MemFlags::trusted(), slot_val, closure_ptr, offset);
         }
 
+        // Stage-6.8-followup Layer 3c — frame_ptr at slot env_len.
+        if let Some(fp) = frame_ptr_v {
+            let offset: i32 = 16 + 8 * env_len as i32;
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), fp, closure_ptr, offset);
+        }
+
         closure_ptr
     }
 
@@ -10247,7 +11283,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // surrounding ARM fn's `arm_k_closure_v` / `arm_k_fn_v`
         // fields, populated at arm-fn Lowerer construction.
         let k_pair = self.arm_k_pair_captures.get(code_fn_name).cloned();
-        let extra_k_slots = if k_pair.is_some() { 2 } else { 0 };
+        // Stage-6.8-followup Layer 3c — k-pair-bearing closure records
+        // gain a third trailing slot for the originating handle's
+        // frame_ptr (k_closure + k_fn + frame_ptr = 3 slots). Allows
+        // `lower_k_pair_call` to re-push the handler frame before
+        // driving run_loop, so synth-cont chains inside k(arg) can
+        // find the originating handler when invoked outside the handle.
+        let extra_k_slots = if k_pair.is_some() { 3 } else { 0 };
 
         let env_len = env_exprs.len();
         let total_slot_count = env_len + extra_k_slots;
@@ -10276,6 +11318,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             bitmap |= 1u32 << (info.k_closure_idx + 1);
             // k_fn is a fn pointer (text-segment), non-GC. No bit.
             let _ = info.k_fn_idx;
+            // Stage-6.8-followup Layer 3c — frame_ptr is a heap-
+            // allocated HandlerFrame pointer (sigil_handler_frame_new
+            // allocates from the GC heap with TAG_HANDLER_FRAME).
+            // bitmap bit position is `info.frame_ptr_idx + 1`.
+            bitmap |= 1u32 << (info.frame_ptr_idx + 1);
         }
         let count: u8 = 1 + total_slot_count as u8;
         let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
@@ -10297,9 +11344,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let closure_ptr = self.builder.inst_results(alloc_call)[0];
 
         // Store code_ptr at offset 8 (past header).
-        let code_fn_ref = *self.user_fn_refs.get(code_fn_name).unwrap_or_else(|| {
-            unreachable!("codegen: ClosureRecord code_fn_name `{code_fn_name}` not registered")
-        });
+        //
+        // Stage-6.8-followup Layer 3b — for fn-as-value materialization
+        // of a Cps-ABI top-level fn, write the Sync shim's func_addr
+        // instead of the underlying Cps fn's. The shim has the
+        // standard Sync calling convention `(closure_ptr, params...)
+        // -> ret_ty`; an indirect call through this closure record's
+        // code_ptr therefore sees a uniform Sync convention regardless
+        // of the underlying fn's actual ABI. The shim internally drives
+        // sigil_run_loop to dispatch the Cps fn's NextStep result.
+        // For Sync-ABI fns and synth lambdas (`$lambda_N`), the
+        // sync_shim_refs map has no entry and this falls through to
+        // the original user_fn_refs lookup.
+        let code_fn_ref = if let Some(shim_ref) = self.sync_shim_refs.get(code_fn_name) {
+            *shim_ref
+        } else {
+            *self.user_fn_refs.get(code_fn_name).unwrap_or_else(|| {
+                unreachable!("codegen: ClosureRecord code_fn_name `{code_fn_name}` not registered")
+            })
+        };
         let code_ptr = self.builder.ins().func_addr(self.pointer_ty, code_fn_ref);
         self.builder
             .ins()
@@ -10354,6 +11417,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlags::trusted(), k_fn_v, closure_ptr, k_fn_offset);
+
+            // Stage-6.8-followup Layer 3c — frame_ptr at trailing-
+            // triple's third slot. Sourced from arm fn's
+            // `arm_frame_ptr_v`, populated at arm-fn Lowerer
+            // construction by the synth-arm-fn body emit which
+            // unpacks frame_ptr from its closure_ptr.
+            let frame_ptr_v = self.arm_frame_ptr_v.unwrap_or_else(|| {
+                unreachable!(
+                    "codegen invariant: lower_closure_record for k-pair-bearing fn \
+                     `{code_fn_name}` requires surrounding arm fn's frame_ptr_v"
+                )
+            });
+            let frame_ptr_offset: i32 = 16 + 8 * info.frame_ptr_idx as i32;
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                frame_ptr_v,
+                closure_ptr,
+                frame_ptr_offset,
+            );
         }
 
         closure_ptr
@@ -11253,6 +12335,122 @@ fn k_closure_offset(user_arg_count: usize) -> i32 {
     (user_arg_count as i32) * 8
 }
 
+/// Stage-6.8-followup Layer 3c — scan an expression tree for a
+/// nested `Expr::ClosureRecord` whose `code_fn_name` is registered
+/// in `arm_k_pair_captures` (i.e., a k-pair-bearing lifted lambda).
+/// Used at handle codegen time and arm-fn body emit time to decide
+/// whether an arm closure record needs the trailing-triple's frame_ptr
+/// slot, and whether the arm fn body emit should load `arm_frame_ptr_v`.
+fn arm_body_has_k_pair_lambda(
+    e: &crate::ast::Expr,
+    arm_k_pair_captures: &BTreeMap<String, crate::closure_convert::ArmKPairCapture>,
+) -> bool {
+    use crate::ast::Expr;
+    match e {
+        Expr::ClosureRecord {
+            code_fn_name,
+            env_exprs,
+            ..
+        } => {
+            if arm_k_pair_captures.contains_key(code_fn_name) {
+                return true;
+            }
+            env_exprs
+                .iter()
+                .any(|e| arm_body_has_k_pair_lambda(e, arm_k_pair_captures))
+        }
+        Expr::Block(b) => block_has_k_pair_lambda(b, arm_k_pair_captures),
+        Expr::Binary { lhs, rhs, .. } => {
+            arm_body_has_k_pair_lambda(lhs, arm_k_pair_captures)
+                || arm_body_has_k_pair_lambda(rhs, arm_k_pair_captures)
+        }
+        Expr::Unary { operand, .. } => arm_body_has_k_pair_lambda(operand, arm_k_pair_captures),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            arm_body_has_k_pair_lambda(cond, arm_k_pair_captures)
+                || block_has_k_pair_lambda(then_block, arm_k_pair_captures)
+                || block_has_k_pair_lambda(else_block, arm_k_pair_captures)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            arm_body_has_k_pair_lambda(scrutinee, arm_k_pair_captures)
+                || arms
+                    .iter()
+                    .any(|a| arm_body_has_k_pair_lambda(&a.body, arm_k_pair_captures))
+        }
+        Expr::Call { callee, args, .. } => {
+            arm_body_has_k_pair_lambda(callee, arm_k_pair_captures)
+                || args
+                    .iter()
+                    .any(|a| arm_body_has_k_pair_lambda(a, arm_k_pair_captures))
+        }
+        Expr::Perform(p) => p
+            .args
+            .iter()
+            .any(|a| arm_body_has_k_pair_lambda(a, arm_k_pair_captures)),
+        Expr::RecordLit { fields, .. } => fields
+            .iter()
+            .any(|f| arm_body_has_k_pair_lambda(&f.value, arm_k_pair_captures)),
+        Expr::Lambda { .. } => unreachable!(
+            "arm_body_has_k_pair_lambda: Expr::Lambda should not survive \
+             closure_convert — every Lambda is rewritten to ClosureRecord. \
+             Reaching this arm means closure_convert leaked a Lambda; \
+             treating it as `false` here would silently misclassify \
+             k-pair-bearing children and produce wrong codegen (frame_ptr \
+             would not be threaded through the lifted lambda's closure \
+             record). Fail loud at codegen instead."
+        ),
+        Expr::Handle { body, op_arms, .. } => {
+            arm_body_has_k_pair_lambda(body, arm_k_pair_captures)
+                || op_arms
+                    .iter()
+                    .any(|a| arm_body_has_k_pair_lambda(&a.body, arm_k_pair_captures))
+        }
+        Expr::IntLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::StringLit(..)
+        | Expr::Ident(..)
+        | Expr::ClosureEnvLoad { .. } => false,
+    }
+}
+
+fn block_has_k_pair_lambda(
+    b: &crate::ast::Block,
+    arm_k_pair_captures: &BTreeMap<String, crate::closure_convert::ArmKPairCapture>,
+) -> bool {
+    for s in &b.stmts {
+        match s {
+            crate::ast::Stmt::Let(l) => {
+                if arm_body_has_k_pair_lambda(&l.value, arm_k_pair_captures) {
+                    return true;
+                }
+            }
+            crate::ast::Stmt::Expr(e) => {
+                if arm_body_has_k_pair_lambda(e, arm_k_pair_captures) {
+                    return true;
+                }
+            }
+            crate::ast::Stmt::Perform(p) => {
+                for a in &p.args {
+                    if arm_body_has_k_pair_lambda(a, arm_k_pair_captures) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    b.tail
+        .as_ref()
+        .map(|t| arm_body_has_k_pair_lambda(t, arm_k_pair_captures))
+        .unwrap_or(false)
+}
+
 /// Plan B Task 55, Phase 4d/4e — byte offset within `args_ptr` for
 /// the `k_fn` slot. Always `k_closure_offset + 8`. Companion to
 /// [`k_closure_offset`].
@@ -11316,6 +12514,33 @@ struct PerFnRefsCtx<'a> {
     outer_post_arm_k_push: cranelift_module::FuncId,
     run_loop: cranelift_module::FuncId,
     next_step_done: cranelift_module::FuncId,
+    /// Stage-6.8-followup Bug 2 fix — `sigil_next_step_discharged`
+    /// FuncId. Op arm fn body's discard-`k` tail emit replaces
+    /// `next_step_done` with this so the trampoline's
+    /// `LAST_TERMINAL_TAG` records DISCHARGED at terminal; handle
+    /// expression's outer logic queries `last_terminal_tag` and skips
+    /// return arm dispatch when the body terminated via discharge.
+    next_step_discharged: cranelift_module::FuncId,
+    /// Stage-6.8-followup Bug 2 fix — `sigil_last_terminal_tag`
+    /// FuncId. Queried by handle expression's `lower_expr`
+    /// immediately after `sigil_run_loop` returns body_val to decide
+    /// whether to dispatch the return arm (DONE) or use body_val
+    /// directly as handle's overall (DISCHARGED).
+    last_terminal_tag: cranelift_module::FuncId,
+    /// Stage-6.8-followup Bug 2 fix — `sigil_reset_last_terminal_tag`
+    /// FuncId. Emitted by handle expression's `lower_expr` before
+    /// body lowering so handles whose bodies don't run a perform
+    /// (no run_loop call) see a clean DONE tag state.
+    reset_last_terminal_tag: cranelift_module::FuncId,
+    /// Stage-6.8-followup Bug 1 fix — `sigil_last_terminal_value`
+    /// FuncId. Read in the handle expression's discharge_block to
+    /// recover the trampoline's terminal value when body has post-
+    /// perform code that overwrites body_val.
+    last_terminal_value: cranelift_module::FuncId,
+    /// Stage-6.8-followup Bug 1 fix — `sigil_reset_last_terminal_value`
+    /// FuncId. Emitted alongside `reset_last_terminal_tag` at the
+    /// entry of each handle lowering.
+    reset_last_terminal_value: cranelift_module::FuncId,
     next_step_call: cranelift_module::FuncId,
     next_step_args_ptr: cranelift_module::FuncId,
     continuation_identity: cranelift_module::FuncId,
@@ -11329,6 +12554,11 @@ struct PerFnRefsCtx<'a> {
     handler_return_arm_synth: &'a [HandlerReturnArmSynth],
     handler_return_arm_indices: &'a BTreeMap<Span, usize>,
     user_fns: &'a BTreeMap<String, UserFnEntry>,
+    /// Stage-6.8-followup Layer 3b — Sync shim FuncIds for Cps-ABI
+    /// user fns. Used by `prepare_per_fn_refs` to declare per-fn
+    /// FuncRefs available at fn-as-value materialization sites
+    /// (`lower_closure_record`).
+    sync_shim_fn_ids: &'a BTreeMap<String, cranelift_module::FuncId>,
     string_literals: &'a [(Span, String)],
     lit_ids: &'a [cranelift_module::DataId],
 }
@@ -11366,6 +12596,16 @@ struct PerFnRefs {
     outer_post_arm_k_push_ref: FuncRef,
     run_loop_ref: FuncRef,
     next_step_done_ref: FuncRef,
+    /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::next_step_discharged`.
+    next_step_discharged_ref: FuncRef,
+    /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::last_terminal_tag`.
+    last_terminal_tag_ref: FuncRef,
+    /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::reset_last_terminal_tag`.
+    reset_last_terminal_tag_ref: FuncRef,
+    /// Stage-6.8-followup Bug 1 fix — see `PerFnRefsCtx::last_terminal_value`.
+    last_terminal_value_ref: FuncRef,
+    /// Stage-6.8-followup Bug 1 fix — see `PerFnRefsCtx::reset_last_terminal_value`.
+    reset_last_terminal_value_ref: FuncRef,
     next_step_call_ref: FuncRef,
     next_step_args_ptr_ref: FuncRef,
     continuation_identity_ref: FuncRef,
@@ -11375,6 +12615,14 @@ struct PerFnRefs {
     /// span. Mirrors `handler_arm_refs_per_handle` shape.
     handler_return_arm_refs_per_handle: BTreeMap<Span, FuncRef>,
     user_fn_refs: BTreeMap<String, FuncRef>,
+    /// Stage-6.8-followup Layer 3b — per-Cps-ABI-fn Sync shim FuncRef.
+    /// Keyed by fn name. Read by `lower_closure_record` when
+    /// materializing a fn-as-value: if the user fn is Cps-ABI, the
+    /// closure record's code_ptr slot gets this shim's func_addr
+    /// instead of the underlying Cps fn's, so an indirect call
+    /// through the resulting fn-typed value sees a uniform Sync
+    /// calling convention.
+    sync_shim_refs: BTreeMap<String, FuncRef>,
     lit_gvs: Vec<(Span, GlobalValue, usize)>,
 }
 
@@ -11409,6 +12657,15 @@ fn prepare_per_fn_refs(
         module.declare_func_in_func(ctx.outer_post_arm_k_push, builder.func);
     let run_loop_ref = module.declare_func_in_func(ctx.run_loop, builder.func);
     let next_step_done_ref = module.declare_func_in_func(ctx.next_step_done, builder.func);
+    let next_step_discharged_ref =
+        module.declare_func_in_func(ctx.next_step_discharged, builder.func);
+    let last_terminal_tag_ref = module.declare_func_in_func(ctx.last_terminal_tag, builder.func);
+    let reset_last_terminal_tag_ref =
+        module.declare_func_in_func(ctx.reset_last_terminal_tag, builder.func);
+    let last_terminal_value_ref =
+        module.declare_func_in_func(ctx.last_terminal_value, builder.func);
+    let reset_last_terminal_value_ref =
+        module.declare_func_in_func(ctx.reset_last_terminal_value, builder.func);
     let next_step_call_ref = module.declare_func_in_func(ctx.next_step_call, builder.func);
     let next_step_args_ptr_ref = module.declare_func_in_func(ctx.next_step_args_ptr, builder.func);
     let continuation_identity_ref =
@@ -11459,6 +12716,18 @@ fn prepare_per_fn_refs(
         })
         .collect();
 
+    // Stage-6.8-followup Layer 3b — per-Cps-ABI-fn Sync shim FuncRef.
+    let sync_shim_refs: BTreeMap<String, FuncRef> = ctx
+        .sync_shim_fn_ids
+        .iter()
+        .map(|(name, fid)| {
+            (
+                name.clone(),
+                module.declare_func_in_func(*fid, builder.func),
+            )
+        })
+        .collect();
+
     // String-literal GVs + lengths keyed by source span. Closure
     // conversion can reorder the walk relative to typecheck's
     // source-order list; span-keyed linear-search is O(small) and
@@ -11485,12 +12754,18 @@ fn prepare_per_fn_refs(
         outer_post_arm_k_push_ref,
         run_loop_ref,
         next_step_done_ref,
+        next_step_discharged_ref,
+        last_terminal_tag_ref,
+        reset_last_terminal_tag_ref,
+        last_terminal_value_ref,
+        reset_last_terminal_value_ref,
         next_step_call_ref,
         next_step_args_ptr_ref,
         continuation_identity_ref,
         handler_arm_refs_per_handle,
         handler_return_arm_refs_per_handle,
         user_fn_refs,
+        sync_shim_refs,
         lit_gvs,
     }
 }

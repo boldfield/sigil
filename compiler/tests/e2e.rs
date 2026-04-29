@@ -985,32 +985,42 @@ fn catch_example_recovers_with_42() {
     );
 }
 
-/// Plan B Task 59 — `examples/state.sigil` exercises both `State.get`
-/// and `State.set` ops through the dual-handle pattern (one `handle`
-/// per op).
+/// Plan B' Stage 6.8 (post-followup) — `examples/state.sigil` uses
+/// the canonical `run_state(initial, comp)` higher-order helper.
 ///
-/// **Why dual-handle, not literal `run_state`.** Plan B' Stage 6.8
-/// shipped B.3 (TypeExpr::Fn) and B.4 (arm-body lambdas + Phase B
-/// k-capture trailing-pair convention) — the lifts the literal
-/// `run_state(initial, comp)` shape needs. But Task 109's first
-/// CI cycle on the canonical CPS-style run_state revealed a runtime
-/// integration gap: `state_fn(initial)` returned a closure-record
-/// pointer rather than the threaded integer value. See
-/// `[DEVIATION Task 109] run_state canonical shape — runtime chain
-/// integration gap` for the gap analysis. Until the chain bug
-/// closes, state.sigil keeps the dual-handle Plan B v1 workaround.
+/// **What this exercises end-to-end.** The full stack of Stage 6.8 +
+/// Stage-6.8-followup architectural lifts:
+/// - Stage 6.8 B.3: TypeExpr::Fn parameters (`c: () -> Int ![State]`).
+/// - Stage 6.8 B.4: arm-body-as-lambda (`Trigger.fire(k) => fn (s) =>
+///   k(arg)(arg)`).
+/// - Stage-6.8-followup Bug 2: handle skips return arm on op-arm
+///   discharge (B ≠ R type-soundness).
+/// - Stage-6.8-followup Layer 2: lifted lambda's k(arg) self-applies
+///   originating handle's return arm.
+/// - Stage-6.8-followup Bug 1: recover discharged value across
+///   non-tail-perform body via LAST_TERMINAL_VALUE TLS.
+/// - Stage-6.8-followup Layer 3a: tag-conditional return-arm
+///   self-apply (skip on DISCHARGED, apply on DONE).
+/// - Stage-6.8-followup Layer 3b: Sync shims for Cps-ABI fns at
+///   fn-as-value materialization (`comp` passed as `c`).
+/// - Stage-6.8-followup Layer 3c: trailing-triple `(k_closure,
+///   k_fn, frame_ptr)` + handler frame re-push in lower_k_pair_call
+///   + DISCHARGED preservation through outer_post_arm_k routing +
+///     closure_convert k-index two-pass.
 ///
-/// Invariant: stdout = "6\n99\n", stderr = "", exit 0.
+/// **Trace.** See file header for the full algebraic trace.
+///
+/// Invariant: stdout = "11\n", stderr = "", exit 0.
 #[test]
-fn state_example_dual_handle_returns_6_then_99() {
+fn state_example_canonical_run_state_returns_11() {
     let root = workspace_root();
     let source = root.join("examples/state.sigil");
     let (stdout, stderr, code) = compile_file_and_run(&source, "state_example");
     assert_eq!(code, 0, "state exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "6\n99\n",
-        "state stdout mismatch (expected read=6 from get arm k(5)+1, \
-         then write=99 from set arm k(arg)=k(99)); stderr={stderr:?}"
+        stdout, "11\n",
+        "state stdout mismatch (expected `run_state(5, comp) = 11` for \
+         comp doing set(10); v=get(); v+1); stderr={stderr:?}"
     );
     assert_eq!(
         stderr, "",
@@ -4397,21 +4407,33 @@ fn handle_with_return_arm_transforms_body_value_no_op_arms_fired() {
 }
 
 #[test]
-fn handle_with_return_arm_fires_on_op_arm_discharge_value() {
-    // Plan B Task 55 (Phase 4g) — semantic pin: return arms fire on
-    // the value the body **yields**, regardless of whether that
-    // value comes from the body completing normally OR from an op
-    // arm discharging the perform without invoking `k`. This
-    // matches Koka / Effekt standard algebraic-effects semantics:
-    // the return clause runs over whatever value flows out of the
-    // body (including non-resuming op-arm tail values). It is NOT
-    // the case that op-arm dispatch "skips" the return arm.
+fn handle_with_op_arm_discharge_skips_return_arm() {
+    // Stage-6.8-followup Bug 2 fix — corrects Phase 4g's incorrect
+    // semantics from PR #29 `dd10379`. **Op arm body's discard-`k`
+    // tail bypasses the return arm.** Per algebraic-effects type
+    // theory (Plotkin–Pretnar), the body has type B and op arms
+    // have body type R (handle's overall). The return clause
+    // `return(v: B) => body_R` wraps body's normal value (type B)
+    // into R. When an op arm fires and discards `k`, its value
+    // already has type R and IS the handle's final value; passing
+    // it through the return clause as `v: B` is type-unsound when
+    // B ≠ R. PR #29's CI fix at `dd10379` shipped uniform return
+    // arm dispatch on the assumption that "return clause runs over
+    // whatever flows out of the body" — that interpretation is
+    // wrong; this test pins the corrected semantics.
     //
     // `handle (perform Raise.fail()) with { Raise.fail(k) => 99,
     //  return(v) => v * 100 }` — body performs Raise.fail; op arm
-    // fires returning 99 (without calling `k`); the 99 flows out
-    // as the body's yielded value; return arm fires with v=99
-    // → 99*100 = 9900. main prints "9900\n".
+    // fires, returns 99 (discards k); 99 IS handle's overall
+    // (return arm bypassed). main prints "99\n".
+    //
+    // The test's symptoms BEFORE this fix produced "9900\n"
+    // (return arm applied 99 * 100). For B = R = Int (this test),
+    // the bug was masked by the type coincidence — both interpretations
+    // produced valid integers. The B ≠ R case (covered by the
+    // run_state-shaped test landed alongside this fix) shows the
+    // bug clearly: the discharged R-typed value is passed as B-typed
+    // `v` and pointer arithmetic ensues.
     let src = "effect Raise { fail: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform Raise.fail()) with {\n    \
@@ -4421,9 +4443,10 @@ fn handle_with_return_arm_fires_on_op_arm_discharge_value() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_op_arm_value_via_return_arm");
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_bug2_discharge_skips_return");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "9900\n", "stdout mismatch; stderr={stderr:?}");
+    assert_eq!(stdout, "99\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]
@@ -4550,18 +4573,443 @@ fn handle_with_return_arm_body_type_differs_from_body_type() {
 }
 
 #[test]
-fn handle_with_constant_return_arm_overrides_op_arm_yield() {
-    // Plan B Task 55 (Phase 4g) — combined coverage: when the
-    // return arm body is a constant (ignoring `v`), it overrides
-    // whatever value flows out of the body — including non-
-    // resuming op-arm tail values. The op arm fires (perform
-    // dispatched), yields 7; return arm body is `999` (constant);
-    // handle's overall value = 999. Pins both (a) registering both
-    // op + return arms on the same frame doesn't break op-arm
-    // dispatch (the perform path still works), and (b) the return
-    // arm runs over the op-arm-yielded value per the standard
-    // semantics demonstrated by
-    // `handle_with_return_arm_fires_on_op_arm_discharge_value`.
+fn handle_returning_fn_typed_value_with_op_arm_discharge_runs() {
+    // Stage-6.8-followup Bug 2 fix — the load-bearing run_state-shape
+    // test that exercises B ≠ R (body's type ≠ handle's overall
+    // type) under op-arm discharge. Pre-fix, this shape produced a
+    // heap-pointer-shaped value: the discharged arm's lambda
+    // (closure_ptr at type R) was passed as `v: B` (Int) into the
+    // return arm, which computed `fn (s) => v + s` — a new lambda
+    // capturing the closure_ptr-as-Int and adding the s arg. The
+    // resulting `f(7)` evaluated `closure_ptr + 7`, a meaningless
+    // pointer-shaped integer.
+    //
+    // Post-fix: arm's lambda IS handle's overall directly. f =
+    // arm's lambda. f(7) = 7 + 100 = 107.
+    //
+    // This shape is a minimal proxy for the canonical
+    // `run_state(initial, comp)` higher-order helper from
+    // `examples/state.sigil`'s reverted Task 109 first-cycle attempt
+    // (see `[DEVIATION Task 109] run_state canonical shape — runtime
+    // chain integration gap` in `PLAN_B_PRIME_DEVIATIONS.md`).
+    // Closing rs_a unblocks the canonical run_state rewrite that
+    // PR #38 deferred.
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 perform Trigger.fire()\n\
+               }\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => s + 100,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_bug2_fn_typed_handle_discharge");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "107\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_post_perform_body_code_uses_arm_discharge_value() {
+    // Stage-6.8-followup Bug 1 fix — body has post-perform code in
+    // the let-binding shape `{ let _ = perform; tail }`. Pre-fix, the
+    // synchronous body lowering's IR-level body_val reflected body's
+    // tail expression (the lambda `fn (x) => x`), NOT the discharged
+    // arm's lambda. The handle's overall came out as body's identity
+    // lambda; `f(7)` evaluated to 7 instead of 107.
+    //
+    // Post-fix: runtime saves the trampoline's terminal value in
+    // `LAST_TERMINAL_VALUE`; the handle expression's discharge_block
+    // reads it (and similarly in the no-return-arm path's new
+    // discharge branch), recovering the arm's discharge value
+    // regardless of body shape. f = arm's `fn (x) => x + 100`.
+    // f(7) = 107.
+    //
+    // This shape originates from `DEBUG_RUN_STATE.md`'s Source A
+    // probe — the "Layer 1" residual from `[DEVIATION Stage-6.8-
+    // followup Layer 2 analysis]`'s "What's still blocking the
+    // canonical run_state" enumeration.
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn make_f() -> (Int) -> Int ![] ![] {\n  \
+                 handle {\n    \
+                   let _: Int = perform Trigger.fire();\n    \
+                   fn (x: Int) -> Int ![] => x\n  \
+                 } with {\n    \
+                   Trigger.fire(k) => fn (x: Int) -> Int ![] => x + 100,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = make_f();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_bug1_post_perform_body_discharge");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "107\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn cps_effected_fn_typed_parameter_indirect_call_returns_correct_value() {
+    // Stage-6.8-followup Layer 3b — fn-as-value materialization for
+    // Cps-ABI top-level fns. Pre-fix, indirect call through a
+    // CPS-effected fn-typed parameter used a Sync calling convention
+    // built from FnTypeExpr's effect row alone — but the underlying
+    // fn's actual code_ptr (whether Sync or Cps ABI) doesn't inform
+    // the indirect call site. For Cps-ABI fns, the indirect call
+    // returned a *NextStep pointer interpreted as the declared ret
+    // type → heap-pointer-shaped output.
+    //
+    // Post-fix: closure_convert's `Ident(top_level_fn) → ClosureRecord`
+    // materialization writes a Sync shim's func_addr into the closure
+    // record's code_ptr slot when the underlying fn is Cps-ABI. The
+    // shim packs args + trailing (null, identity) into a stack slot,
+    // calls the Cps fn, drives sigil_run_loop, and narrows back. The
+    // indirect call site sees uniform Sync convention.
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn produces_42() -> Int ![Trigger] {\n  \
+                 perform Trigger.fire()\n\
+               }\n\
+               fn invoke(c: () -> Int ![Trigger]) -> Int ![Trigger] {\n  \
+                 c()\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle invoke(produces_42) with {\n    \
+                   Trigger.fire(k) => 42,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_layer3b_cps_indirect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_eager_resume_arms_chains_let_yield_correctly() {
+    // Stage-6.8-followup Layer 3b end-to-end — body is chained-let-
+    // yield (`let _ = perform State.set(10); let v = perform State.get();
+    // v + 1`), arms eagerly tail-resume (no captured-k lambda escape).
+    // Tests that Layer 3b's Sync shim correctly drives comp's
+    // chained-let-yield CPS body when invoked through a fn-typed
+    // parameter `c: () -> Int ![State]`.
+    //
+    // Trace:
+    //   - run_state(5, comp): handle pushes State frame.
+    //   - comp's body's first perform State.set(10) with k_fn = step_0 synth-cont.
+    //   - State.set arm fires `k(arg=10)` (tail-k) → run_loop dispatches step_0.
+    //   - step_0 binds 10 to _, performs State.get with k_fn = step_1.
+    //   - State.get arm fires `k(initial=5)` (tail-k, captures `initial`).
+    //   - step_1 binds 5 to v, computes v + 1 = 6, returns Done(6).
+    //   - run_loop terminates with 6; handle's overall = 6.
+    let src = "effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
+                 v + 1\n\
+               }\n\
+               fn run_state(initial: Int, c: () -> Int ![State]) -> Int ![] {\n  \
+                 handle c() with {\n    \
+                   State.get(k) => k(initial),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_layer3b_eager_chain");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "6\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_return_arm_with_outer_captures_in_k_pair_dispatch_path() {
+    // Stage-6.8-followup Layer 3d — return arm body captures an
+    // outer-scope var (`factor` from caller's params). Pre-fix
+    // `lower_k_pair_call`'s self-apply path bailed to the raw
+    // widened_result fallback when `synth.captures.is_empty()` was
+    // false. Post-fix: load `return_closure` from the handler frame
+    // at HANDLER_FRAME_RETURN_CLOSURE_OFF (where
+    // `sigil_handler_frame_set_return` writes it at handle codegen
+    // time), pass as the Call's closure_ptr. Both empty-captures
+    // (closure = null) and non-empty-captures (closure = allocated
+    // record) cases unify through the frame load.
+    //
+    // f(7) trace:
+    //   - state_fn = caller(3). caller pushes Trigger frame; comp
+    //     performs Trigger.fire; arm body discharges with lambda
+    //     capturing k_pair + frame_ptr.
+    //   - state_fn = lambda. f(7) = k(7)(7).
+    //   - Inner k(7): re-push frame; run_loop with k_fn=identity
+    //     → Done(7). tag=DONE.
+    //   - Layer 3a apply: load ret_closure from frame's
+    //     return_closure slot (= heap-alloc'd record with factor=3
+    //     captured). Call(ret_closure, ret_fn_addr, [7, null,
+    //     identity]); run_loop. ret_fn allocates closure for
+    //     `(s) => v * factor + s` with v=7, factor=3 captured.
+    //   - Inner k(7) yields closure_for_v_eq_7_factor_eq_3.
+    //   - Outer call closure(7) = 7*3 + 7 = 28.
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 perform Trigger.fire()\n\
+               }\n\
+               fn caller(factor: Int) -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v * factor + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller(3);\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_layer3d_return_arm_captures");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "28\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn integration_bug2_plus_layer2_only_tail_perform_canonical_arms() {
+    // PR #39 review §6 — progressive integration test #1.
+    //
+    // Composes Bug 2 + Layer 2 only. Body is tail-perform (no Bug 1
+    // path), single arm with k-capturing lambda (Layer 2 path),
+    // return arm has empty captures (no Layer 3d path), no Cps-
+    // effected fn-typed parameter (no Layer 3b path), no chained-
+    // let-yield body (no Layer 3a/3c path).
+    //
+    // Pre-Bug-2 (PR #29): would have applied return arm to op-arm
+    // discharge value, double-wrapping the closure.
+    // Pre-Layer-2: lambda's k(7) returns raw arg 7 instead of
+    // R-typed value, segfaulting on closure dispatch.
+    // Post-both: returns 14 (= 7 + 7).
+    //
+    // If this regresses but `bug2_alone` and `layer2_alone` probes
+    // pass, the regression is in the composition (e.g., Layer 2's
+    // self-apply path interaction with Bug 2's discharge tag check).
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 perform Trigger.fire()\n\
+               }\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_integration_bug2_plus_layer2_only");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "14\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn integration_bug2_layer2_bug1_non_tail_perform_canonical_arms() {
+    // PR #39 review §6 — progressive integration test #2.
+    //
+    // Composes Bug 2 + Layer 2 + Bug 1 (non-tail-perform body) + Layer
+    // 3a (tag-conditional self-apply when synth-cont chain returns
+    // DONE) + Layer 3c (handler frame re-push for k-pair-bearing
+    // lambda invoked outside handle, since the body's chained-let-
+    // yield synth-cont CAN cause a perform during k(arg) dispatch).
+    //
+    // Adds a non-tail-perform body to integration test #1 above, so
+    // the synth-cont chain exists (step_0 Final binds v from
+    // Trigger.fire, computes v+1). Single arm DISCHARGES with the
+    // captured-k lambda; no second perform fires inside the chain
+    // (chain's terminal is DONE, not DISCHARGED). Same return arm
+    // shape as #1 (no Layer 3d).
+    //
+    // f(7) = k(7)(7).
+    //   - Inner k(7) drives step_0 (Final): bind 7 to v, v+1 = 8,
+    //     terminate DONE.
+    //   - Layer 3a: tag=DONE → apply return arm. ret_fn(8): allocates
+    //     closure for `(s) => v + s` with v=8.
+    //   - Inner k(7) yields closure_for_v_eq_8.
+    //   - Outer call closure_for_v_eq_8(7) = 15.
+    //
+    // If this regresses but `integration_bug2_plus_layer2_only` and
+    // `dbg_a` probes pass, the regression is in the Bug 1 / Layer 3a
+    // / Layer 3c composition.
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 let v: Int = perform Trigger.fire();\n  \
+                 v + 1\n\
+               }\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_integration_bug2_layer2_bug1");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "15\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn run_state_canonical_higher_order_helper_returns_threaded_value() {
+    // Stage-6.8-followup Layer 3c (+ closure_convert k_closure_idx
+    // fix) — the canonical `run_state(initial, comp)` higher-order
+    // helper from PR #38's reverted Task 109 first-cycle attempt.
+    // Composes: chained-let-yield body (2 performs), multi-arm
+    // handle (return + State.get + State.set), each op arm captures
+    // k into a lifted lambda that escapes via discharge AND is
+    // invoked from run_state's caller, k(arg) inside each lambda
+    // drives a synth-cont chain that itself performs (re-pushing
+    // the handler frame), inner arm discharges that propagate
+    // back as DISCHARGED (not converted to DONE through outer
+    // post_arm_k routing), and CPS-effected fn-typed parameter
+    // dispatch (`c: () -> Int ![State]`) via Sync shim.
+    //
+    // Trace:
+    //   - run_state(5, comp) → handle pushes State frame_B.
+    //   - comp's chained-let-yield body emits perform State.set(10)
+    //     with k_fn=step_0_addr.
+    //   - State.set arm fires; body discharges with lambda_set
+    //     capturing arg=10, k_closure=step_0_closure, k_fn=step_0
+    //     _addr, frame_ptr=frame_B.
+    //   - handle terminal: DISCHARGED. handle's overall = lambda_set.
+    //     state_fn = lambda_set.
+    //   - state_fn(5) = lambda_set(5):
+    //     * Inside, k(arg=10)(arg=10).
+    //     * Inner k(10) = lower_k_pair_call: re-push frame_B; build
+    //       Call(step_0_closure, step_0_addr, [10, null, identity],
+    //       count=3); run_loop.
+    //     * step_0 (Middle): bind 10 to _; push outer_post_arm_k(null,
+    //       identity); perform State.get with k_fn=step_1_addr.
+    //     * State.get arm fires; body discharges with lambda_get
+    //       capturing k_closure=step_1_closure, k_fn=step_1_addr,
+    //       frame_ptr=frame_B.
+    //     * Trampoline terminal: DISCHARGED at depth=1. Layer 3c
+    //       bypass: tag preserved as DISCHARGED, return.
+    //     * Pop frame_B. Layer 3a: tag=DISCHARGED, skip return arm.
+    //       Inner k(10) returns lambda_get_ptr.
+    //   - Outer call: lambda_get_ptr(10):
+    //     * call_indirect lambda_get_arm(lambda_get_ptr, 10).
+    //     * Inside, s=10. k(s)(s).
+    //     * Inner k(10) = lower_k_pair_call: re-push frame_B; build
+    //       Call(step_1_closure, step_1_addr, [10, null, identity]);
+    //       run_loop.
+    //     * step_1 (Final): bind 10 to v; lower v+1=11; emit_dispatch
+    //       _to_post_arm_k(11) → Call(null, identity, [11], 1).
+    //     * Trampoline routes through stale outer_post_arm_k entry
+    //       (null, identity) from earlier push; identity → Done(11).
+    //     * Pop frame_B. Layer 3a: tag=DONE, apply return arm.
+    //     * ret_fn(11): allocates closure for `(s) => v` with v=11
+    //       captured. Returns closure_for_v_eq_11.
+    //     * Inner k(10) returns closure_for_v_eq_11.
+    //     * Outer call: closure_for_v_eq_11(10) = 11.
+    //   - state_fn(5) returns 11.
+    let src = "effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
+                 v + 1\n\
+               }\n\
+               fn run_state(initial: Int, c: () -> Int ![State]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle c() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   State.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_layer3_canonical_run_state");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "11\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_returning_k_capturing_lambda_invoked_outside_handle() {
+    // Stage-6.8-followup Layer 2 fix — k captured into a lifted lambda
+    // that escapes the handle, then invoked from the handle's caller via
+    // `f(s)` and recursively chained as `k(s)(s)`. Pre-fix, the lifted
+    // lambda's k(arg) call returned the raw arg (identity-as-k_fn echoes
+    // input) where the source-language type is the handle's overall R =
+    // (Int) -> Int ![]. The next call site `(k(s))(s)` interpreted the
+    // raw Int as a closure pointer → SIGSEGV.
+    //
+    // Post-fix: lower_k_pair_call self-applies the originating handle's
+    // return arm to the run_loop result, producing the R-typed value
+    // (a closure for `(s) => v + s`). The chain `k(s)(s)` then evaluates
+    // to v + s where v = body's terminal value (= s, since perform is
+    // body's tail). For f(7): k(7) returns the closure for `(s) => 7+s`,
+    // applied to s=7 yields 14.
+    //
+    // This is the canonical run_state higher-order helper's arm body
+    // shape. Layer 2 unblocks it for tail-perform single-arm cases;
+    // Layers 1 (non-tail-perform body) and 3 (multi-arm composition)
+    // remain documented under `[DEVIATION Stage-6.8-followup Layer 2
+    // analysis]` for follow-up.
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 perform Trigger.fire()\n\
+               }\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_layer2_k_capturing_lambda");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "14\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_op_arm_discharge_skips_constant_return_arm() {
+    // Stage-6.8-followup Bug 2 fix — corrects PR #29 semantics.
+    // Combined coverage: when both an op arm and a return arm are
+    // declared, and the op arm fires (discards `k`), the op arm's
+    // value IS the handle's overall — the return arm does NOT
+    // fire. Pre-fix behavior dispatched the constant return arm
+    // (output 999); post-fix correctly bypasses (output 7).
+    //
+    // Pins both (a) registering both op + return arms on the same
+    // frame doesn't break op-arm dispatch (the perform path still
+    // works), and (b) the return arm is skipped on op-arm
+    // discharge per standard algebraic-effects semantics
+    // (sibling `handle_with_op_arm_discharge_skips_return_arm`).
     let src = "effect Raise { fail: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform Raise.fail()) with {\n    \
@@ -4571,9 +5019,12 @@ fn handle_with_constant_return_arm_overrides_op_arm_yield() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_constant_return_overrides_op");
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "stage_6_8_followup_bug2_discharge_skips_constant_return",
+    );
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "999\n", "stdout mismatch; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]

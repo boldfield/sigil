@@ -92,7 +92,7 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr;
 
-use sigil_abi::effect::{NEXT_STEP_TAG_CALL, NEXT_STEP_TAG_DONE};
+use sigil_abi::effect::{NEXT_STEP_TAG_CALL, NEXT_STEP_TAG_DISCHARGED, NEXT_STEP_TAG_DONE};
 
 use crate::counters::{self, CounterId};
 use crate::header::{Header, TAG_CLOSURE};
@@ -182,6 +182,60 @@ thread_local! {
     /// `register_handler_stack_root_for_calling_thread`, idempotent
     /// per thread.
     static HANDLER_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
+    /// Per-thread last-terminal tag: records whether the most recent
+    /// `sigil_run_loop` invocation terminated via `Done` (body normal
+    /// completion, value subject to return arm wrapping) or
+    /// `Discharged` (op arm body's discard-`k` tail, value IS the
+    /// handle's final value, return arm bypassed).
+    ///
+    /// Initial value `NEXT_STEP_TAG_DONE` so any caller that queries
+    /// before any run_loop has run gets the conservative answer
+    /// (don't bypass return arm). Set by `sigil_run_loop` immediately
+    /// before returning the terminal value; queried by codegen via
+    /// `sigil_last_terminal_tag` after the run_loop call returns.
+    ///
+    /// **No GC root** — the value is `u32`, not a heap pointer. No
+    /// `register_*_for_calling_thread` is needed.
+    ///
+    /// **Single-threaded v1**: the TLS keeps the API multi-thread-safe
+    /// for future expansion; today's `sigil_run_loop` runs on a single
+    /// thread, but the per-thread design avoids globally-mutable state.
+    static LAST_TERMINAL_TAG: Cell<u32> = const { Cell::new(NEXT_STEP_TAG_DONE) };
+
+    /// Per-thread last-terminal value: records the u64 value the most
+    /// recent `sigil_run_loop` invocation returned at terminal time
+    /// (whether DONE or DISCHARGED).
+    ///
+    /// Stage-6.8-followup Bug 1 fix companion to `LAST_TERMINAL_TAG`.
+    /// Codegen at `Expr::Handle`'s `lower_expr` queries this when the
+    /// body has post-perform code (`{ let _ = perform; tail }` shape):
+    /// without it, body_val computed by synchronous body lowering
+    /// reflects the body's IR-local terminal value, NOT the discharged
+    /// arm's value. The arm's discharged value flows back through the
+    /// trampoline's terminal but gets narrowed at the perform's
+    /// narrow-back to perform's declared return type (lossy when arm
+    /// discharges a value of a different type) and then the body's
+    /// post-perform code overwrites it. By saving the run_loop's raw
+    /// terminal u64 here, the handle expression can recover the
+    /// discharged value when tag == DISCHARGED.
+    ///
+    /// Initial value `0` (any value is safe — codegen only reads when
+    /// LAST_TERMINAL_TAG == DISCHARGED, and the discharge tag is only
+    /// set by `sigil_run_loop`'s terminal). Set by `sigil_run_loop`
+    /// immediately before returning the terminal value; queried by
+    /// codegen via `sigil_last_terminal_value` after run_loop returns.
+    ///
+    /// **No GC root** — the value is u64. The TLS does NOT carry a
+    /// stable heap-pointer rooting contract; codegen must consume the
+    /// value before any GC-triggering operation that could reclaim a
+    /// heap object whose pointer was parked here. In practice the
+    /// consumer site (`Expr::Handle` discharge_block) reads the value
+    /// immediately and threads it through the merge_block's param,
+    /// where Cranelift's register / spill discipline keeps it live for
+    /// Boehm's conservative scan. A future precise-GC pass would
+    /// require either rooting this TLS or moving the value into a
+    /// stack slot at consumption time.
+    static LAST_TERMINAL_VALUE: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Register the calling thread's `HANDLER_STACK` TLS cell as a Boehm
@@ -679,6 +733,115 @@ pub unsafe extern "C" fn sigil_next_step_done(value: u64) -> *mut NextStep {
     ns
 }
 
+/// Read the per-thread `LAST_TERMINAL_TAG` set by the most recent
+/// `sigil_run_loop` invocation. Returns `NEXT_STEP_TAG_DONE` if the
+/// run_loop terminated via body-normal completion (return arm should
+/// fire), or `NEXT_STEP_TAG_DISCHARGED` if it terminated via op arm
+/// body's discard-`k` tail (return arm should be bypassed —
+/// discharged value IS the handle's final value per algebraic-effects
+/// semantics).
+///
+/// Initial value (before any `sigil_run_loop` runs) is
+/// `NEXT_STEP_TAG_DONE` — conservative for callers that query before
+/// running anything.
+///
+/// # Safety
+///
+/// Safe to call. Reads thread-local state without mutation.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_last_terminal_tag() -> u32 {
+    LAST_TERMINAL_TAG.with(|c| c.get())
+}
+
+/// Reset the per-thread `LAST_TERMINAL_TAG` to `NEXT_STEP_TAG_DONE`.
+/// Emitted by codegen at the entry of each `Expr::Handle` lowering
+/// before the body is lowered, so that handle bodies which do not
+/// invoke `sigil_run_loop` (e.g., `handle 5 with { ... }`) see a
+/// clean `DONE` state when their outer logic queries
+/// `sigil_last_terminal_tag` post-body. Without this reset, the tag
+/// would carry over from any prior run_loop on the same thread,
+/// producing spurious return-arm-skips for handles whose bodies
+/// never discharge.
+///
+/// # Safety
+///
+/// Safe to call. Writes thread-local state with no other side effects.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_reset_last_terminal_tag() {
+    LAST_TERMINAL_TAG.with(|c| c.set(NEXT_STEP_TAG_DONE));
+}
+
+/// Read the per-thread `LAST_TERMINAL_VALUE` set by the most recent
+/// `sigil_run_loop` invocation. Returns the raw u64 the trampoline
+/// returned at terminal time (whether DONE or DISCHARGED).
+///
+/// Stage-6.8-followup Bug 1 fix companion to `sigil_last_terminal_tag`.
+/// Codegen reads this when `LAST_TERMINAL_TAG == NEXT_STEP_TAG_DISCHARGED`
+/// to recover the discharged value when body has post-perform code that
+/// would otherwise overwrite the natural body_val with body's IR-locally-
+/// computed terminal.
+///
+/// Initial value (before any `sigil_run_loop` runs) is `0`. Codegen only
+/// reads when the tag indicates DISCHARGED, so the initial-zero is never
+/// observable in well-formed programs.
+///
+/// # Safety
+///
+/// Safe to call. Reads thread-local state without mutation.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_last_terminal_value() -> u64 {
+    LAST_TERMINAL_VALUE.with(|c| c.get())
+}
+
+/// Reset the per-thread `LAST_TERMINAL_VALUE` to `0`. Emitted alongside
+/// `sigil_reset_last_terminal_tag` at the top of each `Expr::Handle`
+/// lowering so handles whose body never runs the trampoline see a
+/// clean state instead of inheriting a prior run's value. Reading this
+/// when the tag is DONE is undefined behavior at the source level
+/// (codegen's discharge_block is gated on tag == DISCHARGED), but
+/// resetting prevents any future code path from observing a stale
+/// value.
+///
+/// # Safety
+///
+/// Safe to call. Writes thread-local state with no other side effects.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_reset_last_terminal_value() {
+    LAST_TERMINAL_VALUE.with(|c| c.set(0));
+}
+
+/// Allocate a `NEXT_STEP_TAG_DISCHARGED` record from the per-dispatch
+/// arena holding `value`.
+///
+/// Emitted by op arm fn bodies on the discard-`k` tail path — the arm
+/// produces a final value WITHOUT invoking `k`, so per algebraic-effects
+/// semantics the value IS the handle's final value (not subject to the
+/// return clause's wrapper). The trampoline propagates the value
+/// identically to `Done` (including routing through the outer post_arm_k
+/// stack for multi-shot composition); the distinction is recorded in
+/// `LAST_TERMINAL_TAG` for the handle expression's outer codegen logic
+/// to query via `sigil_last_terminal_tag`.
+///
+/// See `[DEVIATION Stage-6.8-followup Bug 2] Return arm dispatch on
+/// op-arm-discharge values violates algebraic-effects semantics` for
+/// the bug analysis and Phase-4g `dd10379` rationale this corrects.
+///
+/// # Safety
+///
+/// Safe to call. Returned pointer is valid until the next
+/// `sigil_arena_reset`.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_next_step_discharged(value: u64) -> *mut NextStep {
+    let raw = crate::arena::sigil_arena_alloc(core::mem::size_of::<NextStep>());
+    let ns = raw as *mut NextStep;
+    (*ns).tag = NEXT_STEP_TAG_DISCHARGED;
+    (*ns).arg_count = 0;
+    (*ns).closure_ptr = ptr::null_mut();
+    (*ns).fn_ptr = ptr::null_mut();
+    (*ns).value = value;
+    ns
+}
+
 /// Allocate a `NEXT_STEP_TAG_CALL` record from the per-dispatch arena
 /// describing a call to `(fn_ptr, closure_ptr)` with `arg_count` args.
 /// The args themselves live immediately after the struct in arena
@@ -1111,6 +1274,15 @@ pub unsafe extern "C" fn sigil_perform(
 #[no_mangle]
 pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
     let mut current = initial_step;
+    // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
+    // run_loop entry. On the DISCHARGED bypass terminal (introduced by
+    // Layer 3c to preserve algebraic-effects discharge semantics
+    // through outer chain routing), drain the stack back to this depth
+    // so entries pushed by synth-cont Middle steps during the bypassed
+    // chain don't leak across run_loop boundaries. The Bug-2-era
+    // routing path naturally pops one entry per terminal; the bypass
+    // skips that pop, hence the explicit drain.
+    let outer_post_arm_k_entry_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
     loop {
         counters::incr(CounterId::TrampolineDispatchCount);
 
@@ -1121,21 +1293,92 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
 
         let tag = (*current).tag;
         match tag {
-            NEXT_STEP_TAG_DONE => {
+            NEXT_STEP_TAG_DONE | NEXT_STEP_TAG_DISCHARGED => {
                 let v = (*current).value;
+                // Stage-6.8-followup Layer 3c — DISCHARGED bypasses
+                // outer_post_arm_k routing. Algebraic semantics of
+                // discharge: when ANY arm in a handle discharges, the
+                // handle terminates with the discharged value as its
+                // overall — subsequent computations in the body
+                // (including outer chain steps) are abandoned. The
+                // existing routing logic (Bug 2 era) was designed for
+                // multi-shot composition where the outer chain's
+                // step_i was waiting for a post-perform value AND the
+                // inner arm RESUMES (not discharges); for that case,
+                // the routing correctly forwards the resumed value.
+                // For the discharge case, routing through the chain
+                // is wrong: it converts DISCHARGED to DONE at the
+                // outermost terminal (since the routing builds a Call
+                // dispatched to identity, which returns Done). When
+                // `lower_k_pair_call` (called from a captured-k
+                // lifted lambda outside the handle) drives a synth-
+                // cont chain that discharges via an inner arm, this
+                // bypass preserves the DISCHARGED tag so the call
+                // site can correctly skip return arm dispatch on the
+                // R-typed discharge value.
+                if tag == NEXT_STEP_TAG_DISCHARGED {
+                    LAST_TERMINAL_TAG.with(|c| c.set(tag));
+                    LAST_TERMINAL_VALUE.with(|c| c.set(v));
+                    // Drain outer_post_arm_k stack back to entry-time
+                    // depth. Entries pushed by synth-cont Middle steps
+                    // during this run_loop's chain stay leaked across
+                    // run_loop boundaries otherwise. Subsequent
+                    // run_loop calls would consume them via the DONE-
+                    // path routing, which happens to be benign for
+                    // the canonical (entries from `lower_k_pair_call`
+                    // are always `(null, identity)`, so routing is
+                    // identity-passthrough), but architecturally
+                    // questionable for adversarial nesting and a
+                    // capacity-overflow risk for deep chains.
+                    //
+                    // **Discipline check** (PR #39 review §5). In
+                    // debug builds we assert that the current depth
+                    // is `>= outer_post_arm_k_entry_depth` — i.e.,
+                    // entries on the stack at terminal time are a
+                    // suffix of (or equal to) what was pushed during
+                    // this run_loop. A violation indicates that
+                    // somewhere between entry and terminal we popped
+                    // entries belonging to an outer run_loop, which
+                    // would silently corrupt the parent's chain
+                    // discipline. The drain itself enforces the
+                    // invariant; the assertion catches the upstream
+                    // bug if the invariant is ever violated by a new
+                    // codegen path.
+                    let current_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+                    debug_assert!(
+                        current_depth >= outer_post_arm_k_entry_depth,
+                        "sigil_run_loop terminal: outer_post_arm_k depth \
+                         underflow ({current_depth} < entry-time \
+                         {outer_post_arm_k_entry_depth}); a codegen path \
+                         popped entries belonging to an outer run_loop"
+                    );
+                    OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
+                    crate::arena::sigil_arena_reset();
+                    return v;
+                }
                 // Plan B' Stage 6.7 multi-shot composition fix: before
                 // returning to the wrapper, check the outer post_arm_k
-                // stack. If non-empty, pop the top entry and route
-                // Done's value through that post_arm_k chain (the
+                // stack. If non-empty, pop the top entry and route the
+                // terminal value through that post_arm_k chain (the
                 // outer arm's chain step that's waiting for the result
                 // of an inner arm's enumeration). If empty, this is
-                // top-level Done — return to wrapper.
+                // top-level — return to wrapper.
+                //
+                // **Discharged routing through outer post_arm_k:** an
+                // inner-arm discharge inside an outer multi-shot
+                // continuation chain still feeds the outer chain's
+                // expected `k(arg)` slot. The discharged value flows
+                // through the outer chain identically to a Done value;
+                // the discharge-vs-done distinction matters only at
+                // the top-level run_loop terminal, where the handle
+                // expression's outer codegen logic queries
+                // `LAST_TERMINAL_TAG` to decide return-arm dispatch.
                 if let Some(entry) = outer_post_arm_k_try_pop() {
                     // Reset the arena before allocating the new Call.
                     crate::arena::sigil_arena_reset();
                     // Build Call(popped_closure, popped_fn_ptr,
-                    // [done_value]) with args_len=1 — same shape that
-                    // helper Final's `emit_dispatch_to_post_arm_k`
+                    // [terminal_value]) with args_len=1 — same shape
+                    // that helper Final's `emit_dispatch_to_post_arm_k`
                     // builds for terminal post_arm_k dispatch.
                     let ns = sigil_next_step_call(entry.closure_ptr, entry.fn_ptr, 1);
                     let ns_args = sigil_next_step_args_ptr(ns);
@@ -1145,6 +1388,38 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                     current = ns;
                     continue;
                 }
+                // Top-level terminal: record the source tag AND the
+                // value so the handle expression's outer codegen logic
+                // can branch on the tag (skip return arm dispatch on
+                // discharge) AND recover the value when body's
+                // synchronous IR-level lowering would have overwritten
+                // it with body's post-perform code's natural terminal
+                // (Stage-6.8-followup Bug 1 fix).
+                //
+                // **Discipline check** (Round-3 review §4 symmetric
+                // counterpart). The DISCHARGED bypass branch above
+                // explicitly drains depth back to entry-time; the DONE
+                // path's `try_pop`-then-route loop should leave depth
+                // == entry-time naturally (each Middle's push paired
+                // with one terminal pop via the routing loop). Assert
+                // it: any future codegen path that pushes without a
+                // matching terminal pop, OR that pops entries belonging
+                // to an outer run_loop, would underflow / overflow this
+                // check. The drain assertion on the DISCHARGED path
+                // catches bypassed-leak; this assertion catches
+                // routing-asymmetry — symmetric coverage of the
+                // discipline.
+                let current_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+                debug_assert!(
+                    current_depth == outer_post_arm_k_entry_depth,
+                    "sigil_run_loop DONE terminal: outer_post_arm_k depth \
+                     mismatch ({current_depth} != entry-time \
+                     {outer_post_arm_k_entry_depth}); a codegen path \
+                     pushed without a matching terminal pop, OR popped \
+                     entries belonging to an outer run_loop"
+                );
+                LAST_TERMINAL_TAG.with(|c| c.set(tag));
+                LAST_TERMINAL_VALUE.with(|c| c.set(v));
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
