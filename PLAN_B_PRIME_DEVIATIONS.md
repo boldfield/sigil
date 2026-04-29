@@ -391,3 +391,49 @@ Codegen (`compiler/src/codegen.rs`):
 These remain Plan B' Stage 6.8 followup work tracked under `[DEVIATION Task 109] run_state canonical shape`. The Bug 2 fix in this entry is a load-bearing prerequisite — without it, even the simpler rs_a-style B ≠ R shape fails at runtime.
 
 **Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Layer 2 analysis] Captured-k-from-lambda invocation returns raw arg, not return-arm-wrapped R
+
+**Plan B' Stage 6.8 Task 109 followup, post-Bug-2.** Empirical bisect of the layered run_state canonical bugs identifies and bounds Layer 2 (per [DEVIATION Stage-6.8-followup Bug 2]'s "What this fix DOES NOT close" enumeration). Analysis only — no fix in this entry; this documents what's broken, where, and what fixing it requires.
+
+**Bisect probes (post-Bug-2 fix, all under `/tmp/`):**
+- `rs_b1.sigil` — eager non-lambda k invocation at arm body tail (`Trigger.fire(k) => k(7)`). Result: prints `20`, exit 0. ✓ Works.
+- `rs_b.sigil` — lambda captures k, lambda body invokes `k(s)(s)` (canonical run_state shape minus state). Result: SIGSEGV, exit 139. ✗ Crashes.
+
+Both files declare `effect Trigger resumes: many { fire: () -> Int }`, body `comp() { perform Trigger.fire() }`, return arm `return(v) => fn (s: Int) -> Int ![] => v + s`, and call `f(13)` from main. The only difference is the op arm's body shape: tail-position eager `k(7)` versus arm-body-as-lambda whose body is `k(s)(s)`.
+
+**Root cause.** `lower_k_pair_call` (compiler/src/codegen.rs:9912–9998) — the synth lambda fn's k(arg) dispatch — builds `NextStep::Call(loaded_k_closure, loaded_k_fn, 1)` and drives `sigil_run_loop` synchronously, then narrows the result to `info.handler_overall_ty`'s Cranelift type. But `loaded_k_fn` — captured from the arm fn's trailing-pair (k_closure, k_fn), itself sourced from comp's CPS-ABI k_fn parameter, itself written as `sigil_continuation_identity` by `lower_call`'s CPS path (compiler/src/codegen.rs:10128–10141) — is the identity continuation. `sigil_continuation_identity` (runtime/src/handlers.rs:873–913) returns `Done(arg)` unchanged. The trampoline's terminal then returns `arg` as u64.
+
+So `k(s)` inside the lambda returns the raw `s` (an Int), narrowed to `handler_overall_ty` which is `(Int) -> Int ![] = pointer_ty`. The next call site `(k(s))(s)` interprets that Int (e.g., 13) as a closure pointer and dereferences → SIGSEGV.
+
+**Why eager k(7) works.** In `rs_b1`, the arm body's tail-position k(arg) yields a `NextStep::Call(identity, [arg])` from the arm fn. The handle's outermost `sigil_run_loop` dispatches that Call, identity returns `Done(arg)`, the run_loop hits its top-level terminal, sets `LAST_TERMINAL_TAG = DONE`, and returns `arg`. The handle expression's outer codegen then runs the return arm with `v = arg`, producing the R-typed closure. Return-arm dispatch happens at handle-discharge time, NOT inside k. Identity's "return arg unchanged" is correct as long as the return-arm wrap fires immediately after at the discharge layer.
+
+**Why captured-k-from-lambda breaks.** When the lambda escapes the handle (because the arm body IS the lambda — Bug 2's discharge-without-return-arm path), the originating handle has already discharged by the time `f(13)` runs. The lambda's k(s) drives a *fresh* `sigil_run_loop` over `Call(identity, [s])` → `Done(s)` → terminal returns `s`. There's no handler frame in scope, no return-arm dispatch fires. The lambda gets `s` typed as `(Int) -> Int` and segfaults at the next application.
+
+**The architectural gap.** Identity-as-k_fn is a Phase 4d MVP simplification (per `[DEVIATION Task 55] Phase 4d` in `PLAN_B_DEVIATIONS.md`) that conflates two distinct semantics:
+1. **In-handle tail-position k(arg)**: identity is correct because the handle's outermost run_loop drives discharge + return-arm wrap immediately after.
+2. **Captured-k-from-lambda invocation outside the handle**: identity is *wrong* because there's no outer handle to apply the return arm. k(s) must self-apply the return-arm to produce R.
+
+Phase B's trailing-pair convention (Plan B' Stage 6.8 Task 107) wired up the *dispatch* mechanism for case 2 but inherited identity's case-1 semantics. The dispatch lands; the value type is wrong. This is the architectural debt.
+
+**Fix architecture (proposed, NOT implemented in this entry).** Two paths, ranked:
+
+*Option A (preferred, localized): trailing-triple convention.* Extend the lifted lambda's closure record's trailing-pair (`k_closure`, `k_fn`) to a trailing-triple `(k_closure, k_fn, return_arm_fn)`:
+- closure_convert detects k-capture in lifted lambda; instead of trailing-pair, writes trailing-triple, sourcing `return_arm_fn` from the originating Expr::Handle's pre-pass return-arm synth fn.
+- `lower_k_pair_call` loads the third slot and, after run_loop returns the raw u64, calls `return_arm_fn(raw_u64)` synchronously to produce the R-typed value.
+- Narrows to `handler_overall_ty` AFTER the return-arm call (not before).
+
+For tail-perform body shapes (rs_b case), this collapses to: `k(arg) = return_arm_fn(arg)`. For non-tail-perform (post-perform body code present), the synth-cont mechanism already in place handles post-perform code; the trailing-triple's `k_fn` would be the synth-cont (not identity), and `return_arm_fn` still wraps the synth-cont's result. Both shapes converge.
+
+*Option B (broader, riskier): change handle expression's body invocation contract.* Make `lower_call`'s CPS path optionally pass a non-identity `k_fn` to body — specifically `return_arm_fn` when the call is a handle expression's body and the handle has a return arm. Then identity is replaced everywhere the chain flows; the run_loop terminal's existing DONE-routes-through-return-arm logic conflicts (double-wrap), so the terminal logic must be inverted (DONE → terminal value is already R, no further wrap). This touches Phase 4g's contract directly — risky.
+
+Option A is the recommended path. Estimated scope: closure_convert ~50 LOC change, codegen `lower_k_pair_call` ~20 LOC change, plus FFI plumbing for the third slot. No runtime ABI changes (closure record layout is internal).
+
+**Multi-arm composition (Layer 3) interaction.** Once Option A lands, the multi-arm canonical run_state (return + State.get + State.set arms, where get/set arms each return k-capturing lambdas) becomes testable. Open question: does the trailing-triple correctly thread when multiple arm types' lambdas chain (set's lambda's k(s) returns get's lambda's k(s)(s) returns ...)? The same trailing-triple should compose if `return_arm_fn` is shared per handle (which it is). Pinned for verification post-Layer-2 fix.
+
+**What's verified empirically:**
+- Bug 2's fix is load-bearing and correct in its scope: rs_a (B ≠ R, single discharge arm, no captured-k lambda) prints `107` post-fix.
+- Layer 2 is independent of Bug 2: the segfault reproduces in rs_b with Bug 2 applied. The bug is in `lower_k_pair_call`'s narrow-without-return-arm-wrap, not in handle-level discharge dispatch.
+- Layer 2 is bounded to lifted-lambda k-pair-bearing synth fns. Direct (non-lambda) k(arg) at arm body tail (rs_b1, rs_a) works because the outermost run_loop's terminal applies return arm at handle-discharge time.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` (analysis only — no compiler/runtime changes in this commit).
