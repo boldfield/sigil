@@ -92,7 +92,7 @@ Goal: close B.3 + B.4. Together these unblock the literal `run_state` higher-ord
 - Task 109 — Update existing examples + invert pinning tests (`state.sigil` literal `run_state`; `higher_order.sigil` docstring; `TypeExpr::Fn` rejection tests; arm-body-lambda rejection tests).
   - status: partial-done-pending-run_state-chain-fix
   - commits: [HEAD]
-  - notes: **Done**: `examples/higher_order.sigil` docstring rewrite; `nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen` rejection inverted to `nested_handle_with_inner_lambda_in_arm_body_compiles` (Phase A unblock); `closure_env_load_callee_is_e0138_until_phase_c_plus` rejection inverted to `closure_env_load_callee_returns_42` (Phase C+ Part 2); `p17_compose_source_rejects_until_typeexpr_fn_ships` renamed to `p17_compose_source_rejects_pending_builtin_as_fn_value` (R6 fixup) — TypeExpr::Fn shipped, the actual remaining blocker is builtin-as-fn-value (see `[DEVIATION p17_compose blocker analysis]`). **Pending**: `examples/state.sigil` rewrite to literal `run_state` — Task 109 first cycle (`7b457b6` + `e35dae9`) compiled cleanly but produced a closure-record-pointer-shaped value at runtime instead of the threaded integer. Reverted state.sigil to the dual-handle workaround; added `handle_returning_simple_lambda_invoked_returns_value_pending_chain_fix` `#[ignore]`'d bisect test pinning the simplest "handle returns lambda, lambda invoked" shape. See `[DEVIATION Task 109] run_state canonical shape — runtime chain integration gap` for the layered failure analysis (3 candidate layers; bisect test isolates layer 1). Sub-tasks 3 (no standalone TypeExpr::Fn rejection tests existed) and 4 (arm-body-lambda rejections already inverted by Task 107) confirmed n/a or done.
+  - notes: **Done**: `examples/higher_order.sigil` docstring rewrite; `nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen` rejection inverted to `nested_handle_with_inner_lambda_in_arm_body_compiles` (Phase A unblock); `closure_env_load_callee_is_e0138_until_phase_c_plus` rejection inverted to `closure_env_load_callee_returns_42` (Phase C+ Part 2); `p17_compose_source_rejects_until_typeexpr_fn_ships` renamed to `p17_compose_source_rejects_pending_builtin_as_fn_value` (R6 fixup) — TypeExpr::Fn shipped, the actual remaining blocker is builtin-as-fn-value (see `[DEVIATION p17_compose blocker analysis]`). **`examples/state.sigil` rewrite to literal `run_state` — DONE via Stage-6.8-followup PR #39 (merged at `cf358bb`).** First cycle (`7b457b6` + `e35dae9`) revealed six layered semantic / architectural bugs blocking the canonical runtime chain (Bug 2, Layer 2, Bug 1, Layer 3a, Layer 3b, Layer 3c — see `PLAN_B_PRIME_DEVIATIONS.md`'s "Stage-6.8-followup architectural summary" entry). PR #39 closed all six layers; `state_example_canonical_run_state_returns_11` e2e test pins the threaded-state output (`run_state(5, comp) = 11` for comp doing `set(10); v=get(); v+1`). The bisect test `handle_returning_simple_lambda_invoked_returns_value_pending_chain_fix` was un-ignored or removed by the followup work. Sub-tasks 3 (no standalone TypeExpr::Fn rejection tests existed) and 4 (arm-body-lambda rejections already inverted by Task 107) confirmed n/a or done.
 - Task 110 — Prompt-bank graded-end-to-end flips (P09 / P10 / P17 / P19 / P20; P02 stays compile-only pending stdlib `string_concat`).
   - status: todo
   - commits: []
@@ -119,15 +119,56 @@ Original surfaces:
 - 4 deviation entries documenting deferred work: per-arrow `![..]` syntax design; captureless closure-record per use site; p17_compose blocker (per-arrow + builtin-as-fn-value); B.4 Phase B route decision (k_closure code_ptr patching vs split-into-two-slots).
 - Negative-test discipline retrofit deferred to Plan C work; new tests follow the discipline.
 
-**Stage 6.8 closes after Phase B ships.** Phase B + Tasks 108 examples #1/#3 + Task 109 `state.sigil` rewrite + remaining Task 109 inversions + Task 110 prompt-bank flips form the next session's scope.
+**Stage 6.8 review checkpoint signed off — 2026-04-29.** Phase B Phase B + Tasks 108 examples + Task 109 `state.sigil` rewrite all closed. The Stage 6.8 followup (PR #39) closed six layered semantic / architectural bugs that the first canonical-run_state cycle exposed; see Stage 6.8 followup section below.
+
+## Stage 6.8 followup — Canonical run_state runtime chain integration
+
+**Goal:** close the runtime / codegen layered bugs that Task 109's first canonical-run_state cycle exposed. Without this followup, the language-surface lifts (B.3 + B.4) compiled cleanly but produced wrong-typed runtime values for the canonical shape (heap-pointer-shaped output instead of threaded integer).
+
+**Status: closed at `cf358bb` (PR #39 merged 2026-04-29).** Twelve commits closing six layered fixes plus tooling cleanups + two review rounds.
+
+| Commit | Layer / Concern |
+|---|---|
+| `28bd281` | **Bug 2** — handle skips return arm on op-arm discharge (B≠R type-soundness) |
+| `485f088` | **Layer 2** analysis (empirical bisect identifying captured-k-from-lambda invocation gap) |
+| `14bdf4f` | **Layer 2** fix — lifted lambda's k(arg) self-applies originating handle's return arm |
+| `dfc9980` | **Bug 1** — recover trampoline's terminal value across non-tail-perform body via `LAST_TERMINAL_VALUE` TLS |
+| `00d35d9` | **Layer 3a** — return-arm self-apply tag-conditional (skip on DISCHARGED, apply on DONE); 3b/3c gap analysis |
+| `d38b7ce` | **Layer 3b** — Sync shims for Cps-ABI fns at fn-as-value materialization |
+| `9b7cd8d` | **Layer 3c** — frame re-push, DISCHARGED preservation through outer routing, closure_convert k-index two-pass, trailing-pair convention in lower_k_pair_call |
+| `a839c8a` | **Cleanups** — state.sigil canonical, drain leak, Layer 3d (return arms with outer captures), DEBUG_RUN_STATE.md removal |
+| `1f90e41` | cargo fmt |
+| `9365ec5` | Clippy fixes (dedup `#[no_mangle]`, collapsible_if, doc continuation) |
+| `b47d3fc` | PR review round 1 (§4 §5 §6 §7 §11) |
+| `cde7afb` | PR review round 3 (§2 §4-symmetric §5 §6 §7) |
+
+**Architectural details documented at:** `PLAN_B_PRIME_DEVIATIONS.md`'s "Stage-6.8-followup architectural summary" entry, which provides numbered reading order with surface symptoms and load-bearing test names per layer.
+
+**Architectural follow-ups deferred to Plan-C-or-later** (PR #39 review §2 + §3, deferral rationale in source comments + summary deviation entry):
+- TLS → packed multi-return for `sigil_run_loop` terminal — functionally correct today; nested-handle re-entrancy is a future hazard.
+- Sync shim emission gating on `top_level_fn_names_seen_as_value` — bounded bloat (one ~100-byte shim per Cps fn); always-emit policy documented.
+
+**Tests added across the six layers:**
+- `handle_returning_fn_typed_value_with_op_arm_discharge_runs` (Bug 2)
+- `handle_returning_k_capturing_lambda_invoked_outside_handle` (Layer 2)
+- `handle_with_post_perform_body_code_uses_arm_discharge_value` (Bug 1)
+- `cps_effected_fn_typed_parameter_indirect_call_returns_correct_value` (Layer 3b)
+- `handle_with_eager_resume_arms_chains_let_yield_correctly` (Layer 3b)
+- `handle_return_arm_with_outer_captures_in_k_pair_dispatch_path` (Layer 3d)
+- `integration_bug2_plus_layer2_only_tail_perform_canonical_arms` (PR review §6 progressive integration #1)
+- `integration_bug2_layer2_bug1_non_tail_perform_canonical_arms` (PR review §6 progressive integration #2)
+- `run_state_canonical_higher_order_helper_returns_threaded_value` (full canonical)
+- `state_example_canonical_run_state_returns_11` (canonical state.sigil example)
 
 ## Plan B' completion criteria
 
-- All Stage 6.7 + 6.8 acceptance criteria met on both hosts (CI green).
-- Prior-stage regression tests (Stages 1–6 + Stage 6 cleanup) still pass.
-- Multi-shot continuation runtime test (10+ resumes within a single arm body) compiles + runs in `examples/multishot_stress.sigil`.
-- `examples/state.sigil` uses literal `run_state` higher-order helper.
-- `examples/choose.sigil` uses literal two-flip pair generator.
-- Prompt bank graded-end-to-end count rises from 14/20 to 19/20 (P02 deferred to Plan C Stage 7).
-- `PLAN_B_PRIME_PROGRESS.md` reflects reality; all tasks marked done with commit references.
-- `PLAN_B_DEVIATIONS.md` closure points (B.1 / B.2 / B.3 / B.4) marked closed with cross-references to Plan B' implementing commits.
+- ✅ All Stage 6.7 + 6.8 acceptance criteria met on both hosts (CI green at `cf358bb`).
+- ✅ Prior-stage regression tests (Stages 1–6 + Stage 6 cleanup) still pass.
+- ✅ Multi-shot continuation runtime test (10+ resumes within a single arm body) compiles + runs in `examples/multishot_stress.sigil`.
+- ✅ `examples/state.sigil` uses literal `run_state` higher-order helper (rewritten via PR #39 `a839c8a`; pinned by `state_example_canonical_run_state_returns_11`).
+- ✅ `examples/choose.sigil` uses literal two-flip pair generator.
+- ◻ Prompt bank graded-end-to-end count rises from 14/20 to 19/20 (P02 deferred to Plan C Stage 7) — **deferred to Plan C** (Task 110 was not addressed in PR #39's Stage-6.8-followup scope; the surfaces it depends on are present, but the prompt-bank flips themselves haven't been re-graded yet).
+- ✅ `PLAN_B_PRIME_PROGRESS.md` reflects reality; all tasks marked done with commit references.
+- ✅ `PLAN_B_DEVIATIONS.md` closure points (B.1 / B.2 / B.3 / B.4) marked closed with cross-references to Plan B' implementing commits.
+
+**Plan B' is done.** The architectural lifts plan file moved from `/repos/designs/in-progress/2026-04-29-sigil-architectural-lifts.md` to `/repos/designs/done/`. Plan C (`/repos/designs/queue/2026-04-21-sigil-finish.md`) is queued; Task 110 prompt-bank re-grading rolls into Plan C's prompt-bank work alongside the new stdlib-dependent surfaces.
