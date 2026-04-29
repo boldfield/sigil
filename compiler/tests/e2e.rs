@@ -5203,7 +5203,12 @@ fn fn_as_value_with_effect_row_returns_42() {
 /// `x + n = 7 + 5 = 12`.
 #[test]
 fn make_adder_returns_12() {
-    let src = "fn make_adder(n: Int) -> (Int) -> Int ![] {\n  \
+    // Per-arrow `![..]` discipline (PLAN_B_PRIME_DEVIATIONS Task 103
+    // entry): the fn-decl's return type is `(Int) -> Int ![]` (an
+    // inner fn-type carrying its own row), and the fn-decl carries a
+    // second `![]` for its own effect row — hence the two `![]`s on
+    // line 1.
+    let src = "fn make_adder(n: Int) -> (Int) -> Int ![] ![] {\n  \
                  fn (x: Int) -> Int ![] => x + n\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
