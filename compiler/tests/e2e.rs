@@ -5225,18 +5225,17 @@ fn make_adder_returns_12() {
     );
 }
 
-/// R2 finding 2 — explicit panic-shape rejection test. Pin the
-/// "ClosureEnvLoad-callee" shape (compose-style: lambda body calls a
-/// captured fn-typed value) so Phase C+ inverts a known-state diff:
-/// pre-Phase-C+ asserts compile-fail with E0138; post-Phase-C+
-/// (Task 109) inverts to a positive runtime test.
+/// Phase C+ Part 2 — ClosureEnvLoad-callee dispatch. The lambda
+/// body invokes a captured fn-typed value `f`; closure-convert
+/// rewrites `f` inside the synth lambda body to `ClosureEnvLoad`.
+/// Codegen reads the capture's `FnSig` from the synth fn's
+/// `captured_fn_sigs` map (sourced from `cc.captures_typed`) and
+/// dispatches via `call_indirect`.
 ///
-/// The shape: `caller` takes a fn-typed `f` and constructs a lambda
-/// that captures `f` then calls it. After closure-convert, the
-/// lambda's body has `f(x)` where `f` is `ClosureEnvLoad`, which
-/// trips `unsupported_indirect_call_shape`'s E0138 rejection.
+/// `caller(id_fn)` invokes the captured `id_fn` through the
+/// indirect call; result is 42.
 #[test]
-fn closure_env_load_callee_is_e0138_until_phase_c_plus() {
+fn closure_env_load_callee_returns_42() {
     let src = "fn id_fn(x: Int) -> Int ![] { x }\n\
                fn caller(f: (Int) -> Int ![]) -> Int ![] {\n  \
                  let g: (Int) -> Int ![] = fn (x: Int) -> Int ![] => f(x);\n  \
@@ -5247,35 +5246,11 @@ fn closure_env_load_callee_is_e0138_until_phase_c_plus() {
                  perform IO.println(int_to_string(r));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_closure_env_callee_e0138_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_closure_env_callee_e0138_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .output()
-        .expect("invoke sigil on source");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "ClosureEnvLoad-callee shape must fail to compile until Phase C+ ships; \
-         got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr_str = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr_str.contains("E0138"),
-        "expected E0138 in stderr (typed diagnostic for unsupported indirect-call \
-         callee shape); got stderr={stderr_str:?}"
+    let (stdout, stderr, code) = compile_and_run(src, "closure_env_load_callee");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "ClosureEnvLoad-callee dispatch: caller(id_fn) calls captured `f` via \
+         lambda → 42. stderr={stderr:?}"
     );
 }

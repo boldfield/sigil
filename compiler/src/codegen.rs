@@ -789,21 +789,14 @@ fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
             }
             // Now check the callee shape against Phase C+'s allow-list.
             match callee.as_ref() {
-                // Phase C v1 + Phase C+ Part 1: Ident, ClosureRecord,
-                // and Call(...) callees are all supported. Call(...)
-                // resolves via the typecheck side-table
-                // `call_callee_tys`.
-                Expr::Ident(_, _) | Expr::ClosureRecord { .. } | Expr::Call { .. } => None,
-                Expr::ClosureEnvLoad { name, .. } => Some(format!(
-                    "[E0138] {file}:{line}:{col}: indirect call through a \
-                     captured fn-typed value `{name}` requires Plan B' \
-                     Stage 6.8 Phase C+ Part 2 (ClosureEnvLoad-callee \
-                     dispatch); the lambda body is calling a fn-typed \
-                     value captured from the surrounding scope.",
-                    file = span.file,
-                    line = span.line,
-                    col = span.column
-                )),
+                // Phase C v1 + Phase C+ Part 1 + Phase C+ Part 2:
+                // Ident, ClosureRecord, Call(...), and ClosureEnvLoad
+                // callees are all supported. ClosureEnvLoad resolves
+                // via the synth fn's `captured_fn_sigs` map.
+                Expr::Ident(_, _)
+                | Expr::ClosureRecord { .. }
+                | Expr::Call { .. }
+                | Expr::ClosureEnvLoad { .. } => None,
                 Expr::Lambda { .. } => {
                     // closure_convert rewrites every Lambda to ClosureRecord
                     // before this walker runs; reaching this arm means a
@@ -5674,6 +5667,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     match_scrut_tys: &checked.match_scrut_tys,
                     local_fn_types: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
+                    captured_fn_sigs: BTreeMap::new(),
                 };
 
                 // Phase 5 — lower perform args via Lowerer; pack
@@ -5817,6 +5811,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     m
                 },
                 call_callee_tys: &checked.call_callee_tys,
+                captured_fn_sigs: {
+                    // Plan B' Stage 6.8 Phase C+ Part 2 — for synth
+                    // lambda fns (`$lambda_N`), seed with fn-typed
+                    // captures so `lower_call`'s indirect path can
+                    // resolve `Expr::ClosureEnvLoad`-callee signatures.
+                    // Non-synth user fns get an empty map; their
+                    // fn-typed locals come via params/lets and are
+                    // tracked in `local_fn_types` instead.
+                    let mut m: BTreeMap<String, crate::typecheck::FnSig> = BTreeMap::new();
+                    if let Some(caps) = cc.captures_typed.get(&f.name) {
+                        for (cname, cty) in caps {
+                            if let crate::typecheck::Ty::Fn(sig) = cty {
+                                m.insert(cname.clone(), (**sig).clone());
+                            }
+                        }
+                    }
+                    m
+                },
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -6232,6 +6244,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     match_scrut_tys: &checked.match_scrut_tys,
                     local_fn_types: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
+                    captured_fn_sigs: BTreeMap::new(),
                 };
 
                 // Plan B Task 55 (Phase 4d): route between the two
@@ -6897,6 +6910,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     match_scrut_tys: &checked.match_scrut_tys,
                     local_fn_types: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
+                    captured_fn_sigs: BTreeMap::new(),
                 };
 
                 let body_value = lowerer.lower_expr(&synth.body);
@@ -7122,6 +7136,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 match_scrut_tys: &checked.match_scrut_tys,
                 local_fn_types: BTreeMap::new(),
                 call_callee_tys: &checked.call_callee_tys,
+                captured_fn_sigs: BTreeMap::new(),
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
@@ -7385,6 +7400,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         match_scrut_tys: &checked.match_scrut_tys,
                         local_fn_types: BTreeMap::new(),
                         call_callee_tys: &checked.call_callee_tys,
+                        captured_fn_sigs: BTreeMap::new(),
                     };
 
                     match &step.role {
@@ -8010,6 +8026,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             match_scrut_tys: &checked.match_scrut_tys,
                             local_fn_types: BTreeMap::new(),
                             call_callee_tys: &checked.call_callee_tys,
+                            captured_fn_sigs: BTreeMap::new(),
                         };
 
                         match role {
@@ -8575,6 +8592,17 @@ struct Lowerer<'a, 'b> {
     /// survivors), so `cranelift_ty_of_ty` produces the right
     /// Cranelift types directly.
     call_callee_tys: &'b BTreeMap<Span, Ty>,
+
+    /// Plan B' Stage 6.8 Phase C+ Part 2 — fn-typed captures of the
+    /// current synth lambda fn, keyed by capture name. When a Call's
+    /// callee is `Expr::ClosureEnvLoad { name, .. }` (the lambda body
+    /// invokes a captured fn-typed value), `lower_call` looks the
+    /// `FnSig` up here to build the indirect-call signature. Empty
+    /// for non-synth user fns (which don't have fn-typed captures
+    /// at this layer; their fn-typed locals come via params / lets
+    /// → `local_fn_types`). Sourced from `cc.captures_typed` at
+    /// synth-fn Lowerer construction.
+    captured_fn_sigs: BTreeMap<String, crate::typecheck::FnSig>,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -9771,6 +9799,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         }
                         _ => None,
                     },
+                    // Phase C+ Part 2 — captured fn-typed value
+                    // invoked inside a synth lambda fn. The synth
+                    // fn's `captured_fn_sigs` map (populated at
+                    // Lowerer construction from `cc.captures_typed`)
+                    // gives the FnSig keyed by capture name.
+                    Expr::ClosureEnvLoad { name, .. } => self
+                        .captured_fn_sigs
+                        .get(name)
+                        .cloned()
+                        .map(|sig| CalleeSig::Resolved(Box::new(sig))),
                     _ => None,
                 };
                 let callee_sig = match callee_sig {
@@ -10730,6 +10768,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // `FnTypeExpr` to recover the declared ret type.
                 Expr::Ident(name, _) if self.local_fn_types.contains_key(name) => {
                     cranelift_ty_for_type_expr(&self.local_fn_types[name].ret, self.pointer_ty)
+                }
+                // Phase C+ Part 2 — ClosureEnvLoad-callee (captured
+                // fn-typed value invoked inside a synth lambda fn).
+                // Look up the FnSig in `captured_fn_sigs`; convert
+                // ret to Cranelift.
+                Expr::ClosureEnvLoad { name, .. } if self.captured_fn_sigs.contains_key(name) => {
+                    cranelift_ty_of_ty(&self.captured_fn_sigs[name].ret, self.pointer_ty)
                 }
                 // Phase C+ Part 1 — Call-returning-fn callee. Read
                 // the resolved Ty::Fn from the typecheck side-table

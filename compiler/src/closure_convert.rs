@@ -59,6 +59,16 @@ pub struct ClosureConvertedProgram {
     /// is a flat back-reference kept for Plan B tooling that expects a
     /// program-level captures index, and for tests.
     pub captures: Vec<(String, Vec<String>)>,
+    /// Plan B' Stage 6.8 Phase C+ Part 2 — typed capture metadata per
+    /// synth lambda fn, keyed by synth fn name (`$lambda_N`). Each
+    /// entry is the lambda's capture list with full `Ty` info from
+    /// typecheck's `lambda_captures` side-table. Codegen consumes
+    /// this when entering a synth fn's `Lowerer` to populate
+    /// `local_fn_types` / `captured_fn_sigs` for fn-typed captures
+    /// — required for `lower_call`'s `ClosureEnvLoad`-callee
+    /// dispatch (compose-style: lambda body invokes a captured
+    /// fn-typed value).
+    pub captures_typed: BTreeMap<String, Vec<(String, Ty)>>,
 }
 
 pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
@@ -155,9 +165,31 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
         })
         .collect();
 
+    // Plan B' Stage 6.8 Phase C+ Part 2 — build the typed captures
+    // map for codegen consumption. Keyed by synth fn name so the
+    // synth-fn Lowerer entry can look up its captures' Tys without
+    // re-walking the AST. Original user fns aren't synth and have no
+    // entry (their captures are nominally empty at this layer).
+    let captures_typed: BTreeMap<String, Vec<(String, Ty)>> = new_items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Fn(f) => f
+                .name
+                .strip_prefix("$lambda_")
+                .and_then(|n_str| n_str.parse::<usize>().ok())
+                .and_then(|n| hoisted_captures.get(&n))
+                .map(|v| (f.name.clone(), v.clone())),
+            _ => None,
+        })
+        .collect();
+
     colored.mono.anf.checked.program.items = new_items;
 
-    ClosureConvertedProgram { colored, captures }
+    ClosureConvertedProgram {
+        colored,
+        captures,
+        captures_typed,
+    }
 }
 
 struct Converter {
