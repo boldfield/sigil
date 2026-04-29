@@ -5149,3 +5149,89 @@ fn generic_apply_with_id_fn_returns_42() {
         "generic apply(id_fn, 42) = 42. stderr={stderr:?}"
     );
 }
+
+/// R2 finding 2 — multi-param fn-typed callee. Exercises the
+/// `for p in &fty.params` loop in `lower_call`'s indirect-call sig
+/// builder; the prior 3 tests are all single-param.
+#[test]
+fn fn_as_value_with_multi_param_returns_7() {
+    let src = "fn add(a: Int, b: Int) -> Int ![] { a + b }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int, Int) -> Int ![] = add;\n  \
+                 perform IO.println(int_to_string(f(3, 4)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "fn_as_value_multi_param");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "multi-param fn-as-value: f(3, 4) = 7. stderr={stderr:?}"
+    );
+}
+
+/// R2 finding 2 — effect-bearing fn type as a value. Pins that the
+/// indirect-call codegen path correctly threads effect rows through
+/// the materialized closure record + indirect dispatch.
+#[test]
+fn fn_as_value_with_effect_row_returns_42() {
+    let src = "fn add_one(n: Int) -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 n + 1\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![IO] = add_one;\n  \
+                 let _: Int = f(41);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "fn_as_value_effect_row");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "41\n",
+        "effect-bearing fn-as-value: f prints 41 then returns 42 (discarded). \
+         stderr={stderr:?}"
+    );
+}
+
+/// R2 finding 2 — explicit panic-shape rejection test. Pin the
+/// `make_adder(5)(7)` shape so Phase C+ inverts a known-state diff:
+/// pre-Phase-C+ asserts compile-fail with E0138; post-Phase-C+
+/// (Task 109) inverts to a positive runtime test.
+#[test]
+fn make_adder_call_returning_fn_is_e0138_until_phase_c_plus() {
+    let src = "fn make_adder(n: Int) -> Int ![] { n + 1 }\n\
+               fn caller_taking_fn_value(f: (Int) -> Int ![], x: Int) -> Int ![] { f(x) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = caller_taking_fn_value(make_adder(0), 7);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let tmp = std::env::temp_dir().join(format!(
+        "sigil_e2e_make_adder_e0138_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, src).expect("write make_adder source");
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_make_adder_e0138_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&tmp)
+        .arg("-o")
+        .arg(&bin_path)
+        .output()
+        .expect("invoke sigil on make_adder source");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "make_adder call-returning-fn must fail to compile until Phase C+ ships; \
+         got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr_str.contains("E0138"),
+        "expected E0138 in stderr (typed diagnostic for unsupported indirect-call \
+         callee shape); got stderr={stderr_str:?}"
+    );
+}

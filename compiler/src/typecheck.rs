@@ -310,14 +310,19 @@ pub struct CheckedProgram {
     /// fall back to primitive-scalar dispatch.
     pub match_scrut_tys: BTreeMap<Span, Ty>,
     /// Plan B' Stage 6.8 Task 104 — per-call-site callee Ty for
-    /// every `Expr::Call` whose callee resolved to `Ty::Fn(sig)`.
-    /// Keyed by the call expression's span. Codegen consults this
-    /// at `lower_call` to determine the indirect-call signature
-    /// (params + ret) when the callee is a let-bound / param-bound
-    /// fn-typed value. Direct-call sites (callee = top-level fn
-    /// `Ident`) entries are populated too, but codegen doesn't read
-    /// them — direct dispatch via `user_fn_refs` precedes the
-    /// side-table lookup.
+    /// indirect-call sites whose callee resolved to `Ty::Fn(sig)`.
+    /// Keyed by the call expression's span. Direct calls (callee
+    /// is `Ident(top_level_fn_name)`) skip insertion since codegen
+    /// resolves them via the `user_fn_refs` registry — this keeps
+    /// the table tight (one entry per indirect call) instead of
+    /// one per Call AST node. Reserved for **Phase C+** recursive
+    /// callee-type resolution: when the callee is a `Call(...)`
+    /// returning a `Ty::Fn` value, codegen reads this side-table
+    /// at the call's span to derive the indirect signature without
+    /// re-walking the callee. Phase C v1's `lower_call` reads the
+    /// callee's `FnTypeExpr` from `Lowerer.local_fn_types` (the
+    /// param + let-binding map) instead, so this side-table is
+    /// populated but unread on the v1 path; Phase C+ activates it.
     pub call_callee_tys: BTreeMap<Span, Ty>,
     /// Plan B task 49 — per-fn polymorphic schemes recorded at the
     /// end of the typecheck pass. Monomorphization reads these to
@@ -2844,18 +2849,27 @@ impl Tc {
         let resolved_ret = self.deref(&sig.ret);
 
         // Plan B' Stage 6.8 Task 104 — record the resolved callee
-        // signature for codegen's `lower_call` indirect-call path.
-        // Resolution must happen *after* arg-type unification so any
-        // generic-param Ty::Vars in the original sig pick up their
-        // concrete bindings. Keyed on the call expression's span.
-        let resolved_sig = FnSig {
-            params: sig.params.iter().map(|p| self.deref(p)).collect(),
-            ret: resolved_ret.clone(),
-            effects: sig.effects.clone(),
-            effect_row_var: sig.effect_row_var,
-        };
-        self.call_callee_tys
-            .insert(span.clone(), Ty::Fn(Box::new(resolved_sig)));
+        // signature for indirect calls so Phase C+ codegen can
+        // resolve the call's signature via the side-table. Skip
+        // direct calls (callee = `Ident(top_level_fn_name)`) — those
+        // resolve through `user_fn_refs` at codegen, no side-table
+        // entry needed. Resolution happens *after* arg-type
+        // unification so generic-param `Ty::Var`s pick up their
+        // concrete bindings.
+        let is_direct_call = matches!(
+            callee,
+            Expr::Ident(name, _) if self.fn_schemes.contains_key(name)
+        );
+        if !is_direct_call {
+            let resolved_sig = FnSig {
+                params: sig.params.iter().map(|p| self.deref(p)).collect(),
+                ret: resolved_ret.clone(),
+                effects: sig.effects.clone(),
+                effect_row_var: sig.effect_row_var,
+            };
+            self.call_callee_tys
+                .insert(span.clone(), Ty::Fn(Box::new(resolved_sig)));
+        }
 
         Some(resolved_ret)
     }

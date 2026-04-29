@@ -704,6 +704,209 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     None
 }
 
+/// Plan B' Stage 6.8 Task 104 (R2 finding 1) — typed-diagnostic
+/// rejection of indirect-call callee shapes that Phase C v1 doesn't
+/// support. Walks the post-CC program. Returns `Some(msg)` when a
+/// `Call` whose callee is one of the unsupported shapes is found.
+///
+/// **Phase C v1 supports:**
+/// - `Call { callee: Ident(name), .. }` — direct dispatch (top-level
+///   fn) or indirect (Ident-of-fn-typed-local, where `local_fn_types`
+///   resolves the signature).
+/// - `Call { callee: ClosureRecord { .. }, .. }` — lambda IIFE / fn-
+///   as-value at the call site, dispatched directly via the
+///   ClosureRecord's `code_fn_name`.
+///
+/// **Phase C v1 rejects (with E0138):**
+/// - `Call { callee: Call(..), .. }` — call returning a fn-typed
+///   value (e.g., `make_adder(5)(7)`). Needs recursive callee-type
+///   resolution (Phase C+).
+/// - `Call { callee: ClosureEnvLoad { .. }, .. }` — captured fn-typed
+///   value invoked inside a synth lambda fn (e.g., `compose`'s body
+///   `f(g(x))` where `f`/`g` are captured). Phase C+ extends
+///   `lower_call` to walk ClosureEnvLoad-callees.
+///
+/// Pre-Phase-C, `lower_call`'s catchall `unreachable!()` was
+/// guarded by "Plan A2 cannot reach this arm from a well-typed
+/// program because TypeExpr::Fn is deferred." Phase A unlocked the
+/// surface; Phase C v1's `unreachable!()` becomes user-reachable
+/// for the unsupported shapes. This walker converts the panic into
+/// a typed Sigil diagnostic with the unsupported-callee span.
+pub(crate) fn unsupported_indirect_call_shape(program: &crate::ast::Program) -> Option<String> {
+    for item in &program.items {
+        if let crate::ast::Item::Fn(f) = item {
+            if let Some(msg) = block_unsupported_indirect_call(&f.body) {
+                return Some(format!("in fn `{}`: {}", f.name, msg));
+            }
+        }
+    }
+    None
+}
+
+fn block_unsupported_indirect_call(b: &crate::ast::Block) -> Option<String> {
+    use crate::ast::Stmt;
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                if let Some(m) = expr_unsupported_indirect_call(&l.value) {
+                    return Some(m);
+                }
+            }
+            Stmt::Expr(e) => {
+                if let Some(m) = expr_unsupported_indirect_call(e) {
+                    return Some(m);
+                }
+            }
+            Stmt::Perform(p) => {
+                for a in &p.args {
+                    if let Some(m) = expr_unsupported_indirect_call(a) {
+                        return Some(m);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(t) = &b.tail {
+        if let Some(m) = expr_unsupported_indirect_call(t) {
+            return Some(m);
+        }
+    }
+    None
+}
+
+fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
+    use crate::ast::Expr;
+    match e {
+        Expr::Call { callee, args, span } => {
+            // First check the callee's own subexpressions.
+            if let Some(m) = expr_unsupported_indirect_call(callee) {
+                return Some(m);
+            }
+            for a in args {
+                if let Some(m) = expr_unsupported_indirect_call(a) {
+                    return Some(m);
+                }
+            }
+            // Now check the callee shape against Phase C v1's allow-list.
+            match callee.as_ref() {
+                Expr::Ident(_, _) | Expr::ClosureRecord { .. } => None,
+                Expr::Call { .. } => Some(format!(
+                    "[E0138] indirect call through a call-returning-fn callee \
+                     ({:?}..{:?}) requires Plan B' Stage 6.8 Phase C+ support \
+                     (recursive callee-type resolution); deferred from Phase \
+                     C v1. As a workaround, bind the inner result to a `let` \
+                     and call the binding directly.",
+                    span.line, span.column
+                )),
+                Expr::ClosureEnvLoad { name, .. } => Some(format!(
+                    "[E0138] indirect call through a captured fn-typed value \
+                     `{name}` (lifted into a closure record's env at \
+                     {:?}..{:?}) requires Plan B' Stage 6.8 Phase C+ support \
+                     (ClosureEnvLoad-callee dispatch); deferred from Phase \
+                     C v1. The lambda body is calling a fn-typed value \
+                     captured from the surrounding scope.",
+                    span.line, span.column
+                )),
+                Expr::Lambda { .. } => {
+                    // closure_convert rewrites every Lambda to ClosureRecord
+                    // before this walker runs; reaching this arm means a
+                    // pass-order invariant broke.
+                    Some(format!(
+                        "[E0138] indirect call through a Lambda callee at \
+                         {:?}..{:?}: closure_convert should have rewritten \
+                         this to ClosureRecord — invariant break, file a bug.",
+                        span.line, span.column
+                    ))
+                }
+                _ => Some(format!(
+                    "[E0138] indirect call through an unsupported callee \
+                     shape ({:?}..{:?}); Phase C v1 supports `Ident` and \
+                     `ClosureRecord` callees only.",
+                    span.line, span.column
+                )),
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_unsupported_indirect_call(lhs).or_else(|| expr_unsupported_indirect_call(rhs))
+        }
+        Expr::Unary { operand, .. } => expr_unsupported_indirect_call(operand),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => expr_unsupported_indirect_call(cond)
+            .or_else(|| block_unsupported_indirect_call(then_block))
+            .or_else(|| block_unsupported_indirect_call(else_block)),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            if let Some(m) = expr_unsupported_indirect_call(scrutinee) {
+                return Some(m);
+            }
+            for a in arms {
+                if let Some(m) = expr_unsupported_indirect_call(&a.body) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Expr::Block(b) => block_unsupported_indirect_call(b),
+        Expr::Perform(p) => {
+            for a in &p.args {
+                if let Some(m) = expr_unsupported_indirect_call(a) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Expr::Handle {
+            body,
+            op_arms,
+            return_arm,
+            ..
+        } => {
+            if let Some(m) = expr_unsupported_indirect_call(body) {
+                return Some(m);
+            }
+            for a in op_arms {
+                if let Some(m) = expr_unsupported_indirect_call(&a.body) {
+                    return Some(m);
+                }
+            }
+            if let Some(ra) = return_arm {
+                if let Some(m) = expr_unsupported_indirect_call(&ra.body) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Expr::Lambda { body, .. } => expr_unsupported_indirect_call(body),
+        Expr::ClosureRecord { env_exprs, .. } => {
+            for e in env_exprs {
+                if let Some(m) = expr_unsupported_indirect_call(e) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                if let Some(m) = expr_unsupported_indirect_call(&f.value) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::Ident(..)
+        | Expr::ClosureEnvLoad { .. } => None,
+    }
+}
+
 fn block_unsupported_handle(
     b: &crate::ast::Block,
     globals: &std::collections::BTreeSet<String>,
@@ -4276,6 +4479,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // (including builtin `IO`) routes through `sigil_perform`, so
     // the walker treats IO performs uniformly with non-IO performs.
     if let Some(msg) = unsupported_handle_construct(&checked.program) {
+        return Err(msg);
+    }
+
+    // Plan B' Stage 6.8 Task 104 (R2 finding 1) — reject indirect-
+    // call callee shapes that Phase C v1 doesn't support, with a
+    // typed E0138 diagnostic instead of letting `lower_call`'s
+    // catchall panic at codegen time. Phase C+ extends the
+    // `lower_call` indirect path to recursive callee-type
+    // resolution + ClosureEnvLoad-callee dispatch; this guard is
+    // narrowed at that point.
+    if let Some(msg) = unsupported_indirect_call_shape(&checked.program) {
         return Err(msg);
     }
 
@@ -9508,10 +9722,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 };
                 let fty = match fty {
                     Some(f) => f,
+                    // The codegen-entry walker
+                    // `unsupported_indirect_call_shape` rejects
+                    // unsupported callee shapes upstream with a typed
+                    // E0138 diagnostic. Reaching this arm means a
+                    // shape the walker accepted (Ident or ClosureRecord
+                    // — but ClosureRecord goes through the dedicated
+                    // arm above) didn't have a registered FnTypeExpr.
+                    // That's an invariant break.
                     None => unreachable!(
-                        "codegen: indirect call callee shape not yet supported \
-                         (callee = {callee:?}); Phase C v1 supports Ident(local) \
-                         where local is fn-typed via param or let annotation"
+                        "codegen invariant: walker accepted callee shape but \
+                         `local_fn_types` had no entry — callee = {callee:?}"
                     ),
                 };
 

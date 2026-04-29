@@ -125,3 +125,57 @@ The literal Cartesian-product 4-outcome (sum 10) and 8-outcome (sum 36) enumerat
 **Failure mode:** none — the design is consistent with how `FnSig` and `Expr::Lambda` already store effects per-fn-decl. This deviation entry exists so future readers don't second-guess the design choice.
 
 **Implementing commit(s):** Task 102 (`71ad25b`) shipped the parser surface with this discipline. Test `fn_type_returning_fn_parses` pins the expected shape (`(Int) -> (Int) -> Int ![] ![]`).
+
+## 2026-04-29 — [DEVIATION Task 104] Captureless closure record allocated per fn-as-value use site
+
+**Context:** Plan B' Stage 6.8 Task 104 (`bab66e5`) closure-convert rewrites every `Expr::Ident(top_level_fn_name)` outside callee position to a fresh `Expr::ClosureRecord { code_fn_name, env_exprs: [], env_slot_kinds: [] }`. Codegen then allocates a captureless closure record (header + code_ptr@8) on the GC heap **per use site**, not per fn declaration.
+
+**The cost.** A program like:
+
+```sigil
+fn main() -> Int ![IO] {
+  let n: Int = 0;
+  loop {
+    apply(double, n);  // `double` materializes a fresh ClosureRecord every iteration
+    n + 1
+  }
+}
+```
+
+allocates one closure record per iteration through `apply(double, ...)`. The record's contents are static — same `code_ptr`, no captures — so it's pure waste under any realistic workload.
+
+**Why accepted:** Phase C v1's primary goal is correctness of fn-as-value semantics, not allocation efficiency. The captureless-record-per-use-site shape is the simplest closure-convert pattern that integrates with the existing `Expr::ClosureRecord` lowering. Optimisations are post-v1 work.
+
+**Future closure points** (multiple paths possible, listed in increasing complexity):
+
+1. **Module-level static-init**: codegen synthesises one captureless ClosureRecord per top-level fn at module load, stores it as a global, and rewrites every fn-as-value use site to load from the global. Closes the cost completely. ~50 LOC change spanning closure_convert + codegen.
+
+2. **CSE on identical ClosureRecord exprs within a single block**: if `apply(double, n)` appears N times in a single block, allocate once. Cheaper than (1) but doesn't help loop bodies.
+
+3. **Inline closure-record cache (LRU or per-fn slot)**: per-thread runtime cache keyed on `code_fn_name`. More runtime complexity than (1), no clear advantage.
+
+(1) is the canonical fix and the one Plan C should target if perf gates require it.
+
+**Failure mode:** none under correctness — the user-visible behaviour is identical regardless of allocation strategy. **Perf only**: tight loops calling fn-as-value paths see one extra heap allocation per iteration. Plan C's spec-validation tests should not include workloads where this matters until the closure point lifts.
+
+**Implementing commit(s):** Task 104 (`bab66e5`) shipped the per-use-site allocation. R2 review flagged the cost; this deviation entry documents it.
+
+## 2026-04-29 — [DEVIATION Task 104 Phase C v1 limit] Recursive callee-type resolution + ClosureEnvLoad-callees deferred to Phase C+
+
+**Context:** Plan B' Stage 6.8 Task 104 (`bab66e5`) ships Phase C v1: indirect-call dispatch via `call_indirect` over the closure record's `code_ptr` slot. Phase C v1 supports two callee shapes:
+
+- `Expr::Ident(local)` where `local` is fn-typed via fn parameter or `let` annotation.
+- `Expr::ClosureRecord { code_fn_name, .. }` — lambda IIFE, dispatched directly via the named code_fn_name.
+
+**The deferred shapes:**
+
+- **`Expr::Call(...)` callee** (call returning a fn-typed value, e.g., `make_adder(5)(7)`). Requires recursive callee-type resolution: walk the inner callee's return TypeExpr to derive the outer call's signature. The `typecheck::call_callee_tys` side-table populated in Task 104 is the planned hook — Phase C+ codegen reads it instead of `Lowerer.local_fn_types`.
+- **`Expr::ClosureEnvLoad { .. }` callee** (captured fn-typed value invoked inside a synth lambda fn, e.g., `compose`'s body `f(g(x))` where `f`/`g` are captured). Requires ClosureEnvLoad-callee dispatch in `lower_call`: load the captured value as the closure_ptr, then dispatch as usual.
+
+**Why accepted:** Phase C v1 lands the canonical fn-as-value patterns (id_fn-as-value, generic apply, simple higher-order fn parameters) without taking on the recursive-callee codegen surface in the same commit. The split is principled — three e2e tests in Task 106 partial cover the v1 surface; the deferred shapes have a clear closure path through Phase C+ work.
+
+**The user-facing surface:** Task 104 (R2 finding 1) added the codegen-entry walker `unsupported_indirect_call_shape` which converts the would-be `lower_call` panic into a typed **E0138** Sigil diagnostic with the offending callee's span. Users writing `make_adder(5)(7)` or `compose`-style helpers see a clean diagnostic pointing at Phase C+ instead of a Rust-panic with implementation-detail messages.
+
+**Failure mode:** Programs using `make_adder(5)(7)` or compose-with-captured-fn-types fail compilation with E0138. The existing `p17_compose_source_rejects_until_typeexpr_fn_ships` e2e test catches the compose case. Task 109 inverts these rejections to positive runtime tests after Phase C+ lands.
+
+**Implementing commit(s):** Task 104 (`bab66e5`) ships Phase C v1; the [forthcoming R2 fixup commit] converts the panic to E0138 via `unsupported_indirect_call_shape`. Phase C+ commit closes the deferred shapes.
