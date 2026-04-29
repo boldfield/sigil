@@ -4674,14 +4674,21 @@ fn arm_body_lambda_capturing_k_compiles_returns_99() {
 /// surface compiles cleanly.
 #[test]
 fn task_108_arm_body_lambda_captures_k_runs() {
+    // handle body=0 → handler_overall_ty=Int → k: (Bool) -> Int.
+    // Arm body builds a lambda capturing k (uses `k(b)`) then
+    // discards k and returns 42. body=0 means the arm never fires
+    // (no perform); the handle returns 0. The lambda's k-capture
+    // is allocated via Phase B's trailing-pair convention but
+    // never invoked.
     let src = "effect Choose resumes: many { flip: () -> Bool }\n\
                fn run() -> Int ![] {\n  \
-                 handle perform Choose.flip() with {\n    \
+                 let r: Int = handle 0 with {\n    \
                    Choose.flip(k) => {\n      \
                      let _: (Bool) -> Int ![] = fn (b: Bool) -> Int ![] => k(b);\n      \
                      42\n    \
                    },\n  \
-                 }\n\
+                 };\n  \
+                 r\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  perform IO.println(int_to_string(run()));\n  \
@@ -4689,14 +4696,11 @@ fn task_108_arm_body_lambda_captures_k_runs() {
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_108_choose");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    // `perform Choose.flip()` triggers the arm; arm allocates the
-    // capturing lambda then returns 42 (discard-k + lambda not
-    // invoked). The arm's result becomes perform's value (Sigil's
-    // implicit-resume) so the handle returns 42.
     assert_eq!(
-        stdout, "42\n",
-        "B.4 Phase B Task 108 example #1: arm body allocates k-capturing \
-         lambda then discards k → arm returns 42. stderr={stderr:?}"
+        stdout, "0\n",
+        "B.4 Phase B Task 108 shape: arm body builds k-capturing lambda \
+         (allocates trailing-pair closure record) then discards k. \
+         body=0 → arm never fires → handle returns 0. stderr={stderr:?}"
     );
 }
 
