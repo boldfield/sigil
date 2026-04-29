@@ -1395,6 +1395,29 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                 // synchronous IR-level lowering would have overwritten
                 // it with body's post-perform code's natural terminal
                 // (Stage-6.8-followup Bug 1 fix).
+                //
+                // **Discipline check** (Round-3 review §4 symmetric
+                // counterpart). The DISCHARGED bypass branch above
+                // explicitly drains depth back to entry-time; the DONE
+                // path's `try_pop`-then-route loop should leave depth
+                // == entry-time naturally (each Middle's push paired
+                // with one terminal pop via the routing loop). Assert
+                // it: any future codegen path that pushes without a
+                // matching terminal pop, OR that pops entries belonging
+                // to an outer run_loop, would underflow / overflow this
+                // check. The drain assertion on the DISCHARGED path
+                // catches bypassed-leak; this assertion catches
+                // routing-asymmetry — symmetric coverage of the
+                // discipline.
+                let current_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+                debug_assert!(
+                    current_depth == outer_post_arm_k_entry_depth,
+                    "sigil_run_loop DONE terminal: outer_post_arm_k depth \
+                     mismatch ({current_depth} != entry-time \
+                     {outer_post_arm_k_entry_depth}); a codegen path \
+                     pushed without a matching terminal pop, OR popped \
+                     entries belonging to an outer run_loop"
+                );
                 LAST_TERMINAL_TAG.with(|c| c.set(tag));
                 LAST_TERMINAL_VALUE.with(|c| c.set(v));
                 // Reset the arena before returning so the next

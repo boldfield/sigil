@@ -10090,6 +10090,27 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // body_val is body's tail value, NOT the discharged
                     // arm's value — the runtime preserves the latter
                     // in `LAST_TERMINAL_VALUE`.
+                    //
+                    // SAFETY (Round-3 review §7): the TLS slot
+                    // `LAST_TERMINAL_VALUE` may hold a heap-allocated
+                    // closure-record / handler-frame pointer at terminal
+                    // time. The discipline (declared at the TLS site
+                    // in `runtime/src/handlers.rs`'s `LAST_TERMINAL_VALUE`
+                    // doc) requires consuming the read into a Cranelift
+                    // SSA Value before any allocation that could trigger
+                    // GC — Boehm's conservative scan must find the
+                    // pointer in a register or spill slot. The
+                    // `inst_results(lv_call)[0]` capture below is that
+                    // SSA Value; Cranelift's regalloc threads it through
+                    // the merge_block param and into any subsequent
+                    // narrow / store / call without dropping the
+                    // reference. Inserting an alloc-triggering call
+                    // (e.g., `sigil_alloc`, another `next_step_call`)
+                    // between this load and `last_terminal_v_u64`'s
+                    // first user would silently break this invariant —
+                    // a future regression that adds such a call MUST
+                    // route the value through a stack slot or
+                    // explicitly stackmap-root the SSA value first.
                     let lv_call = self.builder.ins().call(self.last_terminal_value_ref, &[]);
                     self.stackmap
                         .push_placeholder(function_code_offset(&self.builder, lv_call));
@@ -10107,15 +10128,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         // u64 IS bit-identical to the pointer value.
                         last_terminal_v_u64
                     } else {
-                        // Future float / 32-bit-target port would
-                        // need a dedicated branch here. Emit a safe
-                        // placeholder of handler_overall_ty so
-                        // Cranelift's verifier accepts the IR.
-                        if handler_overall_ty.is_int() {
-                            self.builder.ins().iconst(handler_overall_ty, 0)
-                        } else {
-                            self.builder.ins().iconst(self.pointer_ty, 0)
-                        }
+                        // Float / 32-bit-target port would land here.
+                        // Round-3 review §6: panic at codegen instead
+                        // of emitting a wrong-domain zero placeholder
+                        // that propagates through optimization. The
+                        // Cranelift verifier would accept the
+                        // placeholder, but a future port must add a
+                        // dedicated branch (bitcast for floats,
+                        // ireduce/uextend for 32-bit pointer_ty); the
+                        // panic ensures that work happens loudly
+                        // rather than silently producing wrong-domain
+                        // IR.
+                        unreachable!(
+                            "Bug 2 discharge_block: unsupported \
+                             handler_overall_ty {:?} (Bug 2 + Layer 3d \
+                             support I64, I8 / I32 narrower-int, and \
+                             pointer_ty == I64). Float / 32-bit-target \
+                             port needs a dedicated narrow branch here.",
+                            handler_overall_ty
+                        )
                     };
                     self.builder
                         .ins()
@@ -10274,30 +10305,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // body_val. Algebraic semantics says the discharged
                 // value IS handle's overall when an arm discharges.
                 //
-                // Reset both TLS slots before body lowering — match
-                // the return_arm.is_some() path's discipline so
-                // handles whose bodies never run a perform see
-                // tag = DONE → use body_val (the natural body
-                // terminal). The earlier branch handled this for
-                // return-arm-bearing handles; replicate here.
-                //
-                // Note: the reset must happen BEFORE body lowering,
-                // not here. Code emit order: codegen reaches this
-                // point AFTER body has been lowered. To make the
-                // reset fire before body, we'd need to plumb a
-                // pre-body reset emit. As a simpler substitute that
-                // stays correct under sigil's current usage pattern:
-                // the codegen-emitted reset above (in the
-                // return_arm.is_some() branch) doesn't fire for
-                // no-return-arm handles, but `sigil_run_loop`'s
-                // terminal always overwrites LAST_TERMINAL_TAG /
-                // LAST_TERMINAL_VALUE before returning. So the only
-                // observable stale-state path is: prior run_loop
-                // produced DISCHARGED, this handle's body never
-                // invokes run_loop (no perform), and the post-body
-                // tag-check sees stale DISCHARGED. Pinned as known
-                // limitation; v2 either pre-resets unconditionally
-                // or hoists the reset emit before body lowering.
+                // The pre-body TLS reset above (Bug 1's
+                // unconditional reset emit at the handle expression's
+                // entry, gated only on group setup, not on
+                // `return_arm.is_some()`) covers BOTH return-arm-
+                // bearing AND no-return-arm handles. Reaching this
+                // point means body has been lowered; tag/value at the
+                // run_loop terminal correctly reflect THIS body's
+                // completion (or, when body has no perform, the
+                // pre-body reset's DONE / 0 — body_val is then the
+                // natural terminal). The post-body tag-check below
+                // is sound under both shapes.
                 let body_ty = self.builder.func.dfg.value_type(body_val);
                 let body_val_widened = if body_ty == types::I64 {
                     body_val
@@ -10355,10 +10373,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.builder.ins().ireduce(handler_overall_ty, lv_u64)
                 } else if handler_overall_ty == self.pointer_ty {
                     lv_u64
-                } else if handler_overall_ty.is_int() {
-                    self.builder.ins().iconst(handler_overall_ty, 0)
                 } else {
-                    self.builder.ins().iconst(self.pointer_ty, 0)
+                    // Round-3 review §6: panic at codegen instead of
+                    // emitting wrong-domain zero placeholders. Same
+                    // rationale as the return-arm-bearing branch's
+                    // discharge_block above.
+                    unreachable!(
+                        "Bug 1 no-return-arm discharge_block: unsupported \
+                         handler_overall_ty {:?} (Bug 1 supports I64, I8 / \
+                         I32 narrower-int, and pointer_ty == I64). Float / \
+                         32-bit-target port needs a dedicated narrow branch.",
+                        handler_overall_ty
+                    )
                 };
                 self.builder
                     .ins()
@@ -12370,7 +12396,15 @@ fn arm_body_has_k_pair_lambda(
         Expr::RecordLit { fields, .. } => fields
             .iter()
             .any(|f| arm_body_has_k_pair_lambda(&f.value, arm_k_pair_captures)),
-        Expr::Lambda { .. } => false,
+        Expr::Lambda { .. } => unreachable!(
+            "arm_body_has_k_pair_lambda: Expr::Lambda should not survive \
+             closure_convert — every Lambda is rewritten to ClosureRecord. \
+             Reaching this arm means closure_convert leaked a Lambda; \
+             treating it as `false` here would silently misclassify \
+             k-pair-bearing children and produce wrong codegen (frame_ptr \
+             would not be threaded through the lifted lambda's closure \
+             record). Fail loud at codegen instead."
+        ),
         Expr::Handle { body, op_arms, .. } => {
             arm_body_has_k_pair_lambda(body, arm_k_pair_captures)
                 || op_arms
