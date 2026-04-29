@@ -116,3 +116,29 @@ The combined surface (Unit literal + arm-body sequencing + row-poly fn-typed par
 **Failure mode.** None — the documentation on `std/list.sigil` is explicit that `for_each` is intentionally absent and points users at the "write a recursive match helper" workaround.
 
 **Implementing commit(s).** [HEAD] (this entry); shipped alongside `std/list.sigil` and the seven non-`for_each` helpers in [HEAD+1].
+
+## 2026-04-29 — [DEVIATION Task 65] Split into runtime foundation (part 1) and compiler integration (part 2)
+
+**Context.** Plan C Task 65 ships immutable `Array[A]` with five operations: `array_alloc`, `array_length`, `array_get`, `array_set`, plus `from_list` / `to_list` (per the plan body). Unlike Tasks 62–64 (`std/option`, `std/result`, `std/list`), Task 65 explicitly requires "runtime support for array allocation; extend `runtime/`." That extension is the foundation for Tasks 66 (`mut_array`), 66.5 (`byte_array`), 66.6 (`mut_byte_array`), 67 (`string_builder`), and 69 (`int64`) — all of which need similar TAG / heap-layout / FFI work.
+
+The full Task 65 (runtime + compiler integration + sigil source + tests) is a ~600–800 LOC change spread across:
+- `runtime/src/array.rs` (5 FFI primitives + Rust unit tests).
+- `header-constants/src/lib.rs` (TAG_ARRAY = 0x04).
+- `runtime/src/counters.rs` (2 new counter slots).
+- `compiler/src/typecheck.rs` (builtin `Array[A]` type registration via `tc.types`; builtin generic `Scheme`s for the 5 operations in `tc.fn_schemes`).
+- `compiler/src/codegen.rs` (5 FFI declarations; 5 special-case `Expr::Ident` dispatch arms in `lower_call`; corresponding `type_of_expr` arms).
+- `std/array.sigil` (documentation file; the operations are builtin so the file doesn't carry implementations).
+- Tests (typecheck unit tests + e2e tests).
+
+**Why accepted.** The runtime foundation is independently useful: each of Tasks 66 / 66.5 / 66.6 / 67 / 69 will reuse the TAG-based heap-layout pattern. Shipping the runtime in part 1 lets CI verify the foundation in isolation before piling compiler integration on top, reducing the blast radius of any latent bug in either layer.
+
+**Scope split:**
+
+- **Part 1 (this commit pair):** runtime/src/array.rs with the 5 FFI primitives, TAG_ARRAY constant, counters wiring, 7 Rust unit tests covering zero-length / fill / empty / immutable-set / set-chain / Sudoku-size (past the 6-bit count cap) / header-tag invariants. **No compiler integration yet** — the symbols exist in `libsigil_runtime.a` but aren't reachable from sigil source.
+- **Part 2 (follow-up):** typecheck builtin Array type + builtin generic schemes; codegen FFI declarations + dispatch; `std/array.sigil` (likely documentation-only, like `std/io.sigil`); typecheck-level tests; e2e tests; PROGRESS / coverage update. Splits cleanly because the compiler integration can be developed against the already-merged runtime foundation.
+
+**Closure path.** Closed when part 2 ships and Task 65 reaches user-observable parity with the plan body.
+
+**Failure mode.** Stage-7 progress is bottlenecked on part 2 — Tasks 66+ depend on a working `Array[A]` for some demo programs (sudoku.sigil uses `MutArray[Int]`). Part 2 is non-optional Plan C work, just sequenced after part 1.
+
+**Implementing commit(s).** [HEAD] runtime foundation; **part 2 PENDING** — to be shipped in a follow-up commit pair.
