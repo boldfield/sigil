@@ -199,15 +199,22 @@ fn compile_and_run(source: &str, test_name: &str) -> (String, String, i32) {
 ///
 /// Compiles `source` and asserts:
 /// 1. compile fails (exit non-zero), AND
-/// 2. stderr contains `expected_code` (e.g., "E0138").
+/// 2. stderr contains `expected_code` (e.g., "E0138"), AND
+/// 3. stderr contains every substring in `extra_substrings` (for
+///    pinning op names / specific quoted identifiers in addition
+///    to the E-code anchor).
 ///
 /// Use for any negative test of the shape "this source must
 /// compile-fail with code X". Bare `!status.success()` checks
 /// without an E-code anchor are easy to write but brittle —
 /// any future refactor that shifts which pass rejects the source
 /// silently invalidates the test's claim.
-#[allow(dead_code)]
-fn assert_compile_fails_with_code(source: &str, expected_code: &str, test_name: &str) {
+fn assert_compile_fails_with_code(
+    source: &str,
+    expected_code: &str,
+    extra_substrings: &[&str],
+    test_name: &str,
+) {
     let src_path = std::env::temp_dir().join(format!(
         "sigil_e2e_{}_{}.sigil",
         test_name,
@@ -236,6 +243,13 @@ fn assert_compile_fails_with_code(source: &str, expected_code: &str, test_name: 
         stderr_str.contains(expected_code),
         "expected `{expected_code}` in stderr for `{test_name}`; got stderr={stderr_str:?}"
     );
+    for needle in extra_substrings {
+        assert!(
+            stderr_str.contains(needle),
+            "expected substring `{needle}` in stderr for `{test_name}`; \
+             got stderr={stderr_str:?}"
+        );
+    }
 }
 
 /// Like [`compile_file_and_run`] but also returns the wall-clock
@@ -1906,36 +1920,7 @@ fn partial_handler_of_multi_op_effect_rejected_with_e0142() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "partial_handler_e0142_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path =
-        std::env::temp_dir().join(format!("partial_handler_e0142_{}", std::process::id()));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail with E0142 (partial handler over multi-op effect); \
-         got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("E0142") && stderr.contains("Choose.left"),
-        "stderr should reference E0142 and the unhandled op name `Choose.left`; \
-         got stderr={stderr:?}",
-    );
+    assert_compile_fails_with_code(src, "E0142", &["Choose.left"], "partial_handler_e0142");
 }
 
 /// Plan B Stage 6 cleanup — **un-ignored from the previously
@@ -2135,9 +2120,38 @@ fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
 // by `arm_body_does_arithmetic_on_op_args` and the Phase 4c acceptance
 // precondition tests below.
 
+/// P17 compose source: rejects pending builtin-as-fn-value
+/// support. Stage 6.8 originally framed this rejection as
+/// "until TypeExpr::Fn ships" — TypeExpr::Fn DID ship (B.3),
+/// but compose's source has a second blocker that survives:
+/// `compose(int_to_string, ...)` passes the builtin
+/// `int_to_string` as a fn-typed argument. Phase C v1's fn-as-
+/// value materialization (Task 104) handles user-declared top-
+/// level fns by rewriting bare `Ident(name)` to a captureless
+/// `ClosureRecord`, but builtins are seeded into typecheck's
+/// `fn_env` without a corresponding `Item::Fn`, so they're
+/// absent from `top_level_fn_names`. closure-convert leaves
+/// `int_to_string` as `Ident(...)`, and codegen panics in
+/// `lower_expr(Ident)` when the name isn't in env / ctors /
+/// the user-fn ClosureRecord materialization branch.
+///
+/// See `[DEVIATION p17_compose blocker analysis]` (2026-04-29)
+/// for the full surface analysis. Task 109 closes this by
+/// rewriting the example source to use a user-side wrapper:
+/// `fn its(n: Int) -> String ![] { int_to_string(n) }` and
+/// inverting the test to a positive runtime check.
+///
+/// Source note: the outer `compose` return type carries TWO
+/// `![..]` markers per the per-arrow effect-row discipline
+/// (`[DEVIATION Task 103]`) — first for the inner returned
+/// fn-type, second for compose's own effect row. Without the
+/// second `![..]` the test would trip on Blocker 1 (parse
+/// rejection) instead of Blocker 2 (the actual remaining
+/// surface). With the per-arrow fix in source, this test
+/// pins Blocker 2 specifically.
 #[test]
-fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
-    let src = "fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] {\n  \
+fn p17_compose_source_rejects_pending_builtin_as_fn_value() {
+    let src = "fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] ![] {\n  \
                  fn (x: A) -> C ![] => f(g(x))\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
@@ -2165,7 +2179,7 @@ fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
     let _ = std::fs::remove_file(&bin_path);
     assert!(
         !out.status.success(),
-        "P17 source must NOT compile until TypeExpr::Fn ships; got success with stdout={:?} stderr={:?}",
+        "P17 source must NOT compile until builtin-as-fn-value ships; got success with stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
