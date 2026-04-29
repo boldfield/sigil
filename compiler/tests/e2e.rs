@@ -4397,21 +4397,33 @@ fn handle_with_return_arm_transforms_body_value_no_op_arms_fired() {
 }
 
 #[test]
-fn handle_with_return_arm_fires_on_op_arm_discharge_value() {
-    // Plan B Task 55 (Phase 4g) — semantic pin: return arms fire on
-    // the value the body **yields**, regardless of whether that
-    // value comes from the body completing normally OR from an op
-    // arm discharging the perform without invoking `k`. This
-    // matches Koka / Effekt standard algebraic-effects semantics:
-    // the return clause runs over whatever value flows out of the
-    // body (including non-resuming op-arm tail values). It is NOT
-    // the case that op-arm dispatch "skips" the return arm.
+fn handle_with_op_arm_discharge_skips_return_arm() {
+    // Stage-6.8-followup Bug 2 fix — corrects Phase 4g's incorrect
+    // semantics from PR #29 `dd10379`. **Op arm body's discard-`k`
+    // tail bypasses the return arm.** Per algebraic-effects type
+    // theory (Plotkin–Pretnar), the body has type B and op arms
+    // have body type R (handle's overall). The return clause
+    // `return(v: B) => body_R` wraps body's normal value (type B)
+    // into R. When an op arm fires and discards `k`, its value
+    // already has type R and IS the handle's final value; passing
+    // it through the return clause as `v: B` is type-unsound when
+    // B ≠ R. PR #29's CI fix at `dd10379` shipped uniform return
+    // arm dispatch on the assumption that "return clause runs over
+    // whatever flows out of the body" — that interpretation is
+    // wrong; this test pins the corrected semantics.
     //
     // `handle (perform Raise.fail()) with { Raise.fail(k) => 99,
     //  return(v) => v * 100 }` — body performs Raise.fail; op arm
-    // fires returning 99 (without calling `k`); the 99 flows out
-    // as the body's yielded value; return arm fires with v=99
-    // → 99*100 = 9900. main prints "9900\n".
+    // fires, returns 99 (discards k); 99 IS handle's overall
+    // (return arm bypassed). main prints "99\n".
+    //
+    // The test's symptoms BEFORE this fix produced "9900\n"
+    // (return arm applied 99 * 100). For B = R = Int (this test),
+    // the bug was masked by the type coincidence — both interpretations
+    // produced valid integers. The B ≠ R case (covered by the
+    // run_state-shaped test landed alongside this fix) shows the
+    // bug clearly: the discharged R-typed value is passed as B-typed
+    // `v` and pointer arithmetic ensues.
     let src = "effect Raise { fail: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform Raise.fail()) with {\n    \
@@ -4421,9 +4433,9 @@ fn handle_with_return_arm_fires_on_op_arm_discharge_value() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_op_arm_value_via_return_arm");
+    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_bug2_discharge_skips_return");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "9900\n", "stdout mismatch; stderr={stderr:?}");
+    assert_eq!(stdout, "99\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]
@@ -4550,18 +4562,62 @@ fn handle_with_return_arm_body_type_differs_from_body_type() {
 }
 
 #[test]
-fn handle_with_constant_return_arm_overrides_op_arm_yield() {
-    // Plan B Task 55 (Phase 4g) — combined coverage: when the
-    // return arm body is a constant (ignoring `v`), it overrides
-    // whatever value flows out of the body — including non-
-    // resuming op-arm tail values. The op arm fires (perform
-    // dispatched), yields 7; return arm body is `999` (constant);
-    // handle's overall value = 999. Pins both (a) registering both
-    // op + return arms on the same frame doesn't break op-arm
-    // dispatch (the perform path still works), and (b) the return
-    // arm runs over the op-arm-yielded value per the standard
-    // semantics demonstrated by
-    // `handle_with_return_arm_fires_on_op_arm_discharge_value`.
+fn handle_returning_fn_typed_value_with_op_arm_discharge_runs() {
+    // Stage-6.8-followup Bug 2 fix — the load-bearing run_state-shape
+    // test that exercises B ≠ R (body's type ≠ handle's overall
+    // type) under op-arm discharge. Pre-fix, this shape produced a
+    // heap-pointer-shaped value: the discharged arm's lambda
+    // (closure_ptr at type R) was passed as `v: B` (Int) into the
+    // return arm, which computed `fn (s) => v + s` — a new lambda
+    // capturing the closure_ptr-as-Int and adding the s arg. The
+    // resulting `f(7)` evaluated `closure_ptr + 7`, a meaningless
+    // pointer-shaped integer.
+    //
+    // Post-fix: arm's lambda IS handle's overall directly. f =
+    // arm's lambda. f(7) = 7 + 100 = 107.
+    //
+    // This shape is a minimal proxy for the canonical
+    // `run_state(initial, comp)` higher-order helper from
+    // `examples/state.sigil`'s reverted Task 109 first-cycle attempt
+    // (see `[DEVIATION Task 109] run_state canonical shape — runtime
+    // chain integration gap` in `PLAN_B_PRIME_DEVIATIONS.md`).
+    // Closing rs_a unblocks the canonical run_state rewrite that
+    // PR #38 deferred.
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 perform Trigger.fire()\n\
+               }\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => s + 100,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_bug2_fn_typed_handle_discharge");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "107\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_op_arm_discharge_skips_constant_return_arm() {
+    // Stage-6.8-followup Bug 2 fix — corrects PR #29 semantics.
+    // Combined coverage: when both an op arm and a return arm are
+    // declared, and the op arm fires (discards `k`), the op arm's
+    // value IS the handle's overall — the return arm does NOT
+    // fire. Pre-fix behavior dispatched the constant return arm
+    // (output 999); post-fix correctly bypasses (output 7).
+    //
+    // Pins both (a) registering both op + return arms on the same
+    // frame doesn't break op-arm dispatch (the perform path still
+    // works), and (b) the return arm is skipped on op-arm
+    // discharge per standard algebraic-effects semantics
+    // (sibling `handle_with_op_arm_discharge_skips_return_arm`).
     let src = "effect Raise { fail: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform Raise.fail()) with {\n    \
@@ -4571,9 +4627,9 @@ fn handle_with_constant_return_arm_overrides_op_arm_yield() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "phase_4g_constant_return_overrides_op");
+    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_bug2_discharge_skips_constant_return");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "999\n", "stdout mismatch; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]

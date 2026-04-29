@@ -342,3 +342,52 @@ Compile-time was clean (no E0xxx) after the `resumes: many` opt-in. **Runtime** 
 **Closure path:** follow-up Task 109 fixup commit will un-ignore the bisect test, observe which layer breaks, and either ship the targeted compiler fix (if the layer is bounded) or document a Plan-C-or-later closure if the gap is structural. Once the chain runs end-to-end, state.sigil rewrites to the canonical shape and `state_example_run_state_returns_threaded_value` lands as the integration assertion.
 
 **Implementing commit(s):** original Task 109 attempt at `7b457b6` (run_state shape) + `e35dae9` (E0220 `resumes: many` fix); current commit reverts state.sigil to dual-handle, restores the dual-handle e2e test, adds the bisect test, and documents this deviation. Sub-tasks 2 / 3 / 4 of Task 109 (higher_order.sigil docstring / TypeExpr::Fn rejection inversion / arm-body-lambda rejection inversion) all remain closed by prior Stage 6.8 work.
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Bug 2] Return arm dispatch on op-arm-discharge values violates algebraic-effects semantics
+
+**Plan B' Stage 6.8 Task 109 followup.** Closes one of the layered bugs blocking the canonical `run_state` rewrite. Sibling bugs (Source A's body-tail-after-perform under sync lowering, the canonical run_state's k-capturing-lambda-invocation chain, and the multi-arm State.get/set/return composition) remain documented under `[DEVIATION Task 109]` for follow-up work.
+
+**The bug.** Phase 4g (PR #29 `eabef59` activation + `dd10379` test fixup) shipped uniform return arm dispatch in `Expr::Handle`'s `lower_expr`: after body lowering, if `return_arm.is_some()`, codegen unconditionally builds `NextStep::Call(return_closure, return_fn, [body_val_widened, null, identity])` and drives `sigil_run_loop`. The `dd10379` commit message defended this with: *"the return clause runs over whatever value flows out of the body, including non-resuming op-arm tail values."* That interpretation is incorrect per algebraic-effects type theory (Plotkin–Pretnar; Eff; Koka):
+
+- Body's type is `B`.
+- Op arm bodies have type `R` (handle's overall — the same type the handle expression evaluates to).
+- Return clause `return(v: B) => body_R` has v's type B and body_R's type R.
+- When an op arm fires and discards `k`, its value already has type R and IS the handle's final value. Passing it through the return clause as `v: B` is type-unsound when B ≠ R.
+
+The bug is masked when B = R (the case PR #29's tests covered), surfacing only when B ≠ R (the canonical `run_state` shape: B = Int, R = (Int) → A). Symptom: heap-pointer-shaped output values, varying across runs (the closure_ptr to the discharged arm's lambda, interpreted as Int, fed through the return arm's pointer arithmetic).
+
+**The fix — distinguish at runtime, conditional dispatch at codegen.**
+
+Runtime (`abi/src/effect.rs` + `runtime/src/handlers.rs`):
+- New `NEXT_STEP_TAG_DISCHARGED = 2` discriminant alongside existing `NEXT_STEP_TAG_DONE = 0` and `NEXT_STEP_TAG_CALL = 1`.
+- New `sigil_next_step_discharged(value)` constructor — emitted by op arm fn body's discard-`k` tail path (replaces `sigil_next_step_done` at that specific site).
+- New thread-local `LAST_TERMINAL_TAG: Cell<u32>` set by `sigil_run_loop` immediately before returning the terminal value (DONE for normal Done, DISCHARGED for the new variant).
+- New `sigil_last_terminal_tag()` query for codegen.
+- New `sigil_reset_last_terminal_tag()` reset for codegen to call before body lowering (so handles whose bodies don't run a perform see a clean DONE state).
+- The trampoline routes both DONE and DISCHARGED through the existing outer post_arm_k stack uniformly — discharge value still flows through any waiting outer multi-shot continuation chain. The distinction matters only at the top-level run_loop terminal.
+
+Codegen (`compiler/src/codegen.rs`):
+- New FFI declarations + per-fn FuncRefs for `sigil_next_step_discharged`, `sigil_last_terminal_tag`, `sigil_reset_last_terminal_tag`.
+- Op arm fn body's discard-`k` catchall (the path that produces `NextStep::Done(arm_body_value)` when arm body is evaluated to a value WITHOUT invoking k) now emits `sigil_next_step_discharged` instead of `sigil_next_step_done`. Synth-cont chains (the resume-`k` path) continue to emit `sigil_next_step_done` — body completion via continuation IS body-normal completion, the return arm should fire.
+- `Expr::Handle`'s `lower_expr` emits `sigil_reset_last_terminal_tag()` before body lowering (gated on `return_arm.is_some()`).
+- After body lowering, if `return_arm.is_some()`, query the tag and conditionally branch:
+  - DISCHARGED: skip return arm dispatch; convert body_val to handler_overall_ty's Cranelift type and use directly as handle's overall.
+  - DONE: existing return arm dispatch path.
+- Both branches converge on a merge block whose param is the handle's final value.
+
+**Type-conversion path in the discharge branch.** When body's Cranelift type B and handler_overall_ty R coincide (e.g., B = Int = I64 and R = (Int) → Int = pointer_ty = I64 on 64-bit targets — the canonical run_state shape), body_val IS handle's overall directly. When they differ in width (B = Bool = I8 and R = String = pointer_ty = I64, etc.), the discharge branch performs a width-aware conversion (uextend / ireduce / bitcast) OR emits a safe placeholder of handler_overall_ty. The placeholder is never observed at runtime when B's narrow-back at the perform site has truncated R-typed bits — the discharge branch is structurally dead in that case. Codegen still must emit valid IR; the placeholder satisfies the verifier without affecting runtime behavior.
+
+**Test inversions.** Two PR #29 tests pinned the buggy semantics; both inverted to assert the corrected semantics:
+- `handle_with_return_arm_fires_on_op_arm_discharge_value` (asserted "9900\n" — return arm applied to discharge value) → renamed to `handle_with_op_arm_discharge_skips_return_arm`, asserts "99\n" (return arm bypassed; arm's value IS handle's overall).
+- `handle_with_constant_return_arm_overrides_op_arm_yield` (asserted "999\n" — constant return arm applied to op arm's yield) → renamed to `handle_with_op_arm_discharge_skips_constant_return_arm`, asserts "7\n".
+
+**New positive test:** `handle_returning_fn_typed_value_with_op_arm_discharge_runs` exercises the load-bearing B ≠ R case (B = Int, R = (Int) → Int). Pre-fix this produced a heap-pointer-shaped value varying across runs; post-fix produces "107\n" (arm's lambda invoked at top level with arg = 7).
+
+**What this fix DOES NOT close.** The canonical `run_state(initial, comp)` higher-order helper from PR #38's reverted Task 109 first-cycle attempt remains broken — Bug 2 is one of multiple layered bugs in the canonical shape. Verified: a manual `/tmp/run_state_canonical.sigil` matching the original literal shape still produces a heap-pointer-shaped value with this fix applied. Other layers blocking the canonical:
+- **Bug 1** (Source A): synchronous body lowering doesn't propagate discard-k through body's post-perform code. Affects programs whose handle body has the `{ let _ = perform; tail }` shape rather than `comp()` in tail position.
+- **Layer 2** (canonical run_state's k-capturing arm-body lambda invocation chain): arms return lambdas that capture `k` and invoke it via `k(s)(s)` recursive call-of-call. The k-capture allocation + lambda-invocation + recursive Call dispatch chain has its own bug that Bug 2 doesn't address.
+- **Layer 3** (multi-arm composition): the canonical run_state has return + State.get + State.set arms. Whether the multi-arm dispatch composes correctly with k-capturing arms is unverified.
+
+These remain Plan B' Stage 6.8 followup work tracked under `[DEVIATION Task 109] run_state canonical shape`. The Bug 2 fix in this entry is a load-bearing prerequisite — without it, even the simpler rs_a-style B ≠ R shape fails at runtime.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
