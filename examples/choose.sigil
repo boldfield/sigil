@@ -1,44 +1,59 @@
 // examples/choose.sigil
 //
-// Plan B' Stage 6.7 Task 101 — natural shape: literal two-flip pair
-// generator. Helper performs `Choose.flip()` TWICE; multi-shot arm
-// drives both flips with both branches, enumerating all 2×2 = 4
-// outcomes. Replaces the pre-Stage-6.7 single-flip "binary outcome
-// enumerator" workaround that PR #32 shipped under `[DEVIATION Task
-// 59]`.
+// Plan B' Stage 6.7 Task 101 — natural shape: 2-flip helper +
+// multi-shot 2-resume arm. Helper performs `Choose.flip()` TWICE
+// (B.2 chained-let-yield); the multi-shot arm invokes k twice with
+// `true`/`false` for the **second** flip. The combination
+// produces a partial enumeration of the 2×2 = 4 outcome space —
+// see "v1 multi-shot composition limitation" below.
 //
 // **What this exercises** (post-Stage-6.7):
 //
 // - **Helper with chained-let-yield body (B.2)**: `outcome()`
-//   performs Choose.flip twice; the helper synth-cont chain (Plan
-//   B' Tasks 94+95) carries (k_closure, k_fn) + captures + prior
-//   bindings forward across 2 chain steps (Middle: post-flip-1 →
-//   Final: post-flip-2 → tail).
+//   performs Choose.flip twice; the helper synth-cont chain
+//   carries (k_closure, k_fn) + captures + prior bindings forward
+//   across 2 chain steps (Middle: post-flip-1 → Final: post-flip-2).
 //
 // - **Multi-shot arm with N=2 chain (B.1)**: arm body invokes `k`
-//   twice with `true`/`false` for the FIRST flip; helper drives the
-//   second flip recursively under each branch, dispatching the
-//   nested arm with both branches again. Total: 4 leaf outcomes.
+//   twice. Under v1's single-trampoline semantics, only the
+//   INNERMOST arm's chain runs to Done; the OUTER arm's chain
+//   never dispatches (its post_arm_k pair was passed forward but
+//   helper Middle drops it during the inter-perform sigil_perform
+//   call — see deviation entry).
 //
-// **Closed form**. helper's tail encodes (b1, b2) as a 2-bit pair:
+// **v1 multi-shot composition limitation**. With 2-flip helper +
+// 2-resume outer arm:
+//   - Outer arm dispatches for flip 1.
+//   - Outer arm's k(true) drives helper Middle (binds b1=true);
+//     helper Middle issues sigil_perform for flip 2 with k =
+//     (step_1_helper_closure, &step_1_helper_func). Crucially,
+//     helper Middle does NOT route through post_arm_k_outer —
+//     post_arm_k_outer is loaded into step_0_helper's args_ptr
+//     [1..3] but step_0_helper Middle ignores it (Middle steps
+//     don't dispatch to post_arm_k; only Final steps do).
+//   - flip 2 dispatches a fresh inner arm (same arm fn, new k pair
+//     pointing at helper Final).
+//   - Inner arm's k(true)/k(false) drive helper Final twice (b2=t/f
+//     under b1=t); helper Final dispatches each result through
+//     post_arm_k_inner = inner-arm's chain.
+//   - Inner arm chain: r1'=1 (b1=t,b2=t outcome), r2'=2 (b1=t,b2=f
+//     outcome), tail=r1'+r2'=3, Done(3).
+//   - Trampoline observes Done; returns 3 to the wrapper.
+//   - Outer arm's r2 = k(false) NEVER runs (would have enumerated
+//     the b1=false branch).
 //
-//   b1=t, b2=t → 1     b1=t, b2=f → 2
-//   b1=f, b2=t → 3     b1=f, b2=f → 4
+// **Closed form (partial enumeration)**: 1 + 2 = 3. Only the b1=t
+// branch's b2 enumeration runs. The b1=f branch (outcomes 3, 4) is
+// dropped by the v1 trampoline's Done-terminates discipline.
 //
-// Outer arm: r1 = k(true) drives helper with b1=t, then 2nd flip
-// dispatches inner arm. Inner arm: r1' = k(true) → outcome 1; r2' =
-// k(false) → outcome 2. Inner tail r1'+r2' = 3. So outer r1 = 3.
-// Symmetrically, outer r2 = k(false) drives helper with b1=f, then
-// inner dispatches: r1'' = 3 (b1=f,b2=t outcome), r2'' = 4 (b1=f,
-// b2=f), inner tail = 7. So outer r2 = 7. Outer tail = r1 + r2 =
-// 3 + 7 = 10.
+// The literal Cartesian-product 4-outcome pair generator (sum
+// 1+2+3+4 = 10) is documented as deferred in
+// `[DEVIATION Stage 6.7 multi-shot composition]` of
+// `PLAN_B_PRIME_DEVIATIONS.md` — that semantics requires a
+// continuation-marks or trampoline-resume mechanism beyond
+// Stage 6.7's scope.
 //
-// **Cartesian-product semantic**. The (r1, r2) tuple at each arm
-// level enumerates one bit of the outcome space; chaining gives the
-// full 2×2 = 4 product. Sum of all 4 outcomes (1+2+3+4 = 10) is
-// what the program prints.
-//
-// Invariant: stdout reads `10\n` and the program exits 0.
+// Invariant: stdout reads `3\n` and the program exits 0.
 
 effect Choose resumes: many { flip: () -> Bool }
 

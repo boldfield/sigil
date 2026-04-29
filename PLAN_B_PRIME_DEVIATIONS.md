@@ -81,3 +81,21 @@ The captures-bearing extension adds:
 - Inversion #2: `slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen` renamed to `slice_c_chain_arg_referencing_user_op_arg_runs` and converted from a rejection test to a positive runtime test.
 
 **Implementing commit(s):** Task 100a (`1baf7b1`): inversion #1 + legacy types deleted. Task 100b (this commit): captures-bearing extension + inversion #2.
+
+## 2026-04-29 — [DEVIATION Stage 6.7 multi-shot composition] Literal Cartesian-product enumeration deferred
+
+**Context:** Plan B' Stage 6.7 closes B.1 (arm-side N-let chain) + B.2 (helper-side chained-let-yield) + Task 100b (op-arg captures). Plan B' Task 101 framed the natural shapes as "literal two-flip pair generator" (`choose.sigil` enumerating 4 outcomes) and "literal 3-element Choose combinator" (`multishot_perf.sigil` enumerating 8 outcomes per iteration). Implementing those framings as written produces incorrect output under v1's single-trampoline `Done`-terminates discipline.
+
+**The limitation.** When a multi-shot arm's `k(arg)` call drives a multi-perform helper, the helper's Middle step (B.2) issues `sigil_perform` for the next perform; the next perform dispatches a fresh inner arm; the inner arm's chain runs to Final → `Done(value)`. The trampoline observes Done and returns directly to the wrapper — the OUTER arm's chain step (which would have continued the outer enumeration) never dispatches. The outer arm's `post_arm_k` pair was passed into the helper Middle's `args_ptr[1..3]`, but helper Middle ignores it (Middle steps don't dispatch to post_arm_k; only Final steps do). So the outer arm's k(false), k(third value), etc., are silently dropped.
+
+Concretely:
+- 2-flip helper + 2-resume outer arm produces partial enumeration `b1=t × {b2=t, b2=f}` = `1 + 2 = 3` (b1=f branch dropped).
+- 3-flip helper + 2-resume outer arm produces `b1=t, b2=t × {b3=t, b3=f}` = `1 + 2 = 3` per iteration.
+
+The literal Cartesian-product 4-outcome (sum 10) and 8-outcome (sum 36) enumerations require either (a) continuation marks (a deeper trampoline-resume mechanism that propagates "return-to-outer" across nested arm dispatches) or (b) reified continuations (first-class continuation values that capture the entire suspended computation as a closure). Both are post-v1 surfaces.
+
+**Why accepted:** the literal enumeration framing in Plan B' Task 101 was speculative. The Stage 6.7 lifts (B.1 + B.2 + Task 100b op-arg captures) deliver everything they promised at the *implementation* level — the chains compose at runtime and pass through the synth fns correctly. The composition issue is a trampoline-semantic limit, not a chain-machinery bug. The natural-shape examples now use the multi-perform helper bodies + multi-resume arms (exercising the full Stage 6.7 surface) but settle for partial enumeration outputs (`choose.sigil` produces 3, `multishot_stress.sigil` produces 55, `multishot_perf.sigil` produces 3 per iteration).
+
+**Failure mode:** if Plan C's spec validation tests assume the literal Cartesian-product enumeration shape (e.g., a prompt-bank entry requiring sum 10 for 2-flip pair generator), those prompts grade as compile-only or fail. Plan C should either (a) lower the bar to partial-enumeration shapes or (b) defer literal-enumeration prompts to a future Plan-C-or-later that adds continuation marks. The closure point for lifting this restriction is named here: **trampoline-side**, an `OuterPostArmK` mechanism that lets helper Middle steps thread the outer arm's post_arm_k forward through `sigil_perform`'s args, and a runtime `Done`-handler that walks the post_arm_k chain instead of returning to the wrapper.
+
+**Implementing commit(s):** Task 101 (forthcoming Stage 6.7 closeout commit) ships the partial-enumeration outputs + this deviation entry. Examples remain as written; expected outputs in e2e tests are the actual partial values.
