@@ -82,6 +82,10 @@ The captures-bearing extension adds:
 
 **Implementing commit(s):** Task 100a (`1baf7b1`): inversion #1 + legacy types deleted. Task 100b (this commit): captures-bearing extension + inversion #2.
 
+## 2026-04-29 — [DEVIATION Stage 6.7 multi-shot composition] CLOSED: outer post_arm_k stack delivers literal Cartesian-product enumeration
+
+**Closure note** (added at fix-commit landing): the deviation below originally framed the literal Cartesian-product enumeration as deferred. The user requested fixing it before Stage 6.7 closeout. The fix shipped as a runtime + codegen + trampoline change implementing the "outer post_arm_k stack" (continuation marks) approach described under "Closure point chosen" below. Both `examples/choose.sigil` (4-outcome pair generator, sum 10) and `examples/multishot_perf.sigil` (8-outcome 3-element combinator, sum 36 per iteration) now produce literal enumerations.
+
 ## 2026-04-29 — [DEVIATION Stage 6.7 multi-shot composition] Literal Cartesian-product enumeration deferred
 
 **Context:** Plan B' Stage 6.7 closes B.1 (arm-side N-let chain) + B.2 (helper-side chained-let-yield) + Task 100b (op-arg captures). Plan B' Task 101 framed the natural shapes as "literal two-flip pair generator" (`choose.sigil` enumerating 4 outcomes) and "literal 3-element Choose combinator" (`multishot_perf.sigil` enumerating 8 outcomes per iteration). Implementing those framings as written produces incorrect output under v1's single-trampoline `Done`-terminates discipline.

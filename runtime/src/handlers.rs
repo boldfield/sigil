@@ -239,6 +239,159 @@ pub(crate) fn unregister_handler_stack_root_for_calling_thread(
 }
 
 // ---------------------------------------------------------------------
+// Plan B' Stage 6.7 multi-shot composition fix — outer post_arm_k stack
+//
+// Background: when a multi-shot arm's `k(arg)` call dispatches into a
+// multi-perform helper (B.2 chained-let-yield helper body), the
+// helper's Middle step issues `sigil_perform` for the next perform.
+// The outer arm's `post_arm_k` pair is in helper Middle's `args_ptr
+// [1..3]` but Middle dispatches only via sigil_perform, dropping
+// post_arm_k. The inner chain runs to `Done`; the trampoline observes
+// Done and returns to the wrapper, dropping the outer arm's chain.
+//
+// Fix: helper Middle pushes its incoming post_arm_k pair onto a
+// thread-local stack BEFORE issuing sigil_perform; the trampoline's
+// Done branch checks the stack and routes Done's value through the
+// popped post_arm_k chain instead of returning to the wrapper.
+//
+// Stack discipline: 1 push per outer-arm-k-into-helper-Middle, 1 pop
+// per inner Done. Push/pop balance is maintained as long as helper
+// Middle and the trampoline are correctly paired (no abort or skip
+// in between). Stack depth is bounded by the deepest nested
+// helper-perform-count; v1 uses a fixed-size TLS array (32 entries)
+// — overflow aborts cleanly.
+//
+// GC rooting: the stack array sits in TLS; entries' `closure_ptr`
+// fields point at heap-allocated closure records (the post_arm_k
+// closure of the calling arm) and must be reachable from the GC root
+// set across `sigil_perform` boundaries. Boehm scans the registered
+// TLS range; the explicit `GC_add_roots` call in
+// `register_outer_post_arm_k_stack_root_for_calling_thread` covers
+// the array so closure pointers parked here aren't reclaimed
+// mid-dispatch.
+//
+// `fn_ptr` fields point into the text segment (compiled code); Boehm
+// treats them as non-pointer-like or as pointers to non-heap regions,
+// either way they're benign.
+
+const OUTER_POST_ARM_K_STACK_SIZE: usize = 32;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct OuterPostArmKEntry {
+    closure_ptr: *mut u8,
+    fn_ptr: *mut u8,
+}
+
+thread_local! {
+    static OUTER_POST_ARM_K_STACK: Cell<[OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE]> = const {
+        Cell::new([OuterPostArmKEntry {
+            closure_ptr: ptr::null_mut(),
+            fn_ptr: ptr::null_mut(),
+        }; OUTER_POST_ARM_K_STACK_SIZE])
+    };
+    static OUTER_POST_ARM_K_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Register the calling thread's `OUTER_POST_ARM_K_STACK` TLS cell as
+/// a Boehm GC root. Idempotent per thread. Mirrors
+/// [`register_handler_stack_root_for_calling_thread`]'s discipline.
+pub(crate) fn register_outer_post_arm_k_stack_root_for_calling_thread() -> (*mut c_void, *mut c_void)
+{
+    OUTER_POST_ARM_K_STACK.with(|cell| {
+        let start =
+            cell as *const Cell<[OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE]> as *mut c_void;
+        let end = unsafe {
+            (start as *mut u8).add(core::mem::size_of::<
+                [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE],
+            >()) as *mut c_void
+        };
+        let already_registered = OUTER_POST_ARM_K_STACK_ROOTED.with(|rooted| {
+            let r = rooted.get();
+            rooted.set(true);
+            r
+        });
+        if !already_registered {
+            unsafe {
+                crate::gc::GC_add_roots(start, end);
+            }
+        }
+        (start, end)
+    })
+}
+
+/// Inverse of [`register_outer_post_arm_k_stack_root_for_calling_thread`].
+/// Used by `GcThreadEnrolment::drop` in tests to unregister the range
+/// before the thread exits.
+#[cfg(test)]
+pub(crate) fn unregister_outer_post_arm_k_stack_root_for_calling_thread(
+    start: *mut c_void,
+    end: *mut c_void,
+) {
+    OUTER_POST_ARM_K_STACK_ROOTED.with(|rooted| rooted.set(false));
+    OUTER_POST_ARM_K_DEPTH.with(|depth| depth.set(0));
+    unsafe {
+        crate::gc::GC_remove_roots(start, end);
+    }
+}
+
+/// Push an outer `post_arm_k` pair onto the thread-local stack.
+/// Codegen emits a call to this fn from B.2 helper Middle's emit
+/// before issuing `sigil_perform` for the next chain step. Aborts on
+/// stack overflow (stack size 32; helper-perform chains beyond that
+/// depth are not supported in v1).
+///
+/// # Safety
+///
+/// `closure_ptr` must be either null or a valid heap-allocated
+/// TAG_CLOSURE record. `fn_ptr` must point at a CPS-fn satisfying the
+/// `(closure_ptr, args_ptr, args_len) -> *mut NextStep` calling
+/// convention. The caller MUST ensure a corresponding pop happens —
+/// the trampoline pops on `Done` observation; helper Middle's emit
+/// pairs every push with a perform that eventually drives a Done.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_outer_post_arm_k_push(closure_ptr: *mut u8, fn_ptr: *mut u8) {
+    OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
+        let depth = depth_cell.get();
+        if depth >= OUTER_POST_ARM_K_STACK_SIZE {
+            eprintln!(
+                "sigil_outer_post_arm_k_push: stack overflow (depth {} >= cap {})",
+                depth, OUTER_POST_ARM_K_STACK_SIZE
+            );
+            std::process::abort();
+        }
+        OUTER_POST_ARM_K_STACK.with(|stack_cell| {
+            let mut stack = stack_cell.get();
+            stack[depth] = OuterPostArmKEntry {
+                closure_ptr,
+                fn_ptr,
+            };
+            stack_cell.set(stack);
+        });
+        depth_cell.set(depth + 1);
+    });
+}
+
+/// Pop the top of the outer `post_arm_k` stack. Called by the
+/// trampoline's `Done` branch. Returns `None` when the stack is empty
+/// (top-level Done — return to wrapper as before).
+fn outer_post_arm_k_try_pop() -> Option<OuterPostArmKEntry> {
+    OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
+        let depth = depth_cell.get();
+        if depth == 0 {
+            None
+        } else {
+            depth_cell.set(depth - 1);
+            OUTER_POST_ARM_K_STACK.with(|stack_cell| {
+                let stack = stack_cell.get();
+                Some(stack[depth - 1])
+            })
+        }
+    })
+}
+
+// ---------------------------------------------------------------------
 // HandlerFrame allocation
 // ---------------------------------------------------------------------
 
@@ -930,6 +1083,28 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
         match tag {
             NEXT_STEP_TAG_DONE => {
                 let v = (*current).value;
+                // Plan B' Stage 6.7 multi-shot composition fix: before
+                // returning to the wrapper, check the outer post_arm_k
+                // stack. If non-empty, pop the top entry and route
+                // Done's value through that post_arm_k chain (the
+                // outer arm's chain step that's waiting for the result
+                // of an inner arm's enumeration). If empty, this is
+                // top-level Done — return to wrapper.
+                if let Some(entry) = outer_post_arm_k_try_pop() {
+                    // Reset the arena before allocating the new Call.
+                    crate::arena::sigil_arena_reset();
+                    // Build Call(popped_closure, popped_fn_ptr,
+                    // [done_value]) with args_len=1 — same shape that
+                    // helper Final's `emit_dispatch_to_post_arm_k`
+                    // builds for terminal post_arm_k dispatch.
+                    let ns = sigil_next_step_call(entry.closure_ptr, entry.fn_ptr, 1);
+                    let ns_args = sigil_next_step_args_ptr(ns);
+                    // SAFETY: not an interior pointer; ns_args is
+                    // arena-owned and only written here.
+                    ns_args.write(v);
+                    current = ns;
+                    continue;
+                }
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();

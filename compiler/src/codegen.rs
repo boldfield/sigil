@@ -4428,6 +4428,28 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_perform", Linkage::Import, &perform_sig)
         .map_err(|e| format!("declare sigil_perform: {e}"))?;
 
+    // Plan B' Stage 6.7 multi-shot composition fix —
+    // sigil_outer_post_arm_k_push(closure_ptr: *mut u8,
+    //                             fn_ptr: *mut u8).
+    // Called from B.2 helper Middle's emit before sigil_perform; saves
+    // the outer arm's post_arm_k pair onto a thread-local stack so
+    // the trampoline's `Done` branch can route the inner chain's
+    // result back through it.
+    let mut outer_post_arm_k_push_sig = Signature::new(isa_call_conv(&module));
+    outer_post_arm_k_push_sig
+        .params
+        .push(AbiParam::new(pointer_ty)); // closure_ptr
+    outer_post_arm_k_push_sig
+        .params
+        .push(AbiParam::new(pointer_ty)); // fn_ptr
+    let outer_post_arm_k_push = module
+        .declare_function(
+            "sigil_outer_post_arm_k_push",
+            Linkage::Import,
+            &outer_post_arm_k_push_sig,
+        )
+        .map_err(|e| format!("declare sigil_outer_post_arm_k_push: {e}"))?;
+
     // sigil_next_step_done(value: u64) -> *mut NextStep
     let mut next_step_done_sig = Signature::new(isa_call_conv(&module));
     next_step_done_sig.params.push(AbiParam::new(types::I64));
@@ -4932,6 +4954,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         handler_frame_set_arm,
         handler_frame_set_return,
         perform_func,
+        outer_post_arm_k_push,
         run_loop,
         next_step_done,
         next_step_call,
@@ -4982,6 +5005,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_arm_ref,
                 handler_frame_set_return_ref,
                 perform_ref,
+                outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 next_step_done_ref: _,
                 next_step_call_ref,
@@ -5804,6 +5828,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_arm_ref,
                     handler_frame_set_return_ref,
                     perform_ref,
+                    outer_post_arm_k_push_ref: _,
                     run_loop_ref,
                     next_step_done_ref,
                     next_step_call_ref,
@@ -6453,6 +6478,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_arm_ref,
                     handler_frame_set_return_ref,
                     perform_ref,
+                    outer_post_arm_k_push_ref: _,
                     run_loop_ref,
                     next_step_done_ref: _,
                     next_step_call_ref,
@@ -6764,6 +6790,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_arm_ref,
                 handler_frame_set_return_ref,
                 perform_ref,
+                outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 next_step_done_ref,
                 next_step_call_ref,
@@ -7025,6 +7052,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_frame_set_arm_ref,
                         handler_frame_set_return_ref,
                         perform_ref,
+                        outer_post_arm_k_push_ref: _,
                         run_loop_ref,
                         next_step_done_ref,
                         next_step_call_ref,
@@ -7631,6 +7659,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_arm_ref,
                             handler_frame_set_return_ref,
                             perform_ref,
+                            outer_post_arm_k_push_ref,
                             run_loop_ref,
                             next_step_done_ref: _,
                             next_step_call_ref,
@@ -7917,6 +7946,41 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     .builder
                                     .ins()
                                     .func_addr(pointer_ty, next_step_fn_ref);
+
+                                // Plan B' Stage 6.7 multi-shot
+                                // composition fix: BEFORE sigil_perform,
+                                // load the outer arm's post_arm_k pair
+                                // from this step's incoming args_ptr
+                                // (slots POST_ARM_K_CLOSURE_OFF /
+                                // POST_ARM_K_FN_OFF) and push it onto
+                                // the runtime's outer-post_arm_k stack.
+                                // Helper Middle dispatches sigil_perform
+                                // for the next perform — that perform
+                                // dispatches an inner arm whose chain
+                                // eventually returns Done; the
+                                // trampoline's Done branch pops this
+                                // pushed pair and routes Done's value
+                                // through the outer arm's chain.
+                                let outer_post_arm_k_closure = lowerer.builder.ins().load(
+                                    pointer_ty,
+                                    MemFlags::trusted(),
+                                    args_ptr,
+                                    POST_ARM_K_CLOSURE_OFF,
+                                );
+                                let outer_post_arm_k_fn = lowerer.builder.ins().load(
+                                    pointer_ty,
+                                    MemFlags::trusted(),
+                                    args_ptr,
+                                    POST_ARM_K_FN_OFF,
+                                );
+                                let push_call = lowerer.builder.ins().call(
+                                    outer_post_arm_k_push_ref,
+                                    &[outer_post_arm_k_closure, outer_post_arm_k_fn],
+                                );
+                                lowerer.stackmap.push_placeholder(function_code_offset(
+                                    &lowerer.builder,
+                                    push_call,
+                                ));
 
                                 // sigil_perform call. The trampoline
                                 // dispatches the perform's arm with
@@ -10484,6 +10548,10 @@ struct PerFnRefsCtx<'a> {
     handler_frame_set_arm: cranelift_module::FuncId,
     handler_frame_set_return: cranelift_module::FuncId,
     perform_func: cranelift_module::FuncId,
+    /// Plan B' Stage 6.7 multi-shot composition fix —
+    /// `sigil_outer_post_arm_k_push` FuncId, called from B.2 helper
+    /// Middle's emit before sigil_perform.
+    outer_post_arm_k_push: cranelift_module::FuncId,
     run_loop: cranelift_module::FuncId,
     next_step_done: cranelift_module::FuncId,
     next_step_call: cranelift_module::FuncId,
@@ -10531,6 +10599,9 @@ struct PerFnRefs {
     handler_frame_set_arm_ref: FuncRef,
     handler_frame_set_return_ref: FuncRef,
     perform_ref: FuncRef,
+    /// Plan B' Stage 6.7 multi-shot composition fix —
+    /// `sigil_outer_post_arm_k_push` FuncRef, used by B.2 helper Middle's emit.
+    outer_post_arm_k_push_ref: FuncRef,
     run_loop_ref: FuncRef,
     next_step_done_ref: FuncRef,
     next_step_call_ref: FuncRef,
@@ -10572,6 +10643,8 @@ fn prepare_per_fn_refs(
     let handler_frame_set_return_ref =
         module.declare_func_in_func(ctx.handler_frame_set_return, builder.func);
     let perform_ref = module.declare_func_in_func(ctx.perform_func, builder.func);
+    let outer_post_arm_k_push_ref =
+        module.declare_func_in_func(ctx.outer_post_arm_k_push, builder.func);
     let run_loop_ref = module.declare_func_in_func(ctx.run_loop, builder.func);
     let next_step_done_ref = module.declare_func_in_func(ctx.next_step_done, builder.func);
     let next_step_call_ref = module.declare_func_in_func(ctx.next_step_call, builder.func);
@@ -10647,6 +10720,7 @@ fn prepare_per_fn_refs(
         handler_frame_set_arm_ref,
         handler_frame_set_return_ref,
         perform_ref,
+        outer_post_arm_k_push_ref,
         run_loop_ref,
         next_step_done_ref,
         next_step_call_ref,

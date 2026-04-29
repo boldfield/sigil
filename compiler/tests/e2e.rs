@@ -973,32 +973,27 @@ fn state_example_dual_handle_returns_6_then_99() {
     );
 }
 
-/// Plan B' Stage 6.7 Task 101 — `examples/choose.sigil` exercises
-/// the natural shape: 2-flip helper (B.2 chained-let-yield) + multi-
-/// shot 2-resume arm (B.1 N-let chain). Under v1's single-trampoline
-/// Done-terminates discipline, the OUTER arm's k(false) never runs —
-/// only the b1=true branch's inner enumeration completes. Closed
-/// form: 1+2 = 3 (outcomes (b1=t,b2=t) + (b1=t,b2=f); b1=f branch
-/// dropped). The literal Cartesian-product 4-outcome pair generator
-/// is deferred per `[DEVIATION Stage 6.7 multi-shot composition]`.
+/// Plan B' Stage 6.7 + multi-shot composition fix —
+/// `examples/choose.sigil` exercises the literal two-flip pair
+/// generator: 2-flip helper (B.2 chained-let-yield) + multi-shot
+/// 2-resume arm (B.1 N-let chain) + runtime outer post_arm_k stack
+/// (composition fix). Helper enumerates all 2² = 4 outcomes; arm
+/// sums them.
 ///
-/// Pre-Stage-6.7 the example used a 1-flip helper + 2-resume arm,
-/// producing the SAME output (3) via a different code path. Stage
-/// 6.7 upgrades the helper body to chained-let-yield (B.2 coverage)
-/// while keeping output 3 because v1's multi-shot composition limit
-/// drops the b1=f enumeration.
+/// Closed form: outer-arm-tail = inner-tail(b1=t) + inner-tail(b1=f)
+/// = (1+2) + (3+4) = 3 + 7 = 10.
 ///
-/// Invariant: stdout = "3\n", stderr = "", exit 0.
+/// Invariant: stdout = "10\n", stderr = "", exit 0.
 #[test]
-fn choose_example_two_flip_partial_enumeration_returns_3() {
+fn choose_example_pair_generator_returns_10() {
     let root = workspace_root();
     let source = root.join("examples/choose.sigil");
     let (stdout, stderr, code) = compile_file_and_run(&source, "choose_example");
     assert_eq!(code, 0, "choose exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "3\n",
-        "choose stdout mismatch (expected partial enumeration b1=t branch \
-         sum 1+2 = 3 per v1 multi-shot composition limit); stderr={stderr:?}"
+        stdout, "10\n",
+        "choose stdout mismatch (expected pair-generator sum 1+2+3+4 = 10); \
+         stderr={stderr:?}"
     );
     assert_eq!(
         stderr, "",

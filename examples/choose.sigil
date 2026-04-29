@@ -1,13 +1,11 @@
 // examples/choose.sigil
 //
-// Plan B' Stage 6.7 Task 101 — natural shape: 2-flip helper +
-// multi-shot 2-resume arm. Helper performs `Choose.flip()` TWICE
-// (B.2 chained-let-yield); the multi-shot arm invokes k twice with
-// `true`/`false` for the **second** flip. The combination
-// produces a partial enumeration of the 2×2 = 4 outcome space —
-// see "v1 multi-shot composition limitation" below.
+// Plan B' Stage 6.7 + multi-shot composition fix — natural shape:
+// literal two-flip pair generator. Helper performs `Choose.flip()`
+// TWICE (B.2 chained-let-yield); multi-shot 2-resume arm enumerates
+// all 2² = 4 outcomes via the runtime's outer post_arm_k stack.
 //
-// **What this exercises** (post-Stage-6.7):
+// **What this exercises** (post-Stage-6.7 + composition fix):
 //
 // - **Helper with chained-let-yield body (B.2)**: `outcome()`
 //   performs Choose.flip twice; the helper synth-cont chain
@@ -15,45 +13,28 @@
 //   across 2 chain steps (Middle: post-flip-1 → Final: post-flip-2).
 //
 // - **Multi-shot arm with N=2 chain (B.1)**: arm body invokes `k`
-//   twice. Under v1's single-trampoline semantics, only the
-//   INNERMOST arm's chain runs to Done; the OUTER arm's chain
-//   never dispatches (its post_arm_k pair was passed forward but
-//   helper Middle drops it during the inter-perform sigil_perform
-//   call — see deviation entry).
+//   twice with `true`/`false` for the FIRST flip; helper drives the
+//   2nd flip recursively under each branch, dispatching the nested
+//   arm with both branches again. Total: 4 leaf outcomes.
 //
-// **v1 multi-shot composition limitation**. With 2-flip helper +
-// 2-resume outer arm:
-//   - Outer arm dispatches for flip 1.
-//   - Outer arm's k(true) drives helper Middle (binds b1=true);
-//     helper Middle issues sigil_perform for flip 2 with k =
-//     (step_1_helper_closure, &step_1_helper_func). Crucially,
-//     helper Middle does NOT route through post_arm_k_outer —
-//     post_arm_k_outer is loaded into step_0_helper's args_ptr
-//     [1..3] but step_0_helper Middle ignores it (Middle steps
-//     don't dispatch to post_arm_k; only Final steps do).
-//   - flip 2 dispatches a fresh inner arm (same arm fn, new k pair
-//     pointing at helper Final).
-//   - Inner arm's k(true)/k(false) drive helper Final twice (b2=t/f
-//     under b1=t); helper Final dispatches each result through
-//     post_arm_k_inner = inner-arm's chain.
-//   - Inner arm chain: r1'=1 (b1=t,b2=t outcome), r2'=2 (b1=t,b2=f
-//     outcome), tail=r1'+r2'=3, Done(3).
-//   - Trampoline observes Done; returns 3 to the wrapper.
-//   - Outer arm's r2 = k(false) NEVER runs (would have enumerated
-//     the b1=false branch).
+// - **Outer post_arm_k stack (composition fix)**: helper Middle
+//   pushes the outer arm's post_arm_k pair onto a thread-local
+//   stack before `sigil_perform`-ing the next flip. When the inner
+//   chain's Final returns Done, the trampoline pops the stack and
+//   routes Done's value through the outer arm's chain step. This
+//   is what lets the OUTER arm's k(false) actually execute after
+//   k(true) returns the inner sum.
 //
-// **Closed form (partial enumeration)**: 1 + 2 = 3. Only the b1=t
-// branch's b2 enumeration runs. The b1=f branch (outcomes 3, 4) is
-// dropped by the v1 trampoline's Done-terminates discipline.
+// **Closed form**. helper's tail encodes (b1, b2) as 2-bit pair:
 //
-// The literal Cartesian-product 4-outcome pair generator (sum
-// 1+2+3+4 = 10) is documented as deferred in
-// `[DEVIATION Stage 6.7 multi-shot composition]` of
-// `PLAN_B_PRIME_DEVIATIONS.md` — that semantics requires a
-// continuation-marks or trampoline-resume mechanism beyond
-// Stage 6.7's scope.
+//   (t,t) → 1   (t,f) → 2   (f,t) → 3   (f,f) → 4
 //
-// Invariant: stdout reads `3\n` and the program exits 0.
+// Outer arm: r1 = k(true) drives helper with b1=t; nested arm
+// enumerates b2 → returns 1+2 = 3. Outer arm: r2 = k(false) drives
+// helper with b1=f; nested arm enumerates b2 → returns 3+4 = 7.
+// Outer tail: r1 + r2 = 3 + 7 = 10.
+//
+// Invariant: stdout reads `10\n` and the program exits 0.
 
 effect Choose resumes: many { flip: () -> Bool }
 
