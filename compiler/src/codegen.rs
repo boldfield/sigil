@@ -242,15 +242,19 @@ fn compute_user_fn_abi(
     {
         return UserFnAbi::Cps;
     }
-    // Let-yield-then-pure-tail shape — captures-bearing slice
-    // (this commit). Lifts the prior arity-0 restriction: helpers
-    // with user params referenced in the tail are now CPS-eligible
-    // because the synth-cont can capture them via closure record.
-    // The pre-pass populates `CpsContinuationKind::LetBindThenTail
-    // .captures` via `collect_synth_cont_captures`; helper's body
-    // emit allocates the closure record at the perform site and
-    // passes its pointer as `k_closure`.
-    if is_simple_let_yield_then_pure_tail_body(body) {
+    // Plan B' Stage 6.7 (B.2 Phase B+C activation): chained let-
+    // yield-then-pure-tail shape — N >= 1 sequential `let x_i =
+    // perform p_i` stmts terminated by a pure tail. The pre-pass
+    // allocates N `ChainedLetBindStep` synth-cont entries; helper's
+    // body emit issues `sigil_perform(p_0, k_fn = step_0.func_id)`
+    // and each step's synth-cont threads (captures + prior chain
+    // bindings) forward to the next step's closure record. The
+    // chained classifier accepts the original 1-stmt case (so this
+    // is strictly broader than the prior `is_simple_let_yield_then
+    // _pure_tail_body` it replaces — every 1-stmt accept is also
+    // accepted by `is_simple_chained_let_yield_then_pure_tail_body`
+    // returning Some(1)).
+    if is_simple_chained_let_yield_then_pure_tail_body(body).is_some() {
         return UserFnAbi::Cps;
     }
     UserFnAbi::Sync
@@ -1940,6 +1944,19 @@ enum CpsContinuationKind {
     /// the perform site and passes its pointer as `k_closure` to
     /// `sigil_perform`. When `captures` is empty, the parent
     /// passes null `k_closure` (no allocation).
+    ///
+    /// **Plan B' Stage 6.7 Tasks 94+95:** the pre-pass now routes
+    /// 1-stmt let-yield bodies through [`Self::ChainedLetBindStep`]
+    /// (with `chain_length = 1`) instead. This variant + its
+    /// supporting `LetBindThenTail` emit pass + its companion
+    /// classifier `is_simple_let_yield_then_pure_tail_body` +
+    /// captures helper `collect_synth_cont_captures` are now
+    /// structurally dead in the production path, marked
+    /// `#[allow(dead_code)]` so the compile stays clean while unit
+    /// tests still exercise them. Phase D (next commit) removes
+    /// the variant + emit pass + classifier + captures helper +
+    /// dead unit tests in one sweep.
+    #[allow(dead_code)]
     LetBindThenTail {
         /// Source-level name of the let-binding (the name `args_ptr
         /// [0]` is bound to in the synth-cont's env).
@@ -2014,19 +2031,11 @@ enum CpsContinuationKind {
     /// `LetBindThenTail` variant retires alongside its classifier
     /// (Phase D, landing in the same combined commit).
     ///
-    /// **Transitional `#[allow(dead_code)]`:** the variant + the new
-    /// supporting types (`ChainStepRole`, `ChainedPriorBinding`) are
-    /// dead-code-allowed during Task 94+95's incremental refactor.
-    /// The pivot from Phase A's whole-chain shape to this per-step
-    /// shape lands first; the pre-pass + helper body emit +
-    /// synth-cont definition pass updates arrive in the next commit
-    /// within Task 94+95. Once active, the allows go.
-    #[allow(dead_code)]
+    /// Plan B' Stage 6.7 Tasks 94+95 (Phase B+C activation): pre-
+    /// pass + helper body emit + synth-cont definition pass all
+    /// consume this variant. Phase A's `#[allow(dead_code)]`
+    /// transitional marker is dropped here.
     ChainedLetBindStep {
-        /// Index of this step in the chain (0..N-1).
-        step_idx: usize,
-        /// Total chain length N. step_idx < chain_length.
-        chain_length: usize,
         /// Source-level name of the let-binding bound at this step's
         /// entry from `args_ptr[0]`.
         binding_name: String,
@@ -2035,15 +2044,22 @@ enum CpsContinuationKind {
         /// type for binding (mirrors `LetBindThenTail`'s
         /// narrow-on-load discipline).
         binding_ty: Type,
+        /// `EnvSlotKind` for the let-binding's slot — drives the
+        /// pointer-bitmap derivation in Middle steps when this
+        /// binding is appended to the next step's closure record.
+        /// (Final steps don't read this; the tail-dispatch path
+        /// widens the tail value to I64 unconditionally and writes
+        /// it to args_buf[0] without slot encoding.)
+        binding_kind: EnvSlotKind,
         /// Captures of the helper's user params referenced anywhere
         /// in the chain (constant across all steps; loaded from
         /// `closure_ptr` at offsets 16+8*i for i in 0..captures.len()).
         captures: Vec<SynthContCapture>,
-        /// Prior chain bindings step_0..step_{step_idx-1} threaded
-        /// forward via this step's closure record. Empty for step_0;
-        /// grows by 1 entry per step. Loaded from `closure_ptr` at
-        /// offsets 16+8*(captures.len()+j) for j in
-        /// 0..prior_bindings.len().
+        /// Prior chain bindings, in order, threaded forward via this
+        /// step's closure record. Empty for step_0; grows by 1 entry
+        /// per step (so step_i carries the bindings introduced at
+        /// steps 0..i-1). Loaded from `closure_ptr` at offsets
+        /// 16+8*(captures.len()+j) for j in 0..prior_bindings.len().
         prior_bindings: Vec<ChainedPriorBinding>,
         /// What this step does after binding + loading. `Middle`
         /// issues the next perform; `Final` lowers the tail.
@@ -2054,25 +2070,24 @@ enum CpsContinuationKind {
 /// Plan B' Stage 6.7 (B.2) — what a [`CpsContinuationKind::ChainedLetBindStep`]
 /// does after binding `args_ptr[0]` and loading captures + prior
 /// bindings.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 enum ChainStepRole {
-    /// Middle step (step_idx < chain_length - 1): lower the next
-    /// perform's args via Lowerer (env has prior bindings +
-    /// captures), allocate step_{step_idx+1}'s closure record
+    /// Middle step (i.e., not the last step in the chain): lower
+    /// the next perform's args via Lowerer (env has prior bindings
+    /// alongside captures), allocate the next step's closure record
     /// (extending prior_bindings with this step's binding), call
     /// `sigil_perform` with `k_fn = next_step_func_id`, return the
     /// resulting NextStep up to the trampoline.
     Middle {
-        /// The perform expression at chain position step_idx+1
-        /// (i.e., the next perform after this step).
+        /// The perform expression at the next chain position (i.e.,
+        /// the perform that follows this step's let-binding).
         next_perform: crate::ast::PerformExpr,
-        /// FuncId of the next step's synth fn (the `synth_cont_step
-        /// _{step_idx+1}` whose ChainedLetBindStep entry has step_idx
-        /// = this.step_idx + 1).
+        /// FuncId of the next step's synth fn — used as the `k_fn`
+        /// passed to `sigil_perform` so the resumed arm's `k(value)`
+        /// dispatches into the next step's synth-cont.
         next_step_func_id: cranelift_module::FuncId,
     },
-    /// Final step (step_idx == chain_length - 1): lower `tail_expr`
+    /// Final step (the last step in the chain): lower `tail_expr`
     /// via Lowerer (env has all chain bindings + captures), widen
     /// result to I64, return `Done(value)`.
     Final {
@@ -2088,17 +2103,17 @@ enum ChainStepRole {
 
 /// Plan B' Stage 6.7 (B.2) — one prior chain binding threaded forward
 /// via a `ChainedLetBindStep`'s closure record. Step i carries
-/// step_0..step_{i-1}'s bindings; each entry holds the name +
-/// Cranelift type + slot kind (for closure-record load + narrow +
-/// pointer-bitmap derivation).
-#[allow(dead_code)]
+/// step_0..step_{i-1}'s bindings; each entry holds the name + slot
+/// kind (for closure-record load + narrow + pointer-bitmap
+/// derivation). The Cranelift `Type` is derived from `kind` at use
+/// site via `narrow_for_kind` — the slot kind is the canonical
+/// source of truth for both the load-widening shape and the
+/// pointer-bitmap encoding.
 #[derive(Clone, Debug)]
 struct ChainedPriorBinding {
     /// Source-level name of the binding (matches the corresponding
     /// `ChainedLetBindStep::binding_name` from a prior step).
     name: String,
-    /// Cranelift type the binding takes after narrow-on-load.
-    ty: Type,
     /// `EnvSlotKind` for the closure-record encoding. Drives the
     /// closure-record header bitmap (pointer slots are GC-tracked,
     /// non-pointer slots are not) and the per-slot load/store
@@ -2161,6 +2176,12 @@ fn slot_kind_for_type_expr_post_mono(te: &crate::ast::TypeExpr) -> EnvSlotKind {
 /// order matters because the closure record's slots are positional
 /// — `captures[i]` is at `closure_ptr + 16 + 8*i` and the synth-cont
 /// reads them in this same order.
+///
+/// **Plan B' Stage 6.7 Tasks 94+95:** structurally dead in the
+/// production path (replaced by [`collect_chained_synth_cont_captures`])
+/// but retained as `#[allow(dead_code)]` for transitional unit-test
+/// coverage. Phase D removes it.
+#[allow(dead_code)]
 fn collect_synth_cont_captures(
     tail_expr: &crate::ast::Expr,
     let_binding_name: &str,
@@ -2169,6 +2190,53 @@ fn collect_synth_cont_captures(
     let mut bound: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     bound.insert(let_binding_name.to_string());
     let mut out: Vec<SynthContCapture> = Vec::new();
+    walk_collect_captures(tail_expr, &mut bound, helper_params, &mut out);
+    out
+}
+
+/// Plan B' Stage 6.7 (B.2 Phase B/C) — collect helper-user-param
+/// captures for a chained-let-yield-then-pure-tail synth-cont chain.
+///
+/// Generalizes [`collect_synth_cont_captures`] from a single let-
+/// binding name + tail to N let-binding names + N performs + tail.
+/// All chain bindings (step_0..step_{N-1}) are pre-bound in the
+/// initial `bound` set so that any reference to a chain binding
+/// inside a perform's args or the tail is *not* captured (it's
+/// synth-cont-internal, threaded forward via the closure record's
+/// prior-bindings slots). Any reference to a helper user param IS
+/// captured.
+///
+/// The walk visits each `performs[i]`'s args in source order, then
+/// `tail_expr`. The same `out` Vec accumulates captures across all
+/// visits, deduplicating by name (per [`walk_collect_captures`]'s
+/// existing dedup discipline). Returned in source-encounter order
+/// — closure record slot positions follow this order.
+///
+/// **Why all chain bindings pre-bound, not just bindings visible at
+/// each position:** the walker doesn't track which step it's
+/// currently inside. Treating all chain bindings as bound is safe
+/// because typecheck rejects forward-references (step_i's perform
+/// args can't reference step_{i+1}'s binding — it doesn't exist
+/// yet). So any reference to a chain-binding name in source is
+/// either valid (referring to a prior binding) or a typecheck
+/// error (caught earlier); either way, the walker doesn't capture
+/// it.
+fn collect_chained_synth_cont_captures(
+    performs: &[crate::ast::PerformExpr],
+    tail_expr: &crate::ast::Expr,
+    binding_names: &[String],
+    helper_params: &[crate::ast::Param],
+) -> Vec<SynthContCapture> {
+    let mut bound: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for n in binding_names {
+        bound.insert(n.clone());
+    }
+    let mut out: Vec<SynthContCapture> = Vec::new();
+    for p in performs {
+        for arg in &p.args {
+            walk_collect_captures(arg, &mut bound, helper_params, &mut out);
+        }
+    }
     walk_collect_captures(tail_expr, &mut bound, helper_params, &mut out);
     out
 }
@@ -4341,68 +4409,40 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 },
             );
 
-            // Plan B Task 55, Phase 4e — if the fn matches a
-            // synth-cont-eligible body shape, allocate a synthetic
-            // continuation closure FuncId. The synth-cont body is
-            // emitted at the bottom of `emit_object` (mirrors the
-            // `HandlerArmSynth` definition pass pattern).
+            // Plan B Task 55 (Phase 4e) + Plan B' Stage 6.7 Tasks
+            // 94+95 (B.2 Phase B+C) — if the fn matches a synth-
+            // cont-eligible body shape, allocate one or more
+            // synthetic continuation closure FuncIds. The synth-
+            // cont bodies are emitted at the bottom of `emit_object`
+            // (mirrors the `HandlerArmSynth` definition pass pattern).
             //
             // Two shapes at this commit:
             //   - `is_simple_yield_then_constant_tail_body` →
-            //     `CpsContinuationKind::ConstantDone`.
-            //   - `is_simple_let_yield_then_pure_tail_body` →
-            //     `CpsContinuationKind::LetBindThenTail`.
+            //     `CpsContinuationKind::ConstantDone` (single entry).
+            //   - `is_simple_chained_let_yield_then_pure_tail_body`
+            //     returning `Some(N)` → N `CpsContinuationKind::
+            //     ChainedLetBindStep` entries (one per chain step;
+            //     accepts N >= 1, generalizing the prior 1-stmt
+            //     `LetBindThenTail` shape).
+            //
+            // The `cps_continuation_synth_indices` map points at
+            // step_0's index; helper body emit reads step_0's
+            // captures to allocate the perform-time closure record.
+            // Each Middle step's `next_step_func_id` references the
+            // following step's FuncId — so allocation happens in
+            // two passes (declare all N FuncIds first, then build N
+            // entries with cross-references populated).
             if abi == UserFnAbi::Cps {
-                let kind: Option<CpsContinuationKind> =
-                    if is_simple_yield_then_constant_tail_body(&f.body) {
-                        let constant_value = match &f.body.tail {
-                            Some(crate::ast::Expr::IntLit(n, _)) => *n,
-                            _ => unreachable!(
-                                "is_simple_yield_then_constant_tail_body classifier \
-                                 guarantees tail is IntLit"
-                            ),
-                        };
-                        Some(CpsContinuationKind::ConstantDone { constant_value })
-                    } else if is_simple_let_yield_then_pure_tail_body(&f.body) {
-                        let let_stmt = match &f.body.stmts[0] {
-                            crate::ast::Stmt::Let(l) => l.clone(),
-                            _ => unreachable!(
-                                "is_simple_let_yield_then_pure_tail_body classifier \
-                                 guarantees stmts[0] is Stmt::Let"
-                            ),
-                        };
-                        let tail_expr = match &f.body.tail {
-                            Some(t) => t.clone(),
-                            None => unreachable!(
-                                "is_simple_let_yield_then_pure_tail_body classifier \
-                                 guarantees tail is Some"
-                            ),
-                        };
-                        let binding_ty = cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty);
-                        let tail_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
-                        // Captures-bearing slice (this commit):
-                        // free-var analysis on the tail to find
-                        // helper user params referenced. Empty for
-                        // arity-0 helpers OR for tails that don't
-                        // reference helper's params.
-                        let captures =
-                            collect_synth_cont_captures(&tail_expr, &let_stmt.name, &f.params);
-                        Some(CpsContinuationKind::LetBindThenTail {
-                            binding_name: let_stmt.name,
-                            binding_ty,
-                            tail_expr: Box::new(tail_expr),
-                            tail_ty,
-                            captures,
-                        })
-                    } else {
-                        None
+                if is_simple_yield_then_constant_tail_body(&f.body) {
+                    let constant_value = match &f.body.tail {
+                        Some(crate::ast::Expr::IntLit(n, _)) => *n,
+                        _ => unreachable!(
+                            "is_simple_yield_then_constant_tail_body classifier \
+                             guarantees tail is IntLit"
+                        ),
                     };
-
-                if let Some(kind) = kind {
+                    let kind = CpsContinuationKind::ConstantDone { constant_value };
                     let synth_cont_sig = cps_signature(pointer_ty, &module);
-                    // Global-index-based name avoids collisions with
-                    // user fns containing `$` (synthetic lambda fns).
-                    // Mirrors `sigil_handler_arm_{N}` from Phase 3b.
                     let synth_cont_idx = cps_continuation_synth.len();
                     let synth_cont_name = format!("sigil_post_yield_cont_{synth_cont_idx}");
                     let synth_cont_func_id = module
@@ -4414,6 +4454,119 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         kind,
                     });
                     cps_continuation_synth_indices.insert(f.name.clone(), synth_cont_idx);
+                } else if let Some(chain_length) =
+                    is_simple_chained_let_yield_then_pure_tail_body(&f.body)
+                {
+                    // Extract per-step let-binding info (name +
+                    // declared type + slot kind) and the perform.
+                    // Classifier guarantees every stmt is a
+                    // `Stmt::Let` whose value is `Expr::Perform`;
+                    // unreachable!() guards mirror the
+                    // ConstantDone branch above.
+                    let mut performs: Vec<crate::ast::PerformExpr> =
+                        Vec::with_capacity(chain_length);
+                    let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
+                    let mut binding_tys: Vec<Type> = Vec::with_capacity(chain_length);
+                    let mut binding_kinds: Vec<EnvSlotKind> = Vec::with_capacity(chain_length);
+                    for stmt in &f.body.stmts {
+                        let let_stmt = match stmt {
+                            crate::ast::Stmt::Let(l) => l,
+                            _ => unreachable!(
+                                "is_simple_chained_let_yield_then_pure_tail_body \
+                                 classifier guarantees every stmt is Stmt::Let"
+                            ),
+                        };
+                        let perform = match &let_stmt.value {
+                            crate::ast::Expr::Perform(p) => p.clone(),
+                            _ => unreachable!(
+                                "is_simple_chained_let_yield_then_pure_tail_body \
+                                 classifier guarantees Let value is Expr::Perform"
+                            ),
+                        };
+                        performs.push(perform);
+                        binding_names.push(let_stmt.name.clone());
+                        binding_tys.push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
+                        binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                    }
+                    let tail_expr = match &f.body.tail {
+                        Some(t) => t.clone(),
+                        None => unreachable!(
+                            "is_simple_chained_let_yield_then_pure_tail_body \
+                             classifier guarantees tail is Some"
+                        ),
+                    };
+                    let tail_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+
+                    // Free-var analysis across all perform args + tail:
+                    // helper user params referenced anywhere in the
+                    // chain. Each step's closure record carries this
+                    // captures vec (constant across all steps) plus
+                    // its own prior_bindings (step_0..step_{i-1}).
+                    let captures = collect_chained_synth_cont_captures(
+                        &performs,
+                        &tail_expr,
+                        &binding_names,
+                        &f.params,
+                    );
+
+                    // Pass 1: declare all N FuncIds. Each step's
+                    // synth-cont uses the uniform CPS calling
+                    // convention `(closure_ptr, args_ptr, args_len)
+                    // -> *mut NextStep`. Names follow the global-
+                    // index pattern to avoid collisions with user
+                    // fns or other synth-conts.
+                    let synth_cont_sig = cps_signature(pointer_ty, &module);
+                    let starting_idx = cps_continuation_synth.len();
+                    let mut step_func_ids: Vec<cranelift_module::FuncId> =
+                        Vec::with_capacity(chain_length);
+                    for step in 0..chain_length {
+                        let global_idx = starting_idx + step;
+                        let synth_cont_name = format!("sigil_post_yield_cont_{global_idx}");
+                        let synth_cont_func_id = module
+                            .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
+                            .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
+                        step_func_ids.push(synth_cont_func_id);
+                    }
+
+                    // Pass 2: build N CpsContinuationSynth entries.
+                    // step_idx 0..N-2 → Middle; step_idx == N-1 →
+                    // Final. prior_bindings for step i is the slice
+                    // binding_{0..i} (so step_0's prior_bindings is
+                    // empty; step_{N-1}'s is binding_{0..N-1}).
+                    for step in 0..chain_length {
+                        let prior_bindings: Vec<ChainedPriorBinding> = (0..step)
+                            .map(|j| ChainedPriorBinding {
+                                name: binding_names[j].clone(),
+                                kind: binding_kinds[j],
+                            })
+                            .collect();
+                        let role = if step + 1 < chain_length {
+                            ChainStepRole::Middle {
+                                next_perform: performs[step + 1].clone(),
+                                next_step_func_id: step_func_ids[step + 1],
+                            }
+                        } else {
+                            ChainStepRole::Final {
+                                tail_expr: Box::new(tail_expr.clone()),
+                                tail_ty,
+                            }
+                        };
+                        cps_continuation_synth.push(CpsContinuationSynth {
+                            func_id: step_func_ids[step],
+                            parent_fn_name: f.name.clone(),
+                            kind: CpsContinuationKind::ChainedLetBindStep {
+                                binding_name: binding_names[step].clone(),
+                                binding_ty: binding_tys[step],
+                                binding_kind: binding_kinds[step],
+                                captures: captures.clone(),
+                                prior_bindings,
+                                role,
+                            },
+                        });
+                    }
+                    // Map points at step_0; helper body emit reads
+                    // step_0's captures + first perform's k_fn.
+                    cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
                 }
             }
         }
@@ -4798,18 +4951,31 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             module.declare_func_in_func(synth_cont_func_id, builder.func);
                         let synth_cont_addr = builder.ins().func_addr(pointer_ty, synth_cont_ref);
 
-                        // Captures-bearing slice: if the synth-cont's
-                        // kind is LetBindThenTail with non-empty
-                        // captures, alloc a closure record holding
-                        // the captured user-param values from
-                        // helper's env. Otherwise pass null
-                        // k_closure (synth-cont has no captures,
-                        // mirroring `alloc_arm_closure_record`'s
+                        // Captures-bearing slice: if step_0's synth-
+                        // cont kind has non-empty captures, alloc a
+                        // closure record holding the captured user-
+                        // param values from helper's env. Otherwise
+                        // pass null k_closure (synth-cont has no
+                        // captures, mirroring `alloc_arm_closure_record`'s
                         // null-for-empty convention).
+                        //
+                        // Plan B' Stage 6.7: the chained variant
+                        // shares the same captures-bearing path —
+                        // step_0's `captures` Vec carries chain-wide
+                        // helper-param refs (from any perform's args
+                        // or the tail). Each step's closure record
+                        // appends prior_bindings *after* captures;
+                        // the helper-side closure record at this
+                        // first perform writes only `captures` (no
+                        // prior bindings yet — step_0 is first in
+                        // the chain).
                         let synth_cont_idx = cps_continuation_synth_indices[&f.name];
                         let captures: Vec<SynthContCapture> =
                             match &cps_continuation_synth[synth_cont_idx].kind {
                                 CpsContinuationKind::LetBindThenTail { captures, .. } => {
+                                    captures.clone()
+                                }
+                                CpsContinuationKind::ChainedLetBindStep { captures, .. } => {
                                     captures.clone()
                                 }
                                 _ => Vec::new(),
@@ -7163,20 +7329,439 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         lowerer.builder.ins().return_(&[next_step]);
                         lowerer.builder.finalize();
                     }
-                    CpsContinuationKind::ChainedLetBindStep { .. } => {
-                        // Plan B' Stage 6.7 Tasks 94+95 (B.2 Phase B+C)
-                        // implementation lands below this match (the
-                        // emit code currently reaches here from the
-                        // pre-pass). For the duration of the partial
-                        // refactor between Phase A's variant rename
-                        // and Phase B+C's full emit-pass implementation,
-                        // unreachable!() guards against pre-pass
-                        // creating an entry whose emit isn't wired yet.
-                        unreachable!(
-                            "codegen: ChainedLetBindStep synth-cont reached emit \
-                             pass before Phase B+C wired the chain emit code for fn `{}`",
-                            synth.parent_fn_name
-                        );
+                    CpsContinuationKind::ChainedLetBindStep {
+                        binding_name,
+                        binding_ty,
+                        binding_kind,
+                        captures,
+                        prior_bindings,
+                        role,
+                    } => {
+                        // Plan B' Stage 6.7 Tasks 94+95 (B.2 Phase B+C):
+                        // chained let-yield-then-pure-tail synth-cont.
+                        // Each step's incoming `args_ptr` carries the
+                        // 3-slot trailing-pair shape `[arg, post_arm_k_
+                        // closure, post_arm_k_fn]` (per the Slice A
+                        // convention); each step's incoming `closure_-
+                        // ptr` carries `captures + prior_bindings`
+                        // packed at offsets 16+8*i (captures first,
+                        // prior_bindings second).
+                        //
+                        // Final step (step_idx == chain_length - 1):
+                        // bind `args_ptr[0]` → binding_name, load
+                        // captures + prior_bindings into env, lower
+                        // tail_expr via Lowerer, dispatch via post_arm
+                        // _k (mirrors `LetBindThenTail`'s tail-emit).
+                        //
+                        // Middle step (step_idx < chain_length - 1):
+                        // bind args_ptr[0] → binding_name, load captures
+                        // + prior_bindings, allocate next-step closure
+                        // record holding `captures + prior_bindings +
+                        // this binding`, lower next_perform's args via
+                        // Lowerer (env has all bindings + captures
+                        // available), `sigil_perform(next_perform, ...,
+                        // k_closure=next_closure_record, k_fn=
+                        // next_step_func_addr)`, return the resulting
+                        // NextStep up to the trampoline. Middle steps
+                        // intentionally **ignore** their incoming
+                        // post_arm_k_*; the chain's terminal dispatch
+                        // happens through the Final step's args_ptr
+                        // post_arm_k pair (which for tail-`k` arms is
+                        // `(null, identity)` — the chain terminates
+                        // with `Done(tail_value)`, identical to
+                        // `LetBindThenTail`'s tail-`k` flow).
+                        let args_ptr = block_params[1];
+                        let synth_closure_ptr = block_params[0];
+
+                        // Bind args_ptr[0] under binding_name.
+                        let widened_arg =
+                            builder
+                                .ins()
+                                .load(types::I64, MemFlags::trusted(), args_ptr, 0);
+                        let bound_value = if *binding_ty == types::I64 {
+                            widened_arg
+                        } else if binding_ty.is_int() && binding_ty.bits() < 64 {
+                            builder.ins().ireduce(*binding_ty, widened_arg)
+                        } else {
+                            assert_eq!(
+                                *binding_ty, pointer_ty,
+                                "codegen Plan B' Stage 6.7: unexpected ChainedLetBindStep \
+                                 binding type {binding_ty:?} for fn `{}`",
+                                synth.parent_fn_name
+                            );
+                            widened_arg
+                        };
+
+                        let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                        env.insert(binding_name.clone(), bound_value);
+
+                        // Helper: narrow an I64-loaded slot to the
+                        // user-visible Cranelift type per `EnvSlotKind`.
+                        // Mirrors the existing capture-load sequence in
+                        // `LetBindThenTail`'s emit and the closure-env
+                        // load discipline shared with user-lambda
+                        // closures.
+                        let narrow_for_kind = |builder: &mut FunctionBuilder<'_>,
+                                               raw: Value,
+                                               kind: EnvSlotKind|
+                         -> Value {
+                            match kind {
+                                EnvSlotKind::Int => raw,
+                                EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
+                                    builder.ins().ireduce(types::I8, raw)
+                                }
+                                EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
+                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
+                                    if pointer_ty == types::I64 {
+                                        raw
+                                    } else {
+                                        builder.ins().ireduce(pointer_ty, raw)
+                                    }
+                                }
+                            }
+                        };
+
+                        // Load captures from synth-cont's closure_ptr
+                        // at offsets 16 + 8*i for i in 0..captures.len().
+                        for (i, capture) in captures.iter().enumerate() {
+                            let offset: i32 = 16 + 8 * i as i32;
+                            let raw = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                synth_closure_ptr,
+                                offset,
+                            );
+                            let val = narrow_for_kind(&mut builder, raw, capture.kind);
+                            env.insert(capture.name.clone(), val);
+                        }
+
+                        // Load prior_bindings from synth-cont's closure
+                        // _ptr at offsets 16 + 8*(captures.len()+j).
+                        for (j, prior) in prior_bindings.iter().enumerate() {
+                            let offset: i32 = 16 + 8 * (captures.len() + j) as i32;
+                            let raw = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                synth_closure_ptr,
+                                offset,
+                            );
+                            let val = narrow_for_kind(&mut builder, raw, prior.kind);
+                            env.insert(prior.name.clone(), val);
+                        }
+
+                        let PerFnRefs {
+                            string_new_ref,
+                            alloc_ref,
+                            int_to_string_ref,
+                            handler_frame_new_ref,
+                            handle_push_ref,
+                            handle_pop_ref,
+                            handler_frame_set_arm_ref,
+                            handler_frame_set_return_ref,
+                            perform_ref,
+                            run_loop_ref,
+                            next_step_done_ref: _,
+                            next_step_call_ref,
+                            next_step_args_ptr_ref,
+                            continuation_identity_ref,
+                            handler_arm_refs_per_handle,
+                            handler_return_arm_refs_per_handle,
+                            user_fn_refs,
+                            lit_gvs,
+                        } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
+
+                        let closure_ptr = block_params[0];
+                        let mut lowerer = Lowerer {
+                            builder,
+                            stackmap: &mut stackmap,
+                            env,
+                            pointer_ty,
+                            closure_ptr,
+                            lit_gvs,
+                            string_new_ref,
+                            alloc_ref,
+                            int_to_string_ref,
+                            handler_frame_new_ref,
+                            handle_push_ref,
+                            handle_pop_ref,
+                            handler_frame_set_arm_ref,
+                            handler_frame_set_return_ref,
+                            perform_ref,
+                            run_loop_ref,
+                            next_step_call_ref,
+                            next_step_args_ptr_ref,
+                            handler_arm_refs_per_handle,
+                            handler_arm_synth: &handler_arm_synth,
+                            handler_arm_indices: &handler_arm_indices,
+                            handler_return_arm_refs_per_handle,
+                            handler_return_arm_synth: &handler_return_arm_synth,
+                            handler_return_arm_indices: &handler_return_arm_indices,
+                            continuation_identity_ref,
+                            effect_ids: &checked.effect_ids,
+                            op_ids: &checked.op_ids,
+                            effects: &checked.effects,
+                            user_fn_refs,
+                            user_fns: &user_fns,
+                            type_layouts: &type_layouts,
+                            ctor_index: &ctor_index,
+                            match_scrut_tys: &checked.match_scrut_tys,
+                        };
+
+                        match role {
+                            ChainStepRole::Final { tail_expr, tail_ty } => {
+                                let tail_value = lowerer.lower_expr(tail_expr.as_ref());
+                                let widened_tail = if *tail_ty == types::I64 {
+                                    tail_value
+                                } else if tail_ty.is_int() && tail_ty.bits() < 64 {
+                                    lowerer.builder.ins().uextend(types::I64, tail_value)
+                                } else {
+                                    assert_eq!(
+                                        *tail_ty, pointer_ty,
+                                        "codegen Plan B' Stage 6.7: unexpected \
+                                         ChainedLetBindStep Final tail type {tail_ty:?} \
+                                         for fn `{}`",
+                                        synth.parent_fn_name
+                                    );
+                                    tail_value
+                                };
+                                let next_step = emit_dispatch_to_post_arm_k(
+                                    &mut lowerer.builder,
+                                    lowerer.stackmap,
+                                    widened_tail,
+                                );
+                                lowerer.builder.ins().return_(&[next_step]);
+                                lowerer.builder.finalize();
+                            }
+                            ChainStepRole::Middle {
+                                next_perform,
+                                next_step_func_id,
+                            } => {
+                                // Allocate next-step closure record:
+                                // header at +0, null code_ptr at +8,
+                                // captures at +16+8*i, prior_bindings
+                                // at +16+8*(captures.len()+j), this
+                                // step's binding at +16+8*(captures
+                                // .len()+prior_bindings.len()).
+                                let next_slot_count = captures.len() + prior_bindings.len() + 1;
+                                assert!(
+                                    next_slot_count < MAX_CLOSURE_ENV_SLOTS,
+                                    "Plan B' Stage 6.7: chain-step closure env \
+                                     {next_slot_count} >= {MAX_CLOSURE_ENV_SLOTS} \
+                                     exceeds bitmap layout for fn `{}`",
+                                    synth.parent_fn_name
+                                );
+                                let mut bitmap: u32 = 0;
+                                for (i, c) in captures.iter().enumerate() {
+                                    if c.kind.is_pointer() {
+                                        bitmap |= 1u32 << (i + 1);
+                                    }
+                                }
+                                for (j, p) in prior_bindings.iter().enumerate() {
+                                    if p.kind.is_pointer() {
+                                        bitmap |= 1u32 << (captures.len() + j + 1);
+                                    }
+                                }
+                                if binding_kind.is_pointer() {
+                                    bitmap |= 1u32 << (captures.len() + prior_bindings.len() + 1);
+                                }
+                                let count: u8 = 1 + next_slot_count as u8;
+                                let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
+                                let payload_bytes: i64 = 8 + 8 * next_slot_count as i64;
+
+                                let header_v =
+                                    lowerer.builder.ins().iconst(types::I64, header as i64);
+                                let payload_v =
+                                    lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                                let alloc_call = lowerer
+                                    .builder
+                                    .ins()
+                                    .call(lowerer.alloc_ref, &[header_v, payload_v]);
+                                lowerer.stackmap.push_placeholder(function_code_offset(
+                                    &lowerer.builder,
+                                    alloc_call,
+                                ));
+                                let next_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
+
+                                // Null code_ptr at +8.
+                                let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    null_v,
+                                    next_closure_ptr,
+                                    8,
+                                );
+
+                                // Copy captures (raw I64) from this
+                                // step's synth_closure_ptr to
+                                // next_closure_ptr at the same offsets.
+                                for i in 0..captures.len() {
+                                    let offset: i32 = 16 + 8 * i as i32;
+                                    let raw = lowerer.builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        synth_closure_ptr,
+                                        offset,
+                                    );
+                                    lowerer.builder.ins().store(
+                                        MemFlags::trusted(),
+                                        raw,
+                                        next_closure_ptr,
+                                        offset,
+                                    );
+                                }
+                                // Copy prior_bindings (raw I64).
+                                for j in 0..prior_bindings.len() {
+                                    let offset: i32 = 16 + 8 * (captures.len() + j) as i32;
+                                    let raw = lowerer.builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        synth_closure_ptr,
+                                        offset,
+                                    );
+                                    lowerer.builder.ins().store(
+                                        MemFlags::trusted(),
+                                        raw,
+                                        next_closure_ptr,
+                                        offset,
+                                    );
+                                }
+                                // Append this step's binding (already
+                                // widened to I64 at the args_ptr load
+                                // — non-pointer-typed values were
+                                // narrowed to a smaller type for
+                                // binding in env, but the I64 raw
+                                // value is the canonical slot encoding
+                                // matching closure-record + helper-
+                                // body-emit storage discipline).
+                                let this_binding_offset: i32 =
+                                    16 + 8 * (captures.len() + prior_bindings.len()) as i32;
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    widened_arg,
+                                    next_closure_ptr,
+                                    this_binding_offset,
+                                );
+
+                                // Resolve effect_id + op_id for the
+                                // next perform.
+                                let effect_id = match checked.effect_ids.get(&next_perform.effect) {
+                                    Some(id) => *id,
+                                    None => unreachable!(
+                                        "codegen Plan B' Stage 6.7: effect `{}` \
+                                             missing from effect_ids map; typecheck \
+                                             E0042 should have caught this",
+                                        next_perform.effect
+                                    ),
+                                };
+                                let op_id = match checked
+                                    .op_ids
+                                    .get(&(next_perform.effect.clone(), next_perform.op.clone()))
+                                {
+                                    Some(id) => *id,
+                                    None => unreachable!(
+                                        "codegen Plan B' Stage 6.7: op_id missing for \
+                                         `{}.{}`; typecheck E0043 should have caught this",
+                                        next_perform.effect, next_perform.op
+                                    ),
+                                };
+                                let effect_id_v =
+                                    lowerer.builder.ins().iconst(types::I32, effect_id as i64);
+                                let op_id_v =
+                                    lowerer.builder.ins().iconst(types::I32, op_id as i64);
+
+                                // Lower next_perform's args via Lowerer
+                                // (env has captures + prior_bindings +
+                                // this binding). Mirrors helper body
+                                // emit's perform-arg packing.
+                                let (perform_args_ptr, perform_args_len) =
+                                    if next_perform.args.is_empty() {
+                                        (
+                                            lowerer.builder.ins().iconst(pointer_ty, 0),
+                                            lowerer.builder.ins().iconst(types::I32, 0),
+                                        )
+                                    } else {
+                                        let arg_values: Vec<Value> = next_perform
+                                            .args
+                                            .iter()
+                                            .map(|a| lowerer.lower_expr(a))
+                                            .collect();
+                                        let slot_bytes = (next_perform.args.len() * 8) as u32;
+                                        let slot = lowerer.builder.create_sized_stack_slot(
+                                            StackSlotData::new(
+                                                StackSlotKind::ExplicitSlot,
+                                                slot_bytes,
+                                                3,
+                                            ),
+                                        );
+                                        for (i, arg_v) in arg_values.into_iter().enumerate() {
+                                            let arg_ty = lowerer.builder.func.dfg.value_type(arg_v);
+                                            let widened_arg_v = if arg_ty == types::I64 {
+                                                arg_v
+                                            } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                                                lowerer.builder.ins().uextend(types::I64, arg_v)
+                                            } else {
+                                                assert_eq!(
+                                                    arg_ty, pointer_ty,
+                                                    "codegen Plan B' Stage 6.7: \
+                                                     unexpected next-perform arg \
+                                                     type {arg_ty:?} for fn `{}`",
+                                                    synth.parent_fn_name
+                                                );
+                                                arg_v
+                                            };
+                                            lowerer.builder.ins().stack_store(
+                                                widened_arg_v,
+                                                slot,
+                                                (i * 8) as i32,
+                                            );
+                                        }
+                                        (
+                                            lowerer.builder.ins().stack_addr(pointer_ty, slot, 0),
+                                            lowerer
+                                                .builder
+                                                .ins()
+                                                .iconst(types::I32, next_perform.args.len() as i64),
+                                        )
+                                    };
+
+                                // func_addr for the next step's synth-
+                                // cont fn. Used as `k_fn` for the
+                                // perform call so the resumed arm's
+                                // `k(value)` lands in the next step.
+                                let next_step_fn_ref = module
+                                    .declare_func_in_func(*next_step_func_id, lowerer.builder.func);
+                                let next_step_fn_addr = lowerer
+                                    .builder
+                                    .ins()
+                                    .func_addr(pointer_ty, next_step_fn_ref);
+
+                                // sigil_perform call. The trampoline
+                                // dispatches the perform's arm with
+                                // `k = (next_closure_ptr, &next_step
+                                // _synth)`; arm's `k(value)` lands in
+                                // the next step's synth-cont with
+                                // `args_ptr[0] = value` and the
+                                // `next_closure_ptr` it loaded from.
+                                let perform_call = lowerer.builder.ins().call(
+                                    lowerer.perform_ref,
+                                    &[
+                                        effect_id_v,
+                                        op_id_v,
+                                        perform_args_ptr,
+                                        perform_args_len,
+                                        next_closure_ptr,
+                                        next_step_fn_addr,
+                                    ],
+                                );
+                                lowerer.stackmap.push_placeholder(function_code_offset(
+                                    &lowerer.builder,
+                                    perform_call,
+                                ));
+                                let next_step_ns = lowerer.builder.inst_results(perform_call)[0];
+                                lowerer.builder.ins().return_(&[next_step_ns]);
+                                lowerer.builder.finalize();
+                            }
+                        }
                     }
                 }
             }
@@ -10213,6 +10798,13 @@ fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
 /// because the post-arm-k synth fn's closure_ptr is null in
 /// Slice B's first commit (no captures); the helper-side
 /// `LetBindThenTail` synth-cont already ships captures.
+///
+/// **Plan B' Stage 6.7 Tasks 94+95:** structurally dead in the
+/// production path (`compute_user_fn_abi` + the pre-pass now use
+/// [`is_simple_chained_let_yield_then_pure_tail_body`]) but retained
+/// as `#[allow(dead_code)]` for transitional unit-test coverage.
+/// Phase D removes it.
+#[allow(dead_code)]
 fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
     use crate::ast::{Expr, Stmt};
     if body.stmts.len() != 1 {
@@ -10269,7 +10861,6 @@ fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
 /// `chain_length >= 2` (full chain) at the FuncId allocation site.
 /// Phase D retires `LetBindThenTail` once the chained variant covers
 /// all paths.
-#[allow(dead_code)]
 fn is_simple_chained_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> Option<usize> {
     use crate::ast::{Expr, Stmt};
     if body.stmts.is_empty() {
