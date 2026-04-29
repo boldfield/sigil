@@ -4195,30 +4195,22 @@ fn slice_c_multi_let_arm_body_with_resumes_one_effect_is_rejected_at_codegen() {
 }
 
 #[test]
-fn slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen() {
-    // Plan B Task 58 — walker-side check converting an internal-
-    // compiler-error panic into a clean compile diagnostic. Slice C
-    // v1's post_arm_k_1 captures only (k_closure, k_fn) into its
-    // TAG_CLOSURE record (codegen.rs:5480-5485); user op-args from
-    // the parent arm fn are NOT threaded in. Pre-Task-58, an arm
-    // body whose `arg2_expr` referenced a user op-arg compiled
-    // through to the codegen-time panic
-    // `unreachable!("codegen: unknown ident \`arg\`")` at
-    // codegen.rs:7765 (lower_expr's Expr::Ident arm, post_arm_k_1's
-    // env lookup miss). The walker check (codegen.rs:944-994 added
-    // at this PR) reuses the existing Slice B/C tail-free-vars
-    // walker on `arg2_expr` with `extra_bindings = {}` (no
-    // binding_name_2 since it doesn't exist yet at the post_arm_k_1
-    // lowering site) and wraps the diagnostic with arg2-specific
-    // Slice C framing.
+fn slice_c_chain_arg_referencing_user_op_arg_runs() {
+    // Plan B' Stage 6.7 Task 100b — captures-bearing extension for
+    // the arm-side N-let chain. `arg_i` (i >= 1) and the tail
+    // expression may now reference arm-fn user op-args; the chain
+    // closure record threads op-args forward through every step.
     //
-    // Closure point: future Slice C captures-bearing extension PR
-    // threads user op-args into post_arm_k_1's closure record (and
-    // post_arm_k_2's via inheritance). When that lands, this test
-    // becomes a positive test (or moves to a separate accept-shape
-    // test); the walker check stays in place but the diagnostic's
-    // "deferred to future Slice C captures-bearing extension PR"
-    // wording is updated to "Closed at PR #X".
+    // Inverted from the pre-Task-100b
+    // `slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen`
+    // negative test (which asserted REJECTION at codegen). The
+    // captures-bearing extension lifts the Task 58 restriction by
+    // adding `PostArmKChain.captures` and threading op-args via
+    // every step's closure record.
+    //
+    // Step trace: helper(5) performs Choose.choose(5). Arm dispatched
+    // with arg=5. r1 = k(arg+10) = k(15) → resumes helper with 15
+    // → r1 = 15. r2 = k(arg+20) = k(25) → r2 = 25. tail = r1+r2 = 40.
     let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
                fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
                  let x: Int = perform Choose.choose(seed);\n  \
@@ -4235,38 +4227,12 @@ fn slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "slice_c_reject_arg2_op_arg_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path =
-        std::env::temp_dir().join(format!("slice_c_reject_arg2_op_arg_{}", std::process::id()));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail: arg2 of multi-let arm references user op-arg `arg` \
-         (Slice C v1 doesn't thread op-args into post_arm_k_1's closure record). \
-         stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    // Pin the Slice-C-arg2 diagnostic framing (so a future commit
-    // that lifts the restriction inverts this test's diagnostic-
-    // string assertion alongside the success-status one).
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("Slice C: arg2 of multi-let arm body"),
-        "expected Slice C arg2 framing in diagnostic; stderr={stderr:?}"
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_arg_op_arg");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "40\n",
+        "Plan B' Task 100b: arg2 references op-arg `arg` — r1=k(15)=15, \
+         r2=k(25)=25, sum=40. stderr={stderr:?}"
     );
 }
 

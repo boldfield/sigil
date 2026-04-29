@@ -1043,14 +1043,20 @@ fn arm_body_unsupported_construct(
         } else {
             // For each arg_i (i >= 1, since arg_0 is lowered in the
             // arm fn body where all op-args are in scope), enforce
-            // the free-var restriction: `arg_i` may reference only
-            // bindings 0..i-1 plus globals (no user op-args, no
-            // outer-scope captures into the chain). The same Task
-            // 58 closure-point applies across all Middle steps.
+            // the free-var restriction: `arg_i` may reference prior
+            // chain bindings, **op-args**, and globals. Plan B'
+            // Stage 6.7 Task 100b lifted the prior op-arg restriction
+            // (the Task 58 closure-point) by adding chain captures
+            // that thread arm-fn user op-args through every chain
+            // step's closure record.
+            //
+            // op_args set: arm fn's user-param names. The walker
+            // accepts these as "extra bindings" for arg_i / tail
+            // free-var checks. The pre-pass collects them into
+            // `PostArmKChain.captures` for emit-time threading.
+            let op_args: BTreeSet<String> = arm.params.iter().map(|p| p.name.clone()).collect();
             for i in 1..shape.arg_exprs.len() {
-                let mut extras: BTreeSet<String> = BTreeSet::new();
-                // First prior binding name is the "binding_name" arg
-                // to the walker; the rest go into `extras`.
+                let mut extras: BTreeSet<String> = op_args.clone();
                 let first_prior = shape.binding_names[0];
                 for j in 1..i {
                     extras.insert(shape.binding_names[j].to_string());
@@ -1066,22 +1072,20 @@ fn arm_body_unsupported_construct(
                         "Slice C: arg{i_1based} of multi-let arm body (the {i_1based}th \
                          `{k}(arg)` call, lowered inside `post_arm_k_{i_0based_idx}`'s body) \
                          references a name unavailable in that step's env. The step's \
-                         closure record carries (k_closure, k_fn) plus prior chain \
-                         bindings only; user op-args from the parent arm fn and \
-                         outer-scope captures are NOT threaded into chain-step closures \
-                         (per `[DEVIATION Task 58]`'s documented closure point). \
-                         Reference one of {bindings:?} (prior chain bindings visible \
-                         at this step) or globals only. Underlying free-var diagnostic: \
-                         {inner}",
+                         closure record carries (k_closure, k_fn) plus chain captures \
+                         (op-args) plus prior chain bindings. Reference one of {bindings:?} \
+                         (prior chain bindings) or {op_args:?} (op-args) or globals only. \
+                         Underlying free-var diagnostic: {inner}",
                         i_1based = i + 1,
                         i_0based_idx = i,
                         k = arm.k_name,
                         bindings = &shape.binding_names[..i],
+                        op_args = op_args.iter().collect::<Vec<_>>(),
                     ));
                 }
             }
-            // Tail can reference all chain binding names.
-            let mut extras = BTreeSet::new();
+            // Tail can reference all chain binding names + op-args.
+            let mut extras: BTreeSet<String> = op_args.clone();
             for j in 1..shape.binding_names.len() {
                 extras.insert(shape.binding_names[j].to_string());
             }
@@ -1687,6 +1691,15 @@ struct HandlerReturnArmSynth {
 /// the pre-pass + emit pass to this shape and retires the legacy
 /// 9-field struct. The classifier accepts N=2 (subsuming the legacy
 /// case) so post-Phase-B path generalises uniformly.
+///
+/// **Task 100b captures-bearing extension:** `captures` enumerates
+/// arm-fn user op-args (and outer-scope captures, future extension)
+/// that are referenced by any chain step's `arg_i` or by the tail
+/// expression. The arm-fn body emit allocates step_0's closure
+/// record carrying `(k_closure, k_fn) + captures`; each Middle step
+/// forward-copies captures (constant across the chain) into the next
+/// step's closure record alongside the prior_bindings. Final steps
+/// load captures alongside prior_bindings to populate the env.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct PostArmKChain {
@@ -1694,12 +1707,39 @@ struct PostArmKChain {
     /// Lowered inside the arm-fn body emit (not inside any synth fn).
     /// Must satisfy `expr_is_pure`.
     first_arg_expr: crate::ast::Expr,
+    /// Arm-fn user op-args (and other arm-local names) referenced
+    /// anywhere in the chain — in any `arg_i` for `i >= 1` or in
+    /// the tail expression. Threaded forward through every chain
+    /// step's closure record. Empty for arms whose chain references
+    /// only chain-internal bindings + globals (which was Slice C
+    /// v1's restriction; lifted in Task 100b).
+    captures: Vec<PostArmKChainCapture>,
     /// One entry per post-arm-k synth fn (N entries for an N-let
     /// arm body). `steps[0]` is post_arm_k_1 (binds r_1, dispatches
     /// k(arg_2) or runs tail if N=1 — though Slice B handles N=1
     /// separately so the N>=2 path here always has steps.len() >=
     /// 2). `steps[N-1]` is post_arm_k_N (binds r_N, runs tail).
     steps: Vec<PostArmKStep>,
+}
+
+/// Plan B' Stage 6.7 Task 100b — one capture entry threaded forward
+/// through every chain step's closure record. Captures are constant
+/// across the chain (captured once at step_0's closure-record alloc
+/// in the arm-fn body, then forward-copied at each Middle step's
+/// next-step alloc).
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct PostArmKChainCapture {
+    /// Source-level name as it appears in arm-fn-body lowering. For
+    /// op-args this matches the `HandleOpArm.params[i].name`.
+    name: String,
+    /// Cranelift type the capture narrows to after I64 load. Used by
+    /// the Middle/Final synth-fn body emit to populate env with the
+    /// correctly-typed value.
+    ty: Type,
+    /// `EnvSlotKind` for the closure-record encoding. Drives the
+    /// pointer-bitmap bit + load/store widening.
+    kind: crate::ast::EnvSlotKind,
 }
 
 /// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — one post-arm-k synth fn
@@ -2261,6 +2301,120 @@ fn walk_collect_captures(
     }
 }
 
+/// Plan B' Stage 6.7 Task 100b — collect arm-fn user op-args
+/// referenced anywhere in a chain step's `arg_i` or in the chain's
+/// tail expression. Mirrors [`walk_collect_captures`] for the
+/// helper-side chain (which captures helper user params); the arm
+/// side has slightly different param metadata (`HandleArmParam` is
+/// name-only, with types in a parallel `op_decl.params` slice).
+///
+/// `arm_params` carries the tuple `(name, ty_expr)` for each user
+/// op-arg, in declaration order. `bound` is the set of locally-
+/// introduced names (chain bindings + `k_name`); references to
+/// these are NOT captured (chain-internal). Any Ident matching an
+/// arm op-arg name AND not in `bound` is captured.
+fn walk_collect_arm_captures(
+    e: &crate::ast::Expr,
+    bound: &mut std::collections::BTreeSet<String>,
+    arm_params: &[crate::ast::HandleArmParam],
+    out: &mut Vec<PostArmKChainCapture>,
+) {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::ClosureEnvLoad { .. } => {}
+        Expr::Ident(name, _) => {
+            if !bound.contains(name) {
+                if let Some(param) = arm_params.iter().find(|p| p.name == *name) {
+                    if !out.iter().any(|c| c.name == *name) {
+                        // arm_params carries name + span only; the
+                        // type lookup happens in the pre-pass via the
+                        // parallel `op_decl.params: Vec<TypeExpr>`.
+                        // Here we collect the name and a placeholder
+                        // type/kind; the caller fills in real values.
+                        let _ = param; // suppress unused-var; structural
+                        out.push(PostArmKChainCapture {
+                            name: name.clone(),
+                            ty: types::I64,
+                            kind: crate::ast::EnvSlotKind::Int,
+                        });
+                    }
+                }
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_collect_arm_captures(lhs, bound, arm_params, out);
+            walk_collect_arm_captures(rhs, bound, arm_params, out);
+        }
+        Expr::Unary { operand, .. } => {
+            walk_collect_arm_captures(operand, bound, arm_params, out);
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            walk_collect_arm_captures(cond, bound, arm_params, out);
+            walk_collect_arm_captures_block(then_block, bound, arm_params, out);
+            walk_collect_arm_captures_block(else_block, bound, arm_params, out);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            walk_collect_arm_captures(scrutinee, bound, arm_params, out);
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                collect_pattern_bindings(&arm.pattern, &mut arm_bound);
+                walk_collect_arm_captures(&arm.body, &mut arm_bound, arm_params, out);
+            }
+        }
+        Expr::Block(b) => walk_collect_arm_captures_block(b, bound, arm_params, out),
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                walk_collect_arm_captures(&f.value, bound, arm_params, out);
+            }
+        }
+        // Yield-able shapes (Call, Perform, Handle, Lambda,
+        // ClosureRecord) — defensively skip recursion. Note: `k(arg)`
+        // appears as Call but the arm-body chain context is the let-
+        // value of preceding stmts; this walker is invoked on arg_i
+        // / tail_expr (which the classifier guarantees are pure), so
+        // a Call here would be a typecheck-error.
+        Expr::Call { .. }
+        | Expr::Perform(_)
+        | Expr::Handle { .. }
+        | Expr::Lambda { .. }
+        | Expr::ClosureRecord { .. } => {}
+    }
+}
+
+fn walk_collect_arm_captures_block(
+    b: &crate::ast::Block,
+    bound: &mut std::collections::BTreeSet<String>,
+    arm_params: &[crate::ast::HandleArmParam],
+    out: &mut Vec<PostArmKChainCapture>,
+) {
+    use crate::ast::Stmt;
+    let mut local_bound = bound.clone();
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                walk_collect_arm_captures(&l.value, &mut local_bound, arm_params, out);
+                local_bound.insert(l.name.clone());
+            }
+            Stmt::Expr(e) => walk_collect_arm_captures(e, &mut local_bound, arm_params, out),
+            Stmt::Perform(_) => {}
+        }
+    }
+    if let Some(t) = &b.tail {
+        walk_collect_arm_captures(t, &mut local_bound, arm_params, out);
+    }
+}
+
 /// Plan B Task 55, Phase 4e — collect names that a [`Pattern`] binds.
 ///
 /// Used by [`walk_collect_captures`] when descending into a match
@@ -2719,6 +2873,60 @@ fn collect_handle_arms_in_expr(
                             .map(|te| slot_kind_for_type_expr_post_mono(te))
                             .collect();
 
+                        // Plan B' Stage 6.7 Task 100b — collect chain
+                        // captures: arm-fn user op-args referenced
+                        // anywhere in the chain (any `arg_i` for
+                        // `i >= 1` OR the tail expression). Threaded
+                        // forward through every step's closure record
+                        // so Middle steps can lower next_arg_expr
+                        // and Final steps can lower tail_expr with
+                        // op-args in scope.
+                        //
+                        // Walk: for each arg_exprs[1..N] + tail_expr,
+                        // harvest every Expr::Ident whose name matches
+                        // an op-arg AND isn't shadowed by the chain
+                        // bindings (which are pre-bound in `bound`).
+                        let captures: Vec<PostArmKChainCapture> = {
+                            let mut bound_names: std::collections::BTreeSet<String> =
+                                shape.binding_names.iter().map(|s| s.to_string()).collect();
+                            bound_names.insert(arm.k_name.clone());
+                            let mut out: Vec<PostArmKChainCapture> = Vec::new();
+                            for arg_expr in shape.arg_exprs.iter().skip(1) {
+                                walk_collect_arm_captures(
+                                    arg_expr,
+                                    &mut bound_names,
+                                    &arm.params,
+                                    &mut out,
+                                );
+                            }
+                            walk_collect_arm_captures(
+                                &shape.tail_expr,
+                                &mut bound_names,
+                                &arm.params,
+                                &mut out,
+                            );
+                            // Resolve each capture's real type +
+                            // EnvSlotKind from the parallel op_decl
+                            // .params + arg_types arrays. Walker
+                            // populated placeholder I64/Int values;
+                            // overwrite with the real values now.
+                            for cap in &mut out {
+                                let idx = match arm.params.iter().position(|p| p.name == cap.name) {
+                                    Some(i) => i,
+                                    None => unreachable!(
+                                        "walk_collect_arm_captures invariant: \
+                                         captured name `{}` is in arm.params (it \
+                                         was added only when arm.params.find \
+                                         matched)",
+                                        cap.name
+                                    ),
+                                };
+                                cap.ty = arg_types[idx];
+                                cap.kind = slot_kind_for_type_expr_post_mono(&op_decl.params[idx]);
+                            }
+                            out
+                        };
+
                         // Pass 2: build N `PostArmKStep` entries.
                         // step_idx 0..N-2 → Middle (next_arg_expr is
                         // arg_exprs[step_idx + 1]); step_idx N-1 →
@@ -2755,6 +2963,7 @@ fn collect_handle_arms_in_expr(
 
                         Some(PostArmKChain {
                             first_arg_expr: shape.arg_exprs[0].clone(),
+                            captures,
                             steps,
                         })
                     }
@@ -5793,18 +6002,40 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arg1_value
                     };
 
-                    // Allocate step[0]'s closure record (Middle layout:
-                    // (k_closure, k_fn) + 0 prior bindings).
+                    // Allocate step[0]'s closure record. Middle layout:
+                    // (k_closure, k_fn) + chain captures (op-args).
+                    //
+                    // Layout offsets:
+                    //   +0:        header
+                    //   +8:        code_ptr (null)
+                    //   +16:       k_closure (capture-slot 0; bitmap bit 1)
+                    //   +24:       k_fn      (capture-slot 1; non-pointer)
+                    //   +32+8*c:   captures[c] for c in 0..captures.len()
                     //
                     // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
                     // `step_0_closure_ptr` is a heap pointer that lives
                     // across the subsequent `next_step_call` arena
                     // allocation. See the central TODO at the synth-
                     // cont's `post_arm_k_closure` load site.
-                    let count: u8 = 3;
-                    let bitmap: u32 = 1u32 << 1;
+                    let captures = &chain.captures;
+                    let total_capture_slots: usize = 2 + captures.len();
+                    assert!(
+                        total_capture_slots < MAX_CLOSURE_ENV_SLOTS,
+                        "Plan B' Stage 6.7 Task 100b: arm-fn step_0 closure capture \
+                         count {total_capture_slots} >= {MAX_CLOSURE_ENV_SLOTS} \
+                         exceeds bitmap layout"
+                    );
+                    let mut bitmap: u32 = 1u32 << 1; // k_closure (slot 0)
+                                                     // k_fn (slot 1) is a fn-ptr — bitmap policy is non-
+                                                     // pointer (matching the existing 2-let layout).
+                    for (c, cap) in captures.iter().enumerate() {
+                        if cap.kind.is_pointer() {
+                            bitmap |= 1u32 << (2 + c + 1);
+                        }
+                    }
+                    let count: u8 = 1 + total_capture_slots as u8;
                     let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
-                    let payload_bytes: i64 = 8 + 8 * 2;
+                    let payload_bytes: i64 = 8 + 8 * total_capture_slots as i64;
                     let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                     let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
                     let alloc_call = lowerer
@@ -5835,6 +6066,41 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         step_0_closure_ptr,
                         24,
                     );
+                    // Chain captures at offsets 32+8*c. The arm-fn
+                    // env at this point has all op-args bound from
+                    // the args_ptr unpack; load each captured op-arg
+                    // from env and widen to I64 for storage.
+                    for (c, cap) in captures.iter().enumerate() {
+                        let val = match lowerer.env.get(&cap.name) {
+                            Some(v) => *v,
+                            None => unreachable!(
+                                "Plan B' Stage 6.7 Task 100b: chain capture `{}` \
+                                 not in arm-fn env at body-emit time. The pre-pass \
+                                 collected captures from arm.params, which the arm-\
+                                 fn body emit binds in env from args_ptr unpack.",
+                                cap.name
+                            ),
+                        };
+                        let widened = match cap.kind {
+                            crate::ast::EnvSlotKind::Int => val,
+                            crate::ast::EnvSlotKind::Bool
+                            | crate::ast::EnvSlotKind::Byte
+                            | crate::ast::EnvSlotKind::Unit
+                            | crate::ast::EnvSlotKind::Char => {
+                                lowerer.builder.ins().uextend(types::I64, val)
+                            }
+                            crate::ast::EnvSlotKind::String
+                            | crate::ast::EnvSlotKind::Closure
+                            | crate::ast::EnvSlotKind::User => val,
+                        };
+                        let offset: i32 = 32 + 8 * c as i32;
+                        lowerer.builder.ins().store(
+                            MemFlags::trusted(),
+                            widened,
+                            step_0_closure_ptr,
+                            offset,
+                        );
+                    }
 
                     let step_0_fn_ref =
                         module.declare_func_in_func(step_0.func_id, lowerer.builder.func);
@@ -6662,14 +6928,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         bound_widened
                     };
 
-                    // Closure-record layout for THIS step:
+                    // Closure-record layout for THIS step (Task 100b
+                    // captures-bearing extension):
                     //   - Middle: [code_ptr, k_closure, k_fn,
-                    //     prior_bindings...] — k pair at offsets
-                    //     16/24, prior_bindings at 32+8*j.
-                    //   - Final: [code_ptr, prior_bindings...] —
-                    //     prior_bindings at 16+8*j (no k pair).
+                    //     captures..., prior_bindings...] — k pair at
+                    //     16/24, captures at 32+8*c, prior_bindings at
+                    //     32+8*captures.len()+8*j.
+                    //   - Final: [code_ptr, captures..., prior_bindings...]
+                    //     — captures at 16+8*c, prior_bindings at
+                    //     16+8*captures.len()+8*j (no k pair).
                     let is_middle = matches!(step.role, PostArmKStepRole::Middle { .. });
-                    let prior_offset_base: i32 = if is_middle { 32 } else { 16 };
+                    let captures = &chain.captures;
+                    let captures_offset_base: i32 = if is_middle { 32 } else { 16 };
+                    let prior_offset_base: i32 = captures_offset_base + 8 * captures.len() as i32;
 
                     // Load (k_closure, k_fn) IF Middle (Final doesn't
                     // need them).
@@ -6717,8 +6988,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         }
                     };
 
-                    // Load prior chain bindings and build the env.
+                    // Load chain captures (op-args) and prior chain
+                    // bindings; build the env.
                     let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                    for (c, cap) in captures.iter().enumerate() {
+                        let offset: i32 = captures_offset_base + 8 * c as i32;
+                        let raw = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            offset,
+                        );
+                        let val = narrow_for_kind(&mut builder, raw, cap.kind);
+                        env.insert(cap.name.clone(), val);
+                    }
                     for (j, prior) in step.prior_bindings.iter().enumerate() {
                         let offset: i32 = prior_offset_base + 8 * j as i32;
                         let raw = builder.ins().load(
@@ -6846,22 +7129,37 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             };
 
                             // Allocate the next step's closure record.
-                            // Layout depends on next step's role.
+                            // Layout (Task 100b captures-bearing):
+                            //   - Middle next: [code_ptr, k_closure,
+                            //     k_fn, captures..., prior_bindings...,
+                            //     this_binding].
+                            //   - Final next:  [code_ptr, captures...,
+                            //     prior_bindings..., this_binding].
+                            // captures count is constant across the
+                            // chain; prior_bindings of next step
+                            // grows by 1 (this step's binding).
                             let next_step = &chain.steps[step_idx + 1];
                             let next_is_middle =
                                 matches!(next_step.role, PostArmKStepRole::Middle { .. });
                             let prior_count_next = next_step.prior_bindings.len();
-                            let (next_capture_count, next_prior_offset_base): (usize, i32) =
-                                if next_is_middle {
-                                    // Middle layout: k_closure (slot 0)
-                                    // + k_fn (slot 1) + prior_bindings
-                                    // (slots 2..2+|prior|).
-                                    (2 + prior_count_next, 32)
-                                } else {
-                                    // Final layout: prior_bindings only
-                                    // (slots 0..|prior|).
-                                    (prior_count_next, 16)
-                                };
+                            let (next_capture_count, next_captures_off, next_prior_offset_base): (
+                                usize,
+                                i32,
+                                i32,
+                            ) = if next_is_middle {
+                                // Middle: k_closure(0) + k_fn(1) +
+                                // captures(2..2+C) +
+                                // prior_bindings(2+C..2+C+P).
+                                let c = captures.len();
+                                let p = prior_count_next;
+                                (2 + c + p, 32, 32 + 8 * c as i32)
+                            } else {
+                                // Final: captures(0..C) +
+                                // prior_bindings(C..C+P).
+                                let c = captures.len();
+                                let p = prior_count_next;
+                                (c + p, 16, 16 + 8 * c as i32)
+                            };
                             assert!(
                                 next_capture_count < MAX_CLOSURE_ENV_SLOTS,
                                 "Plan B' Stage 6.7: chain-step closure capture count \
@@ -6872,22 +7170,27 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             );
                             let mut bitmap: u32 = 0;
                             if next_is_middle {
-                                // k_closure at capture-slot 0 → bit 1.
-                                bitmap |= 1u32 << 1;
-                                // k_fn at capture-slot 1 → bit 2 (non-
-                                // pointer; not set).
-                                // prior_bindings at slots 2..|prior|+1.
+                                bitmap |= 1u32 << 1; // k_closure (slot 0)
+                                                     // k_fn (slot 1) is non-pointer.
+                                for (c, cap) in captures.iter().enumerate() {
+                                    if cap.kind.is_pointer() {
+                                        bitmap |= 1u32 << (2 + c + 1);
+                                    }
+                                }
                                 for (j, p) in next_step.prior_bindings.iter().enumerate() {
                                     if p.kind.is_pointer() {
-                                        bitmap |= 1u32 << (2 + j + 1);
+                                        bitmap |= 1u32 << (2 + captures.len() + j + 1);
                                     }
                                 }
                             } else {
-                                // Final: prior_bindings at slots
-                                // 0..|prior|-1.
+                                for (c, cap) in captures.iter().enumerate() {
+                                    if cap.kind.is_pointer() {
+                                        bitmap |= 1u32 << (c + 1);
+                                    }
+                                }
                                 for (j, p) in next_step.prior_bindings.iter().enumerate() {
                                     if p.kind.is_pointer() {
-                                        bitmap |= 1u32 << (j + 1);
+                                        bitmap |= 1u32 << (captures.len() + j + 1);
                                     }
                                 }
                             }
@@ -6936,10 +7239,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     24,
                                 );
                             }
-                            // Forward prior bindings + this step's
-                            // binding to the next step's closure.
-                            // Copy prior_bindings (raw I64) from this
-                            // step's closure to next step's closure.
+                            // Forward-copy chain captures (raw I64)
+                            // from this step's closure to next step's
+                            // closure (constant across the chain).
+                            for c in 0..captures.len() {
+                                let src_off: i32 = captures_offset_base + 8 * c as i32;
+                                let dst_off: i32 = next_captures_off + 8 * c as i32;
+                                let raw = lowerer.builder.ins().load(
+                                    types::I64,
+                                    MemFlags::trusted(),
+                                    synth_closure_ptr,
+                                    src_off,
+                                );
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    raw,
+                                    next_closure_ptr,
+                                    dst_off,
+                                );
+                            }
+                            // Forward-copy prior bindings (raw I64).
                             for j in 0..step.prior_bindings.len() {
                                 let src_off: i32 = prior_offset_base + 8 * j as i32;
                                 let dst_off: i32 = next_prior_offset_base + 8 * j as i32;
