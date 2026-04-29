@@ -5855,6 +5855,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     captured_fn_sigs: BTreeMap::new(),
                     arm_k_closure_v: None,
                     arm_k_fn_v: None,
+                    arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
@@ -6025,6 +6026,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 },
                 arm_k_closure_v: None,
                 arm_k_fn_v: None,
+                arm_frame_ptr_v: None,
                 arm_k_pair_self: cc.arm_k_pair_captures.get(&f.name).cloned(),
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
             };
@@ -6412,6 +6414,32 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ((n_user_args + 1) * 8) as i32,
                 );
 
+                // Stage-6.8-followup Layer 3c — load frame_ptr from
+                // arm closure_ptr at offset `16 + 8*captures.len()`
+                // when the arm body has any k-pair-bearing nested
+                // ClosureRecord. The handle expression at
+                // `alloc_arm_closure_record` time wrote frame_ptr to
+                // this slot iff the same condition holds. Conditional
+                // load: when the arm body has no k-pair-bearing child,
+                // the closure record was allocated without the slot
+                // (or as null_ptr if captures was also empty), and
+                // reading would access invalid memory.
+                let arm_body_for_scan = &synth.body;
+                let arm_needs_frame_ptr =
+                    arm_body_has_k_pair_lambda(arm_body_for_scan, &cc.arm_k_pair_captures);
+                let frame_ptr_v = if arm_needs_frame_ptr {
+                    let captures_count = synth.captures.len();
+                    let offset: i32 = 16 + 8 * captures_count as i32;
+                    Some(builder.ins().load(
+                        pointer_ty,
+                        MemFlags::trusted(),
+                        closure_ptr,
+                        offset,
+                    ))
+                } else {
+                    None
+                };
+
                 let mut lowerer = Lowerer {
                     builder,
                     stackmap: &mut stackmap,
@@ -6462,6 +6490,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // inside the arm body.
                     arm_k_closure_v: Some(k_closure_v),
                     arm_k_fn_v: Some(k_fn_v),
+                    arm_frame_ptr_v: frame_ptr_v,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
@@ -7162,6 +7191,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     captured_fn_sigs: BTreeMap::new(),
                     arm_k_closure_v: None,
                     arm_k_fn_v: None,
+                    arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
@@ -7403,6 +7433,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 captured_fn_sigs: BTreeMap::new(),
                 arm_k_closure_v: None,
                 arm_k_fn_v: None,
+                arm_frame_ptr_v: None,
                 arm_k_pair_self: None,
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
             };
@@ -7682,6 +7713,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         captured_fn_sigs: BTreeMap::new(),
                         arm_k_closure_v: None,
                         arm_k_fn_v: None,
+                        arm_frame_ptr_v: None,
                         arm_k_pair_self: None,
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
                     };
@@ -8323,6 +8355,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             captured_fn_sigs: BTreeMap::new(),
                             arm_k_closure_v: None,
                             arm_k_fn_v: None,
+                            arm_frame_ptr_v: None,
                             arm_k_pair_self: None,
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
                         };
@@ -9084,6 +9117,15 @@ struct Lowerer<'a, 'b> {
     /// non-arm-fn Lowerers.
     arm_k_closure_v: Option<Value>,
     arm_k_fn_v: Option<Value>,
+    /// Stage-6.8-followup Layer 3c — when this Lowerer is for a synth
+    /// arm fn whose body contains a k-pair-bearing lifted lambda, this
+    /// holds the originating handler's frame_ptr (loaded from arm
+    /// closure_ptr at offset `16 + 8 * captures.len()`). `lower_closure_
+    /// record` writes this Value to the trailing-triple's third slot
+    /// when allocating the lifted lambda's closure record. None for
+    /// non-arm-fn Lowerers and arm fns whose body has no k-pair-bearing
+    /// children.
+    arm_frame_ptr_v: Option<Value>,
 
     /// Plan B' Stage 6.8 Task 107 Phase B — when this Lowerer is for
     /// a k-pair-bearing synth lambda fn (lifted from an arm body that
@@ -9723,12 +9765,28 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
                         // Phase 4d: build closure record from captures,
                         // or pass null when the arm has none.
+                        // Stage-6.8-followup Layer 3c — if the arm body
+                        // has any k-pair-bearing nested ClosureRecord
+                        // (lifted lambda capturing this arm's k), the
+                        // arm closure record gains a frame_ptr slot at
+                        // the end so `lower_k_pair_call` can re-push
+                        // the handler frame when the lambda's k(arg)
+                        // is invoked outside the handle.
                         let captures = self.handler_arm_synth[synth_idx].captures.clone();
-                        let arm_closure_ptr = if captures.is_empty() {
-                            null_ptr
+                        let arm_body_ref = &self.handler_arm_synth[synth_idx].body;
+                        let needs_frame_ptr =
+                            arm_body_has_k_pair_lambda(arm_body_ref, self.arm_k_pair_captures);
+                        let frame_ptr_for_arm = if needs_frame_ptr {
+                            Some(frame_ptr)
                         } else {
-                            self.alloc_arm_closure_record(&captures)
+                            None
                         };
+                        let arm_closure_ptr =
+                            if captures.is_empty() && frame_ptr_for_arm.is_none() {
+                                null_ptr
+                            } else {
+                                self.alloc_arm_closure_record(&captures, frame_ptr_for_arm)
+                            };
 
                         let set_call = self.builder.ins().call(
                             self.handler_frame_set_arm_ref,
@@ -9782,7 +9840,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             let ret_closure_ptr = if ret_captures.is_empty() {
                                 null_ptr
                             } else {
-                                self.alloc_arm_closure_record(&ret_captures)
+                                self.alloc_arm_closure_record(&ret_captures, None)
                             };
                             let set_return_call = self.builder.ins().call(
                                 self.handler_frame_set_return_ref,
@@ -10336,6 +10394,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // slot indices set by closure_convert.
         let k_closure_offset: i32 = 16 + 8 * info.k_closure_idx as i32;
         let k_fn_offset: i32 = 16 + 8 * info.k_fn_idx as i32;
+        let frame_ptr_offset: i32 = 16 + 8 * info.frame_ptr_idx as i32;
         let k_closure = self.builder.ins().load(
             self.pointer_ty,
             MemFlags::trusted(),
@@ -10348,6 +10407,28 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.closure_ptr,
             k_fn_offset,
         );
+        // Stage-6.8-followup Layer 3c — frame_ptr at trailing-triple's
+        // third slot. Re-pushed onto the handler stack before driving
+        // run_loop so synth-cont chains inside k(arg) can find the
+        // originating handler when invoked outside the handle.
+        let frame_ptr_loaded = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.closure_ptr,
+            frame_ptr_offset,
+        );
+
+        // Push the originating handler frame back onto the thread-local
+        // handler stack. sigil_handle_pop didn't deallocate it; the
+        // closure record's frame_ptr slot kept it GC-rooted. Re-pushing
+        // overwrites frame.prev with the current head, threading it
+        // back into the live stack.
+        let push_call = self
+            .builder
+            .ins()
+            .call(self.handle_push_ref, &[frame_ptr_loaded]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, push_call));
 
         // Lower the arg, widen to I64 for the args buffer.
         let arg_v = self.lower_expr(&args[0]);
@@ -10364,8 +10445,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             arg_v
         };
 
-        // sigil_next_step_call(k_closure, k_fn, 1) → *mut NextStep
-        let arg_count_v = self.builder.ins().iconst(types::I32, 1);
+        // sigil_next_step_call(k_closure, k_fn, 3) → *mut NextStep
+        //
+        // Stage-6.8-followup Layer 3c — args buffer follows the
+        // Phase 4e captures+ Slice A trailing-pair convention: 3
+        // slots `[arg, post_arm_k_closure, post_arm_k_fn]`. When
+        // k_fn is `sigil_continuation_identity`, identity returns
+        // `Done(args[0])` ignoring the trailing pair (its
+        // `args_len == 3` branch is explicitly tolerated). When
+        // k_fn is a synth-cont (chained-let-yield step), the
+        // synth-cont's body emit unpacks args[1..3] as its
+        // post_arm_k pair to forward via `next_step_call(post_arm_k
+        // _closure, post_arm_k_fn, [tail])` after computing its
+        // own value. Pre-fix, this emit only wrote args[0]; synth-
+        // cont steps that expected the trailing-pair read garbage
+        // at args[1..3] and built dispatched Calls with null
+        // fn_ptrs (= the v+1 path's "fn=null, arg_count=1, args=[8]"
+        // failure mode observed in rs_l3d's debug trace).
+        let arg_count_v = self.builder.ins().iconst(types::I32, 3);
         let next_step_call = self
             .builder
             .ins()
@@ -10374,7 +10471,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .push_placeholder(function_code_offset(&self.builder, next_step_call));
         let ns = self.builder.inst_results(next_step_call)[0];
 
-        // sigil_next_step_args_ptr(ns) → *mut u64; write arg at slot 0.
+        // sigil_next_step_args_ptr(ns) → *mut u64; write trailing-
+        // pair convention `[widened_arg, null_post_arm_k_closure,
+        // identity_fn_addr]` at offsets 0 / 8 / 16.
         let args_ptr_call = self.builder.ins().call(self.next_step_args_ptr_ref, &[ns]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, args_ptr_call));
@@ -10382,12 +10481,37 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlags::trusted(), widened_arg, args_buf, 0);
+        let null_post_arm_k_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), null_post_arm_k_closure, args_buf, 8);
+        let identity_fn_addr_for_post_arm_k = self
+            .builder
+            .ins()
+            .func_addr(self.pointer_ty, self.continuation_identity_ref);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            identity_fn_addr_for_post_arm_k,
+            args_buf,
+            16,
+        );
 
         // sigil_run_loop(ns) → u64
         let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let widened_result = self.builder.inst_results(run_loop_call)[0];
+
+        // Stage-6.8-followup Layer 3c — pop the originating handler
+        // frame we re-pushed before run_loop. This restores the
+        // handler stack to its pre-k(arg) state so subsequent
+        // sigil_perform calls see the correct stack discipline. The
+        // pop's return value (the popped frame's pointer) is unused
+        // here; debug-build invariant: it equals frame_ptr_loaded.
+        let pop_call = self.builder.ins().call(self.handle_pop_ref, &[]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, pop_call));
+        let _popped = self.builder.inst_results(pop_call)[0];
 
         // Stage-6.8-followup Layer 2 fix: apply the originating handle's
         // return arm to widened_result. The lifted lambda may be invoked
@@ -10955,11 +11079,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// arm-fn's `func_addr`). It's stored as null to keep the layout
     /// uniform with user-level closures and avoid a divergent GC
     /// bitmap shape.
-    fn alloc_arm_closure_record(&mut self, captures: &[ArmCapture]) -> Value {
+    fn alloc_arm_closure_record(
+        &mut self,
+        captures: &[ArmCapture],
+        frame_ptr_v: Option<Value>,
+    ) -> Value {
         let env_len = captures.len();
+        let frame_slot_count = if frame_ptr_v.is_some() { 1 } else { 0 };
         assert!(
-            env_len > 0,
-            "alloc_arm_closure_record on empty captures — caller should pass null directly"
+            env_len > 0 || frame_slot_count > 0,
+            "alloc_arm_closure_record on empty captures and no frame_ptr — caller should pass null directly"
         );
         assert!(
             env_len < MAX_CLOSURE_ENV_SLOTS,
@@ -10972,9 +11101,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 bitmap |= 1u32 << (i + 1);
             }
         }
-        let count: u8 = 1 + env_len as u8;
+        // Stage-6.8-followup Layer 3c — frame_ptr at slot env_len when
+        // present. HandlerFrame is heap-allocated (sigil_handler_frame_new
+        // returns a TAG_HANDLER_FRAME pointer); mark it in the bitmap
+        // so the GC scans it.
+        if frame_ptr_v.is_some() {
+            bitmap |= 1u32 << (env_len + 1);
+        }
+        let total_slots = env_len + frame_slot_count;
+        let count: u8 = 1 + total_slots as u8;
         let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
-        let payload_bytes: i64 = 8 + 8 * env_len as i64;
+        let payload_bytes: i64 = 8 + 8 * total_slots as i64;
 
         // Lower env values FIRST, in source order — same discipline
         // as `lower_closure_record`. Two source paths:
@@ -11052,6 +11189,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 .store(MemFlags::trusted(), slot_val, closure_ptr, offset);
         }
 
+        // Stage-6.8-followup Layer 3c — frame_ptr at slot env_len.
+        if let Some(fp) = frame_ptr_v {
+            let offset: i32 = 16 + 8 * env_len as i32;
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), fp, closure_ptr, offset);
+        }
+
         closure_ptr
     }
 
@@ -11077,7 +11222,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // surrounding ARM fn's `arm_k_closure_v` / `arm_k_fn_v`
         // fields, populated at arm-fn Lowerer construction.
         let k_pair = self.arm_k_pair_captures.get(code_fn_name).cloned();
-        let extra_k_slots = if k_pair.is_some() { 2 } else { 0 };
+        // Stage-6.8-followup Layer 3c — k-pair-bearing closure records
+        // gain a third trailing slot for the originating handle's
+        // frame_ptr (k_closure + k_fn + frame_ptr = 3 slots). Allows
+        // `lower_k_pair_call` to re-push the handler frame before
+        // driving run_loop, so synth-cont chains inside k(arg) can
+        // find the originating handler when invoked outside the handle.
+        let extra_k_slots = if k_pair.is_some() { 3 } else { 0 };
 
         let env_len = env_exprs.len();
         let total_slot_count = env_len + extra_k_slots;
@@ -11106,6 +11257,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             bitmap |= 1u32 << (info.k_closure_idx + 1);
             // k_fn is a fn pointer (text-segment), non-GC. No bit.
             let _ = info.k_fn_idx;
+            // Stage-6.8-followup Layer 3c — frame_ptr is a heap-
+            // allocated HandlerFrame pointer (sigil_handler_frame_new
+            // allocates from the GC heap with TAG_HANDLER_FRAME).
+            // bitmap bit position is `info.frame_ptr_idx + 1`.
+            bitmap |= 1u32 << (info.frame_ptr_idx + 1);
         }
         let count: u8 = 1 + total_slot_count as u8;
         let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
@@ -11200,6 +11356,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlags::trusted(), k_fn_v, closure_ptr, k_fn_offset);
+
+            // Stage-6.8-followup Layer 3c — frame_ptr at trailing-
+            // triple's third slot. Sourced from arm fn's
+            // `arm_frame_ptr_v`, populated at arm-fn Lowerer
+            // construction by the synth-arm-fn body emit which
+            // unpacks frame_ptr from its closure_ptr.
+            let frame_ptr_v = self.arm_frame_ptr_v.unwrap_or_else(|| {
+                unreachable!(
+                    "codegen invariant: lower_closure_record for k-pair-bearing fn \
+                     `{code_fn_name}` requires surrounding arm fn's frame_ptr_v"
+                )
+            });
+            let frame_ptr_offset: i32 = 16 + 8 * info.frame_ptr_idx as i32;
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), frame_ptr_v, closure_ptr, frame_ptr_offset);
         }
 
         closure_ptr
@@ -12097,6 +12269,116 @@ const fn _cps_args_len_convention_doc() {}
 /// trailing-pair offsets shift by `N * 8`.
 fn k_closure_offset(user_arg_count: usize) -> i32 {
     (user_arg_count as i32) * 8
+}
+
+/// Stage-6.8-followup Layer 3c — scan an expression tree for a
+/// nested `Expr::ClosureRecord` whose `code_fn_name` is registered
+/// in `arm_k_pair_captures` (i.e., a k-pair-bearing lifted lambda).
+/// Used at handle codegen time and arm-fn body emit time to decide
+/// whether an arm closure record needs the trailing-triple's frame_ptr
+/// slot, and whether the arm fn body emit should load `arm_frame_ptr_v`.
+fn arm_body_has_k_pair_lambda(
+    e: &crate::ast::Expr,
+    arm_k_pair_captures: &BTreeMap<String, crate::closure_convert::ArmKPairCapture>,
+) -> bool {
+    use crate::ast::Expr;
+    match e {
+        Expr::ClosureRecord {
+            code_fn_name,
+            env_exprs,
+            ..
+        } => {
+            if arm_k_pair_captures.contains_key(code_fn_name) {
+                return true;
+            }
+            env_exprs
+                .iter()
+                .any(|e| arm_body_has_k_pair_lambda(e, arm_k_pair_captures))
+        }
+        Expr::Block(b) => block_has_k_pair_lambda(b, arm_k_pair_captures),
+        Expr::Binary { lhs, rhs, .. } => {
+            arm_body_has_k_pair_lambda(lhs, arm_k_pair_captures)
+                || arm_body_has_k_pair_lambda(rhs, arm_k_pair_captures)
+        }
+        Expr::Unary { operand, .. } => arm_body_has_k_pair_lambda(operand, arm_k_pair_captures),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            arm_body_has_k_pair_lambda(cond, arm_k_pair_captures)
+                || block_has_k_pair_lambda(then_block, arm_k_pair_captures)
+                || block_has_k_pair_lambda(else_block, arm_k_pair_captures)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            arm_body_has_k_pair_lambda(scrutinee, arm_k_pair_captures)
+                || arms
+                    .iter()
+                    .any(|a| arm_body_has_k_pair_lambda(&a.body, arm_k_pair_captures))
+        }
+        Expr::Call { callee, args, .. } => {
+            arm_body_has_k_pair_lambda(callee, arm_k_pair_captures)
+                || args
+                    .iter()
+                    .any(|a| arm_body_has_k_pair_lambda(a, arm_k_pair_captures))
+        }
+        Expr::Perform(p) => p
+            .args
+            .iter()
+            .any(|a| arm_body_has_k_pair_lambda(a, arm_k_pair_captures)),
+        Expr::RecordLit { fields, .. } => fields
+            .iter()
+            .any(|f| arm_body_has_k_pair_lambda(&f.value, arm_k_pair_captures)),
+        Expr::Lambda { .. } => false,
+        Expr::Handle {
+            body, op_arms, ..
+        } => {
+            arm_body_has_k_pair_lambda(body, arm_k_pair_captures)
+                || op_arms
+                    .iter()
+                    .any(|a| arm_body_has_k_pair_lambda(&a.body, arm_k_pair_captures))
+        }
+        Expr::IntLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::StringLit(..)
+        | Expr::Ident(..)
+        | Expr::ClosureEnvLoad { .. } => false,
+    }
+}
+
+fn block_has_k_pair_lambda(
+    b: &crate::ast::Block,
+    arm_k_pair_captures: &BTreeMap<String, crate::closure_convert::ArmKPairCapture>,
+) -> bool {
+    for s in &b.stmts {
+        match s {
+            crate::ast::Stmt::Let(l) => {
+                if arm_body_has_k_pair_lambda(&l.value, arm_k_pair_captures) {
+                    return true;
+                }
+            }
+            crate::ast::Stmt::Expr(e) => {
+                if arm_body_has_k_pair_lambda(e, arm_k_pair_captures) {
+                    return true;
+                }
+            }
+            crate::ast::Stmt::Perform(p) => {
+                for a in &p.args {
+                    if arm_body_has_k_pair_lambda(a, arm_k_pair_captures) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    b.tail
+        .as_ref()
+        .map(|t| arm_body_has_k_pair_lambda(t, arm_k_pair_captures))
+        .unwrap_or(false)
 }
 
 /// Plan B Task 55, Phase 4d/4e — byte offset within `args_ptr` for

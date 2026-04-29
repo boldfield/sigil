@@ -4723,6 +4723,84 @@ fn handle_with_eager_resume_arms_chains_let_yield_correctly() {
 }
 
 #[test]
+fn run_state_canonical_higher_order_helper_returns_threaded_value() {
+    // Stage-6.8-followup Layer 3c (+ closure_convert k_closure_idx
+    // fix) — the canonical `run_state(initial, comp)` higher-order
+    // helper from PR #38's reverted Task 109 first-cycle attempt.
+    // Composes: chained-let-yield body (2 performs), multi-arm
+    // handle (return + State.get + State.set), each op arm captures
+    // k into a lifted lambda that escapes via discharge AND is
+    // invoked from run_state's caller, k(arg) inside each lambda
+    // drives a synth-cont chain that itself performs (re-pushing
+    // the handler frame), inner arm discharges that propagate
+    // back as DISCHARGED (not converted to DONE through outer
+    // post_arm_k routing), and CPS-effected fn-typed parameter
+    // dispatch (`c: () -> Int ![State]`) via Sync shim.
+    //
+    // Trace:
+    //   - run_state(5, comp) → handle pushes State frame_B.
+    //   - comp's chained-let-yield body emits perform State.set(10)
+    //     with k_fn=step_0_addr.
+    //   - State.set arm fires; body discharges with lambda_set
+    //     capturing arg=10, k_closure=step_0_closure, k_fn=step_0
+    //     _addr, frame_ptr=frame_B.
+    //   - handle terminal: DISCHARGED. handle's overall = lambda_set.
+    //     state_fn = lambda_set.
+    //   - state_fn(5) = lambda_set(5):
+    //     * Inside, k(arg=10)(arg=10).
+    //     * Inner k(10) = lower_k_pair_call: re-push frame_B; build
+    //       Call(step_0_closure, step_0_addr, [10, null, identity],
+    //       count=3); run_loop.
+    //     * step_0 (Middle): bind 10 to _; push outer_post_arm_k(null,
+    //       identity); perform State.get with k_fn=step_1_addr.
+    //     * State.get arm fires; body discharges with lambda_get
+    //       capturing k_closure=step_1_closure, k_fn=step_1_addr,
+    //       frame_ptr=frame_B.
+    //     * Trampoline terminal: DISCHARGED at depth=1. Layer 3c
+    //       bypass: tag preserved as DISCHARGED, return.
+    //     * Pop frame_B. Layer 3a: tag=DISCHARGED, skip return arm.
+    //       Inner k(10) returns lambda_get_ptr.
+    //   - Outer call: lambda_get_ptr(10):
+    //     * call_indirect lambda_get_arm(lambda_get_ptr, 10).
+    //     * Inside, s=10. k(s)(s).
+    //     * Inner k(10) = lower_k_pair_call: re-push frame_B; build
+    //       Call(step_1_closure, step_1_addr, [10, null, identity]);
+    //       run_loop.
+    //     * step_1 (Final): bind 10 to v; lower v+1=11; emit_dispatch
+    //       _to_post_arm_k(11) → Call(null, identity, [11], 1).
+    //     * Trampoline routes through stale outer_post_arm_k entry
+    //       (null, identity) from earlier push; identity → Done(11).
+    //     * Pop frame_B. Layer 3a: tag=DONE, apply return arm.
+    //     * ret_fn(11): allocates closure for `(s) => v` with v=11
+    //       captured. Returns closure_for_v_eq_11.
+    //     * Inner k(10) returns closure_for_v_eq_11.
+    //     * Outer call: closure_for_v_eq_11(10) = 11.
+    //   - state_fn(5) returns 11.
+    let src = "effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
+                 v + 1\n\
+               }\n\
+               fn run_state(initial: Int, c: () -> Int ![State]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle c() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   State.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_layer3_canonical_run_state");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "11\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
 fn handle_returning_k_capturing_lambda_invoked_outside_handle() {
     // Stage-6.8-followup Layer 2 fix — k captured into a lifted lambda
     // that escapes the handle, then invoked from the handle's caller via

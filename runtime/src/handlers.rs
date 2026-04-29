@@ -853,6 +853,7 @@ pub unsafe extern "C" fn sigil_next_step_discharged(value: u64) -> *mut NextStep
 /// Safe to call. Returned pointer is valid until the next
 /// `sigil_arena_reset`.
 #[no_mangle]
+#[no_mangle]
 pub unsafe extern "C" fn sigil_next_step_call(
     closure_ptr: *mut u8,
     fn_ptr: *mut u8,
@@ -1286,6 +1287,33 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
         match tag {
             NEXT_STEP_TAG_DONE | NEXT_STEP_TAG_DISCHARGED => {
                 let v = (*current).value;
+                // Stage-6.8-followup Layer 3c — DISCHARGED bypasses
+                // outer_post_arm_k routing. Algebraic semantics of
+                // discharge: when ANY arm in a handle discharges, the
+                // handle terminates with the discharged value as its
+                // overall — subsequent computations in the body
+                // (including outer chain steps) are abandoned. The
+                // existing routing logic (Bug 2 era) was designed for
+                // multi-shot composition where the outer chain's
+                // step_i was waiting for a post-perform value AND the
+                // inner arm RESUMES (not discharges); for that case,
+                // the routing correctly forwards the resumed value.
+                // For the discharge case, routing through the chain
+                // is wrong: it converts DISCHARGED to DONE at the
+                // outermost terminal (since the routing builds a Call
+                // dispatched to identity, which returns Done). When
+                // `lower_k_pair_call` (called from a captured-k
+                // lifted lambda outside the handle) drives a synth-
+                // cont chain that discharges via an inner arm, this
+                // bypass preserves the DISCHARGED tag so the call
+                // site can correctly skip return arm dispatch on the
+                // R-typed discharge value.
+                if tag == NEXT_STEP_TAG_DISCHARGED {
+                    LAST_TERMINAL_TAG.with(|c| c.set(tag));
+                    LAST_TERMINAL_VALUE.with(|c| c.set(v));
+                    crate::arena::sigil_arena_reset();
+                    return v;
+                }
                 // Plan B' Stage 6.7 multi-shot composition fix: before
                 // returning to the wrapper, check the outer post_arm_k
                 // stack. If non-empty, pop the top entry and route the

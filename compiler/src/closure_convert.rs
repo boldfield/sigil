@@ -132,6 +132,20 @@ pub struct ArmKPairCapture {
     /// canonical run_state's `k(s)(s)` chain segfaults dereferencing
     /// an Int as a closure pointer.
     pub handle_span: Span,
+    /// Stage-6.8-followup Layer 3c — closure-record slot index for
+    /// the originating handle's frame_ptr. By convention this is
+    /// `k_fn_idx + 1` (immediately after the trailing-pair). The
+    /// lifted lambda's closure record gains a third trailing slot
+    /// holding the handler frame pointer captured at handle-allocation
+    /// time. `lower_k_pair_call` loads this slot at runtime and calls
+    /// `sigil_handle_push(frame_ptr)` before driving the trampoline,
+    /// then `sigil_handle_pop()` after — re-installing the handler
+    /// frame so synth-cont chains inside k(arg) can find the
+    /// originating handler's effect via `sigil_perform`'s handler-
+    /// stack walk. Without this, captured continuations invoked
+    /// outside the handle abort with "unhandled effect_id; handler
+    /// stack empty".
+    pub frame_ptr_idx: usize,
 }
 
 pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
@@ -589,37 +603,45 @@ impl Converter {
                     active_arm_k.as_ref().map(|(n, _)| n.clone());
                 let mut k_pair_info: Option<ArmKPairCapture> = None;
                 let caps: Vec<(String, Ty)> = if let Some(arm_k) = &active_arm_k_name {
+                    // Two-pass: first filter out k (recording its Ty
+                    // for op_ret_ty / handler_overall_ty extraction),
+                    // then assign k_closure_idx / k_fn_idx / frame_ptr_idx
+                    // based on the FINAL filtered.len(). The previous
+                    // single-pass form set indices at the moment k
+                    // was encountered, which collided with the env
+                    // slots when `k` appeared in `raw_caps` BEFORE
+                    // other captures (e.g., `fn (s) => k(arg)(arg)`
+                    // where the body references k first as callee
+                    // then arg as call args). Free-var collection
+                    // order is body-traversal order, not declaration
+                    // order, so the previous form was order-fragile.
+                    let mut k_ty_opt: Option<Ty> = None;
                     let mut filtered: Vec<(String, Ty)> = Vec::with_capacity(raw_caps.len());
                     for (cname, cty) in &raw_caps {
                         if cname == arm_k {
-                            // Match the captured-k Ty against
-                            // `Ty::Fn(sig)` to extract op_ret_ty +
-                            // handler_overall_ty for codegen's
-                            // dispatch. typecheck records k as
-                            // `Ty::Fn(FnSig{params:[op_ret], ret:
-                            // handler_overall, ...})`.
-                            if let Ty::Fn(sig) = cty {
-                                let op_ret_ty = sig.params.first().cloned().unwrap_or(Ty::Unit);
-                                let handler_overall_ty = sig.ret.clone();
-                                // k_closure_idx = filtered.len() (next
-                                // slot index AFTER regular captures);
-                                // k_fn_idx = k_closure_idx + 1.
-                                let handle_span = active_arm_k
-                                    .as_ref()
-                                    .map(|(_, s)| s.clone())
-                                    .unwrap_or_else(|| span.clone());
-                                k_pair_info = Some(ArmKPairCapture {
-                                    k_name: cname.clone(),
-                                    k_closure_idx: filtered.len(),
-                                    k_fn_idx: filtered.len() + 1,
-                                    op_ret_ty,
-                                    handler_overall_ty,
-                                    handle_span,
-                                });
+                            if matches!(cty, Ty::Fn(_)) {
+                                k_ty_opt = Some(cty.clone());
                                 continue;
                             }
                         }
                         filtered.push((cname.clone(), cty.clone()));
+                    }
+                    if let Some(Ty::Fn(sig)) = k_ty_opt {
+                        let op_ret_ty = sig.params.first().cloned().unwrap_or(Ty::Unit);
+                        let handler_overall_ty = sig.ret.clone();
+                        let handle_span = active_arm_k
+                            .as_ref()
+                            .map(|(_, s)| s.clone())
+                            .unwrap_or_else(|| span.clone());
+                        k_pair_info = Some(ArmKPairCapture {
+                            k_name: arm_k.clone(),
+                            k_closure_idx: filtered.len(),
+                            k_fn_idx: filtered.len() + 1,
+                            op_ret_ty,
+                            handler_overall_ty,
+                            handle_span,
+                            frame_ptr_idx: filtered.len() + 2,
+                        });
                     }
                     filtered
                 } else {

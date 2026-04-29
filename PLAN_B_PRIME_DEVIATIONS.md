@@ -561,6 +561,41 @@ The 3a fix is correctness-preserving for future cases; the canonical still requi
 
 **What's still blocking the canonical `run_state(initial, comp)`:** Layer 3c — captured continuation invoked outside handle hits empty handler stack. Verified: post-Layer-3b, canonical now hits a clean `unhandled effect_id 2 (op_id 0); handler stack empty` abort (exit 134) instead of a heap-pointer-shaped output. The synth-cont chain inside the lifted lambda IS now reachable (Layer 3b unblocked it); the State frame just isn't on the handler stack at that point.
 
+**Implementing commit(s):** [HEAD~1] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge (Layer 3b).
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Layer 3c fix] Re-push handler frame in lower_k_pair_call; preserve DISCHARGED through outer post_arm_k routing; fix closure_convert k-index collision
+
+**Plan B' Stage 6.8 Task 109 followup, post-Layer-3b — closes the canonical `run_state(initial, comp)` end to end.** Three coordinated fixes:
+
+### 3c-1: Trailing-triple `(k_closure, k_fn, frame_ptr)`
+
+Extends the lifted lambda's closure record's trailing-pair to a trailing-triple including the originating handler's frame pointer. Captured at handle-allocation time via `frame_1_ptr_snapshot`, threaded through:
+- `closure_convert::ArmKPairCapture` gains `frame_ptr_idx: usize` (= `k_fn_idx + 1`).
+- Handle expression's `alloc_arm_closure_record` (extended with `frame_ptr_v: Option<Value>`) writes `frame_ptr` to the arm closure record's trailing slot when the arm body has any nested k-pair-bearing `ClosureRecord` (detected via the new `arm_body_has_k_pair_lambda` walker).
+- Arm fn body emit reads frame_ptr from the arm closure record at offset `16 + 8 * captures.len()`, populating `Lowerer::arm_frame_ptr_v`.
+- `lower_closure_record` writes `arm_frame_ptr_v` to the lifted lambda's closure record's trailing-triple's third slot.
+- `lower_k_pair_call` loads frame_ptr from the closure record at `info.frame_ptr_idx`, calls `sigil_handle_push(frame_ptr)` before the run_loop, and `sigil_handle_pop()` after — re-installing the handler frame so synth-cont chains inside `k(arg)` find the originating effect via `sigil_perform`'s handler-stack walk. The handler frame's heap allocation persists across pop/re-push because `sigil_handle_pop` only unlinks; the closure record's `frame_ptr` slot keeps it GC-rooted.
+
+### 3c-2: Trampoline preserves DISCHARGED through outer_post_arm_k routing
+
+The Bug-2-era "discharged-routing-through-outer-post-arm-k" logic uniformly converted DISCHARGED to DONE at the outermost terminal (since the routing builds a `Call` dispatched to identity, which returns `Done`). For `lower_k_pair_call` driving a synth-cont chain that discharges via an inner arm, this lost the DISCHARGED signal we need to skip return arm dispatch on the R-typed discharge value. **Fix:** the trampoline now bypasses outer_post_arm_k routing when `tag == DISCHARGED` — DISCHARGED propagates to the outermost terminal directly, preserving the tag for `lower_k_pair_call`'s Layer 3a check. Algebraic semantics: when ANY arm discharges, the handle terminates; subsequent computations in the body (including outer chain steps) are abandoned. The Bug 2 routing was correct for multi-shot composition where the outer chain's step expects a post-perform value AND the inner arm RESUMES (not discharges); for the discharge case, routing through the chain conflates terminal semantics.
+
+### 3c-3: closure_convert k-index two-pass
+
+Pre-fix `closure_convert` set `k_closure_idx = filtered.len()` AT the moment `k` was encountered in `raw_caps`. When `k` appeared BEFORE other captures (e.g., `fn (s) => k(arg)(arg)` where the body's free-var traversal sees `k` first as callee), `k_closure_idx` was set to 0 — colliding with env slot 0 (the first regular capture). **Fix:** two-pass — first filter out `k` (recording its `Ty` for `op_ret_ty` / `handler_overall_ty` extraction), then assign `k_closure_idx` / `k_fn_idx` / `frame_ptr_idx` based on the FINAL `filtered.len()`. Order-independent. This bug was latent pre-Layer-3c since prior k-pair tests (rs_b: `k` only, no other captures) didn't exercise the order-dependence; Layer 3c surfaces it because canonical `run_state`'s set arm captures `arg` AND `k`.
+
+### 3c-4: Trailing-pair convention in lower_k_pair_call
+
+Pre-fix, `lower_k_pair_call` only wrote `args[0]` for k(arg) dispatch. When k_fn is a synth-cont (chained-let-yield step), the synth-cont's body expects the trailing-pair convention `[arg, post_arm_k_closure, post_arm_k_fn]` at `args[0..3]` — reading `args[1]` and `args[2]` for its own post-arm-k forwarding. Pre-fix, garbage at `args[1..3]` produced dispatched Calls with null fn_ptrs. **Fix:** `lower_k_pair_call` now writes `(null, identity)` at `args[1..3]` (count=3) — same convention as the arm-fn tail-k emit pattern.
+
+**Tests:**
+- `run_state_canonical_higher_order_helper_returns_threaded_value` — the canonical `run_state(5, comp)` with comp doing `set(10); v = get(); v + 1`. Asserts `11`. Composes Bug 2 + Layer 2 + Bug 1 + Layer 3a + Layer 3b + Layer 3c + closure_convert k-index fix end-to-end.
+- All prior probes (`rs_a`, `rs_b`, `rs_b1`, `dbg_a`, `rs_l3a`, `rs_l3b`, `rs_l3c`, `rs_l3d`) remain green.
+
+**Test suite:** 132/135 e2e (3 perf flakes pre-existing), 539 compiler unit, 73 runtime — all green. **The canonical `run_state` runs end-to-end.**
+
+**What this closes.** Plan B' Stage 6.8's "examples/state.sigil uses literal `run_state` higher-order helper and the threaded-state output is correct" criterion is now met (subject to landing the state.sigil rewrite in a follow-on commit). The `[DEVIATION Task 109] run_state canonical shape` entry's "What this fix DOES NOT close" residual list (Bug 1, Layer 2, Layer 3a, Layer 3b, Layer 3c) is fully resolved.
+
 **Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
 
 
