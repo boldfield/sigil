@@ -312,17 +312,27 @@ pub struct CheckedProgram {
     /// Plan B' Stage 6.8 Task 104 — per-call-site callee Ty for
     /// indirect-call sites whose callee resolved to `Ty::Fn(sig)`.
     /// Keyed by the call expression's span. Direct calls (callee
-    /// is `Ident(top_level_fn_name)`) skip insertion since codegen
-    /// resolves them via the `user_fn_refs` registry — this keeps
-    /// the table tight (one entry per indirect call) instead of
-    /// one per Call AST node. Reserved for **Phase C+** recursive
-    /// callee-type resolution: when the callee is a `Call(...)`
-    /// returning a `Ty::Fn` value, codegen reads this side-table
+    /// is `Ident(top_level_fn_name)` or a builtin name) skip
+    /// insertion since codegen resolves them via the `user_fn_refs`
+    /// registry — this keeps the table tight (one entry per
+    /// indirect call) instead of one per Call AST node.
+    ///
+    /// **Span-survival invariant.** Spans are preserved across
+    /// monomorphize cloning (the AST clone is structural — it copies
+    /// `Span` values verbatim, never re-spans), so a single
+    /// side-table entry serves all instantiations of a generic fn.
+    /// `lower_call` keys the side-table by the in-scope Call's
+    /// span and gets back the typecheck-resolved `Ty::Fn` regardless
+    /// of which monomorphized clone is currently being lowered.
+    ///
+    /// Phase C+ Part 1 activates this side-table for `Call(...)`
+    /// callees — when the callee is a call returning a `Ty::Fn`
+    /// value (e.g. `make_adder(5)(7)`), codegen reads the side-table
     /// at the call's span to derive the indirect signature without
-    /// re-walking the callee. Phase C v1's `lower_call` reads the
-    /// callee's `FnTypeExpr` from `Lowerer.local_fn_types` (the
-    /// param + let-binding map) instead, so this side-table is
-    /// populated but unread on the v1 path; Phase C+ activates it.
+    /// re-walking the callee. The `Ident(local)` callee path uses
+    /// `Lowerer.local_fn_types` (the surface `FnTypeExpr` from the
+    /// param / let-binding annotation); the two paths converge at
+    /// signature construction.
     pub call_callee_tys: BTreeMap<Span, Ty>,
     /// Plan B task 49 — per-fn polymorphic schemes recorded at the
     /// end of the typecheck pass. Monomorphization reads these to
@@ -2848,17 +2858,22 @@ impl Tc {
         // returned type.
         let resolved_ret = self.deref(&sig.ret);
 
-        // Plan B' Stage 6.8 Task 104 — record the resolved callee
-        // signature for indirect calls so Phase C+ codegen can
-        // resolve the call's signature via the side-table. Skip
-        // direct calls (callee = `Ident(top_level_fn_name)`) — those
-        // resolve through `user_fn_refs` at codegen, no side-table
-        // entry needed. Resolution happens *after* arg-type
-        // unification so generic-param `Ty::Var`s pick up their
-        // concrete bindings.
+        // Plan B' Stage 6.8 Task 104 (R3 finding 4) — record the
+        // resolved callee signature for indirect calls so Phase C+
+        // codegen can resolve the call's signature via the side-table.
+        // Skip direct calls — those resolve through `user_fn_refs` or
+        // builtin handlers at codegen, no side-table entry needed.
+        // Direct-call detection covers BOTH user-fn schemes
+        // (`fn_schemes`) and seeded builtins (`fn_env`, e.g.
+        // `int_to_string`); without the `fn_env` check, every
+        // `int_to_string(n)` call would populate the side-table
+        // wastefully. Resolution happens *after* arg-type unification
+        // so generic-param `Ty::Var`s pick up their concrete
+        // bindings.
         let is_direct_call = matches!(
             callee,
-            Expr::Ident(name, _) if self.fn_schemes.contains_key(name)
+            Expr::Ident(name, _)
+                if self.fn_schemes.contains_key(name) || self.fn_env.contains_key(name)
         );
         if !is_direct_call {
             let resolved_sig = FnSig {

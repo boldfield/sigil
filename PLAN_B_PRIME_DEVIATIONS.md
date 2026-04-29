@@ -179,3 +179,29 @@ allocates one closure record per iteration through `apply(double, ...)`. The rec
 **Failure mode:** Programs using `make_adder(5)(7)` or compose-with-captured-fn-types fail compilation with E0138. The existing `p17_compose_source_rejects_until_typeexpr_fn_ships` e2e test catches the compose case. Task 109 inverts these rejections to positive runtime tests after Phase C+ lands.
 
 **Implementing commit(s):** Task 104 (`bab66e5`) ships Phase C v1; the [forthcoming R2 fixup commit] converts the panic to E0138 via `unsupported_indirect_call_shape`. Phase C+ commit closes the deferred shapes.
+
+## 2026-04-29 — [DEVIATION e2e negative-test discipline] Most `!success()` assertions don't pin specific E-codes
+
+**Context:** Plan B' Stage 6.8 PR #38 R3 review (Finding 1) flagged that of 12 negative e2e tests in `compiler/tests/e2e.rs` (those that assert compile failure via `assert!(!out.status.success())`), only 3 also assert that a specific E-code appears in stderr. The other 9 just assert "compile failed" without specifying which error code triggered the failure.
+
+**The latent brittleness.** The `0baaa15` test fixup is a concrete example of how this can hide bugs: an earlier `make_adder_call_returning_fn_is_e0138_until_phase_c_plus` test source had a typecheck-level error (E0044) that fired before the codegen walker could emit E0138. The `assert!(!out.status.success())` passed (compile *did* fail) — but for the wrong reason. The test's claimed coverage of the E0138 path was a lie that only careful inspection caught.
+
+**The discipline:** every negative e2e test should pin the specific E-code it's asserting:
+
+```rust
+let stderr_str = String::from_utf8_lossy(&out.stderr);
+assert!(
+    stderr_str.contains("E0XXX"),
+    "expected E0XXX (description); got stderr={stderr_str:?}"
+);
+```
+
+This catches the "test fails for the wrong reason" class of bug. The 3 tests that already do this (`partial_handler_of_multi_op_effect_rejected_with_e0142`, `closure_env_load_callee_is_e0138_until_phase_c_plus`, the `make_adder_call_returning_fn` original) are the discipline pattern.
+
+**Why deferred:** retrofitting 9 tests requires identifying the right E-code for each shape, which involves running the test (impossible in this pod environment due to Cranelift OOM constraints). Each test landing should add its own E-code check; a bulk sweep risks introducing wrong assertions.
+
+**Failure mode:** none today — all 12 tests pass on current main. The risk surfaces when a future code change shifts an error from one upstream pass to another (as happened with the `make_adder` typecheck-vs-codegen shift). The test still passes ("compile failed") but no longer covers the path it was named for.
+
+**Closure path:** Plan C's spec validation work touches a lot of negative-shape coverage; folding the discipline retrofit into that work is the natural seam. New negative tests landing in Stage 6.8+ should include the E-code check.
+
+**Implementing commit(s):** R3 fixup commit documents this deviation; new tests already follow the discipline (`closure_env_load_callee_is_e0138_until_phase_c_plus` from R2 / `0baaa15`). Existing 9 tests deferred.

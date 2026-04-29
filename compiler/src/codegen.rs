@@ -795,30 +795,36 @@ fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
                 // `call_callee_tys`.
                 Expr::Ident(_, _) | Expr::ClosureRecord { .. } | Expr::Call { .. } => None,
                 Expr::ClosureEnvLoad { name, .. } => Some(format!(
-                    "[E0138] indirect call through a captured fn-typed value \
-                     `{name}` (lifted into a closure record's env at \
-                     {:?}..{:?}) requires Plan B' Stage 6.8 Phase C+ support \
-                     (ClosureEnvLoad-callee dispatch); deferred from Phase \
-                     C v1. The lambda body is calling a fn-typed value \
-                     captured from the surrounding scope.",
-                    span.line, span.column
+                    "[E0138] {file}:{line}:{col}: indirect call through a \
+                     captured fn-typed value `{name}` requires Plan B' \
+                     Stage 6.8 Phase C+ Part 2 (ClosureEnvLoad-callee \
+                     dispatch); the lambda body is calling a fn-typed \
+                     value captured from the surrounding scope.",
+                    file = span.file,
+                    line = span.line,
+                    col = span.column
                 )),
                 Expr::Lambda { .. } => {
                     // closure_convert rewrites every Lambda to ClosureRecord
                     // before this walker runs; reaching this arm means a
                     // pass-order invariant broke.
                     Some(format!(
-                        "[E0138] indirect call through a Lambda callee at \
-                         {:?}..{:?}: closure_convert should have rewritten \
-                         this to ClosureRecord — invariant break, file a bug.",
-                        span.line, span.column
+                        "[E0138] {file}:{line}:{col}: indirect call through \
+                         a Lambda callee — closure_convert should have \
+                         rewritten this to ClosureRecord. Invariant break, \
+                         file a bug.",
+                        file = span.file,
+                        line = span.line,
+                        col = span.column
                     ))
                 }
                 _ => Some(format!(
-                    "[E0138] indirect call through an unsupported callee \
-                     shape ({:?}..{:?}); Phase C v1 supports `Ident` and \
-                     `ClosureRecord` callees only.",
-                    span.line, span.column
+                    "[E0138] {file}:{line}:{col}: indirect call through an \
+                     unsupported callee shape; Phase C v1 supports `Ident`, \
+                     `ClosureRecord`, and `Call(...)` callees only.",
+                    file = span.file,
+                    line = span.line,
+                    col = span.column
                 )),
             }
         }
@@ -11738,6 +11744,92 @@ mod tests {
     // params + ret so any nested `Apply` / generic-param ref still
     // surfaces; concrete fn-types pass through cleanly.
     // ----------------------------------------------------------------
+
+    // ----------------------------------------------------------------
+    // R3 finding 3 — cranelift_ty_for_type_expr / cranelift_ty_of_ty
+    // parity. Phase C+ Part 1's indirect-call sig builder dispatches
+    // through one or the other depending on callee shape (Surface
+    // vs Resolved); a future widening of the type set must touch
+    // BOTH or the indirect ABI silently mismatches. Pin the parity
+    // for the primitive set + fn-type + post-mono-mangled user types.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn cranelift_ty_for_type_expr_and_of_ty_agree_on_primitives() {
+        use crate::ast::TypeExpr;
+        use crate::errors::Span;
+        use crate::typecheck::Ty;
+        let span = Span::synthetic("x.sigil");
+        let ptr = types::I64;
+        let cases: &[(TypeExpr, Ty, &str)] = &[
+            (
+                TypeExpr::Named("Int".to_string(), span.clone()),
+                Ty::Int,
+                "Int",
+            ),
+            (
+                TypeExpr::Named("Bool".to_string(), span.clone()),
+                Ty::Bool,
+                "Bool",
+            ),
+            (
+                TypeExpr::Named("Char".to_string(), span.clone()),
+                Ty::Char,
+                "Char",
+            ),
+            (
+                TypeExpr::Named("Byte".to_string(), span.clone()),
+                Ty::Byte,
+                "Byte",
+            ),
+            (
+                TypeExpr::Named("Unit".to_string(), span.clone()),
+                Ty::Unit,
+                "Unit",
+            ),
+            (
+                TypeExpr::Named("String".to_string(), span.clone()),
+                Ty::String,
+                "String",
+            ),
+            (
+                TypeExpr::Named("MyType".to_string(), span.clone()),
+                Ty::User("MyType".to_string(), Vec::new()),
+                "User-named",
+            ),
+        ];
+        for (te, ty, label) in cases {
+            assert_eq!(
+                cranelift_ty_for_type_expr(te, ptr),
+                cranelift_ty_of_ty(ty, ptr),
+                "Cranelift type drift on {label}: surface vs resolved differ"
+            );
+        }
+    }
+
+    #[test]
+    fn cranelift_ty_for_type_expr_and_of_ty_agree_on_fn_type() {
+        use crate::ast::{FnTypeExpr, TypeExpr};
+        use crate::errors::Span;
+        use crate::typecheck::{FnSig, Ty};
+        let span = Span::synthetic("x.sigil");
+        let ptr = types::I64;
+        let te = TypeExpr::Fn(Box::new(FnTypeExpr {
+            params: vec![TypeExpr::Named("Int".to_string(), span.clone())],
+            ret: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            span: span.clone(),
+        }));
+        let ty = Ty::Fn(Box::new(FnSig {
+            params: vec![Ty::Int],
+            ret: Ty::Int,
+            effects: Vec::new(),
+            effect_row_var: None,
+        }));
+        assert_eq!(cranelift_ty_for_type_expr(&te, ptr), ptr);
+        assert_eq!(cranelift_ty_of_ty(&ty, ptr), ptr);
+    }
 
     #[test]
     fn walker_accepts_fn_type_in_param_position() {
