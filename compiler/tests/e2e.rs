@@ -6164,6 +6164,106 @@ fn std_result_and_then_ok_chains_through() {
     assert_eq!(stdout, "15\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 65 — Array runtime + builtin coverage =====
+//
+// `Array[A]` is a builtin generic type registered at the typechecker
+// (via `builtin_types`); its 5 operations are builtin generic schemes
+// in `tc.fn_schemes`. Codegen lowers each call to a single FFI
+// invocation against `runtime/src/array.rs`'s `sigil_array_*`
+// primitives. v1 supports `Int` and pointer-typed elements; narrower
+// scalars (Bool, Char, Byte) are deferred per `[DEVIATION Task 65]`.
+
+/// Allocate, set, and read back an Int array.
+#[test]
+fn std_array_alloc_set_get_returns_42() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let arr: Array[Int] = array_alloc(3, 0);\n  \
+                 let arr2: Array[Int] = array_set(arr, 1, 42);\n  \
+                 let v: Int = array_get(arr2, 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_alloc_set_get");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `array_set` returns a fresh array; the original is unchanged.
+#[test]
+fn std_array_set_is_immutable() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let arr: Array[Int] = array_alloc(3, 7);\n  \
+                 let arr2: Array[Int] = array_set(arr, 1, 99);\n  \
+                 let original_v: Int = array_get(arr, 1);\n  \
+                 let updated_v: Int = array_get(arr2, 1);\n  \
+                 perform IO.println(int_to_string(original_v));\n  \
+                 perform IO.println(int_to_string(updated_v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_immutable_set");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n99\n", "stderr={stderr:?}");
+}
+
+/// `array_length` works on Sudoku-board sized arrays (81 elements,
+/// past the 6-bit count-field cap of 63).
+#[test]
+fn std_array_length_at_sudoku_size() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let arr: Array[Int] = array_alloc(81, 0);\n  \
+                 let n: Int = array_length(arr);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_sudoku_length");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "81\n", "stderr={stderr:?}");
+}
+
+/// `array_empty[A]()` produces a zero-length array.
+#[test]
+fn std_array_empty_returns_zero_length() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let arr: Array[Int] = array_empty();\n  \
+                 let n: Int = array_length(arr);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_empty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// Array of String — exercises pointer-typed elements end-to-end.
+#[test]
+fn std_array_of_string_round_trips() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let arr: Array[String] = array_alloc(2, \"hi\");\n  \
+                 let arr2: Array[String] = array_set(arr, 0, \"hello\");\n  \
+                 perform IO.println(array_get(arr2, 0));\n  \
+                 perform IO.println(array_get(arr2, 1));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_string");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello\nhi\n", "stderr={stderr:?}");
+}
+
+/// `import std.array` should be accepted (no-op since the surface
+/// is already available unconditionally as a builtin).
+#[test]
+fn std_array_import_is_noop_no_op() {
+    let src = "import std.array\n\
+               fn main() -> Int ![IO] {\n  \
+                 let arr: Array[Int] = array_alloc(1, 5);\n  \
+                 perform IO.println(int_to_string(array_get(arr, 0)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration

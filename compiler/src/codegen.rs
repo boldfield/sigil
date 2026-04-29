@@ -694,6 +694,14 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
         }
     }
     globals.insert("int_to_string".to_string());
+    // Plan C Task 65 — Array runtime primitives are top-level
+    // builtins, not user-declared fns; they live in globals so
+    // the handle-walker doesn't flag references as unbound.
+    globals.insert("array_alloc".to_string());
+    globals.insert("array_empty".to_string());
+    globals.insert("array_length".to_string());
+    globals.insert("array_get".to_string());
+    globals.insert("array_set".to_string());
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
             if let Some(msg) = block_unsupported_handle(&f.body, &globals, &effects_resumes_many) {
@@ -4617,6 +4625,62 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_int_to_string", Linkage::Import, &int_to_string_sig)
         .map_err(|e| format!("declare sigil_int_to_string: {e}"))?;
 
+    // Plan C Task 65 — runtime Array primitives. Five FFI symbols
+    // expose `runtime/src/array.rs`'s `sigil_array_alloc` /
+    // `_empty` / `_length` / `_get` / `_set` to compiled programs.
+    // Typecheck registers builtin generic `Scheme`s for each of
+    // these in `tc.fn_schemes`; codegen dispatches via the
+    // `Expr::Ident(name)` arms in `lower_call` below.
+    //
+    // Element values use 64-bit slots — `Int` and pointer types
+    // fit directly. Narrower scalar types (`Bool` / `Char` /
+    // `Byte`) are not supported in v1; codegen-level narrow on
+    // `array_get` would require threading the per-call type-arg
+    // tuple through the Lowerer (defer to v2).
+
+    // sigil_array_alloc(len: i64, fill: u64) -> *mut u8
+    let mut array_alloc_sig = Signature::new(isa_call_conv(&module));
+    array_alloc_sig.params.push(AbiParam::new(types::I64));
+    array_alloc_sig.params.push(AbiParam::new(types::I64));
+    array_alloc_sig.returns.push(AbiParam::new(pointer_ty));
+    let array_alloc = module
+        .declare_function("sigil_array_alloc", Linkage::Import, &array_alloc_sig)
+        .map_err(|e| format!("declare sigil_array_alloc: {e}"))?;
+
+    // sigil_array_empty() -> *mut u8
+    let mut array_empty_sig = Signature::new(isa_call_conv(&module));
+    array_empty_sig.returns.push(AbiParam::new(pointer_ty));
+    let array_empty = module
+        .declare_function("sigil_array_empty", Linkage::Import, &array_empty_sig)
+        .map_err(|e| format!("declare sigil_array_empty: {e}"))?;
+
+    // sigil_array_length(arr: *const u8) -> i64
+    let mut array_length_sig = Signature::new(isa_call_conv(&module));
+    array_length_sig.params.push(AbiParam::new(pointer_ty));
+    array_length_sig.returns.push(AbiParam::new(types::I64));
+    let array_length = module
+        .declare_function("sigil_array_length", Linkage::Import, &array_length_sig)
+        .map_err(|e| format!("declare sigil_array_length: {e}"))?;
+
+    // sigil_array_get(arr: *const u8, i: i64) -> i64
+    let mut array_get_sig = Signature::new(isa_call_conv(&module));
+    array_get_sig.params.push(AbiParam::new(pointer_ty));
+    array_get_sig.params.push(AbiParam::new(types::I64));
+    array_get_sig.returns.push(AbiParam::new(types::I64));
+    let array_get = module
+        .declare_function("sigil_array_get", Linkage::Import, &array_get_sig)
+        .map_err(|e| format!("declare sigil_array_get: {e}"))?;
+
+    // sigil_array_set(arr: *const u8, i: i64, val: i64) -> *mut u8
+    let mut array_set_sig = Signature::new(isa_call_conv(&module));
+    array_set_sig.params.push(AbiParam::new(pointer_ty));
+    array_set_sig.params.push(AbiParam::new(types::I64));
+    array_set_sig.params.push(AbiParam::new(types::I64));
+    array_set_sig.returns.push(AbiParam::new(pointer_ty));
+    let array_set = module
+        .declare_function("sigil_array_set", Linkage::Import, &array_set_sig)
+        .map_err(|e| format!("declare sigil_array_set: {e}"))?;
+
     // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
     // Phase 3a wires the frame allocation + push/pop ABI from Task
     // 56 around every `handle` body. Arms stay null in this commit
@@ -5379,6 +5443,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         string_new,
         alloc,
         int_to_string,
+        array_alloc,
+        array_empty,
+        array_length,
+        array_get,
+        array_set,
         handler_frame_new,
         handle_push,
         handle_pop,
@@ -5436,6 +5505,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 string_new_ref,
                 alloc_ref,
                 int_to_string_ref,
+                array_alloc_ref,
+                array_empty_ref,
+                array_length_ref,
+                array_get_ref,
+                array_set_ref,
                 handler_frame_new_ref,
                 handle_push_ref,
                 handle_pop_ref,
@@ -5827,6 +5901,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     string_new_ref,
                     alloc_ref,
                     int_to_string_ref,
+                    array_alloc_ref,
+                    array_empty_ref,
+                    array_length_ref,
+                    array_get_ref,
+                    array_set_ref,
                     handler_frame_new_ref,
                     handle_push_ref,
                     handle_pop_ref,
@@ -5970,6 +6049,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 string_new_ref,
                 alloc_ref,
                 int_to_string_ref,
+                array_alloc_ref,
+                array_empty_ref,
+                array_length_ref,
+                array_get_ref,
+                array_set_ref,
                 handler_frame_new_ref,
                 handle_push_ref,
                 handle_pop_ref,
@@ -6319,6 +6403,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     string_new_ref,
                     alloc_ref,
                     int_to_string_ref,
+                    array_alloc_ref,
+                    array_empty_ref,
+                    array_length_ref,
+                    array_get_ref,
+                    array_set_ref,
                     handler_frame_new_ref,
                     handle_push_ref,
                     handle_pop_ref,
@@ -6455,6 +6544,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     string_new_ref,
                     alloc_ref,
                     int_to_string_ref,
+                    array_alloc_ref,
+                    array_empty_ref,
+                    array_length_ref,
+                    array_get_ref,
+                    array_set_ref,
                     handler_frame_new_ref,
                     handle_push_ref,
                     handle_pop_ref,
@@ -7038,6 +7132,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     string_new_ref,
                     alloc_ref,
                     int_to_string_ref,
+                    array_alloc_ref,
+                    array_empty_ref,
+                    array_length_ref,
+                    array_get_ref,
+                    array_set_ref,
                     handler_frame_new_ref,
                     handle_push_ref,
                     handle_pop_ref,
@@ -7162,6 +7261,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     string_new_ref,
                     alloc_ref,
                     int_to_string_ref,
+                    array_alloc_ref,
+                    array_empty_ref,
+                    array_length_ref,
+                    array_get_ref,
+                    array_set_ref,
                     handler_frame_new_ref,
                     handle_push_ref,
                     handle_pop_ref,
@@ -7369,6 +7473,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 string_new_ref,
                 alloc_ref,
                 int_to_string_ref,
+                array_alloc_ref,
+                array_empty_ref,
+                array_length_ref,
+                array_get_ref,
+                array_set_ref,
                 handler_frame_new_ref,
                 handle_push_ref,
                 handle_pop_ref,
@@ -7404,6 +7513,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 string_new_ref,
                 alloc_ref,
                 int_to_string_ref,
+                array_alloc_ref,
+                array_empty_ref,
+                array_length_ref,
+                array_get_ref,
+                array_set_ref,
                 handler_frame_new_ref,
                 handle_push_ref,
                 handle_pop_ref,
@@ -7650,6 +7764,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         string_new_ref,
                         alloc_ref,
                         int_to_string_ref,
+                        array_alloc_ref,
+                        array_empty_ref,
+                        array_length_ref,
+                        array_get_ref,
+                        array_set_ref,
                         handler_frame_new_ref,
                         handle_push_ref,
                         handle_pop_ref,
@@ -7684,6 +7803,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         string_new_ref,
                         alloc_ref,
                         int_to_string_ref,
+                        array_alloc_ref,
+                        array_empty_ref,
+                        array_length_ref,
+                        array_get_ref,
+                        array_set_ref,
                         handler_frame_new_ref,
                         handle_push_ref,
                         handle_pop_ref,
@@ -8291,6 +8415,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             string_new_ref,
                             alloc_ref,
                             int_to_string_ref,
+                            array_alloc_ref,
+                            array_empty_ref,
+                            array_length_ref,
+                            array_get_ref,
+                            array_set_ref,
                             handler_frame_new_ref,
                             handle_push_ref,
                             handle_pop_ref,
@@ -8326,6 +8455,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             string_new_ref,
                             alloc_ref,
                             int_to_string_ref,
+                            array_alloc_ref,
+                            array_empty_ref,
+                            array_length_ref,
+                            array_get_ref,
+                            array_set_ref,
                             handler_frame_new_ref,
                             handle_push_ref,
                             handle_pop_ref,
@@ -8941,6 +9075,18 @@ struct Lowerer<'a, 'b> {
     /// `Ident("int_to_string")` and no user fn of the same name
     /// shadows it.
     int_to_string_ref: FuncRef,
+
+    /// Plan C Task 65 — runtime Array primitive refs. `lower_call`
+    /// dispatches via `Expr::Ident(name)` arms when `name` matches
+    /// one of `array_alloc` / `array_empty` / `array_length` /
+    /// `array_get` / `array_set`. Each call lowers to a single FFI
+    /// invocation; element values are 64-bit slots (Int and pointer
+    /// types fit directly).
+    array_alloc_ref: FuncRef,
+    array_empty_ref: FuncRef,
+    array_length_ref: FuncRef,
+    array_get_ref: FuncRef,
+    array_set_ref: FuncRef,
 
     /// Plan B Task 55 (Phase 3a) — handler-frame ABI runtime refs
     /// from Task 56. `lower_expr` for `Expr::Handle` calls
@@ -10969,6 +11115,55 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .push_placeholder(function_code_offset(&self.builder, call));
                 self.builder.inst_results(call)[0]
             }
+            // Plan C Task 65 — runtime Array primitives. Each lowers to
+            // a single FFI invocation. `array_alloc` and `array_set`
+            // touch the Boehm heap, so they get a safepoint stackmap
+            // placeholder. Element values are 64-bit slots — pointer
+            // and Int types fit directly. `array_get` returns I64
+            // unconditionally; codegen-level narrow for narrower
+            // scalar types (Bool / Char / Byte) is a v2 follow-up.
+            Expr::Ident(name, _) if name == "array_alloc" => {
+                assert_eq!(args.len(), 2, "array_alloc builtin arg count is not 2");
+                let len = self.lower_expr(&args[0]);
+                let fill = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.array_alloc_ref, &[len, fill]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "array_empty" => {
+                assert_eq!(args.len(), 0, "array_empty builtin arg count is not 0");
+                let call = self.builder.ins().call(self.array_empty_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "array_length" => {
+                assert_eq!(args.len(), 1, "array_length builtin arg count is not 1");
+                let arr = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.array_length_ref, &[arr]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "array_get" => {
+                assert_eq!(args.len(), 2, "array_get builtin arg count is not 2");
+                let arr = self.lower_expr(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.array_get_ref, &[arr, idx]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "array_set" => {
+                assert_eq!(args.len(), 3, "array_set builtin arg count is not 3");
+                let arr = self.lower_expr(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let val = self.lower_expr(&args[2]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.array_set_ref, &[arr, idx, val]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
             Expr::ClosureRecord { code_fn_name, .. } => {
                 // Evaluate the ClosureRecord first (allocates + stores
                 // the closure on the heap) and use its pointer as the
@@ -12112,6 +12307,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // Plan A2 task 34: the `int_to_string` builtin returns
                 // a Sigil `String`, which is a heap pointer.
                 Expr::Ident(name, _) if name == "int_to_string" => self.pointer_ty,
+                // Plan C Task 65 — Array primitive return types.
+                // `array_alloc` / `array_empty` / `array_set` return
+                // a heap-allocated Array (pointer). `array_length`
+                // returns Int. `array_get` returns A's slot value;
+                // I64 covers Int and pointer types (the common case).
+                // Narrower scalar elements (Bool / Char / Byte) are
+                // not supported in v1 — see [DEVIATION Task 65].
+                Expr::Ident(name, _)
+                    if matches!(name.as_str(), "array_alloc" | "array_empty" | "array_set") =>
+                {
+                    self.pointer_ty
+                }
+                Expr::Ident(name, _) if name == "array_length" || name == "array_get" => types::I64,
                 Expr::ClosureRecord { code_fn_name, .. } => self
                     .user_fns
                     .get(code_fn_name)
@@ -12502,6 +12710,12 @@ struct PerFnRefsCtx<'a> {
     string_new: cranelift_module::FuncId,
     alloc: cranelift_module::FuncId,
     int_to_string: cranelift_module::FuncId,
+    /// Plan C Task 65 — runtime Array primitive FuncIds.
+    array_alloc: cranelift_module::FuncId,
+    array_empty: cranelift_module::FuncId,
+    array_length: cranelift_module::FuncId,
+    array_get: cranelift_module::FuncId,
+    array_set: cranelift_module::FuncId,
     handler_frame_new: cranelift_module::FuncId,
     handle_push: cranelift_module::FuncId,
     handle_pop: cranelift_module::FuncId,
@@ -12585,6 +12799,12 @@ struct PerFnRefs {
     string_new_ref: FuncRef,
     alloc_ref: FuncRef,
     int_to_string_ref: FuncRef,
+    /// Plan C Task 65 — runtime Array primitive FuncRefs.
+    array_alloc_ref: FuncRef,
+    array_empty_ref: FuncRef,
+    array_length_ref: FuncRef,
+    array_get_ref: FuncRef,
+    array_set_ref: FuncRef,
     handler_frame_new_ref: FuncRef,
     handle_push_ref: FuncRef,
     handle_pop_ref: FuncRef,
@@ -12645,6 +12865,12 @@ fn prepare_per_fn_refs(
     let string_new_ref = module.declare_func_in_func(ctx.string_new, builder.func);
     let alloc_ref = module.declare_func_in_func(ctx.alloc, builder.func);
     let int_to_string_ref = module.declare_func_in_func(ctx.int_to_string, builder.func);
+    // Plan C Task 65 — Array primitives.
+    let array_alloc_ref = module.declare_func_in_func(ctx.array_alloc, builder.func);
+    let array_empty_ref = module.declare_func_in_func(ctx.array_empty, builder.func);
+    let array_length_ref = module.declare_func_in_func(ctx.array_length, builder.func);
+    let array_get_ref = module.declare_func_in_func(ctx.array_get, builder.func);
+    let array_set_ref = module.declare_func_in_func(ctx.array_set, builder.func);
     let handler_frame_new_ref = module.declare_func_in_func(ctx.handler_frame_new, builder.func);
     let handle_push_ref = module.declare_func_in_func(ctx.handle_push, builder.func);
     let handle_pop_ref = module.declare_func_in_func(ctx.handle_pop, builder.func);
@@ -12745,6 +12971,11 @@ fn prepare_per_fn_refs(
         string_new_ref,
         alloc_ref,
         int_to_string_ref,
+        array_alloc_ref,
+        array_empty_ref,
+        array_length_ref,
+        array_get_ref,
+        array_set_ref,
         handler_frame_new_ref,
         handle_push_ref,
         handle_pop_ref,

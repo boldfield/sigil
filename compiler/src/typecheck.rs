@@ -545,6 +545,15 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // downstream passes always see a single canonical variant set.
     let mut types: BTreeMap<String, TypeDecl> = BTreeMap::new();
     let mut errors: Vec<CompilerError> = Vec::new();
+    // Plan C Task 65 — builtin generic types injected before user
+    // types. `Array[A]` has no user-constructible variants (its only
+    // constructors are the runtime FFI primitives `sigil_array_*`,
+    // exposed via builtin generic schemes in `fn_schemes` below). A
+    // user `type Array = ...` declaration trips E0113 (duplicate)
+    // through the existing user-type loop — Array is not shadowable.
+    for builtin in builtin_types(&program.file) {
+        types.insert(builtin.name.clone(), builtin);
+    }
     for item in &program.items {
         if let Item::Type(td) = item {
             if types.contains_key(&td.name) {
@@ -704,6 +713,12 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         handle_return_arm_captures: BTreeMap::new(),
         handle_body_ty: BTreeMap::new(),
     };
+    // Plan C Task 65 — builtin generic schemes for `array_alloc` /
+    // `array_empty` / `array_length` / `array_get` / `array_set`.
+    // Registered before the user-fn scheme pre-pass so a user
+    // `fn array_alloc(...)` declaration overwrites the builtin
+    // (same shadowing model as `int_to_string`).
+    register_builtin_array_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -1062,6 +1077,103 @@ fn builtin_fn_env() -> BTreeMap<String, Ty> {
         })),
     );
     m
+}
+
+/// Plan C Task 65 — builtin generic types registered in `tc.types`
+/// before user types. `Array[A]` is opaque (no user-constructible
+/// variants); its values are produced exclusively via the builtin
+/// generic functions registered alongside in `fn_schemes`.
+///
+/// `file` is the user program's file path, used to construct
+/// synthetic spans that point at the user file rather than a
+/// fictional builtin location. Diagnostics that reference a
+/// builtin TypeDecl's span will surface against the user's own
+/// program — fine for v1's narrow surface (Array doesn't surface
+/// in user-visible diagnostics today).
+fn builtin_types(file: &str) -> Vec<TypeDecl> {
+    use crate::ast::{GenericParam, TypeDecl};
+    let span = Span::synthetic(file);
+    vec![TypeDecl {
+        name: "Array".to_string(),
+        name_span: span.clone(),
+        generic_params: vec![GenericParam {
+            name: "A".to_string(),
+            span: span.clone(),
+        }],
+        variants: Vec::new(),
+        span,
+    }]
+}
+
+/// Plan C Task 65 — builtin generic function schemes for the array
+/// runtime primitives. Inserted into `tc.fn_schemes` after the
+/// generic-fn-allocation pre-pass so user fns of the same names
+/// shadow these (mirrors `int_to_string`'s shadowability via
+/// `fn_env`). Allocates fresh type-var ids per builtin so each
+/// scheme is fully resolved before instantiation at call sites.
+///
+/// Operations registered:
+/// - `array_alloc[A](Int, A) -> Array[A] ![]`
+/// - `array_empty[A]() -> Array[A] ![]`
+/// - `array_length[A](Array[A]) -> Int ![]`
+/// - `array_get[A](Array[A], Int) -> A ![]`
+/// - `array_set[A](Array[A], Int, A) -> Array[A] ![]`
+fn register_builtin_array_schemes(tc: &mut Tc) {
+    // Allocate one fresh type-var per scheme. Each scheme's `A`
+    // is independently fresh so cross-scheme unification stays
+    // sound (e.g. `array_alloc[A]` and `array_get[A]` use
+    // different `A_id` slots).
+    let make_scheme = |params: Vec<Ty>, ret: Ty, type_vars: Vec<u32>| Scheme {
+        type_vars,
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    {
+        let a = tc.fresh_ty_var();
+        let array_a = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "array_alloc".to_string(),
+            make_scheme(vec![Ty::Int, Ty::Var(a)], array_a, vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let array_a = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "array_empty".to_string(),
+            make_scheme(vec![], array_a, vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let array_a = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "array_length".to_string(),
+            make_scheme(vec![array_a], Ty::Int, vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let array_a = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "array_get".to_string(),
+            make_scheme(vec![array_a, Ty::Int], Ty::Var(a), vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let array_a = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        let array_a_clone = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "array_set".to_string(),
+            make_scheme(vec![array_a, Ty::Int, Ty::Var(a)], array_a_clone, vec![a]),
+        );
+    }
 }
 
 struct Tc {
@@ -8746,6 +8858,81 @@ mod tests {
     }
 
     // ===== Plan C Task 64 — std/list typecheck-level coverage =====
+
+    // ===== Plan C Task 65 — builtin Array typecheck-level coverage =====
+    //
+    // Array is registered as a builtin generic type via builtin_types().
+    // Array operations (`array_alloc`, `array_empty`, `array_length`,
+    // `array_get`, `array_set`) are registered as builtin generic
+    // schemes via register_builtin_array_schemes(). Both are accessible
+    // without an `import std.array` statement (Array is a primitive at
+    // the typecheck level).
+
+    #[test]
+    fn array_alloc_get_set_typechecks_cleanly() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let arr: Array[Int] = array_alloc(3, 0);\n  \
+                     let v: Int = array_get(arr, 0);\n  \
+                     let arr2: Array[Int] = array_set(arr, 1, 42);\n  \
+                     let n: Int = array_length(arr2);\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn array_empty_typechecks_with_explicit_type_annotation() {
+        // array_empty[A]() with no value args needs an explicit type
+        // annotation at the let-binding to pin A.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let arr: Array[Int] = array_empty();\n  \
+                     let n: Int = array_length(arr);\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn array_of_string_typechecks_cleanly() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let arr: Array[String] = array_alloc(2, \"hi\");\n  \
+                     let s: String = array_get(arr, 0);\n  \
+                     perform IO.println(s);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn array_get_arg_type_mismatch_fires_e0044() {
+        // array_get(arr, "not int") — the index must be Int.
+        let src = "fn main() -> Int ![] {\n  \
+                     let arr: Array[Int] = array_alloc(1, 0);\n  \
+                     let v: Int = array_get(arr, \"x\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 from array_get's index arg mismatch; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_redeclares_array_type_fires_e0113() {
+        let src = "type Array = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "expected E0113 (duplicate type Array); got {errs:?}"
+        );
+    }
 
     #[test]
     fn import_std_list_typechecks_cleanly() {
