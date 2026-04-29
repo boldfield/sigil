@@ -69,6 +69,58 @@ pub struct ClosureConvertedProgram {
     /// dispatch (compose-style: lambda body invokes a captured
     /// fn-typed value).
     pub captures_typed: BTreeMap<String, Vec<(String, Ty)>>,
+    /// Plan B' Stage 6.8 Task 107 Phase B — arm-body lambda's
+    /// k-pair capture metadata. Keyed by synth lambda fn name
+    /// (`$lambda_N`). Populated when closure_convert hoists a
+    /// Lambda inside a `handle` op-arm body whose captures include
+    /// the arm's continuation `k`.
+    ///
+    /// **Trailing-pair convention.** The synth fn's closure record
+    /// allocates 2 trailing slots (after regular captures) for the
+    /// captured continuation: `k_closure` at offset
+    /// `16 + 8 * k_closure_idx` and `k_fn` at offset
+    /// `16 + 8 * k_fn_idx` where `k_fn_idx == k_closure_idx + 1`.
+    /// This parallels the arm fn's args_ptr layout — arm fns
+    /// receive `(user_args..., k_closure, k_fn)` as a trailing pair
+    /// at args_ptr offsets `n*8` / `(n+1)*8`. The lifted lambda's
+    /// closure record uses the same convention at the closure-
+    /// record-slots layer instead of the args_ptr layer.
+    ///
+    /// Codegen reads this map at two sites:
+    /// - `lower_closure_record` (arm fn's Lowerer): when allocating
+    ///   the lifted lambda's closure record, allocate the extra 2
+    ///   slots and populate them from the arm fn's k_closure_v /
+    ///   k_fn_v locals.
+    /// - `lower_call` (synth fn's Lowerer): when the callee is
+    ///   `Ident(k_name)` AND this synth fn has KPairInfo, dispatch
+    ///   via `sigil_next_step_call(load_k_closure, load_k_fn, arg)`
+    ///   using the trailing slots.
+    pub arm_k_pair_captures: BTreeMap<String, ArmKPairCapture>,
+}
+
+/// Plan B' Stage 6.8 Task 107 Phase B — k-pair capture info for a
+/// lifted arm-body lambda. See `ClosureConvertedProgram::arm_k_pair_
+/// captures` for the trailing-pair convention.
+#[derive(Clone, Debug)]
+pub struct ArmKPairCapture {
+    /// The arm's continuation binding name (e.g., `k`). Used by
+    /// codegen's `lower_call` to detect Call sites whose callee
+    /// references the captured k.
+    pub k_name: String,
+    /// Closure record slot index (0-based, relative to the env
+    /// slots after the code_ptr) for `k_closure`. Codegen reads
+    /// from offset `16 + 8 * k_closure_idx`.
+    pub k_closure_idx: usize,
+    /// Closure record slot index for `k_fn`. By convention
+    /// `k_fn_idx == k_closure_idx + 1` (consecutive trailing slots).
+    pub k_fn_idx: usize,
+    /// k's parameter type (the op's return type). Codegen uses this
+    /// to widen the dispatch arg into the args_ptr buffer.
+    pub op_ret_ty: Ty,
+    /// k's return type (the handler's overall result type). Used
+    /// for type-of-expr prediction at the synth fn's `k(arg)` call
+    /// site.
+    pub handler_overall_ty: Ty,
 }
 
 pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
@@ -118,6 +170,8 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
         hoisted: Vec::new(),
         hoisted_captures: BTreeMap::new(),
         reserved_counters,
+        arm_k_context_stack: Vec::new(),
+        arm_k_pair_captures: BTreeMap::new(),
         top_level_fn_names,
     };
 
@@ -139,6 +193,7 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
     let Converter {
         hoisted,
         hoisted_captures,
+        arm_k_pair_captures,
         ..
     } = conv;
     new_items.extend(hoisted);
@@ -178,6 +233,7 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
         colored,
         captures,
         captures_typed,
+        arm_k_pair_captures,
     }
 }
 
@@ -197,6 +253,21 @@ struct Converter {
     /// skips past any value in this set so synthetic names stay unique
     /// at the symbol-table level.
     reserved_counters: BTreeSet<usize>,
+    /// Plan B' Stage 6.8 Task 107 Phase B — when rewriting an op-arm
+    /// body, the topmost entry is the arm's continuation `k_name`
+    /// (and its op_ret_ty + handler_overall_ty). When closure_convert
+    /// hoists a Lambda inside an arm body whose captures include the
+    /// topmost k_name, it removes k from the regular captures and
+    /// records an `ArmKPairCapture` keyed by the synth fn name. The
+    /// stack handles nested arm contexts (e.g., a `handle` inside
+    /// another `handle`'s arm body — the inner arm's k overrides
+    /// the outer arm's k for any Lambda hoisted inside the inner arm).
+    arm_k_context_stack: Vec<ArmKContext>,
+    /// Plan B' Stage 6.8 Task 107 Phase B — synth-fn-name → KPair
+    /// info. Built as Lambda-hoist sites detect k-capture; transferred
+    /// into `ClosureConvertedProgram::arm_k_pair_captures` at convert()
+    /// completion.
+    arm_k_pair_captures: BTreeMap<String, ArmKPairCapture>,
     /// Plan B' Stage 6.8 Task 104 — set of user-defined top-level fn
     /// names. When `rewrite_expr` sees `Expr::Ident(name)` outside a
     /// callee position, and `name` is in this set, it rewrites to
@@ -205,6 +276,19 @@ struct Converter {
     /// short-circuits the rewrite for callees in this set so direct
     /// dispatch is preserved.
     top_level_fn_names: BTreeSet<String>,
+}
+
+/// Plan B' Stage 6.8 Task 107 Phase B — per-arm continuation context
+/// pushed during op-arm body traversal in `rewrite_expr`'s
+/// `Expr::Handle` arm. See `Converter::arm_k_context_stack`.
+///
+/// We only track `k_name` here; the captured-k's `Ty::Fn(sig)` is
+/// pulled from the Lambda's per-span entry in `all_captures` when
+/// the k-capture is actually detected (avoids needing typecheck
+/// side-tables for op_ret_ty / handler_overall_ty at this layer).
+#[derive(Clone, Debug)]
+struct ArmKContext {
+    k_name: String,
 }
 
 impl Converter {
@@ -421,7 +505,56 @@ impl Converter {
                 let counter = self.allocate_counter();
                 let fn_name = format!("$lambda_{counter}");
 
-                let caps: Vec<(String, Ty)> = self.capture_at(&span);
+                let raw_caps: Vec<(String, Ty)> = self.capture_at(&span);
+
+                // Plan B' Stage 6.8 Task 107 Phase B — detect a
+                // capture whose name matches the topmost arm's
+                // continuation `k_name` and whose Ty is `Ty::Fn(_)`.
+                // Such captures get the trailing-pair convention
+                // (parallel to the arm fn args_ptr layout): the
+                // capture is removed from the regular `caps` list,
+                // and codegen allocates 2 trailing slots in the
+                // lifted lambda's closure record for k_closure and
+                // k_fn. Inside the lambda body, references to
+                // `Ident(k_name)` stay unrewritten (k isn't a regular
+                // capture); codegen detects them via the
+                // `arm_k_pair_captures` side-table at lower-call
+                // time and dispatches via `sigil_next_step_call`.
+                let active_arm_k_name: Option<String> =
+                    self.arm_k_context_stack.last().map(|c| c.k_name.clone());
+                let mut k_pair_info: Option<ArmKPairCapture> = None;
+                let caps: Vec<(String, Ty)> = if let Some(arm_k) = &active_arm_k_name {
+                    let mut filtered: Vec<(String, Ty)> = Vec::with_capacity(raw_caps.len());
+                    for (cname, cty) in &raw_caps {
+                        if cname == arm_k {
+                            // Match the captured-k Ty against
+                            // `Ty::Fn(sig)` to extract op_ret_ty +
+                            // handler_overall_ty for codegen's
+                            // dispatch. typecheck records k as
+                            // `Ty::Fn(FnSig{params:[op_ret], ret:
+                            // handler_overall, ...})`.
+                            if let Ty::Fn(sig) = cty {
+                                let op_ret_ty = sig.params.first().cloned().unwrap_or(Ty::Unit);
+                                let handler_overall_ty = sig.ret.clone();
+                                // k_closure_idx = filtered.len() (next
+                                // slot index AFTER regular captures);
+                                // k_fn_idx = k_closure_idx + 1.
+                                k_pair_info = Some(ArmKPairCapture {
+                                    k_name: cname.clone(),
+                                    k_closure_idx: filtered.len(),
+                                    k_fn_idx: filtered.len() + 1,
+                                    op_ret_ty,
+                                    handler_overall_ty,
+                                });
+                                continue;
+                            }
+                        }
+                        filtered.push((cname.clone(), cty.clone()));
+                    }
+                    filtered
+                } else {
+                    raw_caps.clone()
+                };
 
                 // env_exprs evaluate in the scope where the original lambda
                 // was written. A capture that is itself a capture of the
@@ -438,7 +571,10 @@ impl Converter {
 
                 // Rewrite the lambda body in its own scope: only its
                 // params are locals, and its own captures become the
-                // env-load source.
+                // env-load source. Note: when `k_pair_info` is Some,
+                // the lambda body's `Ident(k_name)` references stay
+                // unrewritten (k was filtered out of `caps`); codegen
+                // detects via `arm_k_pair_captures` at lower-call time.
                 let inner_locals: BTreeSet<String> =
                     params.iter().map(|p| p.name.clone()).collect();
                 let rewritten_body = self.rewrite_expr(*body, &inner_locals, &caps);
@@ -465,6 +601,9 @@ impl Converter {
                 };
                 self.hoisted.push(Item::Fn(Box::new(synthetic)));
                 self.hoisted_captures.insert(fn_name.clone(), caps);
+                if let Some(info) = k_pair_info {
+                    self.arm_k_pair_captures.insert(fn_name.clone(), info);
+                }
 
                 Expr::ClosureRecord {
                     code_fn_name: fn_name,
@@ -537,7 +676,16 @@ impl Converter {
                             arm_locals.insert(p.name.clone());
                         }
                         arm_locals.insert(arm.k_name.clone());
+                        // Plan B' Stage 6.8 Task 107 Phase B —
+                        // push k-context for nested Lambda hoists
+                        // inside this arm body. Pop after the body
+                        // is rewritten so nested handles don't leak
+                        // outer arms' k-contexts.
+                        self.arm_k_context_stack.push(ArmKContext {
+                            k_name: arm.k_name.clone(),
+                        });
                         let new_body = self.rewrite_expr(arm.body, &arm_locals, captures);
+                        let _popped = self.arm_k_context_stack.pop();
                         crate::ast::HandleOpArm {
                             body: new_body,
                             ..arm

@@ -4592,65 +4592,79 @@ fn arm_body_iife_returns_43() {
     );
 }
 
-/// Plan B' Stage 6.8 Task 107 (B.4 Phase A) — rejection test for
-/// the k-capture shape that Phase B (Task 108 run_state) will lift.
-/// `Choose.flip(k) => fn (b: Bool) -> Int ![] => k(true)` returns
-/// a lambda that captures and calls `k`. After closure-convert, the
-/// arm body's ClosureRecord has `env_exprs: [Ident("k")]`; Phase A's
-/// walker rejects this with a Phase B-pointing diagnostic. Pin the
-/// rejection so Phase B inverts a known-state diff.
+/// Plan B' Stage 6.8 Task 107 Phase B — INVERTED from the prior
+/// `arm_body_lambda_capturing_k_is_rejected_until_phase_b`. Phase B
+/// ships the trailing-pair convention: closure_convert flags
+/// k-pair captures, the lifted lambda's closure record allocates 2
+/// trailing slots for (k_closure, k_fn), and codegen's lower_call
+/// dispatches `k(arg)` inside the synth fn via
+/// `sigil_next_step_call(k_closure, k_fn, 1)` followed by
+/// `sigil_run_loop` to drive to a terminal value.
+///
+/// `resumes: many` admits discard-k (0 calls); the lambda is
+/// allocated but not invoked, so this test pins compilation
+/// success — runtime behaviour mirrors the discard-k arm body
+/// (returns 99 directly).
 #[test]
-fn arm_body_lambda_capturing_k_is_rejected_until_phase_b() {
-    // `resumes: many` admits discard-k (0 k-calls in arm body); the
-    // lambda's syntactic `k(x)` doesn't have to fire at runtime. The
-    // arm body's let-bound lambda captures k; closure-convert lifts
-    // it; the resulting `Expr::ClosureRecord` has `env_exprs:
-    // [Ident("k")]`. Phase A's walker matches and rejects with
-    // "captures continuation".
+fn arm_body_lambda_capturing_k_compiles_returns_99() {
     let src = "effect Choose resumes: many { flip: () -> Int }\n\
                fn run() -> Int ![] {\n  \
-                 let _: Int = handle 0 with {\n    \
+                 let r: Int = handle 0 with {\n    \
                    Choose.flip(k) => {\n      \
                      let _: (Int) -> Int ![] = fn (x: Int) -> Int ![] => k(x);\n      \
                      99\n    \
                    },\n  \
                  };\n  \
-                 0\n\
+                 r\n\
                }\n\
-               fn main() -> Int ![] {\n  \
-                 let _: Int = run();\n  \
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_arm_lambda_captures_k_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_arm_lambda_captures_k_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "arm-body lambda capturing k must fail to compile until Phase B \
-         (run_state) ships; got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+    let (stdout, stderr, code) = compile_and_run(src, "arm_lambda_captures_k");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "B.4 Phase B: lambda capturing k allocates trailing-pair \
+         closure record without calling k. handle body=0 so arm \
+         never fires; r = 0. stderr={stderr:?}"
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("captures continuation"),
-        "expected Phase B-pointing diagnostic mentioning `captures continuation`; \
-         got stderr={stderr:?}"
+}
+
+/// Plan B' Stage 6.8 Task 108 example #1 (Choose-as-lambda).
+/// The arm body's let-bound lambda captures k. The handle body
+/// performs `Choose.flip()` — the arm runs, allocates the lambda
+/// (which captures k), and returns 42 directly (discard-k +
+/// resumes-many for the arm itself). The lambda's k-pair is
+/// stored in the trailing slots; in this test the lambda isn't
+/// invoked (allocated, not called), so the dispatch path isn't
+/// exercised at runtime — but the closure-convert + codegen
+/// surface compiles cleanly.
+#[test]
+fn task_108_arm_body_lambda_captures_k_runs() {
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn run() -> Int ![] {\n  \
+                 handle perform Choose.flip() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let _: (Bool) -> Int ![] = fn (b: Bool) -> Int ![] => k(b);\n      \
+                     42\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_108_choose");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // `perform Choose.flip()` triggers the arm; arm allocates the
+    // capturing lambda then returns 42 (discard-k + lambda not
+    // invoked). The arm's result becomes perform's value (Sigil's
+    // implicit-resume) so the handle returns 42.
+    assert_eq!(
+        stdout, "42\n",
+        "B.4 Phase B Task 108 example #1: arm body allocates k-capturing \
+         lambda then discards k → arm returns 42. stderr={stderr:?}"
     );
 }
 
