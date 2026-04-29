@@ -5078,3 +5078,74 @@ fn slice_c_chain_three_let_with_forward_data_dependency() {
          r1=1, r2=k(r1)=1, r3=k(r1+r2)=2, sum=4. stderr={stderr:?}"
     );
 }
+
+// ----------------------------------------------------------------
+// Plan B' Stage 6.8 Task 106 — B.3 acceptance e2e tests for
+// `TypeExpr::Fn` (first-class function types). Phase C v1 supports
+// `Expr::Ident(local)` callees where `local` is fn-typed via fn
+// param or `let` annotation. More general callees (e.g., `make_adder
+// (5)(7)` — call returning fn) defer to Phase C+.
+// ----------------------------------------------------------------
+
+/// Phase C foundation — fn-as-value let binding + indirect call.
+/// Closure-convert materializes `double` as a captureless
+/// `ClosureRecord` at the let RHS; codegen allocates the record
+/// (header + code_ptr@8) on the GC heap. The `f(21)` call dispatches
+/// indirectly via `call_indirect` over the loaded code_ptr.
+#[test]
+fn fn_as_value_via_let_binding_returns_42() {
+    let src = "fn double(n: Int) -> Int ![] { n + n }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = double;\n  \
+                 perform IO.println(int_to_string(f(21)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "fn_as_value_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "fn-as-value let binding + indirect call: f = double; f(21) = 42. \
+         stderr={stderr:?}"
+    );
+}
+
+/// Higher-order fn parameter — non-generic shape.
+/// `apply` takes a fn-typed parameter and dispatches indirectly.
+/// Caller passes `double` as a value; closure-convert materializes
+/// it as a captureless `ClosureRecord` at the call site arg.
+#[test]
+fn higher_order_fn_param_returns_42() {
+    let src = "fn double(n: Int) -> Int ![] { n + n }\n\
+               fn apply(f: (Int) -> Int ![], x: Int) -> Int ![] { f(x) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(apply(double, 21)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "higher_order_fn_param");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "higher-order fn param: apply(double, 21) = 42. stderr={stderr:?}"
+    );
+}
+
+/// Generic higher-order fn — `apply[A, B](f: (A) -> B ![], x: A)
+/// -> B ![]` instantiated at A=Int, B=Int. Monomorphize clones
+/// `apply` to `apply$$Int$$Int` with concrete TypeExpr::Fn for the
+/// `f` param. Inside the clone, `f(x)` is the indirect call.
+#[test]
+fn generic_apply_with_id_fn_returns_42() {
+    let src = "fn id_fn[A](x: A) -> A ![] { x }\n\
+               fn apply[A, B](f: (A) -> B ![], x: A) -> B ![] { f(x) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = apply(id_fn, 42);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "generic_apply_id_fn");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "generic apply(id_fn, 42) = 42. stderr={stderr:?}"
+    );
+}

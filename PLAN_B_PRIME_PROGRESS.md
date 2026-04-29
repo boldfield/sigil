@@ -74,11 +74,13 @@ Goal: close B.3 + B.4. Together these unblock the literal `run_state` higher-ord
   - commits: [HEAD]
   - notes: closure-convert now collects user-defined top-level fn names and rewrites bare `Expr::Ident(top_level_fn)` to a captureless `Expr::ClosureRecord { code_fn_name, env_exprs: [], env_slot_kinds: [] }` when used as a value. The `Call::callee` short-circuit preserves direct dispatch for `Call { callee: Ident(top_level_fn), .. }`. Codegen replaces `lower_call`'s `unreachable!` catchall with a `call_indirect` emission: loads the callee's `closure_ptr`, reads `code_ptr` from offset 8, builds a Cranelift signature `(closure_ptr, params...) -> ret` from the callee's `FnTypeExpr` (stored in a new `Lowerer.local_fn_types` map populated from fn params + `Stmt::Let` annotations), imports it, and dispatches. `type_of_expr`'s Call arm extends with the `Ident-of-local-fn-typed` indirect case. `typecheck::call_callee_tys: BTreeMap<Span, Ty>` side-table added (populated by `check_call`); reserved for Phase C+ recursive-callee resolution. **Phase C v1 limit**: indirect callee must be `Expr::Ident(local)` where `local` is fn-typed via param or let annotation. More general callees (e.g., `make_adder(5)(7)`) trip `unreachable!` until Phase C+. Pod-verify clean.
 - Task 105 — B.3 Phase D: codegen-entry walker update.
-  - status: todo
-  - commits: []
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: walker `contains_apply_or_generic_ref` already accepts `TypeExpr::Fn` (Task 102 added the recurse arm). 3 positive-coverage unit tests pin behaviour: walker accepts fn-type in param position; walker accepts fn-type in return position; walker still rejects an `Apply` hidden inside a fn-type (Apply-recursion through fn-type components).
 - Task 106 — B.3 acceptance e2e tests (id_fn-as-value; apply higher-order fn; make_adder fn-returning-fn; compose generic).
-  - status: todo
-  - commits: []
+  - status: partial-done-pending-ci
+  - commits: [HEAD]
+  - notes: 3 e2e tests for Phase C v1 supported shapes — `fn_as_value_via_let_binding_returns_42` (let RHS is bare top-level fn ident → ClosureRecord materialization + indirect call); `higher_order_fn_param_returns_42` (non-generic apply with fn-typed param + indirect call); `generic_apply_with_id_fn_returns_42` (generic `apply[A,B]` instantiated at Int+Int with `id_fn` as fn-value arg). **Deferred to Phase C+** (call-returning-fn callees + ClosureEnvLoad-callees): `make_adder(5)(7)` (call-returning-fn requires recursive callee-type resolution), `compose` (fn body has a lambda whose captures are fn-typed → ClosureEnvLoad indirect callees inside synth lambda fn). The existing `p17_compose_source_rejects_until_typeexpr_fn_ships` test stays as a rejection assertion until Phase C+ + Task 109 invert it.
 - Task 107 — B.4: arm-body-lambda lift (drop `arm_body_walk` rejection; closure-convert side-table extension).
   - status: todo
   - commits: []

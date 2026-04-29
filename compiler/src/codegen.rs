@@ -11455,6 +11455,139 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------
+    // Plan B' Stage 6.8 Task 105 — codegen-entry walker positive
+    // coverage for `TypeExpr::Fn`. The walker recurses into fn-type
+    // params + ret so any nested `Apply` / generic-param ref still
+    // surfaces; concrete fn-types pass through cleanly.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn walker_accepts_fn_type_in_param_position() {
+        use crate::ast::{Block, FnDecl, FnTypeExpr, Item, Param, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // fn f(g: (Int) -> Int ![]) -> Int ![] { ... }
+        let f_param_ty = TypeExpr::Fn(Box::new(FnTypeExpr {
+            params: vec![TypeExpr::Named("Int".to_string(), span.clone())],
+            ret: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            span: span.clone(),
+        }));
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "main".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![Param {
+                    name: "g".to_string(),
+                    ty: f_param_ty,
+                    span: span.clone(),
+                }],
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            !contains_apply_or_generic_ref(&prog),
+            "walker must accept fn-typed param"
+        );
+    }
+
+    #[test]
+    fn walker_accepts_fn_type_in_return_position() {
+        use crate::ast::{Block, FnDecl, FnTypeExpr, Item, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // fn f() -> (Int) -> Int ![] { ... }
+        let ret_ty = TypeExpr::Fn(Box::new(FnTypeExpr {
+            params: vec![TypeExpr::Named("Int".to_string(), span.clone())],
+            ret: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            span: span.clone(),
+        }));
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "main".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: Vec::new(),
+                return_type: ret_ty,
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            !contains_apply_or_generic_ref(&prog),
+            "walker must accept fn-typed return"
+        );
+    }
+
+    #[test]
+    fn walker_rejects_apply_hidden_inside_fn_type() {
+        use crate::ast::{Block, FnDecl, FnTypeExpr, Item, Param, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // fn f(g: (Option[Int]) -> Int ![]) -> Int ![] { ... }
+        // The Apply hidden inside the fn-type's param must still
+        // surface as a walker rejection.
+        let inner_apply = TypeExpr::Apply {
+            name: "Option".to_string(),
+            args: vec![TypeExpr::Named("Int".to_string(), span.clone())],
+            span: span.clone(),
+        };
+        let f_param_ty = TypeExpr::Fn(Box::new(FnTypeExpr {
+            params: vec![inner_apply],
+            ret: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            span: span.clone(),
+        }));
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "main".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![Param {
+                    name: "g".to_string(),
+                    ty: f_param_ty,
+                    span: span.clone(),
+                }],
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            contains_apply_or_generic_ref(&prog),
+            "walker must reject Apply hidden inside fn-type param"
+        );
+    }
+
     // ---------------- Plan B Task 55, Phase 4e — body-shape classifier
     //
     // Pins `is_simple_tail_perform_with_pure_args_body` for the body shapes the
