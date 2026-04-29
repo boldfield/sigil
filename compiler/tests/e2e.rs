@@ -6164,6 +6164,110 @@ fn std_result_and_then_ok_chains_through() {
     assert_eq!(stdout, "15\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 64 — std/list run-and-check-output =====
+
+/// `length(range(1, 5))` returns 4. Pin the canonical iteration
+/// idiom (`range` + non-effecting fold-like).
+#[test]
+fn std_list_range_length_returns_4() {
+    let src = "import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = range(1, 5);\n  \
+                 perform IO.println(int_to_string(length(xs)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_range_length");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "4\n", "stderr={stderr:?}");
+}
+
+/// `fold(range(1, 5), 0, add) = 1 + 2 + 3 + 4 = 10`.
+#[test]
+fn std_list_fold_sum_returns_10() {
+    let src = "import std.list\n\
+               fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = fold(range(1, 5), 0, add);\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_fold_sum");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "10\n", "stderr={stderr:?}");
+}
+
+/// `map(range(1, 4), double) = [2, 4, 6]` → fold-sum = 12.
+#[test]
+fn std_list_map_then_fold_returns_12() {
+    let src = "import std.list\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = range(1, 4);\n  \
+                 let mapped: List[Int] = map(xs, double);\n  \
+                 perform IO.println(int_to_string(fold(mapped, 0, add)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_map_fold");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "12\n", "stderr={stderr:?}");
+}
+
+/// `filter(range(1, 6), is_pos) = [1, 2, 3, 4, 5]` → length 5.
+/// Pinned trivially since `is_pos` is true for every positive Int.
+#[test]
+fn std_list_filter_returns_5() {
+    let src = "import std.list\n\
+               fn is_pos(n: Int) -> Bool ![] {\n  \
+                 match n { 0 => false, _ => true }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = range(1, 6);\n  \
+                 let kept: List[Int] = filter(xs, is_pos);\n  \
+                 perform IO.println(int_to_string(length(kept)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_filter");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n", "stderr={stderr:?}");
+}
+
+/// `reverse(range(1, 4)) = [3, 2, 1]`. Verify by folding (the order
+/// doesn't change the sum but length should be 3).
+#[test]
+fn std_list_reverse_preserves_length() {
+    let src = "import std.list\n\
+               fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = range(1, 4);\n  \
+                 let rev: List[Int] = reverse(xs);\n  \
+                 perform IO.println(int_to_string(length(rev)));\n  \
+                 perform IO.println(int_to_string(fold(rev, 0, add)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_reverse");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n6\n", "stderr={stderr:?}");
+}
+
+/// `append([1,2], [3,4,5]) = [1,2,3,4,5]` → length 5, sum 15.
+#[test]
+fn std_list_append_concatenates() {
+    let src = "import std.list\n\
+               fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = range(1, 3);\n  \
+                 let ys: List[Int] = range(3, 6);\n  \
+                 let combined: List[Int] = append(xs, ys);\n  \
+                 perform IO.println(int_to_string(length(combined)));\n  \
+                 perform IO.println(int_to_string(fold(combined, 0, add)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_append");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n15\n", "stderr={stderr:?}");
+}
+
 /// `and_then(Ok(0), safe_pos)` short-circuits to Err because the
 /// chained helper returns `Err(\"zero\")`.
 #[test]

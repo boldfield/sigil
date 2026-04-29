@@ -1,0 +1,90 @@
+// sigil: 0.1
+//
+// std/list.sigil — Plan C Task 64.
+//
+// `List[A]` is Sigil's canonical linked sequence: `Nil` for empty,
+// `Cons(head, tail)` for a non-empty list. Sigil has no `for`/`while`
+// loops — `range` and `for_each` (and the higher-order helpers
+// `map`, `filter`, `fold`) are the iteration idioms.
+//
+// All helpers ship with closed effect rows `![]` for v1. A future
+// row-polymorphic surface would let `for_each` thread effect rows
+// from the caller through the per-element callback; today's shape
+// supports the common pure-helper case, and callers who need
+// effects per element write a recursive helper directly via
+// `match` (the same pattern these helpers use internally).
+
+type List[A] = | Nil | Cons(A, List[A])
+
+// `length(xs)` returns the number of elements.
+fn length[A](xs: List[A]) -> Int ![] {
+  match xs {
+    Nil => 0,
+    Cons(_, t) => 1 + length(t),
+  }
+}
+
+// `map(xs, f)` applies `f` to each element. `f` must be pure.
+fn map[A, B](xs: List[A], f: (A) -> B ![]) -> List[B] ![] {
+  match xs {
+    Nil => Nil,
+    Cons(h, t) => Cons(f(h), map(t, f)),
+  }
+}
+
+// `filter(xs, pred)` keeps elements where `pred` returns true.
+fn filter[A](xs: List[A], pred: (A) -> Bool ![]) -> List[A] ![] {
+  match xs {
+    Nil => Nil,
+    Cons(h, t) => match pred(h) {
+      true => Cons(h, filter(t, pred)),
+      false => filter(t, pred),
+    },
+  }
+}
+
+// `fold(xs, init, f)` is a left fold: `f(...f(f(init, x0), x1)..., xN)`.
+fn fold[A, B](xs: List[A], init: B, f: (B, A) -> B ![]) -> B ![] {
+  match xs {
+    Nil => init,
+    Cons(h, t) => fold(t, f(init, h), f),
+  }
+}
+
+// `reverse(xs)` returns the list in reverse order. O(n) via accumulator.
+fn reverse[A](xs: List[A]) -> List[A] ![] {
+  reverse_acc(xs, Nil)
+}
+
+fn reverse_acc[A](xs: List[A], acc: List[A]) -> List[A] ![] {
+  match xs {
+    Nil => acc,
+    Cons(h, t) => reverse_acc(t, Cons(h, acc)),
+  }
+}
+
+// `append(xs, ys)` concatenates two lists. O(length xs).
+fn append[A](xs: List[A], ys: List[A]) -> List[A] ![] {
+  match xs {
+    Nil => ys,
+    Cons(h, t) => Cons(h, append(t, ys)),
+  }
+}
+
+// `range(start, end)` produces `[start, start+1, ..., end-1]`. Empty
+// when `start >= end`.
+fn range(start: Int, end: Int) -> List[Int] ![] {
+  match start < end {
+    true => Cons(start, range(start + 1, end)),
+    false => Nil,
+  }
+}
+
+// `for_each` is deferred — see `[DEVIATION Task 64]` in
+// `PLAN_C_DEVIATIONS.md`. Sigil v1 has no `Unit` literal, no
+// match-arm-body block syntax, and closed effect rows on fn-typed
+// parameters, which together make a useful `for_each` not
+// expressible. Callers needing per-element side effects should
+// write a direct recursive `match` helper for now; the canonical
+// v2 surface lands when row-poly fn-typed params + a Unit literal
+// (or a sequencing primitive in match arm bodies) ships.

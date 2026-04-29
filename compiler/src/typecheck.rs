@@ -8745,6 +8745,46 @@ mod tests {
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
+    // ===== Plan C Task 64 — std/list typecheck-level coverage =====
+
+    #[test]
+    fn import_std_list_typechecks_cleanly() {
+        let src = "import std.list\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let xs: List[Int] = Cons(10, Cons(20, Cons(30, Nil)));\n  \
+                     let n: Int = length(xs);\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_list_higher_order_helpers_typecheck_cleanly() {
+        // Predicate avoids `/` and `%` (both require ArithError per
+        // Plan B Task 57); a positive-test predicate keeps the
+        // closed `![]` row clean.
+        let src = "import std.list\n\
+                   fn double(n: Int) -> Int ![] { n + n }\n\
+                   fn is_pos(n: Int) -> Bool ![] {\n  \
+                     match n { 0 => false, _ => true }\n\
+                   }\n\
+                   fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let xs: List[Int] = range(1, 5);\n  \
+                     let mapped: List[Int] = map(xs, double);\n  \
+                     let kept: List[Int] = filter(xs, is_pos);\n  \
+                     let total: Int = fold(xs, 0, add);\n  \
+                     let rev: List[Int] = reverse(xs);\n  \
+                     let combined: List[Int] = append(xs, rev);\n  \
+                     perform IO.println(int_to_string(length(mapped) + length(kept) + total + length(combined)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
     #[test]
     fn import_std_result_map_map_err_and_then_typecheck_cleanly() {
         let src = "import std.result\n\
