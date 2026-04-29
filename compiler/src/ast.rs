@@ -122,6 +122,31 @@ pub enum TypeExpr {
         args: Vec<TypeExpr>,
         span: Span,
     },
+    /// Plan B' Stage 6.8 Task 102 — first-class function type
+    /// surface: `(T1, ..., Tn) -> R ![E1, ..., En]` or
+    /// `(T1, ..., Tn) -> R ![E1, ..., En | r]`. Allowed in any type
+    /// position: fn parameter types, fn return types, `let`-binding
+    /// annotations, type-decl field types. Parser produces this
+    /// whenever a type expression starts with `(`. Phase B
+    /// (Task 103) maps it to `Ty::Fn` for HM unification;
+    /// closure-convert + codegen (Phase C, Task 104) emit indirect
+    /// calls for fn-typed values via the closure record's `code_ptr`.
+    ///
+    /// The payload is boxed so `TypeExpr` stays small (otherwise it
+    /// pushes `Stmt::Let` and `Expr::Lambda` past clippy's
+    /// `large_enum_variant` limit).
+    Fn(Box<FnTypeExpr>),
+}
+
+/// Boxed payload of [`TypeExpr::Fn`]. See that variant's docstring
+/// for the surface grammar and phasing.
+#[derive(Clone, Debug)]
+pub struct FnTypeExpr {
+    pub params: Vec<TypeExpr>,
+    pub ret: TypeExpr,
+    pub effects: Vec<String>,
+    pub effect_row_var: Option<RowVar>,
+    pub span: Span,
 }
 
 impl TypeExpr {
@@ -130,17 +155,23 @@ impl TypeExpr {
         match self {
             TypeExpr::Named(_, s) => s.clone(),
             TypeExpr::Apply { span, .. } => span.clone(),
+            TypeExpr::Fn(fty) => fty.span.clone(),
         }
     }
 
     /// Head name of this type expression. For `Named` it's the name
     /// itself; for `Apply` it's the constructor's name (the part
-    /// before the `[...]`). Convenience for the many call sites that
-    /// only need the head and not the type arguments.
+    /// before the `[...]`); for `Fn` it's the synthetic `"Fn"`
+    /// marker (no surface name — fn-typed values lower to closure-
+    /// record pointers, and the codegen catchall already routes
+    /// unknown head-names to `pointer_ty`). Convenience for the
+    /// many call sites that only need the head and not the type
+    /// arguments.
     pub fn head_name(&self) -> &str {
         match self {
             TypeExpr::Named(n, _) => n,
             TypeExpr::Apply { name, .. } => name,
+            TypeExpr::Fn(_) => "Fn",
         }
     }
 }

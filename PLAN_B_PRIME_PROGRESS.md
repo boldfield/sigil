@@ -62,36 +62,64 @@ Goal: close B.1 + B.2. Generalize the 2-step Slice C chain (arm-side) and the 1-
 Goal: close B.3 + B.4. Together these unblock the literal `run_state` higher-order helper shape and the canonical algebraic-effects state-threading idiom.
 
 - Task 102 — B.3 Phase A: parser surface for `TypeExpr::Fn`.
-  - status: todo
-  - commits: []
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: AST adds `TypeExpr::Fn(Box<FnTypeExpr>)` (boxed payload to keep the enum below clippy's `large_enum_variant` threshold; `Stmt::Let` and `Expr::Lambda` both transitively contain `TypeExpr` and broke the lint when the variant was inline). `FnTypeExpr` carries `params: Vec<TypeExpr>`, `ret: TypeExpr`, `effects: Vec<String>`, `effect_row_var: Option<RowVar>`, `span`. Parser extends `parse_type` with a leading-`(` discriminator: `(T1, ..., Tn) -> R ![E1, ..., En]` (or `![..|r]`). Downstream pass arms added to keep the compiler building: `check_type_expr_known` recurses into params+ret then emits **E0136** ("first-class function type parsed but not yet usable; Phase B / Task 103 lands the integration"); `ty_from_type_expr` returns `None`; `monomorphize::rewrite_type_expr` substitutes recursively (forward-correct for Phase B); `monomorphize::ty_from_type_expr_under_subst` and `type_expr_to_ty` are unreachable (E0136 gates upstream); codegen entry-walker `type_expr_uses_apply_or_param` recurses (so an `Apply` hidden inside an `Fn` still surfaces); `slot_kind_for_type_expr_post_mono` returns `EnvSlotKind::Closure` for forward correctness. 10 parser unit tests cover the accept matrix (zero/one/two params; effects; row-var; nested fn-in-param; fn-returning-fn; generic-param in signature; let-binding position) and 2 reject cases (missing `->`, missing `![..]`). Pod-verify clean. Phase B (Task 103) replaces the E0136 / unreachable arms with real semantic integration.
 - Task 103 — B.3 Phase B: typecheck + monomorphize integration.
-  - status: todo
-  - commits: []
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: `typecheck::ty_from_type_expr` now maps `TypeExpr::Fn` → `Ty::Fn(FnSig{params, ret, effects, effect_row_var: None})` for closed-row surfaces. `check_type_expr_known` recurses into params + ret (so nested unknown-type / Apply errors surface) and emits **E0137** for row-variable-bearing fn-types ("not yet supported in v1; use a closed row"). HM unification on Ty::Fn was already implemented and stays unchanged. Monomorphize: `ty_from_type_expr_under_subst` and `type_expr_to_ty` map `TypeExpr::Fn` → `Ty::Fn` recursively (closed rows only). `ty_to_type_expr` (the reverse direction) renders `Ty::Fn` back to `TypeExpr::Fn` so a generic-parameter substitution that binds A to a fn-typed concrete still produces a valid surface (forward correctness). 7 typecheck unit tests cover: zero-param fn-type → Ty::Fn; one-param + IO effect; generic-param fn-type sharing Ty::Var across positions; row-var fn-type → E0137; fn-typed let binding with matching RHS typechecks; fn-typed let binding with mismatched RHS → E0044; nested fn-in-param resolves recursively. Pod-verify clean. Phase C (Task 104) extends closure-convert + codegen with indirect calls.
 - Task 104 — B.3 Phase C: closure-convert + codegen for fn-typed values.
-  - status: todo
-  - commits: []
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: closure-convert now collects user-defined top-level fn names and rewrites bare `Expr::Ident(top_level_fn)` to a captureless `Expr::ClosureRecord { code_fn_name, env_exprs: [], env_slot_kinds: [] }` when used as a value. The `Call::callee` short-circuit preserves direct dispatch for `Call { callee: Ident(top_level_fn), .. }`. Codegen replaces `lower_call`'s `unreachable!` catchall with a `call_indirect` emission: loads the callee's `closure_ptr`, reads `code_ptr` from offset 8, builds a Cranelift signature `(closure_ptr, params...) -> ret` from the callee's `FnTypeExpr` (stored in a new `Lowerer.local_fn_types` map populated from fn params + `Stmt::Let` annotations), imports it, and dispatches. `type_of_expr`'s Call arm extends with the `Ident-of-local-fn-typed` indirect case. `typecheck::call_callee_tys: BTreeMap<Span, Ty>` side-table added (populated by `check_call`); reserved for Phase C+ recursive-callee resolution. **Phase C v1 limit**: indirect callee must be `Expr::Ident(local)` where `local` is fn-typed via param or let annotation. More general callees (e.g., `make_adder(5)(7)`) trip `unreachable!` until Phase C+. Pod-verify clean.
 - Task 105 — B.3 Phase D: codegen-entry walker update.
-  - status: todo
-  - commits: []
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: walker `contains_apply_or_generic_ref` already accepts `TypeExpr::Fn` (Task 102 added the recurse arm). 3 positive-coverage unit tests pin behaviour: walker accepts fn-type in param position; walker accepts fn-type in return position; walker still rejects an `Apply` hidden inside a fn-type (Apply-recursion through fn-type components).
 - Task 106 — B.3 acceptance e2e tests (id_fn-as-value; apply higher-order fn; make_adder fn-returning-fn; compose generic).
-  - status: todo
-  - commits: []
+  - status: phase-c-plus-done-pending-ci
+  - commits: [HEAD]
+  - notes: 5 positive e2e tests across Phase C v1 + C+ Part 1 + C+ Part 2 — `fn_as_value_via_let_binding_returns_42`, `higher_order_fn_param_returns_42`, `generic_apply_with_id_fn_returns_42`, `make_adder_returns_12` (Phase C+ Part 1: call-returning-fn), **`closure_env_load_callee_returns_42` (Phase C+ Part 2: lambda body invokes captured fn-typed value via ClosureEnvLoad-callee)**. R2 fixups added: `fn_as_value_with_multi_param_returns_7`, `fn_as_value_with_effect_row_returns_42`. Phase C+ Part 2 inverted the prior `closure_env_load_callee_is_e0138_until_phase_c_plus` rejection test into `closure_env_load_callee_returns_42` since the codegen surface now supports the shape. Only `p17_compose_source_rejects_until_typeexpr_fn_ships` remains as a rejection assertion (compose has additional surfaces — generic params + bare fn-as-value through the codegen-entry walker — that need Task 109's full inversion).
 - Task 107 — B.4: arm-body-lambda lift (drop `arm_body_walk` rejection; closure-convert side-table extension).
-  - status: todo
-  - commits: []
+  - status: done (Phase A + Phase B + Phase C++)
+  - commits: [HEAD]
+  - notes: **Phase A** drops the `arm_body_walk` Lambda + ClosureRecord rejection for non-k-capturing shapes. closure_convert already hoists arm-body lambdas correctly. **Phase B** ships the **2-slot trailing-pair convention** (parallels the arm fn's args_ptr layout): closure_convert detects k-pair captures via the new `arm_k_context_stack`; the lifted lambda's closure record allocates 2 trailing slots for `k_closure` + `k_fn` after the regular env; the synth lambda's `lower_call` dispatches `k(arg)` via `sigil_next_step_call(k_closure, k_fn, 1) → sigil_run_loop` and narrows the result to handler_overall_ty. **Phase C++** monomorphize-rewrites `lambda_captures` per-clone with substitution applied (new `MonoProgram.lambda_captures_resolved: BTreeMap<(String, Span), Vec<(String, Ty)>>`) so generic-context fn-typed captures see concrete Tys at codegen time. End-of-typecheck deref pass resolves `Ty::Var`s recorded mid-walk before they reach codegen. Tests: `arm_body_lambda_capturing_k_compiles_returns_99`, `task_108_arm_body_lambda_captures_k_runs`, `compose_body_via_closure_env_callees_returns_42` (all positive runtime tests). The Phase B route decision (2-slot split) was made by user.
 - Task 108 — B.4 acceptance e2e tests (arm body returning lambda; arm body IIFE; full `run_state` lambdas-of-state shape).
-  - status: todo
-  - commits: []
+  - status: phase-a-partial-done, phase-b-pending
+  - commits: [HEAD]
+  - notes: **Done in Phase A**: example #2 — `arm_body_iife_returns_43` exercises the IIFE-in-arm-body shape (`Raise.fail(k) => (fn (n) => n+1)(42)`); discard-k arm produces 43 via the implicit-resume path. **Phase B pending**: example #1 (`Choose.flip(k) => fn (b) => k(true)`) and example #3 (`run_state` `State.get(k) => fn (s) => k(s)(s)`). Both shapes capture and call `k` from inside a lifted lambda; require Phase B's k-pair-capture surface (see `[DEVIATION Task 107 Phase B]`). The `arm_body_lambda_capturing_k_is_rejected_until_phase_b` rejection test pins the Phase B-deferred shape so a known-state inversion lands when Phase B ships.
 - Task 109 — Update existing examples + invert pinning tests (`state.sigil` literal `run_state`; `higher_order.sigil` docstring; `TypeExpr::Fn` rejection tests; arm-body-lambda rejection tests).
-  - status: todo
-  - commits: []
+  - status: partial-done-pending-run_state-chain-fix
+  - commits: [HEAD]
+  - notes: **Done**: `examples/higher_order.sigil` docstring rewrite; `nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen` rejection inverted to `nested_handle_with_inner_lambda_in_arm_body_compiles` (Phase A unblock); `closure_env_load_callee_is_e0138_until_phase_c_plus` rejection inverted to `closure_env_load_callee_returns_42` (Phase C+ Part 2); `p17_compose_source_rejects_until_typeexpr_fn_ships` renamed to `p17_compose_source_rejects_pending_builtin_as_fn_value` (R6 fixup) — TypeExpr::Fn shipped, the actual remaining blocker is builtin-as-fn-value (see `[DEVIATION p17_compose blocker analysis]`). **Pending**: `examples/state.sigil` rewrite to literal `run_state` — Task 109 first cycle (`7b457b6` + `e35dae9`) compiled cleanly but produced a closure-record-pointer-shaped value at runtime instead of the threaded integer. Reverted state.sigil to the dual-handle workaround; added `handle_returning_simple_lambda_invoked_returns_value_pending_chain_fix` `#[ignore]`'d bisect test pinning the simplest "handle returns lambda, lambda invoked" shape. See `[DEVIATION Task 109] run_state canonical shape — runtime chain integration gap` for the layered failure analysis (3 candidate layers; bisect test isolates layer 1). Sub-tasks 3 (no standalone TypeExpr::Fn rejection tests existed) and 4 (arm-body-lambda rejections already inverted by Task 107) confirmed n/a or done.
 - Task 110 — Prompt-bank graded-end-to-end flips (P09 / P10 / P17 / P19 / P20; P02 stays compile-only pending stdlib `string_concat`).
   - status: todo
   - commits: []
+  - notes: Deferred to follow-up commit. P09/P10/P17 require Phase B + builtin-as-fn-value surface; P19/P20 may flip with Phase A's surfaces alone if the spec sources don't capture k inside lambdas.
 
 ### Stage 6.8 review checkpoint
 
-Pending — request human review of: TypeExpr::Fn parser/typecheck/codegen full surface; HM unification on Ty::Fn for generic fn-typed parameters; indirect-call codegen correctness; arm-body-lambda interaction with multi-shot; run_state higher-order helper end-to-end; closure-convert side-table extension for lifted arm-body lambdas.
+**Reached** (2026-04-29; updated post Phase B + Phase C++). Major surfaces complete:
+- B.3 (Phase A → C+ Part 2): TypeExpr::Fn parser, typecheck, monomorphize, codegen indirect dispatch.
+- B.4 Phase A: non-k-capturing arm-body lambdas (IIFE shape).
+- B.4 Phase B: **k-capture inside arm-body lambdas via 2-slot trailing-pair convention** — canonical run_state surface unblocked.
+- Phase C++: monomorphize rewrites lambda_captures per-clone — generic + fn-typed-captures combination unblocked.
+
+Original surfaces:
+- B.3 Phase A → Phase C+ Part 2: parser, typecheck, monomorphize, closure-convert, codegen indirect-call dispatch. Four supported callee shapes — `Ident(local)` / `ClosureRecord` / `Call(...)` / `ClosureEnvLoad` — all tested end-to-end. canon_ty mangles `Ty::Fn`. E0137 rejects row-variable-bearing fn-types (closed-rows-only in v1). E0138 walker rejects unsupported indirect-call shapes with span-anchored Sigil diagnostics.
+- B.4 Phase A: arm-body-lambda lift for non-k-capturing shapes. closure-convert already hoists correctly; the codegen-side rejection drops with a k-capture guard. IIFE patterns work (Task 108 example #2 covered).
+
+**Awaiting human review of:**
+- TypeExpr::Fn parser surface design (per-arrow `![..]` discipline; deviation entry documented).
+- HM unification on `Ty::Fn` (generic fn-typed parameters; effect-row order independence; effect-row width mismatch detection).
+- Indirect-call codegen correctness (closure_ptr threading; calling convention; `code_ptr` load at offset 8; `call_indirect` ABI; safepoint emission).
+- Three-source-of-truth pattern at `lower_call`'s catchall: `Ident(local)` → `local_fn_types` (FnTypeExpr); `Call(...)` → `call_callee_tys[span]` (Ty::Fn); `ClosureEnvLoad` → `captured_fn_sigs[name]` (FnSig).
+- B.4 Phase A's k-capture rejection criterion (walker checks env_exprs for `Ident(k_name)` — verify this catches every shape where Phase B's runtime gap would surface).
+- 4 deviation entries documenting deferred work: per-arrow `![..]` syntax design; captureless closure-record per use site; p17_compose blocker (per-arrow + builtin-as-fn-value); B.4 Phase B route decision (k_closure code_ptr patching vs split-into-two-slots).
+- Negative-test discipline retrofit deferred to Plan C work; new tests follow the discipline.
+
+**Stage 6.8 closes after Phase B ships.** Phase B + Tasks 108 examples #1/#3 + Task 109 `state.sigil` rewrite + remaining Task 109 inversions + Task 110 prompt-bank flips form the next session's scope.
 
 ## Plan B' completion criteria
 

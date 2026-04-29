@@ -309,6 +309,31 @@ pub struct CheckedProgram {
     /// match introduced by elaborate's if→match desugaring) let codegen
     /// fall back to primitive-scalar dispatch.
     pub match_scrut_tys: BTreeMap<Span, Ty>,
+    /// Plan B' Stage 6.8 Task 104 — per-call-site callee Ty for
+    /// indirect-call sites whose callee resolved to `Ty::Fn(sig)`.
+    /// Keyed by the call expression's span. Direct calls (callee
+    /// is `Ident(top_level_fn_name)` or a builtin name) skip
+    /// insertion since codegen resolves them via the `user_fn_refs`
+    /// registry — this keeps the table tight (one entry per
+    /// indirect call) instead of one per Call AST node.
+    ///
+    /// **Span-survival invariant.** Spans are preserved across
+    /// monomorphize cloning (the AST clone is structural — it copies
+    /// `Span` values verbatim, never re-spans), so a single
+    /// side-table entry serves all instantiations of a generic fn.
+    /// `lower_call` keys the side-table by the in-scope Call's
+    /// span and gets back the typecheck-resolved `Ty::Fn` regardless
+    /// of which monomorphized clone is currently being lowered.
+    ///
+    /// Phase C+ Part 1 activates this side-table for `Call(...)`
+    /// callees — when the callee is a call returning a `Ty::Fn`
+    /// value (e.g. `make_adder(5)(7)`), codegen reads the side-table
+    /// at the call's span to derive the indirect signature without
+    /// re-walking the callee. The `Ident(local)` callee path uses
+    /// `Lowerer.local_fn_types` (the surface `FnTypeExpr` from the
+    /// param / let-binding annotation); the two paths converge at
+    /// signature construction.
+    pub call_callee_tys: BTreeMap<Span, Ty>,
     /// Plan B task 49 — per-fn polymorphic schemes recorded at the
     /// end of the typecheck pass. Monomorphization reads these to
     /// build the surface-name → fresh-var mapping when cloning a
@@ -664,6 +689,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         types,
         ctors,
         match_scrut_tys: BTreeMap::new(),
+        call_callee_tys: BTreeMap::new(),
         fn_schemes: BTreeMap::new(),
         next_ty_var: 0,
         next_row_var: 0,
@@ -948,13 +974,53 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         }
     }
 
+    // Plan B' Stage 6.8 Phase B + C++ — apply final substitution
+    // to every Ty recorded in `lambda_captures`. Captures recorded
+    // mid-typecheck (e.g., k inside an arm body whose
+    // handler_overall_ty was a fresh row var at the arm body's
+    // check time) often hold unresolved `Ty::Var` references that
+    // get bound later by unification at handle-end. Codegen's
+    // `cranelift_ty_of_ty` rejects `Ty::Var(_)`, so this end-of-
+    // typecheck deref pass ensures every recorded Ty is concrete.
+    let raw_lambda_captures = std::mem::take(&mut tc.lambda_captures);
+    let mut resolved_lambda_captures: Vec<(Span, Vec<(String, Ty)>)> =
+        Vec::with_capacity(raw_lambda_captures.len());
+    for (span, caps) in raw_lambda_captures {
+        let resolved_caps: Vec<(String, Ty)> = caps
+            .into_iter()
+            .map(|(name, ty)| {
+                let resolved = tc.deref(&ty);
+                (name, resolved)
+            })
+            .collect();
+        resolved_lambda_captures.push((span, resolved_caps));
+    }
+
+    // Plan B' Stage 6.8 R5 Finding 2 (preemptive) — same end-of-
+    // typecheck deref pass for `call_callee_tys`. Phase C+ Part 1's
+    // codegen consumer (`lower_call`'s Call-callee path) reads
+    // these Tys via `cranelift_ty_of_ty` which rejects `Ty::Var(_)`.
+    // For inner-fn calls inside a generic surrounding fn, generic
+    // params remain free `Ty::Var`s at check_call time; this deref
+    // pass resolves anything that gets bound by later inference.
+    // Generic-context calls whose Vars REMAIN free after
+    // end-of-typecheck still need monomorphize-rebuilds-per-clone
+    // (parallel to `lambda_captures_resolved`); this deref handles
+    // the var-bound-later subset that's the typical case.
+    let raw_call_callee_tys = std::mem::take(&mut tc.call_callee_tys);
+    let mut resolved_call_callee_tys: BTreeMap<Span, Ty> = BTreeMap::new();
+    for (span, ty) in raw_call_callee_tys {
+        resolved_call_callee_tys.insert(span, tc.deref(&ty));
+    }
+
     (
         CheckedProgram {
             program,
             string_literals: tc.string_literals,
-            lambda_captures: tc.lambda_captures,
+            lambda_captures: resolved_lambda_captures,
             types: tc.types,
             match_scrut_tys: tc.match_scrut_tys,
+            call_callee_tys: resolved_call_callee_tys,
             fn_schemes: tc.fn_schemes,
             call_site_instantiations: resolved_calls,
             ctor_site_instantiations: resolved_ctors,
@@ -1050,6 +1116,12 @@ struct Tc {
     /// checked program on typecheck completion. `check_match`
     /// populates an entry when the scrutinee has a known `Ty`.
     match_scrut_tys: BTreeMap<Span, Ty>,
+    /// Mirror of `CheckedProgram.call_callee_tys`. Plan B' Stage 6.8
+    /// Task 104 — populated by `check_call` with the callee's `Ty`
+    /// (typically `Ty::Fn(sig)`); codegen reads via `lower_call` to
+    /// resolve the indirect-call signature when the callee is a
+    /// let-bound / param-bound fn-typed value.
+    call_callee_tys: BTreeMap<Span, Ty>,
     /// Plan B task 48 — Hindley-Milner unification machinery.
     ///
     /// Schemes for top-level functions: a generic fn declaration
@@ -1727,6 +1799,29 @@ impl Tc {
                         format!(
                             "unknown type `{name}` (expected a primitive, a type declared via `type {name} = ...`, or an in-scope generic parameter)",
                         ),
+                    );
+                }
+            }
+            TypeExpr::Fn(fty) => {
+                // Plan B' Stage 6.8 Task 103 — recurse into params +
+                // ret so any nested unknown-type / Apply errors
+                // still surface against the inner spans. The Fn
+                // surface itself maps to Ty::Fn at
+                // `ty_from_type_expr` (closed rows only in v1; row-
+                // variable-bearing fn-types reject via E0137 below).
+                for p in &fty.params {
+                    self.check_type_expr_known(p);
+                }
+                self.check_type_expr_known(&fty.ret);
+                if fty.effect_row_var.is_some() {
+                    self.push_error(
+                        "E0137",
+                        t.span(),
+                        "row-variable-bearing first-class function types \
+                         (`(...) -> R ![..|r]`) are not yet supported in v1; \
+                         use a closed row (e.g. `![]` or `![IO]`) — \
+                         Plan B' Stage 6.8 Task 103 limits"
+                            .to_string(),
                     );
                 }
             }
@@ -2800,7 +2895,37 @@ impl Tc {
         // (5) result type — derefed through the substitution so any
         // var bindings made by per-arg unification flow into the
         // returned type.
-        Some(self.deref(&sig.ret))
+        let resolved_ret = self.deref(&sig.ret);
+
+        // Plan B' Stage 6.8 Task 104 (R3 finding 4) — record the
+        // resolved callee signature for indirect calls so Phase C+
+        // codegen can resolve the call's signature via the side-table.
+        // Skip direct calls — those resolve through `user_fn_refs` or
+        // builtin handlers at codegen, no side-table entry needed.
+        // Direct-call detection covers BOTH user-fn schemes
+        // (`fn_schemes`) and seeded builtins (`fn_env`, e.g.
+        // `int_to_string`); without the `fn_env` check, every
+        // `int_to_string(n)` call would populate the side-table
+        // wastefully. Resolution happens *after* arg-type unification
+        // so generic-param `Ty::Var`s pick up their concrete
+        // bindings.
+        let is_direct_call = matches!(
+            callee,
+            Expr::Ident(name, _)
+                if self.fn_schemes.contains_key(name) || self.fn_env.contains_key(name)
+        );
+        if !is_direct_call {
+            let resolved_sig = FnSig {
+                params: sig.params.iter().map(|p| self.deref(p)).collect(),
+                ret: resolved_ret.clone(),
+                effects: sig.effects.clone(),
+                effect_row_var: sig.effect_row_var,
+            };
+            self.call_callee_tys
+                .insert(span.clone(), Ty::Fn(Box::new(resolved_sig)));
+        }
+
+        Some(resolved_ret)
     }
 
     /// Helper: pick the single active row variable to thread
@@ -2892,6 +3017,16 @@ impl Tc {
                     .get(&name)
                     .cloned()
                     .unwrap_or_else(|| unreachable!("capture {name} missing from outer env"));
+                // Plan B' Stage 6.8 Phase B + C++ — deref the Ty
+                // through the active substitution so any unresolved
+                // `Ty::Var` (handler_overall_ty for k captured from
+                // an arm body, or generic params resolved by
+                // surrounding fn instantiation) is replaced with its
+                // concrete binding before being recorded. Codegen's
+                // `cranelift_ty_of_ty` rejects `Ty::Var(_)`, so
+                // recording an unresolved var would surface as a
+                // crash there rather than at the typecheck point.
+                let ty = self.deref(&ty);
                 (name, ty)
             })
             .collect();
@@ -4302,6 +4437,30 @@ pub(crate) fn ty_from_type_expr(
                 resolved_args.push(ty_from_type_expr(a, types, generic_subst)?);
             }
             Some(Ty::User(name.to_string(), resolved_args))
+        }
+        // Plan B' Stage 6.8 Task 103 — first-class function type
+        // surface maps to Ty::Fn under HM. Closed rows only in v1
+        // (row-variable-bearing fn-types are rejected at
+        // `check_type_expr_known` with E0137); the surface still
+        // *parses* with a row var but typecheck cannot resolve it
+        // here (no row-var allocator in this `&` context), so we
+        // return None and let the E0137 path provide the user
+        // diagnostic.
+        TypeExpr::Fn(fty) => {
+            if fty.effect_row_var.is_some() {
+                return None;
+            }
+            let mut params = Vec::with_capacity(fty.params.len());
+            for p in &fty.params {
+                params.push(ty_from_type_expr(p, types, generic_subst)?);
+            }
+            let ret = ty_from_type_expr(&fty.ret, types, generic_subst)?;
+            Some(Ty::Fn(Box::new(FnSig {
+                params,
+                ret,
+                effects: fty.effects.clone(),
+                effect_row_var: None,
+            })))
         }
     }
 }
@@ -6924,6 +7083,7 @@ mod tests {
             types: BTreeMap::new(),
             ctors: BTreeMap::new(),
             match_scrut_tys: BTreeMap::new(),
+            call_callee_tys: BTreeMap::new(),
             fn_schemes: BTreeMap::new(),
             next_ty_var: 0,
             next_row_var: 0,
@@ -8241,5 +8401,196 @@ mod tests {
             has_code(&errs, "E0044"),
             "k call with wrong arg type must E0044 (k has Fn(op_ret_ty) -> handler_overall): {errs:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Plan B' Stage 6.8 Task 103 — TypeExpr::Fn typecheck integration
+    // ----------------------------------------------------------------
+
+    /// Helper: pipeline that returns the inferred Ty of `fn f`'s
+    /// only parameter. Asserts no errors. Used by the Phase B tests
+    /// to verify TypeExpr::Fn maps to Ty::Fn. The src is augmented
+    /// with a stub `fn main` so typecheck doesn't trip E0040.
+    fn fn_param0_ty(src_fn_f: &str) -> Ty {
+        let src = format!("{src_fn_f}fn main() -> Int ![] {{ 0 }}\n");
+        let (toks, _) = lex("t.sigil", &src);
+        let (prog, _) = parse("t.sigil", &toks);
+        let (rp, _) = resolve(prog);
+        let (tc, errs) = typecheck(rp.program);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let scheme = tc
+            .fn_schemes
+            .get("f")
+            .unwrap_or_else(|| panic!("fn `f` not found in schemes"));
+        let Ty::Fn(sig) = &scheme.body else {
+            panic!("expected scheme body Ty::Fn, got {:?}", scheme.body)
+        };
+        sig.params[0].clone()
+    }
+
+    #[test]
+    fn fn_type_zero_param_in_param_position_resolves_to_ty_fn() {
+        let src = "fn f(g: () -> Int ![]) -> Int ![] { 0 }\n";
+        let ty = fn_param0_ty(src);
+        let Ty::Fn(sig) = ty else {
+            panic!("expected Ty::Fn for fn-typed param, got {ty:?}")
+        };
+        assert!(sig.params.is_empty());
+        assert_eq!(sig.ret, Ty::Int);
+        assert!(sig.effects.is_empty());
+        assert!(sig.effect_row_var.is_none());
+    }
+
+    #[test]
+    fn fn_type_one_param_with_effect_resolves_to_ty_fn() {
+        let src = "fn f(g: (Int) -> String ![IO]) -> Int ![] { 0 }\n";
+        let ty = fn_param0_ty(src);
+        let Ty::Fn(sig) = ty else {
+            panic!("expected Ty::Fn, got {ty:?}")
+        };
+        assert_eq!(sig.params, vec![Ty::Int]);
+        assert_eq!(sig.ret, Ty::String);
+        assert_eq!(sig.effects, vec!["IO".to_string()]);
+    }
+
+    #[test]
+    fn fn_type_with_generic_param_resolves_to_ty_fn_with_var() {
+        let src = "fn f[A](g: (A) -> A ![]) -> Int ![] { 0 }\n";
+        let ty = fn_param0_ty(src);
+        let Ty::Fn(sig) = ty else {
+            panic!("expected Ty::Fn, got {ty:?}")
+        };
+        // params[0] and ret are both Ty::Var(_) — same id since `A`
+        // resolves to the same fresh var across both positions.
+        let Ty::Var(p_id) = &sig.params[0] else {
+            panic!("expected Ty::Var for `A` param, got {:?}", sig.params[0])
+        };
+        let Ty::Var(r_id) = &sig.ret else {
+            panic!("expected Ty::Var for `A` return, got {:?}", sig.ret)
+        };
+        assert_eq!(p_id, r_id, "shared `A` must resolve to the same Ty::Var");
+    }
+
+    #[test]
+    fn fn_type_with_row_variable_is_e0137() {
+        let src = "fn f(g: (Int) -> Int ![IO | r]) -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0137"),
+            "row-var-bearing fn-type must E0137: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_in_let_binding_position_typechecks() {
+        // The let RHS is the same fn `id_fn`, so its scheme matches
+        // the let-binding's annotated type.
+        let src = "fn id_fn(x: Int) -> Int ![] { x }\n\
+                   fn main() -> Int ![] { let f: (Int) -> Int ![] = id_fn; 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "fn-typed let binding must typecheck cleanly: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_let_binding_mismatch_is_e0044() {
+        // Annotated as `(Int) -> String` but RHS returns Int.
+        let src = "fn id_fn(x: Int) -> Int ![] { x }\n\
+                   fn main() -> Int ![] { let f: (Int) -> String ![] = id_fn; 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "fn-typed let mismatch must E0044: {errs:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // R1 finding 3 — exercise HM unification on user-surface Ty::Fn
+    // values. Pre-Phase-B, Ty::Fn was internal-only; Phase B is the
+    // first surface use, so we pin: (a) generic `A` shared across
+    // both fn-type positions unifies through, (b) effect-row order
+    // is irrelevant under unification, (c) effect-row width
+    // mismatch fails cleanly.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn fn_type_unification_through_generic_position() {
+        // `apply[A, B](f: (A) -> B ![], x: A) -> B ![]` invoked with
+        // a concrete fn whose `A`/`B` map to Int/String pins both
+        // positions through unification. Typechecks cleanly iff
+        // unification flows the concrete types through `A` + `B`.
+        let src = "fn int_to_string(n: Int) -> String ![] { \"x\" }\n\
+                   fn apply[A, B](f: (A) -> B ![], x: A) -> B ![] { f(x) }\n\
+                   fn main() -> Int ![] { let _: String = apply(int_to_string, 42); 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "generic apply with fn-typed arg must typecheck via unification: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_unification_effect_row_width_mismatch_is_e0128() {
+        // Annotation says fn-type with `![]` (empty effects); RHS is
+        // a fn whose declared effects are `![IO]`. Unification must
+        // reject. Note: the root cause is E0128 ("effect row
+        // mismatch: closed row `![]` cannot unify with closed row
+        // `![IO]`") fired by the row-unification path; E0045 ("let
+        // binding declared type but initializer has type") fires as
+        // a follow-on when the let-decl-vs-init types differ.
+        let src = "fn pr(s: String) -> Int ![IO] { perform IO.println(s); 0 }\n\
+                   fn main() -> Int ![IO] { let _: (String) -> Int ![] = pr; 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0128"),
+            "fn-type effect-row width mismatch must E0128 (row-unify): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_unification_effect_row_order_independent() {
+        // Effect rows are semantically a set; declaration order is
+        // irrelevant. Wrapper fn `caller` has `![IO, Choose]` row;
+        // RHS `pr` is declared `![Choose, IO]`. Unification accepts
+        // either ordering. Wrapped in `caller` (not `main`) since
+        // `fn main` rejects non-{IO, ArithError} effects.
+        //
+        // NOTE: under v1's representation `effects: Vec<String>` is
+        // ordered — typecheck unifies it as a set. If ordering ever
+        // becomes load-bearing, this test will trip and force the
+        // discussion.
+        let src = "effect Choose { flip: () -> Bool }\n\
+                   fn pr(s: String) -> Int ![Choose, IO] { 0 }\n\
+                   fn caller() -> Int ![IO, Choose] { \
+                     let _: (String) -> Int ![IO, Choose] = pr; 0 }\n\
+                   fn main() -> Int ![IO] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "fn-type effect-row order should not affect unification: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_nested_fn_in_param_resolves() {
+        // `((Int) -> Int ![]) -> Int ![]` — the param is itself a
+        // fn-type. Unify: outer Ty::Fn whose params[0] is inner
+        // Ty::Fn(Int -> Int).
+        let src = "fn f(g: ((Int) -> Int ![]) -> Int ![]) -> Int ![] { 0 }\n";
+        // fn_param0_ty appends fn main; this src has the fn-type in
+        // the param position of the outer fn `f`.
+        let ty = fn_param0_ty(src);
+        let Ty::Fn(outer_sig) = ty else {
+            panic!("expected outer Ty::Fn, got {ty:?}")
+        };
+        let Ty::Fn(inner_sig) = &outer_sig.params[0] else {
+            panic!("expected inner Ty::Fn, got {:?}", outer_sig.params[0])
+        };
+        assert_eq!(inner_sig.params, vec![Ty::Int]);
+        assert_eq!(inner_sig.ret, Ty::Int);
+        assert_eq!(outer_sig.ret, Ty::Int);
     }
 }

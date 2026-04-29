@@ -467,6 +467,18 @@ fn type_expr_uses_apply_or_param(
             true
         }
         TypeExpr::Named(name, _) => params.contains(name),
+        // Plan B' Stage 6.8 Task 102 — fn-type surface itself is
+        // not a generic Apply or generic-param ref. Recurse into
+        // its components so an Apply / generic-param hidden inside
+        // a fn-type still surfaces.
+        TypeExpr::Fn(fty) => {
+            for p in &fty.params {
+                if type_expr_uses_apply_or_param(p, params) {
+                    return true;
+                }
+            }
+            type_expr_uses_apply_or_param(&fty.ret, params)
+        }
     }
 }
 
@@ -690,6 +702,216 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
         }
     }
     None
+}
+
+/// Plan B' Stage 6.8 Task 104 (R2 finding 1) — typed-diagnostic
+/// rejection of indirect-call callee shapes that Phase C v1 +
+/// Phase C+ Parts 1 + 2 don't support. Walks the post-CC program.
+/// Returns `Some(msg)` when a `Call` whose callee is one of the
+/// unsupported shapes is found.
+///
+/// **Currently supported callee shapes (post Phase C+ Part 2):**
+/// - `Call { callee: Ident(name), .. }` — direct dispatch (top-level
+///   fn) or indirect (Ident-of-fn-typed-local, where `local_fn_types`
+///   resolves the signature).
+/// - `Call { callee: ClosureRecord { .. }, .. }` — lambda IIFE / fn-
+///   as-value at the call site, dispatched directly via the
+///   ClosureRecord's `code_fn_name`.
+/// - `Call { callee: Call(..), .. }` — Phase C+ Part 1: call
+///   returning a fn-typed value (e.g., `make_adder(5)(7)`). Resolved
+///   via `call_callee_tys[call_span]` from typecheck.
+/// - `Call { callee: ClosureEnvLoad { .. }, .. }` — Phase C+ Part 2:
+///   captured fn-typed value invoked inside a synth lambda fn (e.g.,
+///   `compose`'s body `f(g(x))` where `f`/`g` are captured).
+///   Resolved via the synth fn's `captured_fn_sigs` map (sourced
+///   from `cc.captures_typed`).
+///
+/// **Currently rejects (with E0138):**
+/// - `Call { callee: Lambda { .. }, .. }` — closure_convert should
+///   have rewritten any Lambda to ClosureRecord before this walker
+///   runs. Reaching this arm signals an invariant break.
+/// - Other callee shapes (Block, If, Match, Perform, Handle, …) are
+///   structurally not fn-valued at typecheck-accepted programs, so
+///   reaching this arm via a well-typed program is unreachable.
+///   The catchall stays as belt-and-braces.
+///
+/// Pre-Phase-C, `lower_call`'s catchall `unreachable!()` was
+/// guarded by "Plan A2 cannot reach this arm from a well-typed
+/// program because TypeExpr::Fn is deferred." Phase A unlocked the
+/// surface; Phase C+ closes every shape we know how to handle. This
+/// walker converts any leftover panic into a typed Sigil diagnostic
+/// with the unsupported-callee span.
+pub(crate) fn unsupported_indirect_call_shape(program: &crate::ast::Program) -> Option<String> {
+    for item in &program.items {
+        if let crate::ast::Item::Fn(f) = item {
+            if let Some(msg) = block_unsupported_indirect_call(&f.body) {
+                return Some(format!("in fn `{}`: {}", f.name, msg));
+            }
+        }
+    }
+    None
+}
+
+fn block_unsupported_indirect_call(b: &crate::ast::Block) -> Option<String> {
+    use crate::ast::Stmt;
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                if let Some(m) = expr_unsupported_indirect_call(&l.value) {
+                    return Some(m);
+                }
+            }
+            Stmt::Expr(e) => {
+                if let Some(m) = expr_unsupported_indirect_call(e) {
+                    return Some(m);
+                }
+            }
+            Stmt::Perform(p) => {
+                for a in &p.args {
+                    if let Some(m) = expr_unsupported_indirect_call(a) {
+                        return Some(m);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(t) = &b.tail {
+        if let Some(m) = expr_unsupported_indirect_call(t) {
+            return Some(m);
+        }
+    }
+    None
+}
+
+fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
+    use crate::ast::Expr;
+    match e {
+        Expr::Call { callee, args, span } => {
+            // First check the callee's own subexpressions.
+            if let Some(m) = expr_unsupported_indirect_call(callee) {
+                return Some(m);
+            }
+            for a in args {
+                if let Some(m) = expr_unsupported_indirect_call(a) {
+                    return Some(m);
+                }
+            }
+            // Now check the callee shape against Phase C+'s allow-list.
+            match callee.as_ref() {
+                // Phase C v1 + Phase C+ Part 1 + Phase C+ Part 2:
+                // Ident, ClosureRecord, Call(...), and ClosureEnvLoad
+                // callees are all supported. ClosureEnvLoad resolves
+                // via the synth fn's `captured_fn_sigs` map.
+                Expr::Ident(_, _)
+                | Expr::ClosureRecord { .. }
+                | Expr::Call { .. }
+                | Expr::ClosureEnvLoad { .. } => None,
+                Expr::Lambda { .. } => {
+                    // closure_convert rewrites every Lambda to ClosureRecord
+                    // before this walker runs; reaching this arm means a
+                    // pass-order invariant broke.
+                    Some(format!(
+                        "[E0138] {file}:{line}:{col}: indirect call through \
+                         a Lambda callee — closure_convert should have \
+                         rewritten this to ClosureRecord. Invariant break, \
+                         file a bug.",
+                        file = span.file,
+                        line = span.line,
+                        col = span.column
+                    ))
+                }
+                _ => Some(format!(
+                    "[E0138] {file}:{line}:{col}: indirect call through an \
+                     unsupported callee shape. Currently supported callee \
+                     shapes (Phase C v1 + Phase C+): `Ident`, \
+                     `ClosureRecord`, `Call(...)`, `ClosureEnvLoad`. \
+                     Reaching this arm via a well-typed program signals a \
+                     codegen invariant break — file a bug.",
+                    file = span.file,
+                    line = span.line,
+                    col = span.column
+                )),
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_unsupported_indirect_call(lhs).or_else(|| expr_unsupported_indirect_call(rhs))
+        }
+        Expr::Unary { operand, .. } => expr_unsupported_indirect_call(operand),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => expr_unsupported_indirect_call(cond)
+            .or_else(|| block_unsupported_indirect_call(then_block))
+            .or_else(|| block_unsupported_indirect_call(else_block)),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            if let Some(m) = expr_unsupported_indirect_call(scrutinee) {
+                return Some(m);
+            }
+            for a in arms {
+                if let Some(m) = expr_unsupported_indirect_call(&a.body) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Expr::Block(b) => block_unsupported_indirect_call(b),
+        Expr::Perform(p) => {
+            for a in &p.args {
+                if let Some(m) = expr_unsupported_indirect_call(a) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Expr::Handle {
+            body,
+            op_arms,
+            return_arm,
+            ..
+        } => {
+            if let Some(m) = expr_unsupported_indirect_call(body) {
+                return Some(m);
+            }
+            for a in op_arms {
+                if let Some(m) = expr_unsupported_indirect_call(&a.body) {
+                    return Some(m);
+                }
+            }
+            if let Some(ra) = return_arm {
+                if let Some(m) = expr_unsupported_indirect_call(&ra.body) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Expr::Lambda { body, .. } => expr_unsupported_indirect_call(body),
+        Expr::ClosureRecord { env_exprs, .. } => {
+            for e in env_exprs {
+                if let Some(m) = expr_unsupported_indirect_call(e) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                if let Some(m) = expr_unsupported_indirect_call(&f.value) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::Ident(..)
+        | Expr::ClosureEnvLoad { .. } => None,
+    }
 }
 
 fn block_unsupported_handle(
@@ -1367,19 +1589,44 @@ fn arm_body_walk(
             }
             None
         }
-        Expr::Lambda { .. } => Some(
-            "contains a nested lambda — lambdas in arm bodies require a \
-             closure-convert side-table extension distinct from Phase 4d MVP \
-             (closure point: future phase, beyond 4e's calling-convention shift)"
-                .to_string(),
-        ),
-        Expr::ClosureRecord { .. } => Some(
-            "contains a nested ClosureRecord (lambda lifted by closure_convert) — \
-             closures in arm bodies require a closure-convert side-table \
-             extension distinct from Phase 4d MVP (closure point: future phase, \
-             beyond 4e's calling-convention shift)"
-                .to_string(),
-        ),
+        Expr::Lambda { .. } => {
+            // Plan B' Stage 6.8 Task 107 (B.4 Phase A): closure_convert
+            // hoists every Lambda to a synthetic top-level fn before
+            // codegen runs. Reaching this arm means a pass-order
+            // invariant broke (closure_convert skipped a Lambda).
+            // Treat as defensive — same shape as Phase C+ Part 1's
+            // walker rejection of Lambda callees.
+            Some(
+                "contains an un-hoisted nested Lambda — closure_convert \
+                 should have rewritten this to ClosureRecord before codegen. \
+                 Invariant break, file a bug."
+                    .to_string(),
+            )
+        }
+        Expr::ClosureRecord {
+            code_fn_name: _,
+            env_exprs,
+            ..
+        } => {
+            // Plan B' Stage 6.8 Task 107 Phase A → Phase B: nested
+            // closure records (lifted lambdas) inside arm bodies are
+            // now fully supported — including those that capture the
+            // arm's continuation `k`. closure_convert detects the
+            // k-capture and applies the trailing-pair convention to
+            // the lifted lambda's closure record (k_closure + k_fn
+            // at trailing slots); codegen's `lower_call` dispatches
+            // `k(arg)` from inside the synth fn via
+            // `sigil_next_step_call` over the captured pair.
+            //
+            // Recurse into env_exprs so nested-shape violations (e.g.,
+            // an Apply inside an env-expr's value) still surface.
+            for env_expr in env_exprs {
+                if let Some(r) = arm_body_walk(env_expr, scopes, k_name, globals, false) {
+                    return Some(r);
+                }
+            }
+            None
+        }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
                 if let Some(r) = arm_body_walk(&f.value, scopes, k_name, globals, false) {
@@ -2200,6 +2447,10 @@ fn slot_kind_for_type_expr_post_mono(te: &crate::ast::TypeExpr) -> EnvSlotKind {
             "codegen Phase 4e: slot_kind_for_type_expr_post_mono received \
              TypeExpr::Apply — monomorphization (Task 49) should have erased it"
         ),
+        // Plan B' Stage 6.8 Task 102 — fn-typed values are heap-
+        // allocated closure records; treat as a pointer slot
+        // (Closure kind matches the codegen-time runtime layout).
+        crate::ast::TypeExpr::Fn(_) => EnvSlotKind::Closure,
     }
 }
 
@@ -4263,6 +4514,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         return Err(msg);
     }
 
+    // Plan B' Stage 6.8 Task 104 (R2 finding 1) — reject indirect-
+    // call callee shapes that Phase C v1 doesn't support, with a
+    // typed E0138 diagnostic instead of letting `lower_call`'s
+    // catchall panic at codegen time. Phase C+ extends the
+    // `lower_call` indirect path to recursive callee-type
+    // resolution + ClosureEnvLoad-callee dispatch; this guard is
+    // narrowed at that point.
+    if let Some(msg) = unsupported_indirect_call_shape(&checked.program) {
+        return Err(msg);
+    }
+
     let string_literals = &checked.string_literals;
 
     // Plan A3 task 40: build per-type layout descriptors once before any
@@ -5440,6 +5702,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    local_fn_types: BTreeMap::new(),
+                    call_callee_tys: &checked.call_callee_tys,
+                    captured_fn_sigs: BTreeMap::new(),
+                    arm_k_closure_v: None,
+                    arm_k_fn_v: None,
+                    arm_k_pair_self: None,
+                    arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
 
                 // Phase 5 — lower perform args via Lowerer; pack
@@ -5570,6 +5839,41 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
                 match_scrut_tys: &checked.match_scrut_tys,
+                local_fn_types: {
+                    // Plan B' Stage 6.8 Task 104 — seed with fn-typed
+                    // parameters so `lower_call`'s indirect path can
+                    // resolve their signatures when used as callees.
+                    let mut m: BTreeMap<String, crate::ast::FnTypeExpr> = BTreeMap::new();
+                    for p in &f.params {
+                        if let crate::ast::TypeExpr::Fn(fty) = &p.ty {
+                            m.insert(p.name.clone(), (**fty).clone());
+                        }
+                    }
+                    m
+                },
+                call_callee_tys: &checked.call_callee_tys,
+                captured_fn_sigs: {
+                    // Plan B' Stage 6.8 Phase C+ Part 2 — for synth
+                    // lambda fns (`$lambda_N`), seed with fn-typed
+                    // captures so `lower_call`'s indirect path can
+                    // resolve `Expr::ClosureEnvLoad`-callee signatures.
+                    // Non-synth user fns get an empty map; their
+                    // fn-typed locals come via params/lets and are
+                    // tracked in `local_fn_types` instead.
+                    let mut m: BTreeMap<String, crate::typecheck::FnSig> = BTreeMap::new();
+                    if let Some(caps) = cc.captures_typed.get(&f.name) {
+                        for (cname, cty) in caps {
+                            if let crate::typecheck::Ty::Fn(sig) = cty {
+                                m.insert(cname.clone(), (**sig).clone());
+                            }
+                        }
+                    }
+                    m
+                },
+                arm_k_closure_v: None,
+                arm_k_fn_v: None,
+                arm_k_pair_self: cc.arm_k_pair_captures.get(&f.name).cloned(),
+                arm_k_pair_captures: &cc.arm_k_pair_captures,
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -5983,6 +6287,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    local_fn_types: BTreeMap::new(),
+                    call_callee_tys: &checked.call_callee_tys,
+                    captured_fn_sigs: BTreeMap::new(),
+                    // Plan B' Stage 6.8 Task 107 Phase B — expose
+                    // the arm fn's k_closure_v / k_fn_v as Lowerer
+                    // fields so `lower_closure_record` can populate
+                    // the trailing-pair slots when allocating a
+                    // k-pair-bearing lifted lambda's closure record
+                    // inside the arm body.
+                    arm_k_closure_v: Some(k_closure_v),
+                    arm_k_fn_v: Some(k_fn_v),
+                    arm_k_pair_self: None,
+                    arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
 
                 // Plan B Task 55 (Phase 4d): route between the two
@@ -6646,6 +6963,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    local_fn_types: BTreeMap::new(),
+                    call_callee_tys: &checked.call_callee_tys,
+                    captured_fn_sigs: BTreeMap::new(),
+                    arm_k_closure_v: None,
+                    arm_k_fn_v: None,
+                    arm_k_pair_self: None,
+                    arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
 
                 let body_value = lowerer.lower_expr(&synth.body);
@@ -6869,6 +7193,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
                 match_scrut_tys: &checked.match_scrut_tys,
+                local_fn_types: BTreeMap::new(),
+                call_callee_tys: &checked.call_callee_tys,
+                captured_fn_sigs: BTreeMap::new(),
+                arm_k_closure_v: None,
+                arm_k_fn_v: None,
+                arm_k_pair_self: None,
+                arm_k_pair_captures: &cc.arm_k_pair_captures,
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
@@ -7130,6 +7461,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         type_layouts: &type_layouts,
                         ctor_index: &ctor_index,
                         match_scrut_tys: &checked.match_scrut_tys,
+                        local_fn_types: BTreeMap::new(),
+                        call_callee_tys: &checked.call_callee_tys,
+                        captured_fn_sigs: BTreeMap::new(),
+                        arm_k_closure_v: None,
+                        arm_k_fn_v: None,
+                        arm_k_pair_self: None,
+                        arm_k_pair_captures: &cc.arm_k_pair_captures,
                     };
 
                     match &step.role {
@@ -7753,6 +8091,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             type_layouts: &type_layouts,
                             ctor_index: &ctor_index,
                             match_scrut_tys: &checked.match_scrut_tys,
+                            local_fn_types: BTreeMap::new(),
+                            call_callee_tys: &checked.call_callee_tys,
+                            captured_fn_sigs: BTreeMap::new(),
+                            arm_k_closure_v: None,
+                            arm_k_fn_v: None,
+                            arm_k_pair_self: None,
+                            arm_k_pair_captures: &cc.arm_k_pair_captures,
                         };
 
                         match role {
@@ -8297,6 +8642,68 @@ struct Lowerer<'a, 'b> {
     /// to primitive-scalar dispatch in that case (which is correct
     /// because if-desugar only emits `Pattern::BoolLit` arms).
     match_scrut_tys: &'b BTreeMap<Span, Ty>,
+
+    /// Plan B' Stage 6.8 Task 104 — local fn-typed bindings in scope.
+    /// Keyed by binding name (fn parameter or `let`-binding); the
+    /// value is the binding's `TypeExpr::Fn` payload, used at
+    /// `lower_call` to reconstruct the indirect-call signature
+    /// (params + ret) when the callee resolves to one of these names.
+    /// Populated at fn entry (user-fn params) and during block
+    /// lowering (`Stmt::Let` with `TypeExpr::Fn`). Empty for synth
+    /// arm-fn / cps continuation lowering surfaces.
+    local_fn_types: BTreeMap<String, crate::ast::FnTypeExpr>,
+
+    /// Plan B' Stage 6.8 Phase C+ — typecheck-resolved callee `Ty::Fn`
+    /// for indirect calls, keyed on the call expression's span.
+    /// Populated by `typecheck::check_call`; consumed by
+    /// `lower_call`'s indirect path when the callee is itself a
+    /// `Call(...)` returning a fn-typed value (e.g., `make_adder(5)
+    /// (7)`). The `Ty::Fn` here is fully deref'd through typecheck's
+    /// substitution and post-monomorphize-resolved (no `Ty::Var`
+    /// survivors), so `cranelift_ty_of_ty` produces the right
+    /// Cranelift types directly.
+    call_callee_tys: &'b BTreeMap<Span, Ty>,
+
+    /// Plan B' Stage 6.8 Phase C+ Part 2 — fn-typed captures of the
+    /// current synth lambda fn, keyed by capture name. When a Call's
+    /// callee is `Expr::ClosureEnvLoad { name, .. }` (the lambda body
+    /// invokes a captured fn-typed value), `lower_call` looks the
+    /// `FnSig` up here to build the indirect-call signature. Empty
+    /// for non-synth user fns (which don't have fn-typed captures
+    /// at this layer; their fn-typed locals come via params / lets
+    /// → `local_fn_types`). Sourced from `cc.captures_typed` at
+    /// synth-fn Lowerer construction.
+    captured_fn_sigs: BTreeMap<String, crate::typecheck::FnSig>,
+
+    /// Plan B' Stage 6.8 Task 107 Phase B — when this Lowerer is
+    /// for a synth arm fn (Cps-form fn dispatched by the runtime),
+    /// these hold the k_closure / k_fn Cranelift Values loaded from
+    /// args_ptr's trailing pair slots. They're forwarded to any
+    /// `lower_closure_record` call whose `code_fn_name` is flagged
+    /// in `arm_k_pair_captures` so the lifted lambda's closure
+    /// record can store the k-pair at its trailing slots. None for
+    /// non-arm-fn Lowerers.
+    arm_k_closure_v: Option<Value>,
+    arm_k_fn_v: Option<Value>,
+
+    /// Plan B' Stage 6.8 Task 107 Phase B — when this Lowerer is for
+    /// a k-pair-bearing synth lambda fn (lifted from an arm body that
+    /// captures continuation `k`), this holds the KPair info. Used
+    /// at `lower_call` time: when the callee is `Ident(k_name)` and
+    /// `arm_k_pair_self.k_name` matches, dispatch via
+    /// `sigil_next_step_call(k_closure, k_fn, 1)` over the closure
+    /// record's trailing pair slots instead of indirect closure
+    /// dispatch. Sourced from `cc.arm_k_pair_captures.get(&f.name)`
+    /// at synth-fn Lowerer construction.
+    arm_k_pair_self: Option<crate::closure_convert::ArmKPairCapture>,
+
+    /// Plan B' Stage 6.8 Task 107 Phase B — global side-table from
+    /// closure_convert flagging which lifted lambda fns are k-pair-
+    /// bearing. Read by `lower_closure_record` when the code_fn_name
+    /// of an arm-body lambda's ClosureRecord is in the map; the
+    /// trailing 2 slots get k_closure / k_fn from the surrounding
+    /// arm fn's `arm_k_closure_v` / `arm_k_fn_v`.
+    arm_k_pair_captures: &'b BTreeMap<String, crate::closure_convert::ArmKPairCapture>,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -8335,6 +8742,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Stmt::Let(l) => {
                 let v = self.lower_expr(&l.value);
                 self.env.insert(l.name.clone(), v);
+                // Plan B' Stage 6.8 Task 104 — track fn-typed let
+                // bindings so `lower_call`'s indirect path can
+                // reconstruct the callee signature when the binding
+                // is invoked.
+                if let crate::ast::TypeExpr::Fn(fty) = &l.ty {
+                    self.local_fn_types.insert(l.name.clone(), (**fty).clone());
+                }
             }
             Stmt::Expr(e) => {
                 let _ = self.lower_expr(e);
@@ -8679,7 +9093,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // IO shortcut produced.
                 self.lower_perform_to_value(p)
             }
-            Expr::Call { callee, args, .. } => self.lower_call(callee, args),
+            Expr::Call {
+                callee, args, span, ..
+            } => self.lower_call(callee, args, span),
             Expr::Lambda { .. } => {
                 // Closure conversion (plan A2 task 31) rewrites every
                 // `Expr::Lambda` into an `Expr::ClosureRecord`; codegen
@@ -9228,8 +9644,128 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// — which is deferred to Plan A3 when the `TypeExpr::Fn` surface
     /// syntax lands and fn-typed lets become expressible. See
     /// `PLAN_A2_DEVIATIONS.md` `[Task 32]` for the rationale.
-    fn lower_call(&mut self, callee: &crate::ast::Expr, args: &[crate::ast::Expr]) -> Value {
+    /// Plan B' Stage 6.8 Task 107 Phase B — dispatch a k-pair call
+    /// from inside a k-pair-bearing synth lambda fn. Loads
+    /// (k_closure, k_fn) from the synth fn's closure record at the
+    /// trailing-pair slots, builds a NextStep::Call via
+    /// `sigil_next_step_call`, writes the (single) arg into the
+    /// args buffer, drives `sigil_run_loop` synchronously, and
+    /// narrows the result to the handler-overall Cranelift type.
+    /// Mirrors `lower_perform_to_value`'s shape but uses the
+    /// k-pair (already-staged closure + fn) instead of allocating
+    /// a fresh perform.
+    fn lower_k_pair_call(
+        &mut self,
+        args: &[crate::ast::Expr],
+        info: &crate::closure_convert::ArmKPairCapture,
+    ) -> Value {
+        // v1: k always takes exactly 1 arg (the op's return value).
+        // The walker enforces arity at the typecheck level.
+        debug_assert_eq!(
+            args.len(),
+            1,
+            "lower_k_pair_call: expected 1 arg (op return value), got {}",
+            args.len()
+        );
+
+        // Load k_closure and k_fn from the synth fn's closure record.
+        // The synth fn's `closure_ptr` is `self.closure_ptr` (block
+        // param 0); k_closure_idx / k_fn_idx are the trailing-pair
+        // slot indices set by closure_convert.
+        let k_closure_offset: i32 = 16 + 8 * info.k_closure_idx as i32;
+        let k_fn_offset: i32 = 16 + 8 * info.k_fn_idx as i32;
+        let k_closure = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.closure_ptr,
+            k_closure_offset,
+        );
+        let k_fn = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.closure_ptr,
+            k_fn_offset,
+        );
+
+        // Lower the arg, widen to I64 for the args buffer.
+        let arg_v = self.lower_expr(&args[0]);
+        let arg_ty = self.builder.func.dfg.value_type(arg_v);
+        let widened_arg = if arg_ty == types::I64 {
+            arg_v
+        } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+            self.builder.ins().uextend(types::I64, arg_v)
+        } else {
+            assert_eq!(
+                arg_ty, self.pointer_ty,
+                "lower_k_pair_call: unexpected arg Cranelift type {arg_ty:?}"
+            );
+            arg_v
+        };
+
+        // sigil_next_step_call(k_closure, k_fn, 1) → *mut NextStep
+        let arg_count_v = self.builder.ins().iconst(types::I32, 1);
+        let next_step_call = self
+            .builder
+            .ins()
+            .call(self.next_step_call_ref, &[k_closure, k_fn, arg_count_v]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, next_step_call));
+        let ns = self.builder.inst_results(next_step_call)[0];
+
+        // sigil_next_step_args_ptr(ns) → *mut u64; write arg at slot 0.
+        let args_ptr_call = self.builder.ins().call(self.next_step_args_ptr_ref, &[ns]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, args_ptr_call));
+        let args_buf = self.builder.inst_results(args_ptr_call)[0];
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), widened_arg, args_buf, 0);
+
+        // sigil_run_loop(ns) → u64
+        let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
+        let widened_result = self.builder.inst_results(run_loop_call)[0];
+
+        // Narrow back to handler_overall_ty's Cranelift type.
+        let target_ty = cranelift_ty_of_ty(&info.handler_overall_ty, self.pointer_ty);
+        if target_ty == types::I64 {
+            widened_result
+        } else if target_ty.is_int() && target_ty.bits() < 64 {
+            self.builder.ins().ireduce(target_ty, widened_result)
+        } else {
+            assert_eq!(
+                target_ty, self.pointer_ty,
+                "lower_k_pair_call: unexpected handler_overall_ty Cranelift type {target_ty:?}"
+            );
+            widened_result
+        }
+    }
+
+    fn lower_call(
+        &mut self,
+        callee: &crate::ast::Expr,
+        args: &[crate::ast::Expr],
+        call_span: &crate::errors::Span,
+    ) -> Value {
         use crate::ast::Expr;
+
+        // Plan B' Stage 6.8 Task 107 Phase B — k-pair dispatch.
+        // Fires before the regular Ident-callee path. When this
+        // synth lambda fn is k-pair-bearing (its `arm_k_pair_self`
+        // is Some) AND the callee is `Ident(name)` with name
+        // matching the captured k_name, dispatch via the
+        // continuation-pair shape: load k_closure / k_fn from the
+        // closure record's trailing slots, call
+        // sigil_next_step_call(k_closure, k_fn, 1), write the arg
+        // into the args buffer, drive sigil_run_loop, narrow the
+        // result to the handler-overall Cranelift type.
+        if let (Expr::Ident(name, _), Some(info)) = (callee, self.arm_k_pair_self.clone()) {
+            if name == &info.k_name {
+                return self.lower_k_pair_call(args, &info);
+            }
+        }
+
         match callee {
             // Plan A3 task 41.1: positional constructor application
             // `Ctor(a, b, ..)` where `Ctor` is a registered ctor name
@@ -9438,17 +9974,117 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.inst_results(call)[0]
             }
             _ => {
-                // Indirect calls (callee is a bound local or an
-                // arbitrary expression producing a closure value) land
-                // in Plan A3. Plan A2 cannot reach this arm from a
-                // well-typed program because `TypeExpr::Fn` is deferred
-                // — there is no surface syntax to declare a let or a
-                // param of function type, so every well-typed callee
-                // reduces to `Ident(top_level_fn)` or `ClosureRecord`
-                // at this point.
-                unreachable!(
-                    "codegen: indirect call (callee = {callee:?}) deferred to Plan A3 (TypeExpr::Fn not in A2)"
-                )
+                // Plan B' Stage 6.8 Task 104 + Phase C+ — indirect
+                // call. The callee is a `Ty::Fn` value (let-binding,
+                // fn parameter, or expression producing a closure).
+                // Closure-convention ABI: `(closure_ptr, args...)
+                // -> ret`. Code_ptr lives at offset 8 in the closure
+                // record (header at 0, code_ptr at 8, captures at
+                // 16+8*i).
+                //
+                // Two callee-resolution paths land here:
+                //
+                // - `Expr::Ident(local)` where `local` is registered
+                //   in `local_fn_types`: read the `FnTypeExpr` from
+                //   the fn-param / let-binding annotation and build
+                //   the Cranelift sig from the surface TypeExpr.
+                // - `Expr::Call(...)` returning a fn-typed value
+                //   (Phase C+ extension, e.g. `make_adder(5)(7)`):
+                //   read the resolved `Ty::Fn` from the typecheck
+                //   side-table `call_callee_tys` keyed on the outer
+                //   call's span. The `Ty` is post-mono-resolved (no
+                //   `Ty::Var` survivors); convert to Cranelift via
+                //   `cranelift_ty_of_ty`.
+                //
+                // Other callee shapes (e.g., `ClosureEnvLoad`)
+                // remain rejected by the codegen-entry walker
+                // `unsupported_indirect_call_shape` with E0138.
+                enum CalleeSig {
+                    Surface(Box<crate::ast::FnTypeExpr>),
+                    Resolved(Box<crate::typecheck::FnSig>),
+                }
+                let callee_sig: Option<CalleeSig> = match callee {
+                    Expr::Ident(name, _) => self
+                        .local_fn_types
+                        .get(name)
+                        .cloned()
+                        .map(|fty| CalleeSig::Surface(Box::new(fty))),
+                    Expr::Call { .. } => match self.call_callee_tys.get(call_span) {
+                        Some(crate::typecheck::Ty::Fn(sig)) => {
+                            Some(CalleeSig::Resolved(sig.clone()))
+                        }
+                        _ => None,
+                    },
+                    // Phase C+ Part 2 — captured fn-typed value
+                    // invoked inside a synth lambda fn. The synth
+                    // fn's `captured_fn_sigs` map (populated at
+                    // Lowerer construction from `cc.captures_typed`)
+                    // gives the FnSig keyed by capture name.
+                    Expr::ClosureEnvLoad { name, .. } => self
+                        .captured_fn_sigs
+                        .get(name)
+                        .cloned()
+                        .map(|sig| CalleeSig::Resolved(Box::new(sig))),
+                    _ => None,
+                };
+                let callee_sig = match callee_sig {
+                    Some(s) => s,
+                    None => unreachable!(
+                        "codegen invariant: walker accepted callee shape but no \
+                         signature source registered — callee = {callee:?}"
+                    ),
+                };
+
+                // Lower the callee to its closure_ptr Value.
+                let closure_value = self.lower_expr(callee);
+
+                // Load code_ptr from offset 8 (past header).
+                let code_ptr =
+                    self.builder
+                        .ins()
+                        .load(self.pointer_ty, MemFlags::trusted(), closure_value, 8);
+
+                // Build the Cranelift signature matching this fn-type.
+                // Closure-convention ABI: closure_ptr first, then
+                // user-declared params, then ret type. Call conv
+                // matches the surrounding fn's (host triple default).
+                let call_conv = self.builder.func.signature.call_conv;
+                let mut sig = Signature::new(call_conv);
+                sig.params.push(AbiParam::new(self.pointer_ty));
+                let ret_ty = match &callee_sig {
+                    CalleeSig::Surface(fty) => {
+                        for p in &fty.params {
+                            sig.params.push(AbiParam::new(cranelift_ty_for_type_expr(
+                                p,
+                                self.pointer_ty,
+                            )));
+                        }
+                        cranelift_ty_for_type_expr(&fty.ret, self.pointer_ty)
+                    }
+                    CalleeSig::Resolved(s) => {
+                        for p in &s.params {
+                            sig.params
+                                .push(AbiParam::new(cranelift_ty_of_ty(p, self.pointer_ty)));
+                        }
+                        cranelift_ty_of_ty(&s.ret, self.pointer_ty)
+                    }
+                };
+                sig.returns.push(AbiParam::new(ret_ty));
+                let sig_ref = self.builder.import_signature(sig);
+
+                // Lower args; prepend closure_ptr.
+                let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 1);
+                all_args.push(closure_value);
+                all_args.extend(arg_vals);
+
+                let call = self
+                    .builder
+                    .ins()
+                    .call_indirect(sig_ref, code_ptr, &all_args);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
             }
         }
     }
@@ -9600,27 +10236,50 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             env_slot_kinds.len(),
             "closure_convert should emit parallel env_exprs / env_slot_kinds"
         );
+
+        // Plan B' Stage 6.8 Task 107 Phase B — k-pair extension.
+        // When closure_convert flagged this synth fn as k-pair-
+        // bearing (its `arm_k_pair_captures` entry exists), the
+        // closure record gets 2 trailing slots after the regular
+        // env: k_closure at offset 16+8*k_closure_idx and k_fn at
+        // 16+8*k_fn_idx. The trailing-pair convention parallels the
+        // arm fn's args_ptr layout. The k-pair Values come from the
+        // surrounding ARM fn's `arm_k_closure_v` / `arm_k_fn_v`
+        // fields, populated at arm-fn Lowerer construction.
+        let k_pair = self.arm_k_pair_captures.get(code_fn_name).cloned();
+        let extra_k_slots = if k_pair.is_some() { 2 } else { 0 };
+
         let env_len = env_exprs.len();
+        let total_slot_count = env_len + extra_k_slots;
         assert!(
-            env_len < MAX_CLOSURE_ENV_SLOTS,
+            total_slot_count < MAX_CLOSURE_ENV_SLOTS,
             "closure env >= {MAX_CLOSURE_ENV_SLOTS} slots exceeds the bitmap layout (tag 0xFF descriptor is v2)"
         );
 
-        // Header bitmap: bit 0 = code_ptr (not a pointer), bit k+1 set
-        // iff env slot k holds a GC-managed pointer.
+        // Header bitmap: bit 0 = code_ptr (not a pointer), bit k+1
+        // set iff env slot k holds a GC-managed pointer. For the
+        // k-pair trailing slots: k_closure is a pointer (bitmap bit
+        // = 1+k_closure_idx + 1); k_fn is a fn pointer (non-GC, bit
+        // = 0). The k_pair_info indices are relative to the post-
+        // env-slots position: k_closure_idx == env_len,
+        // k_fn_idx == env_len + 1 (closure_convert's invariant).
         let mut bitmap: u32 = 0;
         for (i, kind) in env_slot_kinds.iter().enumerate() {
             if kind.is_pointer() {
                 bitmap |= 1u32 << (i + 1);
             }
         }
-        // Payload word count: 1 (code_ptr) + env_len (one word per slot).
-        let count: u8 = 1 + env_len as u8;
-        // Header word assembled via the shared `sigil-header-constants`
-        // crate so the bit-layout formula is a single-point-of-edit
-        // across the compiler and runtime (PR #7 review item 3).
+        if let Some(info) = &k_pair {
+            // k_closure is a heap-allocated TAG_CLOSURE pointer.
+            // bitmap bit position is `info.k_closure_idx + 1` since
+            // bit 0 is code_ptr.
+            bitmap |= 1u32 << (info.k_closure_idx + 1);
+            // k_fn is a fn pointer (text-segment), non-GC. No bit.
+            let _ = info.k_fn_idx;
+        }
+        let count: u8 = 1 + total_slot_count as u8;
         let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
-        let payload_bytes: i64 = 8 + 8 * env_len as i64; // code_ptr + env slots
+        let payload_bytes: i64 = 8 + 8 * total_slot_count as i64;
 
         // Lower env_exprs to Cranelift Values in source order; each
         // Value will be extended to i64 before store.
@@ -9662,6 +10321,39 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlags::trusted(), slot_val, closure_ptr, offset);
+        }
+
+        // Plan B' Stage 6.8 Task 107 Phase B — store the k-pair at
+        // trailing slots. Sourced from the surrounding arm fn's
+        // `arm_k_closure_v` / `arm_k_fn_v`. If those are None,
+        // codegen invariant broke (k-pair-bearing lambda was lifted
+        // outside an arm fn — closure_convert shouldn't allow this).
+        if let Some(info) = &k_pair {
+            let k_closure_v = self.arm_k_closure_v.unwrap_or_else(|| {
+                unreachable!(
+                    "codegen invariant: lower_closure_record for k-pair-bearing fn \
+                     `{code_fn_name}` requires surrounding arm fn's k_closure_v, \
+                     but Lowerer.arm_k_closure_v is None — closure_convert flagged \
+                     a lambda outside an arm context?"
+                )
+            });
+            let k_fn_v = self.arm_k_fn_v.unwrap_or_else(|| {
+                unreachable!(
+                    "codegen invariant: lower_closure_record for k-pair-bearing fn \
+                     `{code_fn_name}` requires surrounding arm fn's k_fn_v"
+                )
+            });
+            let k_closure_offset: i32 = 16 + 8 * info.k_closure_idx as i32;
+            let k_fn_offset: i32 = 16 + 8 * info.k_fn_idx as i32;
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                k_closure_v,
+                closure_ptr,
+                k_closure_offset,
+            );
+            self.builder
+                .ins()
+                .store(MemFlags::trusted(), k_fn_v, closure_ptr, k_fn_offset);
         }
 
         closure_ptr
@@ -10324,7 +11016,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 Some(t) => self.type_of_expr(t, preview),
                 None => types::I8,
             },
-            Expr::Call { callee, .. } => match callee.as_ref() {
+            Expr::Call { callee, span, .. } => match callee.as_ref() {
                 // Plan A3 task 41.1: constructor application returns a
                 // heap pointer to the newly-allocated user-type record.
                 Expr::Ident(name, _)
@@ -10343,9 +11035,32 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .get(code_fn_name)
                     .map(|e| e.ret_ty)
                     .unwrap_or(types::I64),
-                // Indirect calls don't exist in Plan A2 (see lower_call);
-                // defensively return i64.
-                _ => types::I64,
+                // Plan B' Stage 6.8 Task 104 — indirect call via a
+                // local fn-typed value. Look up the callee's
+                // `FnTypeExpr` to recover the declared ret type.
+                Expr::Ident(name, _) if self.local_fn_types.contains_key(name) => {
+                    cranelift_ty_for_type_expr(&self.local_fn_types[name].ret, self.pointer_ty)
+                }
+                // Phase C+ Part 2 — ClosureEnvLoad-callee (captured
+                // fn-typed value invoked inside a synth lambda fn).
+                // Look up the FnSig in `captured_fn_sigs`; convert
+                // ret to Cranelift.
+                Expr::ClosureEnvLoad { name, .. } if self.captured_fn_sigs.contains_key(name) => {
+                    cranelift_ty_of_ty(&self.captured_fn_sigs[name].ret, self.pointer_ty)
+                }
+                // Phase C+ Part 1 — Call-returning-fn callee. Read
+                // the resolved Ty::Fn from the typecheck side-table
+                // keyed on the call's span; convert ret to Cranelift.
+                _ => {
+                    if let Some(crate::typecheck::Ty::Fn(sig)) = self.call_callee_tys.get(span) {
+                        cranelift_ty_of_ty(&sig.ret, self.pointer_ty)
+                    } else {
+                        // Defensive default; the codegen-entry walker
+                        // rejects unsupported indirect-call shapes
+                        // before reaching here.
+                        types::I64
+                    }
+                }
             },
             // Lambda type prediction is a Task-31/32 concern; closure
             // conversion ensures `Lambda` is always rewritten before
@@ -11340,6 +12055,225 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------
+    // Plan B' Stage 6.8 Task 105 — codegen-entry walker positive
+    // coverage for `TypeExpr::Fn`. The walker recurses into fn-type
+    // params + ret so any nested `Apply` / generic-param ref still
+    // surfaces; concrete fn-types pass through cleanly.
+    // ----------------------------------------------------------------
+
+    // ----------------------------------------------------------------
+    // R3 finding 3 — cranelift_ty_for_type_expr / cranelift_ty_of_ty
+    // parity. Phase C+ Part 1's indirect-call sig builder dispatches
+    // through one or the other depending on callee shape (Surface
+    // vs Resolved); a future widening of the type set must touch
+    // BOTH or the indirect ABI silently mismatches. Pin the parity
+    // for the primitive set + fn-type + post-mono-mangled user types.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn cranelift_ty_for_type_expr_and_of_ty_agree_on_primitives() {
+        use crate::ast::TypeExpr;
+        use crate::errors::Span;
+        use crate::typecheck::Ty;
+        let span = Span::synthetic("x.sigil");
+        let ptr = types::I64;
+        let cases: &[(TypeExpr, Ty, &str)] = &[
+            (
+                TypeExpr::Named("Int".to_string(), span.clone()),
+                Ty::Int,
+                "Int",
+            ),
+            (
+                TypeExpr::Named("Bool".to_string(), span.clone()),
+                Ty::Bool,
+                "Bool",
+            ),
+            (
+                TypeExpr::Named("Char".to_string(), span.clone()),
+                Ty::Char,
+                "Char",
+            ),
+            (
+                TypeExpr::Named("Byte".to_string(), span.clone()),
+                Ty::Byte,
+                "Byte",
+            ),
+            (
+                TypeExpr::Named("Unit".to_string(), span.clone()),
+                Ty::Unit,
+                "Unit",
+            ),
+            (
+                TypeExpr::Named("String".to_string(), span.clone()),
+                Ty::String,
+                "String",
+            ),
+            (
+                TypeExpr::Named("MyType".to_string(), span.clone()),
+                Ty::User("MyType".to_string(), Vec::new()),
+                "User-named",
+            ),
+        ];
+        for (te, ty, label) in cases {
+            assert_eq!(
+                cranelift_ty_for_type_expr(te, ptr),
+                cranelift_ty_of_ty(ty, ptr),
+                "Cranelift type drift on {label}: surface vs resolved differ"
+            );
+        }
+    }
+
+    #[test]
+    fn cranelift_ty_for_type_expr_and_of_ty_agree_on_fn_type() {
+        use crate::ast::{FnTypeExpr, TypeExpr};
+        use crate::errors::Span;
+        use crate::typecheck::{FnSig, Ty};
+        let span = Span::synthetic("x.sigil");
+        let ptr = types::I64;
+        let te = TypeExpr::Fn(Box::new(FnTypeExpr {
+            params: vec![TypeExpr::Named("Int".to_string(), span.clone())],
+            ret: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            span: span.clone(),
+        }));
+        let ty = Ty::Fn(Box::new(FnSig {
+            params: vec![Ty::Int],
+            ret: Ty::Int,
+            effects: Vec::new(),
+            effect_row_var: None,
+        }));
+        assert_eq!(cranelift_ty_for_type_expr(&te, ptr), ptr);
+        assert_eq!(cranelift_ty_of_ty(&ty, ptr), ptr);
+    }
+
+    #[test]
+    fn walker_accepts_fn_type_in_param_position() {
+        use crate::ast::{Block, FnDecl, FnTypeExpr, Item, Param, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // fn f(g: (Int) -> Int ![]) -> Int ![] { ... }
+        let f_param_ty = TypeExpr::Fn(Box::new(FnTypeExpr {
+            params: vec![TypeExpr::Named("Int".to_string(), span.clone())],
+            ret: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            span: span.clone(),
+        }));
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "main".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![Param {
+                    name: "g".to_string(),
+                    ty: f_param_ty,
+                    span: span.clone(),
+                }],
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            !contains_apply_or_generic_ref(&prog),
+            "walker must accept fn-typed param"
+        );
+    }
+
+    #[test]
+    fn walker_accepts_fn_type_in_return_position() {
+        use crate::ast::{Block, FnDecl, FnTypeExpr, Item, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // fn f() -> (Int) -> Int ![] { ... }
+        let ret_ty = TypeExpr::Fn(Box::new(FnTypeExpr {
+            params: vec![TypeExpr::Named("Int".to_string(), span.clone())],
+            ret: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            span: span.clone(),
+        }));
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "main".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: Vec::new(),
+                return_type: ret_ty,
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            !contains_apply_or_generic_ref(&prog),
+            "walker must accept fn-typed return"
+        );
+    }
+
+    #[test]
+    fn walker_rejects_apply_hidden_inside_fn_type() {
+        use crate::ast::{Block, FnDecl, FnTypeExpr, Item, Param, Program, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // fn f(g: (Option[Int]) -> Int ![]) -> Int ![] { ... }
+        // The Apply hidden inside the fn-type's param must still
+        // surface as a walker rejection.
+        let inner_apply = TypeExpr::Apply {
+            name: "Option".to_string(),
+            args: vec![TypeExpr::Named("Int".to_string(), span.clone())],
+            span: span.clone(),
+        };
+        let f_param_ty = TypeExpr::Fn(Box::new(FnTypeExpr {
+            params: vec![inner_apply],
+            ret: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            span: span.clone(),
+        }));
+        let prog = Program {
+            file: "x.sigil".to_string(),
+            items: vec![Item::Fn(Box::new(FnDecl {
+                name: "main".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![Param {
+                    name: "g".to_string(),
+                    ty: f_param_ty,
+                    span: span.clone(),
+                }],
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: Vec::new(),
+                effect_row_var: None,
+                body: Block {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            }))],
+        };
+        assert!(
+            contains_apply_or_generic_ref(&prog),
+            "walker must reject Apply hidden inside fn-type param"
+        );
+    }
+
     // ---------------- Plan B Task 55, Phase 4e — body-shape classifier
     //
     // Pins `is_simple_tail_perform_with_pure_args_body` for the body shapes the
@@ -12207,6 +13141,7 @@ mod tests {
             lambda_captures: Vec::new(),
             types: std::collections::BTreeMap::new(),
             match_scrut_tys: std::collections::BTreeMap::new(),
+            call_callee_tys: std::collections::BTreeMap::new(),
             fn_schemes: std::collections::BTreeMap::new(),
             call_site_instantiations: std::collections::BTreeMap::new(),
             ctor_site_instantiations: std::collections::BTreeMap::new(),
@@ -12218,7 +13153,10 @@ mod tests {
             handle_body_ty: std::collections::BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
-        let mono = MonoProgram { anf };
+        let mono = MonoProgram {
+            anf,
+            lambda_captures_resolved: std::collections::BTreeMap::new(),
+        };
         let colored = crate::color::infer_colors(mono);
         assert_eq!(
             compute_user_fn_abi("f", &body, &[], &colored),
@@ -12282,6 +13220,7 @@ mod tests {
             lambda_captures: Vec::new(),
             types: std::collections::BTreeMap::new(),
             match_scrut_tys: std::collections::BTreeMap::new(),
+            call_callee_tys: std::collections::BTreeMap::new(),
             fn_schemes: std::collections::BTreeMap::new(),
             call_site_instantiations: std::collections::BTreeMap::new(),
             ctor_site_instantiations: std::collections::BTreeMap::new(),
@@ -12293,7 +13232,10 @@ mod tests {
             handle_body_ty: std::collections::BTreeMap::new(),
         };
         let anf = AnfProgram { checked };
-        let mono = MonoProgram { anf };
+        let mono = MonoProgram {
+            anf,
+            lambda_captures_resolved: std::collections::BTreeMap::new(),
+        };
         // Build ColoredProgram manually with `colors[("f")] = Native`,
         // overriding what `infer_colors` would have returned. This is
         // the test setup that pins the short-circuit; reordering the
@@ -12547,6 +13489,7 @@ mod tests {
                 lambda_captures: Vec::new(),
                 types: std::collections::BTreeMap::new(),
                 match_scrut_tys: std::collections::BTreeMap::new(),
+                call_callee_tys: std::collections::BTreeMap::new(),
                 fn_schemes: std::collections::BTreeMap::new(),
                 call_site_instantiations: std::collections::BTreeMap::new(),
                 ctor_site_instantiations: std::collections::BTreeMap::new(),
@@ -12558,7 +13501,10 @@ mod tests {
                 handle_body_ty: std::collections::BTreeMap::new(),
             };
             let anf = crate::elaborate::AnfProgram { checked };
-            let mono = crate::monomorphize::MonoProgram { anf };
+            let mono = crate::monomorphize::MonoProgram {
+                anf,
+                lambda_captures_resolved: std::collections::BTreeMap::new(),
+            };
             crate::color::infer_colors(mono)
         };
 

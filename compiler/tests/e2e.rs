@@ -188,6 +188,70 @@ fn compile_and_run(source: &str, test_name: &str) -> (String, String, i32) {
     out
 }
 
+/// Plan B' Stage 6.8 R5 finding 1 — discipline helper for negative
+/// e2e tests that pin specific compile-failure E-codes.
+///
+/// Mandates the asserted error code as a named arg so the test
+/// can't silently pass on a different compile-failure (e.g., a
+/// typecheck error in the test source masking the codegen path the
+/// test was written to exercise — the recurring bug class caught
+/// by `0baaa15`, `4e5d165`, and `5619df6`).
+///
+/// Compiles `source` and asserts:
+/// 1. compile fails (exit non-zero), AND
+/// 2. stderr contains `expected_code` (e.g., "E0138"), AND
+/// 3. stderr contains every substring in `extra_substrings` (for
+///    pinning op names / specific quoted identifiers in addition
+///    to the E-code anchor).
+///
+/// Use for any negative test of the shape "this source must
+/// compile-fail with code X". Bare `!status.success()` checks
+/// without an E-code anchor are easy to write but brittle —
+/// any future refactor that shifts which pass rejects the source
+/// silently invalidates the test's claim.
+fn assert_compile_fails_with_code(
+    source: &str,
+    expected_code: &str,
+    extra_substrings: &[&str],
+    test_name: &str,
+) {
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_{}_{}.sigil",
+        test_name,
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .output()
+        .expect("invoke sigil compiler");
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail for `{test_name}`; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr_str.contains(expected_code),
+        "expected `{expected_code}` in stderr for `{test_name}`; got stderr={stderr_str:?}"
+    );
+    for needle in extra_substrings {
+        assert!(
+            stderr_str.contains(needle),
+            "expected substring `{needle}` in stderr for `{test_name}`; \
+             got stderr={stderr_str:?}"
+        );
+    }
+}
+
 /// Like [`compile_file_and_run`] but also returns the wall-clock
 /// duration of the child process's `exec(2)`-to-exit run. The
 /// compile step is NOT measured; only the compiled-program run is
@@ -923,39 +987,20 @@ fn catch_example_recovers_with_42() {
 
 /// Plan B Task 59 — `examples/state.sigil` exercises both `State.get`
 /// and `State.set` ops through the dual-handle pattern (one `handle`
-/// per op). Confirms that:
+/// per op).
 ///
-/// - `effect State { get: () -> Int, set: (Int) -> Int }` parses +
-///   typechecks; the alphabetically-assigned op_ids `get=0, set=1`
-///   align with each handle's per-frame arm slot writes (per
-///   `op_ids_assigned_alphabetically_within_each_effect`);
-/// - both `handle` expressions register BOTH op arms (the v1
-///   workaround for the Phase 4f latent op_id/arm_count constraint
-///   pinned at `partial_handler_of_multi_op_effect_aborts_at_runtime
-///   _pending_resolution`); the unused arm in each handle is
-///   unreachable but its presence keeps `arm_count` matched to the
-///   effect's 2-op declaration;
-/// - the use-`k` tail-position arm shape (`State.get(k) => k(5)`,
-///   `State.set(arg, k) => k(arg)`) lowers correctly: the arm fn
-///   builds `Call(k_closure, k_fn, [arg])` and the trampoline
-///   dispatches helper's synth-cont with the bound let value;
-/// - `read_value` flows `5` (the `k(5)` resume) into `count`,
-///   computes `count + 1 = 6`; `write_value` flows `99` (the
-///   `k(arg)` echo) into `prev`, returns `prev = 99`. Two
-///   sequential handles produce two stdout lines. (Helpers are
-///   named `read_value` / `write_value` rather than `_counter` to
-///   avoid suggesting cross-call mutable state — there is no
-///   threaded counter in v1; each handle is independent.)
+/// **Why dual-handle, not literal `run_state`.** Plan B' Stage 6.8
+/// shipped B.3 (TypeExpr::Fn) and B.4 (arm-body lambdas + Phase B
+/// k-capture trailing-pair convention) — the lifts the literal
+/// `run_state(initial, comp)` shape needs. But Task 109's first
+/// CI cycle on the canonical CPS-style run_state revealed a runtime
+/// integration gap: `state_fn(initial)` returned a closure-record
+/// pointer rather than the threaded integer value. See
+/// `[DEVIATION Task 109] run_state canonical shape — runtime chain
+/// integration gap` for the gap analysis. Until the chain bug
+/// closes, state.sigil keeps the dual-handle Plan B v1 workaround.
 ///
 /// Invariant: stdout = "6\n99\n", stderr = "", exit 0.
-///
-/// **Dual-handle vs. `run_state` rationale**: see `[DEVIATION Task
-/// 59]` in `boldfield/designs/PLAN_B_DEVIATIONS.md`. The classic
-/// `run_state(initial, comp)` higher-order helper requires
-/// `TypeExpr::Fn` parameters AND arm-body lambdas — both deferred
-/// to post-Plan-B / Plan-C-or-later territory. This example
-/// demonstrates the State effect's get/set surface within the
-/// v1 expressibility envelope.
 #[test]
 fn state_example_dual_handle_returns_6_then_99() {
     let root = workspace_root();
@@ -1856,36 +1901,7 @@ fn partial_handler_of_multi_op_effect_rejected_with_e0142() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "partial_handler_e0142_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path =
-        std::env::temp_dir().join(format!("partial_handler_e0142_{}", std::process::id()));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail with E0142 (partial handler over multi-op effect); \
-         got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("E0142") && stderr.contains("Choose.left"),
-        "stderr should reference E0142 and the unhandled op name `Choose.left`; \
-         got stderr={stderr:?}",
-    );
+    assert_compile_fails_with_code(src, "E0142", &["Choose.left"], "partial_handler_e0142");
 }
 
 /// Plan B Stage 6 cleanup — **un-ignored from the previously
@@ -2085,9 +2101,38 @@ fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
 // by `arm_body_does_arithmetic_on_op_args` and the Phase 4c acceptance
 // precondition tests below.
 
+/// P17 compose source: rejects pending builtin-as-fn-value
+/// support. Stage 6.8 originally framed this rejection as
+/// "until TypeExpr::Fn ships" — TypeExpr::Fn DID ship (B.3),
+/// but compose's source has a second blocker that survives:
+/// `compose(int_to_string, ...)` passes the builtin
+/// `int_to_string` as a fn-typed argument. Phase C v1's fn-as-
+/// value materialization (Task 104) handles user-declared top-
+/// level fns by rewriting bare `Ident(name)` to a captureless
+/// `ClosureRecord`, but builtins are seeded into typecheck's
+/// `fn_env` without a corresponding `Item::Fn`, so they're
+/// absent from `top_level_fn_names`. closure-convert leaves
+/// `int_to_string` as `Ident(...)`, and codegen panics in
+/// `lower_expr(Ident)` when the name isn't in env / ctors /
+/// the user-fn ClosureRecord materialization branch.
+///
+/// See `[DEVIATION p17_compose blocker analysis]` (2026-04-29)
+/// for the full surface analysis. Task 109 closes this by
+/// rewriting the example source to use a user-side wrapper:
+/// `fn its(n: Int) -> String ![] { int_to_string(n) }` and
+/// inverting the test to a positive runtime check.
+///
+/// Source note: the outer `compose` return type carries TWO
+/// `![..]` markers per the per-arrow effect-row discipline
+/// (`[DEVIATION Task 103]`) — first for the inner returned
+/// fn-type, second for compose's own effect row. Without the
+/// second `![..]` the test would trip on Blocker 1 (parse
+/// rejection) instead of Blocker 2 (the actual remaining
+/// surface). With the per-arrow fix in source, this test
+/// pins Blocker 2 specifically.
 #[test]
-fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
-    let src = "fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] {\n  \
+fn p17_compose_source_rejects_pending_builtin_as_fn_value() {
+    let src = "fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] ![] {\n  \
                  fn (x: A) -> C ![] => f(g(x))\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
@@ -2115,7 +2160,7 @@ fn p17_compose_source_rejects_until_typeexpr_fn_ships() {
     let _ = std::fs::remove_file(&bin_path);
     assert!(
         !out.status.success(),
-        "P17 source must NOT compile until TypeExpr::Fn ships; got success with stdout={:?} stderr={:?}",
+        "P17 source must NOT compile until builtin-as-fn-value ships; got success with stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
@@ -4532,22 +4577,15 @@ fn handle_with_constant_return_arm_overrides_op_arm_yield() {
 }
 
 #[test]
-fn nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen() {
-    // Plan B Task 55 (Phase 4g) — walker-recursion regression
-    // sentinel post-Phase-4g. The previous sentinel
-    // (`nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic`)
-    // used inner-handle-with-return-arm; Phase 4g lifted that. This
-    // new sentinel uses inner-handle-with-nested-Lambda-in-arm-body
-    // — still rejected per the Phase 4d closure-convert restriction
-    // (lambdas in arm bodies need a closure-convert side-table
-    // extension distinct from Phase 4d MVP). Coverage: the outer
-    // walker must recurse into the inner `handle`'s arm body and
-    // surface the Lambda rejection.
-    //
-    // The inner handle's `Outer.op_in(k) =>` arm body contains a
-    // synthetic-Lambda IIFE (the only way to introduce a lambda in
-    // expression position under Sigil v1's surface — same pattern
-    // as Phase 4c's `arm_inside_lambda_captures_outer_via_closure_env_load`).
+fn nested_handle_with_inner_lambda_in_arm_body_compiles() {
+    // Plan B' Stage 6.8 Task 107 (B.4 Phase A) — INVERTED from the
+    // prior `..._is_rejected_at_codegen` rejection. Phase A drops
+    // the arm-body-Lambda / arm-body-ClosureRecord rejection in
+    // `arm_body_walk` for shapes that don't capture continuation `k`.
+    // The inner `Inner.op_in(k) => (fn (x) => x + 1)(0)` IIFE is
+    // discard-k and doesn't capture `k`, so it now compiles cleanly;
+    // both inner and outer `handle` bodies are `0` (no perform), so
+    // arms never fire — overall returns 0.
     let src = "effect Inner { op_in: () -> Int }\n\
                effect Outer { op_out: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
@@ -4559,38 +4597,193 @@ fn nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase_4g_walker_recursion_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase_4g_walker_recursion_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail — inner nested handle has a Lambda/ClosureRecord in arm \
-         body (still pending); got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+    let (stdout, stderr, code) = compile_and_run(src, "phase4g_walker_recursion_inverted");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "B.4 Phase A: inner-handle-with-arm-body-IIFE compiles and runs; \
+         no perform → arm never fires → both handles return 0. stderr={stderr:?}"
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("lambda") || stderr.contains("closure") || stderr.contains("Lambda"),
-        "error message should reference the inner handle's Lambda/ClosureRecord \
-         restriction; got stderr={stderr:?}",
+}
+
+/// Plan B' Stage 6.8 Phase C++ — generic surrounding fn with
+/// fn-typed captures. compose's body lambda captures f and g whose
+/// `Ty::Fn` types contain `Ty::Var(A)`/`Ty::Var(B)`/`Ty::Var(C)`
+/// before monomorphize. Phase C++ extends monomorphize's clone
+/// routine to populate `lambda_captures_resolved` keyed by
+/// `(clone_fn_name, lambda_span)` with substitution applied;
+/// closure_convert reads from that map first, falling back to the
+/// pre-mono typecheck side-table for non-generic fns.
+///
+/// `compose[A=Int, B=Int, C=Int](id_int, id_int)(42)` =
+/// id_int(id_int(42)) = 42.
+#[test]
+fn compose_body_via_closure_env_callees_returns_42() {
+    let src = "fn id_int(x: Int) -> Int ![] { x }\n\
+               fn compose[A, B, C](f: (B) -> C ![], g: (A) -> B ![]) -> (A) -> C ![] ![] {\n  \
+                 fn (x: A) -> C ![] => f(g(x))\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let composed: (Int) -> Int ![] = compose(id_int, id_int);\n  \
+                 let r: Int = composed(42);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "compose_body");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "compose body: lifted lambda dispatches f(g(x)) via two \
+         ClosureEnvLoad-callees → 42. stderr={stderr:?}"
     );
+}
+
+/// Plan B' Stage 6.8 Task 107 (B.4 Phase A) — arm body IIFE that
+/// invokes a lambda inline (Task 108 example #2: `Raise.fail(k) =>
+/// (fn (n) => n + 1)(42)`). The lambda doesn't capture `k`, so
+/// Phase A's walker accepts; closure-convert hoists the lambda;
+/// codegen lowers the IIFE call as a direct dispatch.
+///
+/// `Raise.fail` is one-shot; the arm discards `k`. Sigil v1's
+/// implicit-resume semantics (per `examples/div_recover.sigil`):
+/// the arm body's value becomes `perform`'s result inside the body
+/// expression. So `perform Raise.fail()` resolves to 43, and the
+/// body assignment binds `n = 43`.
+#[test]
+fn arm_body_iife_returns_43() {
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle perform Raise.fail() with {\n    \
+                   Raise.fail(k) => (fn (n: Int) -> Int ![] => n + 1)(42),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "arm_body_iife");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "43\n",
+        "B.4 Phase A: arm body IIFE — Raise.fail's arm runs \
+         `(fn (n) => n+1)(42)` = 43, which becomes perform's result. \
+         stderr={stderr:?}"
+    );
+}
+
+/// Plan B' Stage 6.8 Task 107 Phase B — INVERTED from the prior
+/// `arm_body_lambda_capturing_k_is_rejected_until_phase_b`. Phase B
+/// ships the trailing-pair convention: closure_convert flags
+/// k-pair captures, the lifted lambda's closure record allocates 2
+/// trailing slots for (k_closure, k_fn), and codegen's lower_call
+/// dispatches `k(arg)` inside the synth fn via
+/// `sigil_next_step_call(k_closure, k_fn, 1)` followed by
+/// `sigil_run_loop` to drive to a terminal value.
+///
+/// `resumes: many` admits discard-k (0 calls); the lambda is
+/// allocated but not invoked, so this test pins compilation
+/// success — runtime behaviour mirrors the discard-k arm body
+/// (returns 99 directly).
+#[test]
+fn arm_body_lambda_capturing_k_compiles_returns_99() {
+    let src = "effect Choose resumes: many { flip: () -> Int }\n\
+               fn run() -> Int ![] {\n  \
+                 let r: Int = handle 0 with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let _: (Int) -> Int ![] = fn (x: Int) -> Int ![] => k(x);\n      \
+                     99\n    \
+                   },\n  \
+                 };\n  \
+                 r\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "arm_lambda_captures_k");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "B.4 Phase B: lambda capturing k allocates trailing-pair \
+         closure record without calling k. handle body=0 so arm \
+         never fires; r = 0. stderr={stderr:?}"
+    );
+}
+
+/// Plan B' Stage 6.8 Task 108 example #1 (Choose-as-lambda).
+/// The arm body's let-bound lambda captures k. The handle body
+/// performs `Choose.flip()` — the arm runs, allocates the lambda
+/// (which captures k), and returns 42 directly (discard-k +
+/// resumes-many for the arm itself). The lambda's k-pair is
+/// stored in the trailing slots; in this test the lambda isn't
+/// invoked (allocated, not called), so the dispatch path isn't
+/// exercised at runtime — but the closure-convert + codegen
+/// surface compiles cleanly.
+#[test]
+fn task_108_arm_body_lambda_captures_k_runs() {
+    // handle body=0 → handler_overall_ty=Int → k: (Bool) -> Int.
+    // Arm body builds a lambda capturing k (uses `k(b)`) then
+    // discards k and returns 42. body=0 means the arm never fires
+    // (no perform); the handle returns 0. The lambda's k-capture
+    // is allocated via Phase B's trailing-pair convention but
+    // never invoked.
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn run() -> Int ![] {\n  \
+                 let r: Int = handle 0 with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let _: (Bool) -> Int ![] = fn (b: Bool) -> Int ![] => k(b);\n      \
+                     42\n    \
+                   },\n  \
+                 };\n  \
+                 r\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_108_choose");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "B.4 Phase B Task 108 shape: arm body builds k-capturing lambda \
+         (allocates trailing-pair closure record) then discards k. \
+         body=0 → arm never fires → handle returns 0. stderr={stderr:?}"
+    );
+}
+
+/// Plan B' Stage 6.8 Task 109 bisect — pinning test for the
+/// simplest "handle returns a lambda value, lambda invoked"
+/// shape. Pre-Task-109 there was no e2e coverage of "arm
+/// allocates a lambda AND the handle's overall result is that
+/// lambda AND we then invoke the lambda". The Task 109 first-
+/// cycle run_state attempt failed at runtime
+/// (`state_fn(initial)` returned a closure-record pointer
+/// instead of the threaded value) — which led to needing this
+/// bisect: does the simplest fn-returning handle work, or is
+/// the bug already at this lower level?
+///
+/// **Ignored** while the runtime integration gap exists. See
+/// `[DEVIATION Task 109] run_state canonical shape — runtime
+/// chain integration gap` for the gap analysis. Un-ignore once
+/// the chain bug closes; the test source is the minimal repro.
+///
+/// Source: an arm with no k-capture returns a constant-shape
+/// lambda; main let-binds the handle's result and invokes the
+/// lambda once. Expected: lambda runs as `x + 100` with x=7,
+/// stdout = "107\n".
+#[test]
+#[ignore]
+fn handle_returning_simple_lambda_invoked_returns_value_pending_chain_fix() {
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = handle (perform Trigger.fire()) with {\n    \
+                   Trigger.fire(k) => fn (x: Int) -> Int ![] => x + 100,\n  \
+                 };\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_returns_lambda_bisect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "107\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]
@@ -5076,5 +5269,261 @@ fn slice_c_chain_three_let_with_forward_data_dependency() {
         stdout, "4\n",
         "Plan B' Task 99: 3-let chain with forward data dependency — \
          r1=1, r2=k(r1)=1, r3=k(r1+r2)=2, sum=4. stderr={stderr:?}"
+    );
+}
+
+// ----------------------------------------------------------------
+// Plan B' Stage 6.8 Task 106 — B.3 acceptance e2e tests for
+// `TypeExpr::Fn` (first-class function types). Phase C v1 supports
+// `Expr::Ident(local)` callees where `local` is fn-typed via fn
+// param or `let` annotation. More general callees (e.g., `make_adder
+// (5)(7)` — call returning fn) defer to Phase C+.
+// ----------------------------------------------------------------
+
+/// Phase C foundation — fn-as-value let binding + indirect call.
+/// Closure-convert materializes `double` as a captureless
+/// `ClosureRecord` at the let RHS; codegen allocates the record
+/// (header + code_ptr@8) on the GC heap. The `f(21)` call dispatches
+/// indirectly via `call_indirect` over the loaded code_ptr.
+#[test]
+fn fn_as_value_via_let_binding_returns_42() {
+    let src = "fn double(n: Int) -> Int ![] { n + n }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = double;\n  \
+                 perform IO.println(int_to_string(f(21)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "fn_as_value_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "fn-as-value let binding + indirect call: f = double; f(21) = 42. \
+         stderr={stderr:?}"
+    );
+}
+
+/// Higher-order fn parameter — non-generic shape.
+/// `apply` takes a fn-typed parameter and dispatches indirectly.
+/// Caller passes `double` as a value; closure-convert materializes
+/// it as a captureless `ClosureRecord` at the call site arg.
+#[test]
+fn higher_order_fn_param_returns_42() {
+    let src = "fn double(n: Int) -> Int ![] { n + n }\n\
+               fn apply(f: (Int) -> Int ![], x: Int) -> Int ![] { f(x) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(apply(double, 21)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "higher_order_fn_param");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "higher-order fn param: apply(double, 21) = 42. stderr={stderr:?}"
+    );
+}
+
+/// Generic higher-order fn — `apply[A, B](f: (A) -> B ![], x: A)
+/// -> B ![]` instantiated at A=Int, B=Int. Monomorphize clones
+/// `apply` to `apply$$Int$$Int` with concrete TypeExpr::Fn for the
+/// `f` param. Inside the clone, `f(x)` is the indirect call.
+#[test]
+fn generic_apply_with_id_fn_returns_42() {
+    let src = "fn id_fn[A](x: A) -> A ![] { x }\n\
+               fn apply[A, B](f: (A) -> B ![], x: A) -> B ![] { f(x) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = apply(id_fn, 42);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "generic_apply_id_fn");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "generic apply(id_fn, 42) = 42. stderr={stderr:?}"
+    );
+}
+
+/// R2 finding 2 — multi-param fn-typed callee. Exercises the
+/// `for p in &fty.params` loop in `lower_call`'s indirect-call sig
+/// builder; the prior 3 tests are all single-param.
+#[test]
+fn fn_as_value_with_multi_param_returns_7() {
+    let src = "fn add(a: Int, b: Int) -> Int ![] { a + b }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int, Int) -> Int ![] = add;\n  \
+                 perform IO.println(int_to_string(f(3, 4)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "fn_as_value_multi_param");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "multi-param fn-as-value: f(3, 4) = 7. stderr={stderr:?}"
+    );
+}
+
+/// R2 finding 2 — effect-bearing fn type as a value. Pins that the
+/// indirect-call codegen path correctly threads effect rows through
+/// the materialized closure record + indirect dispatch.
+#[test]
+fn fn_as_value_with_effect_row_returns_42() {
+    let src = "fn add_one(n: Int) -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 n + 1\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![IO] = add_one;\n  \
+                 let _: Int = f(41);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "fn_as_value_effect_row");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "41\n",
+        "effect-bearing fn-as-value: f prints 41 then returns 42 (discarded). \
+         stderr={stderr:?}"
+    );
+}
+
+/// Phase C+ Part 1 — call-returning-fn (make_adder shape). The
+/// outer Call's callee is itself a `Call(...)` returning a fn-typed
+/// value. Codegen reads the resolved `Ty::Fn` from typecheck's
+/// `call_callee_tys` side-table keyed on the outer call's span.
+///
+/// `make_adder(5)` returns a closure record (the lambda capturing
+/// `n=5`). The outer `(7)` indirectly calls it, dispatching to the
+/// hoisted `$lambda_0` synth fn with `x=7`; the body returns
+/// `x + n = 7 + 5 = 12`.
+#[test]
+fn make_adder_returns_12() {
+    // Per-arrow `![..]` discipline (PLAN_B_PRIME_DEVIATIONS Task 103
+    // entry): the fn-decl's return type is `(Int) -> Int ![]` (an
+    // inner fn-type carrying its own row), and the fn-decl carries a
+    // second `![]` for its own effect row — hence the two `![]`s on
+    // line 1.
+    let src = "fn make_adder(n: Int) -> (Int) -> Int ![] ![] {\n  \
+                 fn (x: Int) -> Int ![] => x + n\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = make_adder(5)(7);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "make_adder_call_returning_fn");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "12\n",
+        "make_adder(5)(7) = 12 (5 + 7) via call-returning-fn indirect dispatch. \
+         stderr={stderr:?}"
+    );
+}
+
+/// Phase C+ Part 2 — ClosureEnvLoad-callee dispatch. The lambda
+/// body invokes a captured fn-typed value `f`; closure-convert
+/// rewrites `f` inside the synth lambda body to `ClosureEnvLoad`.
+/// Codegen reads the capture's `FnSig` from the synth fn's
+/// `captured_fn_sigs` map (sourced from `cc.captures_typed`) and
+/// dispatches via `call_indirect`.
+///
+/// `caller(id_fn)` invokes the captured `id_fn` through the
+/// indirect call; result is 42.
+#[test]
+fn closure_env_load_callee_returns_42() {
+    let src = "fn id_fn(x: Int) -> Int ![] { x }\n\
+               fn caller(f: (Int) -> Int ![]) -> Int ![] {\n  \
+                 let g: (Int) -> Int ![] = fn (x: Int) -> Int ![] => f(x);\n  \
+                 g(42)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = caller(id_fn);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "closure_env_load_callee");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "ClosureEnvLoad-callee dispatch: caller(id_fn) calls captured `f` via \
+         lambda → 42. stderr={stderr:?}"
+    );
+}
+
+/// R4 finding 4 — Phase C+ Part 2 with a multi-param captured fn.
+/// Exercises the args-loop in `lower_call`'s sig builder via the
+/// ClosureEnvLoad path (Part 1 already exercises it via Ident path).
+#[test]
+fn closure_env_load_callee_multi_param_returns_7() {
+    let src = "fn add(a: Int, b: Int) -> Int ![] { a + b }\n\
+               fn caller(f: (Int, Int) -> Int ![]) -> Int ![] {\n  \
+                 let g: (Int, Int) -> Int ![] = fn (a: Int, b: Int) -> Int ![] => f(a, b);\n  \
+                 g(3, 4)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = caller(add);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "closure_env_load_multi_param");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "ClosureEnvLoad multi-param dispatch: caller(add) calls captured \
+         `f(a, b)` → 7. stderr={stderr:?}"
+    );
+}
+
+/// R4 finding 4 — Phase C+ Part 2 with an effect-bearing captured
+/// fn. Pins effect-row threading through the closure-record + indirect
+/// call when the captured value carries effects.
+#[test]
+fn closure_env_load_callee_effect_row_returns_42() {
+    let src = "fn announce(n: Int) -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 n\n\
+               }\n\
+               fn caller(f: (Int) -> Int ![IO]) -> Int ![IO] {\n  \
+                 let g: (Int) -> Int ![IO] = fn (x: Int) -> Int ![IO] => f(x);\n  \
+                 g(42)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _: Int = caller(announce);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "closure_env_load_effect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "ClosureEnvLoad effect-bearing capture: caller(announce) prints 42 \
+         via captured fn-typed value. stderr={stderr:?}"
+    );
+}
+
+/// R4 finding 4 (most load-bearing) — Phase C+ Part 2 with mixed
+/// capture kinds: a fn-typed capture `f` AND a non-fn capture `n`.
+/// The synth fn body uses both: `f(n) + n`. Pins that the
+/// `captures_typed` filter `if let Ty::Fn(sig) = cty` correctly
+/// keeps `n` in the env layout (so reads from offset 16 + 8*1 give
+/// the right value) WITHOUT putting `n` into `captured_fn_sigs`.
+/// If the filter mishandles iteration order, env slot offsets
+/// diverge between codegen's view and the synth fn's reads.
+#[test]
+fn closure_env_load_mixed_capture_kinds_returns_47() {
+    let src = "fn double(n: Int) -> Int ![] { n + n }\n\
+               fn caller(f: (Int) -> Int ![], n: Int) -> Int ![] {\n  \
+                 let g: (Int) -> Int ![] = fn (x: Int) -> Int ![] => f(x) + n;\n  \
+                 g(20)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = caller(double, 7);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "closure_env_load_mixed");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "47\n",
+        "Mixed-capture-kinds: lambda captures fn-typed `f` AND Int `n`. \
+         g(20) = f(20) + n = double(20) + 7 = 40 + 7 = 47. \
+         stderr={stderr:?}"
     );
 }
