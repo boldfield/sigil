@@ -5082,15 +5082,17 @@ fn saturating_add(a: usize, b: usize) -> usize {
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
-    use crate::{lexer::lex, parser::parse, resolve::resolve};
+    use crate::{imports, lexer::lex, parser::parse, resolve::resolve};
 
     fn pipeline(src: &str) -> Vec<CompilerError> {
         let (toks, lex_errs) = lex("x.sigil", src);
         let (prog, parse_errs) = parse("x.sigil", &toks);
+        let (prog, import_errs) = imports::resolve(prog);
         let (rp, res_errs) = resolve(prog);
         let (_tc, tc_errs) = typecheck(rp.program);
         let mut all = lex_errs;
         all.extend(parse_errs);
+        all.extend(import_errs);
         all.extend(res_errs);
         all.extend(tc_errs);
         all
@@ -5265,6 +5267,9 @@ mod tests {
             // E0220 — one-shot continuation used more than once:
             "effect Raise { fail: (String) -> Int }\n\
              fn main() -> Int ![] { handle 0 with { Raise.fail(msg, k) => k(0) + k(1) } }\n",
+            // Plan C Task 62.0 — stdlib import resolution:
+            // E0032 — stdlib module not found:
+            "import std.does_not_exist\nfn main() -> Int ![] { 0 }\n",
         ];
         for src in programs {
             let errs = pipeline(src);
@@ -5786,6 +5791,8 @@ mod tests {
         assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
         let (prog, parse_errs) = parse("x.sigil", &toks);
         assert!(parse_errs.is_empty(), "parse: {parse_errs:?}");
+        let (prog, import_errs) = imports::resolve(prog);
+        assert!(import_errs.is_empty(), "imports: {import_errs:?}");
         let (rp, res_errs) = resolve(prog);
         assert!(res_errs.is_empty(), "resolve: {res_errs:?}");
         typecheck(rp.program)

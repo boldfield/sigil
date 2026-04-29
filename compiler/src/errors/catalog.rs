@@ -102,6 +102,29 @@ pub const CATALOG: &[ErrorEntry] = &[
         fix_example: "import std.io",
     },
     ErrorEntry {
+        code: "E0032",
+        short: "stdlib module not found",
+        long: "An `import std.X` (or `import std.X.Y`) named a module path with no \
+               matching file in the embedded standard library tree. Sigil's stdlib \
+               is a fixed set of modules baked into the compiler binary; only modules \
+               that ship with the compiler can be imported. Check the path for typos, \
+               or remove the import if the module name is wrong.",
+        fix_example: "// Wrong:\n// import std.optionz\n\n\
+                      // Right:\nimport std.option",
+    },
+    ErrorEntry {
+        code: "E0033",
+        short: "circular stdlib import",
+        long: "Two or more stdlib modules import each other directly or via a chain. \
+               The import resolver loads each module exactly once via depth-first \
+               traversal; a cycle would loop forever. This is a stdlib bug, not a \
+               user error: a stdlib commit introduced an `import std.X` whose \
+               transitive imports re-enter the importer. Report the diagnostic with \
+               the module names from the cycle so the stdlib import graph can be \
+               un-cycled.",
+        fix_example: "// Stdlib bug. No user-side fix. Report with the cycle named in the diagnostic.",
+    },
+    ErrorEntry {
         code: "E0040",
         short: "program has no `fn main`",
         long: "Every Sigil program is a standalone executable and must declare a \

@@ -16,6 +16,7 @@ pub mod codegen;
 pub mod color;
 pub mod elaborate;
 pub mod errors;
+pub mod imports;
 pub mod layout;
 pub mod lexer;
 pub mod link;
