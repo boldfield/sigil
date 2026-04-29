@@ -4270,53 +4270,13 @@ fn slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen() {
     );
 }
 
-#[test]
-fn slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen() {
-    // Slice C negative coverage: shape detector requires exactly 2
-    // `Stmt::Let`s. 3+ Lets are deferred to a future captures-bearing
-    // extension that generalises the chain to N.
-    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
-               fn helper() -> Int ![Choose, IO] {\n  \
-                 let b: Bool = perform Choose.flip();\n  \
-                 if b { 1 } else { 0 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle helper() with {\n    \
-                   Choose.flip(k) => {\n      \
-                     let r1: Int = k(true);\n      \
-                     let r2: Int = k(false);\n      \
-                     let r3: Int = k(true);\n      \
-                     r1 + r2 + r3\n    \
-                   },\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(n));\n  \
-                 0\n\
-               }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "slice_c_reject_three_lets_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path =
-        std::env::temp_dir().join(format!("slice_c_reject_three_lets_{}", std::process::id()));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail: 3-let arm body (Slice C v1 supports only 2). \
-         stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-}
+// Plan B' Stage 6.7 Task 100: the legacy
+// `slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen`
+// pinning test — which asserted that 3-let arm bodies REJECT at
+// codegen — is deleted here. Phase B (Task 98) lifted the 2-let cap
+// to N >= 2; positive coverage of 3-let arm bodies lives in
+// `slice_c_chain_three_let_arm_body_invokes_k_three_times` (and the
+// 5-let / forward-data-dep variants) further down this file.
 
 #[test]
 fn slice_c_choose_multi_shot_with_string_chain_threads_pointer_through_closures() {

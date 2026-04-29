@@ -61,3 +61,19 @@ This is documented here for transparency: if Plan C ultimately adopts the genero
 **Failure mode:** if a Plan C demo or stdlib helper hits the captures + chain edge case, the workaround is documented in the assert message. A future revision could lift captures collection into the classifier (the captures walker currently depends on closure-converted helper params, which are available pre-`compute_user_fn_abi` — the restructure is feasible if motivation surfaces).
 
 **Implementing commit(s):** Activation `5ad78c3` shipped the assert; classifier-side cap check + improved assert message land in the Task 96 acceptance-tests commit.
+
+## 2026-04-29 — [DEVIATION Task 100] B.1 arg2-op-arg pinning-test inversion deferred to follow-up
+
+**Context:** Plan B' Task 100 specifies inverting two pinning tests:
+1. `slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen` → positive (3-let arm bodies now ACCEPT).
+2. `slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen` → positive (arg_i references to user op-args now ACCEPT).
+
+Inversion #1 is delivered in this Task 100 commit (the test is deleted; positive coverage lives in `slice_c_chain_three_let_arm_body_invokes_k_three_times` from Task 99). Inversion #2 requires the arm-side captures-bearing extension — chain step closures must additionally carry the arm fn's user op-args (analogous to B.2 helper-side `ChainedLetBindStep::captures` carrying helper user params). The walker, pre-pass, arm-fn body emit, and Middle/Final synth-fn emit all need updates to thread op-args through the chain's closure records, with bitmap derivation per-slot for pointer-typed op-args. Estimated ~150-200 LOC of new emit code.
+
+**Closure point chosen:** defer inversion #2 to a follow-up commit before Stage 6.7 review checkpoint closes. The current Task 100 commit (this one) lands inversion #1 + legacy-types deletion (Phase D-equivalent for B.1) so the activation work flows through CI cleanly. Inversion #2 + the captures-bearing extension lands as Task 100b before the Stage 6.7 review checkpoint commit.
+
+**Why split:** Task 99's six e2e tests (added in commit `e62aa30` and reaffirmed by the ANF-handling fixup in `96f834a` + walker-lift fixup in `2daf60c`) demonstrate the N-let chain at runtime for chain-internal references (binding-to-binding forward data dependencies). The remaining op-arg-into-chain extension is a separable surface area — Task 99's tests don't exercise it, so the CI-green signal on inversion #1 alone validates the activation discipline. Splitting keeps the commits focused and matches the lockstep-or-feature-gate pattern the B.2 reviewer recommended for activations.
+
+**Failure mode:** if Task 100b is deferred indefinitely, the arg2-op-arg pinning test stays as a rejection test forever, and natural-shape multi-shot demos with op-args (e.g., `Choose.choose(arg, k) => k(arg+10); k(arg+20); ...`) compile-fail. Plan B' Task 101 ("update existing examples to natural shapes") may need to lower its bar accordingly if Task 100b doesn't land in time.
+
+**Implementing commit(s):** Task 100a (this commit): inversion #1 + legacy types deleted. Task 100b (next commit): captures-bearing extension + inversion #2.
