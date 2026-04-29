@@ -180,14 +180,20 @@ fn program_has_generics(program: &Program) -> bool {
 /// See module-level docs for the exact format. Public so unit tests
 /// in this module can pin the contract.
 ///
-/// `Ty::Var(_)` and `Ty::Fn(_)` are *unreachable* here in v1: the
-/// E0132 ambiguous-polymorphism diagnostic in typecheck rejects any
-/// `Ty::Var(_)` that would survive substitution to a use site, and
-/// `Ty::Fn(_)` requires a `TypeExpr::Fn` surface syntax that v1's
-/// grammar deliberately omits. Hitting either arm means an upstream
+/// `Ty::Var(_)` is *unreachable* here: the E0132 ambiguous-polymorphism
+/// diagnostic in typecheck rejects any `Ty::Var(_)` that would survive
+/// substitution to a use site. Hitting that arm means an upstream
 /// invariant broke; we trip `unreachable!` rather than silently
 /// rendering a placeholder that two distinct vars would both collide
 /// to.
+///
+/// `Ty::Fn(_)` (Plan B' Stage 6.8 Task 103) renders as
+/// `Fn$<P1>$..$<Pn>$Ret$<R>$Eff$<E1>$..$<Em>` — params first, then
+/// `Ret$<R>`, then `Eff$<E1>$..` for the effect set. The `Fn` /
+/// `Ret` / `Eff` segment markers fence each component so a 0-param
+/// fn-type still has a syntactically distinct mangle from a unit-
+/// returning user type. Closed rows only — `effect_row_var` is
+/// rejected upstream by E0137.
 pub fn canon_ty(ty: &Ty) -> String {
     match ty {
         Ty::Int => "Int".to_string(),
@@ -222,16 +228,32 @@ pub fn canon_ty(ty: &Ty) -> String {
                  monomorph descent missed an outer-fn var binding"
             )
         }
-        Ty::Fn(_) => {
-            // `Ty::Fn` requires `TypeExpr::Fn` surface syntax that v1
-            // doesn't accept. If a Ty::Fn reaches mangling, a future
-            // plan added the syntax without updating mangling — block
-            // the mangle so the gap is loud rather than silent.
-            unreachable!(
-                "monomorphize::canon_ty: Ty::Fn reached mangling — \
-                 first-class function types are out of scope for Plan B v1; \
-                 update canon_ty before introducing TypeExpr::Fn"
-            )
+        Ty::Fn(sig) => {
+            // Plan B' Stage 6.8 Task 103 fixup (R1 finding 1): render
+            // `Ty::Fn` to a stable mangled string so generic helpers
+            // instantiated with fn-typed args don't trip a panic in
+            // monomorphize. Closed rows only (typecheck E0137 rejects
+            // row-variable-bearing fn-types upstream).
+            let mut s = String::from("Fn");
+            for p in &sig.params {
+                s.push('$');
+                s.push_str(&canon_ty(p));
+            }
+            s.push_str("$Ret$");
+            s.push_str(&canon_ty(&sig.ret));
+            if !sig.effects.is_empty() {
+                s.push_str("$Eff");
+                // Sort for stable mangling regardless of declaration
+                // order (parser keeps source order; effect rows are
+                // semantically a set).
+                let mut effs: Vec<&String> = sig.effects.iter().collect();
+                effs.sort();
+                for e in effs {
+                    s.push('$');
+                    s.push_str(e);
+                }
+            }
+            s
         }
     }
 }
@@ -1371,6 +1393,85 @@ mod tests {
         assert_eq!(canon_ty(&underscored), "List_Option$Int");
         assert_eq!(canon_ty(&nested), "List$Option$Int");
         assert_ne!(canon_ty(&underscored), canon_ty(&nested));
+    }
+
+    // ----------------------------------------------------------------
+    // Plan B' Stage 6.8 Task 103 R1 fixup 1 — canon_ty for Ty::Fn.
+    // Pin the mangling format so a generic helper instantiated with a
+    // fn-typed type-arg gets a stable, distinct symbol rather than
+    // tripping the prior `unreachable!`.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn canon_ty_renders_zero_param_fn_type() {
+        let t = Ty::Fn(Box::new(crate::typecheck::FnSig {
+            params: vec![],
+            ret: Ty::Int,
+            effects: vec![],
+            effect_row_var: None,
+        }));
+        assert_eq!(canon_ty(&t), "Fn$Ret$Int");
+    }
+
+    #[test]
+    fn canon_ty_renders_one_param_fn_type_no_effects() {
+        let t = Ty::Fn(Box::new(crate::typecheck::FnSig {
+            params: vec![Ty::Int],
+            ret: Ty::String,
+            effects: vec![],
+            effect_row_var: None,
+        }));
+        assert_eq!(canon_ty(&t), "Fn$Int$Ret$String");
+    }
+
+    #[test]
+    fn canon_ty_renders_two_param_fn_type_with_effects() {
+        let t = Ty::Fn(Box::new(crate::typecheck::FnSig {
+            params: vec![Ty::Int, Ty::Bool],
+            ret: Ty::Unit,
+            effects: vec!["IO".to_string(), "Choose".to_string()],
+            effect_row_var: None,
+        }));
+        // Effects sort: Choose < IO.
+        assert_eq!(canon_ty(&t), "Fn$Int$Bool$Ret$Unit$Eff$Choose$IO");
+    }
+
+    #[test]
+    fn canon_ty_fn_effect_order_is_canonical() {
+        // Two structurally identical fn-types with different effect
+        // declaration order canonicalise to the same mangle. Effect
+        // rows are semantically sets; mangling sorts.
+        let a = Ty::Fn(Box::new(crate::typecheck::FnSig {
+            params: vec![Ty::Int],
+            ret: Ty::Int,
+            effects: vec!["IO".to_string(), "Choose".to_string()],
+            effect_row_var: None,
+        }));
+        let b = Ty::Fn(Box::new(crate::typecheck::FnSig {
+            params: vec![Ty::Int],
+            ret: Ty::Int,
+            effects: vec!["Choose".to_string(), "IO".to_string()],
+            effect_row_var: None,
+        }));
+        assert_eq!(canon_ty(&a), canon_ty(&b));
+    }
+
+    #[test]
+    fn canon_ty_fn_nested_fn_param_renders_recursively() {
+        // `((Int) -> Int ![]) -> Int ![]` — a fn-returning-fn.
+        let inner = Ty::Fn(Box::new(crate::typecheck::FnSig {
+            params: vec![Ty::Int],
+            ret: Ty::Int,
+            effects: vec![],
+            effect_row_var: None,
+        }));
+        let outer = Ty::Fn(Box::new(crate::typecheck::FnSig {
+            params: vec![inner],
+            ret: Ty::Int,
+            effects: vec![],
+            effect_row_var: None,
+        }));
+        assert_eq!(canon_ty(&outer), "Fn$Fn$Int$Ret$Int$Ret$Int");
     }
 
     #[test]

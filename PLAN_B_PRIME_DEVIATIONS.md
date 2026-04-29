@@ -103,3 +103,25 @@ The literal Cartesian-product 4-outcome (sum 10) and 8-outcome (sum 36) enumerat
 **Failure mode:** if Plan C's spec validation tests assume the literal Cartesian-product enumeration shape (e.g., a prompt-bank entry requiring sum 10 for 2-flip pair generator), those prompts grade as compile-only or fail. Plan C should either (a) lower the bar to partial-enumeration shapes or (b) defer literal-enumeration prompts to a future Plan-C-or-later that adds continuation marks. The closure point for lifting this restriction is named here: **trampoline-side**, an `OuterPostArmK` mechanism that lets helper Middle steps thread the outer arm's post_arm_k forward through `sigil_perform`'s args, and a runtime `Done`-handler that walks the post_arm_k chain instead of returning to the wrapper.
 
 **Implementing commit(s):** Task 101 (forthcoming Stage 6.7 closeout commit) ships the partial-enumeration outputs + this deviation entry. Examples remain as written; expected outputs in e2e tests are the actual partial values.
+
+## 2026-04-29 — [DEVIATION Task 102 fixup] E0136 collision in Phase A commit
+
+**Context:** Plan B' Stage 6.8 Task 102 (Phase A parser surface for `TypeExpr::Fn`) shipped a stub diagnostic in `check_type_expr_known` using `errors::code("E0136")` to gate fn-typed surfaces from reaching Phase B's typecheck integration. **`E0136` was already allocated** to "duplicate effect declaration" at `compiler/src/typecheck.rs:630` (Plan B Task 53). Phase A's commit (`71ad25b`) sits in history with two distinct error conditions sharing one code.
+
+**Why accepted:** Phase B (Task 103, commit `616e776`) replaced the fn-type stub with a fresh `E0137` ("row-variable-bearing first-class function types not supported in v1"), so the live PR state has no collision. The collision exists only in the Phase A commit if cherry-picked or bisected to in isolation. The fix-forward (E0137 in Phase B) is the simpler path than rewriting Phase A history.
+
+**Lessons learned:** the second near-miss on E-code allocation discipline in Plan B'-era (the first was the `f74e073` deviation entry's compressed lifecycle). Worth a centralised E-code registry / table to catch collisions at allocation time. Out of scope for Plan B' itself; flagged here as Plan C / housekeeping work.
+
+**Implementing commit(s):** [forthcoming Task 103 R1 fixup commit] adds this deviation entry. No code change — the live state is already correct via Phase B's E0137.
+
+## 2026-04-29 — [DEVIATION Task 103] Per-arrow `![..]` effect-row syntax in `TypeExpr::Fn`
+
+**Context:** Plan B' Stage 6.8 Task 102's parser surface accepts `TypeExpr::Fn` as `(T1, ..., Tn) -> R ![E1, ..., En]` — the effect row attaches to **every** fn-type-arrow, not only the outermost one. A nested fn-type like `(Int) -> (Int) -> Int` requires `(Int) -> (Int) -> Int ![] ![]` (two effect rows, one per arrow). ML-family languages typically right-associate fn-types with effects bound at the outermost arrow only.
+
+**Why per-arrow:** in an effect-typed language, the effects of a fn-typed value are part of its identity, not the surrounding context. `let f: (Int) -> Int ![IO] = ...; let g: (Int) -> Int ![] = ...;` are distinct values with distinct types — `f` performs IO when called, `g` doesn't. Anchoring effects at the outermost arrow only would conflate the inner returned function's effect surface with the outer caller's effect row, which breaks the substitution principle (you can't pass `f` where `g` is expected — yet outermost-only would let you, structurally).
+
+**Trade-off:** the surface is more verbose for higher-order types. `(A) -> (B) -> C` is `(A) -> (B) -> C ![] ![]` (two `![]` markers). For the Stage 6.8 e2e tests this is fine — `compose`, `make_adder`, `apply`, `id_fn` all use closed rows; the extra `![]` per arrow is tolerable. Future ergonomics work could allow effect-row inference / inheritance ("if the inner arrow has no `![..]`, inherit from the outer fn's row").
+
+**Failure mode:** none — the design is consistent with how `FnSig` and `Expr::Lambda` already store effects per-fn-decl. This deviation entry exists so future readers don't second-guess the design choice.
+
+**Implementing commit(s):** Task 102 (`71ad25b`) shipped the parser surface with this discipline. Test `fn_type_returning_fn_parses` pins the expected shape (`(Int) -> (Int) -> Int ![] ![]`).

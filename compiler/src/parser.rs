@@ -3362,4 +3362,57 @@ mod tests {
             "expected at least one parse error for missing `![..]`"
         );
     }
+
+    // ----------------------------------------------------------------
+    // R1 finding 5 — parser edge cases (trailing comma, missing
+    // separator, row-var-only effect row).
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn fn_type_trailing_comma_in_param_list_parses() {
+        // `(Int,) -> Int ![]` — trailing comma after the last param.
+        // The parameter loop sees the comma, advances; the next peek
+        // is `)`, which exits the loop via the `RParen | Eof` guard.
+        // Sigil follows Rust's discipline (accept trailing comma).
+        let te = parse_type_in_param_position("(Int,) -> Int ![]");
+        let TypeExpr::Fn(fty) = te else {
+            panic!("expected TypeExpr::Fn, got {te:?}")
+        };
+        assert_eq!(fty.params.len(), 1);
+        assert_eq!(fty.params[0].head_name(), "Int");
+    }
+
+    #[test]
+    fn fn_type_missing_comma_between_params_errors_cleanly() {
+        // `(Int Int) -> Int ![]` — missing comma between two params.
+        // The first `parse_type` consumes `Int`; the next peek is
+        // `Int` (an Ident), not `Comma` — loop's `else { break }`
+        // exits, then `expect(RParen)` fails, surfacing a clean
+        // parse error.
+        let src = "fn f(x: (Int Int) -> Int ![]) -> Int ![] { 0 }\n";
+        let (toks, _) = lex("t.sigil", src);
+        let (_prog, errs) = parse("t.sigil", &toks);
+        assert!(
+            !errs.is_empty(),
+            "expected parse error for missing comma between fn-type params"
+        );
+    }
+
+    #[test]
+    fn fn_type_row_var_only_effect_row_parses() {
+        // `(Int) -> Int ![| r]` — effect row with only a row variable
+        // (no leading effect names). `parse_effect_row` expects the
+        // initial loop body to handle effect names; with `|` as the
+        // first token, the loop's `Pipe | RBracket | Eof` guard
+        // exits immediately, then the row-var branch fires. Tests
+        // that this corner case parses without a synthetic empty
+        // effect.
+        let te = parse_type_in_param_position("(Int) -> Int ![| r]");
+        let TypeExpr::Fn(fty) = te else {
+            panic!("expected TypeExpr::Fn, got {te:?}")
+        };
+        assert!(fty.effects.is_empty(), "no leading effects");
+        let rv = fty.effect_row_var.as_ref().expect("row var present");
+        assert_eq!(rv.name, "r");
+    }
 }

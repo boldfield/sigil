@@ -8394,6 +8394,73 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------
+    // R1 finding 3 — exercise HM unification on user-surface Ty::Fn
+    // values. Pre-Phase-B, Ty::Fn was internal-only; Phase B is the
+    // first surface use, so we pin: (a) generic `A` shared across
+    // both fn-type positions unifies through, (b) effect-row order
+    // is irrelevant under unification, (c) effect-row width
+    // mismatch fails cleanly.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn fn_type_unification_through_generic_position() {
+        // `apply[A, B](f: (A) -> B ![], x: A) -> B ![]` invoked with
+        // a concrete fn whose `A`/`B` map to Int/String pins both
+        // positions through unification. Typechecks cleanly iff
+        // unification flows the concrete types through `A` + `B`.
+        let src = "fn int_to_string(n: Int) -> String ![] { \"x\" }\n\
+                   fn apply[A, B](f: (A) -> B ![], x: A) -> B ![] { f(x) }\n\
+                   fn main() -> Int ![] { let _: String = apply(int_to_string, 42); 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "generic apply with fn-typed arg must typecheck via unification: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_unification_effect_row_width_mismatch_is_e0128() {
+        // Annotation says fn-type with `![]` (empty effects); RHS is
+        // a fn whose declared effects are `![IO]`. Unification must
+        // reject. Note: the root cause is E0128 ("effect row
+        // mismatch: closed row `![]` cannot unify with closed row
+        // `![IO]`") fired by the row-unification path; E0045 ("let
+        // binding declared type but initializer has type") fires as
+        // a follow-on when the let-decl-vs-init types differ.
+        let src = "fn pr(s: String) -> Int ![IO] { perform IO.println(s); 0 }\n\
+                   fn main() -> Int ![IO] { let _: (String) -> Int ![] = pr; 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0128"),
+            "fn-type effect-row width mismatch must E0128 (row-unify): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fn_type_unification_effect_row_order_independent() {
+        // Effect rows are semantically a set; declaration order is
+        // irrelevant. Wrapper fn `caller` has `![IO, Choose]` row;
+        // RHS `pr` is declared `![Choose, IO]`. Unification accepts
+        // either ordering. Wrapped in `caller` (not `main`) since
+        // `fn main` rejects non-{IO, ArithError} effects.
+        //
+        // NOTE: under v1's representation `effects: Vec<String>` is
+        // ordered — typecheck unifies it as a set. If ordering ever
+        // becomes load-bearing, this test will trip and force the
+        // discussion.
+        let src = "effect Choose { flip: () -> Bool }\n\
+                   fn pr(s: String) -> Int ![Choose, IO] { 0 }\n\
+                   fn caller() -> Int ![IO, Choose] { \
+                     let _: (String) -> Int ![IO, Choose] = pr; 0 }\n\
+                   fn main() -> Int ![IO] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "fn-type effect-row order should not affect unification: {errs:?}"
+        );
+    }
+
     #[test]
     fn fn_type_nested_fn_in_param_resolves() {
         // `((Int) -> Int ![]) -> Int ![]` — the param is itself a
