@@ -5193,37 +5193,48 @@ fn fn_as_value_with_effect_row_returns_42() {
 }
 
 /// R2 finding 2 — explicit panic-shape rejection test. Pin the
-/// `make_adder(5)(7)` shape so Phase C+ inverts a known-state diff:
+/// "ClosureEnvLoad-callee" shape (compose-style: lambda body calls a
+/// captured fn-typed value) so Phase C+ inverts a known-state diff:
 /// pre-Phase-C+ asserts compile-fail with E0138; post-Phase-C+
 /// (Task 109) inverts to a positive runtime test.
+///
+/// The shape: `caller` takes a fn-typed `f` and constructs a lambda
+/// that captures `f` then calls it. After closure-convert, the
+/// lambda's body has `f(x)` where `f` is `ClosureEnvLoad`, which
+/// trips `unsupported_indirect_call_shape`'s E0138 rejection.
 #[test]
-fn make_adder_call_returning_fn_is_e0138_until_phase_c_plus() {
-    let src = "fn make_adder(n: Int) -> Int ![] { n + 1 }\n\
-               fn caller_taking_fn_value(f: (Int) -> Int ![], x: Int) -> Int ![] { f(x) }\n\
+fn closure_env_load_callee_is_e0138_until_phase_c_plus() {
+    let src = "fn id_fn(x: Int) -> Int ![] { x }\n\
+               fn caller(f: (Int) -> Int ![]) -> Int ![] {\n  \
+                 let g: (Int) -> Int ![] = fn (x: Int) -> Int ![] => f(x);\n  \
+                 g(42)\n\
+               }\n\
                fn main() -> Int ![IO] {\n  \
-                 let r: Int = caller_taking_fn_value(make_adder(0), 7);\n  \
+                 let r: Int = caller(id_fn);\n  \
                  perform IO.println(int_to_string(r));\n  \
                  0\n\
                }\n";
     let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_make_adder_e0138_{}.sigil",
+        "sigil_e2e_closure_env_callee_e0138_{}.sigil",
         std::process::id()
     ));
-    std::fs::write(&tmp, src).expect("write make_adder source");
-    let bin_path =
-        std::env::temp_dir().join(format!("sigil_e2e_make_adder_e0138_{}", std::process::id()));
+    std::fs::write(&tmp, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_closure_env_callee_e0138_{}",
+        std::process::id()
+    ));
     let sigil_bin = sigil_binary();
     let out = Command::new(&sigil_bin)
         .arg(&tmp)
         .arg("-o")
         .arg(&bin_path)
         .output()
-        .expect("invoke sigil on make_adder source");
+        .expect("invoke sigil on source");
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&bin_path);
     assert!(
         !out.status.success(),
-        "make_adder call-returning-fn must fail to compile until Phase C+ ships; \
+        "ClosureEnvLoad-callee shape must fail to compile until Phase C+ ships; \
          got success with stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
