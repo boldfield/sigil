@@ -17,8 +17,9 @@ Goal: close B.1 + B.2. Generalize the 2-step Slice C chain (arm-side) and the 1-
 - 6.7.4 — Foundation `[DEVIATION Plan B' overview]` entry framing the bundled lifts + per-stage review-checkpoint discipline + closure-point cross-references to `PLAN_B_DEVIATIONS.md`.
   - status: done (this commit)
 - Task 93 — B.2 Phase A: classifier + data-shape refactor (`is_simple_let_yield_then_pure_tail_body` 1-stmt cap → N stmts; `CpsContinuationKind::ChainedLetBindThenTail` variant).
-  - status: todo
-  - commits: []
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: Adds `CpsContinuationKind::ChainedLetBindThenTail { steps, performs, tail_expr, tail_ty, captures }` variant + `ChainedLetBindStep { binding_name, binding_ty }` struct, both `#[allow(dead_code)]` while Phase B/C wire up the pre-pass + emit code. Adds `is_simple_chained_let_yield_then_pure_tail_body(body) -> Option<usize>` classifier returning the chain length on match (None on reject). Accepts N >= 1 (the existing 1-stmt case generalises into the chained variant; Phase D will retire `LetBindThenTail`). 9 unit tests cover the accept/reject matrix: single let-yield + pure tail (N=1); two/three let-yields + pure tail (N=2/3); empty body (rejected); non-let stmt in chain (rejected); let with non-perform value (rejected); impure perform args (rejected); impure tail (rejected); missing tail (rejected). Match on `CpsContinuationKind` in synth-cont definition pass extended with an `unreachable!()` guard for the new variant; until Phase B activates the pre-pass, no `CpsContinuationSynth` entry should carry this kind. Pod-verify clean.
 - Task 94 — B.2 Phase B: pre-pass FuncId allocation for N synth-cont chain.
   - status: todo
   - commits: []

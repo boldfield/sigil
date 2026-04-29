@@ -1969,6 +1969,93 @@ enum CpsContinuationKind {
         /// captures and passes its pointer.
         captures: Vec<SynthContCapture>,
     },
+    /// **Plan B' Stage 6.7 Task 93 (B.2 Phase A) — chained-let-bind-
+    /// then-tail shape** (per [`is_simple_chained_let_yield_then_pure_-
+    /// tail_body`]): generalises [`Self::LetBindThenTail`]'s 1-stmt
+    /// cap to N stmts. The helper's body is `let name_0: ty_0 =
+    /// perform p_0; let name_1: ty_1 = perform p_1; ...; let name_{N
+    /// -1}: ty_{N-1} = perform p_{N-1}; tail_expr`, where every
+    /// perform's args are pure and the tail is pure.
+    ///
+    /// **Codegen plan (Phase B + C land in Tasks 94 / 95):** N synth-
+    /// cont fns chain through the helper's perform sites:
+    ///
+    /// - helper's body emit issues `sigil_perform(p_0, ...,
+    ///   k_fn=synth_cont_step_0)` and allocates step-0's closure
+    ///   record.
+    /// - synth_cont_step_i (i < N - 1) reads `args_ptr[0]`, narrows
+    ///   to `steps[i].binding_ty`, binds under `steps[i].binding_-
+    ///   name`, allocates step_{i+1}'s closure record (carrying
+    ///   prior bindings + remaining-chain captures forward),
+    ///   issues `sigil_perform(performs[i+1], ...,
+    ///   k_fn=synth_cont_step_{i+1})`.
+    /// - synth_cont_step_{N-1} binds the final value, loads captures
+    ///   from `closure_ptr`, lowers `tail_expr` via Lowerer, returns
+    ///   `Done(value)`.
+    ///
+    /// Each step's closure record carries `(prior bindings) +
+    /// (remaining-chain captures from helper's user params)`. The
+    /// outermost (`additional_func_ids`) field on
+    /// [`CpsContinuationSynth`] holds FuncIds for synth_cont_step_1
+    /// through synth_cont_step_{N-1}; the outer struct's `func_id`
+    /// remains synth_cont_step_0's FuncId so the existing N=1 path
+    /// (helper sets `k_fn = func_addr(synth.func_id)`) generalises.
+    ///
+    /// **Phase A scope (Task 93):** add the variant + classifier +
+    /// classifier unit tests. The variant is `#[allow(dead_code)]`
+    /// while Phases B/C wire up the pre-pass + emit code; the
+    /// existing `LetBindThenTail` continues to handle the 1-stmt
+    /// case until Phase B switches `compute_user_fn_abi` to use
+    /// this variant for both 1-stmt and N>=2 cases (at which point
+    /// `LetBindThenTail` retires).
+    #[allow(dead_code)]
+    ChainedLetBindThenTail {
+        /// Length-N list of let-bindings the chain produces.
+        /// `steps[i]` is bound at `synth_cont_step_i`'s entry from
+        /// `args_ptr[0]`, narrowed to `steps[i].binding_ty`.
+        steps: Vec<ChainedLetBindStep>,
+        /// Length-N list of perform expressions in source order.
+        /// `performs[0]` is what helper's body emits at fn entry;
+        /// `performs[i]` for i > 0 is what `synth_cont_step_{i-1}`
+        /// emits after binding `steps[i-1]`. Each perform is the
+        /// original AST node so codegen can lower its args + look
+        /// up effect_id / op_id at the synth-cont's emit site.
+        performs: Vec<crate::ast::PerformExpr>,
+        /// The pure tail expression that `synth_cont_step_{N-1}`
+        /// lowers via `Lowerer.lower_expr`. May reference any of
+        /// `steps[*].binding_name` plus the `captures` user-param
+        /// names plus globals.
+        tail_expr: Box<crate::ast::Expr>,
+        /// Cranelift type of `tail_expr`'s value. Used to widen to
+        /// I64 before wrapping in `Done(...)` at synth_cont_step_{
+        /// N-1}'s body emit.
+        tail_ty: Type,
+        /// Captures of the parent helper's user params referenced
+        /// anywhere in the chain (any `performs[i]`'s args OR
+        /// `tail_expr`). Each chain step's closure record carries
+        /// the captures forward + accumulated prior bindings; the
+        /// captures themselves stay constant across steps (they
+        /// originate at the helper's body, not at intermediate
+        /// chain steps).
+        captures: Vec<SynthContCapture>,
+    },
+}
+
+/// Plan B' Stage 6.7 Task 93 (B.2 Phase A) — one let-binding step in a
+/// chained-let-bind-then-tail synth-cont chain. See
+/// [`CpsContinuationKind::ChainedLetBindThenTail`].
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ChainedLetBindStep {
+    /// Source-level name of the let-binding (the `name` in `let
+    /// name: ty = perform ...`). Bound in synth_cont_step_i's env
+    /// at fn entry from `args_ptr[0]`.
+    binding_name: String,
+    /// Cranelift type the let-binding declares. The synth-cont
+    /// loads `args_ptr[0]` as I64 and `ireduce`s back to this type
+    /// for binding (mirrors `LetBindThenTail`'s narrow-on-load
+    /// discipline).
+    binding_ty: Type,
 }
 
 /// Plan B Task 55, Phase 4e — derive an [`EnvSlotKind`] from a
@@ -7026,6 +7113,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         lowerer.builder.ins().return_(&[next_step]);
                         lowerer.builder.finalize();
                     }
+                    CpsContinuationKind::ChainedLetBindThenTail { .. } => {
+                        // Plan B' Stage 6.7 Task 93 (B.2 Phase A) —
+                        // variant added but pre-pass not yet emitting
+                        // it (Phase B / Task 94 activates). Until then,
+                        // no `CpsContinuationSynth` entry should carry
+                        // this kind; reaching here would be a pre-pass
+                        // bug.
+                        unreachable!(
+                            "codegen: ChainedLetBindThenTail synth-cont reached emit \
+                             pass before Phase B (Task 94) activated it for fn `{}`",
+                            synth.parent_fn_name
+                        );
+                    }
                 }
             }
             module
@@ -10085,6 +10185,63 @@ fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
     }
 }
 
+/// Plan B' Stage 6.7 Task 93 (B.2 Phase A) — does this fn body match
+/// the **chained let-yield then pure tail** shape that the chained-
+/// synth-cont extension supports?
+///
+/// A body matches iff:
+///
+/// 1. Its statement list has N >= 1 stmts.
+/// 2. Each stmt is a [`crate::ast::Stmt::Let`] whose value is an
+///    [`crate::ast::Expr::Perform`] with all pure args (per
+///    [`expr_is_pure`]).
+/// 3. The tail expression is pure (per [`expr_is_pure`]).
+///
+/// Returns `Some(N)` (the chain length) on match; `None` otherwise.
+/// Callers use the returned length to size the chain's synth-cont
+/// allocation.
+///
+/// **Phase A scope (Task 93):** the classifier is added alongside
+/// the existing 1-stmt classifier [`is_simple_let_yield_then_pure_-
+/// tail_body`]; nothing yet consumes it. Phase B (Task 94) switches
+/// `compute_user_fn_abi` to this classifier and allocates N synth-
+/// cont FuncIds for chain length N. The classifier accepts N=1 (the
+/// existing 1-stmt case) so the post-Phase-B path generalises
+/// uniformly; until Phase B activates it, the existing 1-stmt path
+/// stays on `is_simple_let_yield_then_pure_tail_body` +
+/// [`CpsContinuationKind::LetBindThenTail`].
+///
+/// **Why N >= 1 not N >= 2:** the chained variant covers both 1-stmt
+/// and N-stmt cases uniformly. Phase B's pre-pass distinguishes
+/// `chain_length == 1` (single synth-cont, no chain steps) from
+/// `chain_length >= 2` (full chain) at the FuncId allocation site.
+/// Phase D retires `LetBindThenTail` once the chained variant covers
+/// all paths.
+#[allow(dead_code)]
+fn is_simple_chained_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> Option<usize> {
+    use crate::ast::{Expr, Stmt};
+    if body.stmts.is_empty() {
+        return None;
+    }
+    for stmt in &body.stmts {
+        let let_stmt = match stmt {
+            Stmt::Let(l) => l,
+            _ => return None,
+        };
+        let yield_perform = match &let_stmt.value {
+            Expr::Perform(p) => p,
+            _ => return None,
+        };
+        if !yield_perform.args.iter().all(expr_is_pure) {
+            return None;
+        }
+    }
+    match &body.tail {
+        Some(t) if expr_is_pure(t) => Some(body.stmts.len()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -10645,6 +10802,268 @@ mod tests {
         };
         assert!(is_simple_let_yield_then_pure_tail_body(&body));
     }
+
+    // ---------------- Plan B' Stage 6.7 Task 93 (B.2 Phase A) —
+    // chained-let-yield-then-pure-tail classifier ----------------
+
+    #[test]
+    fn chained_classifier_accepts_single_let_yield_pure_tail() {
+        // N=1 case: matches the existing 1-stmt path. The chained
+        // classifier accepts N >= 1 so Phase B's pre-pass can
+        // generalise uniformly.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn chained_classifier_accepts_two_let_yields_pure_tail() {
+        // N=2 case: two let-yields then a pure tail referencing both
+        // bindings. The classic "let a = perform p1; let b = perform p2;
+        // a + b" shape that B.2 is closing.
+        use crate::ast::{BinOp, Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![
+                Stmt::Let(LetStmt {
+                    name: "a".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::Perform(PerformExpr {
+                        effect: "Raise".to_string(),
+                        op: "fail".to_string(),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    }),
+                    span: span.clone(),
+                }),
+                Stmt::Let(LetStmt {
+                    name: "b".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::Perform(PerformExpr {
+                        effect: "Raise".to_string(),
+                        op: "fail".to_string(),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    }),
+                    span: span.clone(),
+                }),
+            ],
+            tail: Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("a".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("b".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn chained_classifier_accepts_three_let_yields_pure_tail() {
+        // N=3 stress case for the chain depth.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let make_let = |name: &str| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })
+        };
+        let body = Block {
+            stmts: vec![make_let("a"), make_let("b"), make_let("c")],
+            tail: Some(Expr::Ident("c".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn chained_classifier_rejects_empty_body() {
+        // No stmts, no tail → classifier rejects (no synth-cont chain
+        // to build).
+        use crate::ast::Block;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: Vec::new(),
+            tail: None,
+            span,
+        };
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+    }
+
+    #[test]
+    fn chained_classifier_rejects_non_let_stmt_in_chain() {
+        // Mixing a non-let stmt into the chain disqualifies the body.
+        // Future widenings might accept Stmt::Perform-without-binding
+        // alongside Stmt::Let; v1 keeps the chain pure-let.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![
+                Stmt::Let(LetStmt {
+                    name: "x".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::Perform(PerformExpr {
+                        effect: "Raise".to_string(),
+                        op: "fail".to_string(),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    }),
+                    span: span.clone(),
+                }),
+                // Second stmt is Stmt::Expr, not Stmt::Let — disqualifies.
+                Stmt::Expr(Expr::IntLit(1, span.clone())),
+            ],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+    }
+
+    #[test]
+    fn chained_classifier_rejects_let_with_non_perform_value() {
+        // A let whose value isn't a Perform doesn't fit the chain
+        // (the chain is specifically about chaining performs).
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::IntLit(42, span.clone()),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+    }
+
+    #[test]
+    fn chained_classifier_rejects_impure_perform_args() {
+        // A perform whose args aren't pure (e.g., a nested call)
+        // disqualifies — the synth-cont machinery can't lower
+        // yield-able args.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    // Args contain a Call — not pure.
+                    args: vec![Expr::Call {
+                        callee: Box::new(Expr::Ident("helper".to_string(), span.clone())),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    }],
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+    }
+
+    #[test]
+    fn chained_classifier_rejects_impure_tail() {
+        // A non-pure tail (e.g., containing a Call) disqualifies.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("helper".to_string(), span.clone())),
+                args: Vec::new(),
+                span: span.clone(),
+            }),
+            span,
+        };
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+    }
+
+    #[test]
+    fn chained_classifier_rejects_missing_tail() {
+        // A body with stmts but no tail expression disqualifies —
+        // the chain needs a final expression for synth_cont_step_{N-1}
+        // to lower into Done(value).
+        use crate::ast::Expr;
+        use crate::ast::{Block, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: None,
+            span,
+        };
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+    }
+
+    // ---------------- end Plan B' Stage 6.7 Task 93 tests ----------------
 
     #[test]
     fn multi_stmt_body_with_let_yield_first_is_not_let_yield_then_pure() {
