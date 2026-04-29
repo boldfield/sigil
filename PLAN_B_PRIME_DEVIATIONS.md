@@ -465,3 +465,30 @@ Verified: post-Layer-2 fix, `/tmp/run_state_canonical.sigil` (canonical multi-ar
 
 **Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
 
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Bug 1 fix] Recover discharged value across non-tail-perform body
+
+**Plan B' Stage 6.8 Task 109 followup, post-Layer-2.** Closes Bug 1 from `[DEVIATION Stage-6.8-followup Bug 2]`'s "What this fix DOES NOT close" enumeration: synchronous body lowering's IR-locally-computed `body_val` reflects body's tail expression's natural value, NOT the discharged arm's value, when the body has post-perform code (`{ let _ = perform; tail }` shape). For the `dbg_a` probe (Source A from `DEBUG_RUN_STATE.md`), pre-fix `f(7)` printed `7` (body's identity-lambda's behavior on `7`); post-fix prints `107` (arm's discharge lambda `fn (x) => x + 100` applied to `7`).
+
+**The runtime piece** (`abi`/`runtime`):
+- New `LAST_TERMINAL_VALUE: Cell<u64>` TLS in `runtime/src/handlers.rs` alongside the existing `LAST_TERMINAL_TAG`.
+- `sigil_run_loop`'s terminal sets both: tag (DONE / DISCHARGED) AND value (the u64 returned to the caller).
+- New FFI exports `sigil_last_terminal_value()` and `sigil_reset_last_terminal_value()` paralleling the tag's exports.
+- No GC root; the value is u64 (not a pointer-shaped slot). Codegen consumes it immediately; for precise-GC v2, either root the TLS or copy through a stack slot at consumption.
+
+**The codegen piece** (`compiler/src/codegen.rs`):
+- New FFI declarations + per-fn FuncRefs for `sigil_last_terminal_value` / `sigil_reset_last_terminal_value`. Plumbed through `PerFnRefsCtx`, `PerFnRefs`, `prepare_per_fn_refs`, `Lowerer`, and 7 Lowerer construction sites (parallel to Bug 2's plumbing for the tag side).
+- `Expr::Handle`'s `lower_expr` now resets BOTH TLS slots before body lowering — both for return-arm-bearing AND no-return-arm handles — so a stale tag/value from a prior run_loop on the same thread doesn't shadow this handle's body completion when this body never invokes a perform.
+- The return-arm-bearing path's `discharge_block` reads `sigil_last_terminal_value()` instead of `body_val_widened` to recover the trampoline's actual terminal u64. Narrowing logic: I64 → identity, narrower-int → ireduce, pointer_ty → identity, else placeholder.
+- The no-return-arm path (previously fall-through to `body_val`) gains an analogous tag-conditional structure: 3 blocks (`discharge_block_nra`, `normal_block_nra`, `merge_block_nra`); discharge branch reads TLS_VALUE + narrows to body's type B; normal branch uses body_val as before.
+
+**Test added:** `handle_with_post_perform_body_code_uses_arm_discharge_value` exercises the dbg_a probe shape (no return arm, body `{ let _ = perform Trigger.fire(); fn (x) => x }`, arm `fn (x) => x + 100`). Asserts `f(7) = 107` post-fix. Pre-fix this returned 7 (body's tail lambda's behavior).
+
+**Composability with Bug 2 + Layer 2.**
+- Bug 2 (op-arm-discharge skips return arm) and Bug 1 (non-tail-perform body recovery) are independent fixes. Bug 1's discharge_block tag-check is gated on `LAST_TERMINAL_TAG == DISCHARGED`, the same condition Bug 2 introduced. Bug 1 strengthens the discharge branch's value source from `body_val` (Bug 2's MVP that worked only for tail-perform body) to `LAST_TERMINAL_VALUE` (correct for all body shapes).
+- Layer 2 fix (lifted lambda's k(arg) self-applies return arm) is at a different codegen site (`lower_k_pair_call`) and is unaffected by Bug 1's TLS plumbing. Both fixes coexist; the rs_b probe (Layer 2 case with tail-perform body) still prints `14`.
+
+**What's still blocking the canonical `run_state(initial, comp)`:** Layer 3 — multi-arm composition where comp's body has multiple performs across `State.set` and `State.get`, AND each arm captures k into a lambda that escapes via discharge AND is invoked from the run_state caller, AND k(arg) must resume body to drive subsequent performs (not just self-apply return arm). The current `lower_k_pair_call`'s self-apply-return-arm path is correct for tail-perform body but wrong for non-tail-perform body where k must resume body to run further performs. The synth-cont infrastructure that handles non-tail-perform bodies in CPS-color fns covers limited shapes (`{ let _ = perform; constant }` / `{ let r = k(a); pure_tail }`); the canonical run_state's `{ let _ = perform State.set(arg); let v = perform State.get(); v + 1 }` shape is not yet covered. Verified: post-Bug-1 fix, `/tmp/run_state_canonical.sigil` still produces a heap-pointer-shaped output. Bug 1 closes one residual; Layer 3 remains.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
+
+

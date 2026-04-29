@@ -4813,6 +4813,39 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_reset_last_terminal_tag: {e}"))?;
 
+    // sigil_last_terminal_value() -> u64
+    //
+    // Stage-6.8-followup Bug 1 fix: queried by the handle expression's
+    // outer codegen logic in the discharge_block when the body has
+    // post-perform code. Body's IR-locally-computed body_val reflects
+    // body's natural terminal (the value of body's tail expression),
+    // NOT the discharged arm's value. The runtime stores the
+    // trampoline's terminal u64 in `LAST_TERMINAL_VALUE` so codegen
+    // can recover it when the tag indicates DISCHARGED.
+    let mut last_terminal_value_sig = Signature::new(isa_call_conv(&module));
+    last_terminal_value_sig.returns.push(AbiParam::new(types::I64));
+    let last_terminal_value = module
+        .declare_function(
+            "sigil_last_terminal_value",
+            Linkage::Import,
+            &last_terminal_value_sig,
+        )
+        .map_err(|e| format!("declare sigil_last_terminal_value: {e}"))?;
+
+    // sigil_reset_last_terminal_value() -> ()
+    //
+    // Stage-6.8-followup Bug 1 fix: emitted alongside
+    // `sigil_reset_last_terminal_tag` at the entry of each handle
+    // lowering so a stale value from a prior run isn't observable.
+    let reset_last_terminal_value_sig = Signature::new(isa_call_conv(&module));
+    let reset_last_terminal_value = module
+        .declare_function(
+            "sigil_reset_last_terminal_value",
+            Linkage::Import,
+            &reset_last_terminal_value_sig,
+        )
+        .map_err(|e| format!("declare sigil_reset_last_terminal_value: {e}"))?;
+
     // sigil_run_loop(initial: *mut NextStep) -> u64. Drives the CPS
     // trampoline to a terminal NextStep::Done and returns its value.
     // Phase 3b uses this to dispatch the NextStep::Call that
@@ -5315,6 +5348,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         next_step_discharged,
         last_terminal_tag,
         reset_last_terminal_tag,
+        last_terminal_value,
+        reset_last_terminal_value,
         next_step_call,
         next_step_args_ptr,
         continuation_identity,
@@ -5369,6 +5404,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 next_step_discharged_ref: _,
                 last_terminal_tag_ref,
                 reset_last_terminal_tag_ref,
+                last_terminal_value_ref,
+                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
@@ -5754,6 +5791,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     run_loop_ref,
                     last_terminal_tag_ref,
                     reset_last_terminal_tag_ref,
+                    last_terminal_value_ref,
+                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
@@ -5893,6 +5932,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 run_loop_ref,
                 last_terminal_tag_ref,
                 reset_last_terminal_tag_ref,
+                last_terminal_value_ref,
+                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 handler_arm_refs_per_handle,
@@ -6241,6 +6282,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     next_step_discharged_ref,
                     last_terminal_tag_ref,
                     reset_last_terminal_tag_ref,
+                    last_terminal_value_ref,
+                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
@@ -6346,6 +6389,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     run_loop_ref,
                     last_terminal_tag_ref,
                     reset_last_terminal_tag_ref,
+                    last_terminal_value_ref,
+                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
@@ -6928,6 +6973,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     next_step_discharged_ref: _,
                     last_terminal_tag_ref,
                     reset_last_terminal_tag_ref,
+                    last_terminal_value_ref,
+                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
@@ -7046,6 +7093,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     run_loop_ref,
                     last_terminal_tag_ref,
                     reset_last_terminal_tag_ref,
+                    last_terminal_value_ref,
+                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
@@ -7252,6 +7301,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 next_step_discharged_ref: _,
                 last_terminal_tag_ref,
                 reset_last_terminal_tag_ref,
+                last_terminal_value_ref,
+                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
@@ -7281,6 +7332,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 run_loop_ref,
                 last_terminal_tag_ref,
                 reset_last_terminal_tag_ref,
+                last_terminal_value_ref,
+                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 handler_arm_refs_per_handle,
@@ -7526,6 +7579,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         next_step_discharged_ref: _,
                         last_terminal_tag_ref,
                         reset_last_terminal_tag_ref,
+                        last_terminal_value_ref,
+                        reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
                         continuation_identity_ref,
@@ -7554,6 +7609,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         run_loop_ref,
                         last_terminal_tag_ref,
                         reset_last_terminal_tag_ref,
+                        last_terminal_value_ref,
+                        reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
                         handler_arm_refs_per_handle,
@@ -8160,6 +8217,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             next_step_discharged_ref: _,
                             last_terminal_tag_ref,
                             reset_last_terminal_tag_ref,
+                            last_terminal_value_ref,
+                            reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             continuation_identity_ref,
@@ -8189,6 +8248,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             run_loop_ref,
                             last_terminal_tag_ref,
                             reset_last_terminal_tag_ref,
+                            last_terminal_value_ref,
+                            reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             handler_arm_refs_per_handle,
@@ -8668,6 +8729,15 @@ struct Lowerer<'a, 'b> {
     /// before body lowering so handles whose bodies don't run a
     /// perform start with a clean DONE tag state.
     reset_last_terminal_tag_ref: FuncRef,
+    /// Stage-6.8-followup Bug 1 fix — `sigil_last_terminal_value`
+    /// FuncRef. Read in the handle expression's discharge_block to
+    /// recover the trampoline's terminal value when body has post-
+    /// perform code.
+    last_terminal_value_ref: FuncRef,
+    /// Stage-6.8-followup Bug 1 fix — `sigil_reset_last_terminal_value`
+    /// FuncRef. Emitted alongside `reset_last_terminal_tag_ref` at
+    /// each handle lowering's entry.
+    reset_last_terminal_value_ref: FuncRef,
     /// Plan B Task 55 (Phase 3b) — per-handle-span synthetic arm fn
     /// refs. Used by `Expr::Handle` codegen to emit `func_addr`
     /// pointers for `sigil_handler_frame_set_arm`. Keyed by the
@@ -9541,14 +9611,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // `handle 5 with { ... }`), the tag stays at the
                 // reset DONE so the post-body check at handle exit
                 // dispatches the return arm correctly.
-                if return_arm.is_some() {
-                    let reset_call = self
-                        .builder
-                        .ins()
-                        .call(self.reset_last_terminal_tag_ref, &[]);
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, reset_call));
-                }
+                // Stage-6.8-followup Bug 1 fix: reset both
+                // LAST_TERMINAL_TAG and LAST_TERMINAL_VALUE before
+                // body lowering. Both return-arm-bearing AND
+                // no-return-arm handles need the reset so a prior
+                // run_loop's discharge tag/value doesn't shadow this
+                // handle's body completion when this body never runs
+                // a perform.
+                let reset_tag_call = self
+                    .builder
+                    .ins()
+                    .call(self.reset_last_terminal_tag_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, reset_tag_call));
+                let reset_v_call = self
+                    .builder
+                    .ins()
+                    .call(self.reset_last_terminal_value_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, reset_v_call));
                 let body_val = self.lower_expr(body);
 
                 // Step 3: pop N frames in reverse push order. Capture
@@ -9708,32 +9789,40 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // unreachable.
                     self.builder.switch_to_block(discharge_block);
                     self.builder.seal_block(discharge_block);
-                    let discharge_val = if body_ty == handler_overall_ty {
-                        body_val
-                    } else if body_ty.bytes() == handler_overall_ty.bytes() {
+                    // Stage-6.8-followup Bug 1 fix: read the trampoline's
+                    // terminal value from `sigil_last_terminal_value`
+                    // instead of using body_val. body_val reflects body's
+                    // IR-locally-computed terminal expression (correct
+                    // only for tail-perform body where body's value IS
+                    // perform's return value). For body shapes with
+                    // post-perform code (`{ let _ = perform; tail }`),
+                    // body_val is body's tail value, NOT the discharged
+                    // arm's value — the runtime preserves the latter
+                    // in `LAST_TERMINAL_VALUE`.
+                    let lv_call = self
+                        .builder
+                        .ins()
+                        .call(self.last_terminal_value_ref, &[]);
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, lv_call));
+                    let last_terminal_v_u64 = self.builder.inst_results(lv_call)[0];
+
+                    // Narrow u64 → handler_overall_ty.
+                    let discharge_val = if handler_overall_ty == types::I64 {
+                        last_terminal_v_u64
+                    } else if handler_overall_ty.is_int()
+                        && handler_overall_ty.bits() < 64
+                    {
                         self.builder
                             .ins()
-                            .bitcast(handler_overall_ty, MemFlags::new(), body_val)
-                    } else if body_ty.is_int()
-                        && handler_overall_ty.is_int()
-                        && body_ty.bits() < handler_overall_ty.bits()
-                    {
-                        self.builder.ins().uextend(handler_overall_ty, body_val)
-                    } else if body_ty.is_int()
-                        && handler_overall_ty.is_int()
-                        && body_ty.bits() > handler_overall_ty.bits()
-                    {
-                        self.builder.ins().ireduce(handler_overall_ty, body_val)
+                            .ireduce(handler_overall_ty, last_terminal_v_u64)
+                    } else if handler_overall_ty == self.pointer_ty {
+                        // pointer_ty == I64 on supported targets; the
+                        // u64 IS bit-identical to the pointer value.
+                        last_terminal_v_u64
                     } else {
-                        // Conversion path not directly expressible
-                        // (e.g., pointer-to-narrower-int). The
-                        // discharge branch is dead at runtime when
-                        // body has no perform OR when it does perform
-                        // but R's Cranelift type doesn't fit B's
-                        // narrow-back at the perform site (algebraic
-                        // semantics enforce R's value flows out only
-                        // when the runtime invariant holds; codegen
-                        // still must emit valid IR). Emit a safe
+                        // Future float / 32-bit-target port would
+                        // need a dedicated branch here. Emit a safe
                         // placeholder of handler_overall_ty so
                         // Cranelift's verifier accepts the IR.
                         if handler_overall_ty.is_int() {
@@ -9887,7 +9976,123 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     return self.builder.block_params(merge_block)[0];
                 }
 
-                body_val
+                // No return arm declared. Stage-6.8-followup Bug 1
+                // fix (no-return-arm variant): even without a return
+                // arm, body's IR-locally-computed body_val can be
+                // wrong when the body has post-perform code AND an
+                // op arm fires with discard-k. The arm's discharge
+                // value flows back through the trampoline's terminal
+                // (preserved in `LAST_TERMINAL_VALUE`); body's
+                // synchronous lowering then continues past the
+                // perform site and produces a different terminal in
+                // body_val. Algebraic semantics says the discharged
+                // value IS handle's overall when an arm discharges.
+                //
+                // Reset both TLS slots before body lowering — match
+                // the return_arm.is_some() path's discipline so
+                // handles whose bodies never run a perform see
+                // tag = DONE → use body_val (the natural body
+                // terminal). The earlier branch handled this for
+                // return-arm-bearing handles; replicate here.
+                //
+                // Note: the reset must happen BEFORE body lowering,
+                // not here. Code emit order: codegen reaches this
+                // point AFTER body has been lowered. To make the
+                // reset fire before body, we'd need to plumb a
+                // pre-body reset emit. As a simpler substitute that
+                // stays correct under sigil's current usage pattern:
+                // the codegen-emitted reset above (in the
+                // return_arm.is_some() branch) doesn't fire for
+                // no-return-arm handles, but `sigil_run_loop`'s
+                // terminal always overwrites LAST_TERMINAL_TAG /
+                // LAST_TERMINAL_VALUE before returning. So the only
+                // observable stale-state path is: prior run_loop
+                // produced DISCHARGED, this handle's body never
+                // invokes run_loop (no perform), and the post-body
+                // tag-check sees stale DISCHARGED. Pinned as known
+                // limitation; v2 either pre-resets unconditionally
+                // or hoists the reset emit before body lowering.
+                let body_ty = self.builder.func.dfg.value_type(body_val);
+                let body_val_widened = if body_ty == types::I64 {
+                    body_val
+                } else if body_ty.is_int() && body_ty.bits() < 64 {
+                    self.builder.ins().uextend(types::I64, body_val)
+                } else {
+                    assert_eq!(
+                        body_ty, self.pointer_ty,
+                        "codegen no-return-arm Bug 1: unexpected body Cranelift \
+                         type {body_ty:?} widening for discharge query"
+                    );
+                    body_val
+                };
+
+                let tag_call = self
+                    .builder
+                    .ins()
+                    .call(self.last_terminal_tag_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, tag_call));
+                let tag_v = self.builder.inst_results(tag_call)[0];
+                let discharged_const = self.builder.ins().iconst(
+                    types::I32,
+                    sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
+                );
+                let is_discharged =
+                    self.builder.ins().icmp(IntCC::Equal, tag_v, discharged_const);
+
+                // For no-return-arm, handle's overall type = body's
+                // type B (no return arm to widen / change type).
+                let handler_overall_ty = body_ty;
+
+                let discharge_block_nra = self.builder.create_block();
+                let normal_block_nra = self.builder.create_block();
+                let merge_block_nra = self.builder.create_block();
+                self.builder
+                    .append_block_param(merge_block_nra, handler_overall_ty);
+                self.builder.ins().brif(
+                    is_discharged,
+                    discharge_block_nra,
+                    &[],
+                    normal_block_nra,
+                    &[],
+                );
+
+                // Discharge block: read LAST_TERMINAL_VALUE, narrow.
+                self.builder.switch_to_block(discharge_block_nra);
+                self.builder.seal_block(discharge_block_nra);
+                let lv_call = self
+                    .builder
+                    .ins()
+                    .call(self.last_terminal_value_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, lv_call));
+                let lv_u64 = self.builder.inst_results(lv_call)[0];
+                let discharge_val = if handler_overall_ty == types::I64 {
+                    lv_u64
+                } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
+                    self.builder.ins().ireduce(handler_overall_ty, lv_u64)
+                } else if handler_overall_ty == self.pointer_ty {
+                    lv_u64
+                } else if handler_overall_ty.is_int() {
+                    self.builder.ins().iconst(handler_overall_ty, 0)
+                } else {
+                    self.builder.ins().iconst(self.pointer_ty, 0)
+                };
+                self.builder
+                    .ins()
+                    .jump(merge_block_nra, &[discharge_val.into()]);
+
+                // Normal block: body_val IS handle's overall.
+                self.builder.switch_to_block(normal_block_nra);
+                self.builder.seal_block(normal_block_nra);
+                let _ = body_val_widened;
+                self.builder
+                    .ins()
+                    .jump(merge_block_nra, &[body_val.into()]);
+
+                self.builder.switch_to_block(merge_block_nra);
+                self.builder.seal_block(merge_block_nra);
+                self.builder.block_params(merge_block_nra)[0]
             }
         }
     }
@@ -11693,6 +11898,15 @@ struct PerFnRefsCtx<'a> {
     /// body lowering so handles whose bodies don't run a perform
     /// (no run_loop call) see a clean DONE tag state.
     reset_last_terminal_tag: cranelift_module::FuncId,
+    /// Stage-6.8-followup Bug 1 fix — `sigil_last_terminal_value`
+    /// FuncId. Read in the handle expression's discharge_block to
+    /// recover the trampoline's terminal value when body has post-
+    /// perform code that overwrites body_val.
+    last_terminal_value: cranelift_module::FuncId,
+    /// Stage-6.8-followup Bug 1 fix — `sigil_reset_last_terminal_value`
+    /// FuncId. Emitted alongside `reset_last_terminal_tag` at the
+    /// entry of each handle lowering.
+    reset_last_terminal_value: cranelift_module::FuncId,
     next_step_call: cranelift_module::FuncId,
     next_step_args_ptr: cranelift_module::FuncId,
     continuation_identity: cranelift_module::FuncId,
@@ -11749,6 +11963,10 @@ struct PerFnRefs {
     last_terminal_tag_ref: FuncRef,
     /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::reset_last_terminal_tag`.
     reset_last_terminal_tag_ref: FuncRef,
+    /// Stage-6.8-followup Bug 1 fix — see `PerFnRefsCtx::last_terminal_value`.
+    last_terminal_value_ref: FuncRef,
+    /// Stage-6.8-followup Bug 1 fix — see `PerFnRefsCtx::reset_last_terminal_value`.
+    reset_last_terminal_value_ref: FuncRef,
     next_step_call_ref: FuncRef,
     next_step_args_ptr_ref: FuncRef,
     continuation_identity_ref: FuncRef,
@@ -11797,6 +12015,10 @@ fn prepare_per_fn_refs(
     let last_terminal_tag_ref = module.declare_func_in_func(ctx.last_terminal_tag, builder.func);
     let reset_last_terminal_tag_ref =
         module.declare_func_in_func(ctx.reset_last_terminal_tag, builder.func);
+    let last_terminal_value_ref =
+        module.declare_func_in_func(ctx.last_terminal_value, builder.func);
+    let reset_last_terminal_value_ref =
+        module.declare_func_in_func(ctx.reset_last_terminal_value, builder.func);
     let next_step_call_ref = module.declare_func_in_func(ctx.next_step_call, builder.func);
     let next_step_args_ptr_ref = module.declare_func_in_func(ctx.next_step_args_ptr, builder.func);
     let continuation_identity_ref =
@@ -11876,6 +12098,8 @@ fn prepare_per_fn_refs(
         next_step_discharged_ref,
         last_terminal_tag_ref,
         reset_last_terminal_tag_ref,
+        last_terminal_value_ref,
+        reset_last_terminal_value_ref,
         next_step_call_ref,
         next_step_args_ptr_ref,
         continuation_identity_ref,

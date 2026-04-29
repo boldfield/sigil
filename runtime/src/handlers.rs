@@ -201,6 +201,41 @@ thread_local! {
     /// for future expansion; today's `sigil_run_loop` runs on a single
     /// thread, but the per-thread design avoids globally-mutable state.
     static LAST_TERMINAL_TAG: Cell<u32> = const { Cell::new(NEXT_STEP_TAG_DONE) };
+
+    /// Per-thread last-terminal value: records the u64 value the most
+    /// recent `sigil_run_loop` invocation returned at terminal time
+    /// (whether DONE or DISCHARGED).
+    ///
+    /// Stage-6.8-followup Bug 1 fix companion to `LAST_TERMINAL_TAG`.
+    /// Codegen at `Expr::Handle`'s `lower_expr` queries this when the
+    /// body has post-perform code (`{ let _ = perform; tail }` shape):
+    /// without it, body_val computed by synchronous body lowering
+    /// reflects the body's IR-local terminal value, NOT the discharged
+    /// arm's value. The arm's discharged value flows back through the
+    /// trampoline's terminal but gets narrowed at the perform's
+    /// narrow-back to perform's declared return type (lossy when arm
+    /// discharges a value of a different type) and then the body's
+    /// post-perform code overwrites it. By saving the run_loop's raw
+    /// terminal u64 here, the handle expression can recover the
+    /// discharged value when tag == DISCHARGED.
+    ///
+    /// Initial value `0` (any value is safe — codegen only reads when
+    /// LAST_TERMINAL_TAG == DISCHARGED, and the discharge tag is only
+    /// set by `sigil_run_loop`'s terminal). Set by `sigil_run_loop`
+    /// immediately before returning the terminal value; queried by
+    /// codegen via `sigil_last_terminal_value` after run_loop returns.
+    ///
+    /// **No GC root** — the value is u64. The TLS does NOT carry a
+    /// stable heap-pointer rooting contract; codegen must consume the
+    /// value before any GC-triggering operation that could reclaim a
+    /// heap object whose pointer was parked here. In practice the
+    /// consumer site (`Expr::Handle` discharge_block) reads the value
+    /// immediately and threads it through the merge_block's param,
+    /// where Cranelift's register / spill discipline keeps it live for
+    /// Boehm's conservative scan. A future precise-GC pass would
+    /// require either rooting this TLS or moving the value into a
+    /// stack slot at consumption time.
+    static LAST_TERMINAL_VALUE: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Register the calling thread's `HANDLER_STACK` TLS cell as a Boehm
@@ -736,6 +771,45 @@ pub unsafe extern "C" fn sigil_reset_last_terminal_tag() {
     LAST_TERMINAL_TAG.with(|c| c.set(NEXT_STEP_TAG_DONE));
 }
 
+/// Read the per-thread `LAST_TERMINAL_VALUE` set by the most recent
+/// `sigil_run_loop` invocation. Returns the raw u64 the trampoline
+/// returned at terminal time (whether DONE or DISCHARGED).
+///
+/// Stage-6.8-followup Bug 1 fix companion to `sigil_last_terminal_tag`.
+/// Codegen reads this when `LAST_TERMINAL_TAG == NEXT_STEP_TAG_DISCHARGED`
+/// to recover the discharged value when body has post-perform code that
+/// would otherwise overwrite the natural body_val with body's IR-locally-
+/// computed terminal.
+///
+/// Initial value (before any `sigil_run_loop` runs) is `0`. Codegen only
+/// reads when the tag indicates DISCHARGED, so the initial-zero is never
+/// observable in well-formed programs.
+///
+/// # Safety
+///
+/// Safe to call. Reads thread-local state without mutation.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_last_terminal_value() -> u64 {
+    LAST_TERMINAL_VALUE.with(|c| c.get())
+}
+
+/// Reset the per-thread `LAST_TERMINAL_VALUE` to `0`. Emitted alongside
+/// `sigil_reset_last_terminal_tag` at the top of each `Expr::Handle`
+/// lowering so handles whose body never runs the trampoline see a
+/// clean state instead of inheriting a prior run's value. Reading this
+/// when the tag is DONE is undefined behavior at the source level
+/// (codegen's discharge_block is gated on tag == DISCHARGED), but
+/// resetting prevents any future code path from observing a stale
+/// value.
+///
+/// # Safety
+///
+/// Safe to call. Writes thread-local state with no other side effects.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_reset_last_terminal_value() {
+    LAST_TERMINAL_VALUE.with(|c| c.set(0));
+}
+
 /// Allocate a `NEXT_STEP_TAG_DISCHARGED` record from the per-dispatch
 /// arena holding `value`.
 ///
@@ -1244,10 +1318,15 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                     current = ns;
                     continue;
                 }
-                // Top-level terminal: record the source tag so the
-                // handle expression's outer codegen logic can branch
-                // on it (skip return arm dispatch on discharge).
+                // Top-level terminal: record the source tag AND the
+                // value so the handle expression's outer codegen logic
+                // can branch on the tag (skip return arm dispatch on
+                // discharge) AND recover the value when body's
+                // synchronous IR-level lowering would have overwritten
+                // it with body's post-perform code's natural terminal
+                // (Stage-6.8-followup Bug 1 fix).
                 LAST_TERMINAL_TAG.with(|c| c.set(tag));
+                LAST_TERMINAL_VALUE.with(|c| c.set(v));
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();

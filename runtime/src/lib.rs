@@ -40,6 +40,10 @@
 //!   6.8-followup Bug 2 fix — distinguish op-arm-discharge from
 //!   body-normal completion so handle expression skips return arm
 //!   dispatch on discharge per algebraic-effects semantics)
+//! - `sigil_last_terminal_value`, `sigil_reset_last_terminal_value`
+//!   (Stage 6.8-followup Bug 1 fix — recover the trampoline's
+//!   terminal value at discharge time when body has post-perform
+//!   code that overwrites the synchronous body_val)
 //! - `sigil_io_println_arm`, `sigil_arith_error_div_by_zero_arm`,
 //!   `sigil_arith_error_mod_by_zero_arm` (Plan B Task 57 — runtime-
 //!   side default arm fns installed by the `main` shim's top-level

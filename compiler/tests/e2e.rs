@@ -4605,6 +4605,47 @@ fn handle_returning_fn_typed_value_with_op_arm_discharge_runs() {
 }
 
 #[test]
+fn handle_with_post_perform_body_code_uses_arm_discharge_value() {
+    // Stage-6.8-followup Bug 1 fix — body has post-perform code in
+    // the let-binding shape `{ let _ = perform; tail }`. Pre-fix, the
+    // synchronous body lowering's IR-level body_val reflected body's
+    // tail expression (the lambda `fn (x) => x`), NOT the discharged
+    // arm's lambda. The handle's overall came out as body's identity
+    // lambda; `f(7)` evaluated to 7 instead of 107.
+    //
+    // Post-fix: runtime saves the trampoline's terminal value in
+    // `LAST_TERMINAL_VALUE`; the handle expression's discharge_block
+    // reads it (and similarly in the no-return-arm path's new
+    // discharge branch), recovering the arm's discharge value
+    // regardless of body shape. f = arm's `fn (x) => x + 100`.
+    // f(7) = 107.
+    //
+    // This shape originates from `DEBUG_RUN_STATE.md`'s Source A
+    // probe — the "Layer 1" residual from `[DEVIATION Stage-6.8-
+    // followup Layer 2 analysis]`'s "What's still blocking the
+    // canonical run_state" enumeration.
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn make_f() -> (Int) -> Int ![] ![] {\n  \
+                 handle {\n    \
+                   let _: Int = perform Trigger.fire();\n    \
+                   fn (x: Int) -> Int ![] => x\n  \
+                 } with {\n    \
+                   Trigger.fire(k) => fn (x: Int) -> Int ![] => x + 100,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = make_f();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_bug1_post_perform_body_discharge");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "107\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
 fn handle_returning_k_capturing_lambda_invoked_outside_handle() {
     // Stage-6.8-followup Layer 2 fix — k captured into a lifted lambda
     // that escapes the handle, then invoked from the handle's caller via
