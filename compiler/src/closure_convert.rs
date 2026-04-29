@@ -90,12 +90,25 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
         })
         .collect();
 
+    // Plan B' Stage 6.8 Task 104 — collect user-defined top-level fn
+    // names so `rewrite_expr` can materialize fn-as-value uses as
+    // ClosureRecords. Built before the rewrite loop so the ordering
+    // matches: forward references in lower fns to higher fns work.
+    let top_level_fn_names: BTreeSet<String> = original_items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Fn(f) => Some(f.name.clone()),
+            _ => None,
+        })
+        .collect();
+
     let mut conv = Converter {
         all_captures,
         counter: 0,
         hoisted: Vec::new(),
         hoisted_captures: BTreeMap::new(),
         reserved_counters,
+        top_level_fn_names,
     };
 
     // Rewrite every user fn's body in its own param scope with no enclosing
@@ -164,6 +177,14 @@ struct Converter {
     /// skips past any value in this set so synthetic names stay unique
     /// at the symbol-table level.
     reserved_counters: BTreeSet<usize>,
+    /// Plan B' Stage 6.8 Task 104 — set of user-defined top-level fn
+    /// names. When `rewrite_expr` sees `Expr::Ident(name)` outside a
+    /// callee position, and `name` is in this set, it rewrites to
+    /// `Expr::ClosureRecord { code_fn_name: name, env_exprs: [], .. }`.
+    /// The caller's `Expr::Call { callee: Ident(name), .. }` arm
+    /// short-circuits the rewrite for callees in this set so direct
+    /// dispatch is preserved.
+    top_level_fn_names: BTreeSet<String>,
 }
 
 impl Converter {
@@ -259,10 +280,29 @@ impl Converter {
                         name,
                         span,
                     }
+                } else if self.top_level_fn_names.contains(&name) {
+                    // Plan B' Stage 6.8 Task 104 — fn-as-value
+                    // materialization. A bare `Ident(top_level_fn)`
+                    // outside callee position represents using the fn
+                    // as a Ty::Fn value (e.g., `let f = id_fn`,
+                    // `apply(my_fn, 42)`). Rewrite to a captureless
+                    // ClosureRecord so codegen allocates a record
+                    // {header, code_ptr@8} on the GC heap. Codegen's
+                    // existing `lower_closure_record` (env_len = 0)
+                    // handles the empty-env case. The caller's
+                    // `Expr::Call { callee: Ident(name), .. }` arm
+                    // short-circuits this rewrite for callee names so
+                    // direct dispatch via `user_fn_refs` is preserved.
+                    Expr::ClosureRecord {
+                        code_fn_name: name,
+                        env_exprs: Vec::new(),
+                        env_slot_kinds: Vec::new(),
+                        span,
+                    }
                 } else {
-                    // Top-level fn reference (resolved at codegen via the
-                    // top-level fn registry) or a legitimately-free name
-                    // that resolve/typecheck already accepted.
+                    // Builtin fn reference (e.g., `int_to_string`) or a
+                    // legitimately-free name that resolve/typecheck
+                    // already accepted. Passes through unchanged.
                     Expr::Ident(name, span)
                 }
             }
@@ -317,14 +357,34 @@ impl Converter {
                 }
             }
             Expr::Block(b) => Expr::Block(Box::new(self.rewrite_block(*b, locals, captures))),
-            Expr::Call { callee, args, span } => Expr::Call {
-                callee: Box::new(self.rewrite_expr(*callee, locals, captures)),
-                args: args
-                    .into_iter()
-                    .map(|a| self.rewrite_expr(a, locals, captures))
-                    .collect(),
-                span,
-            },
+            Expr::Call { callee, args, span } => {
+                // Plan B' Stage 6.8 Task 104 — preserve direct dispatch
+                // for `Call { callee: Ident(top_level_fn), .. }`. The
+                // Ident arm above would otherwise rewrite the callee to
+                // a ClosureRecord, forcing every direct call to allocate
+                // a closure record. Short-circuit here: if the callee is
+                // a bare Ident naming a top-level fn (and not shadowed
+                // by a local or capture), keep the Ident so codegen's
+                // direct-dispatch path matches.
+                let callee = match *callee {
+                    Expr::Ident(ref name, _)
+                        if !locals.contains(name)
+                            && !captures.iter().any(|(n, _)| n == name)
+                            && self.top_level_fn_names.contains(name) =>
+                    {
+                        *callee
+                    }
+                    other => self.rewrite_expr(other, locals, captures),
+                };
+                Expr::Call {
+                    callee: Box::new(callee),
+                    args: args
+                        .into_iter()
+                        .map(|a| self.rewrite_expr(a, locals, captures))
+                        .collect(),
+                    span,
+                }
+            }
             Expr::Perform(p) => Expr::Perform(self.rewrite_perform(p, locals, captures)),
             Expr::Lambda {
                 params,

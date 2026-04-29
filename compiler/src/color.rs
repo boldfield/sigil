@@ -1140,6 +1140,7 @@ mod tests {
             lambda_captures: Vec::new(),
             types: BTreeMap::new(),
             match_scrut_tys: BTreeMap::new(),
+            call_callee_tys: BTreeMap::new(),
             fn_schemes: BTreeMap::new(),
             call_site_instantiations: calls,
             ctor_site_instantiations: BTreeMap::new(),

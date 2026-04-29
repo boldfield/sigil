@@ -309,6 +309,16 @@ pub struct CheckedProgram {
     /// match introduced by elaborate's if→match desugaring) let codegen
     /// fall back to primitive-scalar dispatch.
     pub match_scrut_tys: BTreeMap<Span, Ty>,
+    /// Plan B' Stage 6.8 Task 104 — per-call-site callee Ty for
+    /// every `Expr::Call` whose callee resolved to `Ty::Fn(sig)`.
+    /// Keyed by the call expression's span. Codegen consults this
+    /// at `lower_call` to determine the indirect-call signature
+    /// (params + ret) when the callee is a let-bound / param-bound
+    /// fn-typed value. Direct-call sites (callee = top-level fn
+    /// `Ident`) entries are populated too, but codegen doesn't read
+    /// them — direct dispatch via `user_fn_refs` precedes the
+    /// side-table lookup.
+    pub call_callee_tys: BTreeMap<Span, Ty>,
     /// Plan B task 49 — per-fn polymorphic schemes recorded at the
     /// end of the typecheck pass. Monomorphization reads these to
     /// build the surface-name → fresh-var mapping when cloning a
@@ -664,6 +674,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         types,
         ctors,
         match_scrut_tys: BTreeMap::new(),
+        call_callee_tys: BTreeMap::new(),
         fn_schemes: BTreeMap::new(),
         next_ty_var: 0,
         next_row_var: 0,
@@ -955,6 +966,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             lambda_captures: tc.lambda_captures,
             types: tc.types,
             match_scrut_tys: tc.match_scrut_tys,
+            call_callee_tys: tc.call_callee_tys,
             fn_schemes: tc.fn_schemes,
             call_site_instantiations: resolved_calls,
             ctor_site_instantiations: resolved_ctors,
@@ -1050,6 +1062,12 @@ struct Tc {
     /// checked program on typecheck completion. `check_match`
     /// populates an entry when the scrutinee has a known `Ty`.
     match_scrut_tys: BTreeMap<Span, Ty>,
+    /// Mirror of `CheckedProgram.call_callee_tys`. Plan B' Stage 6.8
+    /// Task 104 — populated by `check_call` with the callee's `Ty`
+    /// (typically `Ty::Fn(sig)`); codegen reads via `lower_call` to
+    /// resolve the indirect-call signature when the callee is a
+    /// let-bound / param-bound fn-typed value.
+    call_callee_tys: BTreeMap<Span, Ty>,
     /// Plan B task 48 — Hindley-Milner unification machinery.
     ///
     /// Schemes for top-level functions: a generic fn declaration
@@ -2823,7 +2841,23 @@ impl Tc {
         // (5) result type — derefed through the substitution so any
         // var bindings made by per-arg unification flow into the
         // returned type.
-        Some(self.deref(&sig.ret))
+        let resolved_ret = self.deref(&sig.ret);
+
+        // Plan B' Stage 6.8 Task 104 — record the resolved callee
+        // signature for codegen's `lower_call` indirect-call path.
+        // Resolution must happen *after* arg-type unification so any
+        // generic-param Ty::Vars in the original sig pick up their
+        // concrete bindings. Keyed on the call expression's span.
+        let resolved_sig = FnSig {
+            params: sig.params.iter().map(|p| self.deref(p)).collect(),
+            ret: resolved_ret.clone(),
+            effects: sig.effects.clone(),
+            effect_row_var: sig.effect_row_var,
+        };
+        self.call_callee_tys
+            .insert(span.clone(), Ty::Fn(Box::new(resolved_sig)));
+
+        Some(resolved_ret)
     }
 
     /// Helper: pick the single active row variable to thread
@@ -6971,6 +7005,7 @@ mod tests {
             types: BTreeMap::new(),
             ctors: BTreeMap::new(),
             match_scrut_tys: BTreeMap::new(),
+            call_callee_tys: BTreeMap::new(),
             fn_schemes: BTreeMap::new(),
             next_ty_var: 0,
             next_row_var: 0,

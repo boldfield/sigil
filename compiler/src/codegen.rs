@@ -5456,6 +5456,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    local_fn_types: BTreeMap::new(),
                 };
 
                 // Phase 5 — lower perform args via Lowerer; pack
@@ -5586,6 +5587,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
                 match_scrut_tys: &checked.match_scrut_tys,
+                local_fn_types: {
+                    // Plan B' Stage 6.8 Task 104 — seed with fn-typed
+                    // parameters so `lower_call`'s indirect path can
+                    // resolve their signatures when used as callees.
+                    let mut m: BTreeMap<String, crate::ast::FnTypeExpr> = BTreeMap::new();
+                    for p in &f.params {
+                        if let crate::ast::TypeExpr::Fn(fty) = &p.ty {
+                            m.insert(p.name.clone(), (**fty).clone());
+                        }
+                    }
+                    m
+                },
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -5999,6 +6012,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    local_fn_types: BTreeMap::new(),
                 };
 
                 // Plan B Task 55 (Phase 4d): route between the two
@@ -6662,6 +6676,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    local_fn_types: BTreeMap::new(),
                 };
 
                 let body_value = lowerer.lower_expr(&synth.body);
@@ -6885,6 +6900,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
                 match_scrut_tys: &checked.match_scrut_tys,
+                local_fn_types: BTreeMap::new(),
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
@@ -7146,6 +7162,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         type_layouts: &type_layouts,
                         ctor_index: &ctor_index,
                         match_scrut_tys: &checked.match_scrut_tys,
+                        local_fn_types: BTreeMap::new(),
                     };
 
                     match &step.role {
@@ -7769,6 +7786,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             type_layouts: &type_layouts,
                             ctor_index: &ctor_index,
                             match_scrut_tys: &checked.match_scrut_tys,
+                            local_fn_types: BTreeMap::new(),
                         };
 
                         match role {
@@ -8313,6 +8331,16 @@ struct Lowerer<'a, 'b> {
     /// to primitive-scalar dispatch in that case (which is correct
     /// because if-desugar only emits `Pattern::BoolLit` arms).
     match_scrut_tys: &'b BTreeMap<Span, Ty>,
+
+    /// Plan B' Stage 6.8 Task 104 — local fn-typed bindings in scope.
+    /// Keyed by binding name (fn parameter or `let`-binding); the
+    /// value is the binding's `TypeExpr::Fn` payload, used at
+    /// `lower_call` to reconstruct the indirect-call signature
+    /// (params + ret) when the callee resolves to one of these names.
+    /// Populated at fn entry (user-fn params) and during block
+    /// lowering (`Stmt::Let` with `TypeExpr::Fn`). Empty for synth
+    /// arm-fn / cps continuation lowering surfaces.
+    local_fn_types: BTreeMap<String, crate::ast::FnTypeExpr>,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -8351,6 +8379,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Stmt::Let(l) => {
                 let v = self.lower_expr(&l.value);
                 self.env.insert(l.name.clone(), v);
+                // Plan B' Stage 6.8 Task 104 — track fn-typed let
+                // bindings so `lower_call`'s indirect path can
+                // reconstruct the callee signature when the binding
+                // is invoked.
+                if let crate::ast::TypeExpr::Fn(fty) = &l.ty {
+                    self.local_fn_types.insert(l.name.clone(), (**fty).clone());
+                }
             }
             Stmt::Expr(e) => {
                 let _ = self.lower_expr(e);
@@ -9454,17 +9489,73 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.inst_results(call)[0]
             }
             _ => {
-                // Indirect calls (callee is a bound local or an
-                // arbitrary expression producing a closure value) land
-                // in Plan A3. Plan A2 cannot reach this arm from a
-                // well-typed program because `TypeExpr::Fn` is deferred
-                // — there is no surface syntax to declare a let or a
-                // param of function type, so every well-typed callee
-                // reduces to `Ident(top_level_fn)` or `ClosureRecord`
-                // at this point.
-                unreachable!(
-                    "codegen: indirect call (callee = {callee:?}) deferred to Plan A3 (TypeExpr::Fn not in A2)"
-                )
+                // Plan B' Stage 6.8 Task 104 — indirect call.
+                // The callee is a `Ty::Fn` value (let-binding,
+                // fn parameter, or expression producing a closure).
+                // Closure-convention ABI: `(closure_ptr, args...)
+                // -> ret`. Code_ptr lives at offset 8 in the closure
+                // record (header at 0, code_ptr at 8, captures at
+                // 16+8*i).
+                //
+                // Phase C v1 limits supported callee shapes to
+                // `Expr::Ident(local)` where `local` is registered in
+                // `local_fn_types`. More general callees (e.g.,
+                // `Call(make_adder, [5])(7)`) need recursive callee-
+                // type resolution; deferred to Phase C+.
+                let fty = match callee {
+                    Expr::Ident(name, _) => self.local_fn_types.get(name).cloned(),
+                    _ => None,
+                };
+                let fty = match fty {
+                    Some(f) => f,
+                    None => unreachable!(
+                        "codegen: indirect call callee shape not yet supported \
+                         (callee = {callee:?}); Phase C v1 supports Ident(local) \
+                         where local is fn-typed via param or let annotation"
+                    ),
+                };
+
+                // Lower the callee to its closure_ptr Value.
+                let closure_value = self.lower_expr(callee);
+
+                // Load code_ptr from offset 8 (past header).
+                let code_ptr =
+                    self.builder
+                        .ins()
+                        .load(self.pointer_ty, MemFlags::trusted(), closure_value, 8);
+
+                // Build the Cranelift signature matching this fn-type.
+                // Closure-convention ABI: closure_ptr first, then
+                // user-declared params, then ret type. Call conv
+                // matches the surrounding fn's (host triple default).
+                let call_conv = self.builder.func.signature.call_conv;
+                let mut sig = Signature::new(call_conv);
+                sig.params.push(AbiParam::new(self.pointer_ty));
+                for p in &fty.params {
+                    sig.params.push(AbiParam::new(cranelift_ty_for_type_expr(
+                        p,
+                        self.pointer_ty,
+                    )));
+                }
+                sig.returns.push(AbiParam::new(cranelift_ty_for_type_expr(
+                    &fty.ret,
+                    self.pointer_ty,
+                )));
+                let sig_ref = self.builder.import_signature(sig);
+
+                // Lower args; prepend closure_ptr.
+                let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 1);
+                all_args.push(closure_value);
+                all_args.extend(arg_vals);
+
+                let call = self
+                    .builder
+                    .ins()
+                    .call_indirect(sig_ref, code_ptr, &all_args);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
             }
         }
     }
@@ -10359,8 +10450,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .get(code_fn_name)
                     .map(|e| e.ret_ty)
                     .unwrap_or(types::I64),
-                // Indirect calls don't exist in Plan A2 (see lower_call);
-                // defensively return i64.
+                // Plan B' Stage 6.8 Task 104 — indirect call via a
+                // local fn-typed value. Look up the callee's
+                // `FnTypeExpr` to recover the declared ret type.
+                Expr::Ident(name, _) if self.local_fn_types.contains_key(name) => {
+                    cranelift_ty_for_type_expr(&self.local_fn_types[name].ret, self.pointer_ty)
+                }
+                // Other indirect call shapes (e.g., `make_adder(5)(7)`)
+                // are not yet supported by Phase C v1; defensively
+                // return i64. Codegen will trip the `lower_call`
+                // unreachable when such a shape reaches lowering.
                 _ => types::I64,
             },
             // Lambda type prediction is a Task-31/32 concern; closure
@@ -12223,6 +12322,7 @@ mod tests {
             lambda_captures: Vec::new(),
             types: std::collections::BTreeMap::new(),
             match_scrut_tys: std::collections::BTreeMap::new(),
+            call_callee_tys: std::collections::BTreeMap::new(),
             fn_schemes: std::collections::BTreeMap::new(),
             call_site_instantiations: std::collections::BTreeMap::new(),
             ctor_site_instantiations: std::collections::BTreeMap::new(),
@@ -12298,6 +12398,7 @@ mod tests {
             lambda_captures: Vec::new(),
             types: std::collections::BTreeMap::new(),
             match_scrut_tys: std::collections::BTreeMap::new(),
+            call_callee_tys: std::collections::BTreeMap::new(),
             fn_schemes: std::collections::BTreeMap::new(),
             call_site_instantiations: std::collections::BTreeMap::new(),
             ctor_site_instantiations: std::collections::BTreeMap::new(),
@@ -12563,6 +12664,7 @@ mod tests {
                 lambda_captures: Vec::new(),
                 types: std::collections::BTreeMap::new(),
                 match_scrut_tys: std::collections::BTreeMap::new(),
+                call_callee_tys: std::collections::BTreeMap::new(),
                 fn_schemes: std::collections::BTreeMap::new(),
                 call_site_instantiations: std::collections::BTreeMap::new(),
                 ctor_site_instantiations: std::collections::BTreeMap::new(),
