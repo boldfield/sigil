@@ -62,8 +62,9 @@ Goal: close B.1 + B.2. Generalize the 2-step Slice C chain (arm-side) and the 1-
 Goal: close B.3 + B.4. Together these unblock the literal `run_state` higher-order helper shape and the canonical algebraic-effects state-threading idiom.
 
 - Task 102 — B.3 Phase A: parser surface for `TypeExpr::Fn`.
-  - status: todo
-  - commits: []
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: AST adds `TypeExpr::Fn(Box<FnTypeExpr>)` (boxed payload to keep the enum below clippy's `large_enum_variant` threshold; `Stmt::Let` and `Expr::Lambda` both transitively contain `TypeExpr` and broke the lint when the variant was inline). `FnTypeExpr` carries `params: Vec<TypeExpr>`, `ret: TypeExpr`, `effects: Vec<String>`, `effect_row_var: Option<RowVar>`, `span`. Parser extends `parse_type` with a leading-`(` discriminator: `(T1, ..., Tn) -> R ![E1, ..., En]` (or `![..|r]`). Downstream pass arms added to keep the compiler building: `check_type_expr_known` recurses into params+ret then emits **E0136** ("first-class function type parsed but not yet usable; Phase B / Task 103 lands the integration"); `ty_from_type_expr` returns `None`; `monomorphize::rewrite_type_expr` substitutes recursively (forward-correct for Phase B); `monomorphize::ty_from_type_expr_under_subst` and `type_expr_to_ty` are unreachable (E0136 gates upstream); codegen entry-walker `type_expr_uses_apply_or_param` recurses (so an `Apply` hidden inside an `Fn` still surfaces); `slot_kind_for_type_expr_post_mono` returns `EnvSlotKind::Closure` for forward correctness. 10 parser unit tests cover the accept matrix (zero/one/two params; effects; row-var; nested fn-in-param; fn-returning-fn; generic-param in signature; let-binding position) and 2 reject cases (missing `->`, missing `![..]`). Pod-verify clean. Phase B (Task 103) replaces the E0136 / unreachable arms with real semantic integration.
 - Task 103 — B.3 Phase B: typecheck + monomorphize integration.
   - status: todo
   - commits: []

@@ -467,6 +467,18 @@ fn type_expr_uses_apply_or_param(
             true
         }
         TypeExpr::Named(name, _) => params.contains(name),
+        // Plan B' Stage 6.8 Task 102 — fn-type surface itself is
+        // not a generic Apply or generic-param ref. Recurse into
+        // its components so an Apply / generic-param hidden inside
+        // a fn-type still surfaces.
+        TypeExpr::Fn(fty) => {
+            for p in &fty.params {
+                if type_expr_uses_apply_or_param(p, params) {
+                    return true;
+                }
+            }
+            type_expr_uses_apply_or_param(&fty.ret, params)
+        }
     }
 }
 
@@ -2200,6 +2212,10 @@ fn slot_kind_for_type_expr_post_mono(te: &crate::ast::TypeExpr) -> EnvSlotKind {
             "codegen Phase 4e: slot_kind_for_type_expr_post_mono received \
              TypeExpr::Apply — monomorphization (Task 49) should have erased it"
         ),
+        // Plan B' Stage 6.8 Task 102 — fn-typed values are heap-
+        // allocated closure records; treat as a pointer slot
+        // (Closure kind matches the codegen-time runtime layout).
+        crate::ast::TypeExpr::Fn(_) => EnvSlotKind::Closure,
     }
 }
 

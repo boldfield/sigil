@@ -419,6 +419,36 @@ impl<'a> Parser<'a> {
 
     fn parse_type(&mut self) -> Option<TypeExpr> {
         let tok = self.peek().clone();
+        // Plan B' Stage 6.8 Task 102 — first-class function type:
+        // `(T1, ..., Tn) -> R ![E1, ..., En]`. Discriminated by the
+        // leading `(`; everything else falls through to the
+        // Ident-headed Named/Apply path below.
+        if matches!(tok.kind, TokenKind::LParen) {
+            self.advance();
+            let mut params = Vec::new();
+            while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
+                let p = self.parse_type()?;
+                params.push(p);
+                if matches!(self.peek().kind, TokenKind::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RParen, "`)` closing fn-type parameter list")?;
+            self.expect(&TokenKind::Arrow, "`->` fn-type return arrow")?;
+            let ret = self.parse_type()?;
+            self.expect(&TokenKind::Bang, "`!` before fn-type effect row")?;
+            self.expect(&TokenKind::LBracket, "`[` opening fn-type effect row")?;
+            let (effects, effect_row_var) = self.parse_effect_row()?;
+            return Some(TypeExpr::Fn(Box::new(crate::ast::FnTypeExpr {
+                params,
+                ret,
+                effects,
+                effect_row_var,
+                span: tok.span,
+            })));
+        }
         let TokenKind::Ident(n) = tok.kind else {
             self.err(tok.span.clone(), "expected type name");
             return None;
@@ -3170,5 +3200,166 @@ mod tests {
         // shape we expect — full-AST navigation is overkill for the
         // pin's purpose (catch grammar regression).
         assert_eq!(prog.items.len(), 2);
+    }
+
+    // ----------------------------------------------------------------
+    // Plan B' Stage 6.8 Task 102 — `TypeExpr::Fn` parser surface.
+    // ----------------------------------------------------------------
+
+    /// Helper: parse `src` as a stand-alone `TypeExpr` via a fn-decl
+    /// position. Returns the param's type for inspection. Panics on any
+    /// parse / lex error so test assertions read cleanly.
+    fn parse_type_in_param_position(src_param_ty: &str) -> TypeExpr {
+        let src = format!("fn f(x: {src_param_ty}) -> Int ![] {{ 0 }}\n");
+        let (toks, lex_errs) = lex("t.sigil", &src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, errs) = parse("t.sigil", &toks);
+        assert!(errs.is_empty(), "parse errs for `{src_param_ty}`: {errs:?}");
+        let Item::Fn(f) = &prog.items[0] else {
+            panic!("expected fn item")
+        };
+        f.params[0].ty.clone()
+    }
+
+    #[test]
+    fn fn_type_zero_params_no_effects_parses() {
+        let te = parse_type_in_param_position("() -> Int ![]");
+        let TypeExpr::Fn(fty) = te else {
+            panic!("expected TypeExpr::Fn, got {te:?}")
+        };
+        assert!(fty.params.is_empty(), "zero-param fn type has empty params");
+        assert_eq!(fty.ret.head_name(), "Int");
+        assert!(fty.effects.is_empty());
+        assert!(fty.effect_row_var.is_none());
+    }
+
+    #[test]
+    fn fn_type_one_param_one_effect_parses() {
+        let te = parse_type_in_param_position("(Int) -> String ![IO]");
+        let TypeExpr::Fn(fty) = te else {
+            panic!("expected TypeExpr::Fn, got {te:?}")
+        };
+        assert_eq!(fty.params.len(), 1);
+        assert_eq!(fty.params[0].head_name(), "Int");
+        assert_eq!(fty.ret.head_name(), "String");
+        assert_eq!(fty.effects, vec!["IO".to_string()]);
+    }
+
+    #[test]
+    fn fn_type_two_params_two_effects_parses() {
+        let te = parse_type_in_param_position("(Int, String) -> Bool ![IO, Choose]");
+        let TypeExpr::Fn(fty) = te else {
+            panic!("expected TypeExpr::Fn, got {te:?}")
+        };
+        assert_eq!(fty.params.len(), 2);
+        assert_eq!(fty.params[0].head_name(), "Int");
+        assert_eq!(fty.params[1].head_name(), "String");
+        assert_eq!(fty.ret.head_name(), "Bool");
+        assert_eq!(fty.effects, vec!["IO".to_string(), "Choose".to_string()]);
+    }
+
+    #[test]
+    fn fn_type_with_row_variable_parses() {
+        let te = parse_type_in_param_position("(Int) -> Int ![IO | r]");
+        let TypeExpr::Fn(fty) = te else {
+            panic!("expected TypeExpr::Fn, got {te:?}")
+        };
+        assert_eq!(fty.effects, vec!["IO".to_string()]);
+        let rv = fty.effect_row_var.as_ref().expect("row var present");
+        assert_eq!(rv.name, "r");
+    }
+
+    #[test]
+    fn fn_type_nested_fn_in_param_parses() {
+        // `((Int) -> Int ![]) -> Int ![]` — a fn that takes another
+        // fn-typed value as its only parameter.
+        let te = parse_type_in_param_position("((Int) -> Int ![]) -> Int ![]");
+        let TypeExpr::Fn(fty) = te else {
+            panic!("expected outer TypeExpr::Fn, got {te:?}")
+        };
+        assert_eq!(fty.params.len(), 1);
+        let TypeExpr::Fn(inner) = &fty.params[0] else {
+            panic!("expected inner TypeExpr::Fn, got {:?}", fty.params[0])
+        };
+        assert_eq!(inner.params.len(), 1);
+        assert_eq!(inner.params[0].head_name(), "Int");
+        assert_eq!(inner.ret.head_name(), "Int");
+        assert_eq!(fty.ret.head_name(), "Int");
+    }
+
+    #[test]
+    fn fn_type_returning_fn_parses() {
+        // `(Int) -> (Int) -> Int ![] ![]` — a fn that returns a fn-
+        // typed value. Right-associative reading of two `->`s with
+        // explicit `![..]` per arrow.
+        let te = parse_type_in_param_position("(Int) -> (Int) -> Int ![] ![]");
+        let TypeExpr::Fn(fty) = te else {
+            panic!("expected outer TypeExpr::Fn, got {te:?}")
+        };
+        assert_eq!(fty.params.len(), 1);
+        let TypeExpr::Fn(inner) = &fty.ret else {
+            panic!("expected inner TypeExpr::Fn, got {:?}", fty.ret)
+        };
+        assert_eq!(inner.params.len(), 1);
+        assert_eq!(inner.params[0].head_name(), "Int");
+        assert_eq!(inner.ret.head_name(), "Int");
+    }
+
+    #[test]
+    fn fn_type_with_generic_param_in_signature_parses() {
+        let src = "fn f(x: (A) -> A ![]) -> Int ![] { 0 }\n";
+        let (toks, _) = lex("t.sigil", src);
+        let (prog, errs) = parse("t.sigil", &toks);
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        let Item::Fn(f) = &prog.items[0] else {
+            panic!("expected fn item")
+        };
+        let TypeExpr::Fn(fty) = &f.params[0].ty else {
+            panic!("expected TypeExpr::Fn, got {:?}", f.params[0].ty)
+        };
+        assert_eq!(fty.params[0].head_name(), "A");
+        assert_eq!(fty.ret.head_name(), "A");
+    }
+
+    #[test]
+    fn fn_type_in_let_binding_position_parses() {
+        let src = "fn main() -> Int ![] { let g: (Int) -> Int ![] = id_fn; 0 }\n";
+        let (toks, _) = lex("t.sigil", src);
+        let (prog, errs) = parse("t.sigil", &toks);
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        let Item::Fn(f) = &prog.items[0] else {
+            panic!("expected fn item")
+        };
+        let Stmt::Let(l) = &f.body.stmts[0] else {
+            panic!("expected let stmt")
+        };
+        let TypeExpr::Fn(fty) = &l.ty else {
+            panic!("expected TypeExpr::Fn in let binding, got {:?}", l.ty)
+        };
+        assert_eq!(fty.params.len(), 1);
+        assert_eq!(fty.params[0].head_name(), "Int");
+        assert_eq!(fty.ret.head_name(), "Int");
+    }
+
+    #[test]
+    fn fn_type_missing_arrow_errors_cleanly() {
+        let src = "fn f(x: (Int) Int ![]) -> Int ![] { 0 }\n";
+        let (toks, _) = lex("t.sigil", src);
+        let (_prog, errs) = parse("t.sigil", &toks);
+        assert!(
+            !errs.is_empty(),
+            "expected at least one parse error for missing `->`"
+        );
+    }
+
+    #[test]
+    fn fn_type_missing_effect_row_errors_cleanly() {
+        let src = "fn f(x: (Int) -> Int) -> Int ![] { 0 }\n";
+        let (toks, _) = lex("t.sigil", src);
+        let (_prog, errs) = parse("t.sigil", &toks);
+        assert!(
+            !errs.is_empty(),
+            "expected at least one parse error for missing `![..]`"
+        );
     }
 }

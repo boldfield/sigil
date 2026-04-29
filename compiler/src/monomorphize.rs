@@ -613,6 +613,26 @@ impl<'a> Monomorphizer<'a> {
                 let mangled = mangle_type(name, &resolved_args);
                 TypeExpr::Named(mangled, span.clone())
             }
+            // Plan B' Stage 6.8 Task 102 — rewrite a fn-type by
+            // recursively substituting its params + ret. Effects
+            // and `effect_row_var` are surface text (no generic
+            // substitution at type-name level — row polymorphism
+            // handles row-vars at typecheck/monomorphize via the
+            // existing `Tc` row machinery, not at this surface
+            // rewrite). Phase B (Task 103) integrates `Ty::Fn` for
+            // typechecking the result; this rewrite produces a
+            // substituted surface that downstream Phase B sees.
+            TypeExpr::Fn(fty) => TypeExpr::Fn(Box::new(crate::ast::FnTypeExpr {
+                params: fty
+                    .params
+                    .iter()
+                    .map(|p| self.rewrite_type_expr(p, subst))
+                    .collect(),
+                ret: self.rewrite_type_expr(&fty.ret, subst),
+                effects: fty.effects.clone(),
+                effect_row_var: fty.effect_row_var.clone(),
+                span: fty.span.clone(),
+            })),
         }
     }
 
@@ -1128,6 +1148,15 @@ fn ty_from_type_expr_under_subst(te: &TypeExpr, subst: &BTreeMap<String, Ty>) ->
                 .map(|a| ty_from_type_expr_under_subst(a, subst))
                 .collect(),
         ),
+        // Plan B' Stage 6.8 Task 102 — Phase B (Task 103) wires the
+        // `TypeExpr::Fn` → `Ty::Fn` integration. Until then this
+        // path is unreachable: typecheck rejects `TypeExpr::Fn` at
+        // `check_type_expr_known` with E0136.
+        TypeExpr::Fn(_) => unreachable!(
+            "monomorphize::ty_from_type_expr_under_subst: TypeExpr::Fn \
+             reached resolution — typecheck E0136 should have rejected \
+             this site (Phase B / Task 103 lands the integration)"
+        ),
     }
 }
 
@@ -1249,6 +1278,13 @@ fn type_expr_to_ty(te: &TypeExpr) -> Ty {
         TypeExpr::Apply { name, args, .. } => {
             Ty::User(name.clone(), args.iter().map(type_expr_to_ty).collect())
         }
+        // Plan B' Stage 6.8 Task 102 — Phase B (Task 103) wires the
+        // surface → `Ty::Fn` resolution. Until then unreachable
+        // (typecheck E0136 rejects).
+        TypeExpr::Fn(_) => unreachable!(
+            "monomorphize::type_expr_to_ty: TypeExpr::Fn reached — \
+             Phase B / Task 103 lands the integration"
+        ),
     }
 }
 

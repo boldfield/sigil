@@ -1730,6 +1730,26 @@ impl Tc {
                     );
                 }
             }
+            TypeExpr::Fn(fty) => {
+                // Plan B' Stage 6.8 Task 102 — fn-type surface is
+                // accepted for parsing/storage but not yet wired into
+                // ty_from_type_expr_here (Phase B / Task 103). Reject
+                // with a clear "not yet implemented" until Phase B
+                // lands. Recurse into components first so any nested
+                // unknown-type / Apply errors still surface.
+                for p in &fty.params {
+                    self.check_type_expr_known(p);
+                }
+                self.check_type_expr_known(&fty.ret);
+                self.push_error(
+                    "E0136",
+                    t.span(),
+                    "first-class function type `(...) -> R ![..]` is parsed but \
+                     not yet usable (Plan B' Stage 6.8 Task 103 lands the \
+                     typecheck integration)"
+                        .to_string(),
+                );
+            }
         }
     }
 
@@ -4303,6 +4323,12 @@ pub(crate) fn ty_from_type_expr(
             }
             Some(Ty::User(name.to_string(), resolved_args))
         }
+        // Plan B' Stage 6.8 Task 102 — fn-type surface accepted at
+        // parse time but typecheck integration lands in Phase B
+        // (Task 103). Returning None here causes the caller's
+        // E0112 / E0136 path to surface an error before the program
+        // reaches downstream passes.
+        TypeExpr::Fn(_) => None,
     }
 }
 
