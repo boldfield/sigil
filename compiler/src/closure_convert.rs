@@ -121,6 +121,17 @@ pub struct ArmKPairCapture {
     /// for type-of-expr prediction at the synth fn's `k(arg)` call
     /// site.
     pub handler_overall_ty: Ty,
+    /// Stage-6.8-followup Layer 2 — span of the originating `Expr::
+    /// Handle`. Codegen's `lower_k_pair_call` looks up the handle's
+    /// return-arm synth fn via `handler_return_arm_indices.get(span)`
+    /// to self-apply the return arm to k(arg)'s raw u64 result, so
+    /// the lifted lambda observes the handler-overall-typed value
+    /// (not identity-of-arg). Without this, k captured into a
+    /// lambda that escapes the handle returns the raw input arg,
+    /// type-erased to handler_overall_ty's Cranelift type — the
+    /// canonical run_state's `k(s)(s)` chain segfaults dereferencing
+    /// an Int as a closure pointer.
+    pub handle_span: Span,
 }
 
 pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
@@ -313,9 +324,20 @@ struct Converter {
 /// pulled from the Lambda's per-span entry in `all_captures` when
 /// the k-capture is actually detected (avoids needing typecheck
 /// side-tables for op_ret_ty / handler_overall_ty at this layer).
+///
+/// Stage-6.8-followup Layer 2 fix: also track `handle_span` (the
+/// originating `Expr::Handle`'s span) so codegen's `lower_k_pair_call`
+/// can look up the handle's return-arm synth fn via
+/// `handler_return_arm_indices`. Required when the lifted lambda
+/// escapes the handle (op arm body IS the lambda) and the lambda's
+/// k(arg) invocation must self-apply the return arm to produce the
+/// handler-overall-typed value. Identity-as-k_fn alone returns raw
+/// arg, which the canonical run_state's `k(s)(s)` chain dereferences
+/// as a closure pointer → segfault.
 #[derive(Clone, Debug)]
 struct ArmKContext {
     k_name: String,
+    handle_span: Span,
 }
 
 impl Converter {
@@ -559,8 +581,12 @@ impl Converter {
                 // capture); codegen detects them via the
                 // `arm_k_pair_captures` side-table at lower-call
                 // time and dispatches via `sigil_next_step_call`.
+                let active_arm_k: Option<(String, Span)> = self
+                    .arm_k_context_stack
+                    .last()
+                    .map(|c| (c.k_name.clone(), c.handle_span.clone()));
                 let active_arm_k_name: Option<String> =
-                    self.arm_k_context_stack.last().map(|c| c.k_name.clone());
+                    active_arm_k.as_ref().map(|(n, _)| n.clone());
                 let mut k_pair_info: Option<ArmKPairCapture> = None;
                 let caps: Vec<(String, Ty)> = if let Some(arm_k) = &active_arm_k_name {
                     let mut filtered: Vec<(String, Ty)> = Vec::with_capacity(raw_caps.len());
@@ -578,12 +604,17 @@ impl Converter {
                                 // k_closure_idx = filtered.len() (next
                                 // slot index AFTER regular captures);
                                 // k_fn_idx = k_closure_idx + 1.
+                                let handle_span = active_arm_k
+                                    .as_ref()
+                                    .map(|(_, s)| s.clone())
+                                    .unwrap_or_else(|| span.clone());
                                 k_pair_info = Some(ArmKPairCapture {
                                     k_name: cname.clone(),
                                     k_closure_idx: filtered.len(),
                                     k_fn_idx: filtered.len() + 1,
                                     op_ret_ty,
                                     handler_overall_ty,
+                                    handle_span,
                                 });
                                 continue;
                             }
@@ -722,6 +753,7 @@ impl Converter {
                         // outer arms' k-contexts.
                         self.arm_k_context_stack.push(ArmKContext {
                             k_name: arm.k_name.clone(),
+                            handle_span: span.clone(),
                         });
                         let new_body = self.rewrite_expr(arm.body, &arm_locals, captures);
                         let _popped = self.arm_k_context_stack.pop();

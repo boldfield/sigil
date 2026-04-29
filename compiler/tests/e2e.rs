@@ -4605,6 +4605,50 @@ fn handle_returning_fn_typed_value_with_op_arm_discharge_runs() {
 }
 
 #[test]
+fn handle_returning_k_capturing_lambda_invoked_outside_handle() {
+    // Stage-6.8-followup Layer 2 fix — k captured into a lifted lambda
+    // that escapes the handle, then invoked from the handle's caller via
+    // `f(s)` and recursively chained as `k(s)(s)`. Pre-fix, the lifted
+    // lambda's k(arg) call returned the raw arg (identity-as-k_fn echoes
+    // input) where the source-language type is the handle's overall R =
+    // (Int) -> Int ![]. The next call site `(k(s))(s)` interpreted the
+    // raw Int as a closure pointer → SIGSEGV.
+    //
+    // Post-fix: lower_k_pair_call self-applies the originating handle's
+    // return arm to the run_loop result, producing the R-typed value
+    // (a closure for `(s) => v + s`). The chain `k(s)(s)` then evaluates
+    // to v + s where v = body's terminal value (= s, since perform is
+    // body's tail). For f(7): k(7) returns the closure for `(s) => 7+s`,
+    // applied to s=7 yields 14.
+    //
+    // This is the canonical run_state higher-order helper's arm body
+    // shape. Layer 2 unblocks it for tail-perform single-arm cases;
+    // Layers 1 (non-tail-perform body) and 3 (multi-arm composition)
+    // remain documented under `[DEVIATION Stage-6.8-followup Layer 2
+    // analysis]` for follow-up.
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 perform Trigger.fire()\n\
+               }\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_layer2_k_capturing_lambda");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "14\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
 fn handle_with_op_arm_discharge_skips_constant_return_arm() {
     // Stage-6.8-followup Bug 2 fix — corrects PR #29 semantics.
     // Combined coverage: when both an op arm and a return arm are

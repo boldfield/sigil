@@ -9982,18 +9982,122 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let widened_result = self.builder.inst_results(run_loop_call)[0];
 
+        // Stage-6.8-followup Layer 2 fix: apply the originating handle's
+        // return arm to widened_result. The lifted lambda may be invoked
+        // outside the originating handle (the canonical run_state shape:
+        // op arm body IS the lambda, lambda is the handle's discharge
+        // value, lambda is invoked from the handle's caller). The captured
+        // (k_closure=null, k_fn=identity) above just round-trips arg
+        // unchanged; without the return-arm wrap here, k(arg) returns the
+        // raw B-typed body value where the source-language type is R
+        // (handler_overall_ty), and the next call site `(k(arg))(...)`
+        // dereferences a non-pointer as a closure → SIGSEGV.
+        //
+        // Implementation mirrors the Phase 4g handle-discharge dispatch
+        // (lower_expr Expr::Handle's normal_block branch): build
+        // NextStep::Call(null, return_arm_fn, 3); write [body_val, null,
+        // identity] at args buffer offsets POST_ARM_K_ARG_OFF /
+        // POST_ARM_K_CLOSURE_OFF / POST_ARM_K_FN_OFF; drive sigil_run_loop;
+        // get widened R-typed value.
+        //
+        // **Captures restriction.** This path covers return arms with no
+        // outer captures (return_arm_fn invoked with closure_ptr = null).
+        // For return arms that capture outer-scope vars, the synth fn
+        // would need its closure record allocated and threaded through;
+        // that path is deferred and falls back to the pre-fix raw-arg
+        // semantics (likely segfault on canonical-shape programs that
+        // exercise it). The rs_b probe + canonical run_state's return
+        // arm `return(v) => fn (s: Int) -> Int ![] => v + s` has no outer
+        // captures so this fix unblocks the canonical shape.
+        let final_widened = if let Some(idx) =
+            self.handler_return_arm_indices.get(&info.handle_span).copied()
+        {
+            let synth = &self.handler_return_arm_synth[idx];
+            if synth.captures.is_empty() {
+                let ret_fn_ref = *self
+                    .handler_return_arm_refs_per_handle
+                    .get(&info.handle_span)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen Layer 2: handler_return_arm_refs_per_handle missing \
+                             entry for handle span {:?}; pre-pass should populate it \
+                             alongside handler_return_arm_indices",
+                            info.handle_span
+                        )
+                    });
+                let ret_fn_addr = self.builder.ins().func_addr(self.pointer_ty, ret_fn_ref);
+                let null_ret_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+                let three_v = self.builder.ins().iconst(types::I32, 3);
+                let call_ns = self.builder.ins().call(
+                    self.next_step_call_ref,
+                    &[null_ret_closure, ret_fn_addr, three_v],
+                );
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call_ns));
+                let ns_ptr = self.builder.inst_results(call_ns)[0];
+
+                let argp_call = self
+                    .builder
+                    .ins()
+                    .call(self.next_step_args_ptr_ref, &[ns_ptr]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, argp_call));
+                let argp_v = self.builder.inst_results(argp_call)[0];
+
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    widened_result,
+                    argp_v,
+                    POST_ARM_K_ARG_OFF,
+                );
+                let null_post = self.builder.ins().iconst(self.pointer_ty, 0);
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    null_post,
+                    argp_v,
+                    POST_ARM_K_CLOSURE_OFF,
+                );
+                let identity_fn_addr = self
+                    .builder
+                    .ins()
+                    .func_addr(self.pointer_ty, self.continuation_identity_ref);
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    identity_fn_addr,
+                    argp_v,
+                    POST_ARM_K_FN_OFF,
+                );
+
+                let run_loop_call_2 = self.builder.ins().call(self.run_loop_ref, &[ns_ptr]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, run_loop_call_2));
+                self.builder.inst_results(run_loop_call_2)[0]
+            } else {
+                // Return arm has outer captures — Layer 2 follow-up. Pass
+                // through the raw widened_result (pre-fix semantics).
+                widened_result
+            }
+        } else {
+            // No return arm registered for this handle — pass through
+            // (matches pre-Stage-6.8-followup behavior: identity-as-k_fn
+            // round-trips arg unchanged, narrow_back to handler_overall_ty
+            // is then a type-erasing narrow which is sound only when B = R
+            // by coincidence).
+            widened_result
+        };
+
         // Narrow back to handler_overall_ty's Cranelift type.
         let target_ty = cranelift_ty_of_ty(&info.handler_overall_ty, self.pointer_ty);
         if target_ty == types::I64 {
-            widened_result
+            final_widened
         } else if target_ty.is_int() && target_ty.bits() < 64 {
-            self.builder.ins().ireduce(target_ty, widened_result)
+            self.builder.ins().ireduce(target_ty, final_widened)
         } else {
             assert_eq!(
                 target_ty, self.pointer_ty,
                 "lower_k_pair_call: unexpected handler_overall_ty Cranelift type {target_ty:?}"
             );
-            widened_result
+            final_widened
         }
     }
 

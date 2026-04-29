@@ -437,3 +437,31 @@ Option A is the recommended path. Estimated scope: closure_convert ~50 LOC chang
 - Layer 2 is bounded to lifted-lambda k-pair-bearing synth fns. Direct (non-lambda) k(arg) at arm body tail (rs_b1, rs_a) works because the outermost run_loop's terminal applies return arm at handle-discharge time.
 
 **Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` (analysis only — no compiler/runtime changes in this commit).
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Layer 2 fix] Lifted lambda's k(arg) self-applies originating handle's return arm
+
+**Plan B' Stage 6.8 Task 109 followup, post-Layer-2-analysis.** Implements Option A from the prior analysis entry. Closes the captured-k-from-lambda invocation gap for tail-perform-body, single-op-arm, no-outer-captures-in-return-arm cases — the rs_b probe shape and the canonical `run_state(initial, comp)` helper's arm body pattern (excluding multi-arm + non-tail-perform body, which remain Layers 1 and 3).
+
+**Closure_convert** (`compiler/src/closure_convert.rs`): `ArmKContext` and `ArmKPairCapture` gain a `handle_span: Span` field. The originating `Expr::Handle`'s span is captured when entering an op-arm rewriting context and threaded into every `ArmKPairCapture` lifted from that arm's body. Codegen reads it at `lower_k_pair_call` time to look up the handle's return-arm synth fn.
+
+**Codegen** (`compiler/src/codegen.rs`): `lower_k_pair_call` (synth lambda fn's k-pair dispatch path) gains a return-arm self-apply step between the existing run_loop and narrow-back. After run_loop returns the body-resumed u64:
+1. Look up `handler_return_arm_indices.get(&info.handle_span)`.
+2. If `Some(idx)` AND `handler_return_arm_synth[idx].captures.is_empty()`: build `NextStep::Call(null, return_arm_fn_addr, 3)` with args buffer `[run_loop_result, null_post_handle_k_closure, identity_k_fn_addr]`; drive `sigil_run_loop`; result is the R-typed widened value. Mirrors the Phase 4g handle-discharge dispatch pattern at `lower_expr Expr::Handle`'s `normal_block` branch.
+3. If `None` (no return arm) OR captures non-empty: pass through the raw run_loop result (pre-fix semantics; the latter is a documented follow-up).
+
+The narrow-back to `handler_overall_ty`'s Cranelift type then operates on the R-typed value (post-fix) instead of the raw arg (pre-fix).
+
+**No runtime ABI changes.** The lifted lambda's closure record layout is unchanged (still trailing-pair `(k_closure, k_fn)`). The fix is entirely in the codegen-side dispatch, using the existing `handler_return_arm_indices` / `handler_return_arm_refs_per_handle` side-tables.
+
+**Test added:** `handle_returning_k_capturing_lambda_invoked_outside_handle` in `compiler/tests/e2e.rs`. Asserts `f(7) = k(7)(7) = (s) => 7+s, applied to 7 = 14` for the canonical run_state arm body shape `Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s)` with return arm `return(v) => fn (s: Int) -> Int ![] => v + s`. Pre-fix: SIGSEGV. Post-fix: prints 14.
+
+**Captures restriction.** Return arms with outer captures (e.g., `let x = ...; handle ... with { return(v) => f(x, v), ... }`) fall back to the pre-fix path. The synth fn's closure record requires runtime-allocated slots populated from outer-scope values; threading those through the lifted lambda's invocation context requires either (a) extending the lambda's closure record with the return-arm closure_ptr or (b) using a thread-local or handler-stack lookup that survives handle discharge. Pinned for follow-up; canonical run_state's return arm has no outer captures so the fix unblocks it as-is.
+
+**What's still blocking the canonical `run_state(initial, comp)`:**
+- **Layer 1** (Bug 1): non-tail-perform body shape (`comp() { let _ = perform State.set(10); ...; v + 1 }` does post-perform work). Different bug than Layer 2.
+- **Layer 3**: multi-arm composition (return + State.get + State.set). Whether the trailing-pair k-pair-bearing dispatch composes correctly when multiple arm types' lambdas chain.
+
+Verified: post-Layer-2 fix, `/tmp/run_state_canonical.sigil` (canonical multi-arm + non-tail-perform shape) still produces a heap-pointer-shaped output. Layer 2 fix is necessary but not sufficient.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
+
