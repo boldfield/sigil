@@ -596,6 +596,38 @@ Pre-fix, `lower_k_pair_call` only wrote `args[0]` for k(arg) dispatch. When k_fn
 
 **What this closes.** Plan B' Stage 6.8's "examples/state.sigil uses literal `run_state` higher-order helper and the threaded-state output is correct" criterion is now met (subject to landing the state.sigil rewrite in a follow-on commit). The `[DEVIATION Task 109] run_state canonical shape` entry's "What this fix DOES NOT close" residual list (Bug 1, Layer 2, Layer 3a, Layer 3b, Layer 3c) is fully resolved.
 
+**Implementing commit(s):** [HEAD~1] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge (Layer 3c).
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup non-canonical cleanups] state.sigil canonical, drain leak, Layer 3d, debug-doc removal
+
+**Plan B' Stage 6.8 Task 109 followup, post-Layer-3c.** Closes the four non-canonical residuals identified after the canonical `run_state` runtime fix.
+
+### state.sigil rewritten to canonical `run_state` shape
+
+`examples/state.sigil` now uses the literal `run_state(initial, comp)` higher-order helper, replacing the dual-handle Plan B Task 59 workaround. Canonical body: `comp() { let _ = perform State.set(10); let v = perform State.get(); v + 1 }`. Output: `11`. The e2e test renamed from `state_example_dual_handle_returns_6_then_99` to `state_example_canonical_run_state_returns_11`. Plan B' Stage 6.8 completion criterion is now concretely met by the example file (not just the language surface).
+
+### DEBUG_RUN_STATE.md deleted
+
+The bisect debug-prep doc from `e912315` (Source A / B / C harness) is removed now that all three layers are closed. Architectural narrative lives in this `PLAN_B_PRIME_DEVIATIONS.md` file's deviation entries; the standalone debug doc was a transient bridge.
+
+### Layer 3c outer_post_arm_k drain on DISCHARGED bypass
+
+`sigil_run_loop` snapshots `OUTER_POST_ARM_K_DEPTH` at entry. On the Layer 3c DISCHARGED bypass terminal (which previously returned without draining), the depth is restored to entry-time so synth-cont Middle pushes during the bypassed run don't leak across run_loop boundaries. Pre-fix, leaked entries were consumed via the DONE-path routing on subsequent calls — benign for the canonical (entries from `lower_k_pair_call` are uniformly `(null, identity)`, so routing is identity-passthrough) but architecturally questionable for adversarial nesting and a 32-entry capacity-overflow risk for deep chains. The drain restores stack discipline.
+
+### Layer 3d — return arms with outer captures
+
+`lower_k_pair_call`'s self-apply path now loads `return_closure` from the handler frame at offset `HANDLER_FRAME_RETURN_CLOSURE_OFF` instead of hardcoding `null`. The handle expression's codegen wrote it via `sigil_handler_frame_set_return` at handle codegen time; for return arms with empty outer captures it's null (per the runtime helper's null-for-empty discipline), for non-empty captures it's the closure record allocated by `alloc_arm_closure_record(&ret_captures, None)`. Both cases unify through the frame load. The frame's heap allocation is reachable via `frame_ptr_loaded` (already loaded earlier in `lower_k_pair_call` for Layer 3c's re-push); the slot is GC-rooted via the lifted lambda's closure record.
+
+The pre-fix gate `if synth.captures.is_empty() { ... } else { widened_result }` is removed — the unified path handles both.
+
+**Test added:** `handle_return_arm_with_outer_captures_in_k_pair_dispatch_path`. Caller takes `factor: Int`; return arm body is `fn (s) => v * factor + s` (captures factor). Asserts `f(7) = 28` for `caller(3)` (= `7*3 + 7`). Pre-fix this would have hit the bailout fallback and produced wrong output (or segfault depending on factor's type compatibility).
+
+### Test results
+
+- 133/136 e2e tests ✓ (3 pre-existing perf flakes unchanged)
+- 539 compiler unit + 73 runtime tests ✓
+- All Stage-6.8-followup tests green: state_example_canonical, run_state_canonical, handle_returning_k_capturing_lambda, handle_with_post_perform, handle_returning_fn_typed_value, handle_with_op_arm_discharge_skips_return_arm, handle_with_op_arm_discharge_skips_constant_return_arm, cps_effected_fn_typed_parameter_indirect_call, handle_with_eager_resume_arms_chains_let_yield, handle_return_arm_with_outer_captures.
+
 **Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
 
 

@@ -10531,15 +10531,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // POST_ARM_K_CLOSURE_OFF / POST_ARM_K_FN_OFF; drive sigil_run_loop;
         // get widened R-typed value.
         //
-        // **Captures restriction.** This path covers return arms with no
-        // outer captures (return_arm_fn invoked with closure_ptr = null).
-        // For return arms that capture outer-scope vars, the synth fn
-        // would need its closure record allocated and threaded through;
-        // that path is deferred and falls back to the pre-fix raw-arg
-        // semantics (likely segfault on canonical-shape programs that
-        // exercise it). The rs_b probe + canonical run_state's return
-        // arm `return(v) => fn (s: Int) -> Int ![] => v + s` has no outer
-        // captures so this fix unblocks the canonical shape.
+        // **Captures.** Stage-6.8-followup Layer 3d — return arms with
+        // outer captures are now handled. The handle expression's
+        // codegen path (`sigil_handler_frame_set_return`) writes the
+        // return-arm synth fn's closure_ptr into the handler frame's
+        // `return_closure` slot at frame offset
+        // `HANDLER_FRAME_RETURN_CLOSURE_OFF`. Layer 3c's frame_ptr_loaded
+        // (loaded above from the lifted lambda's trailing-triple) is
+        // a valid pointer to the heap-allocated handler frame; we read
+        // `return_closure` from it and pass that as the Call's
+        // closure_ptr. For return arms with empty outer captures the
+        // frame's `return_closure` is null (per
+        // `sigil_handler_frame_set_return`'s null-for-empty discipline);
+        // for non-empty captures it's the closure record pointer
+        // allocated at handle codegen time. Both cases unify here.
         // Stage-6.8-followup Layer 3 fix: gate the self-apply-return-
         // arm step on the trampoline's terminal tag. The k_fn captured
         // at the perform site may be:
@@ -10568,8 +10573,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let final_widened = if let Some(idx) =
             self.handler_return_arm_indices.get(&info.handle_span).copied()
         {
-            let synth = &self.handler_return_arm_synth[idx];
-            if synth.captures.is_empty() {
+            let _synth = &self.handler_return_arm_synth[idx];
+            {
                 // Query terminal tag and branch.
                 let tag_call = self
                     .builder
@@ -10616,11 +10621,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         )
                     });
                 let ret_fn_addr = self.builder.ins().func_addr(self.pointer_ty, ret_fn_ref);
-                let null_ret_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+                // Stage-6.8-followup Layer 3d — load the return arm's
+                // closure_ptr from the handler frame at offset
+                // HANDLER_FRAME_RETURN_CLOSURE_OFF. The handle
+                // expression's codegen wrote it via
+                // sigil_handler_frame_set_return; for return arms
+                // with empty outer captures it's null, for non-empty
+                // it's the closure record allocated at handle
+                // codegen time. Both cases unify through this load.
+                let ret_closure = self.builder.ins().load(
+                    self.pointer_ty,
+                    MemFlags::trusted(),
+                    frame_ptr_loaded,
+                    sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
+                );
                 let three_v = self.builder.ins().iconst(types::I32, 3);
                 let call_ns = self.builder.ins().call(
                     self.next_step_call_ref,
-                    &[null_ret_closure, ret_fn_addr, three_v],
+                    &[ret_closure, ret_fn_addr, three_v],
                 );
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call_ns));
@@ -10667,10 +10685,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.switch_to_block(merge_block);
                 self.builder.seal_block(merge_block);
                 self.builder.block_params(merge_block)[0]
-            } else {
-                // Return arm has outer captures — Layer 2 follow-up. Pass
-                // through the raw widened_result (pre-fix semantics).
-                widened_result
             }
         } else {
             // No return arm registered for this handle — pass through

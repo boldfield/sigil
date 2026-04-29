@@ -985,32 +985,42 @@ fn catch_example_recovers_with_42() {
     );
 }
 
-/// Plan B Task 59 — `examples/state.sigil` exercises both `State.get`
-/// and `State.set` ops through the dual-handle pattern (one `handle`
-/// per op).
+/// Plan B' Stage 6.8 (post-followup) — `examples/state.sigil` uses
+/// the canonical `run_state(initial, comp)` higher-order helper.
 ///
-/// **Why dual-handle, not literal `run_state`.** Plan B' Stage 6.8
-/// shipped B.3 (TypeExpr::Fn) and B.4 (arm-body lambdas + Phase B
-/// k-capture trailing-pair convention) — the lifts the literal
-/// `run_state(initial, comp)` shape needs. But Task 109's first
-/// CI cycle on the canonical CPS-style run_state revealed a runtime
-/// integration gap: `state_fn(initial)` returned a closure-record
-/// pointer rather than the threaded integer value. See
-/// `[DEVIATION Task 109] run_state canonical shape — runtime chain
-/// integration gap` for the gap analysis. Until the chain bug
-/// closes, state.sigil keeps the dual-handle Plan B v1 workaround.
+/// **What this exercises end-to-end.** The full stack of Stage 6.8 +
+/// Stage-6.8-followup architectural lifts:
+/// - Stage 6.8 B.3: TypeExpr::Fn parameters (`c: () -> Int ![State]`).
+/// - Stage 6.8 B.4: arm-body-as-lambda (`Trigger.fire(k) => fn (s) =>
+///   k(arg)(arg)`).
+/// - Stage-6.8-followup Bug 2: handle skips return arm on op-arm
+///   discharge (B ≠ R type-soundness).
+/// - Stage-6.8-followup Layer 2: lifted lambda's k(arg) self-applies
+///   originating handle's return arm.
+/// - Stage-6.8-followup Bug 1: recover discharged value across
+///   non-tail-perform body via LAST_TERMINAL_VALUE TLS.
+/// - Stage-6.8-followup Layer 3a: tag-conditional return-arm
+///   self-apply (skip on DISCHARGED, apply on DONE).
+/// - Stage-6.8-followup Layer 3b: Sync shims for Cps-ABI fns at
+///   fn-as-value materialization (`comp` passed as `c`).
+/// - Stage-6.8-followup Layer 3c: trailing-triple `(k_closure,
+///   k_fn, frame_ptr)` + handler frame re-push in lower_k_pair_call
+///   + DISCHARGED preservation through outer_post_arm_k routing +
+///   closure_convert k-index two-pass.
 ///
-/// Invariant: stdout = "6\n99\n", stderr = "", exit 0.
+/// **Trace.** See file header for the full algebraic trace.
+///
+/// Invariant: stdout = "11\n", stderr = "", exit 0.
 #[test]
-fn state_example_dual_handle_returns_6_then_99() {
+fn state_example_canonical_run_state_returns_11() {
     let root = workspace_root();
     let source = root.join("examples/state.sigil");
     let (stdout, stderr, code) = compile_file_and_run(&source, "state_example");
     assert_eq!(code, 0, "state exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "6\n99\n",
-        "state stdout mismatch (expected read=6 from get arm k(5)+1, \
-         then write=99 from set arm k(arg)=k(99)); stderr={stderr:?}"
+        stdout, "11\n",
+        "state stdout mismatch (expected `run_state(5, comp) = 11` for \
+         comp doing set(10); v=get(); v+1); stderr={stderr:?}"
     );
     assert_eq!(
         stderr, "",
@@ -4720,6 +4730,55 @@ fn handle_with_eager_resume_arms_chains_let_yield_correctly() {
         compile_and_run(src, "stage_6_8_followup_layer3b_eager_chain");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "6\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_return_arm_with_outer_captures_in_k_pair_dispatch_path() {
+    // Stage-6.8-followup Layer 3d — return arm body captures an
+    // outer-scope var (`factor` from caller's params). Pre-fix
+    // `lower_k_pair_call`'s self-apply path bailed to the raw
+    // widened_result fallback when `synth.captures.is_empty()` was
+    // false. Post-fix: load `return_closure` from the handler frame
+    // at HANDLER_FRAME_RETURN_CLOSURE_OFF (where
+    // `sigil_handler_frame_set_return` writes it at handle codegen
+    // time), pass as the Call's closure_ptr. Both empty-captures
+    // (closure = null) and non-empty-captures (closure = allocated
+    // record) cases unify through the frame load.
+    //
+    // f(7) trace:
+    //   - state_fn = caller(3). caller pushes Trigger frame; comp
+    //     performs Trigger.fire; arm body discharges with lambda
+    //     capturing k_pair + frame_ptr.
+    //   - state_fn = lambda. f(7) = k(7)(7).
+    //   - Inner k(7): re-push frame; run_loop with k_fn=identity
+    //     → Done(7). tag=DONE.
+    //   - Layer 3a apply: load ret_closure from frame's
+    //     return_closure slot (= heap-alloc'd record with factor=3
+    //     captured). Call(ret_closure, ret_fn_addr, [7, null,
+    //     identity]); run_loop. ret_fn allocates closure for
+    //     `(s) => v * factor + s` with v=7, factor=3 captured.
+    //   - Inner k(7) yields closure_for_v_eq_7_factor_eq_3.
+    //   - Outer call closure(7) = 7*3 + 7 = 28.
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 perform Trigger.fire()\n\
+               }\n\
+               fn caller(factor: Int) -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v * factor + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller(3);\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_layer3d_return_arm_captures");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "28\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]

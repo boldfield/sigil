@@ -1275,6 +1275,15 @@ pub unsafe extern "C" fn sigil_perform(
 #[no_mangle]
 pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
     let mut current = initial_step;
+    // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
+    // run_loop entry. On the DISCHARGED bypass terminal (introduced by
+    // Layer 3c to preserve algebraic-effects discharge semantics
+    // through outer chain routing), drain the stack back to this depth
+    // so entries pushed by synth-cont Middle steps during the bypassed
+    // chain don't leak across run_loop boundaries. The Bug-2-era
+    // routing path naturally pops one entry per terminal; the bypass
+    // skips that pop, hence the explicit drain.
+    let outer_post_arm_k_entry_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
     loop {
         counters::incr(CounterId::TrampolineDispatchCount);
 
@@ -1311,6 +1320,18 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                 if tag == NEXT_STEP_TAG_DISCHARGED {
                     LAST_TERMINAL_TAG.with(|c| c.set(tag));
                     LAST_TERMINAL_VALUE.with(|c| c.set(v));
+                    // Drain outer_post_arm_k stack back to entry-time
+                    // depth. Entries pushed by synth-cont Middle steps
+                    // during this run_loop's chain stay leaked across
+                    // run_loop boundaries otherwise. Subsequent
+                    // run_loop calls would consume them via the DONE-
+                    // path routing, which happens to be benign for
+                    // the canonical (entries from `lower_k_pair_call`
+                    // are always `(null, identity)`, so routing is
+                    // identity-passthrough), but architecturally
+                    // questionable for adversarial nesting and a
+                    // capacity-overflow risk for deep chains.
+                    OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
                     crate::arena::sigil_arena_reset();
                     return v;
                 }
