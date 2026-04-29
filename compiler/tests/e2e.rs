@@ -4567,15 +4567,16 @@ fn nested_handle_with_inner_lambda_in_arm_body_compiles() {
 /// Phase A's walker accepts; closure-convert hoists the lambda;
 /// codegen lowers the IIFE call as a direct dispatch.
 ///
-/// `Raise.fail` is one-shot; the arm discards `k` (failure means
-/// no resume), returning 43 (= (n+1)(42)).
+/// `Raise.fail` is one-shot; the arm discards `k`. Sigil v1's
+/// implicit-resume semantics (per `examples/div_recover.sigil`):
+/// the arm body's value becomes `perform`'s result inside the body
+/// expression. So `perform Raise.fail()` resolves to 43, and the
+/// body assignment binds `n = 43`.
 #[test]
 fn arm_body_iife_returns_43() {
     let src = "effect Raise { fail: () -> Int }\n\
                fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle\n    \
-                   (perform Raise.fail()) + 100\n  \
-                 with {\n    \
+                 let n: Int = handle perform Raise.fail() with {\n    \
                    Raise.fail(k) => (fn (n: Int) -> Int ![] => n + 1)(42),\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
@@ -4585,8 +4586,9 @@ fn arm_body_iife_returns_43() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "43\n",
-        "B.4 Phase A: arm body IIFE — Raise.fail discards k, runs \
-         `(fn (n) => n+1)(42)` = 43. stderr={stderr:?}"
+        "B.4 Phase A: arm body IIFE — Raise.fail's arm runs \
+         `(fn (n) => n+1)(42)` = 43, which becomes perform's result. \
+         stderr={stderr:?}"
     );
 }
 
@@ -4599,16 +4601,23 @@ fn arm_body_iife_returns_43() {
 /// rejection so Phase B inverts a known-state diff.
 #[test]
 fn arm_body_lambda_capturing_k_is_rejected_until_phase_b() {
-    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
-               fn run() -> Int ![IO] {\n  \
-                 let r: (Bool) -> Int ![] = handle\n    \
-                   fn (b: Bool) -> Int ![] => 0\n  \
-                 with {\n    \
-                   Choose.flip(k) => fn (b: Bool) -> Int ![] => k(true),\n  \
+    // `resumes: many` admits discard-k (0 k-calls in arm body); the
+    // lambda's syntactic `k(x)` doesn't have to fire at runtime. The
+    // arm body's let-bound lambda captures k; closure-convert lifts
+    // it; the resulting `Expr::ClosureRecord` has `env_exprs:
+    // [Ident("k")]`. Phase A's walker matches and rejects with
+    // "captures continuation".
+    let src = "effect Choose resumes: many { flip: () -> Int }\n\
+               fn run() -> Int ![] {\n  \
+                 let _: Int = handle 0 with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let _: (Int) -> Int ![] = fn (x: Int) -> Int ![] => k(x);\n      \
+                     99\n    \
+                   },\n  \
                  };\n  \
-                 r(true)\n\
+                 0\n\
                }\n\
-               fn main() -> Int ![IO] {\n  \
+               fn main() -> Int ![] {\n  \
                  let _: Int = run();\n  \
                  0\n\
                }\n";

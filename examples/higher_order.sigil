@@ -12,16 +12,19 @@
 //   - GC-heap closure allocation + closure-calling-convention ABI
 //     via direct-IIFE dispatch (Task 32).
 //
-// Scope note (Plan A2): `TypeExpr::Fn` is deferred to Plan A3, so a
-// lambda cannot be let-bound, declared as a user fn parameter, or
-// returned from a top-level fn. The "list of ints" the plan's Task 33
-// wording asks for is therefore implicit in a recursive user fn's
-// walk over `n..=0` rather than an explicit list-of-ints value —
-// Plan A2 has no tuples, no arrays, no sum types. The plan text's
-// "simulate a list via nested tuples" aside is aspirational; user
-// tuples require sum-type machinery from Plan A3. This recursive
-// walk is the closest Plan A2 can get to "apply a lambda to a fixed
-// list of ints" while staying inside the shipped language.
+// Scope note (Plan B' Stage 6.8 update): the original Plan A2 framing
+// noted that `TypeExpr::Fn` was deferred and lambdas couldn't be
+// let-bound, declared as fn parameters, or returned from top-level
+// fns. Plan B' Stage 6.8 (B.3 Phase A through Phase C+ Part 2) lifts
+// those restrictions: `TypeExpr::Fn` is shipped surface syntax, and
+// lambdas / fn-typed values flow through let-bindings, fn parameters,
+// and fn returns. See e2e tests `fn_as_value_via_let_binding_returns_42`,
+// `higher_order_fn_param_returns_42`, `make_adder_returns_12`, and
+// `closure_env_load_callee_returns_42` for the canonical patterns.
+//
+// This example keeps the recursive-walk shape because it predates the
+// B.3 lift; rewriting it to use let-bound fn-typed accumulators is a
+// future-housekeeping ergonomics change, not a correctness one.
 //
 // Invariant: running this program exits with status 130.
 //   weighted_sum(100, 3, 5)

@@ -244,3 +244,23 @@ This makes compose work end-to-end with Phase C v1 + Phase C+ surfaces.
 **Closure path:** Plan C's stdlib + builtin-as-fn-value work closes Blocker 2; Task 109 closes Blocker 1 (rewrite source) and inverts the rejection test once the rewritten source compiles cleanly via the Phase C+ surfaces.
 
 **Implementing commit(s):** R4 fixup commit (this commit) documents the analysis; Task 109 will rewrite the source to use the per-arrow-correct + user-wrapper-`its` shape and invert the rejection test.
+
+## 2026-04-29 — [DEVIATION Task 107 Phase B] k-capture inside arm-body lambdas (canonical run_state) deferred
+
+**Context:** Plan B' Stage 6.8 Task 107 Phase A landed the arm-body-lambda lift for shapes that don't capture the arm's continuation `k`. The canonical `run_state` shape from Task 108 — and Choose-style "k as a lambda" patterns — capture and call `k` from inside a lambda body, which Phase A explicitly rejects with E0xxx-style "captures continuation `k`" diagnostic.
+
+**The runtime-ABI mismatch.** Inside an arm body, `k(arg)` lowers via a special-case path to `sigil_next_step_call(k_closure, k_fn, arg)`. Both pieces are needed: `k_closure` carries the suspended computation's state; `k_fn` is the address of the post-arm-k synth fn (`cps_signature`: `(closure_ptr, args_ptr, args_len) -> *mut NextStep`). At typecheck level `k` has type `Ty::Fn(Int -> Int)` — regular closure-convention. **Inside a hoisted lambda, the captured value is just `k_closure`** (per closure_convert's `Ident("k")` rewrite); calling it via standard indirect-call dispatch would load `k_closure[8]` (which is null per `alloc_arm_closure_record:9998-10001`'s convention) and crash, AND the calling convention is wrong (closure-convention vs cps_signature).
+
+**Two routes to Phase B:**
+
+1. **Patch k_fn into k_closure's code_ptr at arm prologue + install a closure-convention trampoline.** At arm fn entry, after extracting k_closure and k_fn from args_ptr, write a synth trampoline fn's address into k_closure[8] (NOT k_fn directly — k_fn has cps_signature, not closure-convention). The trampoline takes `(closure_ptr, arg)`, packages `arg` into a stack slot, and tail-calls `sigil_next_step_call(closure_ptr, embedded_k_fn, arg)`. Pro: minimal closure-convert change. Con: each k-typed continuation needs a fresh trampoline per concrete signature; the trampoline must match `Ty::Fn`'s declared shape.
+
+2. **Split k into k_closure + k_fn slots in the lifted lambda's closure record.** closure_convert recognizes arm-body lambdas capturing the enclosing arm's k_name; emits TWO `env_exprs` (one for k_closure, one for k_fn) instead of one. The lambda's body lowering detects ClosureEnvLoad-of-the-k-name and dispatches via `sigil_next_step_call` with both loaded values. Pro: parallels the existing arm-body `k(arg)` lowering. Con: closure_convert needs to thread enclosing-arm context (the k_name) through the lambda lift; the lifted synth fn's body emit needs a side-table flagging which env slot is the k-pair.
+
+**Why Phase B deferred for autonomous overnight work:** both routes require non-trivial closure-convert + codegen surface beyond Phase A's "drop the rejection" scope. Each route is roughly a Phase C+ Part 2-sized change. Per the autonomous-overnight constraint, the deferral keeps Stage 6.8 review-ready: Phase A ships the IIFE/non-k-capturing surface (Task 108 example #2 covered); Phase B + Task 108 examples #1 (Choose `k(true)` / `k(false)`) and #3 (`run_state` `k(s)(s)`) defer to the next session.
+
+**Failure mode:** programs using arm-body lambdas that capture `k` fail compilation with E0xxx-style "captures continuation `k`" diagnostic. The `arm_body_lambda_capturing_k_is_rejected_until_phase_b` e2e test pins this rejection so Phase B inverts a known-state diff.
+
+**Closure path:** Phase B follow-up commit closes both routes' design questions and ships one of them. Plan B' Stage 6.8 review checkpoint should surface the route decision before Phase B's implementation begins.
+
+**Implementing commit(s):** Task 107 Phase A (`703c011`) ships the arm-body-lambda lift for non-k-capturing shapes; Phase B + Task 108 examples #1 and #3 + Task 109's full state.sigil run_state rewrite all defer to a future commit pending the route decision.
