@@ -1,0 +1,41 @@
+// sigil: 0.1
+//
+// std/result.sigil — Plan C Task 63.
+//
+// `Result[A, E]` represents either a successful value (`Ok(value)`)
+// or an error (`Err(reason)`). Sigil's nominal sum types make the
+// distinction explicit; there is no exception machinery.
+//
+// Helpers `map`, `map_err`, and `and_then` are pure — they declare
+// closed effect rows `![]`. The `Ok` and `Err` arms have separate
+// transformations: `map` rewrites only the `Ok` payload, `map_err`
+// rewrites only the `Err` payload, and `and_then` chains a fallible
+// continuation through `Ok`. Row-polymorphic Result helpers may
+// ship in v2.
+
+type Result[A, E] = | Ok(A) | Err(E)
+
+// `map(r, f)` transforms the `Ok` payload; `Err` passes through.
+fn map[A, B, E](r: Result[A, E], f: (A) -> B ![]) -> Result[B, E] ![] {
+  match r {
+    Ok(x) => Ok(f(x)),
+    Err(e) => Err(e),
+  }
+}
+
+// `map_err(r, f)` transforms the `Err` payload; `Ok` passes through.
+fn map_err[A, E, F](r: Result[A, E], f: (E) -> F ![]) -> Result[A, F] ![] {
+  match r {
+    Ok(x) => Ok(x),
+    Err(e) => Err(f(e)),
+  }
+}
+
+// `and_then(r, f)` chains a Result-producing transformation. Both
+// inputs and the chained output share the error type `E`.
+fn and_then[A, B, E](r: Result[A, E], f: (A) -> Result[B, E] ![]) -> Result[B, E] ![] {
+  match r {
+    Ok(x) => f(x),
+    Err(e) => Err(e),
+  }
+}

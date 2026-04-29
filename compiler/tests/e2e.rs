@@ -6052,3 +6052,135 @@ fn std_option_and_then_inner_none_short_circuits() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "99\n", "stderr={stderr:?}");
 }
+
+// ===== Plan C Task 63 — std/result run-and-check-output =====
+//
+// Result has two type parameters; each match arm constructor only
+// fixes one (`Ok(_)` → A; `Err(_)` → E). The cross-arm unification
+// in `check_match` exposed a subtle typecheck bug where the bind
+// direction in `bind_ty_var` could pin an outer-fn type-var to a
+// fresh ctor-instance var, making it look unconstrained at the
+// pending E0132 sweep. The fix: prefer to bind the higher-id var
+// to the lower-id one (lower-id is outer-canonical within a
+// single fn body). See typecheck.rs's `bind_ty_var` Plan C Task 63
+// note for the full reasoning. These e2e tests pin the user-
+// observable correctness — the typecheck-level test
+// `import_std_result_typechecks_cleanly` (in typecheck.rs) is the
+// targeted-pin for the bind-direction fix.
+
+/// `match Ok` arm in user code returns `Ok` payload via `unwrap_or`-
+/// style handling. Pinned exit value 42.
+#[test]
+fn std_result_ok_payload_round_trips() {
+    let src = "import std.result\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = Ok(42);\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_ok_payload");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `map(Ok(x), f)` rewrites the Ok payload; Err passes through untouched.
+#[test]
+fn std_result_map_ok_applies_fn() {
+    let src = "import std.result\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let mapped: Result[Int, String] = map(Ok(21), double);\n  \
+                 match mapped {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_map_ok");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `map(Err, f)` leaves Err untouched; the fn is never invoked.
+#[test]
+fn std_result_map_err_passes_through() {
+    let src = "import std.result\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let err_val: Result[Int, String] = Err(\"boom\");\n  \
+                 let mapped: Result[Int, String] = map(err_val, double);\n  \
+                 match mapped {\n    \
+                   Ok(_) => perform IO.println(\"ok\"),\n    \
+                   Err(e) => perform IO.println(e),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_map_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "boom\n", "stderr={stderr:?}");
+}
+
+/// `map_err(Err(e), f)` rewrites the Err payload; Ok passes through.
+#[test]
+fn std_result_map_err_applies_fn() {
+    let src = "import std.result\n\
+               fn err_to_label(_e: String) -> String ![] { \"transformed\" }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let err_val: Result[Int, String] = Err(\"oops\");\n  \
+                 let mapped: Result[Int, String] = map_err(err_val, err_to_label);\n  \
+                 match mapped {\n    \
+                   Ok(_) => perform IO.println(\"ok\"),\n    \
+                   Err(e) => perform IO.println(e),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_map_err_applies");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "transformed\n", "stderr={stderr:?}");
+}
+
+/// `and_then(Ok(x), f)` chains a Result-producing transformation when
+/// the input is `Ok`. The chained output's error type matches the
+/// helper's signature.
+#[test]
+fn std_result_and_then_ok_chains_through() {
+    let src = "import std.result\n\
+               fn safe_pos(n: Int) -> Result[Int, String] ![] {\n  \
+                 match n { 0 => Err(\"zero\"), _ => Ok(n * 3) }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let chained: Result[Int, String] = and_then(Ok(5), safe_pos);\n  \
+                 match chained {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_and_then_ok");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "15\n", "stderr={stderr:?}");
+}
+
+/// `and_then(Ok(0), safe_pos)` short-circuits to Err because the
+/// chained helper returns `Err(\"zero\")`.
+#[test]
+fn std_result_and_then_inner_err_short_circuits() {
+    let src = "import std.result\n\
+               fn safe_pos(n: Int) -> Result[Int, String] ![] {\n  \
+                 match n { 0 => Err(\"zero\"), _ => Ok(n * 3) }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let chained: Result[Int, String] = and_then(Ok(0), safe_pos);\n  \
+                 match chained {\n    \
+                   Ok(_) => perform IO.println(\"ok\"),\n    \
+                   Err(e) => perform IO.println(e),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_and_then_inner_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "zero\n", "stderr={stderr:?}");
+}

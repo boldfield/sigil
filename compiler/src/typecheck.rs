@@ -1424,6 +1424,44 @@ impl Tc {
             if *other == id {
                 return true;
             }
+            // Plan C Task 63 — when binding two unbound type-vars,
+            // prefer to point the higher-id var at the lower-id one.
+            // Outer-fn type vars (collected into `outer_fn_var_ids`
+            // from each fn's `Scheme.type_vars`) are allocated by
+            // `check_fn`'s `fresh_generic_subst` BEFORE any body
+            // fresh vars within that fn (line 2206), so within a
+            // single fn body lower-id is the outer-canonical
+            // representative. Cross-arm unify in `check_match`
+            // unifies one arm's free fresh-var (e.g. `Result[A,
+            // ?fE]`'s ?fE from `Ok(x)`) with the other arm's
+            // outer-bound fresh var (`Result[?fA, E]`'s already-
+            // bound ?fA from `Err(e)`). Without this preference,
+            // the bind direction is OUTER → FRESH (`subst[outer] =
+            // Var(fresh)`), and the pending_ctor `apply_ty` walk
+            // returns the still-unbound fresh var, firing E0132
+            // even though the program is well-typed under HM.
+            // Two-param sum types (Result[A, E]) where each ctor
+            // arm only fixes one of the two params are the
+            // canonical reproducer; List[A] with a single param
+            // never tripped this because the unbound arm-var
+            // never had a competing already-bound counterpart at
+            // cross-arm time.
+            let canonical = (*other).min(id);
+            let other_id = (*other).max(id);
+            if canonical != other_id {
+                if self.occurs_in_ty(other_id, &Ty::Var(canonical)) {
+                    self.push_error(
+                        "E0126",
+                        span.clone(),
+                        format!(
+                            "occurs check failed: cannot construct an infinite type `?{other_id} = ?{canonical}`"
+                        ),
+                    );
+                    return false;
+                }
+                self.subst.tys.insert(other_id, Ty::Var(canonical));
+            }
+            return true;
         }
         if self.occurs_in_ty(id, &resolved) {
             self.push_error(
@@ -8661,5 +8699,79 @@ mod tests {
             !errs.is_empty(),
             "expected the program to fail without `import std.option`; got clean errs"
         );
+    }
+
+    // ===== Plan C Task 63 — std/result typecheck-level coverage =====
+
+    #[test]
+    fn two_param_sum_type_match_each_arm_constrains_one_param_typechecks() {
+        // Plan C Task 63 regression-pin for the `bind_ty_var` order
+        // fix. Before the fix, this program tripped E0132 because
+        // `Ok(x)` constrained only A and `Err(e)` constrained only
+        // E; cross-arm unify bound the outer-fn vars to the
+        // ctor-instance fresh vars, leaving them unconstrained at
+        // the pending E0132 sweep. List[A] never tripped this
+        // because there's only one type-param so an unbound arm-
+        // var has no competing already-bound counterpart. This
+        // test is a free-standing pin; the user-observable surface
+        // ships in `std/result.sigil` and `tests/std_result_*`.
+        let src = "type Result[A, E] = | Ok(A) | Err(E)\n\
+                   fn id[A, E](r: Result[A, E]) -> Result[A, E] ![] {\n  \
+                     match r {\n    \
+                       Ok(x) => Ok(x),\n    \
+                       Err(e) => Err(e),\n  \
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "two-param sum match should typecheck cleanly under bind_ty_var fix; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn import_std_result_typechecks_cleanly() {
+        let src = "import std.result\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let r: Result[Int, String] = Ok(42);\n  \
+                     match r {\n    \
+                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                       Err(_) => perform IO.println(\"err\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_result_map_map_err_and_then_typecheck_cleanly() {
+        let src = "import std.result\n\
+                   fn double(n: Int) -> Int ![] { n + n }\n\
+                   fn err_to_default(_e: String) -> Int ![] { 0 }\n\
+                   fn safe_pos(n: Int) -> Result[Int, String] ![] {\n  \
+                     match n { 0 => Err(\"zero\"), _ => Ok(n * 3) }\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let a: Result[Int, String] = map(Ok(21), double);\n  \
+                     let b: Result[Int, Int] = map_err(Err(\"oops\"), err_to_default);\n  \
+                     let c: Result[Int, String] = and_then(Ok(5), safe_pos);\n  \
+                     match a {\n    \
+                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                       Err(_) => perform IO.println(\"err\"),\n  \
+                     };\n  \
+                     match b {\n    \
+                       Ok(_) => perform IO.println(\"ok\"),\n    \
+                       Err(n) => perform IO.println(int_to_string(n)),\n  \
+                     };\n  \
+                     match c {\n    \
+                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                       Err(_) => perform IO.println(\"err\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 }
