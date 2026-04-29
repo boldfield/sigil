@@ -61,7 +61,15 @@
 //
 // Invariant: stdout = "6\n", exit 0.
 
-effect State { get: () -> Int, set: (Int) -> Int }
+// `resumes: many` opt-in: the one-shot continuation detector
+// (E0220) is conservative about `k` references inside lambda
+// bodies — even when the lambda is invoked at most once per
+// perform, the detector cannot prove single-use without a
+// reachability analysis, so it rejects. The CPS encoding here
+// invokes k exactly once per arm fire (`k(s)` once, applied
+// once); the `resumes: many` declaration opts past the
+// conservative reject, not into actual multi-shot behaviour.
+effect State resumes: many { get: () -> Int, set: (Int) -> Int }
 
 fn comp() -> Int ![State] {
   let _: Int = perform State.set(5);
