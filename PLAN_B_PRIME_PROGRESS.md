@@ -21,11 +21,13 @@ Goal: close B.1 + B.2. Generalize the 2-step Slice C chain (arm-side) and the 1-
   - commits: [HEAD]
   - notes: Adds `CpsContinuationKind::ChainedLetBindThenTail { steps, performs, tail_expr, tail_ty, captures }` variant + `ChainedLetBindStep { binding_name, binding_ty }` struct, both `#[allow(dead_code)]` while Phase B/C wire up the pre-pass + emit code. Adds `is_simple_chained_let_yield_then_pure_tail_body(body) -> Option<usize>` classifier returning the chain length on match (None on reject). Accepts N >= 1 (the existing 1-stmt case generalises into the chained variant; Phase D will retire `LetBindThenTail`). 9 unit tests cover the accept/reject matrix: single let-yield + pure tail (N=1); two/three let-yields + pure tail (N=2/3); empty body (rejected); non-let stmt in chain (rejected); let with non-perform value (rejected); impure perform args (rejected); impure tail (rejected); missing tail (rejected). Match on `CpsContinuationKind` in synth-cont definition pass extended with an `unreachable!()` guard for the new variant; until Phase B activates the pre-pass, no `CpsContinuationSynth` entry should carry this kind. Pod-verify clean.
 - Task 94 — B.2 Phase B: pre-pass FuncId allocation for N synth-cont chain.
-  - status: todo
-  - commits: []
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: bundled with Task 95 in the activation commit per the lockstep recommendation (a separate Phase B-only commit would land a bridge state where ChainedLetBindStep entries exist but emit pass still hits unreachable!()). Pre-pass now uses `is_simple_chained_let_yield_then_pure_tail_body` and allocates N synth-cont FuncIds (one per chain step) declared in two passes: declare all N FuncIds first, then build N `CpsContinuationSynth` entries with cross-references populated (Middle::next_step_func_id). `cps_continuation_synth_indices` map points at step_0's index; helper body emit reads step_0's captures.
 - Task 95 — B.2 Phase C: helper body emit (first perform's k_fn = synth_cont_step_0) + chain step emit (middle steps perform next; final step runs tail).
-  - status: todo
-  - commits: []
+  - status: done-pending-ci
+  - commits: [HEAD]
+  - notes: bundled with Task 94 (see Task 94 notes for the lockstep rationale). Helper body emit's captures-lookup match extends from `LetBindThenTail` to `ChainedLetBindStep`. Synth-cont definition pass replaces the Phase A `unreachable!()` with full Middle/Final emit. Middle step: bind args_ptr[0]; load captures + prior_bindings from synth-cont's closure_ptr; allocate next-step closure record (header + null code_ptr + captures + prior_bindings + this binding); copy captures + prior_bindings forward via raw I64 loads/stores; lower next perform's args via Lowerer; sigil_perform with k_fn=next_step_addr, k_closure=next_closure_record; return the perform's NextStep. Final step: same as `LetBindThenTail` (lower tail, dispatch via post_arm_k). The original 1-stmt path is structurally subsumed: the chained classifier accepts N=1 (returning Some(1)), so 1-stmt cases route through ChainedLetBindStep with chain_length=1 + Final role. `LetBindThenTail` variant + emit pass + `is_simple_let_yield_then_pure_tail_body` + `collect_synth_cont_captures` are now structurally dead in production; marked `#[allow(dead_code)]` transitionally so unit tests still compile. Phase D (follow-up commit) removes them. Pod-verify clean.
 - Task 96 — B.2 acceptance e2e tests (2/3/5-perform helper bodies; helper with forward data dependency).
   - status: todo
   - commits: []
