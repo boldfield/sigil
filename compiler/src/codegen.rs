@@ -1727,6 +1727,136 @@ struct MultiLetPostArmKChain {
     tail_expr: crate::ast::Expr,
 }
 
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — N-step post-arm-k chain
+/// generalising [`MultiLetPostArmKChain`]'s 2-let cap to arbitrary
+/// `N >= 2`. Replaces the 9 hardcoded fields of the legacy struct
+/// with a `Vec<PostArmKStep>` of N entries, one per post-arm-k synth
+/// fn.
+///
+/// **Arm body shape:** `{ let r_1 = k(arg_1); let r_2 = k(arg_2); ...
+/// let r_N = k(arg_N); tail }`. Each let-binding is bound from the
+/// helper synth-cont's `Done(...)` result returned through the
+/// trailing-pair convention; subsequent `k(arg_{i+1})` invocations
+/// use the same `(k_closure, k_fn)` (the helper synth-cont) — multi-
+/// shot reuses the heap-allocated closure record.
+///
+/// **Layout** (per-step closure records):
+/// - **Step 0** (post_arm_k_1): closure built by the arm fn body
+///   emit, holds `(k_closure, k_fn)` at slots 0/1 (offsets +16/+24).
+///   `prior_bindings` is empty.
+/// - **Step i** for `i in 1..N-1` (Middle role): closure built by
+///   the prior step (post_arm_k_i). For Middle steps, the closure
+///   carries `(k_closure, k_fn) + r_1..r_i` (so the next step can
+///   dispatch to k again with prior bindings in scope for arg
+///   lowering). `prior_bindings` has `i` entries.
+/// - **Step N-1** (post_arm_k_N, Final role): closure built by step
+///   N-2 (or by arm fn body emit for N=2). Final's closure carries
+///   only `r_1..r_{N-1}` (no k pair — Final returns `Done`, no
+///   further k dispatch). `prior_bindings` has `N-1` entries.
+///
+/// **Why Middle and Final layouts diverge:** Middle needs `(k_closure,
+/// k_fn)` to dispatch the next k call. Final returns `Done(tail)`
+/// directly — no dispatch, no need for k pair. Asymmetric layout
+/// saves 16 bytes per Final closure record (relative to a uniform
+/// shape carrying k pair always); the reviewer-flagged quadratic
+/// forward-copy cost (B.2's deviation entry) is partially offset by
+/// the smaller Final record.
+///
+/// **Phase A scope (Task 97):** added alongside the legacy struct +
+/// classifier; nothing yet consumes it. Phase B (Task 98) switches
+/// the pre-pass + emit pass to this shape and retires the legacy
+/// 9-field struct. The classifier accepts N=2 (subsuming the legacy
+/// case) so post-Phase-B path generalises uniformly.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct PostArmKChain {
+    /// The `arg_1` expression in the first `let r_1 = k(arg_1)`.
+    /// Lowered inside the arm-fn body emit (not inside any synth fn).
+    /// Must satisfy `expr_is_pure`.
+    first_arg_expr: crate::ast::Expr,
+    /// One entry per post-arm-k synth fn (N entries for an N-let
+    /// arm body). `steps[0]` is post_arm_k_1 (binds r_1, dispatches
+    /// k(arg_2) or runs tail if N=1 — though Slice B handles N=1
+    /// separately so the N>=2 path here always has steps.len() >=
+    /// 2). `steps[N-1]` is post_arm_k_N (binds r_N, runs tail).
+    steps: Vec<PostArmKStep>,
+}
+
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — one post-arm-k synth fn
+/// step in a [`PostArmKChain`].
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct PostArmKStep {
+    /// `post_arm_k_{i+1}` synth fn `FuncId`. Allocated at the pre-pass.
+    /// Linker symbol: `sigil_handler_post_arm_k_{i+1}_<arm_fn_idx>`.
+    func_id: cranelift_module::FuncId,
+    /// Source-level binding name for the let-stmt this step's
+    /// `args_ptr[0]` holds (e.g., "r_2" for step index 1).
+    binding_name: String,
+    /// Cranelift type the synth fn narrows `args_ptr[0]` to at fn
+    /// entry. Derived from the corresponding `LetStmt::ty`.
+    binding_ty: Type,
+    /// `EnvSlotKind` for `binding_name`'s slot. Drives bitmap
+    /// derivation when this binding is appended to the next step's
+    /// closure record (Middle steps) or otherwise threaded forward.
+    binding_kind: crate::ast::EnvSlotKind,
+    /// Prior chain bindings carried in this step's closure record at
+    /// slots after `(k_closure, k_fn)` for Middle, or starting at
+    /// slot 0 for Final. step 0 has empty prior_bindings; step `i`
+    /// has `[r_1..r_i]`.
+    prior_bindings: Vec<PostArmKPriorBinding>,
+    /// What this step does after binding `args_ptr[0]` and loading
+    /// closure state. `Middle` dispatches `k(next_arg_expr)` to the
+    /// next step; `Final` lowers the tail and returns `Done`.
+    role: PostArmKStepRole,
+}
+
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — what a [`PostArmKStep`]
+/// does after binding its arg.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+enum PostArmKStepRole {
+    /// Middle step: lower `next_arg_expr` (env has prior bindings
+    /// alongside this step's binding), allocate the next step's
+    /// closure record (Middle-targeted records carry `k_closure`,
+    /// `k_fn`, and prior_bindings plus this step's binding; Final-
+    /// targeted records carry only prior_bindings plus this step's
+    /// binding), emit a Call to the next step (`Call(k_closure,
+    /// k_fn, [next_arg, next_step_closure_ptr, next_step_func_addr])`),
+    /// return the resulting NextStep.
+    Middle {
+        /// The arg expression for the NEXT k call (lowered inside
+        /// THIS step's body).
+        next_arg_expr: crate::ast::Expr,
+        /// FuncId of the next step's synth fn — used as the post-
+        /// arm-k fn pointer in this step's Call dispatch.
+        next_step_func_id: cranelift_module::FuncId,
+    },
+    /// Final step: lower `tail_expr` (env has all chain bindings),
+    /// widen result to I64, return `Done(value)`.
+    Final {
+        /// The pure tail expression that this step lowers. May
+        /// reference any `binding_name` from `prior_bindings` or
+        /// the step's own `binding_name`, plus globals.
+        tail_expr: crate::ast::Expr,
+    },
+}
+
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — one prior chain binding
+/// threaded forward via a [`PostArmKStep`]'s closure record.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct PostArmKPriorBinding {
+    /// Source-level name (matches the corresponding step's
+    /// `binding_name` from a prior step).
+    name: String,
+    /// Cranelift type the binding narrows to after I64 load.
+    ty: Type,
+    /// `EnvSlotKind` for the closure-record encoding (drives the
+    /// pointer-bitmap bit + load/store widening).
+    kind: crate::ast::EnvSlotKind,
+}
+
 /// Plan B Task 55, Phase 4e captures+ Slice B — synthetic post-arm-k
 /// continuation for an arm body of shape `{ let r: Ty = k(arg);
 /// pure_tail }`. Built by the pre-pass when
@@ -3083,6 +3213,96 @@ struct ArmBodyMultiLetThenPureTailMatch<'a> {
     binding_name_2: &'a str,
     binding_te_2: &'a crate::ast::TypeExpr,
     arg2_expr: &'a crate::ast::Expr,
+    tail_expr: &'a crate::ast::Expr,
+}
+
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — does this arm body
+/// match the **N-step multi-let-then-pure-tail** shape that the
+/// generalised post-arm-k chain supports?
+///
+/// A body matches iff:
+///
+/// 1. It's an `Expr::Block`.
+/// 2. Its statement list has `N >= 2` stmts.
+/// 3. Each stmt is a `Stmt::Let` whose value is `k_name(arg)` (a
+///    `Call` to the captured continuation with exactly one arg).
+/// 4. The block has a tail expression.
+///
+/// Returns `Some(match struct)` with N entries on accept; `None`
+/// on reject.
+///
+/// This generalises [`arm_body_multi_let_then_pure_tail_shape`]'s
+/// 2-let cap to arbitrary N. The `N=2` case is subsumed (every body
+/// the legacy classifier accepts is also accepted here, returning a
+/// match with 2 entries).
+///
+/// **Phase A scope (Task 97):** the classifier is added alongside
+/// the legacy 2-let classifier; nothing yet consumes it. Phase B
+/// (Task 98) switches the codegen-entry walker + pre-pass + emit to
+/// this classifier and retires the legacy.
+///
+/// Returned references all borrow from `body`'s sub-tree.
+#[allow(dead_code)]
+fn arm_body_n_let_then_pure_tail_shape<'a>(
+    body: &'a crate::ast::Expr,
+    k_name: &str,
+) -> Option<ArmBodyNLetThenPureTailMatch<'a>> {
+    use crate::ast::{Expr, Stmt};
+    let block = match body {
+        Expr::Block(b) => b,
+        _ => return None,
+    };
+    if block.stmts.len() < 2 {
+        return None;
+    }
+    let extract_k_call = |value: &'a Expr| -> Option<&'a Expr> {
+        if let Expr::Call { callee, args, .. } = value {
+            if let Expr::Ident(n, _) = callee.as_ref() {
+                if n == k_name && args.len() == 1 {
+                    return Some(&args[0]);
+                }
+            }
+        }
+        None
+    };
+    let mut binding_names: Vec<&'a str> = Vec::with_capacity(block.stmts.len());
+    let mut binding_tes: Vec<&'a crate::ast::TypeExpr> = Vec::with_capacity(block.stmts.len());
+    let mut arg_exprs: Vec<&'a crate::ast::Expr> = Vec::with_capacity(block.stmts.len());
+    for stmt in &block.stmts {
+        let let_stmt = match stmt {
+            Stmt::Let(l) => l,
+            _ => return None,
+        };
+        let arg = extract_k_call(&let_stmt.value)?;
+        binding_names.push(&let_stmt.name);
+        binding_tes.push(&let_stmt.ty);
+        arg_exprs.push(arg);
+    }
+    let tail = block.tail.as_ref()?;
+    Some(ArmBodyNLetThenPureTailMatch {
+        binding_names,
+        binding_tes,
+        arg_exprs,
+        tail_expr: tail,
+    })
+}
+
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — borrowed view of a
+/// matched [`arm_body_n_let_then_pure_tail_shape`] result.
+#[allow(dead_code)]
+struct ArmBodyNLetThenPureTailMatch<'a> {
+    /// Source-level binding names, in source order. `binding_names
+    /// .len()` equals the chain length N (== `arg_exprs.len()` ==
+    /// `binding_tes.len()`).
+    binding_names: Vec<&'a str>,
+    /// Declared types, in source order.
+    binding_tes: Vec<&'a crate::ast::TypeExpr>,
+    /// Per-let `k(arg)` arguments, in source order. Each is the
+    /// single-arg expression of the let's `Call` value.
+    arg_exprs: Vec<&'a crate::ast::Expr>,
+    /// The block's tail expression. Pure per Slice C's invariant
+    /// (the codegen-entry walker enforces purity + free-var
+    /// restrictions; the classifier here is shape-only).
     tail_expr: &'a crate::ast::Expr,
 }
 
@@ -12668,6 +12888,196 @@ mod tests {
         // Detector with k_name = "k": 2nd let invokes "j", not "k", reject.
         assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
     }
+
+    // -----------------------------------------------------------------
+    // Plan B' Stage 6.7 Task 97 (B.1 Phase A) — N-let arm-body
+    // classifier `arm_body_n_let_then_pure_tail_shape` accepts
+    // arbitrary N >= 2 (subsuming the legacy 2-let classifier's
+    // accept set + extending to N=3, N=5, etc.). Phase B (Task 98)
+    // wires the new classifier into the pre-pass + emit; until
+    // then the unit tests below pin the new classifier's behaviour
+    // in isolation.
+    // -----------------------------------------------------------------
+
+    fn slice_c_block_n_lets_with_k_calls(n: usize, span: &crate::errors::Span) -> crate::ast::Expr {
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        let make_let = |i: usize| -> Stmt {
+            Stmt::Let(LetStmt {
+                name: format!("r{i}"),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::IntLit(i as i64, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let stmts: Vec<Stmt> = (1..=n).map(make_let).collect();
+        Expr::Block(Box::new(Block {
+            stmts,
+            tail: Some(Expr::Ident("r1".to_string(), span.clone())),
+            span: span.clone(),
+        }))
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_accepts_two_lets() {
+        // N=2 — the legacy classifier's exact case. Verify the new
+        // classifier subsumes (returns a 2-entry match).
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = slice_c_block_n_lets_with_k_calls(2, &span);
+        let m = arm_body_n_let_then_pure_tail_shape(&body, "k").expect("N=2 matches");
+        assert_eq!(m.binding_names, vec!["r1", "r2"]);
+        assert_eq!(m.arg_exprs.len(), 2);
+        assert_eq!(m.binding_tes.len(), 2);
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_accepts_three_lets() {
+        // N=3 — beyond the legacy 2-let cap. Phase B will activate
+        // this acceptance in the pre-pass + emit.
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = slice_c_block_n_lets_with_k_calls(3, &span);
+        let m = arm_body_n_let_then_pure_tail_shape(&body, "k").expect("N=3 matches");
+        assert_eq!(m.binding_names, vec!["r1", "r2", "r3"]);
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_accepts_five_lets() {
+        // N=5 — stress acceptance beyond practical chain depths.
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = slice_c_block_n_lets_with_k_calls(5, &span);
+        let m = arm_body_n_let_then_pure_tail_shape(&body, "k").expect("N=5 matches");
+        assert_eq!(m.binding_names.len(), 5);
+        assert_eq!(m.arg_exprs.len(), 5);
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_rejects_single_let() {
+        // N=1 belongs to Slice B (single-let with non-tail-k). The
+        // chain classifier's lower bound is N>=2.
+        use crate::ast::{BinOp, Expr, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = slice_b_block_let_k_call_tail(
+            "r",
+            TypeExpr::Named("Int".to_string(), span.clone()),
+            Expr::IntLit(99, span.clone()),
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(1, span.clone())),
+                span: span.clone(),
+            },
+        );
+        assert!(arm_body_n_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_rejects_block_without_tail() {
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let make_let = |name: &str| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::IntLit(1, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![make_let("r1"), make_let("r2"), make_let("r3")],
+            tail: None,
+            span: span.clone(),
+        }));
+        assert!(arm_body_n_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_rejects_let_with_non_k_call_value() {
+        // Mid-chain non-`k` call disqualifies — every let value must
+        // be `k(arg)`.
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let make_k_let = |name: &str, arg: i64| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::IntLit(arg, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let make_lit_let = |name: &str, val: i64| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::IntLit(val, span.clone()),
+                span: span.clone(),
+            })
+        };
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![
+                make_k_let("r1", 1),
+                make_lit_let("r2", 99),
+                make_k_let("r3", 3),
+            ],
+            tail: Some(Expr::Ident("r1".to_string(), span.clone())),
+            span: span.clone(),
+        }));
+        assert!(arm_body_n_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_rejects_different_k_names() {
+        // All let values must invoke the SAME `k_name`. Mixed names
+        // (`k(arg1)` then `j(arg2)`) reject.
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![
+                Stmt::Let(LetStmt {
+                    name: "r1".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::Call {
+                        callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                        args: vec![Expr::IntLit(1, span.clone())],
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                }),
+                Stmt::Let(LetStmt {
+                    name: "r2".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::Call {
+                        callee: Box::new(Expr::Ident("j".to_string(), span.clone())),
+                        args: vec![Expr::IntLit(2, span.clone())],
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                }),
+            ],
+            tail: Some(Expr::Ident("r1".to_string(), span.clone())),
+            span: span.clone(),
+        }));
+        assert!(arm_body_n_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    // ---------------- end Plan B' Stage 6.7 Task 97 tests ----------------
 
     // -----------------------------------------------------------------
     // Plan B Task 55, Phase 4e captures+ Slice D — `find_closure_env_load_lambda_source`
