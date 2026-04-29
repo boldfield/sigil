@@ -985,55 +985,32 @@ fn catch_example_recovers_with_42() {
     );
 }
 
-/// Plan B' Stage 6.8 Task 109 — `examples/state.sigil` rewritten
-/// from the dual-handle workaround to the canonical CPS-style
-/// `run_state(initial, comp)` higher-order helper. The classic
-/// algebraic-effects encoding of `State[Int]`: handler folds State
-/// into a single fn-of-state; each arm returns a `(Int) -> Int ![]`
-/// lambda; `state_fn(initial)` threads state through the chain.
+/// Plan B Task 59 — `examples/state.sigil` exercises both `State.get`
+/// and `State.set` ops through the dual-handle pattern (one `handle`
+/// per op).
 ///
-/// Surfaces exercised:
+/// **Why dual-handle, not literal `run_state`.** Plan B' Stage 6.8
+/// shipped B.3 (TypeExpr::Fn) and B.4 (arm-body lambdas + Phase B
+/// k-capture trailing-pair convention) — the lifts the literal
+/// `run_state(initial, comp)` shape needs. But Task 109's first
+/// CI cycle on the canonical CPS-style run_state revealed a runtime
+/// integration gap: `state_fn(initial)` returned a closure-record
+/// pointer rather than the threaded integer value. See
+/// `[DEVIATION Task 109] run_state canonical shape — runtime chain
+/// integration gap` for the gap analysis. Until the chain bug
+/// closes, state.sigil keeps the dual-handle Plan B v1 workaround.
 ///
-/// - `comp: () -> Int ![State]` fn-typed parameter (B.3);
-/// - `comp` passed by name as a fn-as-value of a top-level user fn
-///   (Plan B' Phase C v1, Task 104);
-/// - arm bodies are lambdas (B.4 Phase A);
-/// - lambdas capture `k` (and `arg` for the set arm) — B.4 Phase B
-///   trailing-pair convention;
-/// - `k(s)(s)` — Phase C+ Part 1 recursive Call-of-Call dispatch on
-///   a fn-typed value returned from k;
-/// - the handle's overall result type is `(Int) -> Int ![]` flowing
-///   through a let-binding into `state_fn`.
-///
-/// **Computation.** comp = set(5) → get → return(state + 1).
-/// run_state(0, comp) drives the handler chain to a final value.
-/// Trace:
-///
-///   - state_fn = handle comp() with {...}; state_fn(0) starts.
-///   - State.set(5) fires: arm returns `fn (s) => k(5)(5)`.
-///     state_fn(0) calls this fn with s=0, computes `k(5)(5)`.
-///   - k(5) resumes comp at the set call site with value 5;
-///     comp continues, performs State.get(); arm returns
-///     `fn (s) => k(s)(s)`. k(5) returned this fn; we apply
-///     it to 5 (the inner arg of the OUTER `k(5)(5)` call).
-///   - inner-k(5) resumes comp at the get call site with state=5;
-///     comp computes 5 + 1 = 6 and returns naturally;
-///     return arm fires: `fn (s) => 6`. inner-k(5) returns this
-///     fn; apply to 5 → 6.
-///   - state_fn(0) = 6. main prints "6\n".
-///
-/// Invariant: stdout = "6\n", stderr = "", exit 0.
+/// Invariant: stdout = "6\n99\n", stderr = "", exit 0.
 #[test]
-fn state_example_run_state_returns_threaded_value() {
+fn state_example_dual_handle_returns_6_then_99() {
     let root = workspace_root();
     let source = root.join("examples/state.sigil");
     let (stdout, stderr, code) = compile_file_and_run(&source, "state_example");
     assert_eq!(code, 0, "state exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "6\n",
-        "state stdout mismatch (expected run_state(0, comp) = 6 — \
-         comp sets state=5, reads it back, returns state+1=6); \
-         stderr={stderr:?}"
+        stdout, "6\n99\n",
+        "state stdout mismatch (expected read=6 from get arm k(5)+1, \
+         then write=99 from set arm k(arg)=k(99)); stderr={stderr:?}"
     );
     assert_eq!(
         stderr, "",
@@ -4770,6 +4747,43 @@ fn task_108_arm_body_lambda_captures_k_runs() {
          (allocates trailing-pair closure record) then discards k. \
          body=0 → arm never fires → handle returns 0. stderr={stderr:?}"
     );
+}
+
+/// Plan B' Stage 6.8 Task 109 bisect — pinning test for the
+/// simplest "handle returns a lambda value, lambda invoked"
+/// shape. Pre-Task-109 there was no e2e coverage of "arm
+/// allocates a lambda AND the handle's overall result is that
+/// lambda AND we then invoke the lambda". The Task 109 first-
+/// cycle run_state attempt failed at runtime
+/// (`state_fn(initial)` returned a closure-record pointer
+/// instead of the threaded value) — which led to needing this
+/// bisect: does the simplest fn-returning handle work, or is
+/// the bug already at this lower level?
+///
+/// **Ignored** while the runtime integration gap exists. See
+/// `[DEVIATION Task 109] run_state canonical shape — runtime
+/// chain integration gap` for the gap analysis. Un-ignore once
+/// the chain bug closes; the test source is the minimal repro.
+///
+/// Source: an arm with no k-capture returns a constant-shape
+/// lambda; main let-binds the handle's result and invokes the
+/// lambda once. Expected: lambda runs as `x + 100` with x=7,
+/// stdout = "107\n".
+#[test]
+#[ignore]
+fn handle_returning_simple_lambda_invoked_returns_value_pending_chain_fix() {
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = handle (perform Trigger.fire()) with {\n    \
+                   Trigger.fire(k) => fn (x: Int) -> Int ![] => x + 100,\n  \
+                 };\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "handle_returns_lambda_bisect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "107\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]

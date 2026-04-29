@@ -307,3 +307,38 @@ This makes compose work end-to-end with Phase C v1 + Phase C+ surfaces.
 **Closure path:** Phase C++ work — either (a) monomorphize rebuilds `captures_typed` per clone applying the substitution, OR (b) closure_convert consumes post-mono TypeExprs from the FnDecl's params and converts via `ty_from_type_expr` at clone time, OR (c) at codegen time the synth fn's Lowerer applies the active substitution at lookup. Each route has trade-offs in pass-order coupling.
 
 **Implementing commit(s):** Phase C+ Part 2 (`a5ab4f9`) shipped the non-generic surface; the speculative `compose_body_via_closure_env_callees_returns_42` test in `4d272db` exposed the gap; this fixup commit reverts the test and documents the deviation. Phase C++ closure deferred to follow-up commit pending the route decision.
+
+## 2026-04-29 — [DEVIATION Task 109] run_state canonical shape — runtime chain integration gap
+
+**Context:** Plan B' Stage 6.8 Task 109 sub-task 1 requires rewriting `examples/state.sigil` from the dual-handle Plan B v1 workaround to the canonical CPS-style `run_state(initial, comp)` higher-order helper. The shape leans on every B.3 + B.4 surface in one program: fn-typed parameters, fn-as-value of a top-level user fn, arm-body lambdas, k-capturing lambdas (B.4 Phase B trailing-pair convention), recursive Call-of-Call dispatch on fn-typed values returned from k (`k(s)(s)`), and let-binding the handle's fn-typed result.
+
+**The gap.** The first-cycle Task 109 commit (`7b457b6` + `e35dae9` for the E0220 `resumes: many` opt-in) shipped state.sigil with the literal canonical shape:
+
+```sigil
+fn run_state(initial: Int, c: () -> Int ![State]) -> Int ![] {
+  let state_fn: (Int) -> Int ![] = handle c() with {
+    return(v) => fn (s: Int) -> Int ![] => v,
+    State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),
+    State.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),
+  };
+  state_fn(initial)
+}
+```
+
+Compile-time was clean (no E0xxx) after the `resumes: many` opt-in. **Runtime** produced a closure-record-pointer-shaped value (`94846082251584` on Linux, `5502959616` on macOS — both look like heap addresses) instead of the expected `6`. `int_to_string` then printed the raw pointer.
+
+**Likely failure layers (untested at runtime before Task 109):**
+
+1. **Handle returns a fn-typed value** — pre-Task-109, no e2e test exercised "arm allocates a lambda AND the handle's overall result is that lambda AND we then invoke the lambda". The closest existing test is `arm_body_iife_returns_43` (lambda invoked inline, value Int) and `arm_body_lambda_capturing_k_compiles_returns_99` (lambda allocated in arm, never invoked). Neither covers the let-bind-then-invoke shape.
+2. **k-capturing lambda's k(arg) actually dispatches** — `task_108_arm_body_lambda_captures_k_runs` allocates a k-capturing lambda but does NOT invoke it; the trailing-pair dispatch path through `sigil_next_step_call(k_closure, k_fn, ...)` + `sigil_run_loop` is unproven at runtime.
+3. **Recursive Call-of-Call (`k(s)(s)`) where the inner `k(s)` returns a fn that's then invoked** — Phase C+ Part 1's recursive callee resolution covers `make_adder(5)(7)` (top-level fn returning a fn), but NOT k as the outer callee. The k(s) shape inside an arm-body lambda goes through the trailing-pair dispatch first, then needs a regular indirect call on the result. Whether `call_callee_tys` is populated for k's typecheck-side return type, and whether codegen's catchall correctly threads the outer call's callee through it, is untested.
+
+**Bisect plan.** Task 109 fixup commit (this commit) lands one bisect e2e test: `handle_returning_simple_lambda_invoked_returns_value_pending_chain_fix` — a `Trigger.fire` arm returning a non-k-capturing constant-shape lambda, let-bound, invoked once. `#[ignore]`'d while the gap exists. If un-ignored that test passes, bug is in k-capture or recursive dispatch (layers 2 or 3); if it fails, layer 1 is the culprit and the fundamental "handle returns a fn-typed value" path needs work.
+
+**Why accepted in v1:** running and bisecting the bug requires the compiler binary on real source, which OOMs the pod (Cranelift constraint per CLAUDE.md). Deferring to a follow-up CI iteration after the bisect test provides direction is the lowest-risk path. state.sigil keeps the dual-handle Plan B v1 workaround so the example builds and the existing `state_example_dual_handle_returns_6_then_99` invariant holds.
+
+**Failure mode:** Plan B' Stage 6.8 completion criterion "examples/state.sigil uses literal `run_state` higher-order helper and the threaded-state output is correct" remains *unmet*. The lifts B.3 and B.4 are individually green (their dedicated e2e tests pass); the integration of those lifts in the literal canonical run_state shape doesn't yet run end-to-end. Other Plan B' completion criteria are met.
+
+**Closure path:** follow-up Task 109 fixup commit will un-ignore the bisect test, observe which layer breaks, and either ship the targeted compiler fix (if the layer is bounded) or document a Plan-C-or-later closure if the gap is structural. Once the chain runs end-to-end, state.sigil rewrites to the canonical shape and `state_example_run_state_returns_threaded_value` lands as the integration assertion.
+
+**Implementing commit(s):** original Task 109 attempt at `7b457b6` (run_state shape) + `e35dae9` (E0220 `resumes: many` fix); current commit reverts state.sigil to dual-handle, restores the dual-handle e2e test, adds the bisect test, and documents this deviation. Sub-tasks 2 / 3 / 4 of Task 109 (higher_order.sigil docstring / TypeExpr::Fn rejection inversion / arm-body-lambda rejection inversion) all remain closed by prior Stage 6.8 work.
