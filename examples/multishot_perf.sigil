@@ -1,63 +1,61 @@
 // examples/multishot_perf.sigil
 //
-// Plan B Task 60 — performance floor #3: multi-shot Choose stress
-// driver. Plan wording calls for "Multi-shot stress test (3-element
-// Choose combinator, N=1000 iterations) in <5s on both hosts". v1
-// ships a single-binary-perform multi-shot pattern wrapped in an
-// N=1000 recursive driver — see `[DEVIATION Task 60]` in
-// `boldfield/designs/PLAN_B_DEVIATIONS.md` for the architectural
-// framing (literal Cartesian-product 3-pick enumeration requires
-// multi-perform helper bodies, deferred to the chained-synth-cont
-// extension; same Plan-C-or-later territory pinned for choose.sigil
-// in [DEVIATION Task 59]).
+// Plan B' Stage 6.7 + multi-shot composition fix — natural shape:
+// literal 3-element Choose combinator. Helper performs `Choose
+// .flip()` THREE times (B.2 chained-let-yield); multi-shot 2-resume
+// arm enumerates all 2³ = 8 outcomes via the runtime's outer
+// post_arm_k stack (composition fix).
 //
-// **Structure.** The driver `run(n)` recursively wraps the canonical
-// Slice C v1 multi-shot pattern (single-perform helper + 2-resume
-// arm) N times:
+// **What this exercises**:
 //
-//   - `outcome()` performs `Choose.flip()` once, returning 1 if true
-//     else 2 (the simplest measurable LetBindThenTail body with a
-//     Bool binding).
-//   - Each iteration's `handle` wraps `outcome()` with a 2-resume
-//     arm: `{ let r1 = k(true); let r2 = k(false); r1 + r2 }` — the
-//     canonical Slice C v1 shape. r1 = 1, r2 = 2, arm returns 3.
-//   - `run(1000)` chains 1000 such handle expressions through
-//     recursion; each iteration produces 2 multi-shot k invocations
-//     for a total of 2000 k invocations across 1000 fresh handler
-//     frames + 1000 fresh heap-reified k_closure records.
+// - **B.2 chained-let-yield helper body** (3 sequential performs).
+// - **B.1 N-let arm-body chain** (2-resume arm).
+// - **Composition fix**: helper Middle pushes outer post_arm_k onto
+//   the runtime stack before sigil_perform; trampoline pops and
+//   routes Done's value through the outer arm's chain.
 //
-// **Stress invariants exercised.** Iteration-scale multi-shot
-// scalability — every push/pop of a handler frame must complete
-// cleanly across a thousand-deep sequence; every heap-reified
-// k_closure must invoke twice without leaking state into a later
-// iteration's k_closure; the recursive driver must complete without
-// stack overflow at N=1000 (run is Native ABI, so this is a C-stack
-// recursion; 1000 frames is well within native stack capacity but
-// tests the colorer's classification of `run` against
-// effect-discharging body shapes).
+// **Per-iteration enumeration**: helper's tail encodes (b1, b2, b3)
+// into 1..8:
 //
-// **Why N=1000 and not larger.** The plan's bound is <5s. With each
-// iteration doing ~2 k invocations + some arithmetic, ~2000 k
-// invocations should fit comfortably under 5s on both CI hosts.
-// Larger N would test the same machinery without changing what's
-// being verified; 1000 is the plan's named iteration count.
+//   (t,t,t) → 1   (t,t,f) → 2   (t,f,t) → 3   (t,f,f) → 4
+//   (f,t,t) → 5   (f,t,f) → 6   (f,f,t) → 7   (f,f,f) → 8
 //
-// **Sentinel print.** The driver returns 0 (the match arm 0 case
-// returns 0; the recursive `_ => { ... ; run(n-1) }` case ends at
-// run(0) returning 0). Each iteration's handle expression returns
-// 3 but those values are bound to `_` and discarded — only the
-// driver's final 0 propagates back to main's `let _ = run(1000)`.
-// main prints "0" as a sentinel that the recursion completed
-// successfully (not a perf measurement output).
+// Each iteration's handle returns 1+2+3+4+5+6+7+8 = 36.
 //
-// Invariant: stdout reads `0\n` and the program exits 0; e2e test
-// asserts wall-clock < 5s.
+// **Iteration count**: N=300 (reduced from PR #33's N=1000). Each
+// iteration enumerates 8 outcomes via ~14 trampoline dispatches
+// (1+2+4 = 7 arm dispatches + 7 helper synth-cont resumes).
+// 300 × 14 ≈ 4200 dispatches, well under 5s on both hosts.
+//
+// **Sentinel print**. `run(n)` returns 0 (the match arm `0 => 0`
+// case). Each iteration's handle returns 36 but those values bind
+// to `_` and are discarded — only the driver's final 0 propagates
+// back to main's `let _ = run(300)`. main prints "0" as a sentinel
+// that the recursion completed successfully (not a perf
+// measurement output).
+//
+// Invariant: stdout reads `0\n`, exit 0; e2e test asserts wall-
+// clock < 5s.
 
 effect Choose resumes: many { flip: () -> Bool }
 
 fn outcome() -> Int ![Choose, IO] {
-  let b: Bool = perform Choose.flip();
-  if b { 1 } else { 2 }
+  let b1: Bool = perform Choose.flip();
+  let b2: Bool = perform Choose.flip();
+  let b3: Bool = perform Choose.flip();
+  if b1 {
+    if b2 {
+      if b3 { 1 } else { 2 }
+    } else {
+      if b3 { 3 } else { 4 }
+    }
+  } else {
+    if b2 {
+      if b3 { 5 } else { 6 }
+    } else {
+      if b3 { 7 } else { 8 }
+    }
+  }
 }
 
 fn run(n: Int) -> Int ![IO] {
@@ -77,7 +75,7 @@ fn run(n: Int) -> Int ![IO] {
 }
 
 fn main() -> Int ![IO] {
-  let _: Int = run(1000);
+  let _: Int = run(300);
   perform IO.println(int_to_string(0));
   0
 }

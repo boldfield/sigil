@@ -189,6 +189,7 @@ enum UserFnAbi {
 fn compute_user_fn_abi(
     name: &str,
     body: &crate::ast::Block,
+    helper_params: &[crate::ast::Param],
     colored: &ColoredProgram,
 ) -> UserFnAbi {
     // Plan B Stage 6 cleanup — `main` is structurally the entry
@@ -242,16 +243,51 @@ fn compute_user_fn_abi(
     {
         return UserFnAbi::Cps;
     }
-    // Let-yield-then-pure-tail shape — captures-bearing slice
-    // (this commit). Lifts the prior arity-0 restriction: helpers
-    // with user params referenced in the tail are now CPS-eligible
-    // because the synth-cont can capture them via closure record.
-    // The pre-pass populates `CpsContinuationKind::LetBindThenTail
-    // .captures` via `collect_synth_cont_captures`; helper's body
-    // emit allocates the closure record at the perform site and
-    // passes its pointer as `k_closure`.
-    if is_simple_let_yield_then_pure_tail_body(body) {
-        return UserFnAbi::Cps;
+    // Plan B' Stage 6.7 (B.2 Phase B+C activation): chained let-
+    // yield-then-pure-tail shape — N >= 1 sequential `let x_i =
+    // perform p_i` stmts terminated by a pure tail. The pre-pass
+    // allocates N `ChainedLetBindStep` synth-cont entries; helper's
+    // body emit issues `sigil_perform(p_0, k_fn = step_0.func_id)`
+    // and each step's synth-cont threads (captures + prior chain
+    // bindings) forward to the next step's closure record.
+    //
+    // **Cap check (R4 close):** the worst-case closure-record slot
+    // count at the last Middle step is `K + N` where K is the chain
+    // captures count and N is the chain length. If this exceeds
+    // `MAX_CLOSURE_ENV_SLOTS`, fall through to the Sync ABI cleanly
+    // (rather than letting the pre-pass `assert!` fire mid-codegen).
+    // Computing K requires walking the body's perform args + tail —
+    // we do that inline here using the same captures-collection
+    // helper the pre-pass uses, so the ABI selection sees the real
+    // K + N combination instead of the conservative `N >=
+    // MAX_CLOSURE_ENV_SLOTS` that the classifier alone enforces.
+    if let Some(chain_length) = is_simple_chained_let_yield_then_pure_tail_body(body) {
+        let mut performs: Vec<crate::ast::PerformExpr> = Vec::with_capacity(chain_length);
+        let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
+        for stmt in &body.stmts {
+            if let crate::ast::Stmt::Let(l) = stmt {
+                if let crate::ast::Expr::Perform(p) = &l.value {
+                    performs.push(p.clone());
+                    binding_names.push(l.name.clone());
+                }
+            }
+        }
+        let tail_expr = match body.tail.as_ref() {
+            Some(t) => t,
+            None => unreachable!(
+                "is_simple_chained_let_yield_then_pure_tail_body classifier guarantees tail is Some"
+            ),
+        };
+        let captures = collect_chained_synth_cont_captures(
+            &performs,
+            tail_expr,
+            &binding_names,
+            helper_params,
+        );
+        if captures.len() + chain_length < MAX_CLOSURE_ENV_SLOTS {
+            return UserFnAbi::Cps;
+        }
+        // K + N >= MAX_CLOSURE_ENV_SLOTS — fall through to Sync.
     }
     UserFnAbi::Sync
 }
@@ -993,14 +1029,27 @@ fn arm_body_unsupported_construct(
     // single-let has 1, so they're disjoint, but checking multi-
     // let first surfaces the `resumes_many` gate explicitly when
     // the source uses multi-`k` shape on a one-shot effect).
-    if let Some(shape) = arm_body_multi_let_then_pure_tail_shape(&arm.body, &arm.k_name) {
+    // Plan B' Stage 6.7 Task 98 (B.1 Phase B): the codegen-entry
+    // walker now uses the N-let classifier (`arm_body_n_let_then_pure
+    // _tail_shape`, accepts N >= 2) instead of the legacy 2-let one.
+    // For N >= 3, each step's post-arm-k synth fn lowers the next
+    // arg expression; the closure-record threading carries
+    // (k_closure, k_fn) + prior chain bindings forward across
+    // Middle steps. The free-var restriction at each `arg_i`
+    // lowering site (i >= 2) is: `arg_i` may reference only
+    // `binding_names[0..i-1]` plus globals — user op-args from the
+    // parent arm fn are NOT threaded into the chain's closure
+    // records (the same restriction the Task 58 closure point
+    // documents for the legacy 2-let case, generalised across all
+    // chain steps).
+    if let Some(shape) = arm_body_n_let_then_pure_tail_shape(&arm.body, &arm.k_name) {
         let is_multi_shot = effects_resumes_many
             .get(&arm.effect)
             .copied()
             .unwrap_or(false);
         if !is_multi_shot {
             return Some(format!(
-                "Slice C: arm body invokes `{}` twice (multi-shot pattern: \
+                "Slice C: arm body invokes `{}` multiple times (multi-shot pattern: \
                  `let r1 = {}(...); let r2 = {}(...); ...`) but effect `{}` is \
                  declared `resumes: one` (default). Declare `effect {} resumes: \
                  many {{ ... }}` to opt in to multi-shot semantics; otherwise \
@@ -1009,74 +1058,72 @@ fn arm_body_unsupported_construct(
                 arm.k_name, arm.k_name, arm.k_name, arm.effect, arm.effect
             ));
         }
-        if !expr_is_pure(shape.arg1_expr) {
+        // Per-arg purity check.
+        let mut any_impure = false;
+        for arg in &shape.arg_exprs {
+            if !expr_is_pure(arg) {
+                any_impure = true;
+                break;
+            }
+        }
+        if any_impure {
             // Fall through; regular walker surfaces the specific
-            // yield-able sub-shape in arg1.
-        } else if !expr_is_pure(shape.arg2_expr) {
-            // Fall through; regular walker surfaces the specific
-            // yield-able sub-shape in arg2.
-        } else if !expr_is_pure(shape.tail_expr) {
+            // yield-able sub-shape in the failing arg.
+        } else if !expr_is_pure(&shape.tail_expr) {
             // Fall through; regular walker surfaces the specific
             // yield-able sub-shape in tail.
         } else {
-            // Plan B Task 58 — `arg2_expr` is lowered inside
-            // `post_arm_k_1`'s body (codegen.rs:6485). post_arm_k_1's
-            // env at construction (codegen.rs:6441-6442) only has
-            // `binding_name_1` (=r1); user op-args from the parent
-            // arm fn are NOT threaded into post_arm_k_1's closure
-            // record (which captures only (k_closure, k_fn) per the
-            // layout comment at codegen.rs:5480-5485). So
-            // `arg2_expr` referencing a user op-arg, an outer-scope
-            // capture, or any name other than `binding_name_1` /
-            // globals would panic at lower_expr's `Expr::Ident` arm
-            // (codegen.rs:7765 — `unreachable!("codegen: unknown
-            // ident...")`). Pre-Task-58 the gap was unreachable in
-            // practice (existing Slice C e2e tests use
-            // `Choose.flip: () -> Bool` — zero user op-args); Task
-            // 58's first `(Int) -> Int` multi-shot example surfaced
-            // it as an internal-compiler-error panic. This walker
-            // check converts the panic into a clean compile
-            // diagnostic pointing at the closure point.
+            // For each arg_i (i >= 1, since arg_0 is lowered in the
+            // arm fn body where all op-args are in scope), enforce
+            // the free-var restriction: `arg_i` may reference prior
+            // chain bindings, **op-args**, and globals. Plan B'
+            // Stage 6.7 Task 100b lifted the prior op-arg restriction
+            // (the Task 58 closure-point) by adding chain captures
+            // that thread arm-fn user op-args through every chain
+            // step's closure record.
             //
-            // Reuse the Slice B/C tail free-var walker with
-            // extra_bindings = empty (no `binding_name_2` since it
-            // doesn't exist yet at the post_arm_k_1 lowering site).
-            // The walker's diagnostic strings reference "post-`k`
-            // tail" framing — wrap the diagnostic here with
-            // arg2-specific Slice C framing so the user knows the
-            // failing site.
-            let no_extras: BTreeSet<String> = BTreeSet::new();
-            if let Some(inner) = arm_body_post_arm_k_tail_free_vars_ok(
-                shape.arg2_expr,
-                shape.binding_name_1,
-                &arm.k_name,
-                globals,
-                &no_extras,
-            ) {
-                return Some(format!(
-                    "Slice C: arg2 of multi-let arm body (the second `{k}(arg2)` \
-                     call) references a name unavailable in `post_arm_k_1`'s env. \
-                     post_arm_k_1's closure record (per `[DEVIATION Task 55] Phase \
-                     4e captures+` Slice C v1) captures only (k_closure, k_fn), \
-                     plus its own arg `{r1}` from args_ptr[0]; user op-args from \
-                     the parent arm fn and outer-scope captures are NOT threaded \
-                     in. Reference `{r1}` (the let-1 binding) or globals only, or \
-                     defer to the future Slice C captures-bearing extension PR \
-                     (named in `[DEVIATION Task 58]` as the closure point for \
-                     threading user op-args into post_arm_k_1's closure record). \
-                     Underlying free-var diagnostic: {inner}",
-                    k = arm.k_name,
-                    r1 = shape.binding_name_1,
-                ));
+            // op_args set: arm fn's user-param names. The walker
+            // accepts these as "extra bindings" for arg_i / tail
+            // free-var checks. The pre-pass collects them into
+            // `PostArmKChain.captures` for emit-time threading.
+            let op_args: BTreeSet<String> = arm.params.iter().map(|p| p.name.clone()).collect();
+            for i in 1..shape.arg_exprs.len() {
+                let mut extras: BTreeSet<String> = op_args.clone();
+                let first_prior = shape.binding_names[0];
+                for j in 1..i {
+                    extras.insert(shape.binding_names[j].to_string());
+                }
+                if let Some(inner) = arm_body_post_arm_k_tail_free_vars_ok(
+                    shape.arg_exprs[i],
+                    first_prior,
+                    &arm.k_name,
+                    globals,
+                    &extras,
+                ) {
+                    return Some(format!(
+                        "Slice C: arg{i_1based} of multi-let arm body (the {i_1based}th \
+                         `{k}(arg)` call, lowered inside `post_arm_k_{i_0based_idx}`'s body) \
+                         references a name unavailable in that step's env. The step's \
+                         closure record carries (k_closure, k_fn) plus chain captures \
+                         (op-args) plus prior chain bindings. Reference one of {bindings:?} \
+                         (prior chain bindings) or {op_args:?} (op-args) or globals only. \
+                         Underlying free-var diagnostic: {inner}",
+                        i_1based = i + 1,
+                        i_0based_idx = i,
+                        k = arm.k_name,
+                        bindings = &shape.binding_names[..i],
+                        op_args = op_args.iter().collect::<Vec<_>>(),
+                    ));
+                }
             }
-            // Multi-let tail can reference both binding names.
-            // Reuse Slice B's free-var walker with binding_name =
-            // name_1 and extra_bindings = {name_2}.
-            let mut extras = BTreeSet::new();
-            extras.insert(shape.binding_name_2.to_string());
+            // Tail can reference all chain binding names + op-args.
+            let mut extras: BTreeSet<String> = op_args.clone();
+            for j in 1..shape.binding_names.len() {
+                extras.insert(shape.binding_names[j].to_string());
+            }
             if let Some(diag) = arm_body_post_arm_k_tail_free_vars_ok(
-                shape.tail_expr,
-                shape.binding_name_1,
+                &shape.tail_expr,
+                shape.binding_names[0],
                 &arm.k_name,
                 globals,
                 &extras,
@@ -1570,7 +1617,7 @@ struct HandlerArmSynth {
     ///
     /// `None` for arms whose body doesn't match the multi-let
     /// shape OR whose effect isn't `resumes: many`.
-    post_arm_k_chain: Option<MultiLetPostArmKChain>,
+    post_arm_k_chain: Option<PostArmKChain>,
 }
 
 /// Plan B Task 55 (Phase 4g) — per-`Expr::Handle` return-arm synthetic
@@ -1638,89 +1685,169 @@ struct HandlerReturnArmSynth {
     captures: Vec<ArmCapture>,
 }
 
-/// Plan B Task 55, Phase 4e captures+ Slice C — synthetic post-arm-k
-/// continuation chain for an arm body of shape `{ let r1: T1 =
-/// k(arg1); let r2: T2 = k(arg2); pure_tail }` of a `resumes: many`
-/// effect. Multi-shot semantics: the arm invokes the captured
-/// continuation `k` twice (once with arg1, once with arg2); each
-/// invocation drives the helper synth-cont independently and
-/// produces a separate result (r1, r2). The pure tail combines
-/// both.
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — N-step post-arm-k chain
+/// supporting arbitrary `N >= 2`. Holds a `Vec<PostArmKStep>` of N
+/// entries, one per post-arm-k synth fn.
 ///
-/// Implementation requires TWO post-arm-k synth fns + two heap-
-/// allocated TAG_CLOSURE records:
+/// **Arm body shape:** `{ let r_1 = k(arg_1); let r_2 = k(arg_2); ...
+/// let r_N = k(arg_N); tail }`. Each let-binding is bound from the
+/// helper synth-cont's `Done(...)` result returned through the
+/// trailing-pair convention; subsequent `k(arg_{i+1})` invocations
+/// use the same `(k_closure, k_fn)` (the helper synth-cont) — multi-
+/// shot reuses the heap-allocated closure record.
 ///
-///   - `post_arm_k_1` (allocated at pre-pass; defined in its own
-///     post-pass): receives `r1` from `args_ptr[0]` (the helper
-///     synth-cont's dispatch result for `k(arg1)`); reads
-///     `(k_closure, k_fn)` from its `closure_ptr` (captured at
-///     arm-fn body-emit time); allocates `post_arm_k_2`'s closure
-///     with `r1` captured; lowers `arg2`; emits
-///     `Call(k_closure, k_fn, [arg2, post_arm_k_2_closure_ptr,
-///     post_arm_k_2_fn_addr])`.
-///   - `post_arm_k_2` (allocated at pre-pass; defined in its own
-///     post-pass): receives `r2` from `args_ptr[0]`; reads `r1`
-///     from its `closure_ptr`; lowers `pure_tail` with both `r1`
-///     and `r2` in env; widens; emits `Done(widened)`.
+/// **Layout** (per-step closure records):
+/// - **Step 0** (post_arm_k_1): closure built by the arm fn body
+///   emit, holds `(k_closure, k_fn)` at slots 0/1 (offsets +16/+24).
+///   `prior_bindings` is empty.
+/// - **Step i** for `i in 1..N-1` (Middle role): closure built by
+///   the prior step (post_arm_k_i). For Middle steps, the closure
+///   carries `(k_closure, k_fn) + r_1..r_i` (so the next step can
+///   dispatch to k again with prior bindings in scope for arg
+///   lowering). `prior_bindings` has `i` entries.
+/// - **Step N-1** (post_arm_k_N, Final role): closure built by step
+///   N-2 (or by arm fn body emit for N=2). Final's closure carries
+///   only `r_1..r_{N-1}` (no k pair — Final returns `Done`, no
+///   further k dispatch). `prior_bindings` has `N-1` entries.
 ///
-/// Slice C first-commit restrictions:
-///   - Effect declared `resumes: many` (one-shot effects continue
-///     to be rejected via the existing E0220 linearity gate at
-///     typecheck; codegen mirrors that here for completeness even
-///     though E0220 already fires).
-///   - Both `arg1` and `arg2` must satisfy `expr_is_pure`.
-///   - `pure_tail` must satisfy `expr_is_pure` and reference only
-///     `r1`, `r2`, plus globals (no op-args, no outer-scope captures
-///     into the chain — those need a captures-bearing extension
-///     paralleling Slice B's deferred extension).
+/// **Why Middle and Final layouts diverge:** Middle needs `(k_closure,
+/// k_fn)` to dispatch the next k call. Final returns `Done(tail)`
+/// directly — no dispatch, no need for k pair. Asymmetric layout
+/// saves 16 bytes per Final closure record (relative to a uniform
+/// shape carrying k pair always); the reviewer-flagged quadratic
+/// forward-copy cost (B.2's deviation entry) is partially offset by
+/// the smaller Final record.
 ///
-/// The k_closure / k_fn passed to the arm fn at runtime is the
-/// helper synth-cont's heap-allocated TAG_CLOSURE record + the
-/// helper synth-cont's fn pointer. PR #26's helper synth-cont
-/// closure is already heap-allocated when the helper has captures;
-/// for captures-free helpers it is null but the synth-cont fn
-/// pointer is still a function pointer. Multi-shot reuses the
-/// SAME k_closure across both invocations — k_closure is read-
-/// only once allocated, so re-invocation is safe.
+/// **Phase A scope (Task 97):** added alongside the legacy struct +
+/// classifier; nothing yet consumes it. Phase B (Task 98) switches
+/// the pre-pass + emit pass to this shape and retires the legacy
+/// 9-field struct. The classifier accepts N=2 (subsuming the legacy
+/// case) so post-Phase-B path generalises uniformly.
+///
+/// **Task 100b captures-bearing extension:** `captures` enumerates
+/// arm-fn user op-args (and outer-scope captures, future extension)
+/// that are referenced by any chain step's `arg_i` or by the tail
+/// expression. The arm-fn body emit allocates step_0's closure
+/// record carrying `(k_closure, k_fn) + captures`; each Middle step
+/// forward-copies captures (constant across the chain) into the next
+/// step's closure record alongside the prior_bindings. Final steps
+/// load captures alongside prior_bindings to populate the env.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
-struct MultiLetPostArmKChain {
-    /// The `arg1` expression in the first `let r1 = k(arg1)`. Lowered
-    /// inside the arm-fn body emit (NOT inside `post_arm_k_1`'s
-    /// body). Must satisfy `expr_is_pure`.
-    arg1_expr: crate::ast::Expr,
-    /// `post_arm_k_1` synth fn `FuncId`. Allocated at the pre-pass.
-    /// Linker symbol: `sigil_handler_post_arm_k_1_<arm_fn_idx>`.
-    post_arm_k_1_func_id: cranelift_module::FuncId,
-    /// Source-level binding name for the FIRST let (e.g., "r1").
-    /// Bound in `post_arm_k_2`'s env from its closure_ptr at fn
-    /// entry.
-    binding_name_1: String,
-    /// Cranelift type that `post_arm_k_1` narrows `args_ptr[0]` to
-    /// at fn entry, before storing into `post_arm_k_2`'s closure
-    /// record. Derived from the first `LetStmt::ty`.
-    binding_ty_1: Type,
-    /// `EnvSlotKind` for `binding_name_1`'s slot in `post_arm_k_2`'s
-    /// closure record. Drives the bitmap (pointer slots become GC
-    /// roots). Derived from `binding_ty_1`.
-    binding_kind_1: crate::ast::EnvSlotKind,
-    /// The `arg2` expression in the second `let r2 = k(arg2)`.
-    /// Lowered inside `post_arm_k_1`'s body (NOT inside the arm
-    /// fn). Must satisfy `expr_is_pure`.
-    arg2_expr: crate::ast::Expr,
-    /// `post_arm_k_2` synth fn `FuncId`. Allocated at the pre-pass.
-    /// Linker symbol: `sigil_handler_post_arm_k_2_<arm_fn_idx>`.
-    post_arm_k_2_func_id: cranelift_module::FuncId,
-    /// Source-level binding name for the SECOND let (e.g., "r2").
-    /// Bound in `post_arm_k_2`'s env from `args_ptr[0]` at fn
-    /// entry.
-    binding_name_2: String,
-    /// Cranelift type that `post_arm_k_2` narrows `args_ptr[0]` to
-    /// at fn entry. Derived from the second `LetStmt::ty`.
-    binding_ty_2: Type,
-    /// The `pure_tail` expression `post_arm_k_2` lowers. Must
-    /// satisfy `expr_is_pure` and reference only `binding_name_1`,
-    /// `binding_name_2`, plus globals.
-    tail_expr: crate::ast::Expr,
+struct PostArmKChain {
+    /// The `arg_1` expression in the first `let r_1 = k(arg_1)`.
+    /// Lowered inside the arm-fn body emit (not inside any synth fn).
+    /// Must satisfy `expr_is_pure`.
+    first_arg_expr: crate::ast::Expr,
+    /// Arm-fn user op-args (and other arm-local names) referenced
+    /// anywhere in the chain — in any `arg_i` for `i >= 1` or in
+    /// the tail expression. Threaded forward through every chain
+    /// step's closure record. Empty for arms whose chain references
+    /// only chain-internal bindings + globals (which was Slice C
+    /// v1's restriction; lifted in Task 100b).
+    captures: Vec<PostArmKChainCapture>,
+    /// One entry per post-arm-k synth fn (N entries for an N-let
+    /// arm body). `steps[0]` is post_arm_k_1 (binds r_1, dispatches
+    /// k(arg_2) or runs tail if N=1 — though Slice B handles N=1
+    /// separately so the N>=2 path here always has steps.len() >=
+    /// 2). `steps[N-1]` is post_arm_k_N (binds r_N, runs tail).
+    steps: Vec<PostArmKStep>,
+}
+
+/// Plan B' Stage 6.7 Task 100b — one capture entry threaded forward
+/// through every chain step's closure record. Captures are constant
+/// across the chain (captured once at step_0's closure-record alloc
+/// in the arm-fn body, then forward-copied at each Middle step's
+/// next-step alloc).
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct PostArmKChainCapture {
+    /// Source-level name as it appears in arm-fn-body lowering. For
+    /// op-args this matches the `HandleOpArm.params[i].name`.
+    name: String,
+    /// Cranelift type the capture narrows to after I64 load. Used by
+    /// the Middle/Final synth-fn body emit to populate env with the
+    /// correctly-typed value.
+    ty: Type,
+    /// `EnvSlotKind` for the closure-record encoding. Drives the
+    /// pointer-bitmap bit + load/store widening.
+    kind: crate::ast::EnvSlotKind,
+}
+
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — one post-arm-k synth fn
+/// step in a [`PostArmKChain`].
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct PostArmKStep {
+    /// `post_arm_k_{i+1}` synth fn `FuncId`. Allocated at the pre-pass.
+    /// Linker symbol: `sigil_handler_post_arm_k_{i+1}_<arm_fn_idx>`.
+    func_id: cranelift_module::FuncId,
+    /// Source-level binding name for the let-stmt this step's
+    /// `args_ptr[0]` holds (e.g., "r_2" for step index 1).
+    binding_name: String,
+    /// Cranelift type the synth fn narrows `args_ptr[0]` to at fn
+    /// entry. Derived from the corresponding `LetStmt::ty`.
+    binding_ty: Type,
+    /// `EnvSlotKind` for `binding_name`'s slot. Drives bitmap
+    /// derivation when this binding is appended to the next step's
+    /// closure record (Middle steps) or otherwise threaded forward.
+    binding_kind: crate::ast::EnvSlotKind,
+    /// Prior chain bindings carried in this step's closure record at
+    /// slots after `(k_closure, k_fn)` for Middle, or starting at
+    /// slot 0 for Final. step 0 has empty prior_bindings; step `i`
+    /// has `[r_1..r_i]`.
+    prior_bindings: Vec<PostArmKPriorBinding>,
+    /// What this step does after binding `args_ptr[0]` and loading
+    /// closure state. `Middle` dispatches `k(next_arg_expr)` to the
+    /// next step; `Final` lowers the tail and returns `Done`.
+    role: PostArmKStepRole,
+}
+
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — what a [`PostArmKStep`]
+/// does after binding its arg.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+enum PostArmKStepRole {
+    /// Middle step: lower `next_arg_expr` (env has prior bindings
+    /// alongside this step's binding), allocate the next step's
+    /// closure record (Middle-targeted records carry `k_closure`,
+    /// `k_fn`, and prior_bindings plus this step's binding; Final-
+    /// targeted records carry only prior_bindings plus this step's
+    /// binding), emit a Call to the next step (`Call(k_closure,
+    /// k_fn, [next_arg, next_step_closure_ptr, next_step_func_addr])`),
+    /// return the resulting NextStep.
+    Middle {
+        /// The arg expression for the NEXT k call (lowered inside
+        /// THIS step's body).
+        next_arg_expr: crate::ast::Expr,
+        /// FuncId of the next step's synth fn — used as the post-
+        /// arm-k fn pointer in this step's Call dispatch.
+        next_step_func_id: cranelift_module::FuncId,
+    },
+    /// Final step: lower `tail_expr` (env has all chain bindings),
+    /// widen result to I64, return `Done(value)`.
+    Final {
+        /// The pure tail expression that this step lowers. May
+        /// reference any `binding_name` from `prior_bindings` or
+        /// the step's own `binding_name`, plus globals.
+        tail_expr: crate::ast::Expr,
+    },
+}
+
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — one prior chain binding
+/// threaded forward via a [`PostArmKStep`]'s closure record. Mirrors
+/// B.2's [`ChainedPriorBinding`] shape — the [`crate::ast::EnvSlotKind`]
+/// is the canonical source of truth for both the load-widening and
+/// the pointer-bitmap encoding; the Cranelift `Type` is derived from
+/// `kind` at use site via `narrow_for_kind`.
+#[derive(Clone, Debug)]
+struct PostArmKPriorBinding {
+    /// Source-level name (matches the corresponding step's
+    /// `binding_name` from a prior step).
+    name: String,
+    /// `EnvSlotKind` for the closure-record encoding (drives the
+    /// pointer-bitmap bit + load/store widening).
+    kind: crate::ast::EnvSlotKind,
 }
 
 /// Plan B Task 55, Phase 4e captures+ Slice B — synthetic post-arm-k
@@ -1919,56 +2046,127 @@ enum CpsContinuationKind {
         /// support BoolLit / CharLit / StringLit.
         constant_value: i64,
     },
-    /// **Let-bind-then-tail shape** (per
-    /// [`is_simple_let_yield_then_pure_tail_body`]): the synth-cont
-    /// reads `args_ptr[0]` as the let-binding's value, binds it in
-    /// a fresh Lowerer's env under `binding_name`, loads any
-    /// `captures` from `closure_ptr`, lowers `tail_expr` via
-    /// Lowerer (which can reference `binding_name`, captured user
-    /// params, and other pure shapes), widens the result to I64,
-    /// returns `Done(value)`. Used when the parent helper's body
-    /// is `let name = perform ...; tail_expr` and the tail is a
-    /// pure expression that may reference `name` and/or helper's
-    /// user params.
+    /// **Plan B' Stage 6.7 Tasks 93-95 (B.2) — chained-let-bind step**:
+    /// one step in a chained-let-yield-then-pure-tail synth-cont chain
+    /// (per [`is_simple_chained_let_yield_then_pure_tail_body`]). Each
+    /// chain step is its own `CpsContinuationSynth` entry, self-
+    /// contained for the existing one-entry-emits-one-fn synth-cont
+    /// definition pass; an N-step chain produces N entries with
+    /// `Middle`-role steps cross-referencing the next step's FuncId
+    /// and a final `Final`-role step lowering the helper's tail.
     ///
-    /// **Captures-bearing extension (this commit's slice)**: the
-    /// `captures` list enumerates user params of the parent helper
-    /// that the tail expression references by name. The synth-cont
-    /// reads them from `closure_ptr` at fn entry (via the same
-    /// `lower_closure_env_load` machinery user lambdas use). The
-    /// parent helper's body emit allocates the closure record at
-    /// the perform site and passes its pointer as `k_closure` to
-    /// `sigil_perform`. When `captures` is empty, the parent
-    /// passes null `k_closure` (no allocation).
-    LetBindThenTail {
-        /// Source-level name of the let-binding (the name `args_ptr
-        /// [0]` is bound to in the synth-cont's env).
+    /// The helper's body is `let name_0: ty_0 = perform p_0; let
+    /// name_1: ty_1 = perform p_1; ...; let name_{N-1}: ty_{N-1} =
+    /// perform p_{N-1}; tail_expr`. For an N-chain, the pre-pass
+    /// allocates N `CpsContinuationSynth` entries with this kind:
+    ///
+    /// - helper's body emit issues `sigil_perform(p_0, ...,
+    ///   k_fn = step_0.func_id)` with step_0's closure record holding
+    ///   `captures + prior_bindings` (where prior_bindings is empty
+    ///   for step_0).
+    /// - synth_cont_step_i with role `Middle` reads `args_ptr[0]`,
+    ///   narrows to `binding_ty`, binds under `binding_name`, loads
+    ///   `captures + prior_bindings` from `closure_ptr`, allocates
+    ///   step_{i+1}'s closure record (extending prior_bindings with
+    ///   step_i's binding), issues `sigil_perform(next_perform, ...,
+    ///   k_fn = next_step_func_id)`.
+    /// - synth_cont_step_{N-1} with role `Final` reads `args_ptr[0]`,
+    ///   binds under `binding_name`, loads `captures +
+    ///   prior_bindings`, lowers `tail_expr` via Lowerer (env has
+    ///   all bindings + captures), returns `Done(widen(tail, I64))`.
+    ///
+    /// Each step's closure record layout: TAG_CLOSURE header at +0,
+    /// null code_ptr at +8, then captures + prior_bindings packed at
+    /// +16, +24, +32, ... in that order. The pointer-bitmap tracks
+    /// which slots are pointer-typed (driven by `SynthContCapture
+    /// .kind.is_pointer()` for captures and `ChainedPriorBinding
+    /// .kind.is_pointer()` for prior bindings).
+    ChainedLetBindStep {
+        /// Source-level name of the let-binding bound at this step's
+        /// entry from `args_ptr[0]`.
         binding_name: String,
         /// Cranelift type the let-binding declares. The synth-cont
-        /// loads `args_ptr[0]` as `i64` then `ireduce`s back to
-        /// this type for binding (mirrors the user-arg unpack
-        /// discipline at the parent helper's body emit).
+        /// loads `args_ptr[0]` as I64 and `ireduce`s back to this
+        /// type for binding (mirrors the user-arg unpack discipline
+        /// at the parent helper's body emit).
         binding_ty: Type,
-        /// The post-yield rest-of-body that the synth-cont lowers
-        /// via Lowerer.lower_expr. Pure per the classifier; may
-        /// reference `binding_name` and any of `captures`. Boxed
-        /// because `Expr` has a large representation and clippy
-        /// flags `clippy::large_enum_variant` on the unboxed
-        /// shape.
-        tail_expr: Box<crate::ast::Expr>,
-        /// Cranelift type of the tail expression's value. Used to
-        /// widen to I64 before wrapping in `Done(...)`.
-        tail_ty: Type,
-        /// Captures of the parent helper's user params that the
-        /// tail expression references. Computed via free-var
-        /// analysis at the user-fn pre-pass. Empty when the
-        /// helper is arity-0 OR when the tail doesn't reference
-        /// any user params (e.g., constant tail). When empty, the
-        /// parent helper passes null `k_closure`; when non-empty,
-        /// the parent allocates a closure record holding the
-        /// captures and passes its pointer.
+        /// `EnvSlotKind` for the let-binding's slot — drives the
+        /// pointer-bitmap derivation in Middle steps when this
+        /// binding is appended to the next step's closure record.
+        /// (Final steps don't read this; the tail-dispatch path
+        /// widens the tail value to I64 unconditionally and writes
+        /// it to args_buf[0] without slot encoding.)
+        binding_kind: EnvSlotKind,
+        /// Captures of the helper's user params referenced anywhere
+        /// in the chain (constant across all steps; loaded from
+        /// `closure_ptr` at offsets 16+8*i for i in 0..captures.len()).
         captures: Vec<SynthContCapture>,
+        /// Prior chain bindings, in order, threaded forward via this
+        /// step's closure record. Empty for step_0; grows by 1 entry
+        /// per step (so step_i carries the bindings introduced at
+        /// steps 0..i-1). Loaded from `closure_ptr` at offsets
+        /// 16+8*(captures.len()+j) for j in 0..prior_bindings.len().
+        prior_bindings: Vec<ChainedPriorBinding>,
+        /// What this step does after binding + loading. `Middle`
+        /// issues the next perform; `Final` lowers the tail.
+        role: ChainStepRole,
     },
+}
+
+/// Plan B' Stage 6.7 (B.2) — what a [`CpsContinuationKind::ChainedLetBindStep`]
+/// does after binding `args_ptr[0]` and loading captures + prior
+/// bindings.
+#[derive(Clone, Debug)]
+enum ChainStepRole {
+    /// Middle step (i.e., not the last step in the chain): lower
+    /// the next perform's args via Lowerer (env has prior bindings
+    /// alongside captures), allocate the next step's closure record
+    /// (extending prior_bindings with this step's binding), call
+    /// `sigil_perform` with `k_fn = next_step_func_id`, return the
+    /// resulting NextStep up to the trampoline.
+    Middle {
+        /// The perform expression at the next chain position (i.e.,
+        /// the perform that follows this step's let-binding).
+        next_perform: crate::ast::PerformExpr,
+        /// FuncId of the next step's synth fn — used as the `k_fn`
+        /// passed to `sigil_perform` so the resumed arm's `k(value)`
+        /// dispatches into the next step's synth-cont.
+        next_step_func_id: cranelift_module::FuncId,
+    },
+    /// Final step (the last step in the chain): lower `tail_expr`
+    /// via Lowerer (env has all chain bindings + captures), widen
+    /// result to I64, return `Done(value)`.
+    Final {
+        /// The pure tail expression that this step lowers. May
+        /// reference any of the `binding_name`s of all chain steps
+        /// plus the `captures` user-param names plus globals.
+        tail_expr: Box<crate::ast::Expr>,
+        /// Cranelift type of `tail_expr`'s value. Used to widen to
+        /// I64 before wrapping in `Done(...)`.
+        tail_ty: Type,
+    },
+}
+
+/// Plan B' Stage 6.7 (B.2) — one prior chain binding threaded forward
+/// via a `ChainedLetBindStep`'s closure record. Step i carries
+/// step_0..step_{i-1}'s bindings; each entry holds the name + slot
+/// kind (for closure-record load + narrow + pointer-bitmap
+/// derivation). The Cranelift `Type` is derived from `kind` at use
+/// site via `narrow_for_kind` — the slot kind is the canonical
+/// source of truth for both the load-widening shape and the
+/// pointer-bitmap encoding.
+#[derive(Clone, Debug)]
+struct ChainedPriorBinding {
+    /// Source-level name of the binding (matches the corresponding
+    /// `ChainedLetBindStep::binding_name` from a prior step).
+    name: String,
+    /// `EnvSlotKind` for the closure-record encoding. Drives the
+    /// closure-record header bitmap (pointer slots are GC-tracked,
+    /// non-pointer slots are not) and the per-slot load/store
+    /// widening shape (`I8` zero-extend for Bool/Byte/Unit, `I32`
+    /// zero-extend for Char, direct stores for `I64`/pointer-typed
+    /// slots).
+    kind: crate::ast::EnvSlotKind,
 }
 
 /// Plan B Task 55, Phase 4e — derive an [`EnvSlotKind`] from a
@@ -2005,33 +2203,55 @@ fn slot_kind_for_type_expr_post_mono(te: &crate::ast::TypeExpr) -> EnvSlotKind {
     }
 }
 
-/// Plan B Task 55, Phase 4e — collect the names that the synth-cont
-/// must capture from the parent helper.
+/// Plan B' Stage 6.7 (B.2 Phase B/C) — collect helper-user-param
+/// captures for a chained-let-yield-then-pure-tail synth-cont chain.
 ///
-/// Walks `tail_expr` and harvests every `Expr::Ident` whose name
-/// matches a helper param AND isn't shadowed by `bound`. The
-/// `bound` set initially contains the let-binding's name (so
-/// `let x = perform; x + threshold` correctly captures `threshold`
-/// but not `x`).
+/// Walks each `performs[i]`'s args in source order, then `tail_expr`,
+/// harvesting every `Expr::Ident` whose name matches a helper param
+/// AND isn't shadowed by `bound`. All chain bindings (step_0..step
+/// _{N-1}) are pre-bound in the initial `bound` set so that any
+/// reference to a chain binding inside a perform's args or the
+/// tail is *not* captured (it's synth-cont-internal, threaded
+/// forward via the closure record's prior-bindings slots). Any
+/// reference to a helper user param IS captured.
 ///
 /// Recursive shapes (Block, Match, If) extend `bound` with locally-
 /// introduced let-bindings as the walker descends. Shape mirrors
 /// `expr_is_pure` since the classifier already restricted to pure
-/// tail expressions — yield-able shapes (Call, Perform, Lambda,
+/// expressions — yield-able shapes (Call, Perform, Lambda,
 /// ClosureRecord, Handle) won't appear here.
 ///
-/// Returns captures in source-encounter order (deduplicated). The
-/// order matters because the closure record's slots are positional
-/// — `captures[i]` is at `closure_ptr + 16 + 8*i` and the synth-cont
-/// reads them in this same order.
-fn collect_synth_cont_captures(
+/// The walk visits each `performs[i]`'s args in source order, then
+/// `tail_expr`. The same `out` Vec accumulates captures across all
+/// visits, deduplicating by name (per [`walk_collect_captures`]'s
+/// existing dedup discipline). Returned in source-encounter order
+/// — closure record slot positions follow this order.
+///
+/// **Why all chain bindings pre-bound, not just bindings visible at
+/// each position:** the walker doesn't track which step it's
+/// currently inside. Treating all chain bindings as bound is safe
+/// because typecheck rejects forward-references (step_i's perform
+/// args can't reference step_{i+1}'s binding — it doesn't exist
+/// yet). So any reference to a chain-binding name in source is
+/// either valid (referring to a prior binding) or a typecheck
+/// error (caught earlier); either way, the walker doesn't capture
+/// it.
+fn collect_chained_synth_cont_captures(
+    performs: &[crate::ast::PerformExpr],
     tail_expr: &crate::ast::Expr,
-    let_binding_name: &str,
+    binding_names: &[String],
     helper_params: &[crate::ast::Param],
 ) -> Vec<SynthContCapture> {
     let mut bound: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    bound.insert(let_binding_name.to_string());
+    for n in binding_names {
+        bound.insert(n.clone());
+    }
     let mut out: Vec<SynthContCapture> = Vec::new();
+    for p in performs {
+        for arg in &p.args {
+            walk_collect_captures(arg, &mut bound, helper_params, &mut out);
+        }
+    }
     walk_collect_captures(tail_expr, &mut bound, helper_params, &mut out);
     out
 }
@@ -2111,6 +2331,120 @@ fn walk_collect_captures(
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => {}
+    }
+}
+
+/// Plan B' Stage 6.7 Task 100b — collect arm-fn user op-args
+/// referenced anywhere in a chain step's `arg_i` or in the chain's
+/// tail expression. Mirrors [`walk_collect_captures`] for the
+/// helper-side chain (which captures helper user params); the arm
+/// side has slightly different param metadata (`HandleArmParam` is
+/// name-only, with types in a parallel `op_decl.params` slice).
+///
+/// `arm_params` carries the tuple `(name, ty_expr)` for each user
+/// op-arg, in declaration order. `bound` is the set of locally-
+/// introduced names (chain bindings + `k_name`); references to
+/// these are NOT captured (chain-internal). Any Ident matching an
+/// arm op-arg name AND not in `bound` is captured.
+fn walk_collect_arm_captures(
+    e: &crate::ast::Expr,
+    bound: &mut std::collections::BTreeSet<String>,
+    arm_params: &[crate::ast::HandleArmParam],
+    out: &mut Vec<PostArmKChainCapture>,
+) {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::ClosureEnvLoad { .. } => {}
+        Expr::Ident(name, _) => {
+            if !bound.contains(name) {
+                if let Some(param) = arm_params.iter().find(|p| p.name == *name) {
+                    if !out.iter().any(|c| c.name == *name) {
+                        // arm_params carries name + span only; the
+                        // type lookup happens in the pre-pass via the
+                        // parallel `op_decl.params: Vec<TypeExpr>`.
+                        // Here we collect the name and a placeholder
+                        // type/kind; the caller fills in real values.
+                        let _ = param; // suppress unused-var; structural
+                        out.push(PostArmKChainCapture {
+                            name: name.clone(),
+                            ty: types::I64,
+                            kind: crate::ast::EnvSlotKind::Int,
+                        });
+                    }
+                }
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_collect_arm_captures(lhs, bound, arm_params, out);
+            walk_collect_arm_captures(rhs, bound, arm_params, out);
+        }
+        Expr::Unary { operand, .. } => {
+            walk_collect_arm_captures(operand, bound, arm_params, out);
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            walk_collect_arm_captures(cond, bound, arm_params, out);
+            walk_collect_arm_captures_block(then_block, bound, arm_params, out);
+            walk_collect_arm_captures_block(else_block, bound, arm_params, out);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            walk_collect_arm_captures(scrutinee, bound, arm_params, out);
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                collect_pattern_bindings(&arm.pattern, &mut arm_bound);
+                walk_collect_arm_captures(&arm.body, &mut arm_bound, arm_params, out);
+            }
+        }
+        Expr::Block(b) => walk_collect_arm_captures_block(b, bound, arm_params, out),
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                walk_collect_arm_captures(&f.value, bound, arm_params, out);
+            }
+        }
+        // Yield-able shapes (Call, Perform, Handle, Lambda,
+        // ClosureRecord) — defensively skip recursion. Note: `k(arg)`
+        // appears as Call but the arm-body chain context is the let-
+        // value of preceding stmts; this walker is invoked on arg_i
+        // / tail_expr (which the classifier guarantees are pure), so
+        // a Call here would be a typecheck-error.
+        Expr::Call { .. }
+        | Expr::Perform(_)
+        | Expr::Handle { .. }
+        | Expr::Lambda { .. }
+        | Expr::ClosureRecord { .. } => {}
+    }
+}
+
+fn walk_collect_arm_captures_block(
+    b: &crate::ast::Block,
+    bound: &mut std::collections::BTreeSet<String>,
+    arm_params: &[crate::ast::HandleArmParam],
+    out: &mut Vec<PostArmKChainCapture>,
+) {
+    use crate::ast::Stmt;
+    let mut local_bound = bound.clone();
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                walk_collect_arm_captures(&l.value, &mut local_bound, arm_params, out);
+                local_bound.insert(l.name.clone());
+            }
+            Stmt::Expr(e) => walk_collect_arm_captures(e, &mut local_bound, arm_params, out),
+            Stmt::Perform(_) => {}
+        }
+    }
+    if let Some(t) = &b.tail {
+        walk_collect_arm_captures(t, &mut local_bound, arm_params, out);
     }
 }
 
@@ -2520,8 +2854,19 @@ fn collect_handle_arms_in_expr(
                 // pre-pass code only fires after the walker has
                 // accepted the shape, so the `is_multi_shot` check
                 // here is defensive (should be true).
+                // Plan B' Stage 6.7 Task 98 (B.1 Phase B activation):
+                // pre-pass populates `PostArmKChain` with N entries
+                // (one per chain step). The chained classifier
+                // accepts N >= 2 uniformly; N = 2 produces 2 steps
+                // (Middle + Final), N >= 3 produces N steps
+                // (Middle..Middle, Final).
+                //
+                // Allocation order: declare all N FuncIds first (so
+                // each Middle step's `next_step_func_id` reference is
+                // available in pass 2), then build N `PostArmKStep`
+                // entries with cross-references populated.
                 let post_arm_k_chain = if let Some(shape) =
-                    arm_body_multi_let_then_pure_tail_shape(&rewritten_body, &arm.k_name)
+                    arm_body_n_let_then_pure_tail_shape(&rewritten_body, &arm.k_name)
                 {
                     let is_multi_shot = ctx
                         .effects
@@ -2532,40 +2877,126 @@ fn collect_handle_arms_in_expr(
                         None
                     } else {
                         let arm_fn_idx = out.synth.len();
-                        let post_arm_k_1_mangled =
-                            format!("sigil_handler_post_arm_k_1_{arm_fn_idx}");
-                        let post_arm_k_1_func_id = module
-                            .declare_function(
-                                &post_arm_k_1_mangled,
-                                Linkage::Local,
-                                ctx.cps_arm_sig,
-                            )
-                            .map_err(|e| format!("declare {post_arm_k_1_mangled}: {e}"))?;
-                        let post_arm_k_2_mangled =
-                            format!("sigil_handler_post_arm_k_2_{arm_fn_idx}");
-                        let post_arm_k_2_func_id = module
-                            .declare_function(
-                                &post_arm_k_2_mangled,
-                                Linkage::Local,
-                                ctx.cps_arm_sig,
-                            )
-                            .map_err(|e| format!("declare {post_arm_k_2_mangled}: {e}"))?;
-                        let binding_ty_1 =
-                            cranelift_ty_for_type_expr(shape.binding_te_1, ctx.pointer_ty);
-                        let binding_ty_2 =
-                            cranelift_ty_for_type_expr(shape.binding_te_2, ctx.pointer_ty);
-                        let binding_kind_1 = slot_kind_for_type_expr_post_mono(shape.binding_te_1);
-                        Some(MultiLetPostArmKChain {
-                            arg1_expr: shape.arg1_expr.clone(),
-                            post_arm_k_1_func_id,
-                            binding_name_1: shape.binding_name_1.to_string(),
-                            binding_ty_1,
-                            binding_kind_1,
-                            arg2_expr: shape.arg2_expr.clone(),
-                            post_arm_k_2_func_id,
-                            binding_name_2: shape.binding_name_2.to_string(),
-                            binding_ty_2,
-                            tail_expr: shape.tail_expr.clone(),
+                        let chain_length = shape.binding_names.len();
+
+                        // Pass 1: declare all N FuncIds for
+                        // post_arm_k_1 .. post_arm_k_N.
+                        let mut step_func_ids: Vec<cranelift_module::FuncId> =
+                            Vec::with_capacity(chain_length);
+                        for i in 0..chain_length {
+                            let step_idx_1based = i + 1;
+                            let mangled =
+                                format!("sigil_handler_post_arm_k_{step_idx_1based}_{arm_fn_idx}");
+                            let func_id = module
+                                .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
+                                .map_err(|e| format!("declare {mangled}: {e}"))?;
+                            step_func_ids.push(func_id);
+                        }
+
+                        // Pre-compute per-let metadata used across
+                        // step entries.
+                        let binding_tys: Vec<Type> = shape
+                            .binding_tes
+                            .iter()
+                            .map(|te| cranelift_ty_for_type_expr(te, ctx.pointer_ty))
+                            .collect();
+                        let binding_kinds: Vec<crate::ast::EnvSlotKind> = shape
+                            .binding_tes
+                            .iter()
+                            .map(|te| slot_kind_for_type_expr_post_mono(te))
+                            .collect();
+
+                        // Plan B' Stage 6.7 Task 100b — collect chain
+                        // captures: arm-fn user op-args referenced
+                        // anywhere in the chain (any `arg_i` for
+                        // `i >= 1` OR the tail expression). Threaded
+                        // forward through every step's closure record
+                        // so Middle steps can lower next_arg_expr
+                        // and Final steps can lower tail_expr with
+                        // op-args in scope.
+                        //
+                        // Walk: for each arg_exprs[1..N] + tail_expr,
+                        // harvest every Expr::Ident whose name matches
+                        // an op-arg AND isn't shadowed by the chain
+                        // bindings (which are pre-bound in `bound`).
+                        let captures: Vec<PostArmKChainCapture> = {
+                            let mut bound_names: std::collections::BTreeSet<String> =
+                                shape.binding_names.iter().map(|s| s.to_string()).collect();
+                            bound_names.insert(arm.k_name.clone());
+                            let mut out: Vec<PostArmKChainCapture> = Vec::new();
+                            for arg_expr in shape.arg_exprs.iter().skip(1) {
+                                walk_collect_arm_captures(
+                                    arg_expr,
+                                    &mut bound_names,
+                                    &arm.params,
+                                    &mut out,
+                                );
+                            }
+                            walk_collect_arm_captures(
+                                &shape.tail_expr,
+                                &mut bound_names,
+                                &arm.params,
+                                &mut out,
+                            );
+                            // Resolve each capture's real type +
+                            // EnvSlotKind from the parallel op_decl
+                            // .params + arg_types arrays. Walker
+                            // populated placeholder I64/Int values;
+                            // overwrite with the real values now.
+                            for cap in &mut out {
+                                let idx = match arm.params.iter().position(|p| p.name == cap.name) {
+                                    Some(i) => i,
+                                    None => unreachable!(
+                                        "walk_collect_arm_captures invariant: \
+                                         captured name `{}` is in arm.params (it \
+                                         was added only when arm.params.find \
+                                         matched)",
+                                        cap.name
+                                    ),
+                                };
+                                cap.ty = arg_types[idx];
+                                cap.kind = slot_kind_for_type_expr_post_mono(&op_decl.params[idx]);
+                            }
+                            out
+                        };
+
+                        // Pass 2: build N `PostArmKStep` entries.
+                        // step_idx 0..N-2 → Middle (next_arg_expr is
+                        // arg_exprs[step_idx + 1]); step_idx N-1 →
+                        // Final (tail_expr).
+                        let mut steps: Vec<PostArmKStep> = Vec::with_capacity(chain_length);
+                        for i in 0..chain_length {
+                            // prior_bindings for step i is bindings 0..i.
+                            let prior_bindings: Vec<PostArmKPriorBinding> = (0..i)
+                                .map(|j| PostArmKPriorBinding {
+                                    name: shape.binding_names[j].to_string(),
+                                    kind: binding_kinds[j],
+                                })
+                                .collect();
+                            let role = if i + 1 < chain_length {
+                                PostArmKStepRole::Middle {
+                                    next_arg_expr: shape.arg_exprs[i + 1].clone(),
+                                    next_step_func_id: step_func_ids[i + 1],
+                                }
+                            } else {
+                                PostArmKStepRole::Final {
+                                    tail_expr: shape.tail_expr.clone(),
+                                }
+                            };
+                            steps.push(PostArmKStep {
+                                func_id: step_func_ids[i],
+                                binding_name: shape.binding_names[i].to_string(),
+                                binding_ty: binding_tys[i],
+                                binding_kind: binding_kinds[i],
+                                prior_bindings,
+                                role,
+                            });
+                        }
+
+                        Some(PostArmKChain {
+                            first_arg_expr: shape.arg_exprs[0].clone(),
+                            captures,
+                            steps,
                         })
                     }
                 } else {
@@ -2846,11 +3277,11 @@ fn arm_body_tail_is_k_call<'a>(
 ///     `arm_body_post_arm_k_tail_free_vars_ok` helper enforces
 ///     this.
 ///
-/// This is the arm-side analogue of the helper-body's
-/// [`is_simple_let_yield_then_pure_tail_body`] from PR #26's `a5ee4c6`
-/// captures-bearing slice. The post-arm-k synth fn's role for the
-/// arm body parallels what the helper's `LetBindThenTail`
-/// `CpsContinuationKind` synth-cont does for the helper body.
+/// This is the arm-side analogue of the helper-body's chained-let-
+/// yield classifier ([`is_simple_chained_let_yield_then_pure_tail
+/// _body`]). The post-arm-k synth fn's role for the arm body
+/// parallels what `CpsContinuationKind::ChainedLetBindStep`'s
+/// synth-cont does for the helper body.
 ///
 /// Returned references all borrow from `body`'s sub-tree.
 fn arm_body_let_then_pure_tail_shape<'a>(
@@ -2896,63 +3327,54 @@ struct ArmBodyLetThenPureTailMatch<'a> {
     tail_expr: &'a crate::ast::Expr,
 }
 
-/// Plan B Task 55, Phase 4e captures+ Slice C — recognise the
-/// multi-let arm body shape `{ let r1: T1 = k(arg1); let r2: T2 =
-/// k(arg2); pure_tail }`. This is the two-let extension of
-/// [`arm_body_let_then_pure_tail_shape`] that exercises multi-shot
-/// `k` semantics (the arm invokes `k` twice with different args).
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — does this arm body
+/// match the **N-step multi-let-then-pure-tail** shape that the
+/// generalised post-arm-k chain supports?
 ///
-/// Returns the matched components when the arm body's structure is
-/// exactly:
-/// ```text
-///     Expr::Block {
-///         stmts: [
-///             Stmt::Let { name: name_1, ty: ty_1, value: Expr::Call {
-///                 callee: Expr::Ident(k_name, _),
-///                 args: [arg1_expr],
-///             } },
-///             Stmt::Let { name: name_2, ty: ty_2, value: Expr::Call {
-///                 callee: Expr::Ident(k_name, _),
-///                 args: [arg2_expr],
-///             } },
-///         ],
-///         tail: Some(tail_expr),
-///     }
-/// ```
+/// A body matches iff:
 ///
-/// Both `Stmt::Let`s must bind a call to the SAME `k_name`. The
-/// caller (the pre-pass + walker) enforces additional restrictions:
-///   - Effect must be `resumes: many` — one-shot effects continue
-///     to reject multi-`k` invocation per the typecheck E0220 gate.
-///   - `arg1_expr` and `arg2_expr` must satisfy `expr_is_pure`.
-///   - `tail_expr` must satisfy `expr_is_pure` and free vars must
-///     be ⊆ `{name_1, name_2} ∪ globals`.
+/// 1. It's an `Expr::Block`.
+/// 2. Its statement list has `N >= 2` stmts.
+/// 3. Each stmt is a `Stmt::Let` whose value is `k_name(arg)` (a
+///    `Call` to the captured continuation with exactly one arg).
+/// 4. The block has a tail expression.
 ///
-/// This is the source-side surface for multi-shot. Future surface
-/// extensions (3+ k invocations, Binary-of-k-calls, captures into
-/// the chain) layer on top.
+/// Returns `Some(match struct)` with N entries on accept; `None`
+/// on reject.
 ///
-/// Returned references all borrow from `body`'s sub-tree.
-fn arm_body_multi_let_then_pure_tail_shape<'a>(
+/// **Handling ANF-introduced intermediate lets**: the elaborate
+/// pass flattens compound tail expressions (e.g., `r1 + r2 + r3`
+/// becomes `let $elab_t0 = r1 + r2; $elab_t0 + r3`). The classifier
+/// matches the **prefix** of stmts that are k-call lets (the chain
+/// steps), then synthesises an owned tail expression that wraps any
+/// remaining (non-k-call) stmts + the original tail in a fresh
+/// Block. The Final step's emit lowers this synthesised Block via
+/// the Lowerer; the env at Final-step entry has all chain bindings
+/// loaded, and the Lowerer extends env with the intermediate lets'
+/// bindings as it walks the Block.
+///
+/// **Phase A scope (Task 97):** the classifier is added alongside
+/// the legacy 2-let classifier; nothing yet consumes it. Phase B
+/// (Task 98) switches the codegen-entry walker + pre-pass + emit to
+/// this classifier and retires the legacy.
+///
+/// Borrowed-vs-owned: name and type-expr references borrow from
+/// `body`'s sub-tree (cheap); the synthesised tail is owned (because
+/// it may need to construct a new Block when ANF intermediate lets
+/// are present).
+#[allow(dead_code)]
+fn arm_body_n_let_then_pure_tail_shape<'a>(
     body: &'a crate::ast::Expr,
     k_name: &str,
-) -> Option<ArmBodyMultiLetThenPureTailMatch<'a>> {
-    use crate::ast::{Expr, Stmt};
+) -> Option<ArmBodyNLetThenPureTailMatch<'a>> {
+    use crate::ast::{Block, Expr, Stmt};
     let block = match body {
         Expr::Block(b) => b,
         _ => return None,
     };
-    if block.stmts.len() != 2 {
+    if block.stmts.len() < 2 {
         return None;
     }
-    let let_1 = match &block.stmts[0] {
-        Stmt::Let(l) => l,
-        _ => return None,
-    };
-    let let_2 = match &block.stmts[1] {
-        Stmt::Let(l) => l,
-        _ => return None,
-    };
     let extract_k_call = |value: &'a Expr| -> Option<&'a Expr> {
         if let Expr::Call { callee, args, .. } = value {
             if let Expr::Ident(n, _) = callee.as_ref() {
@@ -2963,30 +3385,79 @@ fn arm_body_multi_let_then_pure_tail_shape<'a>(
         }
         None
     };
-    let arg1_expr = extract_k_call(&let_1.value)?;
-    let arg2_expr = extract_k_call(&let_2.value)?;
-    let tail = block.tail.as_ref()?;
-    Some(ArmBodyMultiLetThenPureTailMatch {
-        binding_name_1: &let_1.name,
-        binding_te_1: &let_1.ty,
-        arg1_expr,
-        binding_name_2: &let_2.name,
-        binding_te_2: &let_2.ty,
-        arg2_expr,
-        tail_expr: tail,
+    // Walk leading stmts collecting k-call lets. Stop at the first
+    // non-k-call stmt (which must be a let — non-let stmts disqualify
+    // the shape entirely). The split index marks where the chain
+    // ends and the ANF intermediate lets begin.
+    let mut binding_names: Vec<&'a str> = Vec::new();
+    let mut binding_tes: Vec<&'a crate::ast::TypeExpr> = Vec::new();
+    let mut arg_exprs: Vec<&'a crate::ast::Expr> = Vec::new();
+    let mut split_idx: usize = 0;
+    for stmt in &block.stmts {
+        let let_stmt = match stmt {
+            Stmt::Let(l) => l,
+            _ => return None,
+        };
+        match extract_k_call(&let_stmt.value) {
+            Some(arg) => {
+                binding_names.push(&let_stmt.name);
+                binding_tes.push(&let_stmt.ty);
+                arg_exprs.push(arg);
+                split_idx += 1;
+            }
+            None => break,
+        }
+    }
+    if binding_names.len() < 2 {
+        return None;
+    }
+    // Synthesise the final tail expression. If no intermediate lets
+    // (split_idx == stmts.len()), use the block's tail directly.
+    // Otherwise wrap [remaining stmts + original tail] in a new
+    // Block — the Final step's emit lowers this Block via the
+    // Lowerer, which handles intermediate let bindings naturally.
+    let final_tail_owned: crate::ast::Expr = if split_idx == block.stmts.len() {
+        block.tail.as_ref()?.clone()
+    } else {
+        let original_tail = block.tail.as_ref()?;
+        let remaining_stmts: Vec<Stmt> = block.stmts[split_idx..].to_vec();
+        Expr::Block(Box::new(Block {
+            stmts: remaining_stmts,
+            tail: Some(original_tail.clone()),
+            span: block.span.clone(),
+        }))
+    };
+    Some(ArmBodyNLetThenPureTailMatch {
+        binding_names,
+        binding_tes,
+        arg_exprs,
+        tail_expr: final_tail_owned,
     })
 }
 
-/// Plan B Task 55, Phase 4e captures+ Slice C — borrowed view of a
-/// matched [`arm_body_multi_let_then_pure_tail_shape`] result.
-struct ArmBodyMultiLetThenPureTailMatch<'a> {
-    binding_name_1: &'a str,
-    binding_te_1: &'a crate::ast::TypeExpr,
-    arg1_expr: &'a crate::ast::Expr,
-    binding_name_2: &'a str,
-    binding_te_2: &'a crate::ast::TypeExpr,
-    arg2_expr: &'a crate::ast::Expr,
-    tail_expr: &'a crate::ast::Expr,
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — borrowed-mostly view
+/// of a matched [`arm_body_n_let_then_pure_tail_shape`] result. The
+/// `tail_expr` is owned because the classifier may synthesise a new
+/// Block to wrap ANF intermediate lets alongside the original tail
+/// (see classifier docstring for the ANF-handling rationale).
+#[allow(dead_code)]
+struct ArmBodyNLetThenPureTailMatch<'a> {
+    /// Source-level binding names, in source order. `binding_names
+    /// .len()` equals the chain length N (== `arg_exprs.len()` ==
+    /// `binding_tes.len()`).
+    binding_names: Vec<&'a str>,
+    /// Declared types, in source order.
+    binding_tes: Vec<&'a crate::ast::TypeExpr>,
+    /// Per-let `k(arg)` arguments, in source order. Each is the
+    /// single-arg expression of the let's `Call` value.
+    arg_exprs: Vec<&'a crate::ast::Expr>,
+    /// The synthesised tail expression. May be the original block
+    /// tail (when there are no ANF intermediate lets) OR a freshly-
+    /// constructed Block wrapping intermediate lets + the original
+    /// tail. Pure per Slice C's invariant (the codegen-entry walker
+    /// enforces purity + free-var restrictions on this synthesised
+    /// expression; the classifier here is shape-only).
+    tail_expr: crate::ast::Expr,
 }
 
 /// Plan B Task 55, Phase 4e captures+ Slice B — verify the post-arm-k
@@ -3164,6 +3635,16 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
 /// restriction. `Stmt::Let` extends the allowed set with its name
 /// for the rest of the block (mirrors normal lexical scoping);
 /// `Stmt::Perform` is rejected (already excluded by purity gate).
+///
+/// **Plan B' Stage 6.7 Task 98 lift:** previously rejected any
+/// inner `Stmt::Let` to keep the Slice B surface narrow. Now extends
+/// the allowed set with each let-binding's name as the walker
+/// descends — needed for the N-let arm-body chain whose synthesised
+/// Final-step tail wraps ANF intermediate lets (e.g., `let $elab_t0
+/// = r1+r2; $elab_t0+r3`) inside a fresh Block. The let-binding's
+/// *value* is still subject to the outer free-var restriction (it
+/// must reference only `binding_name`, prior `extra_bindings`,
+/// globals, and earlier inner-let bindings).
 fn arm_body_post_arm_k_tail_free_vars_ok_block(
     b: &crate::ast::Block,
     binding_name: &str,
@@ -3172,25 +3653,24 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
     extra_bindings: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     use crate::ast::Stmt;
-    // For Slice B's first commit, we restrict to one binding name
-    // (the outer `let r`) — extending the allowed set to include
-    // inner `let`s would require threading a mutable set through
-    // the recursion. Inner `let`s in the tail are pure (per
-    // `expr_is_pure`'s `block_is_pure`), so the inner-let value's
-    // free vars are still subject to the outer `{r, globals}`
-    // restriction; an inner-let-bound name then appears as a free
-    // Ident in the inner-let's continuation, which we'd want to
-    // permit. Defer the multi-let-in-tail support until a future
-    // slice; for Slice B's surface, reject any inner Stmt::Let.
+    let mut extras_extended: std::collections::BTreeSet<String> = extra_bindings.clone();
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                return Some(format!(
-                    "Slice B: post-`k` tail of arm body contains an inner \
-                     `let {}` — multi-binding tails arrive in a future captures-bearing \
-                     extension; today's surface is one outer let with a pure tail",
-                    l.name
-                ));
+                // Walk the let's value with the extras-so-far (the
+                // let's own name isn't in scope inside its own RHS).
+                if let Some(d) = arm_body_post_arm_k_tail_free_vars_ok(
+                    &l.value,
+                    binding_name,
+                    k_name,
+                    globals,
+                    &extras_extended,
+                ) {
+                    return Some(d);
+                }
+                // Bring the let-binding into scope for subsequent
+                // stmts and the tail.
+                extras_extended.insert(l.name.clone());
             }
             Stmt::Expr(e) => {
                 if let Some(d) = arm_body_post_arm_k_tail_free_vars_ok(
@@ -3198,7 +3678,7 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
                     binding_name,
                     k_name,
                     globals,
-                    extra_bindings,
+                    &extras_extended,
                 ) {
                     return Some(d);
                 }
@@ -3218,7 +3698,7 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
             binding_name,
             k_name,
             globals,
-            extra_bindings,
+            &extras_extended,
         );
     }
     None
@@ -3980,6 +4460,28 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_perform", Linkage::Import, &perform_sig)
         .map_err(|e| format!("declare sigil_perform: {e}"))?;
 
+    // Plan B' Stage 6.7 multi-shot composition fix —
+    // sigil_outer_post_arm_k_push(closure_ptr: *mut u8,
+    //                             fn_ptr: *mut u8).
+    // Called from B.2 helper Middle's emit before sigil_perform; saves
+    // the outer arm's post_arm_k pair onto a thread-local stack so
+    // the trampoline's `Done` branch can route the inner chain's
+    // result back through it.
+    let mut outer_post_arm_k_push_sig = Signature::new(isa_call_conv(&module));
+    outer_post_arm_k_push_sig
+        .params
+        .push(AbiParam::new(pointer_ty)); // closure_ptr
+    outer_post_arm_k_push_sig
+        .params
+        .push(AbiParam::new(pointer_ty)); // fn_ptr
+    let outer_post_arm_k_push = module
+        .declare_function(
+            "sigil_outer_post_arm_k_push",
+            Linkage::Import,
+            &outer_post_arm_k_push_sig,
+        )
+        .map_err(|e| format!("declare sigil_outer_post_arm_k_push: {e}"))?;
+
     // sigil_next_step_done(value: u64) -> *mut NextStep
     let mut next_step_done_sig = Signature::new(isa_call_conv(&module));
     next_step_done_sig.params.push(AbiParam::new(types::I64));
@@ -4154,7 +4656,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // field; this commit consumes it for signature selection.
             // The transitional `#[allow(dead_code)]` on
             // `UserFnEntry::abi` is removed at the same time.
-            let abi = compute_user_fn_abi(&f.name, &f.body, &cc.colored);
+            let abi = compute_user_fn_abi(&f.name, &f.body, &f.params, &cc.colored);
             let (sig, param_tys, ret_ty) = match abi {
                 UserFnAbi::Sync => {
                     let mut sig = Signature::new(isa_call_conv(&module));
@@ -4204,68 +4706,39 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 },
             );
 
-            // Plan B Task 55, Phase 4e — if the fn matches a
-            // synth-cont-eligible body shape, allocate a synthetic
-            // continuation closure FuncId. The synth-cont body is
-            // emitted at the bottom of `emit_object` (mirrors the
-            // `HandlerArmSynth` definition pass pattern).
+            // Plan B Task 55 (Phase 4e) + Plan B' Stage 6.7 Tasks
+            // 94+95 (B.2 Phase B+C) — if the fn matches a synth-
+            // cont-eligible body shape, allocate one or more
+            // synthetic continuation closure FuncIds. The synth-
+            // cont bodies are emitted at the bottom of `emit_object`
+            // (mirrors the `HandlerArmSynth` definition pass pattern).
             //
             // Two shapes at this commit:
             //   - `is_simple_yield_then_constant_tail_body` →
-            //     `CpsContinuationKind::ConstantDone`.
-            //   - `is_simple_let_yield_then_pure_tail_body` →
-            //     `CpsContinuationKind::LetBindThenTail`.
+            //     `CpsContinuationKind::ConstantDone` (single entry).
+            //   - `is_simple_chained_let_yield_then_pure_tail_body`
+            //     returning `Some(N)` → N `CpsContinuationKind::
+            //     ChainedLetBindStep` entries (one per chain step;
+            //     accepts N >= 1).
+            //
+            // The `cps_continuation_synth_indices` map points at
+            // step_0's index; helper body emit reads step_0's
+            // captures to allocate the perform-time closure record.
+            // Each Middle step's `next_step_func_id` references the
+            // following step's FuncId — so allocation happens in
+            // two passes (declare all N FuncIds first, then build N
+            // entries with cross-references populated).
             if abi == UserFnAbi::Cps {
-                let kind: Option<CpsContinuationKind> =
-                    if is_simple_yield_then_constant_tail_body(&f.body) {
-                        let constant_value = match &f.body.tail {
-                            Some(crate::ast::Expr::IntLit(n, _)) => *n,
-                            _ => unreachable!(
-                                "is_simple_yield_then_constant_tail_body classifier \
-                                 guarantees tail is IntLit"
-                            ),
-                        };
-                        Some(CpsContinuationKind::ConstantDone { constant_value })
-                    } else if is_simple_let_yield_then_pure_tail_body(&f.body) {
-                        let let_stmt = match &f.body.stmts[0] {
-                            crate::ast::Stmt::Let(l) => l.clone(),
-                            _ => unreachable!(
-                                "is_simple_let_yield_then_pure_tail_body classifier \
-                                 guarantees stmts[0] is Stmt::Let"
-                            ),
-                        };
-                        let tail_expr = match &f.body.tail {
-                            Some(t) => t.clone(),
-                            None => unreachable!(
-                                "is_simple_let_yield_then_pure_tail_body classifier \
-                                 guarantees tail is Some"
-                            ),
-                        };
-                        let binding_ty = cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty);
-                        let tail_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
-                        // Captures-bearing slice (this commit):
-                        // free-var analysis on the tail to find
-                        // helper user params referenced. Empty for
-                        // arity-0 helpers OR for tails that don't
-                        // reference helper's params.
-                        let captures =
-                            collect_synth_cont_captures(&tail_expr, &let_stmt.name, &f.params);
-                        Some(CpsContinuationKind::LetBindThenTail {
-                            binding_name: let_stmt.name,
-                            binding_ty,
-                            tail_expr: Box::new(tail_expr),
-                            tail_ty,
-                            captures,
-                        })
-                    } else {
-                        None
+                if is_simple_yield_then_constant_tail_body(&f.body) {
+                    let constant_value = match &f.body.tail {
+                        Some(crate::ast::Expr::IntLit(n, _)) => *n,
+                        _ => unreachable!(
+                            "is_simple_yield_then_constant_tail_body classifier \
+                             guarantees tail is IntLit"
+                        ),
                     };
-
-                if let Some(kind) = kind {
+                    let kind = CpsContinuationKind::ConstantDone { constant_value };
                     let synth_cont_sig = cps_signature(pointer_ty, &module);
-                    // Global-index-based name avoids collisions with
-                    // user fns containing `$` (synthetic lambda fns).
-                    // Mirrors `sigil_handler_arm_{N}` from Phase 3b.
                     let synth_cont_idx = cps_continuation_synth.len();
                     let synth_cont_name = format!("sigil_post_yield_cont_{synth_cont_idx}");
                     let synth_cont_func_id = module
@@ -4277,6 +4750,119 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         kind,
                     });
                     cps_continuation_synth_indices.insert(f.name.clone(), synth_cont_idx);
+                } else if let Some(chain_length) =
+                    is_simple_chained_let_yield_then_pure_tail_body(&f.body)
+                {
+                    // Extract per-step let-binding info (name +
+                    // declared type + slot kind) and the perform.
+                    // Classifier guarantees every stmt is a
+                    // `Stmt::Let` whose value is `Expr::Perform`;
+                    // unreachable!() guards mirror the
+                    // ConstantDone branch above.
+                    let mut performs: Vec<crate::ast::PerformExpr> =
+                        Vec::with_capacity(chain_length);
+                    let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
+                    let mut binding_tys: Vec<Type> = Vec::with_capacity(chain_length);
+                    let mut binding_kinds: Vec<EnvSlotKind> = Vec::with_capacity(chain_length);
+                    for stmt in &f.body.stmts {
+                        let let_stmt = match stmt {
+                            crate::ast::Stmt::Let(l) => l,
+                            _ => unreachable!(
+                                "is_simple_chained_let_yield_then_pure_tail_body \
+                                 classifier guarantees every stmt is Stmt::Let"
+                            ),
+                        };
+                        let perform = match &let_stmt.value {
+                            crate::ast::Expr::Perform(p) => p.clone(),
+                            _ => unreachable!(
+                                "is_simple_chained_let_yield_then_pure_tail_body \
+                                 classifier guarantees Let value is Expr::Perform"
+                            ),
+                        };
+                        performs.push(perform);
+                        binding_names.push(let_stmt.name.clone());
+                        binding_tys.push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
+                        binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                    }
+                    let tail_expr = match &f.body.tail {
+                        Some(t) => t.clone(),
+                        None => unreachable!(
+                            "is_simple_chained_let_yield_then_pure_tail_body \
+                             classifier guarantees tail is Some"
+                        ),
+                    };
+                    let tail_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+
+                    // Free-var analysis across all perform args + tail:
+                    // helper user params referenced anywhere in the
+                    // chain. Each step's closure record carries this
+                    // captures vec (constant across all steps) plus
+                    // its own prior_bindings (step_0..step_{i-1}).
+                    let captures = collect_chained_synth_cont_captures(
+                        &performs,
+                        &tail_expr,
+                        &binding_names,
+                        &f.params,
+                    );
+
+                    // Pass 1: declare all N FuncIds. Each step's
+                    // synth-cont uses the uniform CPS calling
+                    // convention `(closure_ptr, args_ptr, args_len)
+                    // -> *mut NextStep`. Names follow the global-
+                    // index pattern to avoid collisions with user
+                    // fns or other synth-conts.
+                    let synth_cont_sig = cps_signature(pointer_ty, &module);
+                    let starting_idx = cps_continuation_synth.len();
+                    let mut step_func_ids: Vec<cranelift_module::FuncId> =
+                        Vec::with_capacity(chain_length);
+                    for step in 0..chain_length {
+                        let global_idx = starting_idx + step;
+                        let synth_cont_name = format!("sigil_post_yield_cont_{global_idx}");
+                        let synth_cont_func_id = module
+                            .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
+                            .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
+                        step_func_ids.push(synth_cont_func_id);
+                    }
+
+                    // Pass 2: build N CpsContinuationSynth entries.
+                    // step_idx 0..N-2 → Middle; step_idx == N-1 →
+                    // Final. prior_bindings for step i is the slice
+                    // binding_{0..i} (so step_0's prior_bindings is
+                    // empty; step_{N-1}'s is binding_{0..N-1}).
+                    for step in 0..chain_length {
+                        let prior_bindings: Vec<ChainedPriorBinding> = (0..step)
+                            .map(|j| ChainedPriorBinding {
+                                name: binding_names[j].clone(),
+                                kind: binding_kinds[j],
+                            })
+                            .collect();
+                        let role = if step + 1 < chain_length {
+                            ChainStepRole::Middle {
+                                next_perform: performs[step + 1].clone(),
+                                next_step_func_id: step_func_ids[step + 1],
+                            }
+                        } else {
+                            ChainStepRole::Final {
+                                tail_expr: Box::new(tail_expr.clone()),
+                                tail_ty,
+                            }
+                        };
+                        cps_continuation_synth.push(CpsContinuationSynth {
+                            func_id: step_func_ids[step],
+                            parent_fn_name: f.name.clone(),
+                            kind: CpsContinuationKind::ChainedLetBindStep {
+                                binding_name: binding_names[step].clone(),
+                                binding_ty: binding_tys[step],
+                                binding_kind: binding_kinds[step],
+                                captures: captures.clone(),
+                                prior_bindings,
+                                role,
+                            },
+                        });
+                    }
+                    // Map points at step_0; helper body emit reads
+                    // step_0's captures + first perform's k_fn.
+                    cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
                 }
             }
         }
@@ -4385,7 +4971,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // the per-fn FuncRef set. Constructed once here; reused at the
     // three call sites that need a full per-fn FuncRef set:
     // user-fn body emit (this loop), synth-arm-fn body emit, and
-    // synth-cont definition pass for `LetBindThenTail`. Closes the
+    // synth-cont definition pass for `ChainedLetBindStep`. Closes the
     // FFI-ref dedup deferred-must-fix flagged in PR #26 mid-flight
     // reviews at `33f2231`, `a5ee4c6`, and `2be70ce`. The
     // `TODO(plan-b-task-55-phase-4e/ffi-ref-extraction)` marker
@@ -4400,6 +4986,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         handler_frame_set_arm,
         handler_frame_set_return,
         perform_func,
+        outer_post_arm_k_push,
         run_loop,
         next_step_done,
         next_step_call,
@@ -4450,6 +5037,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_arm_ref,
                 handler_frame_set_return_ref,
                 perform_ref,
+                outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 next_step_done_ref: _,
                 next_step_call_ref,
@@ -4539,7 +5127,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         crate::ast::Stmt::Let(l) => match &l.value {
                             crate::ast::Expr::Perform(p) => p.clone(),
                             _ => unreachable!(
-                                "is_simple_let_yield_then_pure_tail_body \
+                                "is_simple_chained_let_yield_then_pure_tail_body \
                                  classifier guarantees Let value is Expr::Perform"
                             ),
                         },
@@ -4661,18 +5249,28 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             module.declare_func_in_func(synth_cont_func_id, builder.func);
                         let synth_cont_addr = builder.ins().func_addr(pointer_ty, synth_cont_ref);
 
-                        // Captures-bearing slice: if the synth-cont's
-                        // kind is LetBindThenTail with non-empty
-                        // captures, alloc a closure record holding
-                        // the captured user-param values from
-                        // helper's env. Otherwise pass null
-                        // k_closure (synth-cont has no captures,
-                        // mirroring `alloc_arm_closure_record`'s
+                        // Captures-bearing slice: if step_0's synth-
+                        // cont kind has non-empty captures, alloc a
+                        // closure record holding the captured user-
+                        // param values from helper's env. Otherwise
+                        // pass null k_closure (synth-cont has no
+                        // captures, mirroring `alloc_arm_closure_record`'s
                         // null-for-empty convention).
+                        //
+                        // Plan B' Stage 6.7: the chained variant
+                        // shares the same captures-bearing path —
+                        // step_0's `captures` Vec carries chain-wide
+                        // helper-param refs (from any perform's args
+                        // or the tail). Each step's closure record
+                        // appends prior_bindings *after* captures;
+                        // the helper-side closure record at this
+                        // first perform writes only `captures` (no
+                        // prior bindings yet — step_0 is first in
+                        // the chain).
                         let synth_cont_idx = cps_continuation_synth_indices[&f.name];
                         let captures: Vec<SynthContCapture> =
                             match &cps_continuation_synth[synth_cont_idx].kind {
-                                CpsContinuationKind::LetBindThenTail { captures, .. } => {
+                                CpsContinuationKind::ChainedLetBindStep { captures, .. } => {
                                     captures.clone()
                                 }
                                 _ => Vec::new(),
@@ -5262,6 +5860,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_arm_ref,
                     handler_frame_set_return_ref,
                     perform_ref,
+                    outer_post_arm_k_push_ref: _,
                     run_loop_ref,
                     next_step_done_ref,
                     next_step_call_ref,
@@ -5414,40 +6013,38 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // `arm_body_tail_is_k_call`; non-tail `k` use is
                 // rejected with a Phase-4e-pointing diagnostic.
                 let next_step_ptr = if let Some(chain) = &synth.post_arm_k_chain {
-                    // --- Slice C: multi-let `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }` path ---
+                    // --- Slice C: multi-let `{ let r1 = k(arg1); ...;
+                    //     let rN = k(argN); pure_tail }` path ---
                     //
-                    // For arms of `resumes: many` effects whose body
-                    // matches the multi-let shape, the arm fn invokes
-                    // `k(arg1)` and packs a heap-allocated TAG_CLOSURE
-                    // record holding `(k_closure, k_fn)` as the
-                    // post-arm-k closure. The post_arm_k_1 synth fn
-                    // (defined in its own pass at the bottom of
-                    // `emit_object`) reads `(k_closure, k_fn)` from
-                    // its closure_ptr and uses them to invoke `k(arg2)`
-                    // — re-using the SAME k_closure (helper synth-cont's
-                    // closure record, heap-allocated by PR #26's
-                    // captures-bearing slice). Multi-shot semantics
-                    // emerge from the trampoline dispatching into the
-                    // helper synth-cont k_fn twice with different args.
+                    // Plan B' Stage 6.7 Task 98 (B.1 Phase B): the
+                    // arm fn here lowers `arg_1` (first k call's arg)
+                    // and packs a heap-allocated TAG_CLOSURE record
+                    // for `chain.steps[0]` (post_arm_k_1) holding
+                    // (k_closure, k_fn). Since N >= 2 always for
+                    // chain helpers, step[0]'s role is Middle (it
+                    // dispatches to k again), so its closure carries
+                    // (k_closure, k_fn) + 0 prior bindings = 2
+                    // capture slots.
                     //
-                    // post_arm_k_1's closure layout (TAG_CLOSURE):
-                    //   offset 0: header word (TAG_CLOSURE | count=3 | bitmap=0b10).
-                    //   offset 8: code_ptr (null — synth fns dispatch
-                    //     via FuncId, not via closure record).
+                    // step[0]'s closure layout (TAG_CLOSURE):
+                    //   offset 0: header (TAG_CLOSURE | count=3 | bitmap=0b10).
+                    //   offset 8: code_ptr (null — synth fns dispatch via FuncId).
                     //   offset 16: k_closure (pointer; bitmap bit 1 set).
                     //   offset 24: k_fn (non-pointer fn ptr).
                     //
-                    // Bisecting hint: a regression in the Slice C e2e
-                    // test (`slice_c_choose_multi_shot_*`) after this
-                    // commit means either (a) the closure-record's
-                    // bitmap encoding is wrong (k_closure not GC-rooted
-                    // → dangling pointer post-GC), (b) the arm fn's
-                    // args_ptr stores at offsets 0/8/16 don't match
-                    // what helper synth-cont reads (the trailing-pair
-                    // convention from Slice A), or (c) post_arm_k_1's
-                    // closure_ptr reads don't match the arm fn's
-                    // closure-record stores at offsets 16/24.
-                    let arg1_value = lowerer.lower_expr(&chain.arg1_expr);
+                    // The trampoline dispatches `k_fn(k_closure,
+                    // [arg_1, step[0]_closure, &step[0]_fn], 3)` via
+                    // the trailing-pair convention; the helper's
+                    // synth-cont reads arg_1, computes, dispatches
+                    // through the trailing post_arm_k pair into
+                    // step[0]'s synth fn.
+                    let step_0 = &chain.steps[0];
+                    debug_assert!(
+                        matches!(step_0.role, PostArmKStepRole::Middle { .. }),
+                        "Plan B' Stage 6.7 Task 98: chain step 0 must be Middle role \
+                         (chain length >= 2 invariant); got Final"
+                    );
+                    let arg1_value = lowerer.lower_expr(&chain.first_arg_expr);
                     let arg1_ty = lowerer.builder.func.dfg.value_type(arg1_value);
                     let widened_arg1 = if arg1_ty == types::I64 {
                         arg1_value
@@ -5456,36 +6053,46 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     } else {
                         assert_eq!(
                             arg1_ty, pointer_ty,
-                            "codegen Phase 4e captures+ Slice C: unexpected k-arg1 \
+                            "codegen Plan B' Stage 6.7: unexpected first_arg \
                              Cranelift type {arg1_ty:?} for next_step_call slot widen"
                         );
                         arg1_value
                     };
 
-                    // Allocate post_arm_k_1's TAG_CLOSURE record
-                    // capturing (k_closure, k_fn). Bitmap encoding
-                    // (matching `alloc_arm_closure_record`'s loop
-                    // `bitmap |= 1u32 << (i + 1)`): bit `i + 1`
-                    // marks capture-slot `i` as a GC-tracked
-                    // pointer. Slot 0 is the code_ptr (bit 0;
-                    // always non-pointer), captures start at slot
-                    // 1 (bit 1). Here capture[0] = k_closure
-                    // (pointer; bit 1 set); capture[1] = k_fn
-                    // (non-pointer; no bit).
+                    // Allocate step[0]'s closure record. Middle layout:
+                    // (k_closure, k_fn) + chain captures (op-args).
+                    //
+                    // Layout offsets:
+                    //   +0:        header
+                    //   +8:        code_ptr (null)
+                    //   +16:       k_closure (capture-slot 0; bitmap bit 1)
+                    //   +24:       k_fn      (capture-slot 1; non-pointer)
+                    //   +32+8*c:   captures[c] for c in 0..captures.len()
                     //
                     // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
-                    // `post_arm_k_1_closure_ptr` (returned by `alloc_call`
-                    // below) is a heap pointer that lives across the
-                    // subsequent `next_step_call` arena allocation. See
-                    // the central TODO at the synth-cont's
-                    // `post_arm_k_closure` load site for the full
-                    // 4-site audit framing.
-                    let count: u8 = 3;
-                    // capture-slot 0 (k_closure) is pointer; bit
-                    // index = slot_index + 1 = 1.
-                    let bitmap: u32 = 1u32 << 1;
+                    // `step_0_closure_ptr` is a heap pointer that lives
+                    // across the subsequent `next_step_call` arena
+                    // allocation. See the central TODO at the synth-
+                    // cont's `post_arm_k_closure` load site.
+                    let captures = &chain.captures;
+                    let total_capture_slots: usize = 2 + captures.len();
+                    assert!(
+                        total_capture_slots < MAX_CLOSURE_ENV_SLOTS,
+                        "Plan B' Stage 6.7 Task 100b: arm-fn step_0 closure capture \
+                         count {total_capture_slots} >= {MAX_CLOSURE_ENV_SLOTS} \
+                         exceeds bitmap layout"
+                    );
+                    let mut bitmap: u32 = 1u32 << 1; // k_closure (slot 0)
+                                                     // k_fn (slot 1) is a fn-ptr — bitmap policy is non-
+                                                     // pointer (matching the existing 2-let layout).
+                    for (c, cap) in captures.iter().enumerate() {
+                        if cap.kind.is_pointer() {
+                            bitmap |= 1u32 << (2 + c + 1);
+                        }
+                    }
+                    let count: u8 = 1 + total_capture_slots as u8;
                     let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
-                    let payload_bytes: i64 = 8 + 8 * 2;
+                    let payload_bytes: i64 = 8 + 8 * total_capture_slots as i64;
                     let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                     let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
                     let alloc_call = lowerer
@@ -5495,40 +6102,69 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     lowerer
                         .stackmap
                         .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
-                    let post_arm_k_1_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
+                    let step_0_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
                     // code_ptr at offset 8 = null.
                     let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
-                    lowerer.builder.ins().store(
-                        MemFlags::trusted(),
-                        null_v,
-                        post_arm_k_1_closure_ptr,
-                        8,
-                    );
-                    // k_closure at offset 16 (slot 2).
+                    lowerer
+                        .builder
+                        .ins()
+                        .store(MemFlags::trusted(), null_v, step_0_closure_ptr, 8);
+                    // k_closure at offset 16.
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
                         k_closure_v,
-                        post_arm_k_1_closure_ptr,
+                        step_0_closure_ptr,
                         16,
                     );
-                    // k_fn at offset 24 (slot 3).
+                    // k_fn at offset 24.
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
                         k_fn_v,
-                        post_arm_k_1_closure_ptr,
+                        step_0_closure_ptr,
                         24,
                     );
+                    // Chain captures at offsets 32+8*c. The arm-fn
+                    // env at this point has all op-args bound from
+                    // the args_ptr unpack; load each captured op-arg
+                    // from env and widen to I64 for storage.
+                    for (c, cap) in captures.iter().enumerate() {
+                        let val = match lowerer.env.get(&cap.name) {
+                            Some(v) => *v,
+                            None => unreachable!(
+                                "Plan B' Stage 6.7 Task 100b: chain capture `{}` \
+                                 not in arm-fn env at body-emit time. The pre-pass \
+                                 collected captures from arm.params, which the arm-\
+                                 fn body emit binds in env from args_ptr unpack.",
+                                cap.name
+                            ),
+                        };
+                        let widened = match cap.kind {
+                            crate::ast::EnvSlotKind::Int => val,
+                            crate::ast::EnvSlotKind::Bool
+                            | crate::ast::EnvSlotKind::Byte
+                            | crate::ast::EnvSlotKind::Unit
+                            | crate::ast::EnvSlotKind::Char => {
+                                lowerer.builder.ins().uextend(types::I64, val)
+                            }
+                            crate::ast::EnvSlotKind::String
+                            | crate::ast::EnvSlotKind::Closure
+                            | crate::ast::EnvSlotKind::User => val,
+                        };
+                        let offset: i32 = 32 + 8 * c as i32;
+                        lowerer.builder.ins().store(
+                            MemFlags::trusted(),
+                            widened,
+                            step_0_closure_ptr,
+                            offset,
+                        );
+                    }
 
-                    // post_arm_k_1's func_addr.
-                    let post_arm_k_1_fn_ref = module
-                        .declare_func_in_func(chain.post_arm_k_1_func_id, lowerer.builder.func);
-                    let post_arm_k_1_fn_addr = lowerer
-                        .builder
-                        .ins()
-                        .func_addr(pointer_ty, post_arm_k_1_fn_ref);
+                    let step_0_fn_ref =
+                        module.declare_func_in_func(step_0.func_id, lowerer.builder.func);
+                    let step_0_fn_addr = lowerer.builder.ins().func_addr(pointer_ty, step_0_fn_ref);
 
-                    // Build Call(k_closure, k_fn, [arg1, post_arm_k_1_closure_ptr,
-                    // post_arm_k_1_fn_addr]) via the trailing-pair convention.
+                    // Build Call(k_closure, k_fn, [arg1, step_0_closure,
+                    // step_0_fn_addr]) via the trailing-pair convention.
                     let three_v = lowerer.builder.ins().iconst(types::I32, 3);
                     let call_ns = lowerer
                         .builder
@@ -5554,13 +6190,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     );
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
-                        post_arm_k_1_closure_ptr,
+                        step_0_closure_ptr,
                         argp_v,
                         POST_ARM_K_CLOSURE_OFF,
                     );
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
-                        post_arm_k_1_fn_addr,
+                        step_0_fn_addr,
                         argp_v,
                         POST_ARM_K_FN_OFF,
                     );
@@ -5874,6 +6510,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_arm_ref,
                     handler_frame_set_return_ref,
                     perform_ref,
+                    outer_post_arm_k_push_ref: _,
                     run_loop_ref,
                     next_step_done_ref: _,
                     next_step_call_ref,
@@ -6185,6 +6822,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_arm_ref,
                 handler_frame_set_return_ref,
                 perform_ref,
+                outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 next_step_done_ref,
                 next_step_call_ref,
@@ -6279,20 +6917,33 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         }
     }
 
-    // Plan B Task 55, Phase 4e captures+ Slice C — chained post-arm-k
-    // synth fn definition passes for the multi-let arm body shape
-    // `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }` of
-    // `resumes: many` effects.
+    // Plan B' Stage 6.7 Task 98 (B.1 Phase B activation): unified
+    // emit pass for the N-step post-arm-k chain. Each chain step
+    // (1..=N) is emitted in source order; the per-step body
+    // dispatches on `PostArmKStepRole`:
     //
-    // post_arm_k_1: receives r1 from args_ptr[0]; reads (k_closure,
-    // k_fn) from closure_ptr at offsets 16/24; allocates
-    // post_arm_k_2's TAG_CLOSURE record capturing r1; lowers
-    // arg2_expr; emits `Call(k_closure, k_fn, [arg2,
-    // post_arm_k_2_closure_ptr, post_arm_k_2_fn_addr])`.
+    //   - **Middle step** (steps 1..N-1): receives r_i from
+    //     args_ptr[0]; reads (k_closure, k_fn) from closure_ptr at
+    //     offsets 16/24; reads prior_bindings r_1..r_{i-1} from
+    //     closure_ptr at offsets 32+8*j; allocates the next step's
+    //     closure record (Middle-shape: (k_closure, k_fn) + prior
+    //     bindings + this binding; or Final-shape: prior bindings
+    //     + this binding); lowers next_arg_expr (env has all
+    //     bindings); emits `Call(k_closure, k_fn, [next_arg, next_-
+    //     step_closure, next_step_func_addr])`.
     //
-    // post_arm_k_2: receives r2 from args_ptr[0]; reads r1 from
-    // closure_ptr at offset 16; lowers tail_expr with both bindings
-    // in env; widens; emits `Done(widened)`.
+    //   - **Final step** (step N): receives r_N from args_ptr[0];
+    //     reads prior_bindings r_1..r_{N-1} from closure_ptr at
+    //     offsets 16+8*j (no k pair in Final's closure); lowers
+    //     tail_expr (env has all bindings); widens to I64; emits
+    //     `Done(widened)`.
+    //
+    // The closure record layout asymmetry (Middle has k pair;
+    // Final doesn't) saves 16 bytes per Final closure. Documented
+    // in `PostArmKChain`'s docstring; the reviewer-flagged
+    // quadratic forward-copy cost (B.2's deviation entry) applies
+    // here too — each Middle step copies all prior bindings + the
+    // newly-bound r_i forward to the next step's closure.
     {
         let post_arm_k_chain_sig = cps_signature(pointer_ty, &module);
         for synth in &handler_arm_synth {
@@ -6301,415 +6952,486 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 None => continue,
             };
 
-            // ---- post_arm_k_1 definition pass ----
-            ctx.func.signature = post_arm_k_chain_sig.clone();
-            ctx.func.name = UserFuncName::user(0, chain.post_arm_k_1_func_id.as_u32());
-            {
-                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-                let mut stackmap = StackMapBuilder::new();
-                let block = builder.create_block();
-                builder.append_block_params_for_function_params(block);
-                builder.switch_to_block(block);
-                builder.seal_block(block);
+            for (step_idx, step) in chain.steps.iter().enumerate() {
+                ctx.func.signature = post_arm_k_chain_sig.clone();
+                ctx.func.name = UserFuncName::user(0, step.func_id.as_u32());
+                {
+                    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+                    let mut stackmap = StackMapBuilder::new();
+                    let block = builder.create_block();
+                    builder.append_block_params_for_function_params(block);
+                    builder.switch_to_block(block);
+                    builder.seal_block(block);
 
-                let block_params: Vec<Value> = builder.block_params(block).to_vec();
-                // block_params[0] = closure_ptr (post_arm_k_1's own
-                // closure record holding [k_closure, k_fn] at offsets
-                // 16/24); block_params[1] = args_ptr (= [r1] from
-                // helper synth-cont's `Call(post_arm_k_1, [synth_cont_result])`);
-                // block_params[2] = args_len (== 1 from the helper
-                // synth-cont's terminal Call dispatch).
-                let post_arm_k_1_closure_ptr = block_params[0];
-                let args_ptr = block_params[1];
+                    let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                    let synth_closure_ptr = block_params[0];
+                    let args_ptr = block_params[1];
 
-                // Read r1 from args_ptr[0], narrow per binding_ty_1.
-                let r1_widened = builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), args_ptr, 0);
-                let r1_value = if chain.binding_ty_1 == types::I64 {
-                    r1_widened
-                } else if chain.binding_ty_1.is_int() && chain.binding_ty_1.bits() < 64 {
-                    builder.ins().ireduce(chain.binding_ty_1, r1_widened)
-                } else {
-                    assert_eq!(
-                        chain.binding_ty_1, pointer_ty,
-                        "codegen Phase 4e captures+ Slice C: unexpected r1 binding \
-                         Cranelift type {:?} for post_arm_k_1 in fn `{}`'s chain",
-                        chain.binding_ty_1, synth.k_name
-                    );
-                    r1_widened
-                };
+                    // Read this step's bound arg from args_ptr[0],
+                    // narrow per binding_ty.
+                    let bound_widened =
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlags::trusted(), args_ptr, 0);
+                    let bound_value = if step.binding_ty == types::I64 {
+                        bound_widened
+                    } else if step.binding_ty.is_int() && step.binding_ty.bits() < 64 {
+                        builder.ins().ireduce(step.binding_ty, bound_widened)
+                    } else {
+                        assert_eq!(
+                            step.binding_ty, pointer_ty,
+                            "codegen Plan B' Stage 6.7: unexpected post-arm-k step \
+                             binding type {:?} for fn `{}`'s chain step {}",
+                            step.binding_ty, synth.k_name, step_idx
+                        );
+                        bound_widened
+                    };
 
-                // Read (k_closure, k_fn) from post_arm_k_1's
-                // closure_ptr at offsets 16/24.
-                let k_closure_v = builder.ins().load(
-                    pointer_ty,
-                    MemFlags::trusted(),
-                    post_arm_k_1_closure_ptr,
-                    16,
-                );
-                let k_fn_v = builder.ins().load(
-                    pointer_ty,
-                    MemFlags::trusted(),
-                    post_arm_k_1_closure_ptr,
-                    24,
-                );
+                    // Closure-record layout for THIS step (Task 100b
+                    // captures-bearing extension):
+                    //   - Middle: [code_ptr, k_closure, k_fn,
+                    //     captures..., prior_bindings...] — k pair at
+                    //     16/24, captures at 32+8*c, prior_bindings at
+                    //     32+8*captures.len()+8*j.
+                    //   - Final: [code_ptr, captures..., prior_bindings...]
+                    //     — captures at 16+8*c, prior_bindings at
+                    //     16+8*captures.len()+8*j (no k pair).
+                    let is_middle = matches!(step.role, PostArmKStepRole::Middle { .. });
+                    let captures = &chain.captures;
+                    let captures_offset_base: i32 = if is_middle { 32 } else { 16 };
+                    let prior_offset_base: i32 = captures_offset_base + 8 * captures.len() as i32;
 
-                let PerFnRefs {
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
-                    handler_frame_new_ref,
-                    handle_push_ref,
-                    handle_pop_ref,
-                    handler_frame_set_arm_ref,
-                    handler_frame_set_return_ref,
-                    perform_ref,
-                    run_loop_ref,
-                    next_step_done_ref: _,
-                    next_step_call_ref,
-                    next_step_args_ptr_ref,
-                    continuation_identity_ref,
-                    handler_arm_refs_per_handle,
-                    handler_return_arm_refs_per_handle,
-                    user_fn_refs,
-                    lit_gvs,
-                } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
+                    // Load (k_closure, k_fn) IF Middle (Final doesn't
+                    // need them).
+                    let k_pair = if is_middle {
+                        let kc = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            16,
+                        );
+                        let kf = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            24,
+                        );
+                        Some((kc, kf))
+                    } else {
+                        None
+                    };
 
-                let mut env: BTreeMap<String, Value> = BTreeMap::new();
-                env.insert(chain.binding_name_1.clone(), r1_value);
+                    // Helper: narrow an I64-loaded slot to the user-
+                    // visible Cranelift type per `EnvSlotKind`.
+                    let narrow_for_kind = |builder: &mut FunctionBuilder<'_>,
+                                           raw: Value,
+                                           kind: crate::ast::EnvSlotKind|
+                     -> Value {
+                        match kind {
+                            crate::ast::EnvSlotKind::Int => raw,
+                            crate::ast::EnvSlotKind::Bool
+                            | crate::ast::EnvSlotKind::Byte
+                            | crate::ast::EnvSlotKind::Unit => {
+                                builder.ins().ireduce(types::I8, raw)
+                            }
+                            crate::ast::EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
+                            crate::ast::EnvSlotKind::String
+                            | crate::ast::EnvSlotKind::Closure
+                            | crate::ast::EnvSlotKind::User => {
+                                if pointer_ty == types::I64 {
+                                    raw
+                                } else {
+                                    builder.ins().ireduce(pointer_ty, raw)
+                                }
+                            }
+                        }
+                    };
 
-                let mut lowerer = Lowerer {
-                    builder,
-                    stackmap: &mut stackmap,
-                    env,
-                    pointer_ty,
-                    closure_ptr: post_arm_k_1_closure_ptr,
-                    lit_gvs,
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
-                    handler_frame_new_ref,
-                    handle_push_ref,
-                    handle_pop_ref,
-                    handler_frame_set_arm_ref,
-                    handler_frame_set_return_ref,
-                    perform_ref,
-                    run_loop_ref,
-                    next_step_call_ref,
-                    next_step_args_ptr_ref,
-                    handler_arm_refs_per_handle,
-                    handler_arm_synth: &handler_arm_synth,
-                    handler_arm_indices: &handler_arm_indices,
-                    handler_return_arm_refs_per_handle,
-                    handler_return_arm_synth: &handler_return_arm_synth,
-                    handler_return_arm_indices: &handler_return_arm_indices,
-                    continuation_identity_ref,
-                    effect_ids: &checked.effect_ids,
-                    op_ids: &checked.op_ids,
-                    effects: &checked.effects,
-                    user_fn_refs,
-                    user_fns: &user_fns,
-                    type_layouts: &type_layouts,
-                    ctor_index: &ctor_index,
-                    match_scrut_tys: &checked.match_scrut_tys,
-                };
-
-                // Lower arg2_expr (pure; reads `r1` from env if needed).
-                let arg2_value = lowerer.lower_expr(&chain.arg2_expr);
-                let arg2_ty = lowerer.builder.func.dfg.value_type(arg2_value);
-                let widened_arg2 = if arg2_ty == types::I64 {
-                    arg2_value
-                } else if arg2_ty.is_int() && arg2_ty.bits() < 64 {
-                    lowerer.builder.ins().uextend(types::I64, arg2_value)
-                } else {
-                    assert_eq!(
-                        arg2_ty, pointer_ty,
-                        "codegen Phase 4e captures+ Slice C: unexpected arg2 \
-                         Cranelift type {arg2_ty:?} for post_arm_k_1 emit"
-                    );
-                    arg2_value
-                };
-
-                // Allocate post_arm_k_2's TAG_CLOSURE record capturing
-                // r1. Bitmap encoding mirrors the comment on
-                // `post_arm_k_1`'s closure record above: bit `i + 1`
-                // marks capture-slot `i`. Here capture[0] = r1; bit 1
-                // is set if r1's `binding_kind_1` is pointer.
-                //
-                // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
-                // `widened_arg2` (above) and `post_arm_k_2_closure_ptr`
-                // (below, returned by `alloc_2_call`) are heap pointers
-                // (when their types are pointer-typed) that live across
-                // the subsequent `next_step_call` arena allocation. See
-                // the central TODO at the synth-cont's
-                // `post_arm_k_closure` load site for the 4-site audit.
-                let count_2: u8 = 2;
-                // capture-slot 0 (r1) is pointer iff its kind is
-                // pointer; bit index = slot_index + 1 = 1.
-                let bitmap_2: u32 = if chain.binding_kind_1.is_pointer() {
-                    1u32 << 1
-                } else {
-                    0
-                };
-                let header_2: u64 = header_word(TAG_CLOSURE, count_2, bitmap_2);
-                let payload_2_bytes: i64 = 8 + 8;
-                let header_2_v = lowerer.builder.ins().iconst(types::I64, header_2 as i64);
-                let payload_2_v = lowerer.builder.ins().iconst(pointer_ty, payload_2_bytes);
-                let alloc_2_call = lowerer
-                    .builder
-                    .ins()
-                    .call(alloc_ref, &[header_2_v, payload_2_v]);
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, alloc_2_call));
-                let post_arm_k_2_closure_ptr = lowerer.builder.inst_results(alloc_2_call)[0];
-                // code_ptr at offset 8 = null.
-                let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
-                lowerer.builder.ins().store(
-                    MemFlags::trusted(),
-                    null_v,
-                    post_arm_k_2_closure_ptr,
-                    8,
-                );
-                // r1 at offset 16, stored as I64. Use the original
-                // `r1_widened` (pre-narrow) directly — the round-trip
-                // narrow-to-binding_ty-then-widen-back-to-I64 was
-                // wasted work for non-Int captures (Bool/Char/etc.).
-                // For Int captures `r1_value == r1_widened` already.
-                // For pointer captures both are I64 on supported
-                // targets (where pointer_ty == I64). Skipping the
-                // round-trip drops two instructions per non-Int
-                // capture without changing the stored bit pattern.
-                lowerer.builder.ins().store(
-                    MemFlags::trusted(),
-                    r1_widened,
-                    post_arm_k_2_closure_ptr,
-                    16,
-                );
-
-                // post_arm_k_2's func_addr.
-                let post_arm_k_2_fn_ref =
-                    module.declare_func_in_func(chain.post_arm_k_2_func_id, lowerer.builder.func);
-                let post_arm_k_2_fn_addr = lowerer
-                    .builder
-                    .ins()
-                    .func_addr(pointer_ty, post_arm_k_2_fn_ref);
-
-                // Build Call(k_closure, k_fn, [arg2,
-                // post_arm_k_2_closure_ptr, post_arm_k_2_fn_addr]).
-                let three_v = lowerer.builder.ins().iconst(types::I32, 3);
-                let call_ns = lowerer
-                    .builder
-                    .ins()
-                    .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
-                let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
-                let argp_call = lowerer
-                    .builder
-                    .ins()
-                    .call(next_step_args_ptr_ref, &[ns_ptr]);
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
-                let argp_v = lowerer.builder.inst_results(argp_call)[0];
-                lowerer.builder.ins().store(
-                    MemFlags::trusted(),
-                    widened_arg2,
-                    argp_v,
-                    POST_ARM_K_ARG_OFF,
-                );
-                lowerer.builder.ins().store(
-                    MemFlags::trusted(),
-                    post_arm_k_2_closure_ptr,
-                    argp_v,
-                    POST_ARM_K_CLOSURE_OFF,
-                );
-                lowerer.builder.ins().store(
-                    MemFlags::trusted(),
-                    post_arm_k_2_fn_addr,
-                    argp_v,
-                    POST_ARM_K_FN_OFF,
-                );
-                lowerer.builder.ins().return_(&[ns_ptr]);
-                lowerer.builder.finalize();
-            }
-            module
-                .define_function(chain.post_arm_k_1_func_id, &mut ctx)
-                .map_err(|e| format!("define post_arm_k_1 synth fn: {e}"))?;
-            module.clear_context(&mut ctx);
-
-            // ---- post_arm_k_2 definition pass ----
-            ctx.func.signature = post_arm_k_chain_sig.clone();
-            ctx.func.name = UserFuncName::user(0, chain.post_arm_k_2_func_id.as_u32());
-            {
-                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-                let mut stackmap = StackMapBuilder::new();
-                let block = builder.create_block();
-                builder.append_block_params_for_function_params(block);
-                builder.switch_to_block(block);
-                builder.seal_block(block);
-
-                let block_params: Vec<Value> = builder.block_params(block).to_vec();
-                // block_params[0] = closure_ptr (post_arm_k_2's own
-                // closure record holding [r1] at offset 16);
-                // block_params[1] = args_ptr (= [r2] from helper
-                // synth-cont's `Call(post_arm_k_2, [synth_cont_result_2])`);
-                // block_params[2] = args_len (== 1).
-                let post_arm_k_2_closure_ptr = block_params[0];
-                let args_ptr = block_params[1];
-
-                // Read r2 from args_ptr[0], narrow per binding_ty_2.
-                let r2_widened = builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), args_ptr, 0);
-                let r2_value = if chain.binding_ty_2 == types::I64 {
-                    r2_widened
-                } else if chain.binding_ty_2.is_int() && chain.binding_ty_2.bits() < 64 {
-                    builder.ins().ireduce(chain.binding_ty_2, r2_widened)
-                } else {
-                    assert_eq!(
-                        chain.binding_ty_2, pointer_ty,
-                        "codegen Phase 4e captures+ Slice C: unexpected r2 binding \
-                         Cranelift type {:?} for post_arm_k_2 in fn `{}`'s chain",
-                        chain.binding_ty_2, synth.k_name
-                    );
-                    r2_widened
-                };
-
-                // Read r1 from closure_ptr at offset 16, narrow per
-                // binding_kind_1.
-                let r1_widened_load = builder.ins().load(
-                    types::I64,
-                    MemFlags::trusted(),
-                    post_arm_k_2_closure_ptr,
-                    16,
-                );
-                let r1_value = match chain.binding_kind_1 {
-                    crate::ast::EnvSlotKind::Int => r1_widened_load,
-                    crate::ast::EnvSlotKind::Bool
-                    | crate::ast::EnvSlotKind::Byte
-                    | crate::ast::EnvSlotKind::Unit => {
-                        builder.ins().ireduce(types::I8, r1_widened_load)
+                    // Load chain captures (op-args) and prior chain
+                    // bindings; build the env.
+                    let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                    for (c, cap) in captures.iter().enumerate() {
+                        let offset: i32 = captures_offset_base + 8 * c as i32;
+                        let raw = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            offset,
+                        );
+                        let val = narrow_for_kind(&mut builder, raw, cap.kind);
+                        env.insert(cap.name.clone(), val);
                     }
-                    crate::ast::EnvSlotKind::Char => {
-                        builder.ins().ireduce(types::I32, r1_widened_load)
+                    for (j, prior) in step.prior_bindings.iter().enumerate() {
+                        let offset: i32 = prior_offset_base + 8 * j as i32;
+                        let raw = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            offset,
+                        );
+                        let val = narrow_for_kind(&mut builder, raw, prior.kind);
+                        env.insert(prior.name.clone(), val);
                     }
-                    crate::ast::EnvSlotKind::String
-                    | crate::ast::EnvSlotKind::Closure
-                    | crate::ast::EnvSlotKind::User => {
-                        if pointer_ty == types::I64 {
-                            r1_widened_load
-                        } else {
-                            builder.ins().ireduce(pointer_ty, r1_widened_load)
+                    env.insert(step.binding_name.clone(), bound_value);
+
+                    let PerFnRefs {
+                        string_new_ref,
+                        alloc_ref,
+                        int_to_string_ref,
+                        handler_frame_new_ref,
+                        handle_push_ref,
+                        handle_pop_ref,
+                        handler_frame_set_arm_ref,
+                        handler_frame_set_return_ref,
+                        perform_ref,
+                        outer_post_arm_k_push_ref: _,
+                        run_loop_ref,
+                        next_step_done_ref,
+                        next_step_call_ref,
+                        next_step_args_ptr_ref,
+                        continuation_identity_ref,
+                        handler_arm_refs_per_handle,
+                        handler_return_arm_refs_per_handle,
+                        user_fn_refs,
+                        lit_gvs,
+                    } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
+
+                    let mut lowerer = Lowerer {
+                        builder,
+                        stackmap: &mut stackmap,
+                        env,
+                        pointer_ty,
+                        closure_ptr: synth_closure_ptr,
+                        lit_gvs,
+                        string_new_ref,
+                        alloc_ref,
+                        int_to_string_ref,
+                        handler_frame_new_ref,
+                        handle_push_ref,
+                        handle_pop_ref,
+                        handler_frame_set_arm_ref,
+                        handler_frame_set_return_ref,
+                        perform_ref,
+                        run_loop_ref,
+                        next_step_call_ref,
+                        next_step_args_ptr_ref,
+                        handler_arm_refs_per_handle,
+                        handler_arm_synth: &handler_arm_synth,
+                        handler_arm_indices: &handler_arm_indices,
+                        handler_return_arm_refs_per_handle,
+                        handler_return_arm_synth: &handler_return_arm_synth,
+                        handler_return_arm_indices: &handler_return_arm_indices,
+                        continuation_identity_ref,
+                        effect_ids: &checked.effect_ids,
+                        op_ids: &checked.op_ids,
+                        effects: &checked.effects,
+                        user_fn_refs,
+                        user_fns: &user_fns,
+                        type_layouts: &type_layouts,
+                        ctor_index: &ctor_index,
+                        match_scrut_tys: &checked.match_scrut_tys,
+                    };
+
+                    match &step.role {
+                        PostArmKStepRole::Final { tail_expr } => {
+                            // Final: lower tail with full env, widen,
+                            // return Done.
+                            let tail_value = lowerer.lower_expr(tail_expr);
+                            let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
+                            let widened_tail = if actual_tail_ty == types::I64 {
+                                tail_value
+                            } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
+                                lowerer.builder.ins().uextend(types::I64, tail_value)
+                            } else {
+                                assert_eq!(
+                                    actual_tail_ty, pointer_ty,
+                                    "codegen Plan B' Stage 6.7: unexpected Final-step \
+                                     tail Cranelift type {actual_tail_ty:?} for fn \
+                                     `{}`'s chain step {}",
+                                    synth.k_name, step_idx
+                                );
+                                tail_value
+                            };
+                            let done_call = lowerer
+                                .builder
+                                .ins()
+                                .call(next_step_done_ref, &[widened_tail]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                done_call,
+                            ));
+                            let next_step = lowerer.builder.inst_results(done_call)[0];
+                            lowerer.builder.ins().return_(&[next_step]);
+                            lowerer.builder.finalize();
+                        }
+                        PostArmKStepRole::Middle {
+                            next_arg_expr,
+                            next_step_func_id,
+                        } => {
+                            // Middle: lower next_arg_expr (env has
+                            // prior bindings + this binding), allocate
+                            // next step's closure record, dispatch.
+                            //
+                            // Note: B.1 (arm-side N-let chain) Middle
+                            // dispatches to the next chain step via
+                            // next_step_call (a CPS Call to the next
+                            // synth-cont). It does NOT push onto the
+                            // outer post_arm_k stack — only B.2 helper
+                            // Middle pushes (line ~8005), and only
+                            // because helper Middle issues a fresh
+                            // sigil_perform whose Done unwinds back to
+                            // the trampoline. B.1 Middle's dispatch
+                            // stays on the trampoline's existing chain
+                            // (helper synth-cont → arm post_arm_k →
+                            // step[0] → step[1] → … → Final), so its
+                            // Done already routes through the right
+                            // continuation without any push.
+                            let next_arg_value = lowerer.lower_expr(next_arg_expr);
+                            let next_arg_ty = lowerer.builder.func.dfg.value_type(next_arg_value);
+                            let widened_next_arg = if next_arg_ty == types::I64 {
+                                next_arg_value
+                            } else if next_arg_ty.is_int() && next_arg_ty.bits() < 64 {
+                                lowerer.builder.ins().uextend(types::I64, next_arg_value)
+                            } else {
+                                assert_eq!(
+                                    next_arg_ty, pointer_ty,
+                                    "codegen Plan B' Stage 6.7: unexpected next_arg \
+                                     Cranelift type {next_arg_ty:?} for fn `{}`'s \
+                                     chain step {}",
+                                    synth.k_name, step_idx
+                                );
+                                next_arg_value
+                            };
+
+                            // Allocate the next step's closure record.
+                            // Layout (Task 100b captures-bearing):
+                            //   - Middle next: [code_ptr, k_closure,
+                            //     k_fn, captures..., prior_bindings...,
+                            //     this_binding].
+                            //   - Final next:  [code_ptr, captures...,
+                            //     prior_bindings..., this_binding].
+                            // captures count is constant across the
+                            // chain; prior_bindings of next step
+                            // grows by 1 (this step's binding).
+                            let next_step = &chain.steps[step_idx + 1];
+                            let next_is_middle =
+                                matches!(next_step.role, PostArmKStepRole::Middle { .. });
+                            let prior_count_next = next_step.prior_bindings.len();
+                            let (next_capture_count, next_captures_off, next_prior_offset_base): (
+                                usize,
+                                i32,
+                                i32,
+                            ) = if next_is_middle {
+                                // Middle: k_closure(0) + k_fn(1) +
+                                // captures(2..2+C) +
+                                // prior_bindings(2+C..2+C+P).
+                                let c = captures.len();
+                                let p = prior_count_next;
+                                (2 + c + p, 32, 32 + 8 * c as i32)
+                            } else {
+                                // Final: captures(0..C) +
+                                // prior_bindings(C..C+P).
+                                let c = captures.len();
+                                let p = prior_count_next;
+                                (c + p, 16, 16 + 8 * c as i32)
+                            };
+                            assert!(
+                                next_capture_count < MAX_CLOSURE_ENV_SLOTS,
+                                "Plan B' Stage 6.7: chain-step closure capture count \
+                                 {next_capture_count} >= {MAX_CLOSURE_ENV_SLOTS} \
+                                 exceeds bitmap layout for fn `{}`'s chain step {}",
+                                synth.k_name,
+                                step_idx
+                            );
+                            let mut bitmap: u32 = 0;
+                            if next_is_middle {
+                                bitmap |= 1u32 << 1; // k_closure (slot 0)
+                                                     // k_fn (slot 1) is non-pointer.
+                                for (c, cap) in captures.iter().enumerate() {
+                                    if cap.kind.is_pointer() {
+                                        bitmap |= 1u32 << (2 + c + 1);
+                                    }
+                                }
+                                for (j, p) in next_step.prior_bindings.iter().enumerate() {
+                                    if p.kind.is_pointer() {
+                                        bitmap |= 1u32 << (2 + captures.len() + j + 1);
+                                    }
+                                }
+                            } else {
+                                for (c, cap) in captures.iter().enumerate() {
+                                    if cap.kind.is_pointer() {
+                                        bitmap |= 1u32 << (c + 1);
+                                    }
+                                }
+                                for (j, p) in next_step.prior_bindings.iter().enumerate() {
+                                    if p.kind.is_pointer() {
+                                        bitmap |= 1u32 << (captures.len() + j + 1);
+                                    }
+                                }
+                            }
+                            let count: u8 = 1 + next_capture_count as u8;
+                            let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
+                            let payload_bytes: i64 = 8 + 8 * next_capture_count as i64;
+                            let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
+                            let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                            let alloc_call = lowerer
+                                .builder
+                                .ins()
+                                .call(lowerer.alloc_ref, &[header_v, payload_v]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                alloc_call,
+                            ));
+                            let next_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
+                            // code_ptr at offset 8 = null.
+                            let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                null_v,
+                                next_closure_ptr,
+                                8,
+                            );
+                            // For Middle next step: store k pair at
+                            // offsets 16/24.
+                            if next_is_middle {
+                                let (kc, kf) = match k_pair {
+                                    Some(p) => p,
+                                    None => unreachable!(
+                                        "outer Middle role implies k_pair was loaded; \
+                                         inner next-step Middle requires forwarding k pair"
+                                    ),
+                                };
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    kc,
+                                    next_closure_ptr,
+                                    16,
+                                );
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    kf,
+                                    next_closure_ptr,
+                                    24,
+                                );
+                            }
+                            // Forward-copy chain captures (raw I64)
+                            // from this step's closure to next step's
+                            // closure (constant across the chain).
+                            for c in 0..captures.len() {
+                                let src_off: i32 = captures_offset_base + 8 * c as i32;
+                                let dst_off: i32 = next_captures_off + 8 * c as i32;
+                                let raw = lowerer.builder.ins().load(
+                                    types::I64,
+                                    MemFlags::trusted(),
+                                    synth_closure_ptr,
+                                    src_off,
+                                );
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    raw,
+                                    next_closure_ptr,
+                                    dst_off,
+                                );
+                            }
+                            // Forward-copy prior bindings (raw I64).
+                            for j in 0..step.prior_bindings.len() {
+                                let src_off: i32 = prior_offset_base + 8 * j as i32;
+                                let dst_off: i32 = next_prior_offset_base + 8 * j as i32;
+                                let raw = lowerer.builder.ins().load(
+                                    types::I64,
+                                    MemFlags::trusted(),
+                                    synth_closure_ptr,
+                                    src_off,
+                                );
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    raw,
+                                    next_closure_ptr,
+                                    dst_off,
+                                );
+                            }
+                            // Append this step's binding (raw I64
+                            // form: `bound_widened`) at the end.
+                            let this_binding_offset: i32 =
+                                next_prior_offset_base + 8 * step.prior_bindings.len() as i32;
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                bound_widened,
+                                next_closure_ptr,
+                                this_binding_offset,
+                            );
+
+                            // func_addr for the next step's synth fn.
+                            let next_step_fn_ref = module
+                                .declare_func_in_func(*next_step_func_id, lowerer.builder.func);
+                            let next_step_fn_addr = lowerer
+                                .builder
+                                .ins()
+                                .func_addr(pointer_ty, next_step_fn_ref);
+
+                            // Build Call(k_closure, k_fn, [next_arg,
+                            // next_closure, next_step_fn_addr]). Outer
+                            // Middle role guarantees k_pair was loaded
+                            // at fn entry.
+                            let (k_closure_v, k_fn_v) = match k_pair {
+                                Some(p) => p,
+                                None => unreachable!(
+                                    "outer Middle role implies k_pair was loaded for \
+                                     dispatching the next k call"
+                                ),
+                            };
+                            let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                            let call_ns = lowerer
+                                .builder
+                                .ins()
+                                .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
+                            lowerer
+                                .stackmap
+                                .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                            let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                            let argp_call = lowerer
+                                .builder
+                                .ins()
+                                .call(next_step_args_ptr_ref, &[ns_ptr]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                argp_call,
+                            ));
+                            let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                widened_next_arg,
+                                argp_v,
+                                POST_ARM_K_ARG_OFF,
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                next_closure_ptr,
+                                argp_v,
+                                POST_ARM_K_CLOSURE_OFF,
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                next_step_fn_addr,
+                                argp_v,
+                                POST_ARM_K_FN_OFF,
+                            );
+                            lowerer.builder.ins().return_(&[ns_ptr]);
+                            lowerer.builder.finalize();
                         }
                     }
-                };
-
-                let mut env: BTreeMap<String, Value> = BTreeMap::new();
-                env.insert(chain.binding_name_1.clone(), r1_value);
-                env.insert(chain.binding_name_2.clone(), r2_value);
-
-                let PerFnRefs {
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
-                    handler_frame_new_ref,
-                    handle_push_ref,
-                    handle_pop_ref,
-                    handler_frame_set_arm_ref,
-                    handler_frame_set_return_ref,
-                    perform_ref,
-                    run_loop_ref,
-                    next_step_done_ref,
-                    next_step_call_ref,
-                    next_step_args_ptr_ref,
-                    continuation_identity_ref,
-                    handler_arm_refs_per_handle,
-                    handler_return_arm_refs_per_handle,
-                    user_fn_refs,
-                    lit_gvs,
-                } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
-
-                let mut lowerer = Lowerer {
-                    builder,
-                    stackmap: &mut stackmap,
-                    env,
-                    pointer_ty,
-                    closure_ptr: post_arm_k_2_closure_ptr,
-                    lit_gvs,
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
-                    handler_frame_new_ref,
-                    handle_push_ref,
-                    handle_pop_ref,
-                    handler_frame_set_arm_ref,
-                    handler_frame_set_return_ref,
-                    perform_ref,
-                    run_loop_ref,
-                    next_step_call_ref,
-                    next_step_args_ptr_ref,
-                    handler_arm_refs_per_handle,
-                    handler_arm_synth: &handler_arm_synth,
-                    handler_arm_indices: &handler_arm_indices,
-                    handler_return_arm_refs_per_handle,
-                    handler_return_arm_synth: &handler_return_arm_synth,
-                    handler_return_arm_indices: &handler_return_arm_indices,
-                    continuation_identity_ref,
-                    effect_ids: &checked.effect_ids,
-                    op_ids: &checked.op_ids,
-                    effects: &checked.effects,
-                    user_fn_refs,
-                    user_fns: &user_fns,
-                    type_layouts: &type_layouts,
-                    ctor_index: &ctor_index,
-                    match_scrut_tys: &checked.match_scrut_tys,
-                };
-
-                let tail_value = lowerer.lower_expr(&chain.tail_expr);
-                // Slice C bug fix: read the actual lowered Cranelift
-                // type from the SSA value, not from the pre-stored
-                // `chain.tail_ty`. The pre-pass set `tail_ty =
-                // body_ty` (op's declared return type), but the arm
-                // body's overall return type is the handle's overall
-                // type — those differ when the op's return type
-                // doesn't match the arm body's tail type (e.g., op
-                // returns Bool but arm tail is `r1 + r2` returning
-                // Int). Same fix applied to Slice B's post_arm_k
-                // synth fn (which had the latent bug but didn't
-                // surface in its tests).
-                let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
-                let widened_tail = if actual_tail_ty == types::I64 {
-                    tail_value
-                } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
-                    lowerer.builder.ins().uextend(types::I64, tail_value)
-                } else {
-                    assert_eq!(
-                        actual_tail_ty, pointer_ty,
-                        "codegen Phase 4e captures+ Slice C: unexpected post_arm_k_2 \
-                         tail Cranelift type {actual_tail_ty:?} for fn `{}`'s chain",
-                        synth.k_name
-                    );
-                    tail_value
-                };
-                let done_call = lowerer
-                    .builder
-                    .ins()
-                    .call(next_step_done_ref, &[widened_tail]);
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, done_call));
-                let next_step = lowerer.builder.inst_results(done_call)[0];
-                lowerer.builder.ins().return_(&[next_step]);
-                lowerer.builder.finalize();
+                }
+                module
+                    .define_function(step.func_id, &mut ctx)
+                    .map_err(|e| {
+                        format!(
+                            "define post_arm_k_{} synth fn for `{}`'s chain: {e}",
+                            step_idx + 1,
+                            synth.k_name
+                        )
+                    })?;
+                module.clear_context(&mut ctx);
             }
-            module
-                .define_function(chain.post_arm_k_2_func_id, &mut ctx)
-                .map_err(|e| format!("define post_arm_k_2 synth fn: {e}"))?;
-            module.clear_context(&mut ctx);
         }
     }
 
@@ -6764,8 +7486,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // Slice A: load post-arm-k pair from args_ptr at the
                 // trailing-pair offsets defined by the convention
                 // (closure at +8, fn at +16; arg at +0). Used by both
-                // ConstantDone and LetBindThenTail arms to dispatch
-                // their result through the post-arm-k continuation.
+                // ConstantDone and ChainedLetBindStep::Final arms to
+                // dispatch their result through the post-arm-k
+                // continuation.
                 //
                 // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
                 // This marker covers FOUR sites where heap pointers
@@ -6857,67 +7580,79 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         builder.ins().return_(&[next_step]);
                         builder.finalize();
                     }
-                    CpsContinuationKind::LetBindThenTail {
+                    CpsContinuationKind::ChainedLetBindStep {
                         binding_name,
                         binding_ty,
-                        tail_expr,
-                        tail_ty,
+                        binding_kind,
                         captures,
+                        prior_bindings,
+                        role,
                     } => {
-                        // Captures-bearing let-yield-then-pure-tail
-                        // shape: load `args_ptr[0]` as I64, narrow
-                        // to `binding_ty`, bind in env under
-                        // `binding_name`. For each capture in
-                        // `captures`, load from `closure_ptr` at
-                        // offset `16 + 8*i` (mirroring user-lambda
-                        // closure_env_load), narrow per kind, bind
-                        // in env. Then lower `tail_expr` via
-                        // Lowerer, widen result to I64, emit
-                        // `Done(value)`.
+                        // Plan B' Stage 6.7 Tasks 94+95 (B.2 Phase B+C):
+                        // chained let-yield-then-pure-tail synth-cont.
+                        // Each step's incoming `args_ptr` carries the
+                        // 3-slot trailing-pair shape `[arg, post_arm_k_
+                        // closure, post_arm_k_fn]` (per the Slice A
+                        // convention); each step's incoming `closure_-
+                        // ptr` carries `captures + prior_bindings`
+                        // packed at offsets 16+8*i (captures first,
+                        // prior_bindings second).
                         //
-                        // When `captures` is empty (arity-0 helper
-                        // OR tail not referencing helper's params),
-                        // helper passed null `closure_ptr`; the
-                        // capture-load loop runs zero iterations
-                        // and the env contains only the binding.
+                        // Final step (last in the chain): bind
+                        // `args_ptr[0]` → binding_name, load captures
+                        // + prior_bindings into env, lower tail_expr
+                        // via Lowerer, dispatch via post_arm_k.
+                        //
+                        // Middle step (not the last in the chain):
+                        // bind args_ptr[0] → binding_name, load captures
+                        // + prior_bindings, allocate next-step closure
+                        // record holding `captures + prior_bindings +
+                        // this binding`, lower next_perform's args via
+                        // Lowerer (env has all bindings + captures
+                        // available), `sigil_perform(next_perform, ...,
+                        // k_closure=next_closure_record, k_fn=
+                        // next_step_func_addr)`, return the resulting
+                        // NextStep up to the trampoline. Middle steps
+                        // intentionally **ignore** their incoming
+                        // post_arm_k_*; the chain's terminal dispatch
+                        // happens through the Final step's args_ptr
+                        // post_arm_k pair (which for tail-`k` arms is
+                        // `(null, identity)` — the chain terminates
+                        // with `Done(tail_value)`).
                         let args_ptr = block_params[1];
-                        let widened =
+                        let synth_closure_ptr = block_params[0];
+
+                        // Bind args_ptr[0] under binding_name.
+                        let widened_arg =
                             builder
                                 .ins()
                                 .load(types::I64, MemFlags::trusted(), args_ptr, 0);
                         let bound_value = if *binding_ty == types::I64 {
-                            widened
+                            widened_arg
                         } else if binding_ty.is_int() && binding_ty.bits() < 64 {
-                            builder.ins().ireduce(*binding_ty, widened)
+                            builder.ins().ireduce(*binding_ty, widened_arg)
                         } else {
                             assert_eq!(
                                 *binding_ty, pointer_ty,
-                                "codegen Phase 4e: unexpected synth-cont binding \
-                                 type {binding_ty:?} for fn `{}`",
+                                "codegen Plan B' Stage 6.7: unexpected ChainedLetBindStep \
+                                 binding type {binding_ty:?} for fn `{}`",
                                 synth.parent_fn_name
                             );
-                            widened
+                            widened_arg
                         };
 
                         let mut env: BTreeMap<String, Value> = BTreeMap::new();
                         env.insert(binding_name.clone(), bound_value);
 
-                        // Captures-bearing extension: read each
-                        // capture from `closure_ptr` at offset 16 +
-                        // 8*i. Mirrors `lower_closure_env_load`
-                        // (which reads from `self.closure_ptr`); we
-                        // emit the loads here directly because we
-                        // pre-Lowerer-construction.
-                        let synth_closure_ptr = block_params[0];
-                        for (i, capture) in captures.iter().enumerate() {
-                            let offset: i32 = 16 + 8 * i as i32;
-                            let raw = builder.ins().load(
-                                types::I64,
-                                MemFlags::trusted(),
-                                synth_closure_ptr,
-                                offset,
-                            );
-                            let val = match capture.kind {
+                        // Helper: narrow an I64-loaded slot to the
+                        // user-visible Cranelift type per `EnvSlotKind`.
+                        // Same closure-env load discipline as user-lambda
+                        // closures.
+                        let narrow_for_kind = |builder: &mut FunctionBuilder<'_>,
+                                               raw: Value,
+                                               kind: EnvSlotKind|
+                         -> Value {
+                            match kind {
                                 EnvSlotKind::Int => raw,
                                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                                     builder.ins().ireduce(types::I8, raw)
@@ -6930,17 +7665,37 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         builder.ins().ireduce(pointer_ty, raw)
                                     }
                                 }
-                            };
+                            }
+                        };
+
+                        // Load captures from synth-cont's closure_ptr
+                        // at offsets 16 + 8*i for i in 0..captures.len().
+                        for (i, capture) in captures.iter().enumerate() {
+                            let offset: i32 = 16 + 8 * i as i32;
+                            let raw = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                synth_closure_ptr,
+                                offset,
+                            );
+                            let val = narrow_for_kind(&mut builder, raw, capture.kind);
                             env.insert(capture.name.clone(), val);
                         }
 
-                        // Plan B Task 55, Phase 4e — per-fn FuncRefs
-                        // via shared `prepare_per_fn_refs` helper.
-                        // The synth-cont (LetBindThenTail) body
-                        // doesn't use the tail-`k` lowering refs
-                        // (those are arm-fn-only); unreferenced
-                        // FuncRefs sit in `dfg.ext_funcs` without
-                        // emitting relocations.
+                        // Load prior_bindings from synth-cont's closure
+                        // _ptr at offsets 16 + 8*(captures.len()+j).
+                        for (j, prior) in prior_bindings.iter().enumerate() {
+                            let offset: i32 = 16 + 8 * (captures.len() + j) as i32;
+                            let raw = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                synth_closure_ptr,
+                                offset,
+                            );
+                            let val = narrow_for_kind(&mut builder, raw, prior.kind);
+                            env.insert(prior.name.clone(), val);
+                        }
+
                         let PerFnRefs {
                             string_new_ref,
                             alloc_ref,
@@ -6951,6 +7706,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_arm_ref,
                             handler_frame_set_return_ref,
                             perform_ref,
+                            outer_post_arm_k_push_ref,
                             run_loop_ref,
                             next_step_done_ref: _,
                             next_step_call_ref,
@@ -6999,32 +7755,307 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             match_scrut_tys: &checked.match_scrut_tys,
                         };
 
-                        let tail_value = lowerer.lower_expr(tail_expr.as_ref());
-                        let widened_tail = if *tail_ty == types::I64 {
-                            tail_value
-                        } else if tail_ty.is_int() && tail_ty.bits() < 64 {
-                            lowerer.builder.ins().uextend(types::I64, tail_value)
-                        } else {
-                            assert_eq!(
-                                *tail_ty, pointer_ty,
-                                "codegen Phase 4e: unexpected synth-cont tail \
-                                 type {tail_ty:?} for fn `{}`",
-                                synth.parent_fn_name
-                            );
-                            tail_value
-                        };
+                        match role {
+                            ChainStepRole::Final { tail_expr, tail_ty } => {
+                                let tail_value = lowerer.lower_expr(tail_expr.as_ref());
+                                let widened_tail = if *tail_ty == types::I64 {
+                                    tail_value
+                                } else if tail_ty.is_int() && tail_ty.bits() < 64 {
+                                    lowerer.builder.ins().uextend(types::I64, tail_value)
+                                } else {
+                                    assert_eq!(
+                                        *tail_ty, pointer_ty,
+                                        "codegen Plan B' Stage 6.7: unexpected \
+                                         ChainedLetBindStep Final tail type {tail_ty:?} \
+                                         for fn `{}`",
+                                        synth.parent_fn_name
+                                    );
+                                    tail_value
+                                };
+                                let next_step = emit_dispatch_to_post_arm_k(
+                                    &mut lowerer.builder,
+                                    lowerer.stackmap,
+                                    widened_tail,
+                                );
+                                lowerer.builder.ins().return_(&[next_step]);
+                                lowerer.builder.finalize();
+                            }
+                            ChainStepRole::Middle {
+                                next_perform,
+                                next_step_func_id,
+                            } => {
+                                // Allocate next-step closure record:
+                                // header at +0, null code_ptr at +8,
+                                // captures at +16+8*i, prior_bindings
+                                // at +16+8*(captures.len()+j), this
+                                // step's binding at +16+8*(captures
+                                // .len()+prior_bindings.len()).
+                                let next_slot_count = captures.len() + prior_bindings.len() + 1;
+                                assert!(
+                                    next_slot_count < MAX_CLOSURE_ENV_SLOTS,
+                                    "Plan B' Stage 6.7: chain-step closure env \
+                                     {next_slot_count} >= {MAX_CLOSURE_ENV_SLOTS} \
+                                     exceeds bitmap layout for fn `{}`. \
+                                     The chained classifier rejects bare-chain \
+                                     length >= MAX_CLOSURE_ENV_SLOTS as a \
+                                     conservative bound; this trip means the \
+                                     specific combination of captures + \
+                                     prior_bindings + binding (= {next_slot_count}) \
+                                     exceeds the cap even though the chain \
+                                     length alone is below it. Workarounds: \
+                                     reduce helper user-param count, or split \
+                                     the chain across two helpers with the \
+                                     intermediate result threaded as a single \
+                                     argument.",
+                                    synth.parent_fn_name
+                                );
+                                let mut bitmap: u32 = 0;
+                                for (i, c) in captures.iter().enumerate() {
+                                    if c.kind.is_pointer() {
+                                        bitmap |= 1u32 << (i + 1);
+                                    }
+                                }
+                                for (j, p) in prior_bindings.iter().enumerate() {
+                                    if p.kind.is_pointer() {
+                                        bitmap |= 1u32 << (captures.len() + j + 1);
+                                    }
+                                }
+                                if binding_kind.is_pointer() {
+                                    bitmap |= 1u32 << (captures.len() + prior_bindings.len() + 1);
+                                }
+                                let count: u8 = 1 + next_slot_count as u8;
+                                let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
+                                let payload_bytes: i64 = 8 + 8 * next_slot_count as i64;
 
-                        // Slice A: dispatch the tail value through the
-                        // post-arm-k continuation (read at synth-cont
-                        // entry from `args_ptr[1..3]`) instead of
-                        // returning `Done` directly.
-                        let next_step = emit_dispatch_to_post_arm_k(
-                            &mut lowerer.builder,
-                            lowerer.stackmap,
-                            widened_tail,
-                        );
-                        lowerer.builder.ins().return_(&[next_step]);
-                        lowerer.builder.finalize();
+                                let header_v =
+                                    lowerer.builder.ins().iconst(types::I64, header as i64);
+                                let payload_v =
+                                    lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                                let alloc_call = lowerer
+                                    .builder
+                                    .ins()
+                                    .call(lowerer.alloc_ref, &[header_v, payload_v]);
+                                lowerer.stackmap.push_placeholder(function_code_offset(
+                                    &lowerer.builder,
+                                    alloc_call,
+                                ));
+                                let next_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
+
+                                // Null code_ptr at +8.
+                                let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    null_v,
+                                    next_closure_ptr,
+                                    8,
+                                );
+
+                                // Copy captures (raw I64) from this
+                                // step's synth_closure_ptr to
+                                // next_closure_ptr at the same offsets.
+                                for i in 0..captures.len() {
+                                    let offset: i32 = 16 + 8 * i as i32;
+                                    let raw = lowerer.builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        synth_closure_ptr,
+                                        offset,
+                                    );
+                                    lowerer.builder.ins().store(
+                                        MemFlags::trusted(),
+                                        raw,
+                                        next_closure_ptr,
+                                        offset,
+                                    );
+                                }
+                                // Copy prior_bindings (raw I64).
+                                for j in 0..prior_bindings.len() {
+                                    let offset: i32 = 16 + 8 * (captures.len() + j) as i32;
+                                    let raw = lowerer.builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        synth_closure_ptr,
+                                        offset,
+                                    );
+                                    lowerer.builder.ins().store(
+                                        MemFlags::trusted(),
+                                        raw,
+                                        next_closure_ptr,
+                                        offset,
+                                    );
+                                }
+                                // Append this step's binding (already
+                                // widened to I64 at the args_ptr load
+                                // — non-pointer-typed values were
+                                // narrowed to a smaller type for
+                                // binding in env, but the I64 raw
+                                // value is the canonical slot encoding
+                                // matching closure-record + helper-
+                                // body-emit storage discipline).
+                                let this_binding_offset: i32 =
+                                    16 + 8 * (captures.len() + prior_bindings.len()) as i32;
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    widened_arg,
+                                    next_closure_ptr,
+                                    this_binding_offset,
+                                );
+
+                                // Resolve effect_id + op_id for the
+                                // next perform.
+                                let effect_id = match checked.effect_ids.get(&next_perform.effect) {
+                                    Some(id) => *id,
+                                    None => unreachable!(
+                                        "codegen Plan B' Stage 6.7: effect `{}` \
+                                             missing from effect_ids map; typecheck \
+                                             E0042 should have caught this",
+                                        next_perform.effect
+                                    ),
+                                };
+                                let op_id = match checked
+                                    .op_ids
+                                    .get(&(next_perform.effect.clone(), next_perform.op.clone()))
+                                {
+                                    Some(id) => *id,
+                                    None => unreachable!(
+                                        "codegen Plan B' Stage 6.7: op_id missing for \
+                                         `{}.{}`; typecheck E0043 should have caught this",
+                                        next_perform.effect, next_perform.op
+                                    ),
+                                };
+                                let effect_id_v =
+                                    lowerer.builder.ins().iconst(types::I32, effect_id as i64);
+                                let op_id_v =
+                                    lowerer.builder.ins().iconst(types::I32, op_id as i64);
+
+                                // Lower next_perform's args via Lowerer
+                                // (env has captures + prior_bindings +
+                                // this binding). Mirrors helper body
+                                // emit's perform-arg packing.
+                                let (perform_args_ptr, perform_args_len) =
+                                    if next_perform.args.is_empty() {
+                                        (
+                                            lowerer.builder.ins().iconst(pointer_ty, 0),
+                                            lowerer.builder.ins().iconst(types::I32, 0),
+                                        )
+                                    } else {
+                                        let arg_values: Vec<Value> = next_perform
+                                            .args
+                                            .iter()
+                                            .map(|a| lowerer.lower_expr(a))
+                                            .collect();
+                                        let slot_bytes = (next_perform.args.len() * 8) as u32;
+                                        let slot = lowerer.builder.create_sized_stack_slot(
+                                            StackSlotData::new(
+                                                StackSlotKind::ExplicitSlot,
+                                                slot_bytes,
+                                                3,
+                                            ),
+                                        );
+                                        for (i, arg_v) in arg_values.into_iter().enumerate() {
+                                            let arg_ty = lowerer.builder.func.dfg.value_type(arg_v);
+                                            let widened_arg_v = if arg_ty == types::I64 {
+                                                arg_v
+                                            } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                                                lowerer.builder.ins().uextend(types::I64, arg_v)
+                                            } else {
+                                                assert_eq!(
+                                                    arg_ty, pointer_ty,
+                                                    "codegen Plan B' Stage 6.7: \
+                                                     unexpected next-perform arg \
+                                                     type {arg_ty:?} for fn `{}`",
+                                                    synth.parent_fn_name
+                                                );
+                                                arg_v
+                                            };
+                                            lowerer.builder.ins().stack_store(
+                                                widened_arg_v,
+                                                slot,
+                                                (i * 8) as i32,
+                                            );
+                                        }
+                                        (
+                                            lowerer.builder.ins().stack_addr(pointer_ty, slot, 0),
+                                            lowerer
+                                                .builder
+                                                .ins()
+                                                .iconst(types::I32, next_perform.args.len() as i64),
+                                        )
+                                    };
+
+                                // func_addr for the next step's synth-
+                                // cont fn. Used as `k_fn` for the
+                                // perform call so the resumed arm's
+                                // `k(value)` lands in the next step.
+                                let next_step_fn_ref = module
+                                    .declare_func_in_func(*next_step_func_id, lowerer.builder.func);
+                                let next_step_fn_addr = lowerer
+                                    .builder
+                                    .ins()
+                                    .func_addr(pointer_ty, next_step_fn_ref);
+
+                                // Plan B' Stage 6.7 multi-shot
+                                // composition fix: BEFORE sigil_perform,
+                                // load the outer arm's post_arm_k pair
+                                // from this step's incoming args_ptr
+                                // (slots POST_ARM_K_CLOSURE_OFF /
+                                // POST_ARM_K_FN_OFF) and push it onto
+                                // the runtime's outer-post_arm_k stack.
+                                // Helper Middle dispatches sigil_perform
+                                // for the next perform — that perform
+                                // dispatches an inner arm whose chain
+                                // eventually returns Done; the
+                                // trampoline's Done branch pops this
+                                // pushed pair and routes Done's value
+                                // through the outer arm's chain.
+                                let outer_post_arm_k_closure = lowerer.builder.ins().load(
+                                    pointer_ty,
+                                    MemFlags::trusted(),
+                                    args_ptr,
+                                    POST_ARM_K_CLOSURE_OFF,
+                                );
+                                let outer_post_arm_k_fn = lowerer.builder.ins().load(
+                                    pointer_ty,
+                                    MemFlags::trusted(),
+                                    args_ptr,
+                                    POST_ARM_K_FN_OFF,
+                                );
+                                let push_call = lowerer.builder.ins().call(
+                                    outer_post_arm_k_push_ref,
+                                    &[outer_post_arm_k_closure, outer_post_arm_k_fn],
+                                );
+                                lowerer.stackmap.push_placeholder(function_code_offset(
+                                    &lowerer.builder,
+                                    push_call,
+                                ));
+
+                                // sigil_perform call. The trampoline
+                                // dispatches the perform's arm with
+                                // `k = (next_closure_ptr, &next_step
+                                // _synth)`; arm's `k(value)` lands in
+                                // the next step's synth-cont with
+                                // `args_ptr[0] = value` and the
+                                // `next_closure_ptr` it loaded from.
+                                let perform_call = lowerer.builder.ins().call(
+                                    lowerer.perform_ref,
+                                    &[
+                                        effect_id_v,
+                                        op_id_v,
+                                        perform_args_ptr,
+                                        perform_args_len,
+                                        next_closure_ptr,
+                                        next_step_fn_addr,
+                                    ],
+                                );
+                                lowerer.stackmap.push_placeholder(function_code_offset(
+                                    &lowerer.builder,
+                                    perform_call,
+                                ));
+                                let next_step_ns = lowerer.builder.inst_results(perform_call)[0];
+                                lowerer.builder.ins().return_(&[next_step_ns]);
+                                lowerer.builder.finalize();
+                            }
+                        }
                     }
                 }
             }
@@ -9545,7 +10576,7 @@ const POST_ARM_K_FN_OFF: i32 = 16;
 /// construction. Used at the three sites that need a full per-fn
 /// FuncRef set: the user-fn body emit loop, the synth-arm-fn body
 /// emit loop, and the synth-cont definition pass for
-/// [`CpsContinuationKind::LetBindThenTail`]. Borrows are `'a`-bound
+/// [`CpsContinuationKind::ChainedLetBindStep`]. Borrows are `'a`-bound
 /// to the `emit_object` stack frame; the context is constructed
 /// once and re-used for each fn.
 ///
@@ -9564,6 +10595,10 @@ struct PerFnRefsCtx<'a> {
     handler_frame_set_arm: cranelift_module::FuncId,
     handler_frame_set_return: cranelift_module::FuncId,
     perform_func: cranelift_module::FuncId,
+    /// Plan B' Stage 6.7 multi-shot composition fix —
+    /// `sigil_outer_post_arm_k_push` FuncId, called from B.2 helper
+    /// Middle's emit before sigil_perform.
+    outer_post_arm_k_push: cranelift_module::FuncId,
     run_loop: cranelift_module::FuncId,
     next_step_done: cranelift_module::FuncId,
     next_step_call: cranelift_module::FuncId,
@@ -9611,6 +10646,9 @@ struct PerFnRefs {
     handler_frame_set_arm_ref: FuncRef,
     handler_frame_set_return_ref: FuncRef,
     perform_ref: FuncRef,
+    /// Plan B' Stage 6.7 multi-shot composition fix —
+    /// `sigil_outer_post_arm_k_push` FuncRef, used by B.2 helper Middle's emit.
+    outer_post_arm_k_push_ref: FuncRef,
     run_loop_ref: FuncRef,
     next_step_done_ref: FuncRef,
     next_step_call_ref: FuncRef,
@@ -9652,6 +10690,8 @@ fn prepare_per_fn_refs(
     let handler_frame_set_return_ref =
         module.declare_func_in_func(ctx.handler_frame_set_return, builder.func);
     let perform_ref = module.declare_func_in_func(ctx.perform_func, builder.func);
+    let outer_post_arm_k_push_ref =
+        module.declare_func_in_func(ctx.outer_post_arm_k_push, builder.func);
     let run_loop_ref = module.declare_func_in_func(ctx.run_loop, builder.func);
     let next_step_done_ref = module.declare_func_in_func(ctx.next_step_done, builder.func);
     let next_step_call_ref = module.declare_func_in_func(ctx.next_step_call, builder.func);
@@ -9727,6 +10767,7 @@ fn prepare_per_fn_refs(
         handler_frame_set_arm_ref,
         handler_frame_set_return_ref,
         perform_ref,
+        outer_post_arm_k_push_ref,
         run_loop_ref,
         next_step_done_ref,
         next_step_call_ref,
@@ -9993,95 +11034,66 @@ fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
     matches!(&body.tail, Some(Expr::IntLit(_, _)))
 }
 
-/// Plan B Task 55, Phase 4e — does this fn body match the **simple
-/// let-yield then pure tail** shape that the captures-free
-/// lambda-lifting slice supports?
+/// Plan B' Stage 6.7 Task 93 (B.2 Phase A) — does this fn body match
+/// the **chained let-yield then pure tail** shape that the chained-
+/// synth-cont extension supports?
 ///
 /// A body matches iff:
 ///
-/// 1. Its statement list has exactly one stmt.
-/// 2. That stmt is a [`crate::ast::Stmt::Let`] whose value is a
-///    non-IO [`crate::ast::Expr::Perform`] with all pure args
-///    (per [`expr_is_pure`]).
+/// 1. Its statement list has N >= 1 stmts.
+/// 2. Each stmt is a [`crate::ast::Stmt::Let`] whose value is an
+///    [`crate::ast::Expr::Perform`] with all pure args (per
+///    [`expr_is_pure`]).
 /// 3. The tail expression is pure (per [`expr_is_pure`]).
 ///
-/// **The big difference from `is_simple_yield_then_constant_tail
-/// _body`**: the perform's result is bound by name in the source,
-/// and the tail expression can reference that name. The synth-cont
-/// must bind `args_ptr[0]` (the value passed to `k(...)` by the
-/// arm) as the let-binding's name in its env, then lower the tail
-/// via [`Lowerer`] with that env.
+/// Returns `Some(N)` (the chain length) on match; `None` otherwise.
+/// Callers use the returned length to size the chain's synth-cont
+/// allocation. Accepts N=1 — the 1-stmt case routes through the
+/// chained variant uniformly with `chain_length = 1` and a single
+/// `Final` step.
 ///
-/// **Captures-free constraint**: this slice doesn't yet handle
-/// helpers whose tail expression references user params (which
-/// would require a closure record capturing helper's params). The
-/// `compute_user_fn_abi` selector enforces `params.is_empty()` for
-/// this body shape. Helpers with user params + this body shape
-/// fall through to `UserFnAbi::Sync` (synchronous run_loop path,
-/// the Phase 4d MVP behavior). The captures-bearing slice (next
-/// major commit) lifts the arity-0 restriction.
-///
-/// **Why this carve-out exists.** This shape is exactly what the
-/// `discard_k_handler_does_not_abort_helper_phase_4e_pending`
-/// e2e test exercises:
-///
-/// ```text
-/// fn helper() -> Int ![Raise, IO] {
-///   let x: Int = perform Raise.fail();
-///   x + 100
-/// }
-/// ```
-///
-/// Under Phase 4d MVP synchronous shape, `sigil_run_loop` returned
-/// the arm value (42) to the perform site, x got bound to 42,
-/// helper computed 42 + 100 = 142, handle's overall = 142. Phase
-/// 4e correctness: when the arm discards `k` (no reference to k
-/// in the arm body), the synth-cont never runs, helper's rest-of-
-/// body is dropped, the arm value (42) flows directly to the
-/// handle site. **Inverts the discard_k test from `142` to
-/// `42`.**
-///
-/// When the arm uses `k(value)`, the synth-cont fires, binds
-/// `args_ptr[0] = value` as `x`, lowers `x + 100` via Lowerer,
-/// returns `Done(value + 100)`. Trampoline returns that to the
-/// wrapper.
-///
-/// Future widening from this slice (captures-bearing slice):
-///   1. Helpers with user params + tail referencing them — synth-
-///      cont closure record captures helper's params.
-///   2. Multi-yield bodies (`perform; perform; tail`) — chained
-///      synth-conts.
-///
-/// Cross-link: [`arm_body_let_then_pure_tail_shape`] is the arm-
-/// side analogue of this helper-side classifier (Phase 4e captures+
-/// Slice B). The two walkers' recursion shapes are deliberately
-/// parallel — when a future `Expr` variant arrives, both must be
-/// updated in lockstep. The arm-side detector additionally enforces
-/// a free-var restriction via `arm_body_post_arm_k_tail_free_vars_ok`
-/// because the post-arm-k synth fn's closure_ptr is null in
-/// Slice B's first commit (no captures); the helper-side
-/// `LetBindThenTail` synth-cont already ships captures.
-fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
+/// **Cap on chain length** (R3 finding 1, Plan B' Stage 6.7): the
+/// chained synth-cont closure-record bitmap caps each record at
+/// [`MAX_CLOSURE_ENV_SLOTS`] = 31 slots (bit 0 reserved for the
+/// code_ptr slot at offset +8; bits 1..32 for env slots). For an
+/// N-step chain with K captures, the largest closure record (built
+/// by the last Middle step for the Final step's record) carries
+/// `K + (N - 1) + 1 = K + N` env slots. The classifier
+/// conservatively rejects chains with `chain_length >=
+/// MAX_CLOSURE_ENV_SLOTS` so that captures-free over-cap chains
+/// fall through to the Sync ABI cleanly instead of panicking
+/// inside the pre-pass's slot-count assert. Helpers with shorter
+/// chains but many captures (`K + N >= MAX_CLOSURE_ENV_SLOTS`)
+/// still hit the pre-pass assert at codegen time — the captures
+/// count isn't available at classifier-time. In practice this
+/// edge case is unlikely (helpers with >5 captures are rare;
+/// chains beyond ~10 steps are rare); a future revision could
+/// lift captures collection into the classifier or refactor
+/// `compute_user_fn_abi` to run after captures are known.
+fn is_simple_chained_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> Option<usize> {
     use crate::ast::{Expr, Stmt};
-    if body.stmts.len() != 1 {
-        return false;
+    if body.stmts.is_empty() {
+        return None;
     }
-    let let_stmt = match &body.stmts[0] {
-        Stmt::Let(l) => l,
-        _ => return false,
-    };
-    // Stage 6 cleanup: IO color filter lifted — every perform
-    // (including IO) is eligible for the CPS-color body classifier.
-    let yield_perform = match &let_stmt.value {
-        Expr::Perform(p) => p,
-        _ => return false,
-    };
-    if !yield_perform.args.iter().all(expr_is_pure) {
-        return false;
+    if body.stmts.len() >= MAX_CLOSURE_ENV_SLOTS {
+        return None;
+    }
+    for stmt in &body.stmts {
+        let let_stmt = match stmt {
+            Stmt::Let(l) => l,
+            _ => return None,
+        };
+        let yield_perform = match &let_stmt.value {
+            Expr::Perform(p) => p,
+            _ => return None,
+        };
+        if !yield_perform.args.iter().all(expr_is_pure) {
+            return None;
+        }
     }
     match &body.tail {
-        Some(t) => expr_is_pure(t),
-        None => false,
+        Some(t) if expr_is_pure(t) => Some(body.stmts.len()),
+        _ => None,
     }
 }
 
@@ -10527,16 +11539,171 @@ mod tests {
         assert!(is_simple_yield_then_constant_tail_body(&body));
     }
 
-    // ---------------- Plan B Task 55, Phase 4e — let-yield-then-
-    // pure-tail classifier (lambda-lifting captures-free slice).
+    // ---------------- Plan B' Stage 6.7 Task 93 (B.2 Phase A) —
+    // chained-let-yield-then-pure-tail classifier (replaces the
+    // pre-Phase-D `is_simple_let_yield_then_pure_tail_body` tests:
+    // the chained classifier accepts N >= 1, so the N=1 happy-path
+    // / IO-perform-value / call-in-tail-rejected cases all flow
+    // through the chained tests below) ----------------
+
+    /// Build a `Stmt::Let` whose value is `perform Raise.fail()`
+    /// with the given binding name and Int type. Module-level
+    /// helper used by every accept test in this section to keep the
+    /// per-test boilerplate focused on what the test asserts (chain
+    /// shape) rather than what it constructs (identical-shape
+    /// `LetStmt` longhand).
+    fn make_chained_let_yield_stmt(name: &str, span: &crate::errors::Span) -> crate::ast::Stmt {
+        use crate::ast::{Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        Stmt::Let(LetStmt {
+            name: name.to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            value: Expr::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        })
+    }
 
     #[test]
-    fn let_yield_then_pure_tail_body_recognised() {
-        // `let x: Int = perform Raise.fail(); 42` — happy path with
-        // a literal tail. Even though a constant tail also matches
-        // `is_simple_yield_then_constant_tail_body` for the
-        // Stmt::Perform form, the let-form here goes through the
-        // let-yield classifier.
+    fn chained_classifier_accepts_single_let_yield_pure_tail() {
+        // N=1 case: matches the existing 1-stmt path. The chained
+        // classifier accepts N >= 1 so Phase B's pre-pass can
+        // generalise uniformly.
+        use crate::ast::{Block, Expr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![make_chained_let_yield_stmt("x", &span)],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn chained_classifier_accepts_two_let_yields_pure_tail() {
+        // N=2 case: two let-yields then a pure tail referencing both
+        // bindings. The classic "let a = perform p1; let b = perform p2;
+        // a + b" shape that B.2 is closing.
+        use crate::ast::{BinOp, Block, Expr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![
+                make_chained_let_yield_stmt("a", &span),
+                make_chained_let_yield_stmt("b", &span),
+            ],
+            tail: Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("a".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("b".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn chained_classifier_accepts_three_let_yields_pure_tail() {
+        // N=3 stress case for the chain depth.
+        use crate::ast::{Block, Expr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![
+                make_chained_let_yield_stmt("a", &span),
+                make_chained_let_yield_stmt("b", &span),
+                make_chained_let_yield_stmt("c", &span),
+            ],
+            tail: Some(Expr::Ident("c".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn chained_classifier_rejects_empty_body() {
+        // No stmts, no tail → classifier rejects (no synth-cont chain
+        // to build).
+        use crate::ast::Block;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: Vec::new(),
+            tail: None,
+            span,
+        };
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+    }
+
+    #[test]
+    fn chained_classifier_rejects_non_let_stmt_in_chain() {
+        // Mixing a non-let stmt into the chain disqualifies the body.
+        // Future widenings might accept Stmt::Perform-without-binding
+        // alongside Stmt::Let; v1 keeps the chain pure-let.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![
+                Stmt::Let(LetStmt {
+                    name: "x".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    value: Expr::Perform(PerformExpr {
+                        effect: "Raise".to_string(),
+                        op: "fail".to_string(),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    }),
+                    span: span.clone(),
+                }),
+                // Second stmt is Stmt::Expr, not Stmt::Let — disqualifies.
+                Stmt::Expr(Expr::IntLit(1, span.clone())),
+            ],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+    }
+
+    #[test]
+    fn chained_classifier_rejects_let_with_non_perform_value() {
+        // A let whose value isn't a Perform doesn't fit the chain
+        // (the chain is specifically about chaining performs).
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::IntLit(42, span.clone()),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+    }
+
+    #[test]
+    fn chained_classifier_rejects_impure_perform_args() {
+        // A perform whose args aren't pure (e.g., a nested call)
+        // disqualifies — the synth-cont machinery can't lower
+        // yield-able args.
         use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -10547,54 +11714,25 @@ mod tests {
                 value: Expr::Perform(PerformExpr {
                     effect: "Raise".to_string(),
                     op: "fail".to_string(),
-                    args: Vec::new(),
+                    // Args contain a Call — not pure.
+                    args: vec![Expr::Call {
+                        callee: Box::new(Expr::Ident("helper".to_string(), span.clone())),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    }],
                     span: span.clone(),
                 }),
                 span: span.clone(),
             })],
-            tail: Some(Expr::IntLit(42, span.clone())),
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
             span,
         };
-        assert!(is_simple_let_yield_then_pure_tail_body(&body));
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
     }
 
     #[test]
-    fn let_yield_then_binary_using_binding_recognised() {
-        // `let x: Int = perform Raise.fail(); x + 100` — the
-        // `discard_k_handler_does_abort_helper_across_call_boundary`
-        // e2e test's helper shape. Tail is a pure Binary referencing
-        // the let-binding.
-        use crate::ast::{BinOp, Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
-        use crate::errors::Span;
-        let span = Span::synthetic("x.sigil");
-        let body = Block {
-            stmts: vec![Stmt::Let(LetStmt {
-                name: "x".to_string(),
-                ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                value: Expr::Perform(PerformExpr {
-                    effect: "Raise".to_string(),
-                    op: "fail".to_string(),
-                    args: Vec::new(),
-                    span: span.clone(),
-                }),
-                span: span.clone(),
-            })],
-            tail: Some(Expr::Binary {
-                op: BinOp::Add,
-                lhs: Box::new(Expr::Ident("x".to_string(), span.clone())),
-                rhs: Box::new(Expr::IntLit(100, span.clone())),
-                span: span.clone(),
-            }),
-            span,
-        };
-        assert!(is_simple_let_yield_then_pure_tail_body(&body));
-    }
-
-    #[test]
-    fn let_yield_then_call_in_tail_is_not_let_yield_then_pure() {
-        // `let x: Int = perform Raise.fail(); helper(x)` — tail
-        // contains a Call (impure per `expr_is_pure`). Classifier
-        // rejects; helper falls through to Sync ABI cleanly.
+    fn chained_classifier_rejects_impure_tail() {
+        // A non-pure tail (e.g., containing a Call) disqualifies.
         use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -10612,78 +11750,109 @@ mod tests {
             })],
             tail: Some(Expr::Call {
                 callee: Box::new(Expr::Ident("helper".to_string(), span.clone())),
-                args: vec![Expr::Ident("x".to_string(), span.clone())],
+                args: Vec::new(),
                 span: span.clone(),
             }),
             span,
         };
-        assert!(!is_simple_let_yield_then_pure_tail_body(&body));
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
     }
 
     #[test]
-    fn let_yield_with_io_perform_value_is_let_yield_then_pure_post_stage_6_cleanup() {
-        // Stage 6 cleanup: IO color filter lifted — `let _ = perform
-        // IO.println(...); pure_tail` is now eligible for the
-        // let-yield classifier.
-        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+    fn chained_classifier_rejects_missing_tail() {
+        // A body with stmts but no tail expression disqualifies —
+        // the chain needs a final expression for synth_cont_step_{N-1}
+        // to lower into Done(value).
+        use crate::ast::Expr;
+        use crate::ast::{Block, LetStmt, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
         let body = Block {
             stmts: vec![Stmt::Let(LetStmt {
-                name: "s".to_string(),
-                ty: TypeExpr::Named("Unit".to_string(), span.clone()),
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
                 value: Expr::Perform(PerformExpr {
-                    effect: "IO".to_string(),
-                    op: "println".to_string(),
-                    args: vec![Expr::StringLit("hi".to_string(), span.clone())],
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
                     span: span.clone(),
                 }),
                 span: span.clone(),
             })],
-            tail: Some(Expr::IntLit(0, span.clone())),
+            tail: None,
             span,
         };
-        assert!(is_simple_let_yield_then_pure_tail_body(&body));
+        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
     }
 
     #[test]
-    fn multi_stmt_body_with_let_yield_first_is_not_let_yield_then_pure() {
-        // Classifier requires exactly one stmt. Multi-stmt bodies
-        // with a let-yield as stmts[0] (followed by other stmts)
-        // need full lambda-lifting (chained synth-conts) — future
-        // commit.
+    fn chained_classifier_rejects_chain_at_or_above_max_closure_env_slots() {
+        // R3 finding 1 (Plan B' Stage 6.7 Task 96 follow-up): chains
+        // with `chain_length >= MAX_CLOSURE_ENV_SLOTS` (currently 31)
+        // exceed the closure-record bitmap cap; the classifier
+        // rejects so the helper falls through to the Sync ABI rather
+        // than panicking inside the pre-pass's slot-count assert.
         use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
-        let body = Block {
-            stmts: vec![
-                Stmt::Let(LetStmt {
-                    name: "x".to_string(),
-                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                    value: Expr::Perform(PerformExpr {
-                        effect: "Raise".to_string(),
-                        op: "fail".to_string(),
-                        args: Vec::new(),
-                        span: span.clone(),
-                    }),
+        let mk_stmt = |name: &str| -> Stmt {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
                     span: span.clone(),
                 }),
-                // Second stmt — disqualifies the body from this
-                // classifier's exactly-one-stmt requirement.
-                Stmt::Expr(Expr::IntLit(1, span.clone())),
-            ],
-            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+                span: span.clone(),
+            })
+        };
+        // Build a chain at exactly the cap: chain_length =
+        // MAX_CLOSURE_ENV_SLOTS. Classifier must return None.
+        let stmts: Vec<Stmt> = (0..MAX_CLOSURE_ENV_SLOTS)
+            .map(|i| mk_stmt(&format!("x_{i}")))
+            .collect();
+        let body_at_cap = Block {
+            stmts,
+            tail: Some(Expr::IntLit(0, span.clone())),
+            span: span.clone(),
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body_at_cap),
+            None,
+            "chain at MAX_CLOSURE_ENV_SLOTS rejected"
+        );
+
+        // Build a chain just under the cap: chain_length =
+        // MAX_CLOSURE_ENV_SLOTS - 1. Classifier must accept and
+        // return the chain length. (Captures are 0 for this test;
+        // the captures + chain combination edge case isn't reached.)
+        let stmts_under: Vec<Stmt> = (0..(MAX_CLOSURE_ENV_SLOTS - 1))
+            .map(|i| mk_stmt(&format!("x_{i}")))
+            .collect();
+        let body_under_cap = Block {
+            stmts: stmts_under,
+            tail: Some(Expr::IntLit(0, span.clone())),
             span,
         };
-        assert!(!is_simple_let_yield_then_pure_tail_body(&body));
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body_under_cap),
+            Some(MAX_CLOSURE_ENV_SLOTS - 1),
+            "chain just below MAX_CLOSURE_ENV_SLOTS accepted"
+        );
     }
 
+    // ---------------- end Plan B' Stage 6.7 Task 93 tests ----------------
+
     #[test]
-    fn let_yield_with_match_tail_using_binding_recognised() {
+    fn chained_classifier_accepts_match_tail_using_binding() {
         // Recursive purity: a Match expression over a pure scrutinee
         // (the binding) with pure arm bodies (literals) is pure.
         // The synth-cont's Lowerer handles Match correctly via
-        // `lower_expr` → `lower_match`. Pin acceptance.
+        // `lower_expr` → `lower_match`. Pin acceptance — covers the
+        // pre-Phase-D `let_yield_with_match_tail_using_binding
+        // _recognised` case under the chained classifier.
         use crate::ast::{Block, Expr, LetStmt, MatchArm, Pattern, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -10717,7 +11886,10 @@ mod tests {
             }),
             span,
         };
-        assert!(is_simple_let_yield_then_pure_tail_body(&body));
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            Some(1)
+        );
     }
 
     #[test]
@@ -10917,7 +12089,7 @@ mod tests {
         let (prog, colored) = colored_from_src(src);
         let body = body_of(&prog, "main");
         assert_eq!(
-            compute_user_fn_abi("main", &body, &colored),
+            compute_user_fn_abi("main", &body, &params_of(&prog, "main"), &colored),
             UserFnAbi::Sync
         );
     }
@@ -10937,7 +12109,12 @@ mod tests {
         let (prog, colored) = colored_from_src(src);
         let helper_body = body_of(&prog, "helper");
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_body, &colored),
+            compute_user_fn_abi(
+                "helper",
+                &helper_body,
+                &params_of(&prog, "helper"),
+                &colored
+            ),
             UserFnAbi::Cps,
             "helper has CPS color + simple-tail-perform body + arity-0"
         );
@@ -10967,7 +12144,7 @@ mod tests {
         // ABI selection still picks Sync because main's body shape
         // isn't supported by the simple-tail-perform classifier.
         assert_eq!(
-            compute_user_fn_abi("main", &main_body, &colored),
+            compute_user_fn_abi("main", &main_body, &params_of(&prog, "main"), &colored),
             UserFnAbi::Sync,
             "main is CPS-color but has complex body → Sync ABI"
         );
@@ -11044,7 +12221,7 @@ mod tests {
         let mono = MonoProgram { anf };
         let colored = crate::color::infer_colors(mono);
         assert_eq!(
-            compute_user_fn_abi("f", &body, &colored),
+            compute_user_fn_abi("f", &body, &[], &colored),
             UserFnAbi::Cps,
             "intrinsic perform of non-IO effect taints the fn as CPS via \
              find_non_io_perform_in_block; combined with the simple-tail-\
@@ -11132,7 +12309,7 @@ mod tests {
         assert!(is_simple_tail_perform_with_pure_args_body(&body));
         // The actual assertion: Sync, because color short-circuits.
         assert_eq!(
-            compute_user_fn_abi("f", &body, &colored),
+            compute_user_fn_abi("f", &body, &[], &colored),
             UserFnAbi::Sync,
             "Color::Native must short-circuit `compute_user_fn_abi` \
              regardless of body shape eligibility"
@@ -11180,7 +12357,12 @@ mod tests {
         // Inverted from prior commit's Sync expectation — the
         // arity gate is gone.
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_body, &colored),
+            compute_user_fn_abi(
+                "helper",
+                &helper_body,
+                &params_of(&prog, "helper"),
+                &colored
+            ),
             UserFnAbi::Cps,
             "arity-N intrinsic-CPS helper now classifies Cps after the \
              D1 arity gate's removal in this commit"
@@ -11208,7 +12390,12 @@ mod tests {
         assert!(colored.needs_cps_transform("helper"));
         assert!(helper_params.is_empty());
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_body, &colored),
+            compute_user_fn_abi(
+                "helper",
+                &helper_body,
+                &params_of(&prog, "helper"),
+                &colored
+            ),
             UserFnAbi::Cps,
             "arity-0 helper with arity-N perform now classifies Cps after \
              the D1 perform-args gate's removal in this commit"
@@ -11216,22 +12403,24 @@ mod tests {
     }
 
     // ---------------- Plan B Task 55, Phase 4e — captures-bearing
-    // synth-cont slice (this commit): the let-yield-then-pure-tail
-    // shape now accepts arity-N helpers, with the synth-cont
-    // capturing helper's user params referenced in the tail.
+    // synth-cont slice: the chained-let-yield-then-pure-tail
+    // classifier accepts arity-N helpers, with the synth-cont chain
+    // capturing helper's user params referenced anywhere in the
+    // chain (perform args or tail).
 
     #[test]
     fn compute_user_fn_abi_cps_for_arity_n_let_yield_helper_with_capture() {
         // helper takes `threshold: Int`; body is `let x = perform
-        // Raise.fail(); x + threshold`. Pre-captures-slice
-        // (`f911a0b`), the arity-0 gate in `compute_user_fn_abi`
-        // rejected → Sync. Post-captures-slice (this commit), the
-        // gate is removed → Cps. The pre-pass populates
-        // `LetBindThenTail.captures = [SynthContCapture { name:
-        // "threshold", kind: Int }]`; helper's body emit allocates
-        // a closure record holding `threshold`, passes its pointer
-        // as `k_closure`; synth-cont reads `threshold` from
-        // `closure_ptr + 16` at fn entry.
+        // Raise.fail(); x + threshold`. The arity-0 gate in
+        // `compute_user_fn_abi` was lifted in the captures-bearing
+        // slice — helpers with user params referenced in the tail
+        // classify Cps. The pre-pass populates a `ChainedLetBindStep`
+        // entry with `chain_length = 1` + `Final` role + captures
+        // = [SynthContCapture { name: "threshold", kind: Int }];
+        // helper's body emit allocates a closure record holding
+        // `threshold`, passes its pointer as `k_closure`; the
+        // synth-cont reads `threshold` from `closure_ptr + 16` at
+        // fn entry.
         let src = "effect Raise { fail: () -> Int }\n\
                    fn helper(threshold: Int) -> Int ![Raise, IO] {\n  \
                      let x: Int = perform Raise.fail();\n  \
@@ -11247,24 +12436,158 @@ mod tests {
         let helper_params = params_of(&prog, "helper");
         // Sanity: classifier accepts the body shape; color taints
         // CPS via row.
-        assert!(is_simple_let_yield_then_pure_tail_body(&helper_body));
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&helper_body),
+            Some(1),
+            "1-stmt let-yield body matches chained classifier with N=1"
+        );
         assert!(colored.needs_cps_transform("helper"));
         assert_eq!(helper_params.len(), 1);
-        // Inverted from prior arity-0 restriction — the gate is
-        // gone in this commit.
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_body, &colored),
+            compute_user_fn_abi(
+                "helper",
+                &helper_body,
+                &params_of(&prog, "helper"),
+                &colored
+            ),
             UserFnAbi::Cps,
-            "arity-N let-yield-helper with capture now classifies Cps after \
-             the captures-bearing slice's arity gate lift"
+            "arity-N let-yield-helper with capture classifies Cps via the \
+             chained classifier route"
         );
     }
 
     #[test]
-    fn collect_synth_cont_captures_finds_helper_param_in_tail() {
-        // Free-var analysis on `x + threshold` with let-binding
-        // `x` and helper params `[threshold]` returns
-        // `[threshold]`. Pin the analysis surface directly.
+    fn compute_user_fn_abi_sync_when_chain_captures_plus_length_exceed_max_closure_env_slots() {
+        // R6 close: when K + N >= MAX_CLOSURE_ENV_SLOTS (where K is
+        // chain captures count and N is chain length), the chained
+        // helper falls through to the Sync ABI cleanly instead of
+        // letting the pre-pass slot-count assert fire mid-codegen.
+        //
+        // Build a synthetic FnDecl whose body has 28 sequential
+        // `let r_i = perform Raise.fail()` stmts, with a tail that
+        // references a helper user param `t`. captures = [t] (K=1),
+        // chain_length = 28 (N). K + N = 29 < 31 → still Cps.
+        //
+        // Then bump body length to 30 stmts. K + N = 31 >= 31 →
+        // falls through to Sync.
+        //
+        // Both cases pass through the `compute_user_fn_abi` cap-
+        // check; the second case exercises the fall-through.
+        use crate::ast::{
+            BinOp, Block, Expr, FnDecl, Item, LetStmt, Param, PerformExpr, Program, Stmt, TypeExpr,
+        };
+        use crate::errors::Span;
+        let span = Span::synthetic("test.sigil");
+        let make_let = |name: &str| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })
+        };
+
+        // Build the helper source with N = 28 (cap-fits): K=1 (the
+        // `t` param), N=28, K+N=29.
+        let make_body = |n: usize| Block {
+            stmts: (0..n).map(|i| make_let(&format!("r{i}"))).collect(),
+            tail: Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r0".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("t".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "t".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+
+        // Build a tiny colored program for both cases. Re-using the
+        // make_colored helper pattern from upstream tests to keep
+        // this self-contained.
+        let make_colored = |body: Block| {
+            let fn_decl = FnDecl {
+                name: "helper".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: helper_params.clone(),
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: vec!["Raise".to_string(), "IO".to_string()],
+                effect_row_var: None,
+                body,
+                span: span.clone(),
+            };
+            let program = Program {
+                items: vec![Item::Fn(Box::new(fn_decl))],
+                file: "test.sigil".to_string(),
+            };
+            let mut effects = std::collections::BTreeMap::new();
+            effects.insert(
+                "Raise".to_string(),
+                crate::ast::EffectDecl {
+                    name: "Raise".to_string(),
+                    name_span: span.clone(),
+                    generic_params: Vec::new(),
+                    resumes_many: false,
+                    ops: Vec::new(),
+                    span: span.clone(),
+                },
+            );
+            let checked = crate::typecheck::CheckedProgram {
+                program,
+                string_literals: Vec::new(),
+                lambda_captures: Vec::new(),
+                types: std::collections::BTreeMap::new(),
+                match_scrut_tys: std::collections::BTreeMap::new(),
+                fn_schemes: std::collections::BTreeMap::new(),
+                call_site_instantiations: std::collections::BTreeMap::new(),
+                ctor_site_instantiations: std::collections::BTreeMap::new(),
+                effects,
+                effect_ids: std::collections::BTreeMap::new(),
+                op_ids: std::collections::BTreeMap::new(),
+                handle_arm_captures: std::collections::BTreeMap::new(),
+                handle_return_arm_captures: std::collections::BTreeMap::new(),
+                handle_body_ty: std::collections::BTreeMap::new(),
+            };
+            let anf = crate::elaborate::AnfProgram { checked };
+            let mono = crate::monomorphize::MonoProgram { anf };
+            crate::color::infer_colors(mono)
+        };
+
+        // K + N = 1 + 28 = 29 < 31 → Cps.
+        let body_under_cap = make_body(28);
+        let colored_under = make_colored(body_under_cap.clone());
+        assert_eq!(
+            compute_user_fn_abi("helper", &body_under_cap, &helper_params, &colored_under),
+            UserFnAbi::Cps,
+            "K+N below MAX_CLOSURE_ENV_SLOTS: classifier accepts; abi is Cps"
+        );
+
+        // K + N = 1 + 30 = 31 >= 31 → Sync fall-through.
+        let body_at_cap = make_body(30);
+        let colored_at = make_colored(body_at_cap.clone());
+        assert_eq!(
+            compute_user_fn_abi("helper", &body_at_cap, &helper_params, &colored_at),
+            UserFnAbi::Sync,
+            "K+N >= MAX_CLOSURE_ENV_SLOTS: cap-check converts to Sync fall-through"
+        );
+    }
+
+    #[test]
+    fn chained_captures_finds_helper_param_in_tail() {
+        // Free-var analysis on `x + threshold` with chain-binding
+        // `x` and helper params `[threshold]` returns `[threshold]`.
+        // Equivalent to the pre-Phase-D 1-binding case: an empty
+        // performs slice + single-element binding_names matches the
+        // single-let-yield shape with the chain binding pre-bound.
         use crate::ast::{BinOp, Expr, Param, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -11279,16 +12602,18 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(captures.len(), 1);
         assert_eq!(captures[0].name, "threshold");
         assert_eq!(captures[0].kind, EnvSlotKind::Int);
     }
 
     #[test]
-    fn collect_synth_cont_captures_excludes_let_binding_name() {
-        // Free-var analysis on `x + 100` — the let-binding `x` is
-        // shadowed; `100` is a literal. No captures.
+    fn chained_captures_excludes_chain_binding_names() {
+        // Free-var analysis on `x + 100` — the chain-binding `x` is
+        // pre-bound and shadowed; `100` is a literal. No captures.
         use crate::ast::{BinOp, Expr, Param, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -11305,12 +12630,14 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(captures.len(), 0);
     }
 
     #[test]
-    fn collect_synth_cont_captures_match_pattern_var_shadows_param() {
+    fn chained_captures_match_pattern_var_shadows_param() {
         // PR #26 mid-flight at a5ee4c6 item #1: when a match arm's
         // pattern binds a name (`Pattern::Var`) that shadows a
         // helper param, the walker must NOT capture the param —
@@ -11353,7 +12680,9 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -11363,7 +12692,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_synth_cont_captures_match_with_tuple_pattern_var_shadows_param() {
+    fn chained_captures_match_with_tuple_pattern_var_shadows_param() {
         // PR #26 mid-flight at 2be70ce review item #1:
         // Pattern::Tuple binding shape was unpinned — the
         // `Tuple(patterns)` arm of `collect_pattern_bindings`
@@ -11402,7 +12731,9 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -11412,7 +12743,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_synth_cont_captures_match_with_ctor_positional_pattern_var_shadows_param() {
+    fn chained_captures_match_with_ctor_positional_pattern_var_shadows_param() {
         // PR #26 mid-flight at 2be70ce review item #1:
         // Pattern::Ctor::Positional binding shape was unpinned.
         // Source-equivalent: `match opt { Some(threshold) =>
@@ -11458,7 +12789,9 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -11469,7 +12802,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_synth_cont_captures_match_with_ctor_pattern_handles_record_field_bindings() {
+    fn chained_captures_match_with_ctor_pattern_handles_record_field_bindings() {
         // The Pattern::Ctor with Record fields shape introduces
         // bindings via field-pun (`Point { x, y }`) or rename
         // (`Point { x: px }`). `collect_pattern_bindings` recurses
@@ -11512,7 +12845,9 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -11522,7 +12857,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_synth_cont_captures_does_not_recurse_into_call_in_tail() {
+    fn chained_captures_does_not_recurse_into_call_in_tail() {
         // Renamed from the prior misleading
         // `..._skips_globals` (PR #26 mid-flight at a5ee4c6 item
         // #7). The walker treats `Expr::Call` as a yield-able
@@ -11544,7 +12879,9 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         // The analysis defensively returns empty for Call (yield-able
         // shape); even if it descended, `not_a_param` isn't in
         // helper_params and would be skipped.
@@ -11678,6 +13015,104 @@ mod tests {
             span: span.clone(),
         }));
         assert!(arm_body_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_unsupported_construct_accepts_three_let_chain_for_resumes_many_effect() {
+        // Plan B' Stage 6.7 Task 98 walker check: 3-let arm body of
+        // a `resumes: many` effect is accepted via the N-let chain
+        // classifier path. Pre-Task-98, the shape was rejected at
+        // `arm_body_walk`'s "non-tail k" diagnostic; post-Task-98,
+        // `arm_body_unsupported_construct` short-circuits via the
+        // chain classifier and returns None.
+        use crate::ast::{BinOp, Block, Expr, HandleOpArm, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        use std::collections::{BTreeMap, BTreeSet};
+        let span = Span::synthetic("x.sigil");
+        let make_let = |name: &str, k_arg: bool| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::BoolLit(k_arg, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![
+                make_let("r1", true),
+                make_let("r2", false),
+                make_let("r3", true),
+            ],
+            tail: Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Ident("r1".to_string(), span.clone())),
+                    rhs: Box::new(Expr::Ident("r2".to_string(), span.clone())),
+                    span: span.clone(),
+                }),
+                rhs: Box::new(Expr::Ident("r3".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        }));
+        let arm = HandleOpArm {
+            effect: "Choose".to_string(),
+            effect_span: span.clone(),
+            op: "flip".to_string(),
+            op_span: span.clone(),
+            params: Vec::new(),
+            k_name: "k".to_string(),
+            k_span: span.clone(),
+            body,
+            span: span.clone(),
+        };
+        let globals: BTreeSet<String> = BTreeSet::new();
+        let mut effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
+        effects_resumes_many.insert("Choose".to_string(), true);
+        let result = arm_body_unsupported_construct(&arm, &globals, &effects_resumes_many);
+        assert!(
+            result.is_none(),
+            "expected None (accept) for 3-let arm body of resumes:many effect; \
+             got {result:?}"
+        );
+    }
+
+    #[test]
+    fn arm_body_post_arm_k_tail_free_vars_accepts_three_chain_bindings_in_tail() {
+        // Plan B' Stage 6.7 Task 98 walker check: for an N-let
+        // chain, the tail can reference all chain bindings. Verify
+        // the free-var walker handles `r1 + r2 + r3` with r1 as
+        // binding_name and {r2, r3} in extras.
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("x.sigil");
+        let globals: BTreeSet<String> = BTreeSet::new();
+        let mut extras: BTreeSet<String> = BTreeSet::new();
+        extras.insert("r2".to_string());
+        extras.insert("r3".to_string());
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r1".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("r2".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            rhs: Box::new(Expr::Ident("r3".to_string(), span.clone())),
+            span: span.clone(),
+        };
+        let result = arm_body_post_arm_k_tail_free_vars_ok(&tail, "r1", "k", &globals, &extras);
+        assert!(
+            result.is_none(),
+            "expected None (accept) for `r1 + r2 + r3` with r1 binding, \
+             {{r2, r3}} extras; got {result:?}"
+        );
     }
 
     #[test]
@@ -11816,7 +13251,15 @@ mod tests {
     }
 
     #[test]
-    fn arm_body_post_arm_k_tail_free_vars_rejects_inner_let_in_block_tail() {
+    fn arm_body_post_arm_k_tail_free_vars_accepts_inner_let_in_block_tail() {
+        // Plan B' Stage 6.7 Task 98 lift: inner `Stmt::Let` in the
+        // post-`k` tail Block is now ACCEPTED. Each let-binding's
+        // value is walked under the current extras set; the binding
+        // name is added to extras for subsequent stmts and the tail.
+        // This is needed so the N-let chain's synthesised Final-step
+        // tail (which wraps ANF intermediate lets in a fresh Block)
+        // passes the free-var check. Inverted from the previous
+        // pinning of the old restriction.
         use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
         use crate::errors::Span;
         use std::collections::BTreeSet;
@@ -11831,91 +13274,91 @@ mod tests {
             tail: Some(Expr::Ident("y".to_string(), span.clone())),
             span: span.clone(),
         }));
-        let diag = arm_body_post_arm_k_tail_free_vars_ok(
+        let result = arm_body_post_arm_k_tail_free_vars_ok(
             &tail,
             "r",
             "k",
             &BTreeSet::new(),
             &BTreeSet::new(),
-        )
-        .expect("rejected");
+        );
         assert!(
-            diag.contains("inner") && diag.contains("let"),
-            "diagnostic points at inner-let restriction: {diag}"
+            result.is_none(),
+            "expected None (accept) for `let y = r; y` Block tail with r as \
+             binding_name; got {result:?}"
         );
     }
 
     // -----------------------------------------------------------------
-    // Plan B Task 55, Phase 4e captures+ Slice C — `arm_body_multi_let_
-    // then_pure_tail_shape` unit tests. Pin the shape detector's
-    // match/no-match boundary so a future regression in the multi-let
-    // shape recognition fires precisely.
+    // Plan B' Stage 6.7 Task 97 (B.1 Phase A) — N-let arm-body
+    // classifier `arm_body_n_let_then_pure_tail_shape` accepts
+    // arbitrary N >= 2 (subsuming the legacy 2-let classifier's
+    // accept set + extending to N=3, N=5, etc.). Phase B (Task 98)
+    // wires the new classifier into the pre-pass + emit; until
+    // then the unit tests below pin the new classifier's behaviour
+    // in isolation.
     // -----------------------------------------------------------------
 
-    fn slice_c_block_two_lets_with_k_calls(
-        binding_name_1: &str,
-        binding_ty_1: crate::ast::TypeExpr,
-        k_arg_1: crate::ast::Expr,
-        binding_name_2: &str,
-        binding_ty_2: crate::ast::TypeExpr,
-        k_arg_2: crate::ast::Expr,
-        tail: crate::ast::Expr,
-    ) -> crate::ast::Expr {
-        use crate::ast::{Block, Expr, LetStmt, Stmt};
-        use crate::errors::Span;
-        let span = Span::synthetic("x.sigil");
-        let make_k_call = |arg: Expr| Expr::Call {
-            callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
-            args: vec![arg],
-            span: span.clone(),
+    fn slice_c_block_n_lets_with_k_calls(n: usize, span: &crate::errors::Span) -> crate::ast::Expr {
+        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
+        let make_let = |i: usize| -> Stmt {
+            Stmt::Let(LetStmt {
+                name: format!("r{i}"),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::IntLit(i as i64, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
         };
+        let stmts: Vec<Stmt> = (1..=n).map(make_let).collect();
         Expr::Block(Box::new(Block {
-            stmts: vec![
-                Stmt::Let(LetStmt {
-                    name: binding_name_1.to_string(),
-                    ty: binding_ty_1,
-                    value: make_k_call(k_arg_1),
-                    span: span.clone(),
-                }),
-                Stmt::Let(LetStmt {
-                    name: binding_name_2.to_string(),
-                    ty: binding_ty_2,
-                    value: make_k_call(k_arg_2),
-                    span: span.clone(),
-                }),
-            ],
-            tail: Some(tail),
+            stmts,
+            tail: Some(Expr::Ident("r1".to_string(), span.clone())),
             span: span.clone(),
         }))
     }
 
     #[test]
-    fn arm_body_multi_let_then_pure_tail_shape_matches_two_lets_with_k_calls() {
-        use crate::ast::{BinOp, Expr, TypeExpr};
+    fn arm_body_n_let_then_pure_tail_shape_accepts_two_lets() {
+        // N=2 — the legacy classifier's exact case. Verify the new
+        // classifier subsumes (returns a 2-entry match).
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
-        let body = slice_c_block_two_lets_with_k_calls(
-            "r1",
-            TypeExpr::Named("Int".to_string(), span.clone()),
-            Expr::IntLit(1, span.clone()),
-            "r2",
-            TypeExpr::Named("Int".to_string(), span.clone()),
-            Expr::IntLit(2, span.clone()),
-            Expr::Binary {
-                op: BinOp::Add,
-                lhs: Box::new(Expr::Ident("r1".to_string(), span.clone())),
-                rhs: Box::new(Expr::Ident("r2".to_string(), span.clone())),
-                span: span.clone(),
-            },
-        );
-        let m = arm_body_multi_let_then_pure_tail_shape(&body, "k").expect("shape matches");
-        assert_eq!(m.binding_name_1, "r1");
-        assert_eq!(m.binding_name_2, "r2");
+        let body = slice_c_block_n_lets_with_k_calls(2, &span);
+        let m = arm_body_n_let_then_pure_tail_shape(&body, "k").expect("N=2 matches");
+        assert_eq!(m.binding_names, vec!["r1", "r2"]);
+        assert_eq!(m.arg_exprs.len(), 2);
+        assert_eq!(m.binding_tes.len(), 2);
     }
 
     #[test]
-    fn arm_body_multi_let_then_pure_tail_shape_rejects_single_let() {
-        // Slice B's single-let shape — Slice C detector requires 2 stmts.
+    fn arm_body_n_let_then_pure_tail_shape_accepts_three_lets() {
+        // N=3 — beyond the legacy 2-let cap. Phase B will activate
+        // this acceptance in the pre-pass + emit.
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = slice_c_block_n_lets_with_k_calls(3, &span);
+        let m = arm_body_n_let_then_pure_tail_shape(&body, "k").expect("N=3 matches");
+        assert_eq!(m.binding_names, vec!["r1", "r2", "r3"]);
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_accepts_five_lets() {
+        // N=5 — stress acceptance beyond practical chain depths.
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = slice_c_block_n_lets_with_k_calls(5, &span);
+        let m = arm_body_n_let_then_pure_tail_shape(&body, "k").expect("N=5 matches");
+        assert_eq!(m.binding_names.len(), 5);
+        assert_eq!(m.arg_exprs.len(), 5);
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_rejects_single_let() {
+        // N=1 belongs to Slice B (single-let with non-tail-k). The
+        // chain classifier's lower bound is N>=2.
         use crate::ast::{BinOp, Expr, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -11930,12 +13373,11 @@ mod tests {
                 span: span.clone(),
             },
         );
-        assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
+        assert!(arm_body_n_let_then_pure_tail_shape(&body, "k").is_none());
     }
 
     #[test]
-    fn arm_body_multi_let_then_pure_tail_shape_rejects_three_lets() {
-        // Three Lets — Slice C detector requires exactly 2.
+    fn arm_body_n_let_then_pure_tail_shape_rejects_block_without_tail() {
         use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -11953,74 +13395,122 @@ mod tests {
         };
         let body = Expr::Block(Box::new(Block {
             stmts: vec![make_let("r1"), make_let("r2"), make_let("r3")],
-            tail: Some(Expr::Ident("r1".to_string(), span.clone())),
+            tail: None,
             span: span.clone(),
         }));
-        assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
+        assert!(arm_body_n_let_then_pure_tail_shape(&body, "k").is_none());
     }
 
     #[test]
-    fn arm_body_multi_let_then_pure_tail_shape_rejects_first_let_with_non_k_call_value() {
-        // First let's value is `99` (not a `k` call) — Slice C
-        // detector requires both let values to be `k(arg)` calls.
+    fn arm_body_n_let_then_pure_tail_shape_rejects_let_with_non_k_call_value() {
+        // Mid-chain non-`k` call disqualifies — every let value must
+        // be `k(arg)`.
         use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
-        let body = Expr::Block(Box::new(Block {
-            stmts: vec![
-                Stmt::Let(LetStmt {
-                    name: "r1".to_string(),
-                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                    value: Expr::IntLit(99, span.clone()),
-                    span: span.clone(),
-                }),
-                Stmt::Let(LetStmt {
-                    name: "r2".to_string(),
-                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                    value: Expr::Call {
-                        callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
-                        args: vec![Expr::IntLit(1, span.clone())],
-                        span: span.clone(),
-                    },
-                    span: span.clone(),
-                }),
-            ],
-            tail: Some(Expr::Ident("r1".to_string(), span.clone())),
-            span: span.clone(),
-        }));
-        assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
-    }
-
-    #[test]
-    fn arm_body_multi_let_then_pure_tail_shape_rejects_block_without_tail() {
-        use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
-        use crate::errors::Span;
-        let span = Span::synthetic("x.sigil");
-        let make_let = |name: &str| {
+        let make_k_let = |name: &str, arg: i64| {
             Stmt::Let(LetStmt {
                 name: name.to_string(),
                 ty: TypeExpr::Named("Int".to_string(), span.clone()),
                 value: Expr::Call {
                     callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
-                    args: vec![Expr::IntLit(1, span.clone())],
+                    args: vec![Expr::IntLit(arg, span.clone())],
                     span: span.clone(),
                 },
                 span: span.clone(),
             })
         };
+        let make_lit_let = |name: &str, val: i64| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::IntLit(val, span.clone()),
+                span: span.clone(),
+            })
+        };
         let body = Expr::Block(Box::new(Block {
-            stmts: vec![make_let("r1"), make_let("r2")],
-            tail: None,
+            stmts: vec![
+                make_k_let("r1", 1),
+                make_lit_let("r2", 99),
+                make_k_let("r3", 3),
+            ],
+            tail: Some(Expr::Ident("r1".to_string(), span.clone())),
             span: span.clone(),
         }));
-        assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
+        assert!(arm_body_n_let_then_pure_tail_shape(&body, "k").is_none());
     }
 
     #[test]
-    fn arm_body_multi_let_then_pure_tail_shape_rejects_different_k_names_in_lets() {
-        // Each Let's value must invoke the SAME `k_name`. If the
-        // first invokes `k` and the second invokes `j`, Slice C
-        // rejects (the second isn't a captured-continuation invocation).
+    fn arm_body_n_let_then_pure_tail_shape_accepts_anf_intermediate_lets_after_chain() {
+        // Plan B' Stage 6.7 Task 98 ANF-handling: the elaborate pass
+        // flattens compound tail expressions into ANF form, e.g.,
+        // `r1 + r2 + r3` becomes `let $elab_t0 = r1 + r2; $elab_t0
+        // + r3`. The N-let classifier must accept the prefix of
+        // k-call lets and treat the remaining (non-k-call) lets as
+        // ANF intermediate lets in the synthesised final tail.
+        //
+        // Body shape: 3 k-call lets + 1 ANF intermediate let + tail.
+        // Classifier matches chain length 3; synthesises the tail
+        // as a Block containing the intermediate let + original
+        // tail.
+        use crate::ast::{BinOp, Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let make_k_let = |name: &str, k_arg: bool| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::BoolLit(k_arg, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let anf_let = Stmt::Let(LetStmt {
+            name: "$elab_t0".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            value: Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r1".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("r2".to_string(), span.clone())),
+                span: span.clone(),
+            },
+            span: span.clone(),
+        });
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![
+                make_k_let("r1", true),
+                make_k_let("r2", false),
+                make_k_let("r3", true),
+                anf_let,
+            ],
+            tail: Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("$elab_t0".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("r3".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        }));
+        let m = arm_body_n_let_then_pure_tail_shape(&body, "k").expect("matches with ANF lets");
+        assert_eq!(
+            m.binding_names,
+            vec!["r1", "r2", "r3"],
+            "chain length is 3 (the prefix of k-call lets); ANF let isn't a chain step"
+        );
+        // Synthesised tail must be a Block wrapping the ANF let + original tail.
+        match m.tail_expr {
+            Expr::Block(_) => (),
+            other => panic!("expected synthesised Block as tail_expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_rejects_different_k_names() {
+        // All let values must invoke the SAME `k_name`. Mixed names
+        // (`k(arg1)` then `j(arg2)`) reject.
         use crate::ast::{Block, Expr, LetStmt, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -12050,9 +13540,10 @@ mod tests {
             tail: Some(Expr::Ident("r1".to_string(), span.clone())),
             span: span.clone(),
         }));
-        // Detector with k_name = "k": 2nd let invokes "j", not "k", reject.
-        assert!(arm_body_multi_let_then_pure_tail_shape(&body, "k").is_none());
+        assert!(arm_body_n_let_then_pure_tail_shape(&body, "k").is_none());
     }
+
+    // ---------------- end Plan B' Stage 6.7 Task 97 tests ----------------
 
     // -----------------------------------------------------------------
     // Plan B Task 55, Phase 4e captures+ Slice D — `find_closure_env_load_lambda_source`

@@ -845,57 +845,39 @@ fn choose_demo_example_returns_40() {
     );
 }
 
-/// Plan B Task 58 — `examples/multishot_stress.sigil` exercises the
-/// v1 multi-shot stress shape: 5 sequential `handle` expressions × 2
-/// resumes per arm = 10 multi-shot k invocations across 5 fresh
-/// handler frames and 5 fresh heap-reified k_closure records, with
-/// 10 distinct `(Int)` inputs. Confirms that:
+/// Plan B' Stage 6.7 Task 101 — `examples/multishot_stress.sigil`
+/// exercises the natural multi-shot stress shape: 10 resumes of a
+/// `resumes: many` continuation within a SINGLE arm body. Replaces
+/// the pre-Stage-6.7 5-handles × 2-resumes workaround that PR #27
+/// shipped under `[DEVIATION Task 58]`.
 ///
-/// - the codegen pre-pass allocates per-handle arm FuncIds correctly
-///   when 5 distinct `Expr::Handle` sites occur in a single user fn
-///   (independent FuncId tables per `Span`-keyed `handler_arm_indices`
-///   entry);
-/// - each handle's `sigil_handler_frame_new` + `sigil_handle_push`
-///   path allocates a fresh frame; the runtime's thread-local handler
-///   stack head correctly LIFOs across 5 sequential push/pop cycles
-///   (per Phase 4f machinery);
-/// - the heap-reified k_closure record allocated by Slice C's arm-fn
-///   body emit at the perform site of one handle does NOT leak into
-///   another handle's k invocations (closed-form independence
-///   assertion: any cross-handle leak would diverge the closed-form
-///   sum from 1530);
-/// - the sequential structure of `let h_i = handle ... with { ... }`
-///   in main's body lowers cleanly with each handle expression
-///   driving its own `sigil_run_loop` invocation, returning the
-///   discharged Int to the let-binding before the next handle
-///   begins.
+/// What the natural shape exercises (post-Plan-B' Task 100b):
 ///
-/// Closed-form expected output (per the example's docstring):
-///   - h_i = 2*i + 300 for i ∈ {1, 2, 3, 4, 5}
-///     → 302, 304, 306, 308, 310
-///   - total = 1530
+/// - **N-let arm-body chain (N=10)**: 10 sequential `let r_i = k(arg
+///   +i)` bindings drive 10 distinct trampoline cycles through the
+///   helper synth-cont. Each step's `post_arm_k_i` synth fn dispatches
+///   the next `k(arg+i+1)` call; chained closure records thread
+///   `(k_closure, k_fn) + captures + prior_bindings` forward across
+///   9 Middle steps to the Final step.
 ///
-/// **Stress-shape rationale** — the literal Task 58 wording calls for
-/// "10+ resumes within a single arm with different inputs"; that
-/// shape requires the Slice C N-chain extension explicitly deferred
-/// from PR #27 (the negative-coverage test
-/// `slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen`
-/// pins the v1 cap at exactly 2 lets). The 5-handles × 2-resumes
-/// workaround exercises a complementary invariant — fresh-frame /
-/// fresh-k_closure independence across multiple handles in one
-/// program — and ships under `[DEVIATION Task 58]`.
+/// - **op-arg capture threading**: `arg` is referenced by every
+///   `arg_i` expression. Task 100b's captures-bearing extension
+///   threads `arg` through every chain step's closure record.
 ///
-/// Invariant: stdout = "1530\n", stderr = "", exit 0.
+/// Closed form: helper(0); arm dispatched with arg=0; r_i = k(0+i)
+/// = i. Tail = 1+2+...+10 = 55.
+///
+/// Invariant: stdout = "55\n", stderr = "", exit 0.
 #[test]
-fn multishot_stress_example_returns_1530() {
+fn multishot_stress_example_returns_55() {
     let root = workspace_root();
     let source = root.join("examples/multishot_stress.sigil");
     let (stdout, stderr, code) = compile_file_and_run(&source, "multishot_stress_example");
     assert_eq!(code, 0, "multishot_stress exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "1530\n",
-        "multishot_stress stdout mismatch (expected closed-form 302+304+306+308+310 \
-         = 1530); stderr={stderr:?}"
+        stdout, "55\n",
+        "multishot_stress stdout mismatch (expected closed-form 1+2+...+10 \
+         = 55); stderr={stderr:?}"
     );
     assert_eq!(
         stderr, "",
@@ -991,50 +973,27 @@ fn state_example_dual_handle_returns_6_then_99() {
     );
 }
 
-/// Plan B Task 59 — `examples/choose.sigil` exercises the canonical
-/// Slice C v1 2-resume multi-shot Choose pattern, framed as a binary
-/// outcome enumerator. Confirms that:
+/// Plan B' Stage 6.7 + multi-shot composition fix —
+/// `examples/choose.sigil` exercises the literal two-flip pair
+/// generator: 2-flip helper (B.2 chained-let-yield) + multi-shot
+/// 2-resume arm (B.1 N-let chain) + runtime outer post_arm_k stack
+/// (composition fix). Helper enumerates all 2² = 4 outcomes; arm
+/// sums them.
 ///
-/// - `effect Choose resumes: many { flip: () -> Bool }` parses +
-///   typechecks; the `resumes: many` annotation enables the multi-shot
-///   path through `arm_body_multi_let_then_pure_tail_shape`'s
-///   resumes-many gate (one-shot effects are walker-rejected on the
-///   2-let arm shape per `slice_c_multi_let_arm_body_with_resumes_one
-///   _effect_is_rejected_at_codegen`);
-/// - helper's `LetBindThenTail` body with a Bool binding (`let b: Bool
-///   = perform Choose.flip(); if b { 1 } else { 2 }`) lowers via the
-///   captures-free synth-cont path with binding_ty=I8 narrowed back
-///   from the I64 args_ptr[0] read (per existing precedent
-///   `slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_-
-///   args` in this file);
-/// - the 2-step lambda-lifted post-arm-k chain runs end-to-end:
-///   k(true) → synth-cont with b=true → tail returns 1 → post_arm_k_1
-///   reads r1=1 → k(false) → synth-cont with b=false → tail returns 2
-///   → post_arm_k_2 reads r2=2, reads r1=1 from closure record,
-///   returns r1+r2=3;
-/// - the SAME heap-reified k_closure record is invoked twice (multi-
-///   shot capability of `resumes: many`); cross-resume independence
-///   is asserted by the closed-form expected output 3.
+/// Closed form: outer-arm-tail = inner-tail(b1=t) + inner-tail(b1=f)
+/// = (1+2) + (3+4) = 3 + 7 = 10.
 ///
-/// Invariant: stdout = "3\n", stderr = "", exit 0.
-///
-/// **Pair-generator framing rationale**: see `[DEVIATION Task 59]` in
-/// `boldfield/designs/PLAN_B_DEVIATIONS.md`. The literal Cartesian-
-/// product two-flip pair generator (with 4 outcomes: (T,T)/(T,F)/
-/// (F,T)/(F,F)) requires both the chained-synth-cont extension
-/// (multi-perform helper bodies) and the Slice C N-chain extension —
-/// both Plan-C-or-later territory. v1's "pair" is the (r1, r2) tuple
-/// at the arm-level resume-result space, summed for stdout.
+/// Invariant: stdout = "10\n", stderr = "", exit 0.
 #[test]
-fn choose_example_dual_resume_returns_3() {
+fn choose_example_pair_generator_returns_10() {
     let root = workspace_root();
     let source = root.join("examples/choose.sigil");
     let (stdout, stderr, code) = compile_file_and_run(&source, "choose_example");
     assert_eq!(code, 0, "choose exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "3\n",
-        "choose stdout mismatch (expected r1=1 from k(true) + r2=2 from \
-         k(false) = 3); stderr={stderr:?}"
+        stdout, "10\n",
+        "choose stdout mismatch (expected pair-generator sum 1+2+3+4 = 10); \
+         stderr={stderr:?}"
     );
     assert_eq!(
         stderr, "",
@@ -4195,30 +4154,22 @@ fn slice_c_multi_let_arm_body_with_resumes_one_effect_is_rejected_at_codegen() {
 }
 
 #[test]
-fn slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen() {
-    // Plan B Task 58 — walker-side check converting an internal-
-    // compiler-error panic into a clean compile diagnostic. Slice C
-    // v1's post_arm_k_1 captures only (k_closure, k_fn) into its
-    // TAG_CLOSURE record (codegen.rs:5480-5485); user op-args from
-    // the parent arm fn are NOT threaded in. Pre-Task-58, an arm
-    // body whose `arg2_expr` referenced a user op-arg compiled
-    // through to the codegen-time panic
-    // `unreachable!("codegen: unknown ident \`arg\`")` at
-    // codegen.rs:7765 (lower_expr's Expr::Ident arm, post_arm_k_1's
-    // env lookup miss). The walker check (codegen.rs:944-994 added
-    // at this PR) reuses the existing Slice B/C tail-free-vars
-    // walker on `arg2_expr` with `extra_bindings = {}` (no
-    // binding_name_2 since it doesn't exist yet at the post_arm_k_1
-    // lowering site) and wraps the diagnostic with arg2-specific
-    // Slice C framing.
+fn slice_c_chain_arg_referencing_user_op_arg_runs() {
+    // Plan B' Stage 6.7 Task 100b — captures-bearing extension for
+    // the arm-side N-let chain. `arg_i` (i >= 1) and the tail
+    // expression may now reference arm-fn user op-args; the chain
+    // closure record threads op-args forward through every step.
     //
-    // Closure point: future Slice C captures-bearing extension PR
-    // threads user op-args into post_arm_k_1's closure record (and
-    // post_arm_k_2's via inheritance). When that lands, this test
-    // becomes a positive test (or moves to a separate accept-shape
-    // test); the walker check stays in place but the diagnostic's
-    // "deferred to future Slice C captures-bearing extension PR"
-    // wording is updated to "Closed at PR #X".
+    // Inverted from the pre-Task-100b
+    // `slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen`
+    // negative test (which asserted REJECTION at codegen). The
+    // captures-bearing extension lifts the Task 58 restriction by
+    // adding `PostArmKChain.captures` and threading op-args via
+    // every step's closure record.
+    //
+    // Step trace: helper(5) performs Choose.choose(5). Arm dispatched
+    // with arg=5. r1 = k(arg+10) = k(15) → resumes helper with 15
+    // → r1 = 15. r2 = k(arg+20) = k(25) → r2 = 25. tail = r1+r2 = 40.
     let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
                fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
                  let x: Int = perform Choose.choose(seed);\n  \
@@ -4235,88 +4186,22 @@ fn slice_c_arg2_referencing_user_op_arg_is_rejected_at_codegen() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "slice_c_reject_arg2_op_arg_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path =
-        std::env::temp_dir().join(format!("slice_c_reject_arg2_op_arg_{}", std::process::id()));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail: arg2 of multi-let arm references user op-arg `arg` \
-         (Slice C v1 doesn't thread op-args into post_arm_k_1's closure record). \
-         stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    // Pin the Slice-C-arg2 diagnostic framing (so a future commit
-    // that lifts the restriction inverts this test's diagnostic-
-    // string assertion alongside the success-status one).
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("Slice C: arg2 of multi-let arm body"),
-        "expected Slice C arg2 framing in diagnostic; stderr={stderr:?}"
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_arg_op_arg");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "40\n",
+        "Plan B' Task 100b: arg2 references op-arg `arg` — r1=k(15)=15, \
+         r2=k(25)=25, sum=40. stderr={stderr:?}"
     );
 }
 
-#[test]
-fn slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen() {
-    // Slice C negative coverage: shape detector requires exactly 2
-    // `Stmt::Let`s. 3+ Lets are deferred to a future captures-bearing
-    // extension that generalises the chain to N.
-    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
-               fn helper() -> Int ![Choose, IO] {\n  \
-                 let b: Bool = perform Choose.flip();\n  \
-                 if b { 1 } else { 0 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle helper() with {\n    \
-                   Choose.flip(k) => {\n      \
-                     let r1: Int = k(true);\n      \
-                     let r2: Int = k(false);\n      \
-                     let r3: Int = k(true);\n      \
-                     r1 + r2 + r3\n    \
-                   },\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(n));\n  \
-                 0\n\
-               }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "slice_c_reject_three_lets_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path =
-        std::env::temp_dir().join(format!("slice_c_reject_three_lets_{}", std::process::id()));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail: 3-let arm body (Slice C v1 supports only 2). \
-         stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-}
+// Plan B' Stage 6.7 Task 100: the legacy
+// `slice_c_multi_let_arm_body_with_three_lets_is_rejected_at_codegen`
+// pinning test — which asserted that 3-let arm bodies REJECT at
+// codegen — is deleted here. Phase B (Task 98) lifted the 2-let cap
+// to N >= 2; positive coverage of 3-let arm bodies lives in
+// `slice_c_chain_three_let_arm_body_invokes_k_three_times` (and the
+// 5-let / forward-data-dep variants) further down this file.
 
 #[test]
 fn slice_c_choose_multi_shot_with_string_chain_threads_pointer_through_closures() {
@@ -4823,4 +4708,373 @@ fn handle_with_bool_body_and_return_arm_uses_v_at_narrow_type() {
         "exit code; main returns 1 from the `if b` else branch; stderr={stderr:?}"
     );
     assert_eq!(stdout, "false\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// ---------------- Plan B' Stage 6.7 Task 96 — B.2 acceptance e2e
+// tests for chained-let-yield-then-pure-tail synth-cont chains
+// (N>=2). The activation in commit 5ad78c3 routes both N=1 and N>=2
+// chains through `ChainedLetBindStep`. Existing 1-stmt tests cover
+// N=1; these cover Middle->...->Final transitions with capture +
+// prior-binding threading, forward data dependencies, and pointer-
+// typed bindings.
+
+#[test]
+fn chained_synth_cont_two_perform_helper_returns_sum_of_bindings() {
+    // N=2 chain. Helper performs E.op twice; tail sums the two
+    // bindings. Each step's resume value comes from a single arm
+    // that returns `arg + 100`.
+    //
+    // step_0 (Middle): bind x = 101 from args_ptr[0]; alloc step_1's
+    // closure record carrying x; sigil_perform(E.op(2), k=&step_1).
+    // step_1 (Final): bind y = 102 from args_ptr[0]; load x = 101
+    // from closure_ptr's prior_bindings slot; lower `x + y`; dispatch
+    // through args_ptr[1..3]'s post_arm_k = (null, identity); identity
+    // returns Done(203).
+    //
+    // Verifies: step_0->step_1 transition, prior_bindings forward
+    // copy, args_ptr[0] bind, post_arm_k dispatch from Final.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper() -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(2);\n  \
+                 x + y\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_two_perform_helper");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "203\n",
+        "Plan B' Task 96: 2-perform chain — x=101, y=102, x+y=203. \
+         stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn chained_synth_cont_three_perform_helper_returns_sum_of_bindings() {
+    // N=3 chain. Verifies Middle->Middle->Final transition: catches
+    // off-by-one bugs in prior_bindings offset arithmetic.
+    //
+    // step_0 (Middle): bind x=101; alloc step_1 record with [x];
+    //   sigil_perform(E.op(2), k=&step_1).
+    // step_1 (Middle): load x from prior_bindings[0]; bind y=102;
+    //   alloc step_2 record with [x, y]; sigil_perform(E.op(3),
+    //   k=&step_2).
+    // step_2 (Final): load x from prior_bindings[0], y from
+    //   prior_bindings[1]; bind z=103; lower `x + y + z`; dispatch
+    //   through post_arm_k.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper() -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(2);\n  \
+                 let z: Int = perform E.op(3);\n  \
+                 x + y + z\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_three_perform_helper");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "306\n",
+        "Plan B' Task 96: 3-perform chain — x=101, y=102, z=103, \
+         x+y+z=306. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn chained_synth_cont_two_perform_with_forward_data_dependency() {
+    // N=2 chain where step 1's perform args reference step 0's
+    // binding. The next_perform's args lower through Lowerer with
+    // env populated from prior_bindings — this verifies the env
+    // setup happens before the next perform's args are lowered.
+    //
+    // step_0: bind x = handler(1) = 101; alloc step_1 record with [x].
+    // step_1 (Final): bind y from args_ptr[0]; load x from prior_-
+    //   bindings[0]; lower `x + y`. Note: step_0's lower of `E.op(x)`
+    //   uses the prior-step-bound x via the env populated from
+    //   prior_bindings[0].
+    //
+    // Wait — step_0 is the FIRST perform (in helper body emit, not in
+    // synth-cont). For step_1's perform args, they're lowered inside
+    // step_0's Middle emit. step_0's env at that point = {x: bound}
+    // + captures + prior_bindings (none for step_0). So `E.op(x)` in
+    // step_1's perform lowers correctly with x in scope.
+    //
+    // x = handler(1) = 101. y = handler(101) = 201. x + y = 302.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper() -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(x);\n  \
+                 x + y\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_forward_data_dependency");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "302\n",
+        "Plan B' Task 96: forward-data-dependency — x=handler(1)=101, \
+         y=handler(x)=handler(101)=201, x+y=302. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn chained_synth_cont_two_perform_helper_with_user_param_capture() {
+    // N=2 chain with a helper user param `threshold` referenced in
+    // the tail. Verifies captures collection across the chain (the
+    // capture is computed once, shared by all steps' closure records)
+    // and helper's perform-time closure record carrying the capture.
+    //
+    // step_0 record: [threshold] (captures only).
+    // step_1 record: [threshold, x] (captures + prior_bindings).
+    // step_1 (Final): loads threshold from captures slot, x from
+    //   prior_bindings slot, binds y; lowers `x + y + threshold`.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(threshold: Int) -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(2);\n  \
+                 x + y + threshold\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_user_param_capture");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "213\n",
+        "Plan B' Task 96: user-param-capture — x=101, y=102, \
+         threshold=10, sum=213. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn chained_synth_cont_user_param_referenced_in_perform_arg_and_tail() {
+    // N=2 chain where the helper user param `threshold` is referenced
+    // BOTH in step_0's perform arg AND in the tail. Verifies the
+    // captures-collection walker visits both perform args AND the
+    // tail (not just the tail).
+    //
+    // step_0's perform arg = threshold; arm returns arg+100 = 110.
+    //   So x = 110.
+    // step_1's perform arg = 2; arm returns 102. So y = 102.
+    // tail: x + y + threshold = 110 + 102 + 10 = 222.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(threshold: Int) -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(threshold);\n  \
+                 let y: Int = perform E.op(2);\n  \
+                 x + y + threshold\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "chained_synth_cont_user_param_in_perform_arg_and_tail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "222\n",
+        "Plan B' Task 96: capture referenced in both perform-arg and \
+         tail — x=handler(threshold)=110, y=102, threshold=10, \
+         sum=222. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn chained_synth_cont_two_perform_with_string_binding_exercises_pointer_bitmap() {
+    // N=2 chain with a String-typed binding in step_0 (pointer-typed
+    // slot). The chain's prior_bindings forward-copy must preserve
+    // the pointer slot's GC bitmap bit when allocating step_1's
+    // closure record. Verifies `EnvSlotKind::is_pointer()` derivation
+    // for non-uniform slot types in the chain.
+    //
+    // step_0 record bitmap: empty (no captures).
+    // step_1 record bitmap: bit 1 set (s is String, pointer-typed).
+    // step_1 (Final): load s from prior_bindings[0]; bind n from
+    //   args_ptr[0]; tail returns s.
+    //
+    // helper's tail returns the String binding `s`; main prints it.
+    let src = "effect S { gen_str: () -> String, gen_int: () -> Int }\n\
+               fn helper() -> String ![S, IO] {\n  \
+                 let s: String = perform S.gen_str();\n  \
+                 let n: Int = perform S.gen_int();\n  \
+                 s\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: String = handle helper() with {\n    \
+                   S.gen_str(k) => k(\"hello-chain\"),\n    \
+                   S.gen_int(k) => k(42),\n  \
+                 };\n  \
+                 perform IO.println(r);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "chained_synth_cont_string_binding_pointer_bitmap");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "hello-chain\n",
+        "Plan B' Task 96: pointer-typed (String) binding threaded \
+         forward through chain — s='hello-chain' survives prior_bindings \
+         copy from step_0 to step_1; tail returns s. stderr={stderr:?}"
+    );
+}
+
+// ---------------- Plan B' Stage 6.7 Task 99 — B.1 (arm-side N-let
+// chain) acceptance e2e tests for N>=3. The Phase B activation
+// (Task 98) routes both N=2 (existing slice_c_choose_multi_shot_*
+// tests) and N>=3 chains through the unified `chain.steps` emit
+// loop. Existing 2-let tests cover N=2; these cover Middle->...
+// ->Final transitions for longer chains, including forward data
+// dependencies in arg expressions and full env access in the tail.
+// ----------------
+
+#[test]
+fn slice_c_chain_three_let_arm_body_invokes_k_three_times() {
+    // N=3 arm body. Helper: `let b = perform Choose.flip(); if b
+    // then 1 else 0`. Arm body: 3 sequential k invocations with
+    // alternating args. Tail sums all three results.
+    //
+    // Arm dispatched once. Each k invocation drives helper synth-
+    // cont with the given Bool, returning 1 or 0. Pre-Task-98 (with
+    // legacy 2-let cap), this shape was rejected at codegen via
+    // `slice_c_multi_let_arm_body_with_three_lets_is_rejected` (now
+    // inverted via Task 100); post-Task-98 it compiles + runs.
+    //
+    // Step trace:
+    //   - arm fn: lowers k(true), allocs step_0's closure (k pair),
+    //     dispatches to step_0 via helper synth-cont → trampoline
+    //     dispatches step_0(args_ptr=[1, post_arm_k_pair_a]).
+    //   - step_0 (Middle): binds r1=1, loads (k_closure, k_fn),
+    //     lowers k(false) arg, allocs step_1's closure (k pair +
+    //     [r1]), dispatches.
+    //   - step_1 (Middle): binds r2=0, loads (k_closure, k_fn) +
+    //     [r1] from closure, lowers k(true) arg, allocs step_2's
+    //     closure (Final layout: [r1, r2]), dispatches.
+    //   - step_2 (Final): binds r3=1, loads [r1, r2], lowers
+    //     `r1+r2+r3 = 1+0+1 = 2`, returns Done(2).
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     let r3: Int = k(true);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_three_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "2\n",
+        "Plan B' Task 99: 3-let chain — r1=1, r2=0, r3=1, sum=2. \
+         stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_c_chain_five_let_arm_body_invokes_k_five_times() {
+    // N=5 chain. Stress-tests the Middle->Middle->Middle->Middle->
+    // Final transition + offset arithmetic in prior_bindings copy.
+    // Arm: 5 k(...) invocations with alternating Bool args; tail
+    // sums all 5 results.
+    //
+    // Expected: r1=1, r2=0, r3=1, r4=0, r5=1 → sum=3.
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     let r3: Int = k(true);\n      \
+                     let r4: Int = k(false);\n      \
+                     let r5: Int = k(true);\n      \
+                     r1 + r2 + r3 + r4 + r5\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_five_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3\n",
+        "Plan B' Task 99: 5-let chain — r1=1, r2=0, r3=1, r4=0, r5=1, \
+         sum=3. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_c_chain_three_let_with_forward_data_dependency() {
+    // N=3 chain where the SECOND k invocation's arg references the
+    // FIRST chain binding (`k(r1)`), and the THIRD references both
+    // (`k(r1 + r2)`). Verifies prior_bindings forward-copy +
+    // narrow-on-load + env scoping at each step.
+    //
+    // Effect `Gen resumes: many { next: (Int) -> Int }`. Helper
+    // performs Gen.next(0) and returns the resume value (single-
+    // perform helper; helper synth-cont is a 1-step ChainedLetBindStep
+    // chain via B.2's path).
+    //
+    // Arm dispatched with arg=0. Three k invocations:
+    //   - r1 = k(arg + 1) = k(1) → resumes helper with 1, helper
+    //     returns 1. So r1=1.
+    //   - r2 = k(r1) = k(1) → r2=1.
+    //   - r3 = k(r1 + r2) = k(2) → r3=2.
+    //   - tail = r1 + r2 + r3 = 1 + 1 + 2 = 4.
+    let src = "effect Gen resumes: many { next: (Int) -> Int }\n\
+               fn helper() -> Int ![Gen, IO] {\n  \
+                 let n: Int = perform Gen.next(0);\n  \
+                 n\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m: Int = handle helper() with {\n    \
+                   Gen.next(arg, k) => {\n      \
+                     let r1: Int = k(arg + 1);\n      \
+                     let r2: Int = k(r1);\n      \
+                     let r3: Int = k(r1 + r2);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(m));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_forward_data_dep");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "4\n",
+        "Plan B' Task 99: 3-let chain with forward data dependency — \
+         r1=1, r2=k(r1)=1, r3=k(r1+r2)=2, sum=4. stderr={stderr:?}"
+    );
 }
