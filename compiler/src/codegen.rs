@@ -1923,76 +1923,14 @@ enum CpsContinuationKind {
         /// support BoolLit / CharLit / StringLit.
         constant_value: i64,
     },
-    /// **Let-bind-then-tail shape** (per
-    /// [`is_simple_let_yield_then_pure_tail_body`]): the synth-cont
-    /// reads `args_ptr[0]` as the let-binding's value, binds it in
-    /// a fresh Lowerer's env under `binding_name`, loads any
-    /// `captures` from `closure_ptr`, lowers `tail_expr` via
-    /// Lowerer (which can reference `binding_name`, captured user
-    /// params, and other pure shapes), widens the result to I64,
-    /// returns `Done(value)`. Used when the parent helper's body
-    /// is `let name = perform ...; tail_expr` and the tail is a
-    /// pure expression that may reference `name` and/or helper's
-    /// user params.
-    ///
-    /// **Captures-bearing extension (this commit's slice)**: the
-    /// `captures` list enumerates user params of the parent helper
-    /// that the tail expression references by name. The synth-cont
-    /// reads them from `closure_ptr` at fn entry (via the same
-    /// `lower_closure_env_load` machinery user lambdas use). The
-    /// parent helper's body emit allocates the closure record at
-    /// the perform site and passes its pointer as `k_closure` to
-    /// `sigil_perform`. When `captures` is empty, the parent
-    /// passes null `k_closure` (no allocation).
-    ///
-    /// **Plan B' Stage 6.7 Tasks 94+95:** the pre-pass now routes
-    /// 1-stmt let-yield bodies through [`Self::ChainedLetBindStep`]
-    /// (with `chain_length = 1`) instead. This variant + its
-    /// supporting `LetBindThenTail` emit pass + its companion
-    /// classifier `is_simple_let_yield_then_pure_tail_body` +
-    /// captures helper `collect_synth_cont_captures` are now
-    /// structurally dead in the production path, marked
-    /// `#[allow(dead_code)]` so the compile stays clean while unit
-    /// tests still exercise them. Phase D (next commit) removes
-    /// the variant + emit pass + classifier + captures helper +
-    /// dead unit tests in one sweep.
-    #[allow(dead_code)]
-    LetBindThenTail {
-        /// Source-level name of the let-binding (the name `args_ptr
-        /// [0]` is bound to in the synth-cont's env).
-        binding_name: String,
-        /// Cranelift type the let-binding declares. The synth-cont
-        /// loads `args_ptr[0]` as `i64` then `ireduce`s back to
-        /// this type for binding (mirrors the user-arg unpack
-        /// discipline at the parent helper's body emit).
-        binding_ty: Type,
-        /// The post-yield rest-of-body that the synth-cont lowers
-        /// via Lowerer.lower_expr. Pure per the classifier; may
-        /// reference `binding_name` and any of `captures`. Boxed
-        /// because `Expr` has a large representation and clippy
-        /// flags `clippy::large_enum_variant` on the unboxed
-        /// shape.
-        tail_expr: Box<crate::ast::Expr>,
-        /// Cranelift type of the tail expression's value. Used to
-        /// widen to I64 before wrapping in `Done(...)`.
-        tail_ty: Type,
-        /// Captures of the parent helper's user params that the
-        /// tail expression references. Computed via free-var
-        /// analysis at the user-fn pre-pass. Empty when the
-        /// helper is arity-0 OR when the tail doesn't reference
-        /// any user params (e.g., constant tail). When empty, the
-        /// parent helper passes null `k_closure`; when non-empty,
-        /// the parent allocates a closure record holding the
-        /// captures and passes its pointer.
-        captures: Vec<SynthContCapture>,
-    },
     /// **Plan B' Stage 6.7 Tasks 93-95 (B.2) — chained-let-bind step**:
     /// one step in a chained-let-yield-then-pure-tail synth-cont chain
-    /// (per [`is_simple_chained_let_yield_then_pure_tail_body`]).
-    /// Generalises [`Self::LetBindThenTail`]'s 1-stmt cap to N stmts
-    /// via N synth-cont entries (one per step), each self-contained
-    /// for the existing one-entry-emits-one-fn synth-cont definition
-    /// pass.
+    /// (per [`is_simple_chained_let_yield_then_pure_tail_body`]). Each
+    /// chain step is its own `CpsContinuationSynth` entry, self-
+    /// contained for the existing one-entry-emits-one-fn synth-cont
+    /// definition pass; an N-step chain produces N entries with
+    /// `Middle`-role steps cross-referencing the next step's FuncId
+    /// and a final `Final`-role step lowering the helper's tail.
     ///
     /// The helper's body is `let name_0: ty_0 = perform p_0; let
     /// name_1: ty_1 = perform p_1; ...; let name_{N-1}: ty_{N-1} =
@@ -2020,29 +1958,14 @@ enum CpsContinuationKind {
     /// which slots are pointer-typed (driven by `SynthContCapture
     /// .kind.is_pointer()` for captures and `ChainedPriorBinding
     /// .kind.is_pointer()` for prior bindings).
-    ///
-    /// **Phase A scope (Task 93):** added the per-step kind variant
-    /// alongside the classifier and its unit tests. The variant was
-    /// `#[allow(dead_code)]` while Phase B/C wired up the pre-pass
-    /// and emit code. **Phase B/C (Tasks 94+95) activate it**: the
-    /// pre-pass switches to the chained classifier and allocates N
-    /// entries per chained helper; helper body emit and synth-cont
-    /// definition pass consume the new variant. The old
-    /// `LetBindThenTail` variant retires alongside its classifier
-    /// (Phase D, landing in the same combined commit).
-    ///
-    /// Plan B' Stage 6.7 Tasks 94+95 (Phase B+C activation): pre-
-    /// pass + helper body emit + synth-cont definition pass all
-    /// consume this variant. Phase A's `#[allow(dead_code)]`
-    /// transitional marker is dropped here.
     ChainedLetBindStep {
         /// Source-level name of the let-binding bound at this step's
         /// entry from `args_ptr[0]`.
         binding_name: String,
         /// Cranelift type the let-binding declares. The synth-cont
         /// loads `args_ptr[0]` as I64 and `ireduce`s back to this
-        /// type for binding (mirrors `LetBindThenTail`'s
-        /// narrow-on-load discipline).
+        /// type for binding (mirrors the user-arg unpack discipline
+        /// at the parent helper's body emit).
         binding_ty: Type,
         /// `EnvSlotKind` for the let-binding's slot — drives the
         /// pointer-bitmap derivation in Middle steps when this
@@ -2157,54 +2080,23 @@ fn slot_kind_for_type_expr_post_mono(te: &crate::ast::TypeExpr) -> EnvSlotKind {
     }
 }
 
-/// Plan B Task 55, Phase 4e — collect the names that the synth-cont
-/// must capture from the parent helper.
+/// Plan B' Stage 6.7 (B.2 Phase B/C) — collect helper-user-param
+/// captures for a chained-let-yield-then-pure-tail synth-cont chain.
 ///
-/// Walks `tail_expr` and harvests every `Expr::Ident` whose name
-/// matches a helper param AND isn't shadowed by `bound`. The
-/// `bound` set initially contains the let-binding's name (so
-/// `let x = perform; x + threshold` correctly captures `threshold`
-/// but not `x`).
+/// Walks each `performs[i]`'s args in source order, then `tail_expr`,
+/// harvesting every `Expr::Ident` whose name matches a helper param
+/// AND isn't shadowed by `bound`. All chain bindings (step_0..step
+/// _{N-1}) are pre-bound in the initial `bound` set so that any
+/// reference to a chain binding inside a perform's args or the
+/// tail is *not* captured (it's synth-cont-internal, threaded
+/// forward via the closure record's prior-bindings slots). Any
+/// reference to a helper user param IS captured.
 ///
 /// Recursive shapes (Block, Match, If) extend `bound` with locally-
 /// introduced let-bindings as the walker descends. Shape mirrors
 /// `expr_is_pure` since the classifier already restricted to pure
-/// tail expressions — yield-able shapes (Call, Perform, Lambda,
+/// expressions — yield-able shapes (Call, Perform, Lambda,
 /// ClosureRecord, Handle) won't appear here.
-///
-/// Returns captures in source-encounter order (deduplicated). The
-/// order matters because the closure record's slots are positional
-/// — `captures[i]` is at `closure_ptr + 16 + 8*i` and the synth-cont
-/// reads them in this same order.
-///
-/// **Plan B' Stage 6.7 Tasks 94+95:** structurally dead in the
-/// production path (replaced by [`collect_chained_synth_cont_captures`])
-/// but retained as `#[allow(dead_code)]` for transitional unit-test
-/// coverage. Phase D removes it.
-#[allow(dead_code)]
-fn collect_synth_cont_captures(
-    tail_expr: &crate::ast::Expr,
-    let_binding_name: &str,
-    helper_params: &[crate::ast::Param],
-) -> Vec<SynthContCapture> {
-    let mut bound: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    bound.insert(let_binding_name.to_string());
-    let mut out: Vec<SynthContCapture> = Vec::new();
-    walk_collect_captures(tail_expr, &mut bound, helper_params, &mut out);
-    out
-}
-
-/// Plan B' Stage 6.7 (B.2 Phase B/C) — collect helper-user-param
-/// captures for a chained-let-yield-then-pure-tail synth-cont chain.
-///
-/// Generalizes [`collect_synth_cont_captures`] from a single let-
-/// binding name + tail to N let-binding names + N performs + tail.
-/// All chain bindings (step_0..step_{N-1}) are pre-bound in the
-/// initial `bound` set so that any reference to a chain binding
-/// inside a perform's args or the tail is *not* captured (it's
-/// synth-cont-internal, threaded forward via the closure record's
-/// prior-bindings slots). Any reference to a helper user param IS
-/// captured.
 ///
 /// The walk visits each `performs[i]`'s args in source order, then
 /// `tail_expr`. The same `out` Vec accumulates captures across all
@@ -3051,11 +2943,11 @@ fn arm_body_tail_is_k_call<'a>(
 ///     `arm_body_post_arm_k_tail_free_vars_ok` helper enforces
 ///     this.
 ///
-/// This is the arm-side analogue of the helper-body's
-/// [`is_simple_let_yield_then_pure_tail_body`] from PR #26's `a5ee4c6`
-/// captures-bearing slice. The post-arm-k synth fn's role for the
-/// arm body parallels what the helper's `LetBindThenTail`
-/// `CpsContinuationKind` synth-cont does for the helper body.
+/// This is the arm-side analogue of the helper-body's chained-let-
+/// yield classifier ([`is_simple_chained_let_yield_then_pure_tail
+/// _body`]). The post-arm-k synth fn's role for the arm body
+/// parallels what `CpsContinuationKind::ChainedLetBindStep`'s
+/// synth-cont does for the helper body.
 ///
 /// Returned references all borrow from `body`'s sub-tree.
 fn arm_body_let_then_pure_tail_shape<'a>(
@@ -4422,8 +4314,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             //   - `is_simple_chained_let_yield_then_pure_tail_body`
             //     returning `Some(N)` → N `CpsContinuationKind::
             //     ChainedLetBindStep` entries (one per chain step;
-            //     accepts N >= 1, generalizing the prior 1-stmt
-            //     `LetBindThenTail` shape).
+            //     accepts N >= 1).
             //
             // The `cps_continuation_synth_indices` map points at
             // step_0's index; helper body emit reads step_0's
@@ -4675,7 +4566,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // the per-fn FuncRef set. Constructed once here; reused at the
     // three call sites that need a full per-fn FuncRef set:
     // user-fn body emit (this loop), synth-arm-fn body emit, and
-    // synth-cont definition pass for `LetBindThenTail`. Closes the
+    // synth-cont definition pass for `ChainedLetBindStep`. Closes the
     // FFI-ref dedup deferred-must-fix flagged in PR #26 mid-flight
     // reviews at `33f2231`, `a5ee4c6`, and `2be70ce`. The
     // `TODO(plan-b-task-55-phase-4e/ffi-ref-extraction)` marker
@@ -4829,7 +4720,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         crate::ast::Stmt::Let(l) => match &l.value {
                             crate::ast::Expr::Perform(p) => p.clone(),
                             _ => unreachable!(
-                                "is_simple_let_yield_then_pure_tail_body \
+                                "is_simple_chained_let_yield_then_pure_tail_body \
                                  classifier guarantees Let value is Expr::Perform"
                             ),
                         },
@@ -4972,9 +4863,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let synth_cont_idx = cps_continuation_synth_indices[&f.name];
                         let captures: Vec<SynthContCapture> =
                             match &cps_continuation_synth[synth_cont_idx].kind {
-                                CpsContinuationKind::LetBindThenTail { captures, .. } => {
-                                    captures.clone()
-                                }
                                 CpsContinuationKind::ChainedLetBindStep { captures, .. } => {
                                     captures.clone()
                                 }
@@ -7067,8 +6955,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // Slice A: load post-arm-k pair from args_ptr at the
                 // trailing-pair offsets defined by the convention
                 // (closure at +8, fn at +16; arg at +0). Used by both
-                // ConstantDone and LetBindThenTail arms to dispatch
-                // their result through the post-arm-k continuation.
+                // ConstantDone and ChainedLetBindStep::Final arms to
+                // dispatch their result through the post-arm-k
+                // continuation.
                 //
                 // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
                 // This marker covers FOUR sites where heap pointers
@@ -7160,175 +7049,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         builder.ins().return_(&[next_step]);
                         builder.finalize();
                     }
-                    CpsContinuationKind::LetBindThenTail {
-                        binding_name,
-                        binding_ty,
-                        tail_expr,
-                        tail_ty,
-                        captures,
-                    } => {
-                        // Captures-bearing let-yield-then-pure-tail
-                        // shape: load `args_ptr[0]` as I64, narrow
-                        // to `binding_ty`, bind in env under
-                        // `binding_name`. For each capture in
-                        // `captures`, load from `closure_ptr` at
-                        // offset `16 + 8*i` (mirroring user-lambda
-                        // closure_env_load), narrow per kind, bind
-                        // in env. Then lower `tail_expr` via
-                        // Lowerer, widen result to I64, emit
-                        // `Done(value)`.
-                        //
-                        // When `captures` is empty (arity-0 helper
-                        // OR tail not referencing helper's params),
-                        // helper passed null `closure_ptr`; the
-                        // capture-load loop runs zero iterations
-                        // and the env contains only the binding.
-                        let args_ptr = block_params[1];
-                        let widened =
-                            builder
-                                .ins()
-                                .load(types::I64, MemFlags::trusted(), args_ptr, 0);
-                        let bound_value = if *binding_ty == types::I64 {
-                            widened
-                        } else if binding_ty.is_int() && binding_ty.bits() < 64 {
-                            builder.ins().ireduce(*binding_ty, widened)
-                        } else {
-                            assert_eq!(
-                                *binding_ty, pointer_ty,
-                                "codegen Phase 4e: unexpected synth-cont binding \
-                                 type {binding_ty:?} for fn `{}`",
-                                synth.parent_fn_name
-                            );
-                            widened
-                        };
-
-                        let mut env: BTreeMap<String, Value> = BTreeMap::new();
-                        env.insert(binding_name.clone(), bound_value);
-
-                        // Captures-bearing extension: read each
-                        // capture from `closure_ptr` at offset 16 +
-                        // 8*i. Mirrors `lower_closure_env_load`
-                        // (which reads from `self.closure_ptr`); we
-                        // emit the loads here directly because we
-                        // pre-Lowerer-construction.
-                        let synth_closure_ptr = block_params[0];
-                        for (i, capture) in captures.iter().enumerate() {
-                            let offset: i32 = 16 + 8 * i as i32;
-                            let raw = builder.ins().load(
-                                types::I64,
-                                MemFlags::trusted(),
-                                synth_closure_ptr,
-                                offset,
-                            );
-                            let val = match capture.kind {
-                                EnvSlotKind::Int => raw,
-                                EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
-                                    builder.ins().ireduce(types::I8, raw)
-                                }
-                                EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
-                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
-                                    if pointer_ty == types::I64 {
-                                        raw
-                                    } else {
-                                        builder.ins().ireduce(pointer_ty, raw)
-                                    }
-                                }
-                            };
-                            env.insert(capture.name.clone(), val);
-                        }
-
-                        // Plan B Task 55, Phase 4e — per-fn FuncRefs
-                        // via shared `prepare_per_fn_refs` helper.
-                        // The synth-cont (LetBindThenTail) body
-                        // doesn't use the tail-`k` lowering refs
-                        // (those are arm-fn-only); unreferenced
-                        // FuncRefs sit in `dfg.ext_funcs` without
-                        // emitting relocations.
-                        let PerFnRefs {
-                            string_new_ref,
-                            alloc_ref,
-                            int_to_string_ref,
-                            handler_frame_new_ref,
-                            handle_push_ref,
-                            handle_pop_ref,
-                            handler_frame_set_arm_ref,
-                            handler_frame_set_return_ref,
-                            perform_ref,
-                            run_loop_ref,
-                            next_step_done_ref: _,
-                            next_step_call_ref,
-                            next_step_args_ptr_ref,
-                            continuation_identity_ref,
-                            handler_arm_refs_per_handle,
-                            handler_return_arm_refs_per_handle,
-                            user_fn_refs,
-                            lit_gvs,
-                        } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
-
-                        let closure_ptr = block_params[0];
-                        let mut lowerer = Lowerer {
-                            builder,
-                            stackmap: &mut stackmap,
-                            env,
-                            pointer_ty,
-                            closure_ptr,
-                            lit_gvs,
-                            string_new_ref,
-                            alloc_ref,
-                            int_to_string_ref,
-                            handler_frame_new_ref,
-                            handle_push_ref,
-                            handle_pop_ref,
-                            handler_frame_set_arm_ref,
-                            handler_frame_set_return_ref,
-                            perform_ref,
-                            run_loop_ref,
-                            next_step_call_ref,
-                            next_step_args_ptr_ref,
-                            handler_arm_refs_per_handle,
-                            handler_arm_synth: &handler_arm_synth,
-                            handler_arm_indices: &handler_arm_indices,
-                            handler_return_arm_refs_per_handle,
-                            handler_return_arm_synth: &handler_return_arm_synth,
-                            handler_return_arm_indices: &handler_return_arm_indices,
-                            continuation_identity_ref,
-                            effect_ids: &checked.effect_ids,
-                            op_ids: &checked.op_ids,
-                            effects: &checked.effects,
-                            user_fn_refs,
-                            user_fns: &user_fns,
-                            type_layouts: &type_layouts,
-                            ctor_index: &ctor_index,
-                            match_scrut_tys: &checked.match_scrut_tys,
-                        };
-
-                        let tail_value = lowerer.lower_expr(tail_expr.as_ref());
-                        let widened_tail = if *tail_ty == types::I64 {
-                            tail_value
-                        } else if tail_ty.is_int() && tail_ty.bits() < 64 {
-                            lowerer.builder.ins().uextend(types::I64, tail_value)
-                        } else {
-                            assert_eq!(
-                                *tail_ty, pointer_ty,
-                                "codegen Phase 4e: unexpected synth-cont tail \
-                                 type {tail_ty:?} for fn `{}`",
-                                synth.parent_fn_name
-                            );
-                            tail_value
-                        };
-
-                        // Slice A: dispatch the tail value through the
-                        // post-arm-k continuation (read at synth-cont
-                        // entry from `args_ptr[1..3]`) instead of
-                        // returning `Done` directly.
-                        let next_step = emit_dispatch_to_post_arm_k(
-                            &mut lowerer.builder,
-                            lowerer.stackmap,
-                            widened_tail,
-                        );
-                        lowerer.builder.ins().return_(&[next_step]);
-                        lowerer.builder.finalize();
-                    }
                     CpsContinuationKind::ChainedLetBindStep {
                         binding_name,
                         binding_ty,
@@ -7347,13 +7067,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // packed at offsets 16+8*i (captures first,
                         // prior_bindings second).
                         //
-                        // Final step (step_idx == chain_length - 1):
-                        // bind `args_ptr[0]` → binding_name, load
-                        // captures + prior_bindings into env, lower
-                        // tail_expr via Lowerer, dispatch via post_arm
-                        // _k (mirrors `LetBindThenTail`'s tail-emit).
+                        // Final step (last in the chain): bind
+                        // `args_ptr[0]` → binding_name, load captures
+                        // + prior_bindings into env, lower tail_expr
+                        // via Lowerer, dispatch via post_arm_k.
                         //
-                        // Middle step (step_idx < chain_length - 1):
+                        // Middle step (not the last in the chain):
                         // bind args_ptr[0] → binding_name, load captures
                         // + prior_bindings, allocate next-step closure
                         // record holding `captures + prior_bindings +
@@ -7368,8 +7087,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // happens through the Final step's args_ptr
                         // post_arm_k pair (which for tail-`k` arms is
                         // `(null, identity)` — the chain terminates
-                        // with `Done(tail_value)`, identical to
-                        // `LetBindThenTail`'s tail-`k` flow).
+                        // with `Done(tail_value)`).
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
 
@@ -7397,9 +7115,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                         // Helper: narrow an I64-loaded slot to the
                         // user-visible Cranelift type per `EnvSlotKind`.
-                        // Mirrors the existing capture-load sequence in
-                        // `LetBindThenTail`'s emit and the closure-env
-                        // load discipline shared with user-lambda
+                        // Same closure-env load discipline as user-lambda
                         // closures.
                         let narrow_for_kind = |builder: &mut FunctionBuilder<'_>,
                                                raw: Value,
@@ -10293,7 +10009,7 @@ const POST_ARM_K_FN_OFF: i32 = 16;
 /// construction. Used at the three sites that need a full per-fn
 /// FuncRef set: the user-fn body emit loop, the synth-arm-fn body
 /// emit loop, and the synth-cont definition pass for
-/// [`CpsContinuationKind::LetBindThenTail`]. Borrows are `'a`-bound
+/// [`CpsContinuationKind::ChainedLetBindStep`]. Borrows are `'a`-bound
 /// to the `emit_object` stack frame; the context is constructed
 /// once and re-used for each fn.
 ///
@@ -10741,105 +10457,6 @@ fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
     matches!(&body.tail, Some(Expr::IntLit(_, _)))
 }
 
-/// Plan B Task 55, Phase 4e — does this fn body match the **simple
-/// let-yield then pure tail** shape that the captures-free
-/// lambda-lifting slice supports?
-///
-/// A body matches iff:
-///
-/// 1. Its statement list has exactly one stmt.
-/// 2. That stmt is a [`crate::ast::Stmt::Let`] whose value is a
-///    non-IO [`crate::ast::Expr::Perform`] with all pure args
-///    (per [`expr_is_pure`]).
-/// 3. The tail expression is pure (per [`expr_is_pure`]).
-///
-/// **The big difference from `is_simple_yield_then_constant_tail
-/// _body`**: the perform's result is bound by name in the source,
-/// and the tail expression can reference that name. The synth-cont
-/// must bind `args_ptr[0]` (the value passed to `k(...)` by the
-/// arm) as the let-binding's name in its env, then lower the tail
-/// via [`Lowerer`] with that env.
-///
-/// **Captures-free constraint**: this slice doesn't yet handle
-/// helpers whose tail expression references user params (which
-/// would require a closure record capturing helper's params). The
-/// `compute_user_fn_abi` selector enforces `params.is_empty()` for
-/// this body shape. Helpers with user params + this body shape
-/// fall through to `UserFnAbi::Sync` (synchronous run_loop path,
-/// the Phase 4d MVP behavior). The captures-bearing slice (next
-/// major commit) lifts the arity-0 restriction.
-///
-/// **Why this carve-out exists.** This shape is exactly what the
-/// `discard_k_handler_does_not_abort_helper_phase_4e_pending`
-/// e2e test exercises:
-///
-/// ```text
-/// fn helper() -> Int ![Raise, IO] {
-///   let x: Int = perform Raise.fail();
-///   x + 100
-/// }
-/// ```
-///
-/// Under Phase 4d MVP synchronous shape, `sigil_run_loop` returned
-/// the arm value (42) to the perform site, x got bound to 42,
-/// helper computed 42 + 100 = 142, handle's overall = 142. Phase
-/// 4e correctness: when the arm discards `k` (no reference to k
-/// in the arm body), the synth-cont never runs, helper's rest-of-
-/// body is dropped, the arm value (42) flows directly to the
-/// handle site. **Inverts the discard_k test from `142` to
-/// `42`.**
-///
-/// When the arm uses `k(value)`, the synth-cont fires, binds
-/// `args_ptr[0] = value` as `x`, lowers `x + 100` via Lowerer,
-/// returns `Done(value + 100)`. Trampoline returns that to the
-/// wrapper.
-///
-/// Future widening from this slice (captures-bearing slice):
-///   1. Helpers with user params + tail referencing them — synth-
-///      cont closure record captures helper's params.
-///   2. Multi-yield bodies (`perform; perform; tail`) — chained
-///      synth-conts.
-///
-/// Cross-link: [`arm_body_let_then_pure_tail_shape`] is the arm-
-/// side analogue of this helper-side classifier (Phase 4e captures+
-/// Slice B). The two walkers' recursion shapes are deliberately
-/// parallel — when a future `Expr` variant arrives, both must be
-/// updated in lockstep. The arm-side detector additionally enforces
-/// a free-var restriction via `arm_body_post_arm_k_tail_free_vars_ok`
-/// because the post-arm-k synth fn's closure_ptr is null in
-/// Slice B's first commit (no captures); the helper-side
-/// `LetBindThenTail` synth-cont already ships captures.
-///
-/// **Plan B' Stage 6.7 Tasks 94+95:** structurally dead in the
-/// production path (`compute_user_fn_abi` + the pre-pass now use
-/// [`is_simple_chained_let_yield_then_pure_tail_body`]) but retained
-/// as `#[allow(dead_code)]` for transitional unit-test coverage.
-/// Phase D removes it.
-#[allow(dead_code)]
-fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
-    use crate::ast::{Expr, Stmt};
-    if body.stmts.len() != 1 {
-        return false;
-    }
-    let let_stmt = match &body.stmts[0] {
-        Stmt::Let(l) => l,
-        _ => return false,
-    };
-    // Stage 6 cleanup: IO color filter lifted — every perform
-    // (including IO) is eligible for the CPS-color body classifier.
-    let yield_perform = match &let_stmt.value {
-        Expr::Perform(p) => p,
-        _ => return false,
-    };
-    if !yield_perform.args.iter().all(expr_is_pure) {
-        return false;
-    }
-    match &body.tail {
-        Some(t) => expr_is_pure(t),
-        None => false,
-    }
-}
-
 /// Plan B' Stage 6.7 Task 93 (B.2 Phase A) — does this fn body match
 /// the **chained let-yield then pure tail** shape that the chained-
 /// synth-cont extension supports?
@@ -10854,24 +10471,9 @@ fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
 ///
 /// Returns `Some(N)` (the chain length) on match; `None` otherwise.
 /// Callers use the returned length to size the chain's synth-cont
-/// allocation.
-///
-/// **Phase A scope (Task 93):** the classifier is added alongside
-/// the existing 1-stmt classifier [`is_simple_let_yield_then_pure_-
-/// tail_body`]; nothing yet consumes it. Phase B (Task 94) switches
-/// `compute_user_fn_abi` to this classifier and allocates N synth-
-/// cont FuncIds for chain length N. The classifier accepts N=1 (the
-/// existing 1-stmt case) so the post-Phase-B path generalises
-/// uniformly; until Phase B activates it, the existing 1-stmt path
-/// stays on `is_simple_let_yield_then_pure_tail_body` +
-/// [`CpsContinuationKind::LetBindThenTail`].
-///
-/// **Why N >= 1 not N >= 2:** the chained variant covers both 1-stmt
-/// and N-stmt cases uniformly. Phase B's pre-pass distinguishes
-/// `chain_length == 1` (single synth-cont, no chain steps) from
-/// `chain_length >= 2` (full chain) at the FuncId allocation site.
-/// Phase D retires `LetBindThenTail` once the chained variant covers
-/// all paths.
+/// allocation. Accepts N=1 — the 1-stmt case routes through the
+/// chained variant uniformly with `chain_length = 1` and a single
+/// `Final` step.
 ///
 /// **Cap on chain length** (R3 finding 1, Plan B' Stage 6.7): the
 /// chained synth-cont closure-record bitmap caps each record at
@@ -11360,127 +10962,12 @@ mod tests {
         assert!(is_simple_yield_then_constant_tail_body(&body));
     }
 
-    // ---------------- Plan B Task 55, Phase 4e — let-yield-then-
-    // pure-tail classifier (lambda-lifting captures-free slice).
-
-    #[test]
-    fn let_yield_then_pure_tail_body_recognised() {
-        // `let x: Int = perform Raise.fail(); 42` — happy path with
-        // a literal tail. Even though a constant tail also matches
-        // `is_simple_yield_then_constant_tail_body` for the
-        // Stmt::Perform form, the let-form here goes through the
-        // let-yield classifier.
-        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
-        use crate::errors::Span;
-        let span = Span::synthetic("x.sigil");
-        let body = Block {
-            stmts: vec![Stmt::Let(LetStmt {
-                name: "x".to_string(),
-                ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                value: Expr::Perform(PerformExpr {
-                    effect: "Raise".to_string(),
-                    op: "fail".to_string(),
-                    args: Vec::new(),
-                    span: span.clone(),
-                }),
-                span: span.clone(),
-            })],
-            tail: Some(Expr::IntLit(42, span.clone())),
-            span,
-        };
-        assert!(is_simple_let_yield_then_pure_tail_body(&body));
-    }
-
-    #[test]
-    fn let_yield_then_binary_using_binding_recognised() {
-        // `let x: Int = perform Raise.fail(); x + 100` — the
-        // `discard_k_handler_does_abort_helper_across_call_boundary`
-        // e2e test's helper shape. Tail is a pure Binary referencing
-        // the let-binding.
-        use crate::ast::{BinOp, Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
-        use crate::errors::Span;
-        let span = Span::synthetic("x.sigil");
-        let body = Block {
-            stmts: vec![Stmt::Let(LetStmt {
-                name: "x".to_string(),
-                ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                value: Expr::Perform(PerformExpr {
-                    effect: "Raise".to_string(),
-                    op: "fail".to_string(),
-                    args: Vec::new(),
-                    span: span.clone(),
-                }),
-                span: span.clone(),
-            })],
-            tail: Some(Expr::Binary {
-                op: BinOp::Add,
-                lhs: Box::new(Expr::Ident("x".to_string(), span.clone())),
-                rhs: Box::new(Expr::IntLit(100, span.clone())),
-                span: span.clone(),
-            }),
-            span,
-        };
-        assert!(is_simple_let_yield_then_pure_tail_body(&body));
-    }
-
-    #[test]
-    fn let_yield_then_call_in_tail_is_not_let_yield_then_pure() {
-        // `let x: Int = perform Raise.fail(); helper(x)` — tail
-        // contains a Call (impure per `expr_is_pure`). Classifier
-        // rejects; helper falls through to Sync ABI cleanly.
-        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
-        use crate::errors::Span;
-        let span = Span::synthetic("x.sigil");
-        let body = Block {
-            stmts: vec![Stmt::Let(LetStmt {
-                name: "x".to_string(),
-                ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                value: Expr::Perform(PerformExpr {
-                    effect: "Raise".to_string(),
-                    op: "fail".to_string(),
-                    args: Vec::new(),
-                    span: span.clone(),
-                }),
-                span: span.clone(),
-            })],
-            tail: Some(Expr::Call {
-                callee: Box::new(Expr::Ident("helper".to_string(), span.clone())),
-                args: vec![Expr::Ident("x".to_string(), span.clone())],
-                span: span.clone(),
-            }),
-            span,
-        };
-        assert!(!is_simple_let_yield_then_pure_tail_body(&body));
-    }
-
-    #[test]
-    fn let_yield_with_io_perform_value_is_let_yield_then_pure_post_stage_6_cleanup() {
-        // Stage 6 cleanup: IO color filter lifted — `let _ = perform
-        // IO.println(...); pure_tail` is now eligible for the
-        // let-yield classifier.
-        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
-        use crate::errors::Span;
-        let span = Span::synthetic("x.sigil");
-        let body = Block {
-            stmts: vec![Stmt::Let(LetStmt {
-                name: "s".to_string(),
-                ty: TypeExpr::Named("Unit".to_string(), span.clone()),
-                value: Expr::Perform(PerformExpr {
-                    effect: "IO".to_string(),
-                    op: "println".to_string(),
-                    args: vec![Expr::StringLit("hi".to_string(), span.clone())],
-                    span: span.clone(),
-                }),
-                span: span.clone(),
-            })],
-            tail: Some(Expr::IntLit(0, span.clone())),
-            span,
-        };
-        assert!(is_simple_let_yield_then_pure_tail_body(&body));
-    }
-
     // ---------------- Plan B' Stage 6.7 Task 93 (B.2 Phase A) —
-    // chained-let-yield-then-pure-tail classifier ----------------
+    // chained-let-yield-then-pure-tail classifier (replaces the
+    // pre-Phase-D `is_simple_let_yield_then_pure_tail_body` tests:
+    // the chained classifier accepts N >= 1, so the N=1 happy-path
+    // / IO-perform-value / call-in-tail-rejected cases all flow
+    // through the chained tests below) ----------------
 
     /// Build a `Stmt::Let` whose value is `perform Raise.fail()`
     /// with the given binding name and Int type. Module-level
@@ -11782,43 +11269,13 @@ mod tests {
     // ---------------- end Plan B' Stage 6.7 Task 93 tests ----------------
 
     #[test]
-    fn multi_stmt_body_with_let_yield_first_is_not_let_yield_then_pure() {
-        // Classifier requires exactly one stmt. Multi-stmt bodies
-        // with a let-yield as stmts[0] (followed by other stmts)
-        // need full lambda-lifting (chained synth-conts) — future
-        // commit.
-        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
-        use crate::errors::Span;
-        let span = Span::synthetic("x.sigil");
-        let body = Block {
-            stmts: vec![
-                Stmt::Let(LetStmt {
-                    name: "x".to_string(),
-                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                    value: Expr::Perform(PerformExpr {
-                        effect: "Raise".to_string(),
-                        op: "fail".to_string(),
-                        args: Vec::new(),
-                        span: span.clone(),
-                    }),
-                    span: span.clone(),
-                }),
-                // Second stmt — disqualifies the body from this
-                // classifier's exactly-one-stmt requirement.
-                Stmt::Expr(Expr::IntLit(1, span.clone())),
-            ],
-            tail: Some(Expr::Ident("x".to_string(), span.clone())),
-            span,
-        };
-        assert!(!is_simple_let_yield_then_pure_tail_body(&body));
-    }
-
-    #[test]
-    fn let_yield_with_match_tail_using_binding_recognised() {
+    fn chained_classifier_accepts_match_tail_using_binding() {
         // Recursive purity: a Match expression over a pure scrutinee
         // (the binding) with pure arm bodies (literals) is pure.
         // The synth-cont's Lowerer handles Match correctly via
-        // `lower_expr` → `lower_match`. Pin acceptance.
+        // `lower_expr` → `lower_match`. Pin acceptance — covers the
+        // pre-Phase-D `let_yield_with_match_tail_using_binding
+        // _recognised` case under the chained classifier.
         use crate::ast::{Block, Expr, LetStmt, MatchArm, Pattern, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -11852,7 +11309,10 @@ mod tests {
             }),
             span,
         };
-        assert!(is_simple_let_yield_then_pure_tail_body(&body));
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            Some(1)
+        );
     }
 
     #[test]
@@ -12351,22 +11811,24 @@ mod tests {
     }
 
     // ---------------- Plan B Task 55, Phase 4e — captures-bearing
-    // synth-cont slice (this commit): the let-yield-then-pure-tail
-    // shape now accepts arity-N helpers, with the synth-cont
-    // capturing helper's user params referenced in the tail.
+    // synth-cont slice: the chained-let-yield-then-pure-tail
+    // classifier accepts arity-N helpers, with the synth-cont chain
+    // capturing helper's user params referenced anywhere in the
+    // chain (perform args or tail).
 
     #[test]
     fn compute_user_fn_abi_cps_for_arity_n_let_yield_helper_with_capture() {
         // helper takes `threshold: Int`; body is `let x = perform
-        // Raise.fail(); x + threshold`. Pre-captures-slice
-        // (`f911a0b`), the arity-0 gate in `compute_user_fn_abi`
-        // rejected → Sync. Post-captures-slice (this commit), the
-        // gate is removed → Cps. The pre-pass populates
-        // `LetBindThenTail.captures = [SynthContCapture { name:
-        // "threshold", kind: Int }]`; helper's body emit allocates
-        // a closure record holding `threshold`, passes its pointer
-        // as `k_closure`; synth-cont reads `threshold` from
-        // `closure_ptr + 16` at fn entry.
+        // Raise.fail(); x + threshold`. The arity-0 gate in
+        // `compute_user_fn_abi` was lifted in the captures-bearing
+        // slice — helpers with user params referenced in the tail
+        // classify Cps. The pre-pass populates a `ChainedLetBindStep`
+        // entry with `chain_length = 1` + `Final` role + captures
+        // = [SynthContCapture { name: "threshold", kind: Int }];
+        // helper's body emit allocates a closure record holding
+        // `threshold`, passes its pointer as `k_closure`; the
+        // synth-cont reads `threshold` from `closure_ptr + 16` at
+        // fn entry.
         let src = "effect Raise { fail: () -> Int }\n\
                    fn helper(threshold: Int) -> Int ![Raise, IO] {\n  \
                      let x: Int = perform Raise.fail();\n  \
@@ -12382,24 +11844,28 @@ mod tests {
         let helper_params = params_of(&prog, "helper");
         // Sanity: classifier accepts the body shape; color taints
         // CPS via row.
-        assert!(is_simple_let_yield_then_pure_tail_body(&helper_body));
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&helper_body),
+            Some(1),
+            "1-stmt let-yield body matches chained classifier with N=1"
+        );
         assert!(colored.needs_cps_transform("helper"));
         assert_eq!(helper_params.len(), 1);
-        // Inverted from prior arity-0 restriction — the gate is
-        // gone in this commit.
         assert_eq!(
             compute_user_fn_abi("helper", &helper_body, &colored),
             UserFnAbi::Cps,
-            "arity-N let-yield-helper with capture now classifies Cps after \
-             the captures-bearing slice's arity gate lift"
+            "arity-N let-yield-helper with capture classifies Cps via the \
+             chained classifier route"
         );
     }
 
     #[test]
-    fn collect_synth_cont_captures_finds_helper_param_in_tail() {
-        // Free-var analysis on `x + threshold` with let-binding
-        // `x` and helper params `[threshold]` returns
-        // `[threshold]`. Pin the analysis surface directly.
+    fn chained_captures_finds_helper_param_in_tail() {
+        // Free-var analysis on `x + threshold` with chain-binding
+        // `x` and helper params `[threshold]` returns `[threshold]`.
+        // Equivalent to the pre-Phase-D 1-binding case: an empty
+        // performs slice + single-element binding_names matches the
+        // single-let-yield shape with the chain binding pre-bound.
         use crate::ast::{BinOp, Expr, Param, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -12414,16 +11880,18 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(captures.len(), 1);
         assert_eq!(captures[0].name, "threshold");
         assert_eq!(captures[0].kind, EnvSlotKind::Int);
     }
 
     #[test]
-    fn collect_synth_cont_captures_excludes_let_binding_name() {
-        // Free-var analysis on `x + 100` — the let-binding `x` is
-        // shadowed; `100` is a literal. No captures.
+    fn chained_captures_excludes_chain_binding_names() {
+        // Free-var analysis on `x + 100` — the chain-binding `x` is
+        // pre-bound and shadowed; `100` is a literal. No captures.
         use crate::ast::{BinOp, Expr, Param, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -12440,12 +11908,14 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(captures.len(), 0);
     }
 
     #[test]
-    fn collect_synth_cont_captures_match_pattern_var_shadows_param() {
+    fn chained_captures_match_pattern_var_shadows_param() {
         // PR #26 mid-flight at a5ee4c6 item #1: when a match arm's
         // pattern binds a name (`Pattern::Var`) that shadows a
         // helper param, the walker must NOT capture the param —
@@ -12488,7 +11958,9 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -12498,7 +11970,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_synth_cont_captures_match_with_tuple_pattern_var_shadows_param() {
+    fn chained_captures_match_with_tuple_pattern_var_shadows_param() {
         // PR #26 mid-flight at 2be70ce review item #1:
         // Pattern::Tuple binding shape was unpinned — the
         // `Tuple(patterns)` arm of `collect_pattern_bindings`
@@ -12537,7 +12009,9 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -12547,7 +12021,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_synth_cont_captures_match_with_ctor_positional_pattern_var_shadows_param() {
+    fn chained_captures_match_with_ctor_positional_pattern_var_shadows_param() {
         // PR #26 mid-flight at 2be70ce review item #1:
         // Pattern::Ctor::Positional binding shape was unpinned.
         // Source-equivalent: `match opt { Some(threshold) =>
@@ -12593,7 +12067,9 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -12604,7 +12080,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_synth_cont_captures_match_with_ctor_pattern_handles_record_field_bindings() {
+    fn chained_captures_match_with_ctor_pattern_handles_record_field_bindings() {
         // The Pattern::Ctor with Record fields shape introduces
         // bindings via field-pun (`Point { x, y }`) or rename
         // (`Point { x: px }`). `collect_pattern_bindings` recurses
@@ -12647,7 +12123,9 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -12657,7 +12135,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_synth_cont_captures_does_not_recurse_into_call_in_tail() {
+    fn chained_captures_does_not_recurse_into_call_in_tail() {
         // Renamed from the prior misleading
         // `..._skips_globals` (PR #26 mid-flight at a5ee4c6 item
         // #7). The walker treats `Expr::Call` as a yield-able
@@ -12679,7 +12157,9 @@ mod tests {
             ty: TypeExpr::Named("Int".to_string(), span.clone()),
             span: span.clone(),
         }];
-        let captures = collect_synth_cont_captures(&tail, "x", &helper_params);
+        let binding_names = vec!["x".to_string()];
+        let captures =
+            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
         // The analysis defensively returns empty for Call (yield-able
         // shape); even if it descended, `not_a_param` isn't in
         // helper_params and would be skipped.
