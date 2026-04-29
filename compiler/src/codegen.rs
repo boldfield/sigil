@@ -1037,7 +1037,7 @@ fn arm_body_unsupported_construct(
         if any_impure {
             // Fall through; regular walker surfaces the specific
             // yield-able sub-shape in the failing arg.
-        } else if !expr_is_pure(shape.tail_expr) {
+        } else if !expr_is_pure(&shape.tail_expr) {
             // Fall through; regular walker surfaces the specific
             // yield-able sub-shape in tail.
         } else {
@@ -1086,7 +1086,7 @@ fn arm_body_unsupported_construct(
                 extras.insert(shape.binding_names[j].to_string());
             }
             if let Some(diag) = arm_body_post_arm_k_tail_free_vars_ok(
-                shape.tail_expr,
+                &shape.tail_expr,
                 shape.binding_names[0],
                 &arm.k_name,
                 globals,
@@ -3305,18 +3305,32 @@ struct ArmBodyMultiLetThenPureTailMatch<'a> {
 /// the legacy classifier accepts is also accepted here, returning a
 /// match with 2 entries).
 ///
+/// **Handling ANF-introduced intermediate lets**: the elaborate
+/// pass flattens compound tail expressions (e.g., `r1 + r2 + r3`
+/// becomes `let $elab_t0 = r1 + r2; $elab_t0 + r3`). The classifier
+/// matches the **prefix** of stmts that are k-call lets (the chain
+/// steps), then synthesises an owned tail expression that wraps any
+/// remaining (non-k-call) stmts + the original tail in a fresh
+/// Block. The Final step's emit lowers this synthesised Block via
+/// the Lowerer; the env at Final-step entry has all chain bindings
+/// loaded, and the Lowerer extends env with the intermediate lets'
+/// bindings as it walks the Block.
+///
 /// **Phase A scope (Task 97):** the classifier is added alongside
 /// the legacy 2-let classifier; nothing yet consumes it. Phase B
 /// (Task 98) switches the codegen-entry walker + pre-pass + emit to
 /// this classifier and retires the legacy.
 ///
-/// Returned references all borrow from `body`'s sub-tree.
+/// Borrowed-vs-owned: name and type-expr references borrow from
+/// `body`'s sub-tree (cheap); the synthesised tail is owned (because
+/// it may need to construct a new Block when ANF intermediate lets
+/// are present).
 #[allow(dead_code)]
 fn arm_body_n_let_then_pure_tail_shape<'a>(
     body: &'a crate::ast::Expr,
     k_name: &str,
 ) -> Option<ArmBodyNLetThenPureTailMatch<'a>> {
-    use crate::ast::{Expr, Stmt};
+    use crate::ast::{Block, Expr, Stmt};
     let block = match body {
         Expr::Block(b) => b,
         _ => return None,
@@ -3334,30 +3348,61 @@ fn arm_body_n_let_then_pure_tail_shape<'a>(
         }
         None
     };
-    let mut binding_names: Vec<&'a str> = Vec::with_capacity(block.stmts.len());
-    let mut binding_tes: Vec<&'a crate::ast::TypeExpr> = Vec::with_capacity(block.stmts.len());
-    let mut arg_exprs: Vec<&'a crate::ast::Expr> = Vec::with_capacity(block.stmts.len());
+    // Walk leading stmts collecting k-call lets. Stop at the first
+    // non-k-call stmt (which must be a let — non-let stmts disqualify
+    // the shape entirely). The split index marks where the chain
+    // ends and the ANF intermediate lets begin.
+    let mut binding_names: Vec<&'a str> = Vec::new();
+    let mut binding_tes: Vec<&'a crate::ast::TypeExpr> = Vec::new();
+    let mut arg_exprs: Vec<&'a crate::ast::Expr> = Vec::new();
+    let mut split_idx: usize = 0;
     for stmt in &block.stmts {
         let let_stmt = match stmt {
             Stmt::Let(l) => l,
             _ => return None,
         };
-        let arg = extract_k_call(&let_stmt.value)?;
-        binding_names.push(&let_stmt.name);
-        binding_tes.push(&let_stmt.ty);
-        arg_exprs.push(arg);
+        match extract_k_call(&let_stmt.value) {
+            Some(arg) => {
+                binding_names.push(&let_stmt.name);
+                binding_tes.push(&let_stmt.ty);
+                arg_exprs.push(arg);
+                split_idx += 1;
+            }
+            None => break,
+        }
     }
-    let tail = block.tail.as_ref()?;
+    if binding_names.len() < 2 {
+        return None;
+    }
+    // Synthesise the final tail expression. If no intermediate lets
+    // (split_idx == stmts.len()), use the block's tail directly.
+    // Otherwise wrap [remaining stmts + original tail] in a new
+    // Block — the Final step's emit lowers this Block via the
+    // Lowerer, which handles intermediate let bindings naturally.
+    let final_tail_owned: crate::ast::Expr = if split_idx == block.stmts.len() {
+        block.tail.as_ref()?.clone()
+    } else {
+        let original_tail = block.tail.as_ref()?;
+        let remaining_stmts: Vec<Stmt> = block.stmts[split_idx..].to_vec();
+        Expr::Block(Box::new(Block {
+            stmts: remaining_stmts,
+            tail: Some(original_tail.clone()),
+            span: block.span.clone(),
+        }))
+    };
     Some(ArmBodyNLetThenPureTailMatch {
         binding_names,
         binding_tes,
         arg_exprs,
-        tail_expr: tail,
+        tail_expr: final_tail_owned,
     })
 }
 
-/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — borrowed view of a
-/// matched [`arm_body_n_let_then_pure_tail_shape`] result.
+/// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — borrowed-mostly view
+/// of a matched [`arm_body_n_let_then_pure_tail_shape`] result. The
+/// `tail_expr` is owned because the classifier may synthesise a new
+/// Block to wrap ANF intermediate lets alongside the original tail
+/// (see classifier docstring for the ANF-handling rationale).
 #[allow(dead_code)]
 struct ArmBodyNLetThenPureTailMatch<'a> {
     /// Source-level binding names, in source order. `binding_names
@@ -3369,10 +3414,13 @@ struct ArmBodyNLetThenPureTailMatch<'a> {
     /// Per-let `k(arg)` arguments, in source order. Each is the
     /// single-arg expression of the let's `Call` value.
     arg_exprs: Vec<&'a crate::ast::Expr>,
-    /// The block's tail expression. Pure per Slice C's invariant
-    /// (the codegen-entry walker enforces purity + free-var
-    /// restrictions; the classifier here is shape-only).
-    tail_expr: &'a crate::ast::Expr,
+    /// The synthesised tail expression. May be the original block
+    /// tail (when there are no ANF intermediate lets) OR a freshly-
+    /// constructed Block wrapping intermediate lets + the original
+    /// tail. Pure per Slice C's invariant (the codegen-entry walker
+    /// enforces purity + free-var restrictions on this synthesised
+    /// expression; the classifier here is shape-only).
+    tail_expr: crate::ast::Expr,
 }
 
 /// Plan B Task 55, Phase 4e captures+ Slice B — verify the post-arm-k
@@ -12580,6 +12628,104 @@ mod tests {
     }
 
     #[test]
+    fn arm_body_unsupported_construct_accepts_three_let_chain_for_resumes_many_effect() {
+        // Plan B' Stage 6.7 Task 98 walker check: 3-let arm body of
+        // a `resumes: many` effect is accepted via the N-let chain
+        // classifier path. Pre-Task-98, the shape was rejected at
+        // `arm_body_walk`'s "non-tail k" diagnostic; post-Task-98,
+        // `arm_body_unsupported_construct` short-circuits via the
+        // chain classifier and returns None.
+        use crate::ast::{BinOp, Block, Expr, HandleOpArm, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        use std::collections::{BTreeMap, BTreeSet};
+        let span = Span::synthetic("x.sigil");
+        let make_let = |name: &str, k_arg: bool| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::BoolLit(k_arg, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![
+                make_let("r1", true),
+                make_let("r2", false),
+                make_let("r3", true),
+            ],
+            tail: Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Ident("r1".to_string(), span.clone())),
+                    rhs: Box::new(Expr::Ident("r2".to_string(), span.clone())),
+                    span: span.clone(),
+                }),
+                rhs: Box::new(Expr::Ident("r3".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        }));
+        let arm = HandleOpArm {
+            effect: "Choose".to_string(),
+            effect_span: span.clone(),
+            op: "flip".to_string(),
+            op_span: span.clone(),
+            params: Vec::new(),
+            k_name: "k".to_string(),
+            k_span: span.clone(),
+            body,
+            span: span.clone(),
+        };
+        let globals: BTreeSet<String> = BTreeSet::new();
+        let mut effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
+        effects_resumes_many.insert("Choose".to_string(), true);
+        let result = arm_body_unsupported_construct(&arm, &globals, &effects_resumes_many);
+        assert!(
+            result.is_none(),
+            "expected None (accept) for 3-let arm body of resumes:many effect; \
+             got {result:?}"
+        );
+    }
+
+    #[test]
+    fn arm_body_post_arm_k_tail_free_vars_accepts_three_chain_bindings_in_tail() {
+        // Plan B' Stage 6.7 Task 98 walker check: for an N-let
+        // chain, the tail can reference all chain bindings. Verify
+        // the free-var walker handles `r1 + r2 + r3` with r1 as
+        // binding_name and {r2, r3} in extras.
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("x.sigil");
+        let globals: BTreeSet<String> = BTreeSet::new();
+        let mut extras: BTreeSet<String> = BTreeSet::new();
+        extras.insert("r2".to_string());
+        extras.insert("r3".to_string());
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r1".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("r2".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            rhs: Box::new(Expr::Ident("r3".to_string(), span.clone())),
+            span: span.clone(),
+        };
+        let result = arm_body_post_arm_k_tail_free_vars_ok(&tail, "r1", "k", &globals, &extras);
+        assert!(
+            result.is_none(),
+            "expected None (accept) for `r1 + r2 + r3` with r1 binding, \
+             {{r2, r3}} extras; got {result:?}"
+        );
+    }
+
+    #[test]
     fn arm_body_post_arm_k_tail_free_vars_accepts_binding_plus_globals() {
         // Tail `r + int_to_string_global` (where `int_to_string_global`
         // is in `globals`) — both names allowed.
@@ -13103,6 +13249,73 @@ mod tests {
             span: span.clone(),
         }));
         assert!(arm_body_n_let_then_pure_tail_shape(&body, "k").is_none());
+    }
+
+    #[test]
+    fn arm_body_n_let_then_pure_tail_shape_accepts_anf_intermediate_lets_after_chain() {
+        // Plan B' Stage 6.7 Task 98 ANF-handling: the elaborate pass
+        // flattens compound tail expressions into ANF form, e.g.,
+        // `r1 + r2 + r3` becomes `let $elab_t0 = r1 + r2; $elab_t0
+        // + r3`. The N-let classifier must accept the prefix of
+        // k-call lets and treat the remaining (non-k-call) lets as
+        // ANF intermediate lets in the synthesised final tail.
+        //
+        // Body shape: 3 k-call lets + 1 ANF intermediate let + tail.
+        // Classifier matches chain length 3; synthesises the tail
+        // as a Block containing the intermediate let + original
+        // tail.
+        use crate::ast::{BinOp, Block, Expr, LetStmt, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let make_k_let = |name: &str, k_arg: bool| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::BoolLit(k_arg, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let anf_let = Stmt::Let(LetStmt {
+            name: "$elab_t0".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            value: Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r1".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("r2".to_string(), span.clone())),
+                span: span.clone(),
+            },
+            span: span.clone(),
+        });
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![
+                make_k_let("r1", true),
+                make_k_let("r2", false),
+                make_k_let("r3", true),
+                anf_let,
+            ],
+            tail: Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("$elab_t0".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("r3".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        }));
+        let m = arm_body_n_let_then_pure_tail_shape(&body, "k").expect("matches with ANF lets");
+        assert_eq!(
+            m.binding_names,
+            vec!["r1", "r2", "r3"],
+            "chain length is 3 (the prefix of k-call lets); ANF let isn't a chain step"
+        );
+        // Synthesised tail must be a Block wrapping the ANF let + original tail.
+        match m.tail_expr {
+            Expr::Block(_) => (),
+            other => panic!("expected synthesised Block as tail_expr, got {other:?}"),
+        }
     }
 
     #[test]
