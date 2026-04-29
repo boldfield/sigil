@@ -245,7 +245,14 @@ This makes compose work end-to-end with Phase C v1 + Phase C+ surfaces.
 
 **Implementing commit(s):** R4 fixup commit (this commit) documents the analysis; Task 109 will rewrite the source to use the per-arrow-correct + user-wrapper-`its` shape and invert the rejection test.
 
-## 2026-04-29 — [DEVIATION Task 107 Phase B] k-capture inside arm-body lambdas (canonical run_state) deferred
+## 2026-04-29 — [DEVIATION Task 107 Phase B] k-capture inside arm-body lambdas (canonical run_state) deferred [CLOSED]
+
+**Status: CLOSED** by Phase B's 2-slot trailing-pair convention (PR #38 `51a8a8d`) + PR #39's six-layer followup. Phase B shipped the closure_convert k-pair detection + lifted-lambda's-closure-record trailing slots for `(k_closure, k_fn)` (later extended to a trailing-triple including `frame_ptr` in PR #39's Layer 3c). `arm_body_lambda_capturing_k_compiles_returns_99` and `task_108_arm_body_lambda_captures_k_runs` cover the lambda-allocated-but-not-invoked case; `run_state_canonical_higher_order_helper_returns_threaded_value` covers the full canonical shape with k(s)(s) recursive dispatch.
+
+**Original entry preserved below for historical context.**
+
+---
+
 
 **Context:** Plan B' Stage 6.8 Task 107 Phase A landed the arm-body-lambda lift for shapes that don't capture the arm's continuation `k`. The canonical `run_state` shape from Task 108 — and Choose-style "k as a lambda" patterns — capture and call `k` from inside a lambda body, which Phase A explicitly rejects with E0xxx-style "captures continuation `k`" diagnostic.
 
@@ -288,7 +295,14 @@ This makes compose work end-to-end with Phase C v1 + Phase C+ surfaces.
 
 **Implementing commit(s):** R5 fixup commit (this commit) lands the call_callee_tys deref pass + this deviation entry. Phase C++ (`1166804`) is the precedent fix shape for the per-clone-rebuild route.
 
-## 2026-04-29 — [DEVIATION Phase C+ Part 2 generic + fn-typed-capture] Generic lambda captures with fn-typed Ty::Var crash codegen
+## 2026-04-29 — [DEVIATION Phase C+ Part 2 generic + fn-typed-capture] Generic lambda captures with fn-typed Ty::Var crash codegen [CLOSED]
+
+**Status: CLOSED** by Phase C++ (PR #38 `1166804` + `85fcd5d`). Monomorphize now rewrites `lambda_captures` per-clone with substitution applied via `MonoProgram.lambda_captures_resolved: BTreeMap<(String, Span), Vec<(String, Ty)>>`; closure_convert reads from that map first, falling back to the pre-mono typecheck side-table for non-generic fns. End-of-typecheck deref pass resolves `Ty::Var`s recorded mid-walk. `compose_body_via_closure_env_callees_returns_42` and `run_state_canonical_higher_order_helper_returns_threaded_value` (which uses generic `compose`-style fn-typed parameter dispatch via Sync shim) both pass.
+
+**Original entry preserved below for historical context.**
+
+---
+
 
 **Context:** Phase C+ Part 2 (`a5ab4f9`) wired `cc.captures_typed` from closure_convert through to a new `Lowerer.captured_fn_sigs: BTreeMap<String, FnSig>` field. The map is populated at synth fn Lowerer init from the captures' typed metadata; codegen reads it for ClosureEnvLoad-callee dispatch.
 
@@ -308,7 +322,14 @@ This makes compose work end-to-end with Phase C v1 + Phase C+ surfaces.
 
 **Implementing commit(s):** Phase C+ Part 2 (`a5ab4f9`) shipped the non-generic surface; the speculative `compose_body_via_closure_env_callees_returns_42` test in `4d272db` exposed the gap; this fixup commit reverts the test and documents the deviation. Phase C++ closure deferred to follow-up commit pending the route decision.
 
-## 2026-04-29 — [DEVIATION Task 109] run_state canonical shape — runtime chain integration gap
+## 2026-04-29 — [DEVIATION Task 109] run_state canonical shape — runtime chain integration gap [CLOSED]
+
+**Status: CLOSED** by PR #39 (merge `cf358bb`). The six layered fixes documented under `[DEVIATION Stage-6.8-followup *]` (Bug 2, Layer 2 analysis + fix, Bug 1 fix, Layer 3a, Layer 3b, Layer 3c, non-canonical cleanups including Layer 3d) closed all three candidate failure layers identified in the bisect plan below. `examples/state.sigil` now uses the literal `run_state(initial, comp)` shape; `state_example_canonical_run_state_returns_11` and `run_state_canonical_higher_order_helper_returns_threaded_value` pass deterministically. The `handle_returning_simple_lambda_invoked_returns_value_pending_chain_fix` `#[ignore]`'d bisect test landed in PR #38's `dac72c5` is now obsolete; un-ignoring it (or deleting it) is part of this PR's closeout. Plan B' Stage 6.8 completion criterion "examples/state.sigil uses literal run_state" is concretely met.
+
+**Original entry preserved below for historical context.**
+
+---
+
 
 **Context:** Plan B' Stage 6.8 Task 109 sub-task 1 requires rewriting `examples/state.sigil` from the dual-handle Plan B v1 workaround to the canonical CPS-style `run_state(initial, comp)` higher-order helper. The shape leans on every B.3 + B.4 surface in one program: fn-typed parameters, fn-as-value of a top-level user fn, arm-body lambdas, k-capturing lambdas (B.4 Phase B trailing-pair convention), recursive Call-of-Call dispatch on fn-typed values returned from k (`k(s)(s)`), and let-binding the handle's fn-typed result.
 

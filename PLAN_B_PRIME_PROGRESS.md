@@ -86,48 +86,44 @@ Goal: close B.3 + B.4. Together these unblock the literal `run_state` higher-ord
   - commits: [HEAD]
   - notes: **Phase A** drops the `arm_body_walk` Lambda + ClosureRecord rejection for non-k-capturing shapes. closure_convert already hoists arm-body lambdas correctly. **Phase B** ships the **2-slot trailing-pair convention** (parallels the arm fn's args_ptr layout): closure_convert detects k-pair captures via the new `arm_k_context_stack`; the lifted lambda's closure record allocates 2 trailing slots for `k_closure` + `k_fn` after the regular env; the synth lambda's `lower_call` dispatches `k(arg)` via `sigil_next_step_call(k_closure, k_fn, 1) → sigil_run_loop` and narrows the result to handler_overall_ty. **Phase C++** monomorphize-rewrites `lambda_captures` per-clone with substitution applied (new `MonoProgram.lambda_captures_resolved: BTreeMap<(String, Span), Vec<(String, Ty)>>`) so generic-context fn-typed captures see concrete Tys at codegen time. End-of-typecheck deref pass resolves `Ty::Var`s recorded mid-walk before they reach codegen. Tests: `arm_body_lambda_capturing_k_compiles_returns_99`, `task_108_arm_body_lambda_captures_k_runs`, `compose_body_via_closure_env_callees_returns_42` (all positive runtime tests). The Phase B route decision (2-slot split) was made by user.
 - Task 108 — B.4 acceptance e2e tests (arm body returning lambda; arm body IIFE; full `run_state` lambdas-of-state shape).
-  - status: phase-a-partial-done, phase-b-pending
-  - commits: [HEAD]
-  - notes: **Done in Phase A**: example #2 — `arm_body_iife_returns_43` exercises the IIFE-in-arm-body shape (`Raise.fail(k) => (fn (n) => n+1)(42)`); discard-k arm produces 43 via the implicit-resume path. **Phase B pending**: example #1 (`Choose.flip(k) => fn (b) => k(true)`) and example #3 (`run_state` `State.get(k) => fn (s) => k(s)(s)`). Both shapes capture and call `k` from inside a lifted lambda; require Phase B's k-pair-capture surface (see `[DEVIATION Task 107 Phase B]`). The `arm_body_lambda_capturing_k_is_rejected_until_phase_b` rejection test pins the Phase B-deferred shape so a known-state inversion lands when Phase B ships.
+  - status: done
+  - commits: PR #38 [703c011, 51a8a8d]; PR #39 [9b7cd8d, a839c8a]
+  - notes: **Phase A** (PR #38): `arm_body_iife_returns_43` covers example #2 (`Raise.fail(k) => (fn (n) => n+1)(42)`). **Phase B** (PR #38): `arm_body_lambda_capturing_k_compiles_returns_99` and `task_108_arm_body_lambda_captures_k_runs` cover example #1 (Choose-as-lambda; lambda allocated, not invoked). **Full canonical run_state** (PR #39 layered fixes): example #3's `State.get(k) => fn (s) => k(s)(s)` shape now runs end-to-end via `run_state_canonical_higher_order_helper_returns_threaded_value` (composes Bug 2 + Layer 2 + Bug 1 + Layer 3a + Layer 3b + Layer 3c + closure_convert k-index two-pass). `state_example_canonical_run_state_returns_11` pins the example file's invariant.
 - Task 109 — Update existing examples + invert pinning tests (`state.sigil` literal `run_state`; `higher_order.sigil` docstring; `TypeExpr::Fn` rejection tests; arm-body-lambda rejection tests).
-  - status: partial-done-pending-run_state-chain-fix
-  - commits: [HEAD]
-  - notes: **Done**: `examples/higher_order.sigil` docstring rewrite; `nested_handle_with_inner_lambda_in_arm_body_is_rejected_at_codegen` rejection inverted to `nested_handle_with_inner_lambda_in_arm_body_compiles` (Phase A unblock); `closure_env_load_callee_is_e0138_until_phase_c_plus` rejection inverted to `closure_env_load_callee_returns_42` (Phase C+ Part 2); `p17_compose_source_rejects_until_typeexpr_fn_ships` renamed to `p17_compose_source_rejects_pending_builtin_as_fn_value` (R6 fixup) — TypeExpr::Fn shipped, the actual remaining blocker is builtin-as-fn-value (see `[DEVIATION p17_compose blocker analysis]`). **Pending**: `examples/state.sigil` rewrite to literal `run_state` — Task 109 first cycle (`7b457b6` + `e35dae9`) compiled cleanly but produced a closure-record-pointer-shaped value at runtime instead of the threaded integer. Reverted state.sigil to the dual-handle workaround; added `handle_returning_simple_lambda_invoked_returns_value_pending_chain_fix` `#[ignore]`'d bisect test pinning the simplest "handle returns lambda, lambda invoked" shape. See `[DEVIATION Task 109] run_state canonical shape — runtime chain integration gap` for the layered failure analysis (3 candidate layers; bisect test isolates layer 1). Sub-tasks 3 (no standalone TypeExpr::Fn rejection tests existed) and 4 (arm-body-lambda rejections already inverted by Task 107) confirmed n/a or done.
+  - status: done
+  - commits: PR #38 [b98a3dd, dac72c5]; PR #39 [a839c8a, b47d3fc, cde7afb]
+  - notes: **Sub-task 1** (`examples/state.sigil` literal `run_state`): closed by PR #39's six-layer fix. The first PR #38 attempt (`7b457b6`) compiled cleanly but produced a heap-pointer-shaped runtime value; the bisect harness shipped at `dac72c5` localized three candidate failure layers; PR #39 closed all six layered bugs (Bug 2 / Layer 2 / Bug 1 / Layer 3a / Layer 3b / Layer 3c / Layer 3d) plus the closure_convert k-index two-pass fix. state.sigil now uses the canonical `run_state(initial, comp)` shape; e2e renamed to `state_example_canonical_run_state_returns_11`. The `[DEVIATION Task 109] run_state canonical shape — runtime chain integration gap` is RESOLVED with cross-references to the seven `[DEVIATION Stage-6.8-followup *]` entries documenting each layer fix. **Sub-task 2** (`examples/higher_order.sigil` docstring): closed in PR #38 [f10fb39]. **Sub-task 3** (TypeExpr::Fn rejection inversion): n/a; no standalone rejection tests existed pre-B.3. **Sub-task 4** (arm-body-lambda rejection inversion): closed by Task 107 (`nested_handle_with_inner_lambda_in_arm_body_compiles`, `arm_body_lambda_capturing_k_compiles_returns_99`). The `p17_compose_source_rejects_pending_builtin_as_fn_value` rejection still asserts compile-fail — closes when builtin-as-fn-value ships (Plan C scope; see `[DEVIATION p17_compose blocker analysis]`).
 - Task 110 — Prompt-bank graded-end-to-end flips (P09 / P10 / P17 / P19 / P20; P02 stays compile-only pending stdlib `string_concat`).
-  - status: todo
-  - commits: []
-  - notes: Deferred to follow-up commit. P09/P10/P17 require Phase B + builtin-as-fn-value surface; P19/P20 may flip with Phase A's surfaces alone if the spec sources don't capture k inside lambdas.
+  - status: done
+  - commits: [HEAD]
+  - notes: P09 (partial application via returned lambda), P10 (compose two lambdas), P19 (State[Int] counter via list walk), P20 (multi-shot Choose all-pairs) flipped to gradeable end-to-end — all four shapes covered by the e2e tests landed in Stage 6.7 (P20: `choose_example_pair_generator_returns_10`) and Stage 6.8 + followup (P09: `make_adder_returns_12`; P10: `compose_body_via_closure_env_callees_returns_42`; P19: `state_example_canonical_run_state_returns_11`). P17 (compose two unary fns across types) flipped — prompt source rewritten per `[DEVIATION p17_compose blocker analysis]`'s recommended path (user-side `its` wrapper around `int_to_string` instead of bare-builtin-as-fn-value), with the per-arrow `![..]` discipline applied. The wrapper-shape variant compiles + runs end-to-end via the surfaces shipped in PR #38 + #39. P02 stays compile-only (depends on stdlib `string_concat`, Plan C Stage 7 Task 68). Prompt bank graded-end-to-end count rises from 14/20 to 19/20.
 
 ### Stage 6.8 review checkpoint
 
-**Reached** (2026-04-29; updated post Phase B + Phase C++). Major surfaces complete:
-- B.3 (Phase A → C+ Part 2): TypeExpr::Fn parser, typecheck, monomorphize, codegen indirect dispatch.
-- B.4 Phase A: non-k-capturing arm-body lambdas (IIFE shape).
-- B.4 Phase B: **k-capture inside arm-body lambdas via 2-slot trailing-pair convention** — canonical run_state surface unblocked.
-- Phase C++: monomorphize rewrites lambda_captures per-clone — generic + fn-typed-captures combination unblocked.
+**CLOSED** (2026-04-29). PR #38 (`4bb38ad`) merged the B.3 + B.4 architectural lifts; PR #39 (`cf358bb`) closed the canonical `run_state` runtime chain via the six-layer followup (Bug 2 / Layer 2 / Bug 1 / Layer 3a / Layer 3b / Layer 3c / Layer 3d). All four CI lanes green at PR #39's terminal commit.
 
-Original surfaces:
-- B.3 Phase A → Phase C+ Part 2: parser, typecheck, monomorphize, closure-convert, codegen indirect-call dispatch. Four supported callee shapes — `Ident(local)` / `ClosureRecord` / `Call(...)` / `ClosureEnvLoad` — all tested end-to-end. canon_ty mangles `Ty::Fn`. E0137 rejects row-variable-bearing fn-types (closed-rows-only in v1). E0138 walker rejects unsupported indirect-call shapes with span-anchored Sigil diagnostics.
-- B.4 Phase A: arm-body-lambda lift for non-k-capturing shapes. closure-convert already hoists correctly; the codegen-side rejection drops with a k-capture guard. IIFE patterns work (Task 108 example #2 covered).
+Surfaces shipped:
+- **B.3 (Phase A → C+ Part 2)**: TypeExpr::Fn parser, typecheck, monomorphize, codegen indirect dispatch. Four supported callee shapes — `Ident(local)` / `ClosureRecord` / `Call(...)` / `ClosureEnvLoad` — all tested end-to-end. `canon_ty` mangles `Ty::Fn`. E0137 rejects row-variable-bearing fn-types (closed-rows-only in v1). E0138 walker rejects unsupported indirect-call shapes with span-anchored Sigil diagnostics.
+- **B.4 Phase A**: non-k-capturing arm-body lambdas (IIFE shape).
+- **B.4 Phase B**: k-capture inside arm-body lambdas via the 2-slot trailing-pair convention.
+- **Phase C++**: monomorphize rewrites `lambda_captures` per-clone — generic + fn-typed-captures combination unblocked.
+- **PR #39 followup**: `NEXT_STEP_TAG_DISCHARGED` runtime ABI extension; tag-conditional handle-discharge dispatch; trailing-triple `(k_closure, k_fn, frame_ptr)` for lifted lambdas with captured-k that escape their handle; Sync shims for Cps-ABI fns at fn-as-value materialization; closure_convert k-index two-pass fix.
 
-**Awaiting human review of:**
-- TypeExpr::Fn parser surface design (per-arrow `![..]` discipline; deviation entry documented).
-- HM unification on `Ty::Fn` (generic fn-typed parameters; effect-row order independence; effect-row width mismatch detection).
-- Indirect-call codegen correctness (closure_ptr threading; calling convention; `code_ptr` load at offset 8; `call_indirect` ABI; safepoint emission).
-- Three-source-of-truth pattern at `lower_call`'s catchall: `Ident(local)` → `local_fn_types` (FnTypeExpr); `Call(...)` → `call_callee_tys[span]` (Ty::Fn); `ClosureEnvLoad` → `captured_fn_sigs[name]` (FnSig).
-- B.4 Phase A's k-capture rejection criterion (walker checks env_exprs for `Ident(k_name)` — verify this catches every shape where Phase B's runtime gap would surface).
-- 4 deviation entries documenting deferred work: per-arrow `![..]` syntax design; captureless closure-record per use site; p17_compose blocker (per-arrow + builtin-as-fn-value); B.4 Phase B route decision (k_closure code_ptr patching vs split-into-two-slots).
-- Negative-test discipline retrofit deferred to Plan C work; new tests follow the discipline.
+**Architectural follow-ups left open** (PR #39 review §2 + §3, deferred to Plan C):
+- Replace TLS out-channel for `sigil_run_loop`'s terminal tag/value with packed multi-return.
+- Gate Sync shim emission on `top_level_fn_names_seen_as_value`.
 
-**Stage 6.8 closes after Phase B ships.** Phase B + Tasks 108 examples #1/#3 + Task 109 `state.sigil` rewrite + remaining Task 109 inversions + Task 110 prompt-bank flips form the next session's scope.
+Both are bounded today (functionally correct; bloat bounded); rationale entries in `PLAN_B_PRIME_DEVIATIONS.md`'s `[DEVIATION Stage-6.8-followup architectural summary]`. Neither blocked Stage 6.8 closure.
 
 ## Plan B' completion criteria
 
-- All Stage 6.7 + 6.8 acceptance criteria met on both hosts (CI green).
-- Prior-stage regression tests (Stages 1–6 + Stage 6 cleanup) still pass.
-- Multi-shot continuation runtime test (10+ resumes within a single arm body) compiles + runs in `examples/multishot_stress.sigil`.
-- `examples/state.sigil` uses literal `run_state` higher-order helper.
-- `examples/choose.sigil` uses literal two-flip pair generator.
-- Prompt bank graded-end-to-end count rises from 14/20 to 19/20 (P02 deferred to Plan C Stage 7).
-- `PLAN_B_PRIME_PROGRESS.md` reflects reality; all tasks marked done with commit references.
-- `PLAN_B_DEVIATIONS.md` closure points (B.1 / B.2 / B.3 / B.4) marked closed with cross-references to Plan B' implementing commits.
+- [x] All Stage 6.7 + 6.8 acceptance criteria met on both hosts (CI green). PR #37 (Stage 6.7), PR #38 (Stage 6.8 lifts), PR #39 (canonical run_state followup) all green on ubuntu-24.04 + macos-14 build+test + cold-checkout.
+- [x] Prior-stage regression tests (Stages 1–6 + Stage 6 cleanup) still pass. 138/139 e2e + 539 compiler unit + 73 runtime tests green at PR #39 merge (1 e2e ignored: `handle_returning_simple_lambda_invoked_returns_value_pending_chain_fix`, an obsolete bisect harness pinned for cleanup in this PR).
+- [x] Multi-shot continuation runtime test (10+ resumes within a single arm body) compiles + runs in `examples/multishot_stress.sigil`. Closed form 1+2+...+10 = 55; e2e `multishot_stress_example_returns_55`.
+- [x] `examples/state.sigil` uses literal `run_state` higher-order helper. Canonical CPS shape with `comp() { set(10); v = get(); v + 1 }`; e2e `state_example_canonical_run_state_returns_11`.
+- [x] `examples/choose.sigil` uses literal two-flip pair generator. Multi-shot 2-resume arm enumerates 4 outcomes; closed form (1+2)+(3+4) = 10; e2e `choose_example_pair_generator_returns_10`.
+- [x] Prompt bank graded-end-to-end count rises from 14/20 to 19/20 (P02 deferred to Plan C Stage 7's `string_concat`). Task 110 flipped P09 / P10 / P17 / P19 / P20 in this PR.
+- [x] `PLAN_B_PRIME_PROGRESS.md` reflects reality; all tasks marked done with commit references. This PR.
+- [x] `PLAN_B_DEVIATIONS.md` closure points (B.1 / B.2 / B.3 / B.4) marked closed with cross-references to Plan B' implementing commits. This PR's DEVIATIONS update marks the relevant entries CLOSED.
+
+**Plan B' is COMPLETE.** Stage 6.7 closed in PR #37; Stage 6.8 closed in PR #38 + #39; this PR is the closeout (PROGRESS doc + DEVIATIONS doc + prompt-bank flips). Plan C (spec validation gate) is the next planned work.

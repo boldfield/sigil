@@ -4632,7 +4632,9 @@ fn handle_with_post_perform_body_code_uses_arm_discharge_value() {
     // regardless of body shape. f = arm's `fn (x) => x + 100`.
     // f(7) = 107.
     //
-    // This shape originates from `DEBUG_RUN_STATE.md`'s Source A
+    // This shape originates from the layer-1 probe documented in
+    // `[DEVIATION Stage-6.8-followup Bug 1 fix]`'s "What this fix DOES
+    // NOT close" enumeration of pre-Layer-3 residual probes
     // probe — the "Layer 1" residual from `[DEVIATION Stage-6.8-
     // followup Layer 2 analysis]`'s "What's still blocking the
     // canonical run_state" enumeration.
@@ -5198,43 +5200,6 @@ fn task_108_arm_body_lambda_captures_k_runs() {
          (allocates trailing-pair closure record) then discards k. \
          body=0 → arm never fires → handle returns 0. stderr={stderr:?}"
     );
-}
-
-/// Plan B' Stage 6.8 Task 109 bisect — pinning test for the
-/// simplest "handle returns a lambda value, lambda invoked"
-/// shape. Pre-Task-109 there was no e2e coverage of "arm
-/// allocates a lambda AND the handle's overall result is that
-/// lambda AND we then invoke the lambda". The Task 109 first-
-/// cycle run_state attempt failed at runtime
-/// (`state_fn(initial)` returned a closure-record pointer
-/// instead of the threaded value) — which led to needing this
-/// bisect: does the simplest fn-returning handle work, or is
-/// the bug already at this lower level?
-///
-/// **Ignored** while the runtime integration gap exists. See
-/// `[DEVIATION Task 109] run_state canonical shape — runtime
-/// chain integration gap` for the gap analysis. Un-ignore once
-/// the chain bug closes; the test source is the minimal repro.
-///
-/// Source: an arm with no k-capture returns a constant-shape
-/// lambda; main let-binds the handle's result and invokes the
-/// lambda once. Expected: lambda runs as `x + 100` with x=7,
-/// stdout = "107\n".
-#[test]
-#[ignore]
-fn handle_returning_simple_lambda_invoked_returns_value_pending_chain_fix() {
-    let src = "effect Trigger { fire: () -> Int }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let f: (Int) -> Int ![] = handle (perform Trigger.fire()) with {\n    \
-                   Trigger.fire(k) => fn (x: Int) -> Int ![] => x + 100,\n  \
-                 };\n  \
-                 let n: Int = f(7);\n  \
-                 perform IO.println(int_to_string(n));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "handle_returns_lambda_bisect");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "107\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 #[test]
