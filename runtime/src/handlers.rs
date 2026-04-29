@@ -1330,6 +1330,28 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                     // identity-passthrough), but architecturally
                     // questionable for adversarial nesting and a
                     // capacity-overflow risk for deep chains.
+                    //
+                    // **Discipline check** (PR #39 review §5). In
+                    // debug builds we assert that the current depth
+                    // is `>= outer_post_arm_k_entry_depth` — i.e.,
+                    // entries on the stack at terminal time are a
+                    // suffix of (or equal to) what was pushed during
+                    // this run_loop. A violation indicates that
+                    // somewhere between entry and terminal we popped
+                    // entries belonging to an outer run_loop, which
+                    // would silently corrupt the parent's chain
+                    // discipline. The drain itself enforces the
+                    // invariant; the assertion catches the upstream
+                    // bug if the invariant is ever violated by a new
+                    // codegen path.
+                    let current_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+                    debug_assert!(
+                        current_depth >= outer_post_arm_k_entry_depth,
+                        "sigil_run_loop terminal: outer_post_arm_k depth \
+                         underflow ({current_depth} < entry-time \
+                         {outer_post_arm_k_entry_depth}); a codegen path \
+                         popped entries belonging to an outer run_loop"
+                    );
                     OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
                     crate::arena::sigil_arena_reset();
                     return v;

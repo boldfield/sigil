@@ -116,10 +116,10 @@ pub const MAX_HANDLER_ARMS: u32 = 14;
 /// ```
 ///
 /// Cross-boundary constant: `runtime/src/handlers.rs`'s
-/// `compile_assertions` test asserts this constant equals
-/// `core::mem::offset_of!(HandlerFrame, return_fn)` so a future
-/// struct reorder breaks at the test rather than silently miscompiling
-/// in codegen.
+/// `handler_frame_return_offsets_match_abi_constants` test asserts
+/// this constant equals `core::mem::offset_of!(HandlerFrame,
+/// return_fn)` so a future struct reorder breaks at the test
+/// rather than silently miscompiling in codegen.
 pub const HANDLER_FRAME_RETURN_FN_OFF: i32 = 8;
 
 /// Byte offset of `HandlerFrame::return_closure` within the
@@ -167,9 +167,9 @@ mod tests {
         // Pinning the literal byte offsets: codegen Phase 4g reads
         // `return_fn` and `return_closure` directly off the
         // `frame_1_ptr_snapshot` Value at handle exit. The
-        // `compile_assertions` test in `runtime/src/handlers.rs`
-        // pairs with this one to assert the constants match
-        // `offset_of!(HandlerFrame, ...)`.
+        // `handler_frame_return_offsets_match_abi_constants` test in
+        // `runtime/src/handlers.rs` pairs with this one to assert the
+        // constants match `offset_of!(HandlerFrame, ...)`.
         assert_eq!(HANDLER_FRAME_RETURN_FN_OFF, 8);
         assert_eq!(HANDLER_FRAME_RETURN_CLOSURE_OFF, 16);
     }

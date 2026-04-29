@@ -4782,6 +4782,98 @@ fn handle_return_arm_with_outer_captures_in_k_pair_dispatch_path() {
 }
 
 #[test]
+fn integration_bug2_plus_layer2_only_tail_perform_canonical_arms() {
+    // PR #39 review §6 — progressive integration test #1.
+    //
+    // Composes Bug 2 + Layer 2 only. Body is tail-perform (no Bug 1
+    // path), single arm with k-capturing lambda (Layer 2 path),
+    // return arm has empty captures (no Layer 3d path), no Cps-
+    // effected fn-typed parameter (no Layer 3b path), no chained-
+    // let-yield body (no Layer 3a/3c path).
+    //
+    // Pre-Bug-2 (PR #29): would have applied return arm to op-arm
+    // discharge value, double-wrapping the closure.
+    // Pre-Layer-2: lambda's k(7) returns raw arg 7 instead of
+    // R-typed value, segfaulting on closure dispatch.
+    // Post-both: returns 14 (= 7 + 7).
+    //
+    // If this regresses but `bug2_alone` and `layer2_alone` probes
+    // pass, the regression is in the composition (e.g., Layer 2's
+    // self-apply path interaction with Bug 2's discharge tag check).
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 perform Trigger.fire()\n\
+               }\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_integration_bug2_plus_layer2_only");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "14\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn integration_bug2_layer2_bug1_non_tail_perform_canonical_arms() {
+    // PR #39 review §6 — progressive integration test #2.
+    //
+    // Composes Bug 2 + Layer 2 + Bug 1 (non-tail-perform body) + Layer
+    // 3a (tag-conditional self-apply when synth-cont chain returns
+    // DONE) + Layer 3c (handler frame re-push for k-pair-bearing
+    // lambda invoked outside handle, since the body's chained-let-
+    // yield synth-cont CAN cause a perform during k(arg) dispatch).
+    //
+    // Adds a non-tail-perform body to integration test #1 above, so
+    // the synth-cont chain exists (step_0 Final binds v from
+    // Trigger.fire, computes v+1). Single arm DISCHARGES with the
+    // captured-k lambda; no second perform fires inside the chain
+    // (chain's terminal is DONE, not DISCHARGED). Same return arm
+    // shape as #1 (no Layer 3d).
+    //
+    // f(7) = k(7)(7).
+    //   - Inner k(7) drives step_0 (Final): bind 7 to v, v+1 = 8,
+    //     terminate DONE.
+    //   - Layer 3a: tag=DONE → apply return arm. ret_fn(8): allocates
+    //     closure for `(s) => v + s` with v=8.
+    //   - Inner k(7) yields closure_for_v_eq_8.
+    //   - Outer call closure_for_v_eq_8(7) = 15.
+    //
+    // If this regresses but `integration_bug2_plus_layer2_only` and
+    // `dbg_a` probes pass, the regression is in the Bug 1 / Layer 3a
+    // / Layer 3c composition.
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 let v: Int = perform Trigger.fire();\n  \
+                 v + 1\n\
+               }\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_integration_bug2_layer2_bug1");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "15\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
 fn run_state_canonical_higher_order_helper_returns_threaded_value() {
     // Stage-6.8-followup Layer 3c (+ closure_convert k_closure_idx
     // fix) — the canonical `run_state(initial, comp)` higher-order

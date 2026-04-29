@@ -8690,6 +8690,36 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     //   4. Drives `sigil_run_loop` to a terminal Done/Discharged.
     //   5. Narrows the u64 result back to the user-declared ret
     //      type and returns it.
+    //
+    // **Identity-as-k_fn constraint** (PR #39 review §4). The shim
+    // hardcodes the post-arm-k pair as `(null, sigil_continuation_
+    // identity)`. This means a Cps fn used as a fn-as-value can only
+    // perform effects whose handler is on the live handler stack at
+    // shim invocation time — `identity` round-trips the perform's
+    // value back through the Sync caller's frame, so any unhandled
+    // effect inside the Cps fn aborts via `sigil_perform`'s
+    // "unhandled effect_id; handler stack empty" path. The canonical
+    // run_state shape satisfies this (the `c()` invocation inside
+    // `run_state` happens under the State `handle`); a future call
+    // site like `let f: () -> Int ![Effect] = my_cps_fn; f()` outside
+    // any `handle` for `Effect` would unhandled-abort inside the
+    // shim's `run_loop`. That diagnostic is correct and load-
+    // bearing — typecheck's effect-row inference rejects this shape
+    // statically (an `![Effect]`-rowed call without a surrounding
+    // handler fails E0042 at the call site), so the shim's runtime
+    // abort is the unreachable belt-and-braces fallback. Future
+    // first-class continuations (v2) would replace this hardcode
+    // with a real reified continuation; the shim emit is a Phase 4d
+    // MVP simplification matched to identity's return-Done semantics.
+    //
+    // **Always-emit policy** (PR #39 review §3). The shim is emitted
+    // unconditionally for every Cps-ABI fn, even those never used as
+    // a fn-as-value. Bloat is bounded (one ~100-byte shim per Cps
+    // fn) and the alternative — gating emission on
+    // `top_level_fn_names_seen_as_value` from closure_convert — adds
+    // a side-table dependency without a measured size win. Pinned
+    // for re-evaluation if Cps-fn count grows or binary size
+    // matters; today no one tracks the difference.
     for (fn_name, &shim_id) in sync_shim_fn_ids.iter() {
         let entry = match user_fns.get(fn_name) {
             Some(e) => e,
