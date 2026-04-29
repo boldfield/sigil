@@ -438,6 +438,28 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::RParen, "`)` closing fn-type parameter list")?;
             self.expect(&TokenKind::Arrow, "`->` fn-type return arrow")?;
             let ret = self.parse_type()?;
+            // Plan B' Stage 6.8 R5 Finding 4 — per-arrow `![..]`
+            // diagnostic. Sigil's per-arrow effect-row syntax
+            // (PLAN_B_PRIME_DEVIATIONS [DEVIATION Task 103]) requires
+            // every fn-type to carry its own `![..]`. The default
+            // `expect("`!`...")` error message is opaque on first
+            // encounter — many users (and the implementer at
+            // `986a8b4`) reach for ML-style outermost-only effects.
+            // When the next token is `{` (likely a fn-decl body) or
+            // an arrow-y token, attach a hint pointing at the
+            // per-arrow requirement.
+            if !matches!(self.peek().kind, TokenKind::Bang) {
+                let here = self.peek().span.clone();
+                let msg = format!(
+                    "expected `![..]` for this fn-type's effect row \
+                     (Sigil v1 requires every fn-type to carry its own \
+                     effect row, including inner returns — `(A) -> B \
+                     ![]` not `(A) -> B`); got {:?}",
+                    self.peek().kind
+                );
+                self.err(here, &msg);
+                return None;
+            }
             self.expect(&TokenKind::Bang, "`!` before fn-type effect row")?;
             self.expect(&TokenKind::LBracket, "`[` opening fn-type effect row")?;
             let (effects, effect_row_var) = self.parse_effect_row()?;

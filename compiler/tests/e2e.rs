@@ -188,6 +188,56 @@ fn compile_and_run(source: &str, test_name: &str) -> (String, String, i32) {
     out
 }
 
+/// Plan B' Stage 6.8 R5 finding 1 — discipline helper for negative
+/// e2e tests that pin specific compile-failure E-codes.
+///
+/// Mandates the asserted error code as a named arg so the test
+/// can't silently pass on a different compile-failure (e.g., a
+/// typecheck error in the test source masking the codegen path the
+/// test was written to exercise — the recurring bug class caught
+/// by `0baaa15`, `4e5d165`, and `5619df6`).
+///
+/// Compiles `source` and asserts:
+/// 1. compile fails (exit non-zero), AND
+/// 2. stderr contains `expected_code` (e.g., "E0138").
+///
+/// Use for any negative test of the shape "this source must
+/// compile-fail with code X". Bare `!status.success()` checks
+/// without an E-code anchor are easy to write but brittle —
+/// any future refactor that shifts which pass rejects the source
+/// silently invalidates the test's claim.
+#[allow(dead_code)]
+fn assert_compile_fails_with_code(source: &str, expected_code: &str, test_name: &str) {
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_{}_{}.sigil",
+        test_name,
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .output()
+        .expect("invoke sigil compiler");
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    assert!(
+        !out.status.success(),
+        "compile must fail for `{test_name}`; got success with stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr_str.contains(expected_code),
+        "expected `{expected_code}` in stderr for `{test_name}`; got stderr={stderr_str:?}"
+    );
+}
+
 /// Like [`compile_file_and_run`] but also returns the wall-clock
 /// duration of the child process's `exec(2)`-to-exit run. The
 /// compile step is NOT measured; only the compiled-program run is

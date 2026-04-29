@@ -996,6 +996,23 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         resolved_lambda_captures.push((span, resolved_caps));
     }
 
+    // Plan B' Stage 6.8 R5 Finding 2 (preemptive) — same end-of-
+    // typecheck deref pass for `call_callee_tys`. Phase C+ Part 1's
+    // codegen consumer (`lower_call`'s Call-callee path) reads
+    // these Tys via `cranelift_ty_of_ty` which rejects `Ty::Var(_)`.
+    // For inner-fn calls inside a generic surrounding fn, generic
+    // params remain free `Ty::Var`s at check_call time; this deref
+    // pass resolves anything that gets bound by later inference.
+    // Generic-context calls whose Vars REMAIN free after
+    // end-of-typecheck still need monomorphize-rebuilds-per-clone
+    // (parallel to `lambda_captures_resolved`); this deref handles
+    // the var-bound-later subset that's the typical case.
+    let raw_call_callee_tys = std::mem::take(&mut tc.call_callee_tys);
+    let mut resolved_call_callee_tys: BTreeMap<Span, Ty> = BTreeMap::new();
+    for (span, ty) in raw_call_callee_tys {
+        resolved_call_callee_tys.insert(span, tc.deref(&ty));
+    }
+
     (
         CheckedProgram {
             program,
@@ -1003,7 +1020,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             lambda_captures: resolved_lambda_captures,
             types: tc.types,
             match_scrut_tys: tc.match_scrut_tys,
-            call_callee_tys: tc.call_callee_tys,
+            call_callee_tys: resolved_call_callee_tys,
             fn_schemes: tc.fn_schemes,
             call_site_instantiations: resolved_calls,
             ctor_site_instantiations: resolved_ctors,

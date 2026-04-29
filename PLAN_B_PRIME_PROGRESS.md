@@ -82,9 +82,9 @@ Goal: close B.3 + B.4. Together these unblock the literal `run_state` higher-ord
   - commits: [HEAD]
   - notes: 5 positive e2e tests across Phase C v1 + C+ Part 1 + C+ Part 2 — `fn_as_value_via_let_binding_returns_42`, `higher_order_fn_param_returns_42`, `generic_apply_with_id_fn_returns_42`, `make_adder_returns_12` (Phase C+ Part 1: call-returning-fn), **`closure_env_load_callee_returns_42` (Phase C+ Part 2: lambda body invokes captured fn-typed value via ClosureEnvLoad-callee)**. R2 fixups added: `fn_as_value_with_multi_param_returns_7`, `fn_as_value_with_effect_row_returns_42`. Phase C+ Part 2 inverted the prior `closure_env_load_callee_is_e0138_until_phase_c_plus` rejection test into `closure_env_load_callee_returns_42` since the codegen surface now supports the shape. Only `p17_compose_source_rejects_until_typeexpr_fn_ships` remains as a rejection assertion (compose has additional surfaces — generic params + bare fn-as-value through the codegen-entry walker — that need Task 109's full inversion).
 - Task 107 — B.4: arm-body-lambda lift (drop `arm_body_walk` rejection; closure-convert side-table extension).
-  - status: phase-a-done-pending-ci, phase-b-pending
+  - status: done (Phase A + Phase B + Phase C++)
   - commits: [HEAD]
-  - notes: **Phase A** drops the `arm_body_walk` Lambda + ClosureRecord rejection arms for shapes that don't capture the arm's continuation `k`. closure_convert already hoists arm-body lambdas correctly (the `Expr::Handle` arm extends `arm_locals` with op params + k_name; `env_exprs` reference `k` as a plain `Expr::Ident` resolved against the arm-fn's env at lower time). Phase A's walker now allows ClosureRecord callees in arm bodies *unless* their `env_exprs` contain `Ident(k_name)` — that case stays rejected with a Phase B-pointing diagnostic. **Phase B** (deferred) needs to handle k-capture: at runtime `k` is a continuation-pair (k_closure + k_fn) — capturing-and-calling `k` from inside a hoisted lambda requires either patching k_fn into k_closure's `code_ptr` slot at arm prologue (so indirect dispatch via the captured value reads a valid code_ptr) or splitting k into two slots in the lifted lambda's closure record. Phase B closes the canonical `run_state` shape from Task 108. Phase A unblocks the IIFE patterns from Task 108 example #2.
+  - notes: **Phase A** drops the `arm_body_walk` Lambda + ClosureRecord rejection for non-k-capturing shapes. closure_convert already hoists arm-body lambdas correctly. **Phase B** ships the **2-slot trailing-pair convention** (parallels the arm fn's args_ptr layout): closure_convert detects k-pair captures via the new `arm_k_context_stack`; the lifted lambda's closure record allocates 2 trailing slots for `k_closure` + `k_fn` after the regular env; the synth lambda's `lower_call` dispatches `k(arg)` via `sigil_next_step_call(k_closure, k_fn, 1) → sigil_run_loop` and narrows the result to handler_overall_ty. **Phase C++** monomorphize-rewrites `lambda_captures` per-clone with substitution applied (new `MonoProgram.lambda_captures_resolved: BTreeMap<(String, Span), Vec<(String, Ty)>>`) so generic-context fn-typed captures see concrete Tys at codegen time. End-of-typecheck deref pass resolves `Ty::Var`s recorded mid-walk before they reach codegen. Tests: `arm_body_lambda_capturing_k_compiles_returns_99`, `task_108_arm_body_lambda_captures_k_runs`, `compose_body_via_closure_env_callees_returns_42` (all positive runtime tests). The Phase B route decision (2-slot split) was made by user.
 - Task 108 — B.4 acceptance e2e tests (arm body returning lambda; arm body IIFE; full `run_state` lambdas-of-state shape).
   - status: phase-a-partial-done, phase-b-pending
   - commits: [HEAD]
@@ -100,7 +100,13 @@ Goal: close B.3 + B.4. Together these unblock the literal `run_state` higher-ord
 
 ### Stage 6.8 review checkpoint
 
-**Reached** (2026-04-29). Major surfaces complete:
+**Reached** (2026-04-29; updated post Phase B + Phase C++). Major surfaces complete:
+- B.3 (Phase A → C+ Part 2): TypeExpr::Fn parser, typecheck, monomorphize, codegen indirect dispatch.
+- B.4 Phase A: non-k-capturing arm-body lambdas (IIFE shape).
+- B.4 Phase B: **k-capture inside arm-body lambdas via 2-slot trailing-pair convention** — canonical run_state surface unblocked.
+- Phase C++: monomorphize rewrites lambda_captures per-clone — generic + fn-typed-captures combination unblocked.
+
+Original surfaces:
 - B.3 Phase A → Phase C+ Part 2: parser, typecheck, monomorphize, closure-convert, codegen indirect-call dispatch. Four supported callee shapes — `Ident(local)` / `ClosureRecord` / `Call(...)` / `ClosureEnvLoad` — all tested end-to-end. canon_ty mangles `Ty::Fn`. E0137 rejects row-variable-bearing fn-types (closed-rows-only in v1). E0138 walker rejects unsupported indirect-call shapes with span-anchored Sigil diagnostics.
 - B.4 Phase A: arm-body-lambda lift for non-k-capturing shapes. closure-convert already hoists correctly; the codegen-side rejection drops with a k-capture guard. IIFE patterns work (Task 108 example #2 covered).
 

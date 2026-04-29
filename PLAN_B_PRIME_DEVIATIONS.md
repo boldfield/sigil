@@ -263,7 +263,30 @@ This makes compose work end-to-end with Phase C v1 + Phase C+ surfaces.
 
 **Closure path:** Phase B follow-up commit closes both routes' design questions and ships one of them. Plan B' Stage 6.8 review checkpoint should surface the route decision before Phase B's implementation begins.
 
-**Implementing commit(s):** Task 107 Phase A (`703c011`) ships the arm-body-lambda lift for non-k-capturing shapes; Phase B + Task 108 examples #1 and #3 + Task 109's full state.sigil run_state rewrite all defer to a future commit pending the route decision.
+**Implementing commit(s):** Task 107 Phase A (`703c011`) ships the arm-body-lambda lift for non-k-capturing shapes; Phase B (`51a8a8d`) + Phase B fix (`5619df6`) ship the **2-slot trailing-pair convention** route per the user's design call. Tests `arm_body_lambda_capturing_k_compiles_returns_99` and `task_108_arm_body_lambda_captures_k_runs` ship as positive runtime tests. Phase C++ (`1166804`) closes the parallel generic-context concern.
+
+## 2026-04-29 — [DEVIATION R5 Finding 2] Side-table mono-survival — audit + class-level invariant
+
+**Context:** Phase C++ (`1166804`) shipped `monomorphize`-rewrites-`lambda_captures`-per-clone after the speculative compose test in `4d272db` exposed `Ty::Var(7) reached cranelift_ty_of_ty`. The root cause: typecheck's `lambda_captures` records Tys mid-walk; some carry generic-param `Ty::Var`s; monomorphize specialised the AST per clone but didn't rewrite the side-table; codegen's `cranelift_ty_of_ty` then crashed on the residual Vars.
+
+**The class-level concern.** Every typecheck side-table that maps a span (or other identifier) to a `Ty` (or a structure containing `Ty`) potentially has the same problem when a future code path reads it post-mono in a generic context. The Phase C++ fix is shaped to work for `lambda_captures`; analogous fixes may be needed for sibling side-tables when their consumers cross the generic boundary.
+
+**Audit results (as of `5619df6`).**
+
+| Side-table | Carries `Ty`? | Generic-context risk | Status |
+|---|---|---|---|
+| `match_scrut_tys: BTreeMap<Span, Ty>` | yes | Codegen reads `head_name()` only; `Ty::Var` inside args is benign at this consumer | **Safe**: no fix needed |
+| `call_callee_tys: BTreeMap<Span, Ty>` | yes (Ty::Fn) | Phase C+ Part 1's `lower_call` reads via `cranelift_ty_of_ty`; same risk shape as `lambda_captures` | **Mitigated** via end-of-typecheck deref pass (`5619df6+`); generic-Var-remaining shapes still need monomorphize-rebuilds-per-clone if Phase C+ Part 1 reaches them in generic context |
+| `lambda_captures: Vec<(Span, Vec<(String, Ty)>)>` | yes | Phase C+ Part 2's `captured_fn_sigs` reads via `cranelift_ty_of_ty` | **Fixed** by Phase C++ |
+| `handle_arm_captures` / `handle_return_arm_captures` | yes | codegen consumes; arm-fn captures can be fn-typed under arm-body-lambda lift | Audited; codegen's existing path uses `head_name()` for primitive-vs-pointer disambiguation; no `Ty::Var(_)` unreachable on the read path. Adding deref-at-record at end-of-typecheck would preemptively close this if a future consumer changes the read shape |
+| `handle_body_ty` | yes | Used for return-arm typing in codegen | Same shape as `match_scrut_tys` — read via `head_name()`; safe |
+| `fn_schemes` | yes (Ty::Fn) | Generic by design; consumed by typecheck instantiation, not codegen directly | Different lifecycle; not affected |
+
+**Closure path:** Phase C+ Part 1's call_callee_tys fix is the deref-at-end-of-typecheck pattern; Phase C++'s lambda_captures fix is the per-clone-rebuild pattern. **Choice criterion**: if the side-table's `Ty::Var`s are typically bound by inference completion (typical case), the deref pass suffices. If `Ty::Var`s remain free after typecheck (generic-fn-internal call sites where the surrounding fn's generics aren't bound until use-site monomorphization), the per-clone-rebuild is required.
+
+**Test class-level invariant (future):** a property test that, for every generic instantiation in a sample program, walks the post-mono AST + every span-keyed side-table read by codegen, asserts `Ty::Var(_)` doesn't survive at any read site. Cheap relative to the class of latent panics it catches. Not landed yet; documented here so the next time a side-table-Ty-Var bug surfaces, this entry surfaces in search.
+
+**Implementing commit(s):** R5 fixup commit (this commit) lands the call_callee_tys deref pass + this deviation entry. Phase C++ (`1166804`) is the precedent fix shape for the per-clone-rebuild route.
 
 ## 2026-04-29 — [DEVIATION Phase C+ Part 2 generic + fn-typed-capture] Generic lambda captures with fn-typed Ty::Var crash codegen
 
