@@ -10214,11 +10214,70 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // exercise it). The rs_b probe + canonical run_state's return
         // arm `return(v) => fn (s: Int) -> Int ![] => v + s` has no outer
         // captures so this fix unblocks the canonical shape.
+        // Stage-6.8-followup Layer 3 fix: gate the self-apply-return-
+        // arm step on the trampoline's terminal tag. The k_fn captured
+        // at the perform site may be:
+        //   - identity (tail-perform body): k(arg) → run_loop → Done(arg).
+        //     tag = DONE → apply return arm to wrap arg into R.
+        //   - synth-cont (non-tail-perform body): k(arg) → run_loop →
+        //     synth-cont runs post-perform body → may complete normally
+        //     (Done with body's natural terminal, tag = DONE → apply
+        //     return arm) or discharge from a nested arm (DISCHARGED
+        //     with R-typed value, tag = DISCHARGED → SKIP return arm
+        //     because the discharged value IS R already).
+        //
+        // Pre-Layer-3 Layer 2 fix unconditionally self-applied; for
+        // canonical run_state (multi-arm + non-tail-perform body) the
+        // unconditional apply double-wrapped a discharged R-typed
+        // value, producing a non-sensical closure-of-closure pointer.
+        // The tag-conditional path here is the algebraically correct
+        // contract: return arm fires iff body completed normally.
+        //
+        // The synth-cont machinery (`CpsContinuationKind::ChainedLetBindStep`)
+        // already lambda-lifts post-perform body code for chained-let-
+        // yield shapes; the k_fn captured by the lifted lambda will be
+        // a synth-cont when body has post-perform code, so the run_loop
+        // here drives synth-cont and respects natural completion vs
+        // discharge.
         let final_widened = if let Some(idx) =
             self.handler_return_arm_indices.get(&info.handle_span).copied()
         {
             let synth = &self.handler_return_arm_synth[idx];
             if synth.captures.is_empty() {
+                // Query terminal tag and branch.
+                let tag_call = self
+                    .builder
+                    .ins()
+                    .call(self.last_terminal_tag_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, tag_call));
+                let tag_v = self.builder.inst_results(tag_call)[0];
+                let discharged_const = self.builder.ins().iconst(
+                    types::I32,
+                    sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
+                );
+                let is_discharged =
+                    self.builder.ins().icmp(IntCC::Equal, tag_v, discharged_const);
+
+                let skip_block = self.builder.create_block();
+                let apply_block = self.builder.create_block();
+                let merge_block = self.builder.create_block();
+                self.builder.append_block_param(merge_block, types::I64);
+                self.builder
+                    .ins()
+                    .brif(is_discharged, skip_block, &[], apply_block, &[]);
+
+                // skip_block: body's run terminated via discharge.
+                // The widened_result IS R-typed already; pass through.
+                self.builder.switch_to_block(skip_block);
+                self.builder.seal_block(skip_block);
+                self.builder
+                    .ins()
+                    .jump(merge_block, &[widened_result.into()]);
+
+                // apply_block: body completed normally. Wrap via return arm.
+                self.builder.switch_to_block(apply_block);
+                self.builder.seal_block(apply_block);
                 let ret_fn_ref = *self
                     .handler_return_arm_refs_per_handle
                     .get(&info.handle_span)
@@ -10276,7 +10335,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let run_loop_call_2 = self.builder.ins().call(self.run_loop_ref, &[ns_ptr]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, run_loop_call_2));
-                self.builder.inst_results(run_loop_call_2)[0]
+                let wrapped = self.builder.inst_results(run_loop_call_2)[0];
+                self.builder.ins().jump(merge_block, &[wrapped.into()]);
+
+                self.builder.switch_to_block(merge_block);
+                self.builder.seal_block(merge_block);
+                self.builder.block_params(merge_block)[0]
             } else {
                 // Return arm has outer captures — Layer 2 follow-up. Pass
                 // through the raw widened_result (pre-fix semantics).

@@ -489,6 +489,55 @@ Verified: post-Layer-2 fix, `/tmp/run_state_canonical.sigil` (canonical multi-ar
 
 **What's still blocking the canonical `run_state(initial, comp)`:** Layer 3 — multi-arm composition where comp's body has multiple performs across `State.set` and `State.get`, AND each arm captures k into a lambda that escapes via discharge AND is invoked from the run_state caller, AND k(arg) must resume body to drive subsequent performs (not just self-apply return arm). The current `lower_k_pair_call`'s self-apply-return-arm path is correct for tail-perform body but wrong for non-tail-perform body where k must resume body to run further performs. The synth-cont infrastructure that handles non-tail-perform bodies in CPS-color fns covers limited shapes (`{ let _ = perform; constant }` / `{ let r = k(a); pure_tail }`); the canonical run_state's `{ let _ = perform State.set(arg); let v = perform State.get(); v + 1 }` shape is not yet covered. Verified: post-Bug-1 fix, `/tmp/run_state_canonical.sigil` still produces a heap-pointer-shaped output. Bug 1 closes one residual; Layer 3 remains.
 
-**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
+**Implementing commit(s):** [HEAD~1] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge (Bug 1).
+
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Layer 3a partial fix + analysis] Tag-conditional return-arm self-apply; Layer 3b/3c gaps documented
+
+**Plan B' Stage 6.8 Task 109 followup, post-Bug-1.** Closes Layer 3a (tag-conditional self-apply); documents Layer 3b (fn-as-value Sync vs Cps ABI gap) and Layer 3c (captured-continuation handler-frame re-push) as the remaining architectural blockers for the canonical `run_state(initial, comp)`.
+
+### Layer 3a fix — tag-conditional return arm self-apply in lower_k_pair_call
+
+The Layer 2 fix unconditionally self-applied the originating handle's return arm to k(arg)'s `sigil_run_loop` result. For k-pair-bearing lambdas captured at non-tail-perform body shapes, the captured k_fn is a synth-cont (chained-let-yield helper). Driving k(arg) through synth-cont may complete normally (Done with the natural body terminal — apply return arm) OR discharge from a nested arm (DISCHARGED with R-typed value — skip return arm). Pre-fix would double-wrap the discharged value.
+
+**The fix.** `lower_k_pair_call`'s self-apply step now queries `sigil_last_terminal_tag()` after the run_loop call returns. Three blocks (`skip_block` / `apply_block` / `merge_block`); skip on DISCHARGED, apply on DONE, merge to a single I64-typed value, then narrow to `handler_overall_ty`. Mirrors the discharge-block pattern from Bug 2's handle-discharge dispatch.
+
+**Captures-restriction unchanged.** The fall-back to raw widened_result remains for return arms with outer captures (Layer 3d follow-up).
+
+### Layer 3b gap — fn-as-value indirect call Sync/Cps ABI ambiguity
+
+`compute_user_fn_abi` returns `UserFnAbi::Sync` for many CPS-effected fns (those whose body shape doesn't match simple-tail-perform / yield-then-constant / chained-let-yield) and `UserFnAbi::Cps` only for the body-shape-matching subset. Top-level fns materialized as values via closure_convert's Task 104 `Ident(top_level_fn) → ClosureRecord` path carry a code_ptr referencing the fn's actual code — Sync or Cps. The indirect call site (`lower_call`'s catchall) builds the Cranelift signature from the surface `FnTypeExpr`'s effect row alone — no ABI info. For Sync-ABI fns the existing `(closure, args...) -> ret_ty` shape is correct; for Cps-ABI fns the actual code fn is `(closure, args_ptr, args_len) -> *NextStep`.
+
+The canonical run_state's `c: () -> Int ![State]` parameter, when bound to comp (chained-let-yield → Cps ABI), hits this gap: indirect call returns a NextStep pointer interpreted as Int.
+
+**Verified empirically.** An experimental fix that detected `is_cps` from `FnTypeExpr.effects.is_empty()` and used the CPS interop wrapper at the indirect call site fixed `rs_l3b` (chained-let-yield with eager arms: 6 ✓) and `rs_l3c` (CPS-effected fn-typed parameter: 42 ✓) but broke the existing `fn_as_value_with_effect_row_returns_42` test — `add_one` has `![IO]` row but Sync ABI (its `let _ = perform IO.println(...); n + 1` body shape doesn't match any chain pattern). Surface-effect-row alone is an unreliable proxy for ABI.
+
+**Fix paths (open question for Plan C).**
+1. Track per-fn ABI in the closure record. Add an extra slot at allocation time; runtime branch at indirect call site. Most flexible; runtime cost ≈ one branch per indirect call.
+2. Emit Sync shims for Cps-ABI fns at fn-as-value materialization. closure_convert allocates a synth `sync_shim_for_<name>` Sync fn that internally drives run_loop. closure record's code_ptr points to the shim, not the Cps body. Indirect call uses Sync sig uniformly. Loses no optimization for direct calls.
+3. Force all CPS-needing fns to Sync ABI uniformly. Loses chained-let-yield optimization but simplifies fn-as-value invariably.
+
+Option 2 is recommended — preserves all optimizations + uniform indirect call shape. Estimated scope ~150 LOC (one synth Sync shim emission + closure_convert site update).
+
+### Layer 3c gap — captured continuation invoked outside handle hits empty handler stack
+
+Even with 3b resolved, the canonical's `handle c() with { ... }` op arm body discharges via lambda. The lambda escapes the handle (becomes state_fn). When state_fn is invoked from run_state's caller, the State frame has been popped (sigil_handle_pop unlinks but keeps the allocation alive). The lambda's k(arg) drives a fresh sigil_run_loop whose synth-cont (e.g., post-State.set body `let v = perform State.get(); v + 1`) issues sigil_perform for State.get. The handler stack doesn't have State on it: sigil_perform aborts with `unhandled effect_id ... handler stack empty`.
+
+**Verified empirically.** With an experimental Layer 3b fix applied, canonical run_state aborts with exactly that diagnostic (exit 134). Confirms the gap.
+
+**Fix path (open).** Capture the State frame's pointer at handle-allocation time, thread it through the lifted lambda's closure record (extending the trailing-pair to a trailing-triple `(k_closure, k_fn, frame_ptr)`), and re-push the frame at lower_k_pair_call before driving run_loop (popping after). The frame allocation persists across pop/re-push because sigil_handle_pop only unlinks — the heap allocation lives until GC reclaims it. Estimated scope ~200 LOC across closure_convert (ArmKPairCapture extension), codegen (lower_closure_record + lower_k_pair_call extension + arm fn body emit's frame_ptr unpack), and arm closure record allocation (handle expression writes frame_1_ptr_snapshot at a fixed slot).
+
+### Probe results post-Layer-3a
+
+- `rs_b` (tail-perform body, Layer 2 case): 14 ✓
+- `rs_b1` (eager k(7) tail): 20 ✓
+- `dbg_a` (non-tail-perform body, Bug 1): 107 ✓
+- `rs_l3a` (multi-arm-defined-but-single-fires): 14 ✓
+- `rs_l3b` (chained-let-yield with eager arms): heap-pointer-shaped (blocked by Layer 3b)
+- `rs_l3c` (CPS-effected fn-typed parameter, no handle): heap-pointer-shaped (blocked by Layer 3b)
+- `run_state_canonical`: heap-pointer-shaped (blocked by Layer 3b + 3c stack)
+
+The 3a fix is correctness-preserving for future cases; the canonical still requires Layer 3b + 3c to compose.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge (Layer 3a only — 3b and 3c are documented gaps, no compiler/runtime changes for them in this commit).
 
 
