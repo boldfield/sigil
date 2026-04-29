@@ -4824,3 +4824,233 @@ fn handle_with_bool_body_and_return_arm_uses_v_at_narrow_type() {
     );
     assert_eq!(stdout, "false\n", "stdout mismatch; stderr={stderr:?}");
 }
+
+// ---------------- Plan B' Stage 6.7 Task 96 — B.2 acceptance e2e
+// tests for chained-let-yield-then-pure-tail synth-cont chains
+// (N>=2). The activation in commit 5ad78c3 routes both N=1 and N>=2
+// chains through `ChainedLetBindStep`. Existing 1-stmt tests cover
+// N=1; these cover Middle->...->Final transitions with capture +
+// prior-binding threading, forward data dependencies, and pointer-
+// typed bindings.
+
+#[test]
+fn chained_synth_cont_two_perform_helper_returns_sum_of_bindings() {
+    // N=2 chain. Helper performs E.op twice; tail sums the two
+    // bindings. Each step's resume value comes from a single arm
+    // that returns `arg + 100`.
+    //
+    // step_0 (Middle): bind x = 101 from args_ptr[0]; alloc step_1's
+    // closure record carrying x; sigil_perform(E.op(2), k=&step_1).
+    // step_1 (Final): bind y = 102 from args_ptr[0]; load x = 101
+    // from closure_ptr's prior_bindings slot; lower `x + y`; dispatch
+    // through args_ptr[1..3]'s post_arm_k = (null, identity); identity
+    // returns Done(203).
+    //
+    // Verifies: step_0->step_1 transition, prior_bindings forward
+    // copy, args_ptr[0] bind, post_arm_k dispatch from Final.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper() -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(2);\n  \
+                 x + y\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_two_perform_helper");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "203\n",
+        "Plan B' Task 96: 2-perform chain — x=101, y=102, x+y=203. \
+         stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn chained_synth_cont_three_perform_helper_returns_sum_of_bindings() {
+    // N=3 chain. Verifies Middle->Middle->Final transition: catches
+    // off-by-one bugs in prior_bindings offset arithmetic.
+    //
+    // step_0 (Middle): bind x=101; alloc step_1 record with [x];
+    //   sigil_perform(E.op(2), k=&step_1).
+    // step_1 (Middle): load x from prior_bindings[0]; bind y=102;
+    //   alloc step_2 record with [x, y]; sigil_perform(E.op(3),
+    //   k=&step_2).
+    // step_2 (Final): load x from prior_bindings[0], y from
+    //   prior_bindings[1]; bind z=103; lower `x + y + z`; dispatch
+    //   through post_arm_k.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper() -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(2);\n  \
+                 let z: Int = perform E.op(3);\n  \
+                 x + y + z\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_three_perform_helper");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "306\n",
+        "Plan B' Task 96: 3-perform chain — x=101, y=102, z=103, \
+         x+y+z=306. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn chained_synth_cont_two_perform_with_forward_data_dependency() {
+    // N=2 chain where step 1's perform args reference step 0's
+    // binding. The next_perform's args lower through Lowerer with
+    // env populated from prior_bindings — this verifies the env
+    // setup happens before the next perform's args are lowered.
+    //
+    // step_0: bind x = handler(1) = 101; alloc step_1 record with [x].
+    // step_1 (Final): bind y from args_ptr[0]; load x from prior_-
+    //   bindings[0]; lower `x + y`. Note: step_0's lower of `E.op(x)`
+    //   uses the prior-step-bound x via the env populated from
+    //   prior_bindings[0].
+    //
+    // Wait — step_0 is the FIRST perform (in helper body emit, not in
+    // synth-cont). For step_1's perform args, they're lowered inside
+    // step_0's Middle emit. step_0's env at that point = {x: bound}
+    // + captures + prior_bindings (none for step_0). So `E.op(x)` in
+    // step_1's perform lowers correctly with x in scope.
+    //
+    // x = handler(1) = 101. y = handler(101) = 201. x + y = 302.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper() -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(x);\n  \
+                 x + y\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_forward_data_dependency");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "302\n",
+        "Plan B' Task 96: forward-data-dependency — x=handler(1)=101, \
+         y=handler(x)=handler(101)=201, x+y=302. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn chained_synth_cont_two_perform_helper_with_user_param_capture() {
+    // N=2 chain with a helper user param `threshold` referenced in
+    // the tail. Verifies captures collection across the chain (the
+    // capture is computed once, shared by all steps' closure records)
+    // and helper's perform-time closure record carrying the capture.
+    //
+    // step_0 record: [threshold] (captures only).
+    // step_1 record: [threshold, x] (captures + prior_bindings).
+    // step_1 (Final): loads threshold from captures slot, x from
+    //   prior_bindings slot, binds y; lowers `x + y + threshold`.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(threshold: Int) -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(2);\n  \
+                 x + y + threshold\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_user_param_capture");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "213\n",
+        "Plan B' Task 96: user-param-capture — x=101, y=102, \
+         threshold=10, sum=213. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn chained_synth_cont_user_param_referenced_in_perform_arg_and_tail() {
+    // N=2 chain where the helper user param `threshold` is referenced
+    // BOTH in step_0's perform arg AND in the tail. Verifies the
+    // captures-collection walker visits both perform args AND the
+    // tail (not just the tail).
+    //
+    // step_0's perform arg = threshold; arm returns arg+100 = 110.
+    //   So x = 110.
+    // step_1's perform arg = 2; arm returns 102. So y = 102.
+    // tail: x + y + threshold = 110 + 102 + 10 = 222.
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(threshold: Int) -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(threshold);\n  \
+                 let y: Int = perform E.op(2);\n  \
+                 x + y + threshold\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "chained_synth_cont_user_param_in_perform_arg_and_tail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "222\n",
+        "Plan B' Task 96: capture referenced in both perform-arg and \
+         tail — x=handler(threshold)=110, y=102, threshold=10, \
+         sum=222. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn chained_synth_cont_two_perform_with_string_binding_exercises_pointer_bitmap() {
+    // N=2 chain with a String-typed binding in step_0 (pointer-typed
+    // slot). The chain's prior_bindings forward-copy must preserve
+    // the pointer slot's GC bitmap bit when allocating step_1's
+    // closure record. Verifies `EnvSlotKind::is_pointer()` derivation
+    // for non-uniform slot types in the chain.
+    //
+    // step_0 record bitmap: empty (no captures).
+    // step_1 record bitmap: bit 1 set (s is String, pointer-typed).
+    // step_1 (Final): load s from prior_bindings[0]; bind n from
+    //   args_ptr[0]; tail returns s.
+    //
+    // helper's tail returns the String binding `s`; main prints it.
+    let src = "effect S { gen_str: () -> String, gen_int: () -> Int }\n\
+               fn helper() -> String ![S, IO] {\n  \
+                 let s: String = perform S.gen_str();\n  \
+                 let n: Int = perform S.gen_int();\n  \
+                 s\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: String = handle helper() with {\n    \
+                   S.gen_str(k) => k(\"hello-chain\"),\n    \
+                   S.gen_int(k) => k(42),\n  \
+                 };\n  \
+                 perform IO.println(r);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "chained_synth_cont_string_binding_pointer_bitmap");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "hello-chain\n",
+        "Plan B' Task 96: pointer-typed (String) binding threaded \
+         forward through chain — s='hello-chain' survives prior_bindings \
+         copy from step_0 to step_1; tail returns s. stderr={stderr:?}"
+    );
+}
