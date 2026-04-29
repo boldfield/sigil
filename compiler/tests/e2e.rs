@@ -5054,3 +5054,142 @@ fn chained_synth_cont_two_perform_with_string_binding_exercises_pointer_bitmap()
          copy from step_0 to step_1; tail returns s. stderr={stderr:?}"
     );
 }
+
+// ---------------- Plan B' Stage 6.7 Task 99 — B.1 (arm-side N-let
+// chain) acceptance e2e tests for N>=3. The Phase B activation
+// (Task 98) routes both N=2 (existing slice_c_choose_multi_shot_*
+// tests) and N>=3 chains through the unified `chain.steps` emit
+// loop. Existing 2-let tests cover N=2; these cover Middle->...
+// ->Final transitions for longer chains, including forward data
+// dependencies in arg expressions and full env access in the tail.
+// ----------------
+
+#[test]
+fn slice_c_chain_three_let_arm_body_invokes_k_three_times() {
+    // N=3 arm body. Helper: `let b = perform Choose.flip(); if b
+    // then 1 else 0`. Arm body: 3 sequential k invocations with
+    // alternating args. Tail sums all three results.
+    //
+    // Arm dispatched once. Each k invocation drives helper synth-
+    // cont with the given Bool, returning 1 or 0. Pre-Task-98 (with
+    // legacy 2-let cap), this shape was rejected at codegen via
+    // `slice_c_multi_let_arm_body_with_three_lets_is_rejected` (now
+    // inverted via Task 100); post-Task-98 it compiles + runs.
+    //
+    // Step trace:
+    //   - arm fn: lowers k(true), allocs step_0's closure (k pair),
+    //     dispatches to step_0 via helper synth-cont → trampoline
+    //     dispatches step_0(args_ptr=[1, post_arm_k_pair_a]).
+    //   - step_0 (Middle): binds r1=1, loads (k_closure, k_fn),
+    //     lowers k(false) arg, allocs step_1's closure (k pair +
+    //     [r1]), dispatches.
+    //   - step_1 (Middle): binds r2=0, loads (k_closure, k_fn) +
+    //     [r1] from closure, lowers k(true) arg, allocs step_2's
+    //     closure (Final layout: [r1, r2]), dispatches.
+    //   - step_2 (Final): binds r3=1, loads [r1, r2], lowers
+    //     `r1+r2+r3 = 1+0+1 = 2`, returns Done(2).
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     let r3: Int = k(true);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_three_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "2\n",
+        "Plan B' Task 99: 3-let chain — r1=1, r2=0, r3=1, sum=2. \
+         stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_c_chain_five_let_arm_body_invokes_k_five_times() {
+    // N=5 chain. Stress-tests the Middle->Middle->Middle->Middle->
+    // Final transition + offset arithmetic in prior_bindings copy.
+    // Arm: 5 k(...) invocations with alternating Bool args; tail
+    // sums all 5 results.
+    //
+    // Expected: r1=1, r2=0, r3=1, r4=0, r5=1 → sum=3.
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 0 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     let r3: Int = k(true);\n      \
+                     let r4: Int = k(false);\n      \
+                     let r5: Int = k(true);\n      \
+                     r1 + r2 + r3 + r4 + r5\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_five_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3\n",
+        "Plan B' Task 99: 5-let chain — r1=1, r2=0, r3=1, r4=0, r5=1, \
+         sum=3. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_c_chain_three_let_with_forward_data_dependency() {
+    // N=3 chain where the SECOND k invocation's arg references the
+    // FIRST chain binding (`k(r1)`), and the THIRD references both
+    // (`k(r1 + r2)`). Verifies prior_bindings forward-copy +
+    // narrow-on-load + env scoping at each step.
+    //
+    // Effect `Gen resumes: many { next: (Int) -> Int }`. Helper
+    // performs Gen.next(0) and returns the resume value (single-
+    // perform helper; helper synth-cont is a 1-step ChainedLetBindStep
+    // chain via B.2's path).
+    //
+    // Arm dispatched with arg=0. Three k invocations:
+    //   - r1 = k(arg + 1) = k(1) → resumes helper with 1, helper
+    //     returns 1. So r1=1.
+    //   - r2 = k(r1) = k(1) → r2=1.
+    //   - r3 = k(r1 + r2) = k(2) → r3=2.
+    //   - tail = r1 + r2 + r3 = 1 + 1 + 2 = 4.
+    let src = "effect Gen resumes: many { next: (Int) -> Int }\n\
+               fn helper() -> Int ![Gen, IO] {\n  \
+                 let n: Int = perform Gen.next(0);\n  \
+                 n\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m: Int = handle helper() with {\n    \
+                   Gen.next(arg, k) => {\n      \
+                     let r1: Int = k(arg + 1);\n      \
+                     let r2: Int = k(r1);\n      \
+                     let r3: Int = k(r1 + r2);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(m));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_forward_data_dep");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "4\n",
+        "Plan B' Task 99: 3-let chain with forward data dependency — \
+         r1=1, r2=k(r1)=1, r3=k(r1+r2)=2, sum=4. stderr={stderr:?}"
+    );
+}
