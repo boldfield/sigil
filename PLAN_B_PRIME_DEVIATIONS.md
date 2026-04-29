@@ -540,4 +540,27 @@ The 3a fix is correctness-preserving for future cases; the canonical still requi
 
 **Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge (Layer 3a only — 3b and 3c are documented gaps, no compiler/runtime changes for them in this commit).
 
+## 2026-04-29 — [DEVIATION Stage-6.8-followup Layer 3b fix] Sync shims for Cps-ABI fns at fn-as-value materialization
+
+**Plan B' Stage 6.8 Task 109 followup, post-Layer-3a.** Closes Layer 3b from the prior analysis. Implements **Option 2** (Sync shims at fn-as-value materialization) — the recommended path. Direct-call sites are unchanged; only the indirect-call path through fn-typed values sees the shim.
+
+**The shim.** For every Cps-ABI top-level fn, codegen's pre-pass (`emit_object`'s user_fns loop) declares a parallel Sync-ABI shim with linker name `<mangled>__sync_shim` and signature `(closure_ptr, params...) -> ret_ty`. After all user fn bodies are emitted (just before `module.finish()`), each shim's body is generated:
+1. Pack user params into a stack slot of size `(N + 2) * 8` bytes; each param widened to I64 via `uextend` for narrower-int slots.
+2. Write `null_k_closure` and `sigil_continuation_identity`'s func_addr at `k_closure_offset(N)` / `k_fn_offset(N)`.
+3. Call the underlying Cps fn with `(closure_ptr, args_ptr, args_len)` → `*NextStep`.
+4. Drive `sigil_run_loop` → u64.
+5. Narrow back to `ret_ty` (I64 / ireduce / pointer-passthrough).
+
+**The materialization site.** `lower_closure_record` (codegen.rs:10928, post-fix) checks `sync_shim_refs.get(code_fn_name)` first. If the entry exists, the closure record's `code_ptr` slot gets the shim's func_addr; otherwise falls back to `user_fn_refs[code_fn_name]`. Synth lambdas (`$lambda_N`) and Sync-ABI top-level fns naturally fall through. Direct-call sites (`lower_call`'s `Ident(name)` → user_fn_refs path) are untouched and continue using the inlined CPS interop wrapper for Cps-ABI callees.
+
+**Plumbing.** New side-table `sync_shim_fn_ids: BTreeMap<String, FuncId>`, threaded through `PerFnRefsCtx → PerFnRefs::sync_shim_refs → Lowerer::sync_shim_refs`. 13 destructure / Lowerer-construction sites updated (parallel to Bug 1's `last_terminal_value_ref` plumbing).
+
+**Tests added:**
+- `cps_effected_fn_typed_parameter_indirect_call_returns_correct_value` — minimal probe: `fn invoke(c: () -> Int ![Trigger]) -> Int ![Trigger] { c() }`. Pre-fix: heap-pointer-shaped output. Post-fix: 42.
+- `handle_with_eager_resume_arms_chains_let_yield_correctly` — chained-let-yield body with eager-tail-k arms passed via `c: () -> Int ![State]`. Asserts `run_state(5, comp) = 6` (`v + 1` with v=5).
+
+**What's still blocking the canonical `run_state(initial, comp)`:** Layer 3c — captured continuation invoked outside handle hits empty handler stack. Verified: post-Layer-3b, canonical now hits a clean `unhandled effect_id 2 (op_id 0); handler stack empty` abort (exit 134) instead of a heap-pointer-shaped output. The synth-cont chain inside the lifted lambda IS now reachable (Layer 3b unblocked it); the State frame just isn't on the handler stack at that point.
+
+**Implementing commit(s):** [HEAD] on `stage-6-8-followup-run-state` against `main` post-PR-#38 merge.
+
 

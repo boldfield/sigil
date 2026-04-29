@@ -4646,6 +4646,83 @@ fn handle_with_post_perform_body_code_uses_arm_discharge_value() {
 }
 
 #[test]
+fn cps_effected_fn_typed_parameter_indirect_call_returns_correct_value() {
+    // Stage-6.8-followup Layer 3b — fn-as-value materialization for
+    // Cps-ABI top-level fns. Pre-fix, indirect call through a
+    // CPS-effected fn-typed parameter used a Sync calling convention
+    // built from FnTypeExpr's effect row alone — but the underlying
+    // fn's actual code_ptr (whether Sync or Cps ABI) doesn't inform
+    // the indirect call site. For Cps-ABI fns, the indirect call
+    // returned a *NextStep pointer interpreted as the declared ret
+    // type → heap-pointer-shaped output.
+    //
+    // Post-fix: closure_convert's `Ident(top_level_fn) → ClosureRecord`
+    // materialization writes a Sync shim's func_addr into the closure
+    // record's code_ptr slot when the underlying fn is Cps-ABI. The
+    // shim packs args + trailing (null, identity) into a stack slot,
+    // calls the Cps fn, drives sigil_run_loop, and narrows back. The
+    // indirect call site sees uniform Sync convention.
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn produces_42() -> Int ![Trigger] {\n  \
+                 perform Trigger.fire()\n\
+               }\n\
+               fn invoke(c: () -> Int ![Trigger]) -> Int ![Trigger] {\n  \
+                 c()\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle invoke(produces_42) with {\n    \
+                   Trigger.fire(k) => 42,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_layer3b_cps_indirect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn handle_with_eager_resume_arms_chains_let_yield_correctly() {
+    // Stage-6.8-followup Layer 3b end-to-end — body is chained-let-
+    // yield (`let _ = perform State.set(10); let v = perform State.get();
+    // v + 1`), arms eagerly tail-resume (no captured-k lambda escape).
+    // Tests that Layer 3b's Sync shim correctly drives comp's
+    // chained-let-yield CPS body when invoked through a fn-typed
+    // parameter `c: () -> Int ![State]`.
+    //
+    // Trace:
+    //   - run_state(5, comp): handle pushes State frame.
+    //   - comp's body's first perform State.set(10) with k_fn = step_0 synth-cont.
+    //   - State.set arm fires `k(arg=10)` (tail-k) → run_loop dispatches step_0.
+    //   - step_0 binds 10 to _, performs State.get with k_fn = step_1.
+    //   - State.get arm fires `k(initial=5)` (tail-k, captures `initial`).
+    //   - step_1 binds 5 to v, computes v + 1 = 6, returns Done(6).
+    //   - run_loop terminates with 6; handle's overall = 6.
+    let src = "effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
+                 v + 1\n\
+               }\n\
+               fn run_state(initial: Int, c: () -> Int ![State]) -> Int ![] {\n  \
+                 handle c() with {\n    \
+                   State.get(k) => k(initial),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "stage_6_8_followup_layer3b_eager_chain");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "6\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
 fn handle_returning_k_capturing_lambda_invoked_outside_handle() {
     // Stage-6.8-followup Layer 2 fix — k captured into a lifted lambda
     // that escapes the handle, then invoked from the handle's caller via

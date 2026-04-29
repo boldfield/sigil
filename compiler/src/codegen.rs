@@ -5000,6 +5000,22 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     let mut cps_continuation_synth: Vec<CpsContinuationSynth> = Vec::new();
     let mut cps_continuation_synth_indices: BTreeMap<String, usize> = BTreeMap::new();
 
+    // Stage-6.8-followup Layer 3b — Sync shims for Cps-ABI user fns.
+    // For every fn whose body shape selects `UserFnAbi::Cps`, declare
+    // a parallel Sync-ABI shim fn. The shim has the standard closure-
+    // convention signature `(closure_ptr, params...) -> ret_ty`; its
+    // body packs args into a stack slot with trailing `(null, identity)`,
+    // calls the underlying Cps fn, drives `sigil_run_loop`, and narrows
+    // back. Used at fn-as-value materialization (closure_convert's Task
+    // 104 `Ident(top_level_fn) -> ClosureRecord`): `lower_closure_record`
+    // writes the shim's func_addr into the closure record's code_ptr
+    // slot so an indirect call through the resulting fn-typed value
+    // sees a uniform Sync calling convention regardless of the
+    // underlying fn's ABI. Direct-call sites (lower_call's
+    // `Ident(name)` → user_fn_refs path) bypass the shim and call
+    // the Cps fn through the inlined CPS interop wrapper.
+    let mut sync_shim_fn_ids: BTreeMap<String, cranelift_module::FuncId> = BTreeMap::new();
+
     let mut user_fns: BTreeMap<String, UserFnEntry> = BTreeMap::new();
     for item in &checked.program.items {
         if let crate::ast::Item::Fn(f) = item {
@@ -5061,6 +5077,27 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     abi,
                 },
             );
+
+            // Stage-6.8-followup Layer 3b — declare Sync shim for
+            // Cps-ABI fns. Sig: `(closure_ptr, params...) -> ret_ty`
+            // (Sync). Body emitted at the bottom of `emit_object`,
+            // mirrors the shape of `lower_call`'s CPS-interop wrapper.
+            if abi == UserFnAbi::Cps {
+                let mut shim_sig = Signature::new(isa_call_conv(&module));
+                shim_sig.params.push(AbiParam::new(pointer_ty));
+                for p in &f.params {
+                    shim_sig
+                        .params
+                        .push(AbiParam::new(cranelift_ty_for_type_expr(&p.ty, pointer_ty)));
+                }
+                let ret_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+                shim_sig.returns.push(AbiParam::new(ret_ty));
+                let shim_name = format!("{mangled}__sync_shim");
+                let shim_id = module
+                    .declare_function(&shim_name, Linkage::Local, &shim_sig)
+                    .map_err(|e| format!("declare {shim_name}: {e}"))?;
+                sync_shim_fn_ids.insert(f.name.clone(), shim_id);
+            }
 
             // Plan B Task 55 (Phase 4e) + Plan B' Stage 6.7 Tasks
             // 94+95 (B.2 Phase B+C) — if the fn matches a synth-
@@ -5358,6 +5395,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         handler_return_arm_synth: &handler_return_arm_synth,
         handler_return_arm_indices: &handler_return_arm_indices,
         user_fns: &user_fns,
+        sync_shim_fn_ids: &sync_shim_fn_ids,
         string_literals,
         lit_ids: &lit_ids,
     };
@@ -5412,6 +5450,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
+                sync_shim_refs,
                 lit_gvs,
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -5806,6 +5845,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
                     user_fn_refs,
+                    sync_shim_refs,
                     user_fns: &user_fns,
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
@@ -5947,6 +5987,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
                 user_fn_refs,
+                sync_shim_refs,
                 user_fns: &user_fns,
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
@@ -6290,6 +6331,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
+                    sync_shim_refs,
                     lit_gvs,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -6404,6 +6446,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
                     user_fn_refs,
+                    sync_shim_refs,
                     user_fns: &user_fns,
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
@@ -6981,6 +7024,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
+                    sync_shim_refs,
                     lit_gvs,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -7108,6 +7152,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
                     user_fn_refs,
+                    sync_shim_refs,
                     user_fns: &user_fns,
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
@@ -7309,6 +7354,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
+                sync_shim_refs,
                 lit_gvs,
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -7347,6 +7393,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
                 user_fn_refs,
+                sync_shim_refs,
                 user_fns: &user_fns,
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
@@ -7587,6 +7634,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_arm_refs_per_handle,
                         handler_return_arm_refs_per_handle,
                         user_fn_refs,
+                        sync_shim_refs,
                         lit_gvs,
                     } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -7624,6 +7672,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
                         user_fn_refs,
+                        sync_shim_refs,
                         user_fns: &user_fns,
                         type_layouts: &type_layouts,
                         ctor_index: &ctor_index,
@@ -8225,6 +8274,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_arm_refs_per_handle,
                             handler_return_arm_refs_per_handle,
                             user_fn_refs,
+                            sync_shim_refs,
                             lit_gvs,
                         } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
@@ -8263,6 +8313,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
                             user_fn_refs,
+                            sync_shim_refs,
                             user_fns: &user_fns,
                             type_layouts: &type_layouts,
                             ctor_index: &ctor_index,
@@ -8587,6 +8638,151 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         }
     }
 
+    // Stage-6.8-followup Layer 3b — emit Sync shim bodies for every
+    // Cps-ABI user fn. Each shim:
+    //   1. Receives `(closure_ptr, params...)` via Sync calling
+    //      convention (matches `lower_closure_record`'s indirect-
+    //      call signature when this shim's func_addr is the
+    //      closure record's code_ptr).
+    //   2. Packs the user params + trailing `(null, identity)` pair
+    //      into a stack slot.
+    //   3. Calls the underlying Cps fn with the CPS calling
+    //      convention `(closure_ptr, args_ptr, args_len)` →
+    //      `*mut NextStep`.
+    //   4. Drives `sigil_run_loop` to a terminal Done/Discharged.
+    //   5. Narrows the u64 result back to the user-declared ret
+    //      type and returns it.
+    for (fn_name, &shim_id) in sync_shim_fn_ids.iter() {
+        let entry = match user_fns.get(fn_name) {
+            Some(e) => e,
+            None => unreachable!(
+                "codegen Layer 3b: sync_shim_fn_ids entry for `{fn_name}` has no \
+                 matching user_fns entry"
+            ),
+        };
+        debug_assert_eq!(
+            entry.abi,
+            UserFnAbi::Cps,
+            "codegen Layer 3b: sync_shim declared for `{fn_name}` but its abi is \
+             {:?} (expected Cps)",
+            entry.abi
+        );
+        // Build the shim's signature on demand (matches the one
+        // declared at user_fns insertion time).
+        let mut shim_sig = Signature::new(isa_call_conv(&module));
+        shim_sig.params.push(AbiParam::new(pointer_ty));
+        // entry.param_tys[0] is closure_ptr; user params start at [1].
+        // For Cps fns we used cps_signature so param_tys is
+        // [pointer_ty (closure_ptr), pointer_ty (args_ptr), I32 (args_len)].
+        // The shim's param types come from the source fn's `f.params`
+        // — we look those up via the shim_param_tys side-table built
+        // alongside the shim declaration.
+        let f = match checked.program.items.iter().find_map(|it| match it {
+            crate::ast::Item::Fn(f) if f.name == *fn_name => Some(f),
+            _ => None,
+        }) {
+            Some(f) => f,
+            None => unreachable!(
+                "codegen Layer 3b: sync_shim_fn_ids entry for `{fn_name}` has no \
+                 matching FnDecl in program items"
+            ),
+        };
+        let mut user_param_tys: Vec<Type> = Vec::with_capacity(f.params.len());
+        for p in &f.params {
+            let t = cranelift_ty_for_type_expr(&p.ty, pointer_ty);
+            shim_sig.params.push(AbiParam::new(t));
+            user_param_tys.push(t);
+        }
+        let ret_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+        shim_sig.returns.push(AbiParam::new(ret_ty));
+
+        ctx.func.signature = shim_sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+
+        let block_params: Vec<Value> = builder.block_params(entry_block).to_vec();
+        let closure_ptr_v = block_params[0];
+        let user_args: Vec<Value> = block_params[1..].to_vec();
+        let user_arg_count = user_args.len();
+
+        // Pack args + trailing pair into a stack slot of size
+        // `(N + 2) * 8` bytes.
+        let slot_bytes = ((user_arg_count + 2) * 8) as u32;
+        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            slot_bytes,
+            3,
+        ));
+
+        for (i, (arg_v, arg_ty)) in user_args.iter().zip(user_param_tys.iter()).enumerate() {
+            let widened = if *arg_ty == types::I64 {
+                *arg_v
+            } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                builder.ins().uextend(types::I64, *arg_v)
+            } else {
+                debug_assert_eq!(
+                    *arg_ty, pointer_ty,
+                    "codegen Layer 3b sync_shim: unexpected param Cranelift type \
+                     {arg_ty:?} for `{fn_name}`"
+                );
+                *arg_v
+            };
+            builder.ins().stack_store(widened, slot, (i * 8) as i32);
+        }
+
+        let null_k_closure = builder.ins().iconst(pointer_ty, 0);
+        let identity_ref = module.declare_func_in_func(continuation_identity, builder.func);
+        let identity_addr = builder.ins().func_addr(pointer_ty, identity_ref);
+        builder
+            .ins()
+            .stack_store(null_k_closure, slot, k_closure_offset(user_arg_count));
+        builder
+            .ins()
+            .stack_store(identity_addr, slot, k_fn_offset(user_arg_count));
+
+        let args_ptr = builder.ins().stack_addr(pointer_ty, slot, 0);
+        let args_len_v = builder
+            .ins()
+            .iconst(types::I32, user_arg_count as i64);
+
+        // Call the underlying Cps fn.
+        let cps_fn_ref = module.declare_func_in_func(entry.func_id, builder.func);
+        let cps_call =
+            builder
+                .ins()
+                .call(cps_fn_ref, &[closure_ptr_v, args_ptr, args_len_v]);
+        let next_step = builder.inst_results(cps_call)[0];
+
+        // Drive the trampoline.
+        let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
+        let run_loop_call = builder.ins().call(run_loop_ref, &[next_step]);
+        let raw_u64 = builder.inst_results(run_loop_call)[0];
+
+        // Narrow to ret_ty.
+        let ret_v = if ret_ty == types::I64 {
+            raw_u64
+        } else if ret_ty.is_int() && ret_ty.bits() < 64 {
+            builder.ins().ireduce(ret_ty, raw_u64)
+        } else {
+            debug_assert_eq!(
+                ret_ty, pointer_ty,
+                "codegen Layer 3b sync_shim: unexpected ret_ty {ret_ty:?} for `{fn_name}`"
+            );
+            raw_u64
+        };
+
+        builder.ins().return_(&[ret_v]);
+        builder.finalize();
+        module
+            .define_function(shim_id, &mut ctx)
+            .map_err(|e| format!("define sync_shim for `{fn_name}`: {e}"))?;
+        module.clear_context(&mut ctx);
+    }
+
     // --- finish and add the stackmap section ----------------------------
     let mut product = module.finish();
 
@@ -8810,6 +9006,12 @@ struct Lowerer<'a, 'b> {
     /// `$lambda_N`). Used for direct calls and for `func_addr` when
     /// populating a `ClosureRecord`'s `code_ptr` slot.
     user_fn_refs: BTreeMap<String, FuncRef>,
+
+    /// Stage-6.8-followup Layer 3b — per-Cps-ABI-fn Sync shim FuncRef.
+    /// Read by `lower_closure_record` when materializing a fn-as-value
+    /// to choose between the Cps fn's func_addr (Cps ABI) and the
+    /// shim's func_addr (Sync ABI). Empty for fully-Sync programs.
+    sync_shim_refs: BTreeMap<String, FuncRef>,
 
     /// Shared user-fn registry (FuncId + signature). Immutable over a
     /// fn's lowering — the Lowerer only reads return types and param
@@ -10925,9 +11127,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let closure_ptr = self.builder.inst_results(alloc_call)[0];
 
         // Store code_ptr at offset 8 (past header).
-        let code_fn_ref = *self.user_fn_refs.get(code_fn_name).unwrap_or_else(|| {
-            unreachable!("codegen: ClosureRecord code_fn_name `{code_fn_name}` not registered")
-        });
+        //
+        // Stage-6.8-followup Layer 3b — for fn-as-value materialization
+        // of a Cps-ABI top-level fn, write the Sync shim's func_addr
+        // instead of the underlying Cps fn's. The shim has the
+        // standard Sync calling convention `(closure_ptr, params...)
+        // -> ret_ty`; an indirect call through this closure record's
+        // code_ptr therefore sees a uniform Sync convention regardless
+        // of the underlying fn's actual ABI. The shim internally drives
+        // sigil_run_loop to dispatch the Cps fn's NextStep result.
+        // For Sync-ABI fns and synth lambdas (`$lambda_N`), the
+        // sync_shim_refs map has no entry and this falls through to
+        // the original user_fn_refs lookup.
+        let code_fn_ref = if let Some(shim_ref) = self.sync_shim_refs.get(code_fn_name) {
+            *shim_ref
+        } else {
+            *self.user_fn_refs.get(code_fn_name).unwrap_or_else(|| {
+                unreachable!("codegen: ClosureRecord code_fn_name `{code_fn_name}` not registered")
+            })
+        };
         let code_ptr = self.builder.ins().func_addr(self.pointer_ty, code_fn_ref);
         self.builder
             .ins()
@@ -11984,6 +12202,11 @@ struct PerFnRefsCtx<'a> {
     handler_return_arm_synth: &'a [HandlerReturnArmSynth],
     handler_return_arm_indices: &'a BTreeMap<Span, usize>,
     user_fns: &'a BTreeMap<String, UserFnEntry>,
+    /// Stage-6.8-followup Layer 3b — Sync shim FuncIds for Cps-ABI
+    /// user fns. Used by `prepare_per_fn_refs` to declare per-fn
+    /// FuncRefs available at fn-as-value materialization sites
+    /// (`lower_closure_record`).
+    sync_shim_fn_ids: &'a BTreeMap<String, cranelift_module::FuncId>,
     string_literals: &'a [(Span, String)],
     lit_ids: &'a [cranelift_module::DataId],
 }
@@ -12040,6 +12263,14 @@ struct PerFnRefs {
     /// span. Mirrors `handler_arm_refs_per_handle` shape.
     handler_return_arm_refs_per_handle: BTreeMap<Span, FuncRef>,
     user_fn_refs: BTreeMap<String, FuncRef>,
+    /// Stage-6.8-followup Layer 3b — per-Cps-ABI-fn Sync shim FuncRef.
+    /// Keyed by fn name. Read by `lower_closure_record` when
+    /// materializing a fn-as-value: if the user fn is Cps-ABI, the
+    /// closure record's code_ptr slot gets this shim's func_addr
+    /// instead of the underlying Cps fn's, so an indirect call
+    /// through the resulting fn-typed value sees a uniform Sync
+    /// calling convention.
+    sync_shim_refs: BTreeMap<String, FuncRef>,
     lit_gvs: Vec<(Span, GlobalValue, usize)>,
 }
 
@@ -12133,6 +12364,18 @@ fn prepare_per_fn_refs(
         })
         .collect();
 
+    // Stage-6.8-followup Layer 3b — per-Cps-ABI-fn Sync shim FuncRef.
+    let sync_shim_refs: BTreeMap<String, FuncRef> = ctx
+        .sync_shim_fn_ids
+        .iter()
+        .map(|(name, fid)| {
+            (
+                name.clone(),
+                module.declare_func_in_func(*fid, builder.func),
+            )
+        })
+        .collect();
+
     // String-literal GVs + lengths keyed by source span. Closure
     // conversion can reorder the walk relative to typecheck's
     // source-order list; span-keyed linear-search is O(small) and
@@ -12170,6 +12413,7 @@ fn prepare_per_fn_refs(
         handler_arm_refs_per_handle,
         handler_return_arm_refs_per_handle,
         user_fn_refs,
+        sync_shim_refs,
         lit_gvs,
     }
 }
