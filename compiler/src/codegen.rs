@@ -189,6 +189,7 @@ enum UserFnAbi {
 fn compute_user_fn_abi(
     name: &str,
     body: &crate::ast::Block,
+    helper_params: &[crate::ast::Param],
     colored: &ColoredProgram,
 ) -> UserFnAbi {
     // Plan B Stage 6 cleanup — `main` is structurally the entry
@@ -248,14 +249,45 @@ fn compute_user_fn_abi(
     // allocates N `ChainedLetBindStep` synth-cont entries; helper's
     // body emit issues `sigil_perform(p_0, k_fn = step_0.func_id)`
     // and each step's synth-cont threads (captures + prior chain
-    // bindings) forward to the next step's closure record. The
-    // chained classifier accepts the original 1-stmt case (so this
-    // is strictly broader than the prior `is_simple_let_yield_then
-    // _pure_tail_body` it replaces — every 1-stmt accept is also
-    // accepted by `is_simple_chained_let_yield_then_pure_tail_body`
-    // returning Some(1)).
-    if is_simple_chained_let_yield_then_pure_tail_body(body).is_some() {
-        return UserFnAbi::Cps;
+    // bindings) forward to the next step's closure record.
+    //
+    // **Cap check (R4 close):** the worst-case closure-record slot
+    // count at the last Middle step is `K + N` where K is the chain
+    // captures count and N is the chain length. If this exceeds
+    // `MAX_CLOSURE_ENV_SLOTS`, fall through to the Sync ABI cleanly
+    // (rather than letting the pre-pass `assert!` fire mid-codegen).
+    // Computing K requires walking the body's perform args + tail —
+    // we do that inline here using the same captures-collection
+    // helper the pre-pass uses, so the ABI selection sees the real
+    // K + N combination instead of the conservative `N >=
+    // MAX_CLOSURE_ENV_SLOTS` that the classifier alone enforces.
+    if let Some(chain_length) = is_simple_chained_let_yield_then_pure_tail_body(body) {
+        let mut performs: Vec<crate::ast::PerformExpr> = Vec::with_capacity(chain_length);
+        let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
+        for stmt in &body.stmts {
+            if let crate::ast::Stmt::Let(l) = stmt {
+                if let crate::ast::Expr::Perform(p) = &l.value {
+                    performs.push(p.clone());
+                    binding_names.push(l.name.clone());
+                }
+            }
+        }
+        let tail_expr = match body.tail.as_ref() {
+            Some(t) => t,
+            None => unreachable!(
+                "is_simple_chained_let_yield_then_pure_tail_body classifier guarantees tail is Some"
+            ),
+        };
+        let captures = collect_chained_synth_cont_captures(
+            &performs,
+            tail_expr,
+            &binding_names,
+            helper_params,
+        );
+        if captures.len() + chain_length < MAX_CLOSURE_ENV_SLOTS {
+            return UserFnAbi::Cps;
+        }
+        // K + N >= MAX_CLOSURE_ENV_SLOTS — fall through to Sync.
     }
     UserFnAbi::Sync
 }
@@ -1803,15 +1835,16 @@ enum PostArmKStepRole {
 }
 
 /// Plan B' Stage 6.7 Task 97 (B.1 Phase A) — one prior chain binding
-/// threaded forward via a [`PostArmKStep`]'s closure record.
-#[allow(dead_code)]
+/// threaded forward via a [`PostArmKStep`]'s closure record. Mirrors
+/// B.2's [`ChainedPriorBinding`] shape — the [`crate::ast::EnvSlotKind`]
+/// is the canonical source of truth for both the load-widening and
+/// the pointer-bitmap encoding; the Cranelift `Type` is derived from
+/// `kind` at use site via `narrow_for_kind`.
 #[derive(Clone, Debug)]
 struct PostArmKPriorBinding {
     /// Source-level name (matches the corresponding step's
     /// `binding_name` from a prior step).
     name: String,
-    /// Cranelift type the binding narrows to after I64 load.
-    ty: Type,
     /// `EnvSlotKind` for the closure-record encoding (drives the
     /// pointer-bitmap bit + load/store widening).
     kind: crate::ast::EnvSlotKind,
@@ -2937,7 +2970,6 @@ fn collect_handle_arms_in_expr(
                             let prior_bindings: Vec<PostArmKPriorBinding> = (0..i)
                                 .map(|j| PostArmKPriorBinding {
                                     name: shape.binding_names[j].to_string(),
-                                    ty: binding_tys[j],
                                     kind: binding_kinds[j],
                                 })
                                 .collect();
@@ -4624,7 +4656,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // field; this commit consumes it for signature selection.
             // The transitional `#[allow(dead_code)]` on
             // `UserFnEntry::abi` is removed at the same time.
-            let abi = compute_user_fn_abi(&f.name, &f.body, &cc.colored);
+            let abi = compute_user_fn_abi(&f.name, &f.body, &f.params, &cc.colored);
             let (sig, param_tys, ret_ty) = match abi {
                 UserFnAbi::Sync => {
                     let mut sig = Signature::new(isa_call_conv(&module));
@@ -7139,6 +7171,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // Middle: lower next_arg_expr (env has
                             // prior bindings + this binding), allocate
                             // next step's closure record, dispatch.
+                            //
+                            // Note: B.1 (arm-side N-let chain) Middle
+                            // dispatches to the next chain step via
+                            // next_step_call (a CPS Call to the next
+                            // synth-cont). It does NOT push onto the
+                            // outer post_arm_k stack — only B.2 helper
+                            // Middle pushes (line ~8005), and only
+                            // because helper Middle issues a fresh
+                            // sigil_perform whose Done unwinds back to
+                            // the trampoline. B.1 Middle's dispatch
+                            // stays on the trampoline's existing chain
+                            // (helper synth-cont → arm post_arm_k →
+                            // step[0] → step[1] → … → Final), so its
+                            // Done already routes through the right
+                            // continuation without any push.
                             let next_arg_value = lowerer.lower_expr(next_arg_expr);
                             let next_arg_ty = lowerer.builder.func.dfg.value_type(next_arg_value);
                             let widened_next_arg = if next_arg_ty == types::I64 {
@@ -12042,7 +12089,7 @@ mod tests {
         let (prog, colored) = colored_from_src(src);
         let body = body_of(&prog, "main");
         assert_eq!(
-            compute_user_fn_abi("main", &body, &colored),
+            compute_user_fn_abi("main", &body, &params_of(&prog, "main"), &colored),
             UserFnAbi::Sync
         );
     }
@@ -12062,7 +12109,12 @@ mod tests {
         let (prog, colored) = colored_from_src(src);
         let helper_body = body_of(&prog, "helper");
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_body, &colored),
+            compute_user_fn_abi(
+                "helper",
+                &helper_body,
+                &params_of(&prog, "helper"),
+                &colored
+            ),
             UserFnAbi::Cps,
             "helper has CPS color + simple-tail-perform body + arity-0"
         );
@@ -12092,7 +12144,7 @@ mod tests {
         // ABI selection still picks Sync because main's body shape
         // isn't supported by the simple-tail-perform classifier.
         assert_eq!(
-            compute_user_fn_abi("main", &main_body, &colored),
+            compute_user_fn_abi("main", &main_body, &params_of(&prog, "main"), &colored),
             UserFnAbi::Sync,
             "main is CPS-color but has complex body → Sync ABI"
         );
@@ -12169,7 +12221,7 @@ mod tests {
         let mono = MonoProgram { anf };
         let colored = crate::color::infer_colors(mono);
         assert_eq!(
-            compute_user_fn_abi("f", &body, &colored),
+            compute_user_fn_abi("f", &body, &[], &colored),
             UserFnAbi::Cps,
             "intrinsic perform of non-IO effect taints the fn as CPS via \
              find_non_io_perform_in_block; combined with the simple-tail-\
@@ -12257,7 +12309,7 @@ mod tests {
         assert!(is_simple_tail_perform_with_pure_args_body(&body));
         // The actual assertion: Sync, because color short-circuits.
         assert_eq!(
-            compute_user_fn_abi("f", &body, &colored),
+            compute_user_fn_abi("f", &body, &[], &colored),
             UserFnAbi::Sync,
             "Color::Native must short-circuit `compute_user_fn_abi` \
              regardless of body shape eligibility"
@@ -12305,7 +12357,12 @@ mod tests {
         // Inverted from prior commit's Sync expectation — the
         // arity gate is gone.
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_body, &colored),
+            compute_user_fn_abi(
+                "helper",
+                &helper_body,
+                &params_of(&prog, "helper"),
+                &colored
+            ),
             UserFnAbi::Cps,
             "arity-N intrinsic-CPS helper now classifies Cps after the \
              D1 arity gate's removal in this commit"
@@ -12333,7 +12390,12 @@ mod tests {
         assert!(colored.needs_cps_transform("helper"));
         assert!(helper_params.is_empty());
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_body, &colored),
+            compute_user_fn_abi(
+                "helper",
+                &helper_body,
+                &params_of(&prog, "helper"),
+                &colored
+            ),
             UserFnAbi::Cps,
             "arity-0 helper with arity-N perform now classifies Cps after \
              the D1 perform-args gate's removal in this commit"
@@ -12382,10 +12444,140 @@ mod tests {
         assert!(colored.needs_cps_transform("helper"));
         assert_eq!(helper_params.len(), 1);
         assert_eq!(
-            compute_user_fn_abi("helper", &helper_body, &colored),
+            compute_user_fn_abi(
+                "helper",
+                &helper_body,
+                &params_of(&prog, "helper"),
+                &colored
+            ),
             UserFnAbi::Cps,
             "arity-N let-yield-helper with capture classifies Cps via the \
              chained classifier route"
+        );
+    }
+
+    #[test]
+    fn compute_user_fn_abi_sync_when_chain_captures_plus_length_exceed_max_closure_env_slots() {
+        // R6 close: when K + N >= MAX_CLOSURE_ENV_SLOTS (where K is
+        // chain captures count and N is chain length), the chained
+        // helper falls through to the Sync ABI cleanly instead of
+        // letting the pre-pass slot-count assert fire mid-codegen.
+        //
+        // Build a synthetic FnDecl whose body has 28 sequential
+        // `let r_i = perform Raise.fail()` stmts, with a tail that
+        // references a helper user param `t`. captures = [t] (K=1),
+        // chain_length = 28 (N). K + N = 29 < 31 → still Cps.
+        //
+        // Then bump body length to 30 stmts. K + N = 31 >= 31 →
+        // falls through to Sync.
+        //
+        // Both cases pass through the `compute_user_fn_abi` cap-
+        // check; the second case exercises the fall-through.
+        use crate::ast::{
+            BinOp, Block, Expr, FnDecl, Item, LetStmt, Param, PerformExpr, Program, Stmt, TypeExpr,
+        };
+        use crate::errors::Span;
+        let span = Span::synthetic("test.sigil");
+        let make_let = |name: &str| {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })
+        };
+
+        // Build the helper source with N = 28 (cap-fits): K=1 (the
+        // `t` param), N=28, K+N=29.
+        let make_body = |n: usize| Block {
+            stmts: (0..n).map(|i| make_let(&format!("r{i}"))).collect(),
+            tail: Some(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r0".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("t".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "t".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+
+        // Build a tiny colored program for both cases. Re-using the
+        // make_colored helper pattern from upstream tests to keep
+        // this self-contained.
+        let make_colored = |body: Block| {
+            let fn_decl = FnDecl {
+                name: "helper".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: helper_params.clone(),
+                return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+                effects: vec!["Raise".to_string(), "IO".to_string()],
+                effect_row_var: None,
+                body,
+                span: span.clone(),
+            };
+            let program = Program {
+                items: vec![Item::Fn(Box::new(fn_decl))],
+                file: "test.sigil".to_string(),
+            };
+            let mut effects = std::collections::BTreeMap::new();
+            effects.insert(
+                "Raise".to_string(),
+                crate::ast::EffectDecl {
+                    name: "Raise".to_string(),
+                    name_span: span.clone(),
+                    generic_params: Vec::new(),
+                    resumes_many: false,
+                    ops: Vec::new(),
+                    span: span.clone(),
+                },
+            );
+            let checked = crate::typecheck::CheckedProgram {
+                program,
+                string_literals: Vec::new(),
+                lambda_captures: Vec::new(),
+                types: std::collections::BTreeMap::new(),
+                match_scrut_tys: std::collections::BTreeMap::new(),
+                fn_schemes: std::collections::BTreeMap::new(),
+                call_site_instantiations: std::collections::BTreeMap::new(),
+                ctor_site_instantiations: std::collections::BTreeMap::new(),
+                effects,
+                effect_ids: std::collections::BTreeMap::new(),
+                op_ids: std::collections::BTreeMap::new(),
+                handle_arm_captures: std::collections::BTreeMap::new(),
+                handle_return_arm_captures: std::collections::BTreeMap::new(),
+                handle_body_ty: std::collections::BTreeMap::new(),
+            };
+            let anf = crate::elaborate::AnfProgram { checked };
+            let mono = crate::monomorphize::MonoProgram { anf };
+            crate::color::infer_colors(mono)
+        };
+
+        // K + N = 1 + 28 = 29 < 31 → Cps.
+        let body_under_cap = make_body(28);
+        let colored_under = make_colored(body_under_cap.clone());
+        assert_eq!(
+            compute_user_fn_abi("helper", &body_under_cap, &helper_params, &colored_under),
+            UserFnAbi::Cps,
+            "K+N below MAX_CLOSURE_ENV_SLOTS: classifier accepts; abi is Cps"
+        );
+
+        // K + N = 1 + 30 = 31 >= 31 → Sync fall-through.
+        let body_at_cap = make_body(30);
+        let colored_at = make_colored(body_at_cap.clone());
+        assert_eq!(
+            compute_user_fn_abi("helper", &body_at_cap, &helper_params, &colored_at),
+            UserFnAbi::Sync,
+            "K+N >= MAX_CLOSURE_ENV_SLOTS: cap-check converts to Sync fall-through"
         );
     }
 

@@ -342,6 +342,28 @@ pub(crate) fn unregister_outer_post_arm_k_stack_root_for_calling_thread(
 /// stack overflow (stack size 32; helper-perform chains beyond that
 /// depth are not supported in v1).
 ///
+/// # Push/pop balance discipline
+///
+/// Every push from helper Middle's emit is paired with exactly one
+/// pop in the trampoline's `Done` branch (see `sigil_run_loop`).
+/// The pairing holds across the perform → arm-dispatch → arm-body →
+/// Done dispatch sequence: helper Middle issues `sigil_perform`,
+/// the perform's arm runs, the arm body eventually returns Done,
+/// the trampoline's Done branch pops the pushed entry and routes
+/// the value through it.
+///
+/// **Abnormal exit (process-fatal-by-design).** If the program
+/// aborts mid-perform (panic, unhandled effect, stack overflow,
+/// runtime invariant violation), the push has no matching pop —
+/// the stack is left with a stale entry. This is acceptable
+/// because: (1) Sigil aborts the process on any of these conditions
+/// (no unwinding to user code that would observe stale state); (2)
+/// the TLS stack dies with the thread on process exit, so leaks
+/// don't accumulate across runs; (3) recovering from such a state
+/// is out of scope for v1. The discipline is "balanced under normal
+/// flow; fatal under abnormal flow," matching how `HANDLER_STACK`
+/// and the arena handle the same edge.
+///
 /// # Safety
 ///
 /// `closure_ptr` must be either null or a valid heap-allocated
@@ -376,6 +398,16 @@ pub unsafe extern "C" fn sigil_outer_post_arm_k_push(closure_ptr: *mut u8, fn_pt
 /// Pop the top of the outer `post_arm_k` stack. Called by the
 /// trampoline's `Done` branch. Returns `None` when the stack is empty
 /// (top-level Done — return to wrapper as before).
+///
+/// **Stale-pointer hygiene:** the popped slot is overwritten with
+/// nulls so a future Boehm scan of the rooted TLS range doesn't
+/// see a stale `closure_ptr` from the prior push as a live heap
+/// reference. Without this, the slot would retain the pushed value
+/// until overwritten by a future push at the same depth — Boehm
+/// would treat it as a root and keep the closure record alive
+/// past its useful lifetime, plus risk segfaults from interior-
+/// pointer mis-classification when the test-mode pushed values are
+/// non-heap-allocated synthetic pointers.
 fn outer_post_arm_k_try_pop() -> Option<OuterPostArmKEntry> {
     OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
         let depth = depth_cell.get();
@@ -384,8 +416,16 @@ fn outer_post_arm_k_try_pop() -> Option<OuterPostArmKEntry> {
         } else {
             depth_cell.set(depth - 1);
             OUTER_POST_ARM_K_STACK.with(|stack_cell| {
-                let stack = stack_cell.get();
-                Some(stack[depth - 1])
+                let mut stack = stack_cell.get();
+                let popped = stack[depth - 1];
+                // Clear the slot so a stale pointer doesn't survive
+                // in the TLS-rooted range across the next GC scan.
+                stack[depth - 1] = OuterPostArmKEntry {
+                    closure_ptr: ptr::null_mut(),
+                    fn_ptr: ptr::null_mut(),
+                };
+                stack_cell.set(stack);
+                Some(popped)
             })
         }
     })
@@ -2029,5 +2069,220 @@ mod tests {
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
         }
         reset_state();
+    }
+
+    // ---------------------------------------------------------------
+    // Plan B' Stage 6.7 multi-shot composition fix — outer post_arm_k
+    // stack discipline tests. Direct unit coverage of push / pop
+    // balance, GC root coverage, and trampoline-Done routing through
+    // a popped entry. R6 review finding: e2e coverage alone is thin
+    // for a TLS-rooted heap-pointer mechanism with non-trivial GC
+    // interaction.
+    // ---------------------------------------------------------------
+
+    fn reset_outer_post_arm_k_stack() {
+        // Drain any lingering entries from prior tests in the same
+        // thread. The runtime's OUTER_POST_ARM_K_DEPTH is reset on
+        // unregister; tests that share a thread must clear between
+        // iterations.
+        OUTER_POST_ARM_K_DEPTH.with(|d| d.set(0));
+    }
+
+    // CPS-color terminal: returns Done(value-passed-in-args_ptr[0] + 1).
+    // Wired as the popped fn pointer in the trampoline-routes-Done
+    // test; verifies the trampoline writes Done's value to args_ptr
+    // [0] and dispatches the popped fn.
+    unsafe extern "C" fn cps_done_with_arg(
+        _closure: *mut u8,
+        args_ptr: *const u64,
+        args_len: u32,
+    ) -> *mut NextStep {
+        assert_eq!(args_len, 1);
+        let v = *args_ptr;
+        sigil_next_step_done(v + 1)
+    }
+
+    // CPS-color initial: pushes a (heap_closure, cps_done_with_arg)
+    // pair onto the outer post_arm_k stack, then returns Done(42). The
+    // trampoline's Done branch should pop the pushed entry and route
+    // 42 through cps_done_with_arg, which returns Done(43). The
+    // closure_ptr is GC-allocated so the TLS-rooted scan range never
+    // sees a synthetic non-heap pointer.
+    unsafe extern "C" fn cps_push_then_done(
+        _closure: *mut u8,
+        _args_ptr: *const u64,
+        _args_len: u32,
+    ) -> *mut NextStep {
+        let heap_closure = crate::gc::sigil_alloc(0, 64);
+        sigil_outer_post_arm_k_push(heap_closure, cps_done_with_arg as *mut u8);
+        sigil_next_step_done(42)
+    }
+
+    // Each test re-execs the test binary in a subprocess (matches the
+    // pattern used by the GC-stress tests above) so the scenario runs
+    // against fresh Boehm state. Without the subprocess pattern, a
+    // prior test in the same process can leave Boehm root state that
+    // segfaults the next allocation. Inner mode (env var set) runs the
+    // body; outer mode just spawns the child.
+
+    #[test]
+    fn outer_post_arm_k_push_pop_round_trips_one_entry() {
+        if !in_stress_subprocess() {
+            run_stress_in_subprocess("outer_post_arm_k_push_pop_round_trips_one_entry");
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        reset_outer_post_arm_k_stack();
+
+        // Real Boehm-allocated buffer as `closure_ptr`: the TLS-rooted
+        // stack range gets scanned conservatively, so we want pointers
+        // that resolve to valid heap blocks. The buffer's contents are
+        // never read; only pointer-identity round-trip is checked.
+        let closure_ptr = crate::gc::sigil_alloc(0, 64);
+        let fn_ptr = cps_done_with_arg as *mut u8; // text-segment pointer.
+        unsafe {
+            sigil_outer_post_arm_k_push(closure_ptr, fn_ptr);
+        }
+        let popped = match outer_post_arm_k_try_pop() {
+            Some(e) => e,
+            None => {
+                eprintln!("test bug: push then try_pop returned None");
+                std::process::abort();
+            }
+        };
+        assert_eq!(popped.closure_ptr, closure_ptr);
+        assert_eq!(popped.fn_ptr, fn_ptr);
+        // Stack now empty.
+        assert!(
+            outer_post_arm_k_try_pop().is_none(),
+            "second try_pop on emptied stack returns None"
+        );
+        reset_outer_post_arm_k_stack();
+    }
+
+    #[test]
+    fn outer_post_arm_k_pop_on_empty_returns_none() {
+        if !in_stress_subprocess() {
+            run_stress_in_subprocess("outer_post_arm_k_pop_on_empty_returns_none");
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        reset_outer_post_arm_k_stack();
+
+        assert!(
+            outer_post_arm_k_try_pop().is_none(),
+            "try_pop on freshly-reset stack returns None"
+        );
+        reset_outer_post_arm_k_stack();
+    }
+
+    #[test]
+    fn outer_post_arm_k_stack_lifo_order() {
+        if !in_stress_subprocess() {
+            run_stress_in_subprocess("outer_post_arm_k_stack_lifo_order");
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        reset_outer_post_arm_k_stack();
+
+        let closures: Vec<*mut u8> = (0..3).map(|_| crate::gc::sigil_alloc(0, 64)).collect();
+        let fns: [*mut u8; 3] = [
+            cps_done_with_arg as *mut u8,
+            cps_done_plus_one as *mut u8,
+            cps_call_then_plus_one as *mut u8,
+        ];
+        unsafe {
+            for (c, f) in closures.iter().zip(fns.iter()) {
+                sigil_outer_post_arm_k_push(*c, *f);
+            }
+        }
+        // Pop in reverse (LIFO).
+        for (c, f) in closures.iter().zip(fns.iter()).rev() {
+            let popped = match outer_post_arm_k_try_pop() {
+                Some(e) => e,
+                None => {
+                    eprintln!("test bug: try_pop returned None mid-LIFO walk");
+                    std::process::abort();
+                }
+            };
+            assert_eq!(popped.closure_ptr, *c);
+            assert_eq!(popped.fn_ptr, *f);
+        }
+        assert!(outer_post_arm_k_try_pop().is_none());
+        reset_outer_post_arm_k_stack();
+    }
+
+    #[test]
+    fn outer_post_arm_k_stack_fills_to_cap_minus_one() {
+        // Push OUTER_POST_ARM_K_STACK_SIZE - 1 entries; the cap is
+        // OUTER_POST_ARM_K_STACK_SIZE. The Nth push (where N == cap)
+        // would abort; verifying the cap-1 case stays safe + LIFO.
+        if !in_stress_subprocess() {
+            run_stress_in_subprocess("outer_post_arm_k_stack_fills_to_cap_minus_one");
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        reset_outer_post_arm_k_stack();
+
+        let n = OUTER_POST_ARM_K_STACK_SIZE - 1;
+        let closures: Vec<*mut u8> = (0..n).map(|_| crate::gc::sigil_alloc(0, 64)).collect();
+        let fn_ptr = cps_done_with_arg as *mut u8;
+        unsafe {
+            for c in closures.iter() {
+                sigil_outer_post_arm_k_push(*c, fn_ptr);
+            }
+        }
+        for c in closures.iter().rev() {
+            let popped = match outer_post_arm_k_try_pop() {
+                Some(e) => e,
+                None => {
+                    eprintln!("test bug: try_pop returned None at depth in cap-fill walk");
+                    std::process::abort();
+                }
+            };
+            assert_eq!(popped.closure_ptr, *c);
+            assert_eq!(popped.fn_ptr, fn_ptr);
+        }
+        assert!(outer_post_arm_k_try_pop().is_none());
+        reset_outer_post_arm_k_stack();
+    }
+
+    #[test]
+    fn trampoline_done_routes_through_popped_outer_post_arm_k() {
+        // Round-trip test: push a fn pointer onto the outer post_arm_k
+        // stack, then return Done from the same dispatch. Trampoline's
+        // Done branch pops, re-dispatches Call(popped_closure,
+        // popped_fn, [42]); popped_fn is `cps_done_with_arg` which
+        // returns Done(43). Trampoline observes Done(43) with empty
+        // stack and returns 43.
+        if !in_stress_subprocess() {
+            run_stress_in_subprocess("trampoline_done_routes_through_popped_outer_post_arm_k");
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        reset_outer_post_arm_k_stack();
+
+        unsafe {
+            let initial = sigil_next_step_call(ptr::null_mut(), cps_push_then_done as *mut u8, 0);
+            let result = sigil_run_loop(initial);
+            // 42 + 1 = 43; cps_done_with_arg adds 1 to its arg.
+            assert_eq!(result, 43);
+        }
+        // Stack must be empty at end (1 push + 1 pop).
+        assert!(
+            outer_post_arm_k_try_pop().is_none(),
+            "trampoline Done branch must have popped the pushed entry"
+        );
+        reset_outer_post_arm_k_stack();
     }
 }
