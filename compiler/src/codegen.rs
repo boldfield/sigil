@@ -1994,20 +1994,27 @@ enum CpsContinuationKind {
     ///   `Done(value)`.
     ///
     /// Each step's closure record carries `(prior bindings) +
-    /// (remaining-chain captures from helper's user params)`. The
-    /// outermost (`additional_func_ids`) field on
-    /// [`CpsContinuationSynth`] holds FuncIds for synth_cont_step_1
-    /// through synth_cont_step_{N-1}; the outer struct's `func_id`
-    /// remains synth_cont_step_0's FuncId so the existing N=1 path
-    /// (helper sets `k_fn = func_addr(synth.func_id)`) generalises.
+    /// (remaining-chain captures from helper's user params)`. Phase B
+    /// (Task 94) will extend [`CpsContinuationSynth`] with an
+    /// `additional_func_ids: Vec<FuncId>` field of length N-1
+    /// holding FuncIds for synth_cont_step_1 through
+    /// synth_cont_step_{N-1}; the outer struct's `func_id` remains
+    /// synth_cont_step_0's FuncId so the existing N=1 path (helper
+    /// sets `k_fn = func_addr(synth.func_id)`) generalises. (At
+    /// Phase A landing, that field does not yet exist on
+    /// [`CpsContinuationSynth`] — this paragraph is forward-design
+    /// for Phase B's commit.)
     ///
     /// **Phase A scope (Task 93):** add the variant + classifier +
     /// classifier unit tests. The variant is `#[allow(dead_code)]`
     /// while Phases B/C wire up the pre-pass + emit code; the
-    /// existing `LetBindThenTail` continues to handle the 1-stmt
-    /// case until Phase B switches `compute_user_fn_abi` to use
-    /// this variant for both 1-stmt and N>=2 cases (at which point
-    /// `LetBindThenTail` retires).
+    /// existing `LetBindThenTail` (and its classifier
+    /// [`is_simple_let_yield_then_pure_tail_body`]) continue to
+    /// handle the 1-stmt case until Phase B switches
+    /// `compute_user_fn_abi` to use this variant + the chained
+    /// classifier for both 1-stmt and N>=2 cases (at which point
+    /// the old variant + the old classifier retire together at
+    /// Phase D).
     #[allow(dead_code)]
     ChainedLetBindThenTail {
         /// Length-N list of let-bindings the chain produces.
@@ -10806,26 +10813,37 @@ mod tests {
     // ---------------- Plan B' Stage 6.7 Task 93 (B.2 Phase A) —
     // chained-let-yield-then-pure-tail classifier ----------------
 
+    /// Build a `Stmt::Let` whose value is `perform Raise.fail()`
+    /// with the given binding name and Int type. Module-level
+    /// helper used by every accept test in this section to keep the
+    /// per-test boilerplate focused on what the test asserts (chain
+    /// shape) rather than what it constructs (identical-shape
+    /// `LetStmt` longhand).
+    fn make_chained_let_yield_stmt(name: &str, span: &crate::errors::Span) -> crate::ast::Stmt {
+        use crate::ast::{Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        Stmt::Let(LetStmt {
+            name: name.to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            value: Expr::Perform(PerformExpr {
+                effect: "Raise".to_string(),
+                op: "fail".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        })
+    }
+
     #[test]
     fn chained_classifier_accepts_single_let_yield_pure_tail() {
         // N=1 case: matches the existing 1-stmt path. The chained
         // classifier accepts N >= 1 so Phase B's pre-pass can
         // generalise uniformly.
-        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::ast::{Block, Expr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
         let body = Block {
-            stmts: vec![Stmt::Let(LetStmt {
-                name: "x".to_string(),
-                ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                value: Expr::Perform(PerformExpr {
-                    effect: "Raise".to_string(),
-                    op: "fail".to_string(),
-                    args: Vec::new(),
-                    span: span.clone(),
-                }),
-                span: span.clone(),
-            })],
+            stmts: vec![make_chained_let_yield_stmt("x", &span)],
             tail: Some(Expr::Ident("x".to_string(), span.clone())),
             span,
         };
@@ -10840,33 +10858,13 @@ mod tests {
         // N=2 case: two let-yields then a pure tail referencing both
         // bindings. The classic "let a = perform p1; let b = perform p2;
         // a + b" shape that B.2 is closing.
-        use crate::ast::{BinOp, Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::ast::{BinOp, Block, Expr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
         let body = Block {
             stmts: vec![
-                Stmt::Let(LetStmt {
-                    name: "a".to_string(),
-                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                    value: Expr::Perform(PerformExpr {
-                        effect: "Raise".to_string(),
-                        op: "fail".to_string(),
-                        args: Vec::new(),
-                        span: span.clone(),
-                    }),
-                    span: span.clone(),
-                }),
-                Stmt::Let(LetStmt {
-                    name: "b".to_string(),
-                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                    value: Expr::Perform(PerformExpr {
-                        effect: "Raise".to_string(),
-                        op: "fail".to_string(),
-                        args: Vec::new(),
-                        span: span.clone(),
-                    }),
-                    span: span.clone(),
-                }),
+                make_chained_let_yield_stmt("a", &span),
+                make_chained_let_yield_stmt("b", &span),
             ],
             tail: Some(Expr::Binary {
                 op: BinOp::Add,
@@ -10885,24 +10883,15 @@ mod tests {
     #[test]
     fn chained_classifier_accepts_three_let_yields_pure_tail() {
         // N=3 stress case for the chain depth.
-        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::ast::{Block, Expr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
-        let make_let = |name: &str| {
-            Stmt::Let(LetStmt {
-                name: name.to_string(),
-                ty: TypeExpr::Named("Int".to_string(), span.clone()),
-                value: Expr::Perform(PerformExpr {
-                    effect: "Raise".to_string(),
-                    op: "fail".to_string(),
-                    args: Vec::new(),
-                    span: span.clone(),
-                }),
-                span: span.clone(),
-            })
-        };
         let body = Block {
-            stmts: vec![make_let("a"), make_let("b"), make_let("c")],
+            stmts: vec![
+                make_chained_let_yield_stmt("a", &span),
+                make_chained_let_yield_stmt("b", &span),
+                make_chained_let_yield_stmt("c", &span),
+            ],
             tail: Some(Expr::Ident("c".to_string(), span.clone())),
             span,
         };
