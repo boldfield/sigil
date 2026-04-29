@@ -28,6 +28,22 @@ pub const TAG_INT64: u8 = 0x02;
 /// payload word `k+1` (env slot `k`) holds a GC-managed pointer.
 pub const TAG_CLOSURE: u8 = 0x03;
 
+/// Immutable Array layout: `{header, length, elem[0], ..., elem[N-1]}`.
+/// Plan C Task 65. Length lives in payload word 0 (offset 8); element
+/// slots follow at offsets `16, 24, 32, ...`. Each element is a
+/// 64-bit slot — `Int` and pointer types fit directly; narrower
+/// types (`Bool`, `Char`, `Byte`) are widened at write and narrowed
+/// at read by codegen.
+///
+/// **Header `count` field is unused for arrays.** The 6-bit count field
+/// caps self-described objects at 63 payload words (Sudoku's 81-element
+/// array would overflow). Arrays write `count = 0` and rely on Boehm's
+/// allocator-tracked size for scanning. The pointer bitmap is set to a
+/// non-zero value so Boehm scans the whole block conservatively, since
+/// the runtime cannot distinguish per-element pointer-ness without a
+/// type descriptor (the v2 typed walker fixes this).
+pub const TAG_ARRAY: u8 = 0x04;
+
 /// Payload-word-count field layout.
 pub const COUNT_BITS: u32 = 6;
 pub const COUNT_SHIFT: u32 = 8;
@@ -101,6 +117,7 @@ mod tests {
         assert_eq!(TAG_STRING, 0x01);
         assert_eq!(TAG_INT64, 0x02);
         assert_eq!(TAG_CLOSURE, 0x03);
+        assert_eq!(TAG_ARRAY, 0x04);
         assert_eq!(TAG_EXTERNAL_DESCRIPTOR, 0xFF);
     }
 }

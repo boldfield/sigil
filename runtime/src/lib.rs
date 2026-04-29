@@ -51,6 +51,7 @@
 
 pub mod arena;
 pub mod arith;
+pub mod array;
 pub mod byte;
 pub mod counters;
 pub mod gc;
