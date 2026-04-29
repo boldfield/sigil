@@ -21,6 +21,8 @@ Tracks Plan C's execution against `boldfield/designs/in-progress/2026-04-21-sigi
 
 **Goal:** All stdlib modules implemented in sigil; every public function unit-tested; stdlib doctests extracted and run.
 
+- Task 62.0 — **Stdlib import resolution prerequisite.** Implement minimal import resolution between parse and resolve. `import std.X` loads `std/X.sigil` from the embedded tree, parses it, prepends its non-import items into the program. Cycle detection (E0033), missing-module (E0032). Builtin-injected paths (`std.io`) skip-listed at the resolver. Logged as `[DEVIATION Task 62.0]` in `PLAN_C_DEVIATIONS.md`.
+  - status: todo
 - Task 62 — Write `std/option.sigil` — `Option[A]`, `map`, `and_then`, `unwrap_or`. Tests under `tests/std/option.rs` (each test compiles a small sigil program and checks output).
   - status: todo
 - Task 63 — Write `std/result.sigil` — `Result[A, E]`, `map`, `map_err`, `and_then`. Tests.
