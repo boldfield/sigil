@@ -997,14 +997,27 @@ fn arm_body_unsupported_construct(
     // single-let has 1, so they're disjoint, but checking multi-
     // let first surfaces the `resumes_many` gate explicitly when
     // the source uses multi-`k` shape on a one-shot effect).
-    if let Some(shape) = arm_body_multi_let_then_pure_tail_shape(&arm.body, &arm.k_name) {
+    // Plan B' Stage 6.7 Task 98 (B.1 Phase B): the codegen-entry
+    // walker now uses the N-let classifier (`arm_body_n_let_then_pure
+    // _tail_shape`, accepts N >= 2) instead of the legacy 2-let one.
+    // For N >= 3, each step's post-arm-k synth fn lowers the next
+    // arg expression; the closure-record threading carries
+    // (k_closure, k_fn) + prior chain bindings forward across
+    // Middle steps. The free-var restriction at each `arg_i`
+    // lowering site (i >= 2) is: `arg_i` may reference only
+    // `binding_names[0..i-1]` plus globals — user op-args from the
+    // parent arm fn are NOT threaded into the chain's closure
+    // records (the same restriction the Task 58 closure point
+    // documents for the legacy 2-let case, generalised across all
+    // chain steps).
+    if let Some(shape) = arm_body_n_let_then_pure_tail_shape(&arm.body, &arm.k_name) {
         let is_multi_shot = effects_resumes_many
             .get(&arm.effect)
             .copied()
             .unwrap_or(false);
         if !is_multi_shot {
             return Some(format!(
-                "Slice C: arm body invokes `{}` twice (multi-shot pattern: \
+                "Slice C: arm body invokes `{}` multiple times (multi-shot pattern: \
                  `let r1 = {}(...); let r2 = {}(...); ...`) but effect `{}` is \
                  declared `resumes: one` (default). Declare `effect {} resumes: \
                  many {{ ... }}` to opt in to multi-shot semantics; otherwise \
@@ -1013,74 +1026,68 @@ fn arm_body_unsupported_construct(
                 arm.k_name, arm.k_name, arm.k_name, arm.effect, arm.effect
             ));
         }
-        if !expr_is_pure(shape.arg1_expr) {
+        // Per-arg purity check.
+        let mut any_impure = false;
+        for arg in &shape.arg_exprs {
+            if !expr_is_pure(arg) {
+                any_impure = true;
+                break;
+            }
+        }
+        if any_impure {
             // Fall through; regular walker surfaces the specific
-            // yield-able sub-shape in arg1.
-        } else if !expr_is_pure(shape.arg2_expr) {
-            // Fall through; regular walker surfaces the specific
-            // yield-able sub-shape in arg2.
+            // yield-able sub-shape in the failing arg.
         } else if !expr_is_pure(shape.tail_expr) {
             // Fall through; regular walker surfaces the specific
             // yield-able sub-shape in tail.
         } else {
-            // Plan B Task 58 — `arg2_expr` is lowered inside
-            // `post_arm_k_1`'s body (codegen.rs:6485). post_arm_k_1's
-            // env at construction (codegen.rs:6441-6442) only has
-            // `binding_name_1` (=r1); user op-args from the parent
-            // arm fn are NOT threaded into post_arm_k_1's closure
-            // record (which captures only (k_closure, k_fn) per the
-            // layout comment at codegen.rs:5480-5485). So
-            // `arg2_expr` referencing a user op-arg, an outer-scope
-            // capture, or any name other than `binding_name_1` /
-            // globals would panic at lower_expr's `Expr::Ident` arm
-            // (codegen.rs:7765 — `unreachable!("codegen: unknown
-            // ident...")`). Pre-Task-58 the gap was unreachable in
-            // practice (existing Slice C e2e tests use
-            // `Choose.flip: () -> Bool` — zero user op-args); Task
-            // 58's first `(Int) -> Int` multi-shot example surfaced
-            // it as an internal-compiler-error panic. This walker
-            // check converts the panic into a clean compile
-            // diagnostic pointing at the closure point.
-            //
-            // Reuse the Slice B/C tail free-var walker with
-            // extra_bindings = empty (no `binding_name_2` since it
-            // doesn't exist yet at the post_arm_k_1 lowering site).
-            // The walker's diagnostic strings reference "post-`k`
-            // tail" framing — wrap the diagnostic here with
-            // arg2-specific Slice C framing so the user knows the
-            // failing site.
-            let no_extras: BTreeSet<String> = BTreeSet::new();
-            if let Some(inner) = arm_body_post_arm_k_tail_free_vars_ok(
-                shape.arg2_expr,
-                shape.binding_name_1,
-                &arm.k_name,
-                globals,
-                &no_extras,
-            ) {
-                return Some(format!(
-                    "Slice C: arg2 of multi-let arm body (the second `{k}(arg2)` \
-                     call) references a name unavailable in `post_arm_k_1`'s env. \
-                     post_arm_k_1's closure record (per `[DEVIATION Task 55] Phase \
-                     4e captures+` Slice C v1) captures only (k_closure, k_fn), \
-                     plus its own arg `{r1}` from args_ptr[0]; user op-args from \
-                     the parent arm fn and outer-scope captures are NOT threaded \
-                     in. Reference `{r1}` (the let-1 binding) or globals only, or \
-                     defer to the future Slice C captures-bearing extension PR \
-                     (named in `[DEVIATION Task 58]` as the closure point for \
-                     threading user op-args into post_arm_k_1's closure record). \
-                     Underlying free-var diagnostic: {inner}",
-                    k = arm.k_name,
-                    r1 = shape.binding_name_1,
-                ));
+            // For each arg_i (i >= 1, since arg_0 is lowered in the
+            // arm fn body where all op-args are in scope), enforce
+            // the free-var restriction: `arg_i` may reference only
+            // bindings 0..i-1 plus globals (no user op-args, no
+            // outer-scope captures into the chain). The same Task
+            // 58 closure-point applies across all Middle steps.
+            for i in 1..shape.arg_exprs.len() {
+                let mut extras: BTreeSet<String> = BTreeSet::new();
+                // First prior binding name is the "binding_name" arg
+                // to the walker; the rest go into `extras`.
+                let first_prior = shape.binding_names[0];
+                for j in 1..i {
+                    extras.insert(shape.binding_names[j].to_string());
+                }
+                if let Some(inner) = arm_body_post_arm_k_tail_free_vars_ok(
+                    shape.arg_exprs[i],
+                    first_prior,
+                    &arm.k_name,
+                    globals,
+                    &extras,
+                ) {
+                    return Some(format!(
+                        "Slice C: arg{i_1based} of multi-let arm body (the {i_1based}th \
+                         `{k}(arg)` call, lowered inside `post_arm_k_{i_0based_idx}`'s body) \
+                         references a name unavailable in that step's env. The step's \
+                         closure record carries (k_closure, k_fn) plus prior chain \
+                         bindings only; user op-args from the parent arm fn and \
+                         outer-scope captures are NOT threaded into chain-step closures \
+                         (per `[DEVIATION Task 58]`'s documented closure point). \
+                         Reference one of {bindings:?} (prior chain bindings visible \
+                         at this step) or globals only. Underlying free-var diagnostic: \
+                         {inner}",
+                        i_1based = i + 1,
+                        i_0based_idx = i,
+                        k = arm.k_name,
+                        bindings = &shape.binding_names[..i],
+                    ));
+                }
             }
-            // Multi-let tail can reference both binding names.
-            // Reuse Slice B's free-var walker with binding_name =
-            // name_1 and extra_bindings = {name_2}.
+            // Tail can reference all chain binding names.
             let mut extras = BTreeSet::new();
-            extras.insert(shape.binding_name_2.to_string());
+            for j in 1..shape.binding_names.len() {
+                extras.insert(shape.binding_names[j].to_string());
+            }
             if let Some(diag) = arm_body_post_arm_k_tail_free_vars_ok(
                 shape.tail_expr,
-                shape.binding_name_1,
+                shape.binding_names[0],
                 &arm.k_name,
                 globals,
                 &extras,
@@ -1574,7 +1581,7 @@ struct HandlerArmSynth {
     ///
     /// `None` for arms whose body doesn't match the multi-let
     /// shape OR whose effect isn't `resumes: many`.
-    post_arm_k_chain: Option<MultiLetPostArmKChain>,
+    post_arm_k_chain: Option<PostArmKChain>,
 }
 
 /// Plan B Task 55 (Phase 4g) — per-`Expr::Handle` return-arm synthetic
@@ -1686,6 +1693,14 @@ struct HandlerReturnArmSynth {
 /// pointer is still a function pointer. Multi-shot reuses the
 /// SAME k_closure across both invocations — k_closure is read-
 /// only once allocated, so re-invocation is safe.
+///
+/// **Plan B' Stage 6.7 Task 98:** structurally dead in the
+/// production path (replaced by [`PostArmKChain`]) but retained as
+/// `#[allow(dead_code)]` so Task 97's unit tests + Task 100's invert-
+/// pinning work can compile during the transitional commit. Task 100
+/// (Phase D-equivalent) deletes this struct + the legacy classifier
+/// + the legacy pinning tests in one sweep.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct MultiLetPostArmKChain {
     /// The `arg1` expression in the first `let r1 = k(arg1)`. Lowered
@@ -2747,8 +2762,20 @@ fn collect_handle_arms_in_expr(
                 // pre-pass code only fires after the walker has
                 // accepted the shape, so the `is_multi_shot` check
                 // here is defensive (should be true).
+                // Plan B' Stage 6.7 Task 98 (B.1 Phase B activation):
+                // pre-pass populates the new `PostArmKChain` shape
+                // with N entries (one per chain step). Replaces the
+                // legacy 2-let `MultiLetPostArmKChain` 9-field shape.
+                // The chained classifier accepts N >= 2 uniformly;
+                // N = 2 produces 2 steps (Middle + Final), N >= 3
+                // produces N steps (Middle..Middle, Final).
+                //
+                // Allocation order: declare all N FuncIds first (so
+                // each Middle step's `next_step_func_id` reference is
+                // available in pass 2), then build N `PostArmKStep`
+                // entries with cross-references populated.
                 let post_arm_k_chain = if let Some(shape) =
-                    arm_body_multi_let_then_pure_tail_shape(&rewritten_body, &arm.k_name)
+                    arm_body_n_let_then_pure_tail_shape(&rewritten_body, &arm.k_name)
                 {
                     let is_multi_shot = ctx
                         .effects
@@ -2759,40 +2786,72 @@ fn collect_handle_arms_in_expr(
                         None
                     } else {
                         let arm_fn_idx = out.synth.len();
-                        let post_arm_k_1_mangled =
-                            format!("sigil_handler_post_arm_k_1_{arm_fn_idx}");
-                        let post_arm_k_1_func_id = module
-                            .declare_function(
-                                &post_arm_k_1_mangled,
-                                Linkage::Local,
-                                ctx.cps_arm_sig,
-                            )
-                            .map_err(|e| format!("declare {post_arm_k_1_mangled}: {e}"))?;
-                        let post_arm_k_2_mangled =
-                            format!("sigil_handler_post_arm_k_2_{arm_fn_idx}");
-                        let post_arm_k_2_func_id = module
-                            .declare_function(
-                                &post_arm_k_2_mangled,
-                                Linkage::Local,
-                                ctx.cps_arm_sig,
-                            )
-                            .map_err(|e| format!("declare {post_arm_k_2_mangled}: {e}"))?;
-                        let binding_ty_1 =
-                            cranelift_ty_for_type_expr(shape.binding_te_1, ctx.pointer_ty);
-                        let binding_ty_2 =
-                            cranelift_ty_for_type_expr(shape.binding_te_2, ctx.pointer_ty);
-                        let binding_kind_1 = slot_kind_for_type_expr_post_mono(shape.binding_te_1);
-                        Some(MultiLetPostArmKChain {
-                            arg1_expr: shape.arg1_expr.clone(),
-                            post_arm_k_1_func_id,
-                            binding_name_1: shape.binding_name_1.to_string(),
-                            binding_ty_1,
-                            binding_kind_1,
-                            arg2_expr: shape.arg2_expr.clone(),
-                            post_arm_k_2_func_id,
-                            binding_name_2: shape.binding_name_2.to_string(),
-                            binding_ty_2,
-                            tail_expr: shape.tail_expr.clone(),
+                        let chain_length = shape.binding_names.len();
+
+                        // Pass 1: declare all N FuncIds for
+                        // post_arm_k_1 .. post_arm_k_N.
+                        let mut step_func_ids: Vec<cranelift_module::FuncId> =
+                            Vec::with_capacity(chain_length);
+                        for i in 0..chain_length {
+                            let step_idx_1based = i + 1;
+                            let mangled =
+                                format!("sigil_handler_post_arm_k_{step_idx_1based}_{arm_fn_idx}");
+                            let func_id = module
+                                .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
+                                .map_err(|e| format!("declare {mangled}: {e}"))?;
+                            step_func_ids.push(func_id);
+                        }
+
+                        // Pre-compute per-let metadata used across
+                        // step entries.
+                        let binding_tys: Vec<Type> = shape
+                            .binding_tes
+                            .iter()
+                            .map(|te| cranelift_ty_for_type_expr(te, ctx.pointer_ty))
+                            .collect();
+                        let binding_kinds: Vec<crate::ast::EnvSlotKind> = shape
+                            .binding_tes
+                            .iter()
+                            .map(|te| slot_kind_for_type_expr_post_mono(te))
+                            .collect();
+
+                        // Pass 2: build N `PostArmKStep` entries.
+                        // step_idx 0..N-2 → Middle (next_arg_expr is
+                        // arg_exprs[step_idx + 1]); step_idx N-1 →
+                        // Final (tail_expr).
+                        let mut steps: Vec<PostArmKStep> = Vec::with_capacity(chain_length);
+                        for i in 0..chain_length {
+                            // prior_bindings for step i is bindings 0..i.
+                            let prior_bindings: Vec<PostArmKPriorBinding> = (0..i)
+                                .map(|j| PostArmKPriorBinding {
+                                    name: shape.binding_names[j].to_string(),
+                                    ty: binding_tys[j],
+                                    kind: binding_kinds[j],
+                                })
+                                .collect();
+                            let role = if i + 1 < chain_length {
+                                PostArmKStepRole::Middle {
+                                    next_arg_expr: shape.arg_exprs[i + 1].clone(),
+                                    next_step_func_id: step_func_ids[i + 1],
+                                }
+                            } else {
+                                PostArmKStepRole::Final {
+                                    tail_expr: shape.tail_expr.clone(),
+                                }
+                            };
+                            steps.push(PostArmKStep {
+                                func_id: step_func_ids[i],
+                                binding_name: shape.binding_names[i].to_string(),
+                                binding_ty: binding_tys[i],
+                                binding_kind: binding_kinds[i],
+                                prior_bindings,
+                                role,
+                            });
+                        }
+
+                        Some(PostArmKChain {
+                            first_arg_expr: shape.arg_exprs[0].clone(),
+                            steps,
                         })
                     }
                 } else {
@@ -3160,6 +3219,12 @@ struct ArmBodyLetThenPureTailMatch<'a> {
 /// the chain) layer on top.
 ///
 /// Returned references all borrow from `body`'s sub-tree.
+///
+/// **Plan B' Stage 6.7 Task 98:** structurally dead in the
+/// production path (replaced by [`arm_body_n_let_then_pure_tail
+/// _shape`]). Task 100 retires this classifier + its match struct +
+/// the pinning tests it backs.
+#[allow(dead_code)]
 fn arm_body_multi_let_then_pure_tail_shape<'a>(
     body: &'a crate::ast::Expr,
     k_name: &str,
@@ -3206,6 +3271,10 @@ fn arm_body_multi_let_then_pure_tail_shape<'a>(
 
 /// Plan B Task 55, Phase 4e captures+ Slice C — borrowed view of a
 /// matched [`arm_body_multi_let_then_pure_tail_shape`] result.
+///
+/// **Plan B' Stage 6.7 Task 98:** structurally dead alongside the
+/// classifier. Task 100 deletes both.
+#[allow(dead_code)]
 struct ArmBodyMultiLetThenPureTailMatch<'a> {
     binding_name_1: &'a str,
     binding_te_1: &'a crate::ast::TypeExpr,
@@ -5825,40 +5894,38 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // `arm_body_tail_is_k_call`; non-tail `k` use is
                 // rejected with a Phase-4e-pointing diagnostic.
                 let next_step_ptr = if let Some(chain) = &synth.post_arm_k_chain {
-                    // --- Slice C: multi-let `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }` path ---
+                    // --- Slice C: multi-let `{ let r1 = k(arg1); ...;
+                    //     let rN = k(argN); pure_tail }` path ---
                     //
-                    // For arms of `resumes: many` effects whose body
-                    // matches the multi-let shape, the arm fn invokes
-                    // `k(arg1)` and packs a heap-allocated TAG_CLOSURE
-                    // record holding `(k_closure, k_fn)` as the
-                    // post-arm-k closure. The post_arm_k_1 synth fn
-                    // (defined in its own pass at the bottom of
-                    // `emit_object`) reads `(k_closure, k_fn)` from
-                    // its closure_ptr and uses them to invoke `k(arg2)`
-                    // — re-using the SAME k_closure (helper synth-cont's
-                    // closure record, heap-allocated by PR #26's
-                    // captures-bearing slice). Multi-shot semantics
-                    // emerge from the trampoline dispatching into the
-                    // helper synth-cont k_fn twice with different args.
+                    // Plan B' Stage 6.7 Task 98 (B.1 Phase B): the
+                    // arm fn here lowers `arg_1` (first k call's arg)
+                    // and packs a heap-allocated TAG_CLOSURE record
+                    // for `chain.steps[0]` (post_arm_k_1) holding
+                    // (k_closure, k_fn). Since N >= 2 always for
+                    // chain helpers, step[0]'s role is Middle (it
+                    // dispatches to k again), so its closure carries
+                    // (k_closure, k_fn) + 0 prior bindings = 2
+                    // capture slots.
                     //
-                    // post_arm_k_1's closure layout (TAG_CLOSURE):
-                    //   offset 0: header word (TAG_CLOSURE | count=3 | bitmap=0b10).
-                    //   offset 8: code_ptr (null — synth fns dispatch
-                    //     via FuncId, not via closure record).
+                    // step[0]'s closure layout (TAG_CLOSURE):
+                    //   offset 0: header (TAG_CLOSURE | count=3 | bitmap=0b10).
+                    //   offset 8: code_ptr (null — synth fns dispatch via FuncId).
                     //   offset 16: k_closure (pointer; bitmap bit 1 set).
                     //   offset 24: k_fn (non-pointer fn ptr).
                     //
-                    // Bisecting hint: a regression in the Slice C e2e
-                    // test (`slice_c_choose_multi_shot_*`) after this
-                    // commit means either (a) the closure-record's
-                    // bitmap encoding is wrong (k_closure not GC-rooted
-                    // → dangling pointer post-GC), (b) the arm fn's
-                    // args_ptr stores at offsets 0/8/16 don't match
-                    // what helper synth-cont reads (the trailing-pair
-                    // convention from Slice A), or (c) post_arm_k_1's
-                    // closure_ptr reads don't match the arm fn's
-                    // closure-record stores at offsets 16/24.
-                    let arg1_value = lowerer.lower_expr(&chain.arg1_expr);
+                    // The trampoline dispatches `k_fn(k_closure,
+                    // [arg_1, step[0]_closure, &step[0]_fn], 3)` via
+                    // the trailing-pair convention; the helper's
+                    // synth-cont reads arg_1, computes, dispatches
+                    // through the trailing post_arm_k pair into
+                    // step[0]'s synth fn.
+                    let step_0 = &chain.steps[0];
+                    debug_assert!(
+                        matches!(step_0.role, PostArmKStepRole::Middle { .. }),
+                        "Plan B' Stage 6.7 Task 98: chain step 0 must be Middle role \
+                         (chain length >= 2 invariant); got Final"
+                    );
+                    let arg1_value = lowerer.lower_expr(&chain.first_arg_expr);
                     let arg1_ty = lowerer.builder.func.dfg.value_type(arg1_value);
                     let widened_arg1 = if arg1_ty == types::I64 {
                         arg1_value
@@ -5867,33 +5934,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     } else {
                         assert_eq!(
                             arg1_ty, pointer_ty,
-                            "codegen Phase 4e captures+ Slice C: unexpected k-arg1 \
+                            "codegen Plan B' Stage 6.7: unexpected first_arg \
                              Cranelift type {arg1_ty:?} for next_step_call slot widen"
                         );
                         arg1_value
                     };
 
-                    // Allocate post_arm_k_1's TAG_CLOSURE record
-                    // capturing (k_closure, k_fn). Bitmap encoding
-                    // (matching `alloc_arm_closure_record`'s loop
-                    // `bitmap |= 1u32 << (i + 1)`): bit `i + 1`
-                    // marks capture-slot `i` as a GC-tracked
-                    // pointer. Slot 0 is the code_ptr (bit 0;
-                    // always non-pointer), captures start at slot
-                    // 1 (bit 1). Here capture[0] = k_closure
-                    // (pointer; bit 1 set); capture[1] = k_fn
-                    // (non-pointer; no bit).
+                    // Allocate step[0]'s closure record (Middle layout:
+                    // (k_closure, k_fn) + 0 prior bindings).
                     //
                     // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
-                    // `post_arm_k_1_closure_ptr` (returned by `alloc_call`
-                    // below) is a heap pointer that lives across the
-                    // subsequent `next_step_call` arena allocation. See
-                    // the central TODO at the synth-cont's
-                    // `post_arm_k_closure` load site for the full
-                    // 4-site audit framing.
+                    // `step_0_closure_ptr` is a heap pointer that lives
+                    // across the subsequent `next_step_call` arena
+                    // allocation. See the central TODO at the synth-
+                    // cont's `post_arm_k_closure` load site.
                     let count: u8 = 3;
-                    // capture-slot 0 (k_closure) is pointer; bit
-                    // index = slot_index + 1 = 1.
                     let bitmap: u32 = 1u32 << 1;
                     let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
                     let payload_bytes: i64 = 8 + 8 * 2;
@@ -5906,40 +5961,34 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     lowerer
                         .stackmap
                         .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
-                    let post_arm_k_1_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
+                    let step_0_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
                     // code_ptr at offset 8 = null.
                     let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
-                    lowerer.builder.ins().store(
-                        MemFlags::trusted(),
-                        null_v,
-                        post_arm_k_1_closure_ptr,
-                        8,
-                    );
-                    // k_closure at offset 16 (slot 2).
+                    lowerer
+                        .builder
+                        .ins()
+                        .store(MemFlags::trusted(), null_v, step_0_closure_ptr, 8);
+                    // k_closure at offset 16.
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
                         k_closure_v,
-                        post_arm_k_1_closure_ptr,
+                        step_0_closure_ptr,
                         16,
                     );
-                    // k_fn at offset 24 (slot 3).
+                    // k_fn at offset 24.
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
                         k_fn_v,
-                        post_arm_k_1_closure_ptr,
+                        step_0_closure_ptr,
                         24,
                     );
 
-                    // post_arm_k_1's func_addr.
-                    let post_arm_k_1_fn_ref = module
-                        .declare_func_in_func(chain.post_arm_k_1_func_id, lowerer.builder.func);
-                    let post_arm_k_1_fn_addr = lowerer
-                        .builder
-                        .ins()
-                        .func_addr(pointer_ty, post_arm_k_1_fn_ref);
+                    let step_0_fn_ref =
+                        module.declare_func_in_func(step_0.func_id, lowerer.builder.func);
+                    let step_0_fn_addr = lowerer.builder.ins().func_addr(pointer_ty, step_0_fn_ref);
 
-                    // Build Call(k_closure, k_fn, [arg1, post_arm_k_1_closure_ptr,
-                    // post_arm_k_1_fn_addr]) via the trailing-pair convention.
+                    // Build Call(k_closure, k_fn, [arg1, step_0_closure,
+                    // step_0_fn_addr]) via the trailing-pair convention.
                     let three_v = lowerer.builder.ins().iconst(types::I32, 3);
                     let call_ns = lowerer
                         .builder
@@ -5965,13 +6014,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     );
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
-                        post_arm_k_1_closure_ptr,
+                        step_0_closure_ptr,
                         argp_v,
                         POST_ARM_K_CLOSURE_OFF,
                     );
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
-                        post_arm_k_1_fn_addr,
+                        step_0_fn_addr,
                         argp_v,
                         POST_ARM_K_FN_OFF,
                     );
@@ -6690,20 +6739,33 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         }
     }
 
-    // Plan B Task 55, Phase 4e captures+ Slice C — chained post-arm-k
-    // synth fn definition passes for the multi-let arm body shape
-    // `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }` of
-    // `resumes: many` effects.
+    // Plan B' Stage 6.7 Task 98 (B.1 Phase B activation): unified
+    // emit pass for the N-step post-arm-k chain. Each chain step
+    // (1..=N) is emitted in source order; the per-step body
+    // dispatches on `PostArmKStepRole`:
     //
-    // post_arm_k_1: receives r1 from args_ptr[0]; reads (k_closure,
-    // k_fn) from closure_ptr at offsets 16/24; allocates
-    // post_arm_k_2's TAG_CLOSURE record capturing r1; lowers
-    // arg2_expr; emits `Call(k_closure, k_fn, [arg2,
-    // post_arm_k_2_closure_ptr, post_arm_k_2_fn_addr])`.
+    //   - **Middle step** (steps 1..N-1): receives r_i from
+    //     args_ptr[0]; reads (k_closure, k_fn) from closure_ptr at
+    //     offsets 16/24; reads prior_bindings r_1..r_{i-1} from
+    //     closure_ptr at offsets 32+8*j; allocates the next step's
+    //     closure record (Middle-shape: (k_closure, k_fn) + prior
+    //     bindings + this binding; or Final-shape: prior bindings
+    //     + this binding); lowers next_arg_expr (env has all
+    //     bindings); emits `Call(k_closure, k_fn, [next_arg, next_-
+    //     step_closure, next_step_func_addr])`.
     //
-    // post_arm_k_2: receives r2 from args_ptr[0]; reads r1 from
-    // closure_ptr at offset 16; lowers tail_expr with both bindings
-    // in env; widens; emits `Done(widened)`.
+    //   - **Final step** (step N): receives r_N from args_ptr[0];
+    //     reads prior_bindings r_1..r_{N-1} from closure_ptr at
+    //     offsets 16+8*j (no k pair in Final's closure); lowers
+    //     tail_expr (env has all bindings); widens to I64; emits
+    //     `Done(widened)`.
+    //
+    // The closure record layout asymmetry (Middle has k pair;
+    // Final doesn't) saves 16 bytes per Final closure. Documented
+    // in `PostArmKChain`'s docstring; the reviewer-flagged
+    // quadratic forward-copy cost (B.2's deviation entry) applies
+    // here too — each Middle step copies all prior bindings + the
+    // newly-bound r_i forward to the next step's closure.
     {
         let post_arm_k_chain_sig = cps_signature(pointer_ty, &module);
         for synth in &handler_arm_synth {
@@ -6712,415 +6774,417 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 None => continue,
             };
 
-            // ---- post_arm_k_1 definition pass ----
-            ctx.func.signature = post_arm_k_chain_sig.clone();
-            ctx.func.name = UserFuncName::user(0, chain.post_arm_k_1_func_id.as_u32());
-            {
-                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-                let mut stackmap = StackMapBuilder::new();
-                let block = builder.create_block();
-                builder.append_block_params_for_function_params(block);
-                builder.switch_to_block(block);
-                builder.seal_block(block);
+            for (step_idx, step) in chain.steps.iter().enumerate() {
+                ctx.func.signature = post_arm_k_chain_sig.clone();
+                ctx.func.name = UserFuncName::user(0, step.func_id.as_u32());
+                {
+                    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+                    let mut stackmap = StackMapBuilder::new();
+                    let block = builder.create_block();
+                    builder.append_block_params_for_function_params(block);
+                    builder.switch_to_block(block);
+                    builder.seal_block(block);
 
-                let block_params: Vec<Value> = builder.block_params(block).to_vec();
-                // block_params[0] = closure_ptr (post_arm_k_1's own
-                // closure record holding [k_closure, k_fn] at offsets
-                // 16/24); block_params[1] = args_ptr (= [r1] from
-                // helper synth-cont's `Call(post_arm_k_1, [synth_cont_result])`);
-                // block_params[2] = args_len (== 1 from the helper
-                // synth-cont's terminal Call dispatch).
-                let post_arm_k_1_closure_ptr = block_params[0];
-                let args_ptr = block_params[1];
+                    let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                    let synth_closure_ptr = block_params[0];
+                    let args_ptr = block_params[1];
 
-                // Read r1 from args_ptr[0], narrow per binding_ty_1.
-                let r1_widened = builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), args_ptr, 0);
-                let r1_value = if chain.binding_ty_1 == types::I64 {
-                    r1_widened
-                } else if chain.binding_ty_1.is_int() && chain.binding_ty_1.bits() < 64 {
-                    builder.ins().ireduce(chain.binding_ty_1, r1_widened)
-                } else {
-                    assert_eq!(
-                        chain.binding_ty_1, pointer_ty,
-                        "codegen Phase 4e captures+ Slice C: unexpected r1 binding \
-                         Cranelift type {:?} for post_arm_k_1 in fn `{}`'s chain",
-                        chain.binding_ty_1, synth.k_name
-                    );
-                    r1_widened
-                };
+                    // Read this step's bound arg from args_ptr[0],
+                    // narrow per binding_ty.
+                    let bound_widened =
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlags::trusted(), args_ptr, 0);
+                    let bound_value = if step.binding_ty == types::I64 {
+                        bound_widened
+                    } else if step.binding_ty.is_int() && step.binding_ty.bits() < 64 {
+                        builder.ins().ireduce(step.binding_ty, bound_widened)
+                    } else {
+                        assert_eq!(
+                            step.binding_ty, pointer_ty,
+                            "codegen Plan B' Stage 6.7: unexpected post-arm-k step \
+                             binding type {:?} for fn `{}`'s chain step {}",
+                            step.binding_ty, synth.k_name, step_idx
+                        );
+                        bound_widened
+                    };
 
-                // Read (k_closure, k_fn) from post_arm_k_1's
-                // closure_ptr at offsets 16/24.
-                let k_closure_v = builder.ins().load(
-                    pointer_ty,
-                    MemFlags::trusted(),
-                    post_arm_k_1_closure_ptr,
-                    16,
-                );
-                let k_fn_v = builder.ins().load(
-                    pointer_ty,
-                    MemFlags::trusted(),
-                    post_arm_k_1_closure_ptr,
-                    24,
-                );
+                    // Closure-record layout for THIS step:
+                    //   - Middle: [code_ptr, k_closure, k_fn,
+                    //     prior_bindings...] — k pair at offsets
+                    //     16/24, prior_bindings at 32+8*j.
+                    //   - Final: [code_ptr, prior_bindings...] —
+                    //     prior_bindings at 16+8*j (no k pair).
+                    let is_middle = matches!(step.role, PostArmKStepRole::Middle { .. });
+                    let prior_offset_base: i32 = if is_middle { 32 } else { 16 };
 
-                let PerFnRefs {
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
-                    handler_frame_new_ref,
-                    handle_push_ref,
-                    handle_pop_ref,
-                    handler_frame_set_arm_ref,
-                    handler_frame_set_return_ref,
-                    perform_ref,
-                    run_loop_ref,
-                    next_step_done_ref: _,
-                    next_step_call_ref,
-                    next_step_args_ptr_ref,
-                    continuation_identity_ref,
-                    handler_arm_refs_per_handle,
-                    handler_return_arm_refs_per_handle,
-                    user_fn_refs,
-                    lit_gvs,
-                } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
+                    // Load (k_closure, k_fn) IF Middle (Final doesn't
+                    // need them).
+                    let k_pair = if is_middle {
+                        let kc = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            16,
+                        );
+                        let kf = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            24,
+                        );
+                        Some((kc, kf))
+                    } else {
+                        None
+                    };
 
-                let mut env: BTreeMap<String, Value> = BTreeMap::new();
-                env.insert(chain.binding_name_1.clone(), r1_value);
+                    // Helper: narrow an I64-loaded slot to the user-
+                    // visible Cranelift type per `EnvSlotKind`.
+                    let narrow_for_kind = |builder: &mut FunctionBuilder<'_>,
+                                           raw: Value,
+                                           kind: crate::ast::EnvSlotKind|
+                     -> Value {
+                        match kind {
+                            crate::ast::EnvSlotKind::Int => raw,
+                            crate::ast::EnvSlotKind::Bool
+                            | crate::ast::EnvSlotKind::Byte
+                            | crate::ast::EnvSlotKind::Unit => {
+                                builder.ins().ireduce(types::I8, raw)
+                            }
+                            crate::ast::EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
+                            crate::ast::EnvSlotKind::String
+                            | crate::ast::EnvSlotKind::Closure
+                            | crate::ast::EnvSlotKind::User => {
+                                if pointer_ty == types::I64 {
+                                    raw
+                                } else {
+                                    builder.ins().ireduce(pointer_ty, raw)
+                                }
+                            }
+                        }
+                    };
 
-                let mut lowerer = Lowerer {
-                    builder,
-                    stackmap: &mut stackmap,
-                    env,
-                    pointer_ty,
-                    closure_ptr: post_arm_k_1_closure_ptr,
-                    lit_gvs,
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
-                    handler_frame_new_ref,
-                    handle_push_ref,
-                    handle_pop_ref,
-                    handler_frame_set_arm_ref,
-                    handler_frame_set_return_ref,
-                    perform_ref,
-                    run_loop_ref,
-                    next_step_call_ref,
-                    next_step_args_ptr_ref,
-                    handler_arm_refs_per_handle,
-                    handler_arm_synth: &handler_arm_synth,
-                    handler_arm_indices: &handler_arm_indices,
-                    handler_return_arm_refs_per_handle,
-                    handler_return_arm_synth: &handler_return_arm_synth,
-                    handler_return_arm_indices: &handler_return_arm_indices,
-                    continuation_identity_ref,
-                    effect_ids: &checked.effect_ids,
-                    op_ids: &checked.op_ids,
-                    effects: &checked.effects,
-                    user_fn_refs,
-                    user_fns: &user_fns,
-                    type_layouts: &type_layouts,
-                    ctor_index: &ctor_index,
-                    match_scrut_tys: &checked.match_scrut_tys,
-                };
-
-                // Lower arg2_expr (pure; reads `r1` from env if needed).
-                let arg2_value = lowerer.lower_expr(&chain.arg2_expr);
-                let arg2_ty = lowerer.builder.func.dfg.value_type(arg2_value);
-                let widened_arg2 = if arg2_ty == types::I64 {
-                    arg2_value
-                } else if arg2_ty.is_int() && arg2_ty.bits() < 64 {
-                    lowerer.builder.ins().uextend(types::I64, arg2_value)
-                } else {
-                    assert_eq!(
-                        arg2_ty, pointer_ty,
-                        "codegen Phase 4e captures+ Slice C: unexpected arg2 \
-                         Cranelift type {arg2_ty:?} for post_arm_k_1 emit"
-                    );
-                    arg2_value
-                };
-
-                // Allocate post_arm_k_2's TAG_CLOSURE record capturing
-                // r1. Bitmap encoding mirrors the comment on
-                // `post_arm_k_1`'s closure record above: bit `i + 1`
-                // marks capture-slot `i`. Here capture[0] = r1; bit 1
-                // is set if r1's `binding_kind_1` is pointer.
-                //
-                // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
-                // `widened_arg2` (above) and `post_arm_k_2_closure_ptr`
-                // (below, returned by `alloc_2_call`) are heap pointers
-                // (when their types are pointer-typed) that live across
-                // the subsequent `next_step_call` arena allocation. See
-                // the central TODO at the synth-cont's
-                // `post_arm_k_closure` load site for the 4-site audit.
-                let count_2: u8 = 2;
-                // capture-slot 0 (r1) is pointer iff its kind is
-                // pointer; bit index = slot_index + 1 = 1.
-                let bitmap_2: u32 = if chain.binding_kind_1.is_pointer() {
-                    1u32 << 1
-                } else {
-                    0
-                };
-                let header_2: u64 = header_word(TAG_CLOSURE, count_2, bitmap_2);
-                let payload_2_bytes: i64 = 8 + 8;
-                let header_2_v = lowerer.builder.ins().iconst(types::I64, header_2 as i64);
-                let payload_2_v = lowerer.builder.ins().iconst(pointer_ty, payload_2_bytes);
-                let alloc_2_call = lowerer
-                    .builder
-                    .ins()
-                    .call(alloc_ref, &[header_2_v, payload_2_v]);
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, alloc_2_call));
-                let post_arm_k_2_closure_ptr = lowerer.builder.inst_results(alloc_2_call)[0];
-                // code_ptr at offset 8 = null.
-                let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
-                lowerer.builder.ins().store(
-                    MemFlags::trusted(),
-                    null_v,
-                    post_arm_k_2_closure_ptr,
-                    8,
-                );
-                // r1 at offset 16, stored as I64. Use the original
-                // `r1_widened` (pre-narrow) directly — the round-trip
-                // narrow-to-binding_ty-then-widen-back-to-I64 was
-                // wasted work for non-Int captures (Bool/Char/etc.).
-                // For Int captures `r1_value == r1_widened` already.
-                // For pointer captures both are I64 on supported
-                // targets (where pointer_ty == I64). Skipping the
-                // round-trip drops two instructions per non-Int
-                // capture without changing the stored bit pattern.
-                lowerer.builder.ins().store(
-                    MemFlags::trusted(),
-                    r1_widened,
-                    post_arm_k_2_closure_ptr,
-                    16,
-                );
-
-                // post_arm_k_2's func_addr.
-                let post_arm_k_2_fn_ref =
-                    module.declare_func_in_func(chain.post_arm_k_2_func_id, lowerer.builder.func);
-                let post_arm_k_2_fn_addr = lowerer
-                    .builder
-                    .ins()
-                    .func_addr(pointer_ty, post_arm_k_2_fn_ref);
-
-                // Build Call(k_closure, k_fn, [arg2,
-                // post_arm_k_2_closure_ptr, post_arm_k_2_fn_addr]).
-                let three_v = lowerer.builder.ins().iconst(types::I32, 3);
-                let call_ns = lowerer
-                    .builder
-                    .ins()
-                    .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
-                let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
-                let argp_call = lowerer
-                    .builder
-                    .ins()
-                    .call(next_step_args_ptr_ref, &[ns_ptr]);
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
-                let argp_v = lowerer.builder.inst_results(argp_call)[0];
-                lowerer.builder.ins().store(
-                    MemFlags::trusted(),
-                    widened_arg2,
-                    argp_v,
-                    POST_ARM_K_ARG_OFF,
-                );
-                lowerer.builder.ins().store(
-                    MemFlags::trusted(),
-                    post_arm_k_2_closure_ptr,
-                    argp_v,
-                    POST_ARM_K_CLOSURE_OFF,
-                );
-                lowerer.builder.ins().store(
-                    MemFlags::trusted(),
-                    post_arm_k_2_fn_addr,
-                    argp_v,
-                    POST_ARM_K_FN_OFF,
-                );
-                lowerer.builder.ins().return_(&[ns_ptr]);
-                lowerer.builder.finalize();
-            }
-            module
-                .define_function(chain.post_arm_k_1_func_id, &mut ctx)
-                .map_err(|e| format!("define post_arm_k_1 synth fn: {e}"))?;
-            module.clear_context(&mut ctx);
-
-            // ---- post_arm_k_2 definition pass ----
-            ctx.func.signature = post_arm_k_chain_sig.clone();
-            ctx.func.name = UserFuncName::user(0, chain.post_arm_k_2_func_id.as_u32());
-            {
-                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-                let mut stackmap = StackMapBuilder::new();
-                let block = builder.create_block();
-                builder.append_block_params_for_function_params(block);
-                builder.switch_to_block(block);
-                builder.seal_block(block);
-
-                let block_params: Vec<Value> = builder.block_params(block).to_vec();
-                // block_params[0] = closure_ptr (post_arm_k_2's own
-                // closure record holding [r1] at offset 16);
-                // block_params[1] = args_ptr (= [r2] from helper
-                // synth-cont's `Call(post_arm_k_2, [synth_cont_result_2])`);
-                // block_params[2] = args_len (== 1).
-                let post_arm_k_2_closure_ptr = block_params[0];
-                let args_ptr = block_params[1];
-
-                // Read r2 from args_ptr[0], narrow per binding_ty_2.
-                let r2_widened = builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), args_ptr, 0);
-                let r2_value = if chain.binding_ty_2 == types::I64 {
-                    r2_widened
-                } else if chain.binding_ty_2.is_int() && chain.binding_ty_2.bits() < 64 {
-                    builder.ins().ireduce(chain.binding_ty_2, r2_widened)
-                } else {
-                    assert_eq!(
-                        chain.binding_ty_2, pointer_ty,
-                        "codegen Phase 4e captures+ Slice C: unexpected r2 binding \
-                         Cranelift type {:?} for post_arm_k_2 in fn `{}`'s chain",
-                        chain.binding_ty_2, synth.k_name
-                    );
-                    r2_widened
-                };
-
-                // Read r1 from closure_ptr at offset 16, narrow per
-                // binding_kind_1.
-                let r1_widened_load = builder.ins().load(
-                    types::I64,
-                    MemFlags::trusted(),
-                    post_arm_k_2_closure_ptr,
-                    16,
-                );
-                let r1_value = match chain.binding_kind_1 {
-                    crate::ast::EnvSlotKind::Int => r1_widened_load,
-                    crate::ast::EnvSlotKind::Bool
-                    | crate::ast::EnvSlotKind::Byte
-                    | crate::ast::EnvSlotKind::Unit => {
-                        builder.ins().ireduce(types::I8, r1_widened_load)
+                    // Load prior chain bindings and build the env.
+                    let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                    for (j, prior) in step.prior_bindings.iter().enumerate() {
+                        let offset: i32 = prior_offset_base + 8 * j as i32;
+                        let raw = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            offset,
+                        );
+                        let val = narrow_for_kind(&mut builder, raw, prior.kind);
+                        env.insert(prior.name.clone(), val);
                     }
-                    crate::ast::EnvSlotKind::Char => {
-                        builder.ins().ireduce(types::I32, r1_widened_load)
-                    }
-                    crate::ast::EnvSlotKind::String
-                    | crate::ast::EnvSlotKind::Closure
-                    | crate::ast::EnvSlotKind::User => {
-                        if pointer_ty == types::I64 {
-                            r1_widened_load
-                        } else {
-                            builder.ins().ireduce(pointer_ty, r1_widened_load)
+                    env.insert(step.binding_name.clone(), bound_value);
+
+                    let PerFnRefs {
+                        string_new_ref,
+                        alloc_ref,
+                        int_to_string_ref,
+                        handler_frame_new_ref,
+                        handle_push_ref,
+                        handle_pop_ref,
+                        handler_frame_set_arm_ref,
+                        handler_frame_set_return_ref,
+                        perform_ref,
+                        run_loop_ref,
+                        next_step_done_ref,
+                        next_step_call_ref,
+                        next_step_args_ptr_ref,
+                        continuation_identity_ref,
+                        handler_arm_refs_per_handle,
+                        handler_return_arm_refs_per_handle,
+                        user_fn_refs,
+                        lit_gvs,
+                    } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
+
+                    let mut lowerer = Lowerer {
+                        builder,
+                        stackmap: &mut stackmap,
+                        env,
+                        pointer_ty,
+                        closure_ptr: synth_closure_ptr,
+                        lit_gvs,
+                        string_new_ref,
+                        alloc_ref,
+                        int_to_string_ref,
+                        handler_frame_new_ref,
+                        handle_push_ref,
+                        handle_pop_ref,
+                        handler_frame_set_arm_ref,
+                        handler_frame_set_return_ref,
+                        perform_ref,
+                        run_loop_ref,
+                        next_step_call_ref,
+                        next_step_args_ptr_ref,
+                        handler_arm_refs_per_handle,
+                        handler_arm_synth: &handler_arm_synth,
+                        handler_arm_indices: &handler_arm_indices,
+                        handler_return_arm_refs_per_handle,
+                        handler_return_arm_synth: &handler_return_arm_synth,
+                        handler_return_arm_indices: &handler_return_arm_indices,
+                        continuation_identity_ref,
+                        effect_ids: &checked.effect_ids,
+                        op_ids: &checked.op_ids,
+                        effects: &checked.effects,
+                        user_fn_refs,
+                        user_fns: &user_fns,
+                        type_layouts: &type_layouts,
+                        ctor_index: &ctor_index,
+                        match_scrut_tys: &checked.match_scrut_tys,
+                    };
+
+                    match &step.role {
+                        PostArmKStepRole::Final { tail_expr } => {
+                            // Final: lower tail with full env, widen,
+                            // return Done.
+                            let tail_value = lowerer.lower_expr(tail_expr);
+                            let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
+                            let widened_tail = if actual_tail_ty == types::I64 {
+                                tail_value
+                            } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
+                                lowerer.builder.ins().uextend(types::I64, tail_value)
+                            } else {
+                                assert_eq!(
+                                    actual_tail_ty, pointer_ty,
+                                    "codegen Plan B' Stage 6.7: unexpected Final-step \
+                                     tail Cranelift type {actual_tail_ty:?} for fn \
+                                     `{}`'s chain step {}",
+                                    synth.k_name, step_idx
+                                );
+                                tail_value
+                            };
+                            let done_call = lowerer
+                                .builder
+                                .ins()
+                                .call(next_step_done_ref, &[widened_tail]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                done_call,
+                            ));
+                            let next_step = lowerer.builder.inst_results(done_call)[0];
+                            lowerer.builder.ins().return_(&[next_step]);
+                            lowerer.builder.finalize();
+                        }
+                        PostArmKStepRole::Middle {
+                            next_arg_expr,
+                            next_step_func_id,
+                        } => {
+                            // Middle: lower next_arg_expr (env has
+                            // prior bindings + this binding), allocate
+                            // next step's closure record, dispatch.
+                            let next_arg_value = lowerer.lower_expr(next_arg_expr);
+                            let next_arg_ty = lowerer.builder.func.dfg.value_type(next_arg_value);
+                            let widened_next_arg = if next_arg_ty == types::I64 {
+                                next_arg_value
+                            } else if next_arg_ty.is_int() && next_arg_ty.bits() < 64 {
+                                lowerer.builder.ins().uextend(types::I64, next_arg_value)
+                            } else {
+                                assert_eq!(
+                                    next_arg_ty, pointer_ty,
+                                    "codegen Plan B' Stage 6.7: unexpected next_arg \
+                                     Cranelift type {next_arg_ty:?} for fn `{}`'s \
+                                     chain step {}",
+                                    synth.k_name, step_idx
+                                );
+                                next_arg_value
+                            };
+
+                            // Allocate the next step's closure record.
+                            // Layout depends on next step's role.
+                            let next_step = &chain.steps[step_idx + 1];
+                            let next_is_middle =
+                                matches!(next_step.role, PostArmKStepRole::Middle { .. });
+                            let prior_count_next = next_step.prior_bindings.len();
+                            let (next_capture_count, next_prior_offset_base): (usize, i32) =
+                                if next_is_middle {
+                                    // Middle layout: k_closure (slot 0)
+                                    // + k_fn (slot 1) + prior_bindings
+                                    // (slots 2..2+|prior|).
+                                    (2 + prior_count_next, 32)
+                                } else {
+                                    // Final layout: prior_bindings only
+                                    // (slots 0..|prior|).
+                                    (prior_count_next, 16)
+                                };
+                            assert!(
+                                next_capture_count < MAX_CLOSURE_ENV_SLOTS,
+                                "Plan B' Stage 6.7: chain-step closure capture count \
+                                 {next_capture_count} >= {MAX_CLOSURE_ENV_SLOTS} \
+                                 exceeds bitmap layout for fn `{}`'s chain step {}",
+                                synth.k_name,
+                                step_idx
+                            );
+                            let mut bitmap: u32 = 0;
+                            if next_is_middle {
+                                // k_closure at capture-slot 0 → bit 1.
+                                bitmap |= 1u32 << 1;
+                                // k_fn at capture-slot 1 → bit 2 (non-
+                                // pointer; not set).
+                                // prior_bindings at slots 2..|prior|+1.
+                                for (j, p) in next_step.prior_bindings.iter().enumerate() {
+                                    if p.kind.is_pointer() {
+                                        bitmap |= 1u32 << (2 + j + 1);
+                                    }
+                                }
+                            } else {
+                                // Final: prior_bindings at slots
+                                // 0..|prior|-1.
+                                for (j, p) in next_step.prior_bindings.iter().enumerate() {
+                                    if p.kind.is_pointer() {
+                                        bitmap |= 1u32 << (j + 1);
+                                    }
+                                }
+                            }
+                            let count: u8 = 1 + next_capture_count as u8;
+                            let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
+                            let payload_bytes: i64 = 8 + 8 * next_capture_count as i64;
+                            let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
+                            let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                            let alloc_call = lowerer
+                                .builder
+                                .ins()
+                                .call(lowerer.alloc_ref, &[header_v, payload_v]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                alloc_call,
+                            ));
+                            let next_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
+                            // code_ptr at offset 8 = null.
+                            let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                null_v,
+                                next_closure_ptr,
+                                8,
+                            );
+                            // For Middle next step: store k pair at
+                            // offsets 16/24.
+                            if next_is_middle {
+                                let (kc, kf) = match k_pair {
+                                    Some(p) => p,
+                                    None => unreachable!(
+                                        "outer Middle role implies k_pair was loaded; \
+                                         inner next-step Middle requires forwarding k pair"
+                                    ),
+                                };
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    kc,
+                                    next_closure_ptr,
+                                    16,
+                                );
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    kf,
+                                    next_closure_ptr,
+                                    24,
+                                );
+                            }
+                            // Forward prior bindings + this step's
+                            // binding to the next step's closure.
+                            // Copy prior_bindings (raw I64) from this
+                            // step's closure to next step's closure.
+                            for j in 0..step.prior_bindings.len() {
+                                let src_off: i32 = prior_offset_base + 8 * j as i32;
+                                let dst_off: i32 = next_prior_offset_base + 8 * j as i32;
+                                let raw = lowerer.builder.ins().load(
+                                    types::I64,
+                                    MemFlags::trusted(),
+                                    synth_closure_ptr,
+                                    src_off,
+                                );
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    raw,
+                                    next_closure_ptr,
+                                    dst_off,
+                                );
+                            }
+                            // Append this step's binding (raw I64
+                            // form: `bound_widened`) at the end.
+                            let this_binding_offset: i32 =
+                                next_prior_offset_base + 8 * step.prior_bindings.len() as i32;
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                bound_widened,
+                                next_closure_ptr,
+                                this_binding_offset,
+                            );
+
+                            // func_addr for the next step's synth fn.
+                            let next_step_fn_ref = module
+                                .declare_func_in_func(*next_step_func_id, lowerer.builder.func);
+                            let next_step_fn_addr = lowerer
+                                .builder
+                                .ins()
+                                .func_addr(pointer_ty, next_step_fn_ref);
+
+                            // Build Call(k_closure, k_fn, [next_arg,
+                            // next_closure, next_step_fn_addr]). Outer
+                            // Middle role guarantees k_pair was loaded
+                            // at fn entry.
+                            let (k_closure_v, k_fn_v) = match k_pair {
+                                Some(p) => p,
+                                None => unreachable!(
+                                    "outer Middle role implies k_pair was loaded for \
+                                     dispatching the next k call"
+                                ),
+                            };
+                            let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                            let call_ns = lowerer
+                                .builder
+                                .ins()
+                                .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
+                            lowerer
+                                .stackmap
+                                .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                            let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                            let argp_call = lowerer
+                                .builder
+                                .ins()
+                                .call(next_step_args_ptr_ref, &[ns_ptr]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                argp_call,
+                            ));
+                            let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                widened_next_arg,
+                                argp_v,
+                                POST_ARM_K_ARG_OFF,
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                next_closure_ptr,
+                                argp_v,
+                                POST_ARM_K_CLOSURE_OFF,
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                next_step_fn_addr,
+                                argp_v,
+                                POST_ARM_K_FN_OFF,
+                            );
+                            lowerer.builder.ins().return_(&[ns_ptr]);
+                            lowerer.builder.finalize();
                         }
                     }
-                };
-
-                let mut env: BTreeMap<String, Value> = BTreeMap::new();
-                env.insert(chain.binding_name_1.clone(), r1_value);
-                env.insert(chain.binding_name_2.clone(), r2_value);
-
-                let PerFnRefs {
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
-                    handler_frame_new_ref,
-                    handle_push_ref,
-                    handle_pop_ref,
-                    handler_frame_set_arm_ref,
-                    handler_frame_set_return_ref,
-                    perform_ref,
-                    run_loop_ref,
-                    next_step_done_ref,
-                    next_step_call_ref,
-                    next_step_args_ptr_ref,
-                    continuation_identity_ref,
-                    handler_arm_refs_per_handle,
-                    handler_return_arm_refs_per_handle,
-                    user_fn_refs,
-                    lit_gvs,
-                } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
-
-                let mut lowerer = Lowerer {
-                    builder,
-                    stackmap: &mut stackmap,
-                    env,
-                    pointer_ty,
-                    closure_ptr: post_arm_k_2_closure_ptr,
-                    lit_gvs,
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
-                    handler_frame_new_ref,
-                    handle_push_ref,
-                    handle_pop_ref,
-                    handler_frame_set_arm_ref,
-                    handler_frame_set_return_ref,
-                    perform_ref,
-                    run_loop_ref,
-                    next_step_call_ref,
-                    next_step_args_ptr_ref,
-                    handler_arm_refs_per_handle,
-                    handler_arm_synth: &handler_arm_synth,
-                    handler_arm_indices: &handler_arm_indices,
-                    handler_return_arm_refs_per_handle,
-                    handler_return_arm_synth: &handler_return_arm_synth,
-                    handler_return_arm_indices: &handler_return_arm_indices,
-                    continuation_identity_ref,
-                    effect_ids: &checked.effect_ids,
-                    op_ids: &checked.op_ids,
-                    effects: &checked.effects,
-                    user_fn_refs,
-                    user_fns: &user_fns,
-                    type_layouts: &type_layouts,
-                    ctor_index: &ctor_index,
-                    match_scrut_tys: &checked.match_scrut_tys,
-                };
-
-                let tail_value = lowerer.lower_expr(&chain.tail_expr);
-                // Slice C bug fix: read the actual lowered Cranelift
-                // type from the SSA value, not from the pre-stored
-                // `chain.tail_ty`. The pre-pass set `tail_ty =
-                // body_ty` (op's declared return type), but the arm
-                // body's overall return type is the handle's overall
-                // type — those differ when the op's return type
-                // doesn't match the arm body's tail type (e.g., op
-                // returns Bool but arm tail is `r1 + r2` returning
-                // Int). Same fix applied to Slice B's post_arm_k
-                // synth fn (which had the latent bug but didn't
-                // surface in its tests).
-                let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
-                let widened_tail = if actual_tail_ty == types::I64 {
-                    tail_value
-                } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
-                    lowerer.builder.ins().uextend(types::I64, tail_value)
-                } else {
-                    assert_eq!(
-                        actual_tail_ty, pointer_ty,
-                        "codegen Phase 4e captures+ Slice C: unexpected post_arm_k_2 \
-                         tail Cranelift type {actual_tail_ty:?} for fn `{}`'s chain",
-                        synth.k_name
-                    );
-                    tail_value
-                };
-                let done_call = lowerer
-                    .builder
-                    .ins()
-                    .call(next_step_done_ref, &[widened_tail]);
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, done_call));
-                let next_step = lowerer.builder.inst_results(done_call)[0];
-                lowerer.builder.ins().return_(&[next_step]);
-                lowerer.builder.finalize();
+                }
+                module
+                    .define_function(step.func_id, &mut ctx)
+                    .map_err(|e| {
+                        format!(
+                            "define post_arm_k_{} synth fn for `{}`'s chain: {e}",
+                            step_idx + 1,
+                            synth.k_name
+                        )
+                    })?;
+                module.clear_context(&mut ctx);
             }
-            module
-                .define_function(chain.post_arm_k_2_func_id, &mut ctx)
-                .map_err(|e| format!("define post_arm_k_2 synth fn: {e}"))?;
-            module.clear_context(&mut ctx);
         }
     }
 
