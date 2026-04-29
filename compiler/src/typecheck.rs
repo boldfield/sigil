@@ -974,11 +974,33 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         }
     }
 
+    // Plan B' Stage 6.8 Phase B + C++ — apply final substitution
+    // to every Ty recorded in `lambda_captures`. Captures recorded
+    // mid-typecheck (e.g., k inside an arm body whose
+    // handler_overall_ty was a fresh row var at the arm body's
+    // check time) often hold unresolved `Ty::Var` references that
+    // get bound later by unification at handle-end. Codegen's
+    // `cranelift_ty_of_ty` rejects `Ty::Var(_)`, so this end-of-
+    // typecheck deref pass ensures every recorded Ty is concrete.
+    let raw_lambda_captures = std::mem::take(&mut tc.lambda_captures);
+    let mut resolved_lambda_captures: Vec<(Span, Vec<(String, Ty)>)> =
+        Vec::with_capacity(raw_lambda_captures.len());
+    for (span, caps) in raw_lambda_captures {
+        let resolved_caps: Vec<(String, Ty)> = caps
+            .into_iter()
+            .map(|(name, ty)| {
+                let resolved = tc.deref(&ty);
+                (name, resolved)
+            })
+            .collect();
+        resolved_lambda_captures.push((span, resolved_caps));
+    }
+
     (
         CheckedProgram {
             program,
             string_literals: tc.string_literals,
-            lambda_captures: tc.lambda_captures,
+            lambda_captures: resolved_lambda_captures,
             types: tc.types,
             match_scrut_tys: tc.match_scrut_tys,
             call_callee_tys: tc.call_callee_tys,
@@ -2978,6 +3000,16 @@ impl Tc {
                     .get(&name)
                     .cloned()
                     .unwrap_or_else(|| unreachable!("capture {name} missing from outer env"));
+                // Plan B' Stage 6.8 Phase B + C++ — deref the Ty
+                // through the active substitution so any unresolved
+                // `Ty::Var` (handler_overall_ty for k captured from
+                // an arm body, or generic params resolved by
+                // surrounding fn instantiation) is replaced with its
+                // concrete binding before being recorded. Codegen's
+                // `cranelift_ty_of_ty` rejects `Ty::Var(_)`, so
+                // recording an unresolved var would surface as a
+                // crash there rather than at the typecheck point.
+                let ty = self.deref(&ty);
                 (name, ty)
             })
             .collect();
