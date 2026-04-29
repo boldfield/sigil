@@ -7547,7 +7547,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     next_slot_count < MAX_CLOSURE_ENV_SLOTS,
                                     "Plan B' Stage 6.7: chain-step closure env \
                                      {next_slot_count} >= {MAX_CLOSURE_ENV_SLOTS} \
-                                     exceeds bitmap layout for fn `{}`",
+                                     exceeds bitmap layout for fn `{}`. \
+                                     The chained classifier rejects bare-chain \
+                                     length >= MAX_CLOSURE_ENV_SLOTS as a \
+                                     conservative bound; this trip means the \
+                                     specific combination of captures + \
+                                     prior_bindings + binding (= {next_slot_count}) \
+                                     exceeds the cap even though the chain \
+                                     length alone is below it. Workarounds: \
+                                     reduce helper user-param count, or split \
+                                     the chain across two helpers with the \
+                                     intermediate result threaded as a single \
+                                     argument.",
                                     synth.parent_fn_name
                                 );
                                 let mut bitmap: u32 = 0;
@@ -10861,9 +10872,31 @@ fn is_simple_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> bool {
 /// `chain_length >= 2` (full chain) at the FuncId allocation site.
 /// Phase D retires `LetBindThenTail` once the chained variant covers
 /// all paths.
+///
+/// **Cap on chain length** (R3 finding 1, Plan B' Stage 6.7): the
+/// chained synth-cont closure-record bitmap caps each record at
+/// [`MAX_CLOSURE_ENV_SLOTS`] = 31 slots (bit 0 reserved for the
+/// code_ptr slot at offset +8; bits 1..32 for env slots). For an
+/// N-step chain with K captures, the largest closure record (built
+/// by the last Middle step for the Final step's record) carries
+/// `K + (N - 1) + 1 = K + N` env slots. The classifier
+/// conservatively rejects chains with `chain_length >=
+/// MAX_CLOSURE_ENV_SLOTS` so that captures-free over-cap chains
+/// fall through to the Sync ABI cleanly instead of panicking
+/// inside the pre-pass's slot-count assert. Helpers with shorter
+/// chains but many captures (`K + N >= MAX_CLOSURE_ENV_SLOTS`)
+/// still hit the pre-pass assert at codegen time — the captures
+/// count isn't available at classifier-time. In practice this
+/// edge case is unlikely (helpers with >5 captures are rare;
+/// chains beyond ~10 steps are rare); a future revision could
+/// lift captures collection into the classifier or refactor
+/// `compute_user_fn_abi` to run after captures are known.
 fn is_simple_chained_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> Option<usize> {
     use crate::ast::{Expr, Stmt};
     if body.stmts.is_empty() {
+        return None;
+    }
+    if body.stmts.len() >= MAX_CLOSURE_ENV_SLOTS {
         return None;
     }
     for stmt in &body.stmts {
@@ -11686,6 +11719,64 @@ mod tests {
             span,
         };
         assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+    }
+
+    #[test]
+    fn chained_classifier_rejects_chain_at_or_above_max_closure_env_slots() {
+        // R3 finding 1 (Plan B' Stage 6.7 Task 96 follow-up): chains
+        // with `chain_length >= MAX_CLOSURE_ENV_SLOTS` (currently 31)
+        // exceed the closure-record bitmap cap; the classifier
+        // rejects so the helper falls through to the Sync ABI rather
+        // than panicking inside the pre-pass's slot-count assert.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let mk_stmt = |name: &str| -> Stmt {
+            Stmt::Let(LetStmt {
+                name: name.to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })
+        };
+        // Build a chain at exactly the cap: chain_length =
+        // MAX_CLOSURE_ENV_SLOTS. Classifier must return None.
+        let stmts: Vec<Stmt> = (0..MAX_CLOSURE_ENV_SLOTS)
+            .map(|i| mk_stmt(&format!("x_{i}")))
+            .collect();
+        let body_at_cap = Block {
+            stmts,
+            tail: Some(Expr::IntLit(0, span.clone())),
+            span: span.clone(),
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body_at_cap),
+            None,
+            "chain at MAX_CLOSURE_ENV_SLOTS rejected"
+        );
+
+        // Build a chain just under the cap: chain_length =
+        // MAX_CLOSURE_ENV_SLOTS - 1. Classifier must accept and
+        // return the chain length. (Captures are 0 for this test;
+        // the captures + chain combination edge case isn't reached.)
+        let stmts_under: Vec<Stmt> = (0..(MAX_CLOSURE_ENV_SLOTS - 1))
+            .map(|i| mk_stmt(&format!("x_{i}")))
+            .collect();
+        let body_under_cap = Block {
+            stmts: stmts_under,
+            tail: Some(Expr::IntLit(0, span.clone())),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(&body_under_cap),
+            Some(MAX_CLOSURE_ENV_SLOTS - 1),
+            "chain just below MAX_CLOSURE_ENV_SLOTS accepted"
+        );
     }
 
     // ---------------- end Plan B' Stage 6.7 Task 93 tests ----------------
