@@ -1969,100 +1969,143 @@ enum CpsContinuationKind {
         /// captures and passes its pointer.
         captures: Vec<SynthContCapture>,
     },
-    /// **Plan B' Stage 6.7 Task 93 (B.2 Phase A) — chained-let-bind-
-    /// then-tail shape** (per [`is_simple_chained_let_yield_then_pure_-
-    /// tail_body`]): generalises [`Self::LetBindThenTail`]'s 1-stmt
-    /// cap to N stmts. The helper's body is `let name_0: ty_0 =
-    /// perform p_0; let name_1: ty_1 = perform p_1; ...; let name_{N
-    /// -1}: ty_{N-1} = perform p_{N-1}; tail_expr`, where every
-    /// perform's args are pure and the tail is pure.
+    /// **Plan B' Stage 6.7 Tasks 93-95 (B.2) — chained-let-bind step**:
+    /// one step in a chained-let-yield-then-pure-tail synth-cont chain
+    /// (per [`is_simple_chained_let_yield_then_pure_tail_body`]).
+    /// Generalises [`Self::LetBindThenTail`]'s 1-stmt cap to N stmts
+    /// via N synth-cont entries (one per step), each self-contained
+    /// for the existing one-entry-emits-one-fn synth-cont definition
+    /// pass.
     ///
-    /// **Codegen plan (Phase B + C land in Tasks 94 / 95):** N synth-
-    /// cont fns chain through the helper's perform sites:
+    /// The helper's body is `let name_0: ty_0 = perform p_0; let
+    /// name_1: ty_1 = perform p_1; ...; let name_{N-1}: ty_{N-1} =
+    /// perform p_{N-1}; tail_expr`. For an N-chain, the pre-pass
+    /// allocates N `CpsContinuationSynth` entries with this kind:
     ///
     /// - helper's body emit issues `sigil_perform(p_0, ...,
-    ///   k_fn=synth_cont_step_0)` and allocates step-0's closure
-    ///   record.
-    /// - synth_cont_step_i (i < N - 1) reads `args_ptr[0]`, narrows
-    ///   to `steps[i].binding_ty`, binds under `steps[i].binding_-
-    ///   name`, allocates step_{i+1}'s closure record (carrying
-    ///   prior bindings + remaining-chain captures forward),
-    ///   issues `sigil_perform(performs[i+1], ...,
-    ///   k_fn=synth_cont_step_{i+1})`.
-    /// - synth_cont_step_{N-1} binds the final value, loads captures
-    ///   from `closure_ptr`, lowers `tail_expr` via Lowerer, returns
-    ///   `Done(value)`.
+    ///   k_fn = step_0.func_id)` with step_0's closure record holding
+    ///   `captures + prior_bindings` (where prior_bindings is empty
+    ///   for step_0).
+    /// - synth_cont_step_i with role `Middle` reads `args_ptr[0]`,
+    ///   narrows to `binding_ty`, binds under `binding_name`, loads
+    ///   `captures + prior_bindings` from `closure_ptr`, allocates
+    ///   step_{i+1}'s closure record (extending prior_bindings with
+    ///   step_i's binding), issues `sigil_perform(next_perform, ...,
+    ///   k_fn = next_step_func_id)`.
+    /// - synth_cont_step_{N-1} with role `Final` reads `args_ptr[0]`,
+    ///   binds under `binding_name`, loads `captures +
+    ///   prior_bindings`, lowers `tail_expr` via Lowerer (env has
+    ///   all bindings + captures), returns `Done(widen(tail, I64))`.
     ///
-    /// Each step's closure record carries `(prior bindings) +
-    /// (remaining-chain captures from helper's user params)`. Phase B
-    /// (Task 94) will extend [`CpsContinuationSynth`] with an
-    /// `additional_func_ids: Vec<FuncId>` field of length N-1
-    /// holding FuncIds for synth_cont_step_1 through
-    /// synth_cont_step_{N-1}; the outer struct's `func_id` remains
-    /// synth_cont_step_0's FuncId so the existing N=1 path (helper
-    /// sets `k_fn = func_addr(synth.func_id)`) generalises. (At
-    /// Phase A landing, that field does not yet exist on
-    /// [`CpsContinuationSynth`] — this paragraph is forward-design
-    /// for Phase B's commit.)
+    /// Each step's closure record layout: TAG_CLOSURE header at +0,
+    /// null code_ptr at +8, then captures + prior_bindings packed at
+    /// +16, +24, +32, ... in that order. The pointer-bitmap tracks
+    /// which slots are pointer-typed (driven by `SynthContCapture
+    /// .kind.is_pointer()` for captures and `ChainedPriorBinding
+    /// .kind.is_pointer()` for prior bindings).
     ///
-    /// **Phase A scope (Task 93):** add the variant + classifier +
-    /// classifier unit tests. The variant is `#[allow(dead_code)]`
-    /// while Phases B/C wire up the pre-pass + emit code; the
-    /// existing `LetBindThenTail` (and its classifier
-    /// [`is_simple_let_yield_then_pure_tail_body`]) continue to
-    /// handle the 1-stmt case until Phase B switches
-    /// `compute_user_fn_abi` to use this variant + the chained
-    /// classifier for both 1-stmt and N>=2 cases (at which point
-    /// the old variant + the old classifier retire together at
-    /// Phase D).
+    /// **Phase A scope (Task 93):** added the per-step kind variant
+    /// alongside the classifier and its unit tests. The variant was
+    /// `#[allow(dead_code)]` while Phase B/C wired up the pre-pass
+    /// and emit code. **Phase B/C (Tasks 94+95) activate it**: the
+    /// pre-pass switches to the chained classifier and allocates N
+    /// entries per chained helper; helper body emit and synth-cont
+    /// definition pass consume the new variant. The old
+    /// `LetBindThenTail` variant retires alongside its classifier
+    /// (Phase D, landing in the same combined commit).
+    ///
+    /// **Transitional `#[allow(dead_code)]`:** the variant + the new
+    /// supporting types (`ChainStepRole`, `ChainedPriorBinding`) are
+    /// dead-code-allowed during Task 94+95's incremental refactor.
+    /// The pivot from Phase A's whole-chain shape to this per-step
+    /// shape lands first; the pre-pass + helper body emit +
+    /// synth-cont definition pass updates arrive in the next commit
+    /// within Task 94+95. Once active, the allows go.
     #[allow(dead_code)]
-    ChainedLetBindThenTail {
-        /// Length-N list of let-bindings the chain produces.
-        /// `steps[i]` is bound at `synth_cont_step_i`'s entry from
-        /// `args_ptr[0]`, narrowed to `steps[i].binding_ty`.
-        steps: Vec<ChainedLetBindStep>,
-        /// Length-N list of perform expressions in source order.
-        /// `performs[0]` is what helper's body emits at fn entry;
-        /// `performs[i]` for i > 0 is what `synth_cont_step_{i-1}`
-        /// emits after binding `steps[i-1]`. Each perform is the
-        /// original AST node so codegen can lower its args + look
-        /// up effect_id / op_id at the synth-cont's emit site.
-        performs: Vec<crate::ast::PerformExpr>,
-        /// The pure tail expression that `synth_cont_step_{N-1}`
-        /// lowers via `Lowerer.lower_expr`. May reference any of
-        /// `steps[*].binding_name` plus the `captures` user-param
-        /// names plus globals.
-        tail_expr: Box<crate::ast::Expr>,
-        /// Cranelift type of `tail_expr`'s value. Used to widen to
-        /// I64 before wrapping in `Done(...)` at synth_cont_step_{
-        /// N-1}'s body emit.
-        tail_ty: Type,
-        /// Captures of the parent helper's user params referenced
-        /// anywhere in the chain (any `performs[i]`'s args OR
-        /// `tail_expr`). Each chain step's closure record carries
-        /// the captures forward + accumulated prior bindings; the
-        /// captures themselves stay constant across steps (they
-        /// originate at the helper's body, not at intermediate
-        /// chain steps).
+    ChainedLetBindStep {
+        /// Index of this step in the chain (0..N-1).
+        step_idx: usize,
+        /// Total chain length N. step_idx < chain_length.
+        chain_length: usize,
+        /// Source-level name of the let-binding bound at this step's
+        /// entry from `args_ptr[0]`.
+        binding_name: String,
+        /// Cranelift type the let-binding declares. The synth-cont
+        /// loads `args_ptr[0]` as I64 and `ireduce`s back to this
+        /// type for binding (mirrors `LetBindThenTail`'s
+        /// narrow-on-load discipline).
+        binding_ty: Type,
+        /// Captures of the helper's user params referenced anywhere
+        /// in the chain (constant across all steps; loaded from
+        /// `closure_ptr` at offsets 16+8*i for i in 0..captures.len()).
         captures: Vec<SynthContCapture>,
+        /// Prior chain bindings step_0..step_{step_idx-1} threaded
+        /// forward via this step's closure record. Empty for step_0;
+        /// grows by 1 entry per step. Loaded from `closure_ptr` at
+        /// offsets 16+8*(captures.len()+j) for j in
+        /// 0..prior_bindings.len().
+        prior_bindings: Vec<ChainedPriorBinding>,
+        /// What this step does after binding + loading. `Middle`
+        /// issues the next perform; `Final` lowers the tail.
+        role: ChainStepRole,
     },
 }
 
-/// Plan B' Stage 6.7 Task 93 (B.2 Phase A) — one let-binding step in a
-/// chained-let-bind-then-tail synth-cont chain. See
-/// [`CpsContinuationKind::ChainedLetBindThenTail`].
+/// Plan B' Stage 6.7 (B.2) — what a [`CpsContinuationKind::ChainedLetBindStep`]
+/// does after binding `args_ptr[0]` and loading captures + prior
+/// bindings.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-struct ChainedLetBindStep {
-    /// Source-level name of the let-binding (the `name` in `let
-    /// name: ty = perform ...`). Bound in synth_cont_step_i's env
-    /// at fn entry from `args_ptr[0]`.
-    binding_name: String,
-    /// Cranelift type the let-binding declares. The synth-cont
-    /// loads `args_ptr[0]` as I64 and `ireduce`s back to this type
-    /// for binding (mirrors `LetBindThenTail`'s narrow-on-load
-    /// discipline).
-    binding_ty: Type,
+enum ChainStepRole {
+    /// Middle step (step_idx < chain_length - 1): lower the next
+    /// perform's args via Lowerer (env has prior bindings +
+    /// captures), allocate step_{step_idx+1}'s closure record
+    /// (extending prior_bindings with this step's binding), call
+    /// `sigil_perform` with `k_fn = next_step_func_id`, return the
+    /// resulting NextStep up to the trampoline.
+    Middle {
+        /// The perform expression at chain position step_idx+1
+        /// (i.e., the next perform after this step).
+        next_perform: crate::ast::PerformExpr,
+        /// FuncId of the next step's synth fn (the `synth_cont_step
+        /// _{step_idx+1}` whose ChainedLetBindStep entry has step_idx
+        /// = this.step_idx + 1).
+        next_step_func_id: cranelift_module::FuncId,
+    },
+    /// Final step (step_idx == chain_length - 1): lower `tail_expr`
+    /// via Lowerer (env has all chain bindings + captures), widen
+    /// result to I64, return `Done(value)`.
+    Final {
+        /// The pure tail expression that this step lowers. May
+        /// reference any of the `binding_name`s of all chain steps
+        /// plus the `captures` user-param names plus globals.
+        tail_expr: Box<crate::ast::Expr>,
+        /// Cranelift type of `tail_expr`'s value. Used to widen to
+        /// I64 before wrapping in `Done(...)`.
+        tail_ty: Type,
+    },
+}
+
+/// Plan B' Stage 6.7 (B.2) — one prior chain binding threaded forward
+/// via a `ChainedLetBindStep`'s closure record. Step i carries
+/// step_0..step_{i-1}'s bindings; each entry holds the name +
+/// Cranelift type + slot kind (for closure-record load + narrow +
+/// pointer-bitmap derivation).
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ChainedPriorBinding {
+    /// Source-level name of the binding (matches the corresponding
+    /// `ChainedLetBindStep::binding_name` from a prior step).
+    name: String,
+    /// Cranelift type the binding takes after narrow-on-load.
+    ty: Type,
+    /// `EnvSlotKind` for the closure-record encoding. Drives the
+    /// closure-record header bitmap (pointer slots are GC-tracked,
+    /// non-pointer slots are not) and the per-slot load/store
+    /// widening shape (`I8` zero-extend for Bool/Byte/Unit, `I32`
+    /// zero-extend for Char, direct stores for `I64`/pointer-typed
+    /// slots).
+    kind: crate::ast::EnvSlotKind,
 }
 
 /// Plan B Task 55, Phase 4e — derive an [`EnvSlotKind`] from a
@@ -7120,16 +7163,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         lowerer.builder.ins().return_(&[next_step]);
                         lowerer.builder.finalize();
                     }
-                    CpsContinuationKind::ChainedLetBindThenTail { .. } => {
-                        // Plan B' Stage 6.7 Task 93 (B.2 Phase A) —
-                        // variant added but pre-pass not yet emitting
-                        // it (Phase B / Task 94 activates). Until then,
-                        // no `CpsContinuationSynth` entry should carry
-                        // this kind; reaching here would be a pre-pass
-                        // bug.
+                    CpsContinuationKind::ChainedLetBindStep { .. } => {
+                        // Plan B' Stage 6.7 Tasks 94+95 (B.2 Phase B+C)
+                        // implementation lands below this match (the
+                        // emit code currently reaches here from the
+                        // pre-pass). For the duration of the partial
+                        // refactor between Phase A's variant rename
+                        // and Phase B+C's full emit-pass implementation,
+                        // unreachable!() guards against pre-pass
+                        // creating an entry whose emit isn't wired yet.
                         unreachable!(
-                            "codegen: ChainedLetBindThenTail synth-cont reached emit \
-                             pass before Phase B (Task 94) activated it for fn `{}`",
+                            "codegen: ChainedLetBindStep synth-cont reached emit \
+                             pass before Phase B+C wired the chain emit code for fn `{}`",
                             synth.parent_fn_name
                         );
                     }
