@@ -5192,6 +5192,34 @@ fn fn_as_value_with_effect_row_returns_42() {
     );
 }
 
+/// Phase C+ Part 1 — call-returning-fn (make_adder shape). The
+/// outer Call's callee is itself a `Call(...)` returning a fn-typed
+/// value. Codegen reads the resolved `Ty::Fn` from typecheck's
+/// `call_callee_tys` side-table keyed on the outer call's span.
+///
+/// `make_adder(5)` returns a closure record (the lambda capturing
+/// `n=5`). The outer `(7)` indirectly calls it, dispatching to the
+/// hoisted `$lambda_0` synth fn with `x=7`; the body returns
+/// `x + n = 7 + 5 = 12`.
+#[test]
+fn make_adder_returns_12() {
+    let src = "fn make_adder(n: Int) -> (Int) -> Int ![] {\n  \
+                 fn (x: Int) -> Int ![] => x + n\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = make_adder(5)(7);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "make_adder_call_returning_fn");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "12\n",
+        "make_adder(5)(7) = 12 (5 + 7) via call-returning-fn indirect dispatch. \
+         stderr={stderr:?}"
+    );
+}
+
 /// R2 finding 2 — explicit panic-shape rejection test. Pin the
 /// "ClosureEnvLoad-callee" shape (compose-style: lambda body calls a
 /// captured fn-typed value) so Phase C+ inverts a known-state diff:

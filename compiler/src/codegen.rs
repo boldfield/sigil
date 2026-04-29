@@ -787,17 +787,13 @@ fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
                     return Some(m);
                 }
             }
-            // Now check the callee shape against Phase C v1's allow-list.
+            // Now check the callee shape against Phase C+'s allow-list.
             match callee.as_ref() {
-                Expr::Ident(_, _) | Expr::ClosureRecord { .. } => None,
-                Expr::Call { .. } => Some(format!(
-                    "[E0138] indirect call through a call-returning-fn callee \
-                     ({:?}..{:?}) requires Plan B' Stage 6.8 Phase C+ support \
-                     (recursive callee-type resolution); deferred from Phase \
-                     C v1. As a workaround, bind the inner result to a `let` \
-                     and call the binding directly.",
-                    span.line, span.column
-                )),
+                // Phase C v1 + Phase C+ Part 1: Ident, ClosureRecord,
+                // and Call(...) callees are all supported. Call(...)
+                // resolves via the typecheck side-table
+                // `call_callee_tys`.
+                Expr::Ident(_, _) | Expr::ClosureRecord { .. } | Expr::Call { .. } => None,
                 Expr::ClosureEnvLoad { name, .. } => Some(format!(
                     "[E0138] indirect call through a captured fn-typed value \
                      `{name}` (lifted into a closure record's env at \
@@ -5671,6 +5667,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
                     local_fn_types: BTreeMap::new(),
+                    call_callee_tys: &checked.call_callee_tys,
                 };
 
                 // Phase 5 — lower perform args via Lowerer; pack
@@ -5813,6 +5810,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     }
                     m
                 },
+                call_callee_tys: &checked.call_callee_tys,
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -6227,6 +6225,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
                     local_fn_types: BTreeMap::new(),
+                    call_callee_tys: &checked.call_callee_tys,
                 };
 
                 // Plan B Task 55 (Phase 4d): route between the two
@@ -6891,6 +6890,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
                     local_fn_types: BTreeMap::new(),
+                    call_callee_tys: &checked.call_callee_tys,
                 };
 
                 let body_value = lowerer.lower_expr(&synth.body);
@@ -7115,6 +7115,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 ctor_index: &ctor_index,
                 match_scrut_tys: &checked.match_scrut_tys,
                 local_fn_types: BTreeMap::new(),
+                call_callee_tys: &checked.call_callee_tys,
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
@@ -7377,6 +7378,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         ctor_index: &ctor_index,
                         match_scrut_tys: &checked.match_scrut_tys,
                         local_fn_types: BTreeMap::new(),
+                        call_callee_tys: &checked.call_callee_tys,
                     };
 
                     match &step.role {
@@ -8001,6 +8003,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             ctor_index: &ctor_index,
                             match_scrut_tys: &checked.match_scrut_tys,
                             local_fn_types: BTreeMap::new(),
+                            call_callee_tys: &checked.call_callee_tys,
                         };
 
                         match role {
@@ -8555,6 +8558,17 @@ struct Lowerer<'a, 'b> {
     /// lowering (`Stmt::Let` with `TypeExpr::Fn`). Empty for synth
     /// arm-fn / cps continuation lowering surfaces.
     local_fn_types: BTreeMap<String, crate::ast::FnTypeExpr>,
+
+    /// Plan B' Stage 6.8 Phase C+ — typecheck-resolved callee `Ty::Fn`
+    /// for indirect calls, keyed on the call expression's span.
+    /// Populated by `typecheck::check_call`; consumed by
+    /// `lower_call`'s indirect path when the callee is itself a
+    /// `Call(...)` returning a fn-typed value (e.g., `make_adder(5)
+    /// (7)`). The `Ty::Fn` here is fully deref'd through typecheck's
+    /// substitution and post-monomorphize-resolved (no `Ty::Var`
+    /// survivors), so `cranelift_ty_of_ty` produces the right
+    /// Cranelift types directly.
+    call_callee_tys: &'b BTreeMap<Span, Ty>,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -8944,7 +8958,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // IO shortcut produced.
                 self.lower_perform_to_value(p)
             }
-            Expr::Call { callee, args, .. } => self.lower_call(callee, args),
+            Expr::Call {
+                callee, args, span, ..
+            } => self.lower_call(callee, args, span),
             Expr::Lambda { .. } => {
                 // Closure conversion (plan A2 task 31) rewrites every
                 // `Expr::Lambda` into an `Expr::ClosureRecord`; codegen
@@ -9493,7 +9509,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// — which is deferred to Plan A3 when the `TypeExpr::Fn` surface
     /// syntax lands and fn-typed lets become expressible. See
     /// `PLAN_A2_DEVIATIONS.md` `[Task 32]` for the rationale.
-    fn lower_call(&mut self, callee: &crate::ast::Expr, args: &[crate::ast::Expr]) -> Value {
+    fn lower_call(
+        &mut self,
+        callee: &crate::ast::Expr,
+        args: &[crate::ast::Expr],
+        call_span: &crate::errors::Span,
+    ) -> Value {
         use crate::ast::Expr;
         match callee {
             // Plan A3 task 41.1: positional constructor application
@@ -9703,36 +9724,54 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.inst_results(call)[0]
             }
             _ => {
-                // Plan B' Stage 6.8 Task 104 — indirect call.
-                // The callee is a `Ty::Fn` value (let-binding,
+                // Plan B' Stage 6.8 Task 104 + Phase C+ — indirect
+                // call. The callee is a `Ty::Fn` value (let-binding,
                 // fn parameter, or expression producing a closure).
                 // Closure-convention ABI: `(closure_ptr, args...)
                 // -> ret`. Code_ptr lives at offset 8 in the closure
                 // record (header at 0, code_ptr at 8, captures at
                 // 16+8*i).
                 //
-                // Phase C v1 limits supported callee shapes to
-                // `Expr::Ident(local)` where `local` is registered in
-                // `local_fn_types`. More general callees (e.g.,
-                // `Call(make_adder, [5])(7)`) need recursive callee-
-                // type resolution; deferred to Phase C+.
-                let fty = match callee {
-                    Expr::Ident(name, _) => self.local_fn_types.get(name).cloned(),
+                // Two callee-resolution paths land here:
+                //
+                // - `Expr::Ident(local)` where `local` is registered
+                //   in `local_fn_types`: read the `FnTypeExpr` from
+                //   the fn-param / let-binding annotation and build
+                //   the Cranelift sig from the surface TypeExpr.
+                // - `Expr::Call(...)` returning a fn-typed value
+                //   (Phase C+ extension, e.g. `make_adder(5)(7)`):
+                //   read the resolved `Ty::Fn` from the typecheck
+                //   side-table `call_callee_tys` keyed on the outer
+                //   call's span. The `Ty` is post-mono-resolved (no
+                //   `Ty::Var` survivors); convert to Cranelift via
+                //   `cranelift_ty_of_ty`.
+                //
+                // Other callee shapes (e.g., `ClosureEnvLoad`)
+                // remain rejected by the codegen-entry walker
+                // `unsupported_indirect_call_shape` with E0138.
+                enum CalleeSig {
+                    Surface(Box<crate::ast::FnTypeExpr>),
+                    Resolved(Box<crate::typecheck::FnSig>),
+                }
+                let callee_sig: Option<CalleeSig> = match callee {
+                    Expr::Ident(name, _) => self
+                        .local_fn_types
+                        .get(name)
+                        .cloned()
+                        .map(|fty| CalleeSig::Surface(Box::new(fty))),
+                    Expr::Call { .. } => match self.call_callee_tys.get(call_span) {
+                        Some(crate::typecheck::Ty::Fn(sig)) => {
+                            Some(CalleeSig::Resolved(sig.clone()))
+                        }
+                        _ => None,
+                    },
                     _ => None,
                 };
-                let fty = match fty {
-                    Some(f) => f,
-                    // The codegen-entry walker
-                    // `unsupported_indirect_call_shape` rejects
-                    // unsupported callee shapes upstream with a typed
-                    // E0138 diagnostic. Reaching this arm means a
-                    // shape the walker accepted (Ident or ClosureRecord
-                    // — but ClosureRecord goes through the dedicated
-                    // arm above) didn't have a registered FnTypeExpr.
-                    // That's an invariant break.
+                let callee_sig = match callee_sig {
+                    Some(s) => s,
                     None => unreachable!(
-                        "codegen invariant: walker accepted callee shape but \
-                         `local_fn_types` had no entry — callee = {callee:?}"
+                        "codegen invariant: walker accepted callee shape but no \
+                         signature source registered — callee = {callee:?}"
                     ),
                 };
 
@@ -9752,16 +9791,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let call_conv = self.builder.func.signature.call_conv;
                 let mut sig = Signature::new(call_conv);
                 sig.params.push(AbiParam::new(self.pointer_ty));
-                for p in &fty.params {
-                    sig.params.push(AbiParam::new(cranelift_ty_for_type_expr(
-                        p,
-                        self.pointer_ty,
-                    )));
-                }
-                sig.returns.push(AbiParam::new(cranelift_ty_for_type_expr(
-                    &fty.ret,
-                    self.pointer_ty,
-                )));
+                let ret_ty = match &callee_sig {
+                    CalleeSig::Surface(fty) => {
+                        for p in &fty.params {
+                            sig.params.push(AbiParam::new(cranelift_ty_for_type_expr(
+                                p,
+                                self.pointer_ty,
+                            )));
+                        }
+                        cranelift_ty_for_type_expr(&fty.ret, self.pointer_ty)
+                    }
+                    CalleeSig::Resolved(s) => {
+                        for p in &s.params {
+                            sig.params
+                                .push(AbiParam::new(cranelift_ty_of_ty(p, self.pointer_ty)));
+                        }
+                        cranelift_ty_of_ty(&s.ret, self.pointer_ty)
+                    }
+                };
+                sig.returns.push(AbiParam::new(ret_ty));
                 let sig_ref = self.builder.import_signature(sig);
 
                 // Lower args; prepend closure_ptr.
@@ -10652,7 +10700,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 Some(t) => self.type_of_expr(t, preview),
                 None => types::I8,
             },
-            Expr::Call { callee, .. } => match callee.as_ref() {
+            Expr::Call { callee, span, .. } => match callee.as_ref() {
                 // Plan A3 task 41.1: constructor application returns a
                 // heap pointer to the newly-allocated user-type record.
                 Expr::Ident(name, _)
@@ -10677,11 +10725,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 Expr::Ident(name, _) if self.local_fn_types.contains_key(name) => {
                     cranelift_ty_for_type_expr(&self.local_fn_types[name].ret, self.pointer_ty)
                 }
-                // Other indirect call shapes (e.g., `make_adder(5)(7)`)
-                // are not yet supported by Phase C v1; defensively
-                // return i64. Codegen will trip the `lower_call`
-                // unreachable when such a shape reaches lowering.
-                _ => types::I64,
+                // Phase C+ Part 1 — Call-returning-fn callee. Read
+                // the resolved Ty::Fn from the typecheck side-table
+                // keyed on the call's span; convert ret to Cranelift.
+                _ => {
+                    if let Some(crate::typecheck::Ty::Fn(sig)) = self.call_callee_tys.get(span) {
+                        cranelift_ty_of_ty(&sig.ret, self.pointer_ty)
+                    } else {
+                        // Defensive default; the codegen-entry walker
+                        // rejects unsupported indirect-call shapes
+                        // before reaching here.
+                        types::I64
+                    }
+                }
             },
             // Lambda type prediction is a Task-31/32 concern; closure
             // conversion ensures `Lambda` is always rewritten before
