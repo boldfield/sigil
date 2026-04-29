@@ -22,9 +22,9 @@ Tracks Plan C's execution against `boldfield/designs/in-progress/2026-04-21-sigi
 **Goal:** All stdlib modules implemented in sigil; every public function unit-tested; stdlib doctests extracted and run.
 
 - Task 62.0 — **Stdlib import resolution prerequisite.** Implement minimal import resolution between parse and resolve. `import std.X` loads `std/X.sigil` from the embedded tree, parses it, prepends its non-import items into the program. Cycle detection (E0033), missing-module (E0032). Builtin-injected paths (`std.io`) skip-listed at the resolver. Logged as `[DEVIATION Task 62.0]` in `PLAN_C_DEVIATIONS.md`.
-  - status: todo
+  - status: done-pending-ci ([HEAD~1])
 - Task 62 — Write `std/option.sigil` — `Option[A]`, `map`, `and_then`, `unwrap_or`. Tests under `tests/std/option.rs` (each test compiles a small sigil program and checks output).
-  - status: todo
+  - status: done-pending-ci ([HEAD]) — `std/option.sigil` ships with `Option[A]`, `map`, `and_then`, `unwrap_or` (closed-row `![]` helpers; row polymorphism deferred). Typecheck-level tests in `compiler/src/typecheck.rs::tests` (3 tests prefixed `import_std_option_` / `option_helpers_unavailable_without_import`). 6 e2e run-and-check-output tests in `compiler/tests/e2e.rs::std_option_*` covering Some/None across map/and_then/unwrap_or.
 - Task 63 — Write `std/result.sigil` — `Result[A, E]`, `map`, `map_err`, `and_then`. Tests.
   - status: todo
 - Task 64 — Write `std/list.sigil` — `List[A] = Nil | Cons(A, List[A])`, `map`, `filter`, `fold`, `length`, `reverse`, `append`, `range`, `for_each`. Tests. `range(0, n)` and `for_each` are the canonical iteration idioms since Sigil has no `for`/`while`.

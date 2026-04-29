@@ -1,0 +1,43 @@
+// sigil: 0.1
+//
+// std/option.sigil — Plan C Task 62.
+//
+// `Option[A]` represents an optional value: either `None` (absent)
+// or `Some(value)` (present). Sigil's nominal sum types make the
+// distinction explicit; there is no `null` or implicit absence.
+//
+// Helpers `map`, `and_then`, and `unwrap_or` are pure — they declare
+// closed effect rows `![]`. If a caller needs to compose with an
+// effecting transformation, the canonical pattern is to `match`
+// directly rather than thread the effect row through a generic
+// helper. Row-polymorphic Option helpers may ship in v2.
+
+type Option[A] = | None | Some(A)
+
+// `map(o, f)` returns `Some(f(x))` when `o = Some(x)` and `None`
+// when `o = None`. `f` must be pure (effect row `![]`).
+fn map[A, B](o: Option[A], f: (A) -> B ![]) -> Option[B] ![] {
+  match o {
+    None => None,
+    Some(x) => Some(f(x)),
+  }
+}
+
+// `and_then(o, f)` chains an Option-producing transformation. Returns
+// `f(x)` when `o = Some(x)` and `None` when `o = None`. `f` must be
+// pure (effect row `![]`).
+fn and_then[A, B](o: Option[A], f: (A) -> Option[B] ![]) -> Option[B] ![] {
+  match o {
+    None => None,
+    Some(x) => f(x),
+  }
+}
+
+// `unwrap_or(o, default)` returns the value in `o` when present, or
+// `default` otherwise.
+fn unwrap_or[A](o: Option[A], default: A) -> A ![] {
+  match o {
+    None => default,
+    Some(x) => x,
+  }
+}

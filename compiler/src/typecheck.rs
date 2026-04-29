@@ -8600,4 +8600,66 @@ mod tests {
         assert_eq!(inner_sig.ret, Ty::Int);
         assert_eq!(outer_sig.ret, Ty::Int);
     }
+
+    // ===== Plan C Task 62 — std/option typecheck-level coverage =====
+    //
+    // E2E run-and-check-output tests live in `compiler/tests/e2e.rs`
+    // (CI-only on the headless pod per the memory-pressure rule).
+    // These typecheck-only tests give fast pod-side feedback that
+    // `std/option.sigil` is valid sigil syntax + that the import
+    // resolver (Task 62.0) loads it cleanly.
+
+    #[test]
+    fn import_std_option_typechecks_cleanly() {
+        let src = "import std.option\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let o: Option[Int] = Some(42);\n  \
+                     let v: Int = unwrap_or(o, 0);\n  \
+                     perform IO.println(int_to_string(v));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_option_map_and_and_then_typecheck_cleanly() {
+        // `safe_pos` mimics a partial transformation without using `/`
+        // (which would require `![ArithError]` on the row per Plan B
+        // Task 57). `map` and `and_then` are pure-row helpers; this
+        // test confirms generic instantiation at A=Int, B=Int compiles.
+        let src = "import std.option\n\
+                   fn double(n: Int) -> Int ![] { n + n }\n\
+                   fn safe_pos(n: Int) -> Option[Int] ![] {\n  \
+                     match n { 0 => None, _ => Some(n * 2) }\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let a: Option[Int] = map(Some(21), double);\n  \
+                     let b: Option[Int] = and_then(Some(5), safe_pos);\n  \
+                     let v: Int = unwrap_or(a, 0) + unwrap_or(b, 0);\n  \
+                     perform IO.println(int_to_string(v));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn option_helpers_unavailable_without_import() {
+        // Without `import std.option`, the user program cannot
+        // reference `Some`, `None`, `unwrap_or`, etc. The diagnostic
+        // wording varies by which lookup fires first; this test
+        // pins that compilation fails (does not silently succeed).
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let o: Option[Int] = Some(42);\n  \
+                     let v: Int = unwrap_or(o, 0);\n  \
+                     perform IO.println(int_to_string(v));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !errs.is_empty(),
+            "expected the program to fail without `import std.option`; got clean errs"
+        );
+    }
 }

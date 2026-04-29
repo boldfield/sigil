@@ -5943,3 +5943,112 @@ fn closure_env_load_mixed_capture_kinds_returns_47() {
          stderr={stderr:?}"
     );
 }
+
+// ===== Plan C Task 62 — std/option run-and-check-output =====
+//
+// Each test compiles a small program that imports std.option and
+// exercises one of the helpers. Pod-side typecheck-only coverage
+// lives in `compiler/src/typecheck.rs::tests` (tests prefixed with
+// `import_std_option_`). These compile + run the binary and assert
+// stdout, exit code, and the expected codepath.
+
+/// `unwrap_or(Some(x), default)` returns `x`.
+#[test]
+fn std_option_unwrap_or_some_returns_inner() {
+    let src = "import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 let v: Int = unwrap_or(Some(42), 0);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_unwrap_or_some");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `unwrap_or(None, default)` returns `default`.
+#[test]
+fn std_option_unwrap_or_none_returns_default() {
+    let src = "import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 let none_val: Option[Int] = None;\n  \
+                 let v: Int = unwrap_or(none_val, 99);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_unwrap_or_none");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "99\n", "stderr={stderr:?}");
+}
+
+/// `map(Some(x), f)` returns `Some(f(x))`.
+#[test]
+fn std_option_map_some_applies_fn() {
+    let src = "import std.option\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let mapped: Option[Int] = map(Some(21), double);\n  \
+                 let v: Int = unwrap_or(mapped, 0);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_map_some");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `map(None, f)` returns `None`; `f` is never invoked. The pinned
+/// behaviour: `unwrap_or` falls through to the default.
+#[test]
+fn std_option_map_none_returns_none() {
+    let src = "import std.option\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let none_val: Option[Int] = None;\n  \
+                 let mapped: Option[Int] = map(none_val, double);\n  \
+                 let v: Int = unwrap_or(mapped, 7);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_map_none");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stderr={stderr:?}");
+}
+
+/// `and_then(Some(x), f)` chains an Option-producing function. When
+/// `f(x) = Some(_)`, the result preserves the inner value.
+#[test]
+fn std_option_and_then_some_chains_through() {
+    let src = "import std.option\n\
+               fn safe_pos(n: Int) -> Option[Int] ![] {\n  \
+                 match n { 0 => None, _ => Some(n * 3) }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let chained: Option[Int] = and_then(Some(5), safe_pos);\n  \
+                 let v: Int = unwrap_or(chained, 0);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_and_then_some");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "15\n", "stderr={stderr:?}");
+}
+
+/// `and_then(Some(0), safe_pos)` produces `None` because `safe_pos(0)`
+/// returns `None`. Pins the short-circuit through the helper chain.
+#[test]
+fn std_option_and_then_inner_none_short_circuits() {
+    let src = "import std.option\n\
+               fn safe_pos(n: Int) -> Option[Int] ![] {\n  \
+                 match n { 0 => None, _ => Some(n * 3) }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let chained: Option[Int] = and_then(Some(0), safe_pos);\n  \
+                 let v: Int = unwrap_or(chained, 99);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_and_then_inner_none");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "99\n", "stderr={stderr:?}");
+}
