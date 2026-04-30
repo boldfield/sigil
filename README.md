@@ -3,11 +3,16 @@
 A compiled, statically-typed programming language designed to be reliably
 authored by large language models — not humans.
 
-Sigil is under active construction. Plan A2 is complete: the compiler
-handles arithmetic, conditionals, multi-argument functions, recursion,
-closures, and higher-order programs. Plan A3 (sum types + pattern
-matching), Plan B (polymorphism + algebraic effects), and Plan C (stdlib +
-demos + spec + polish) follow.
+Sigil is under active construction. **Plans A1, A2, A3, and B are
+complete**; **Plan C** (stdlib + demos + spec + polish) is currently in
+progress, with the stdlib core (`Option`, `Result`, `List`, `Array`,
+`MutArray`, `ByteArray`, `MutByteArray`, `String`, `Int64`,
+`StringBuilder`, `IO`, `Mem`, `Random`, `Clock`, `Raise`, `State`,
+`Choose`) shipped and the interpreter + JSON pretty-printer demos in
+[`examples/`](examples). Specification authoring and a Plan-D
+architectural slice for first-class continuations (which unlocks
+arbitrary-arity `Choose` handlers and the Sudoku demo) are the
+remaining major work items.
 
 ## Why sigil exists
 
@@ -75,9 +80,9 @@ sigil's existence.
 
 ## What it looks like
 
-Currently working (Plan A2 — arithmetic, closures, higher-order):
+Pure recursion (Plan A2):
 
-```
+```sigil
 fn fib(n: Int) -> Int ![] {
   match n {
     0 => 0,
@@ -96,36 +101,65 @@ row (`![]` for pure). The `Int` type annotation on `n` is mandatory.
 The `match` is exhaustive — adding a case without `_` would be a
 compile error. No shadowing; no implicit conversions; no surprises.
 
-Lands in Plan B (effects + handlers):
+Algebraic effects with handlers (Plan B + Plan C stdlib):
 
-```
-effect Raise {
-  fail: (String) -> Never,
-}
+```sigil
+import std.raise
+import std.result
 
-fn parse_digit(c: Char) -> Int ![Raise] {
-  if c >= '0' && c <= '9' {
-    char_to_int(c) - char_to_int('0')
-  } else {
-    perform Raise.fail("not a digit")
+fn parse_pos(n: Int) -> Int ![Raise] {
+  match n {
+    0 => raise("expected positive"),
+    _ => n,
   }
 }
 
-fn safe_parse(c: Char) -> Result[Int, String] ![] {
-  handle parse_digit(c) with {
-    return(n) => Ok(n),
-    fail(msg, _k) => Err(msg),
-  }
+fn main() -> Int ![IO] {
+  let r: Result[Int, String] = catch(fn () -> Int ![Raise] => parse_pos(3));
+  match r {
+    Ok(v) => perform IO.println(int_to_string(v)),
+    Err(m) => perform IO.println(m),
+  };
+  0
 }
 ```
 
-Four more things to notice: `parse_digit`'s signature declares
-`![Raise]` — the type tells callers it can fail. `safe_parse` is `![]`
-(pure) because the `handle` block discharges `Raise` entirely. Effect
-operations use `perform E.op(...)`, syntactically distinct from
-ordinary function calls. `handle … with { return(v) => …,
-op(args, k) => … }` is a first-class expression; `k` is the
-continuation, a first-class value.
+Things to notice: `parse_pos`'s signature declares `![Raise]` — the
+type tells callers it can fail. `catch[A]` discharges `Raise` and
+returns `Result[A, String] ![]`. Effect operations use
+`perform E.op(...)`, syntactically distinct from ordinary calls.
+`handle … with { return(v) => …, op(args, k) => … }` is a
+first-class expression — `k` is the continuation, a first-class
+value (single-shot in v1; multi-shot supported for the static-N
+let-chain shape per [`PLAN_C_DEVIATIONS.md`](PLAN_C_DEVIATIONS.md)
+Tasks 71–73).
+
+Stateful computation with `State` + multi-effect rows:
+
+```sigil
+import std.state
+
+fn counter() -> Int ![State] {
+  let _: Int = perform State.set(10);
+  let v: Int = perform State.get();
+  v + 1
+}
+
+fn main() -> Int ![IO] {
+  let result: Int = run_state(5, counter);
+  perform IO.println(int_to_string(result));   // prints 11
+  0
+}
+```
+
+`run_state(initial, body)` is a higher-order discharger that threads
+the state through the body's `perform State.get/set` sites. Other
+effects in the row (here `IO`) are unaffected.
+
+See [`examples/interpreter.sigil`](examples/interpreter.sigil) for a
+tree-walking interpreter using `Raise` + `catch`, and
+[`examples/json.sigil`](examples/json.sigil) for a JSON pretty-printer
+using the `StringBuilder` rope under `Mem`.
 
 ## What sigil deliberately is not
 
@@ -214,55 +248,54 @@ compiling any single Plan-A2 sigil program peaks at ~63 MiB;
 the Rust toolchain, not sigil itself. Reproduce with
 `scripts/peak-rss.sh`.
 
-## Verification limits (in-flight)
+## Verification limits (current Plan C)
 
-Sigil is **under active construction**. Some language features compile
-and run, but with semantic gaps that have not yet been closed. Programs
-that depend on the gapped behavior may produce results that diverge
-from standard algebraic-effects semantics without any compile-time
-signal. Each row in the table below names the plan-tracker phase that
-closes the gap; the discard-continuation entry has additional prose
-because the failure mode is silent (programs compile and run but
-produce algebraic-incorrect results) and is the load-bearing one for
-Stage 9 spec validation.
+Sigil is **under active construction**. The Plan B effect-handler
+correctness gates closed in PRs #26–#30; the remaining gaps are
+expressivity-class limits captured in
+[`PLAN_C_DEVIATIONS.md`](PLAN_C_DEVIATIONS.md) per stdlib task. The
+load-bearing remaining gap is a Plan-D-deferred architectural slice
+for **first-class continuations** that unlocks the rest of Task 73's
+`Choose` dischargers and the Sudoku demo:
 
 | Gap | Behavior today | Closure point |
 |-----|----------------|---------------|
-| Discard-continuation handlers across function-call boundaries | **Closed at PR #26** — the colorer-driven dispatch reclassifies helper fns whose performs reach a discharging handler as CPS-color; their performs return `NextStep::Call` to the enclosing trampoline rather than synchronously blocking on `sigil_run_loop`. | Phase 4e (PR #26) |
-| Non-tail continuation use (`let r = k(x); pure_tail`) | **Closed at PR #27 Slice B** for the let-then-pure-tail shape; the arm body's post-`k` rest is lambda-lifted into a synthetic post-arm-k fn dispatched via the trailing-pair convention. Other non-tail `k` shapes (3+ invocations, Binary-of-`k`-calls, computed conditional `k`-use) require future captures-bearing extensions and remain rejected. | Phase 4e captures+ (PR #27) |
-| Multi-shot continuations (`effect E resumes: many`) | **Closed at PR #27 Slice C** for the explicit two-let arm body shape `{ let r1 = k(arg1); let r2 = k(arg2); pure_tail }`. The k_closure (helper synth-cont's TAG_CLOSURE record) is heap-reified and the trampoline dispatches into it twice with different args. N-let chains (3+ invocations) and Binary-of-`k`-calls remain in future captures-bearing extension territory. | Phase 4e captures+ (PR #27) |
-| Captures from a surrounding lambda's closure record | **Closed at PR #27 Slice D** — when an `Expr::Handle` lives inside a `Lambda`, closure_convert rewrites outer-scope references inside the arm body to `Expr::ClosureEnvLoad`; codegen sources the captured value via `lower_closure_env_load` against the lifted lambda's closure_ptr at handle codegen time. The post-arm-k synth fn body (Slice B/C path) does NOT yet support these captures — that surface is deferred to a future captures-bearing extension that mirrors Slice D's pattern at the post-arm-k closure-record allocation site. | Phase 4e captures+ Slice D (PR #27) for arm bodies; future extension for post-arm-k synth fns |
-| Multi-effect handlers (arms targeting different effects) | **Closed at PR #28** — codegen groups arms by effect via a `BTreeMap<String, _>` (stable iteration order pinned to effect-id-lex-order) and emits one `HandlerFrame` per distinct effect. Frames are pushed at handle entry in BTreeMap order, popped in reverse at handle exit; a `cfg!(debug_assertions)`-gated discipline check (`TRAP_HANDLE_DISCIPLINE_VIOLATION = 0x42`) verifies the last pop returns the first-pushed frame snapshot. Per-frame `MAX_HANDLER_ARMS = 14` cap rejected at compile time via the codegen walker (clean diagnostic, not a runtime abort). See `[DEVIATION Task 55] Phase 4f` in `PLAN_B_DEVIATIONS.md` for the architectural rationale (Option A push-N-frames over Option B extend-HandlerFrame; reversibility-led; Phase 4f-2 escape valve). | Phase 4f (PR #28) |
-| Return arms (`handle … with { return(v) => …, … }`) | **Closed at PR #29** — codegen synthesises a CPS-color return-arm fn (uniform calling convention mirroring op-arm fns), allocates a per-handle FuncId in the pre-pass, registers it via `sigil_handler_frame_set_return` against the first-pushed frame (per the Phase 4f deviation entry's concern #2 contract: `[DEVIATION Task 55] Phase 4f`), and dispatches at handle exit via the trailing-pair convention through `sigil_run_loop`. No new FFI required — the runtime's `sigil_handler_frame_set_return` setter from Task 56 is consumed; codegen reads `return_fn` / `return_closure` off the `frame_1_ptr_snapshot` SSA Value at the pinned struct offsets (`HANDLER_FRAME_RETURN_FN_OFF` / `_CLOSURE_OFF` in `sigil_abi::effect`, with a `compile_assertions` test pinning offsets to `offset_of!(HandlerFrame, ...)`). Captures from outer-fn locals supported via Phase 4d's `alloc_arm_closure_record`. Nested handles inside return arm bodies supported as a freebie (Phase 4f's machinery extends transparently). Walker still rejects nested `Lambda` / `ClosureRecord` in return arm bodies (mirrors Phase 4d op-arm restriction). See `[DEVIATION Task 55] Phase 4g` in `PLAN_B_DEVIATIONS.md` for the architectural rationale (Option A codegen-driven dispatch over Option B runtime-driven `sigil_handle_pop_with_return`). | Phase 4g (PR #29) |
-| `IO` synchronous shortcut + `sigil_panic_arith_error` runtime panic | **Closed at PR #30** — Plan A1's `IO.println` synchronous codegen shortcut and Plan A2's `sigil_panic_arith_error` runtime fn both retired in Plan B Task 57. Synthetic builtin `effect IO { println }` and `effect ArithError { div_by_zero, mod_by_zero }` injected into `tc.effects` at typecheck pre-pass start (reserved low effect_ids `ArithError = 0`, `IO = 1`); user effects start at id 2. Codegen `lower_perform`'s IO shortcut deleted; every effect (including `IO`) routes through `sigil_perform`. `BinOp::Div` / `Mod` elaborate to `if rhs == 0 { perform ArithError.{div,mod}_by_zero() } else { Sdiv/SremUnchecked }`; the perform-bearing branch flows through the same `sigil_perform` machinery. The `main` shim installs two top-level handler frames between `sigil_gc_init` and `call sigil_user_main` — ArithError pushed first (2 arms), IO pushed second (1 arm), both popped in reverse with a Phase-4f-style discipline check (debug-only). Default arm fns (`sigil_io_println_arm`, `sigil_arith_error_div_by_zero_arm`, `sigil_arith_error_mod_by_zero_arm`) preserve Plan A2 user-visible behavior verbatim (same stderr banner per operator, same exit code 2). User programs can now wrap arithmetic in `handle ... with { ArithError.div_by_zero(k) => ... }` to recover algebraically — see `examples/div_recover.sigil`. The colorer's `NATIVE_EFFECT = "IO"` filter retained as a perf-preserving choice with a documented residual gap (user-installed discard-`k` IO handlers don't unwind Native-color helpers; pinned by `#[ignore]`'d e2e). See `[DEVIATION Task 57]` entries in `PLAN_B_DEVIATIONS.md` for the five architectural choices: builtin-effect injection vs. full stdlib loading; ArithError op return type `Int` (v1) vs. `Never` (v2); top-level handler installation in main shim; `BinOp::Div`/`Mod` elaborate to perform-bearing form (vs. codegen-time synthesis); IO color filter retention. | Plan B Task 57 (PR #30) |
-| Stage 9 spec validation | **Phase 4e correctness gate closes at PR #27 squash-merge.** This PR closes the algebraic-effects codegen correctness gates that were the load-bearing prerequisite. **Full Stage 9 unblock additionally requires** Tasks 57–61 (Stage 6 closeout, including Task 61's P18–P20 prompt authoring) and Plan C Stage 6.5 scaffolding (`scripts/validate-spec.sh`). Today only P01–P17 exist in `spec/validation-prompts.md`; the prompt-bank's algebraic-effects entries (existing P06 `Raise`-based parser; future P19 `State` counter and P20 multi-shot `Choose`) become measurable when those prompts land in Task 61 and the validation script ships. | Phase 4e captures+ (PR #27) closes the codegen gate; Tasks 57–61 + Plan C Stage 6.5 close the rest |
+| First-class continuations (`k` as a value, captured into a closure, passed to a helper) | Rejected with "first-class continuations are deferred to v2" diagnostic in `compiler/src/codegen.rs::arm_body_walk`. Single-shot and static-N let-chain multi-shot handler arms work; arbitrary-arity / fold-callback / nested-match k-call shapes do not. Blocks `std/choose.sigil`'s `all_choices` / `first_choice` dischargers and the Sudoku demo. | Plan D (planned 6-PR architectural slice) |
+| Wrapper-fn-frame composition for discharge-with-lambda | `examples/state.sigil`'s inline-perform shape works; wrapping `perform State.get/set` in a helper fn breaks the discharge-with-lambda continuation chain (the wrapper's frame doesn't re-thread state). Pinned by `#[ignore]`'d e2e test `std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix`. | Plan D (same slice) |
+| Type-parameterized effect rows (`![Raise[E]]`, `![State[S]]`) | Parser rejects type-parameterized effect references in rows; v1 ships concrete-typed effects (`Raise` over `String`, `State` over `Int`). | Plan D + parser surface lift |
+| Tuple type / `Pair[A, B]` stdlib | No tuples; `run_state` returns just `A` (not `(A, S)`). User code threads final state via the body return value. | v2 stdlib expansion |
 
-**Phase 4e cadence pivot — closed.** The original Phase 4e
-deviation entry committed to a single-PR comprehensive scope
-covering all four remaining lifts (discard-`k` correctness, non-
-tail `k`, multi-shot `k`, surrounding-lambda captures). PR #26
-(`plan-b-task-55-phase-4e`) shipped the architectural foundation
-plus the helper-side lambda-lifting first slices, closing hard
-condition #2 (both discard-`k` test inversions). PR #27
-(`plan-b-task-55-phase-4e-captures`) shipped the residual three
-lifts as four slices (Slice A foundation refactor; Slice B
-non-tail `k`; Slice C multi-shot `k`; Slice D surrounding-lambda
-captures) plus a closeout commit. Both PRs preserved the
-lambda-lifting + trailing-pair architecture from sections 5 and
-6 of the comprehensive deviation entry; see the
-[cadence-pivot addendum and the captures+ entry in `PLAN_B_DEVIATIONS.md`](PLAN_B_DEVIATIONS.md)
-for the full record.
+Each row's "Closure point" links to the corresponding `[DEVIATION
+Task NN]` entry in `PLAN_C_DEVIATIONS.md`. The Plan-D slice
+(first-class-continuation infrastructure + wrapper-fn-frame
+composition + conditional-k handler-arm tails) is scoped as 6
+incremental PRs and unlocks `all_choices` / `first_choice` over
+arbitrary-arity `Choose.choose(n)` plus the Sudoku demo (Task 81).
 
-This list is a living section: each entry tracks an in-flight gap that
-will close in a specific tracked phase, and is updated alongside the
-implementing PR. The authoritative source for current Plan B phase
-state is [`PLAN_B_PROGRESS.md`](PLAN_B_PROGRESS.md); architectural
-decisions are in [`PLAN_B_DEVIATIONS.md`](PLAN_B_DEVIATIONS.md).
+Authoritative sources:
+- [`PLAN_C_PROGRESS.md`](PLAN_C_PROGRESS.md) — current task status.
+- [`PLAN_C_DEVIATIONS.md`](PLAN_C_DEVIATIONS.md) — per-task deviation
+  entries with v1 constraints and v2 closure paths.
+- [`PLAN_B_PROGRESS.md`](PLAN_B_PROGRESS.md) +
+  [`PLAN_B_DEVIATIONS.md`](PLAN_B_DEVIATIONS.md) — historical Plan B
+  effect-handler correctness gates and the architectural decisions
+  underlying them.
 
 ## Status
 
-- **Plan A1** — Stage 0 scaffolding + Stage 1 hello-world vertical slice: **done**.
+- **Plan A1** — Stage 0 scaffolding + Stage 1 hello-world: **done**.
 - **Plan A2** — Stages 2–3, arithmetic + conditionals + closures: **done**.
-- **Plan A3** — Stage 4, sum types + pattern matching: pending.
-- **Plan B** — Stages 5–6, HM parametric polymorphism + algebraic effects with multi-shot handlers: pending.
-- **Plan C** — Stages 7–10, stdlib + three demo programs + language specification + polish: pending.
+- **Plan A3** — Stage 4, sum types + pattern matching: **done**.
+- **Plan B** — Stages 5–6, HM parametric polymorphism + algebraic
+  effects with multi-shot handlers (static-N): **done** (effect-handler
+  correctness gates closed in PRs #26–#30; multi-shot composition fix
+  shipped in Plan B' Stage 6.7+6.8).
+- **Plan C** — Stages 7–10, stdlib + three demo programs + language
+  specification + polish: **in progress** (~75%). Stdlib core
+  shipped (Tasks 62–76 except 67/69 part 2 deferred and 73 dischargers
+  Plan-D-deferred); interpreter + JSON pretty-printer demos shipped;
+  Sudoku demo + spec/language.md authoring + spec validation gate
+  pending.
+- **Plan D** — first-class-continuation architectural slice
+  (planned): unlocks `Choose` dischargers, Sudoku demo, and the
+  wrapper-fn-frame composition gap. Estimated 6 incremental PRs.
