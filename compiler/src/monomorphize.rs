@@ -1419,7 +1419,7 @@ fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
 /// Convert a fully-rewritten `TypeExpr` (no `Apply`, no generic-param
 /// references, no `Var`) into a `Ty`. Used when resolving the args
 /// of a `TypeExpr::Apply` recursively.
-fn type_expr_to_ty(te: &TypeExpr) -> Ty {
+pub(crate) fn type_expr_to_ty(te: &TypeExpr) -> Ty {
     match te {
         TypeExpr::Named(n, _) => match n.as_str() {
             "Int" => Ty::Int,

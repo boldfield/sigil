@@ -6762,6 +6762,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
                     local_fn_types: BTreeMap::new(),
+                    local_var_tys: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
                     captured_fn_sigs: BTreeMap::new(),
                     arm_k_closure_v: None,
@@ -6911,6 +6912,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         if let crate::ast::TypeExpr::Fn(fty) = &p.ty {
                             m.insert(p.name.clone(), (**fty).clone());
                         }
+                    }
+                    m
+                },
+                local_var_tys: {
+                    // Plan D Task 113 — seed with each param's
+                    // (post-mono concrete) Ty so `lower_match` can
+                    // recover a clone-safe scrutinee type from an
+                    // `Expr::Ident(param_name)`.
+                    let mut m: BTreeMap<String, Ty> = BTreeMap::new();
+                    for p in &f.params {
+                        m.insert(p.name.clone(), crate::monomorphize::type_expr_to_ty(&p.ty));
                     }
                     m
                 },
@@ -7401,6 +7413,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
                     local_fn_types: BTreeMap::new(),
+                    local_var_tys: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
                     captured_fn_sigs: BTreeMap::new(),
                     // Plan B' Stage 6.8 Task 107 Phase B — expose
@@ -8104,6 +8117,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
                     local_fn_types: BTreeMap::new(),
+                    local_var_tys: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
                     captured_fn_sigs: BTreeMap::new(),
                     arm_k_closure_v: None,
@@ -8342,6 +8356,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 ctor_index: &ctor_index,
                 match_scrut_tys: &checked.match_scrut_tys,
                 local_fn_types: BTreeMap::new(),
+                local_var_tys: BTreeMap::new(),
                 call_callee_tys: &checked.call_callee_tys,
                 captured_fn_sigs: BTreeMap::new(),
                 arm_k_closure_v: None,
@@ -8618,6 +8633,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         ctor_index: &ctor_index,
                         match_scrut_tys: &checked.match_scrut_tys,
                         local_fn_types: BTreeMap::new(),
+                        local_var_tys: BTreeMap::new(),
                         call_callee_tys: &checked.call_callee_tys,
                         captured_fn_sigs: BTreeMap::new(),
                         arm_k_closure_v: None,
@@ -9256,6 +9272,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             ctor_index: &ctor_index,
                             match_scrut_tys: &checked.match_scrut_tys,
                             local_fn_types: BTreeMap::new(),
+                            local_var_tys: BTreeMap::new(),
                             call_callee_tys: &checked.call_callee_tys,
                             captured_fn_sigs: BTreeMap::new(),
                             arm_k_closure_v: None,
@@ -10013,6 +10030,23 @@ struct Lowerer<'a, 'b> {
     /// arm-fn / cps continuation lowering surfaces.
     local_fn_types: BTreeMap<String, crate::ast::FnTypeExpr>,
 
+    /// Plan D Task 113 — local Tys for params + `let`-bindings in
+    /// scope, keyed by binding name. Derived from each binding's
+    /// declared `TypeExpr` via `monomorphize::type_expr_to_ty`. Used
+    /// by `lower_match` to recover a *concrete* scrutinee `Ty` when
+    /// the scrutinee is `Expr::Ident(name)`. The span-keyed
+    /// `match_scrut_tys` side-table is shared across all
+    /// monomorphized clones of a generic fn, so for a clone like
+    /// `fst$Int$String` the entry can still hold `Ty::Var(A)`-bearing
+    /// types from the pre-mono parent. Per-clone `local_var_tys` are
+    /// populated at construction with the post-mono concrete param
+    /// types, so an `Ident` scrutinee resolves correctly even when
+    /// the side-table entry is stale. Non-Ident scrutinees (e.g.
+    /// `match (1,2) { ... }`) still rely on the span-keyed side-
+    /// table (correct in that case because the scrutinee carries no
+    /// generic type-vars).
+    local_var_tys: BTreeMap<String, Ty>,
+
     /// Plan B' Stage 6.8 Phase C+ — typecheck-resolved callee `Ty::Fn`
     /// for indirect calls, keyed on the call expression's span.
     /// Populated by `typecheck::check_call`; consumed by
@@ -10118,6 +10152,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 if let crate::ast::TypeExpr::Fn(fty) = &l.ty {
                     self.local_fn_types.insert(l.name.clone(), (**fty).clone());
                 }
+                // Plan D Task 113 — track every let-binding's Ty so
+                // `lower_match` can recover a clone-safe scrutinee
+                // type from `Expr::Ident(let_name)` (the span-keyed
+                // `match_scrut_tys` side-table is shared across
+                // generic clones and may be stale for tuple-typed
+                // scrutinees).
+                self.local_var_tys
+                    .insert(l.name.clone(), crate::monomorphize::type_expr_to_ty(&l.ty));
             }
             Stmt::Expr(e) => {
                 let _ = self.lower_expr(e);
@@ -13282,7 +13324,23 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match_span: &Span,
     ) -> Value {
         let s = self.lower_expr(scrutinee);
-        let scrut_ty = self.match_scrut_tys.get(match_span).cloned();
+        // Plan D Task 113 — prefer per-Lowerer `local_var_tys` (post-
+        // mono concrete types, populated at fn entry from params and
+        // at `Stmt::Let`) when the scrutinee is `Expr::Ident(name)`.
+        // The span-keyed `match_scrut_tys` side-table is shared
+        // across all monomorphized clones of a generic fn; for a
+        // clone like `fst$Int$String` the entry can hold
+        // `Ty::Var(_)`-bearing types from the pre-mono parent.
+        // Falling back to the side-table covers non-Ident scrutinees
+        // (e.g. `match (1,2) { ... }`) which carry no generic vars.
+        let scrut_ty = if let crate::ast::Expr::Ident(name, _) = scrutinee {
+            self.local_var_tys
+                .get(name)
+                .cloned()
+                .or_else(|| self.match_scrut_tys.get(match_span).cloned())
+        } else {
+            self.match_scrut_tys.get(match_span).cloned()
+        };
 
         // Predict the result type from the first arm's body. Pattern
         // bindings introduced by the first arm are added to a preview
@@ -13585,15 +13643,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match pat {
             Pattern::Wildcard(_) => true,
             Pattern::Var(name, _) => self.nullary_ctor_promotion(name, scrut_ty).is_none(),
-            // Plan D Task 113 — tuple pattern catchall iff sub-patterns
-            // are catchall against matching tuple element types.
-            Pattern::Tuple(pats, _) => match scrut_ty {
-                Some(Ty::Tuple(elem_tys)) if pats.len() == elem_tys.len() => pats
-                    .iter()
-                    .zip(elem_tys.iter())
-                    .all(|(sub, ety)| self.is_catchall_pattern(sub, Some(ety))),
-                _ => false,
-            },
+            // Plan D Task 113 — `Pattern::Tuple` is *structurally
+            // present* even when every sub-pattern is catchall, because
+            // the bindings inside still need to be installed into the
+            // arm body's env. The conditional path (via
+            // `emit_pattern_test`) is the place that walks tuple
+            // sub-patterns and accumulates `(name, Value)` pairs; the
+            // catchall fast-path here only knows how to bind a single
+            // top-level `Pattern::Var`. Returning `false` here forces
+            // tuples through the conditional path so destructure
+            // bindings reach the arm body.
             _ => false,
         }
     }
@@ -13765,11 +13824,28 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 UnOp::Neg => types::I64,
                 UnOp::Not => types::I8,
             },
-            Expr::Match { arms, span, .. } => {
+            Expr::Match {
+                scrutinee,
+                arms,
+                span,
+            } => {
                 // Propagate the preview down, extending with any pattern
                 // bindings this inner match's first arm introduces so
                 // nested-match result-type prediction sees them.
-                let inner_scrut_ty = self.match_scrut_tys.get(span).cloned();
+                //
+                // Plan D Task 113 — mirror `lower_match`'s
+                // local_var_tys-first lookup so a tuple-typed Ident
+                // scrutinee resolves to its concrete (post-mono)
+                // `Ty::Tuple` even when the span-keyed side-table
+                // entry contains generic `Ty::Var` elements.
+                let inner_scrut_ty = if let crate::ast::Expr::Ident(name, _) = scrutinee.as_ref() {
+                    self.local_var_tys
+                        .get(name)
+                        .cloned()
+                        .or_else(|| self.match_scrut_tys.get(span).cloned())
+                } else {
+                    self.match_scrut_tys.get(span).cloned()
+                };
                 let mut inner_preview = preview.clone();
                 self.predict_pattern_bindings(
                     &arms[0].pattern,
