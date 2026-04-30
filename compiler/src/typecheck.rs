@@ -613,6 +613,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
             EffectOp {
                 name: "div_by_zero".to_string(),
                 name_span: span.clone(),
+                generic_params: Vec::new(),
                 params: Vec::new(),
                 return_type: TypeExpr::Named("Int".to_string(), span.clone()),
                 span: span.clone(),
@@ -620,6 +621,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
             EffectOp {
                 name: "mod_by_zero".to_string(),
                 name_span: span.clone(),
+                generic_params: Vec::new(),
                 params: Vec::new(),
                 return_type: TypeExpr::Named("Int".to_string(), span.clone()),
                 span: span.clone(),
@@ -637,6 +639,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
             EffectOp {
                 name: "print".to_string(),
                 name_span: span.clone(),
+                generic_params: Vec::new(),
                 params: vec![TypeExpr::Named("String".to_string(), span.clone())],
                 return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
                 span: span.clone(),
@@ -645,6 +648,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
             EffectOp {
                 name: "println".to_string(),
                 name_span: span.clone(),
+                generic_params: Vec::new(),
                 params: vec![TypeExpr::Named("String".to_string(), span.clone())],
                 return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
                 span: span.clone(),
@@ -654,6 +658,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
             EffectOp {
                 name: "read_file".to_string(),
                 name_span: span.clone(),
+                generic_params: Vec::new(),
                 params: vec![TypeExpr::Named("String".to_string(), span.clone())],
                 return_type: TypeExpr::Named("String".to_string(), span.clone()),
                 span: span.clone(),
@@ -663,6 +668,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
             EffectOp {
                 name: "read_line".to_string(),
                 name_span: span.clone(),
+                generic_params: Vec::new(),
                 params: Vec::new(),
                 return_type: TypeExpr::Named("String".to_string(), span.clone()),
                 span: span.clone(),
@@ -672,6 +678,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
             EffectOp {
                 name: "write_file".to_string(),
                 name_span: span.clone(),
+                generic_params: Vec::new(),
                 params: vec![
                     TypeExpr::Named("String".to_string(), span.clone()),
                     TypeExpr::Named("String".to_string(), span.clone()),
