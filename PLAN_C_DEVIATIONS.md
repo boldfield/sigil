@@ -182,3 +182,200 @@ The marker-effect shape preserves every user-observable invariant Plan C cares a
 **Failure mode.** A v2 user trying to mock Mem via `handle ... with { Mem.new_array(args, k) => ... }` gets E0139 (unknown op on declared effect) until v2 ships generic Mem ops. Documented in `std/mut_array.sigil`.
 
 **Implementing commit(s).** [HEAD+1] (this commit lands the deviation; the next commit lands the implementation).
+
+## 2026-04-30 — [DEVIATION Task 66.5] User-side `byte_from_int` / `string_from_bytes` / `from_list` / `to_list` wrappers deferred
+
+**Context.** Plan C Task 66.5's plan body lists six core ops (`length`, `get`, `concat`, `slice`, `from_list(List[Byte]) -> ByteArray`, `to_list(ByteArray) -> List[Byte]`) plus String interop (`string_to_bytes(s) -> ByteArray`, `string_from_bytes(ba) -> Result[String, Utf8Error]`) plus the `Byte` primitive wired up via `byte_from_int(n: Int) -> Option[Byte]`.
+
+The four user-facing wrappers — `byte_from_int(n) -> Option[Byte]`, `string_from_bytes(ba) -> Result[String, Utf8Error]`, `from_list(xs: List[Byte]) -> ByteArray`, `to_list(ba: ByteArray) -> List[Byte]` — each depend on a different stdlib type:
+
+- `byte_from_int` returns `Option[Byte]` → needs `import std.option`.
+- `string_from_bytes` returns `Result[String, Utf8Error]` → needs `import std.result` (and a `Utf8Error` declaration).
+- `from_list` / `to_list` consume / produce `List[Byte]` → need `import std.list`.
+
+A natural shape for `std/byte_array.sigil` is a single module that imports all three and ships all four wrappers. **That shape collides on the flat namespace.** Each of `std/option.sigil`, `std/result.sigil`, `std/list.sigil` declares a `fn map`; loading all three from one transitive import path produces a duplicated `map` scheme registration where the last-loaded module wins. Inside `std/list.sigil`'s own `map` body, the recursive `map(t, f)` call then resolves to whichever module was registered last — the typechecker reports `expected Result[?,?], got List[?]` cascades inside list.sigil with no obvious user-visible cause.
+
+**Why accepted (defer the wrappers).** The collision is the architectural concern PR #42 review #2 (architectural concerns section) flagged: "Single flat namespace for stdlib imports... collision likelihood grows. The escape hatch (E0136 / duplicate-fn) is correct but loud-by-design." The proper fix is module-qualified names (`std.list.map` vs `std.option.map`), which is a separate Plan C task (queued for the namespace-architecture work in Tasks 67–72 if the collision surfaces sharper).
+
+For Task 66.5, the workaround is:
+
+- Ship the **runtime layer** + **builtin primitives** — these don't need user-side imports.
+- Ship `std/byte_array.sigil` as **documentation-only** (mirrors `std/array.sigil` / `std/mut_array.sigil`), added to `BUILTIN_INJECTED` skip-list.
+- Defer the four wrappers. Until the namespace fix lands, callers who want them write them in their own program.
+
+**What ships in Task 66.5:**
+
+1. Runtime `runtime/src/byte_array.rs` with 9 FFI primitives:
+   `sigil_byte_array_alloc` / `_empty` / `_length` / `_get` / `_concat` / `_slice` (6 ops) plus `sigil_string_to_bytes` / `sigil_string_from_bytes_validate` / `sigil_string_from_bytes_alloc` (3 string-interop ops).
+2. Two new helpers in `runtime/src/byte.rs`: `sigil_byte_in_range(n: i64) -> bool`, `sigil_byte_truncate(n: i64) -> u8`. These factor what would have been `byte_from_int`'s body so user-side code can construct `Option[Byte]` directly: `match byte_in_range(n) { true => Some(byte_truncate(n)), false => None }`.
+3. New `TAG_BYTE_ARRAY = 0x06` in `header-constants` + 2 counter slots.
+4. `ByteArray` registered as a non-generic builtin type (`builtin_types`).
+5. 11 builtin schemes (`register_builtin_byte_array_schemes`) covering all 6 ops + 3 string-interop primitives + 2 Byte helpers.
+6. Codegen FFI declarations + `lower_call` dispatch arms + `type_of_expr` predictions, all flowing through `BuiltinFuncIds` / `BuiltinFuncRefs` (no per-call-site churn — see PR #42 review #10's consolidation).
+7. `std/byte_array.sigil` documentation file, added to `imports::BUILTIN_INJECTED`.
+
+**What doesn't ship (deferred to the namespace-fix task):**
+
+1. `byte_from_int(n: Int) -> Option[Byte]` — user-side wrapper around `byte_in_range` + `byte_truncate`.
+2. `string_from_bytes(ba: ByteArray) -> Result[String, Utf8Error]` — user-side wrapper around `string_from_bytes_validate` + `string_from_bytes_alloc`.
+3. `from_list(xs: List[Byte]) -> ByteArray` — recursive concat.
+4. `to_list(ba: ByteArray) -> List[Byte]` — recursive build via accumulator.
+5. `type Utf8Error = | InvalidUtf8(Int)` — user-side declaration alongside `string_from_bytes`.
+
+**Closure path.** Closes when stdlib namespace qualification ships (e.g. `std.list.map` vs `std.option.map`, OR per-module re-export with explicit aliasing). At that point, `std/byte_array.sigil` flips from doc-only to a real importable module that ships the four wrappers + `Utf8Error`. Removing the entry from `BUILTIN_INJECTED` is the structural step. The runtime and builtin-scheme surface stays unchanged.
+
+**Failure mode.** Users wanting `Option[Byte]`-shaped byte construction or `Result[String, Utf8Error]`-shaped UTF-8 decoding write a few lines of sigil against the deferred-wrapper-equivalent surface. The runtime primitives carry the same algorithmic content, so the user code is straightforward — the loss is API ergonomics, not capability.
+
+**Implementing commit(s).** Part 1 (runtime foundation): `5ec5fef`. Part 2 (compiler integration + doc-only stdlib file + typecheck/e2e tests): `6304ba8`.
+
+## 2026-04-30 — [DEVIATION cross-cutting] v2 path: `extern fn` + `opaque type` for stdlib FFI declarations
+
+**Context.** Sigil v1's stdlib has two classes of module:
+
+1. **Sigil-expressible.** `std/option.sigil`, `std/result.sigil`, `std/list.sigil` — variant sum types + helper fns, fully written in sigil. The user-visible source IS the implementation.
+
+2. **Opaque-runtime-backed.** `std/io.sigil`, `std/array.sigil`, `std/mut_array.sigil`, `std/byte_array.sigil`, `std/mut_byte_array.sigil` — heap-allocated objects with non-variant layouts (`{header, length, payload}`) plus FFI functions backed by `runtime/src/*.rs`. The user-visible `.sigil` file is **documentation-only**; the actual type registrations and operation schemes are injected at the typechecker via `builtin_types()` / `register_builtin_*_schemes()` and at codegen via FFI declarations + dispatch arms.
+
+The split exists because Sigil v1's surface doesn't support either:
+
+- **Opaque runtime-managed types.** No syntax says "the layout of this type lives outside sigil — the runtime knows it." Variant sum types can declare `type T = | Foo | Bar(Int)`; there's no way to declare `type ByteArray` with an opaque non-variant payload.
+- **External function bindings.** No `extern fn name(args) -> ret` syntax to declare an FFI symbol. The compiler's builtin-injection pattern (Plan B Task 57 for IO/ArithError, Plan C Tasks 65/66/66.5/66.6 for Array/MutArray/ByteArray/MutByteArray) registers schemes directly in the typechecker.
+
+The result: each opaque-runtime stdlib module has roughly the same structure — a doc-only `.sigil` file describing the surface, plus typecheck.rs / codegen.rs additions that mirror the sigil signatures one-to-one. Adding a new opaque builtin (Task 67's `string_builder`, Task 69's `int64`) repeats the pattern.
+
+**Why accepted (defer to v2).** Adding `extern fn` + `opaque type` syntax is a real language change touching parser, AST, typecheck, and a small linkage layer at codegen. Plan A1's "Do not change language semantics" guardrail (carried into Plan C) keeps language-surface work out of the stdlib-growth tasks. The current builtin-injection pattern works correctly; the cost is convention drift between stdlib modules (real vs doc-only) and a small per-module mechanical cost when adding new runtime-backed primitives.
+
+**What v2 enables.** With both features in place, `std/byte_array.sigil` could declare the full surface in sigil source:
+
+```sigil
+opaque type ByteArray
+
+extern fn byte_array_alloc(len: Int, fill: Byte) -> ByteArray ![]
+  = "sigil_byte_array_alloc"
+
+extern fn byte_array_length(ba: ByteArray) -> Int ![]
+  = "sigil_byte_array_length"
+// ... etc.
+
+// User-side wrappers stay as ordinary sigil:
+fn byte_from_int(n: Int) -> Option[Byte] ![] {
+  match byte_in_range(n) {
+    true => Some(byte_truncate(n)),
+    false => None,
+  }
+}
+```
+
+Compiler internals would consume the `extern fn` declarations directly — no `register_builtin_*_schemes()` boilerplate, no `BuiltinFuncIds` extension per primitive, no separate documentation-vs-implementation drift. `imports::BUILTIN_INJECTED` retires entirely.
+
+**Closure path.** Tracked as a v2 language-surface task. Implementation steps would touch:
+
+1. Parser: `extern fn name(args) -> ret ![row]\n = "C_symbol"` + `opaque type Name`.
+2. AST: `Item::ExternFn { name, sig, c_symbol }` and `Item::OpaqueType { name }`.
+3. Typecheck: ExternFn registers as a regular `Scheme` with no body; OpaqueType registers in `tc.types` with empty variants (mirroring today's builtin-type injection).
+4. Codegen: walk `Item::ExternFn` items at `emit_object` start to populate `BuiltinFuncIds` automatically; lower call sites via the existing dispatch mechanism (no per-name dispatch arm needed — the FFI-call lowering generalises).
+5. Stdlib migration: convert `std/io.sigil`, `std/array.sigil`, `std/mut_array.sigil`, `std/byte_array.sigil`, `std/mut_byte_array.sigil`, plus future Task 67 `string_builder`, Task 69 `int64`, etc. from doc-only to fully-declared.
+
+**Failure mode (today).** Adding a new runtime-backed stdlib primitive in v1 requires the full mechanical sweep: runtime FFI + counter/tag wiring + typecheck builtin scheme + codegen FuncId/FuncRef extension + dispatch arm + `type_of_expr` prediction + entry-walker globals + doc-only `.sigil` update + tests. PR #42 review #10 already drove the `BuiltinFuncIds` / `BuiltinFuncRefs` consolidation that absorbed most of the per-call-site cost; the remaining ~5-line-per-primitive overhead is what v2 retires.
+
+**Implementing commit(s).** Tracking entry only. Would land as a separate language-surface task; documented here so Task 67+ implementers know the convention is v1-bounded, not architectural.
+
+## 2026-04-30 — [DEVIATION Task 66.6] Plan A2's `byte_to_int` finally wired to the sigil surface
+
+**Context.** Plan A2 task 25 shipped `sigil_byte_to_int` (i.e. `Byte -> Int` widening) as a runtime FFI primitive, but never wired it through to a sigil-side builtin scheme — the surface plan called for `Char` / `Byte` work to grow incrementally and the loop closure was deferred each time. Task 66.6's e2e tests (`std_mut_byte_array_*`) need to widen a `Byte` back to `Int` for `int_to_string` + `IO.println` printing, surfacing the missing wire.
+
+**Why accepted.** Wiring it through is a 3-line change (codegen FFI declaration + dispatch arm + builtin scheme) that completes a Plan A2 carryover. The alternative — keeping `byte_to_int` as a runtime-only symbol and forcing test code to re-implement the widening via match expressions — is strictly worse and gates byte-typed test scenarios on no real architectural change.
+
+**Closure path.** Closed at this commit. `byte_to_int(Byte) -> Int ![]` is callable from sigil source. Plan A2's task 25 carryover line in `PLAN_A2_PROGRESS.md` is implicitly closed (the runtime symbol's surface exposure no longer pending).
+
+**Failure mode.** N/A — closure-completion entry.
+
+**Implementing commit(s).** `279c2d8` (the Task 66.6 commit pair).
+
+## 2026-04-30 — [DEVIATION Task 68] String surface — byte-indexed v1 + namespace-blocked v2 deferrals
+
+**Context.** Plan C Task 68's plan body lists 20 String operations: `string_length`, `string_byte_at`, `string_char_at`, `string_chars`, `string_concat`, `string_substring`, `string_compare`, `string_starts_with`, `string_ends_with`, `string_contains`, `string_index_of`, `string_split`, `string_join`, `string_trim`, `string_from_int`, `string_to_int`, `string_from_float`, `string_to_float`, `char_to_int`, `int_to_char`. Task 68 part 1 ships 12 of these; the remaining 8 are split across three deferral classes.
+
+**What ships in part 1 (12 ops).** All byte-indexed surface operations: `string_concat`, `string_substring`, `string_byte_at`, `string_compare`, `string_starts_with`, `string_ends_with`, `string_contains`, `string_index_of`, `string_trim`, `string_to_int_validate`, `string_to_int_parse`, `string_length`. Plus `byte_to_int` from the parallel Task 66.6 cleanup. Each registered via `register_builtin_string_schemes` and dispatched in `lower_call`.
+
+**Deferred class 1 — codepoint-aware ops (`string_char_at`, `string_chars`).** Both depend on a runtime UTF-8-aware iterator + the `Char` primitive promoted to user-side surface. v1 `Char` exists at the type level (Plan A2) but has no surface literal syntax; widening it to user-callable construction is a separate v2 task. Defer until the `Char` surface lands.
+
+**Deferred class 2 — List-returning helpers (`string_split`, `string_join`).** Both produce / consume `List[String]`. As with Task 66.5's `from_list` / `to_list`, putting `string_split` in `std/string.sigil` would force `import std.list`, and any user importing `std.string` + `std.option` + `std.result` together hits the flat-stdlib-namespace `fn map` collision (per `[DEVIATION Task 66.5]`). Defer until namespace qualification ships.
+
+**Deferred class 3 — Float helpers (`string_from_float`, `string_to_float`).** Sigil v1 has no `Float` primitive type. Defer until `Float` lands in v2 (the Plan C plan body doesn't queue a Float task; this is a v2 prerequisite).
+
+**Deferred class 4 — Sum-typed wrappers (`string_to_int`, `string_from_int`).** `string_to_int` ships as the validate / parse pair; the `Result[Int, ParseError]` user-facing wrapper is deferred under the same flat-namespace concern as Task 66.5. `string_from_int` is essentially `int_to_string` (which already ships from Plan A2); no new primitive needed.
+
+**Deferred class 5 — `char_to_int` / `int_to_char`.** Both depend on the user-side `Char` surface (same blocker as deferred class 1).
+
+**Why accepted.** The 12 byte-indexed ops give the rest of Stage 7's stdlib (Task 67's `string_builder`, Task 70's `IO.read_file`/`IO.write_file`, demos in Stage 8) a usable working set. The 8 deferred ops have specific, narrow blockers — none are blocked on Task 68 internals. Shipping the 12 unblocks P02's `string_concat` run-portion + P05/etc. that need substring/comparison; deferring 8 keeps Task 68 part 1 mechanical and reviewable.
+
+**Closure path.**
+- Codepoint ops: ship alongside `Char` user-surface widening (v2).
+- List ops: ship after stdlib namespace qualification.
+- Float ops: ship after `Float` primitive lands (v2).
+- Sum-typed wrappers: same as List ops (namespace).
+
+**Failure mode.** Users wanting deferred ops write equivalents in their own program against the byte-indexed primitives. Verbose but expressible for ASCII-pinned use cases.
+
+**Implementing commit(s).** `d6401b2`.
+
+## 2026-04-30 — [DEVIATION Task 70] IO op-id reordering + alphabetical ABI
+
+**Context.** Plan C Task 70 grew the builtin `IO` effect from 1 op (`println`) to 5 (`print`, `println`, `read_file`, `read_line`, `write_file`). Op IDs are assigned alphabetically per effect (per the convention from Plan B Task 55 Phase 4f's `BUILTIN_EFFECT_NAMES`). After Task 70:
+
+```
+IO.print      → op_id 0
+IO.println    → op_id 1   (was op_id 0 pre-Task-70)
+IO.read_file  → op_id 2
+IO.read_line  → op_id 3
+IO.write_file → op_id 4
+```
+
+Adding the 4 new ops shifted `println` from op_id 0 to op_id 1.
+
+**Why accepted (alphabetical ordering).** Plan B Task 55 Phase 4f committed to alphabetical-by-effect-then-by-user op_id assignment. The compiler dynamically re-assigns op_ids at typecheck (no hardcoded integer constants in production code), so the runtime ABI continues to work after the shift. The main shim's hardcoded "IO arm at op_id 0" call updated mechanically to install all 5 arms at their alphabetical positions.
+
+**The breaking-change risk.** Pre-Task-70 the partial-handler test `user_discard_k_io_handler_unwinds_helper_at_perform_site` registered a 1-arm handler `IO.println(s, k) => 0`. Post-Task-70 the handler is partial (4 of 5 IO ops uncovered) and trips E0142. **The CI regression on PR #43 (commit `25b8aec`, fixed at `8fc57b0`) is exactly this failure mode** — hardcoded per-effect handler arm sets need to grow when the effect adds ops.
+
+Architectural escalation flagged in PR #43's review: "any test loadbearing on a specific op_id ordering is now silently brittle." Audit confirmed no production code hardcodes op_ids — codegen and typecheck both look them up dynamically — so the breaking change is bounded to test-suite-level handler completeness checks.
+
+**Closure path.** Future ops added to existing builtin effects (Tasks 71-76's user-effect handlers don't touch builtins) face the same op_id-shift risk; partial-handler tests need updating in the same commit. The `extern fn` + `opaque type` v2 path doesn't change this (the typecheck-side enforcement is independent).
+
+**Failure mode.** Same as the CI regression: typecheck rejects partial handlers with E0142. The fix is mechanical (add missing arms with discharge-`k` shapes).
+
+**Implementing commit(s).** `25b8aec` (Task 70 + 74); `8fc57b0` (CI fix for the broken partial-handler test).
+
+## 2026-04-30 — [DEVIATION Task 74] Mem ships entirely as a marker effect
+
+**Context.** Plan C Task 74's plan body says: "the handler performs in-place mutation on `MutArray` and rope operations on `StringBuilder`. `main` functions that need mutation declare `![Mem, ...]` in their row." This implies Mem operations are intercepted at a top-level handler frame.
+
+**Why accepted (marker-only).** Per `[DEVIATION Task 66]` Mem ships as a marker effect with zero ops in v1: the Plan C Stage 7 design accommodates generic-typed runtime types (`MutArray[A]`, `MutByteArray`, `StringBuilder`) by gating their ops on the row rather than dispatching through perform. Task 74's "`main` declares `![Mem]`" remains true; the "top-level handler" the plan body references is the type-level absence of a deeper override (no runtime handler frame is installed because there are no ops to dispatch).
+
+**What ships.** `std/mem.sigil` documentation file added to `imports::BUILTIN_INJECTED` skip-list. Doc covers the marker-effect rationale + v2 closure path.
+
+**Closure path.** When `effect Mem[A] { new_array, get, set, ... }` ships as a generic builtin (deferred from Task 66), Task 74 closes by reframing `std/mem.sigil` from doc-only to a real importable module that declares the handler operations. User code stays surface-stable across the v1 → v2 shift.
+
+**Failure mode.** Users trying to intercept Mem operations via `handle ... with { Mem.X(...) => ... }` get E0139 (unknown op on declared effect) until v2 ships generic Mem ops. Documented in `std/mem.sigil`.
+
+**Implementing commit(s).** `25b8aec`.
+
+## 2026-04-30 — [DEVIATION Task 75 + 76] Pseudo-random naming + Int64-blocked deferred handlers
+
+**Context.** Plan C Tasks 75 and 76 specify `Random` and `Clock` effects with `os_seed()` / `seeded(Int64)` and `os_clock()` / `frozen(Int64)` handlers respectively. Two deferral classes apply.
+
+**Class 1 — Naming honesty.** The plan body's `os_seed()` handler implies OS-level entropy (`getrandom(2)` / `BCryptGenRandom`). Sigil v1 has neither a `getrandom`-class crate nor direct syscall plumbing; shipping the runtime-side primitive as `sigil_random_os_int` would mislead users into reaching for it for tokens, salts, session IDs, etc. — a footgun.
+
+**Why accepted (rename to `pseudo`).** The runtime primitive is renamed `sigil_random_pseudo_int`; the sigil-side surface is `random_pseudo_int` + `run_pseudo_random`. The `Random` effect itself stays neutral (`rand_int` op name), since `random_int` is what the user calls and the effect's quality is pinned by the active handler at the use site. Documentation in `runtime/src/random.rs` and `std/random.sigil` carries an explicit "NOT CRYPTOGRAPHICALLY SECURE" warning. v2 will add a real `os_random_int` primitive backed by `getrandom(2)` / `getentropy(3)` / `BCryptGenRandom`, with a parallel `run_os_random` handler; the pseudo-random surface stays for tests and reproducibility.
+
+**Class 2 — Int64-blocked handlers.** The plan-body `seeded(Int64)` (Task 75) and `frozen(Int64)` (Task 76) handlers depend on Plan C Task 69 (`Int64`). Both are deferred to Task 75-followup / Task 76-followup once Int64 ships.
+
+**Class 3 — Clock saturation semantics.** `Clock.now() -> Int` returns 63-bit non-negative nanos since Unix epoch (sigil's `Int` reserves the high bit at the runtime Value layer). Past year ~2262, the value would exceed `i64::MAX`; the runtime saturates at `i64::MAX` rather than wrapping silently. Documented in `runtime/src/clock.rs`.
+
+**Closure path.** Pseudo-rename closes when v2's true OS-entropy primitive lands and the parallel `run_os_random` handler ships in `std/random.sigil`. Int64-blocked handlers close when Task 69 ships. Clock saturation is a long-tail v2 concern (year 2262 ≈ 240 years out).
+
+**Failure mode (Random).** Pre-rename users would reach for `os_random` / `random_os_int` for security-sensitive contexts and get a fully-predictable PRNG. Post-rename, the `pseudo` substring + module-doc warning + std/random.sigil doc warning keep the non-crypto property visible at every call site.
+
+**Failure mode (Clock).** Saturation at year 2262 is silent at the type level (returns `i64::MAX`); user code can detect saturation by `==` comparison.
+
+**Implementing commit(s).** `91d1e55` (initial Tasks 75 + 76 land); [HEAD] (Random rename + scheme-organisation + clock saturation explicit).

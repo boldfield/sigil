@@ -1974,13 +1974,22 @@ fn user_discard_k_io_handler_unwinds_helper_at_perform_site() {
     //
     // The fix-PR un-ignores + verifies the assertion. No source
     // edits to this test should be required at fix time.
+    // Plan C Task 70 expanded `IO` from 1 op (println) to 5 (print,
+    // println, read_file, read_line, write_file). The user handler
+    // must be exhaustive — the discard-k semantics this test pins
+    // apply uniformly across all ops; only the println arm is
+    // exercised at runtime since helper() performs only println.
     let src = "fn helper() -> Int ![IO] {\n  \
                  perform IO.println(\"a\");\n  \
                  1\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle helper() with {\n    \
-                   IO.println(s, k) => 0,\n  \
+                   IO.print(s, k) => 0,\n    \
+                   IO.println(s, k) => 0,\n    \
+                   IO.read_file(p, k) => 0,\n    \
+                   IO.read_line(k) => 0,\n    \
+                   IO.write_file(p, d, k) => 0,\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
@@ -6358,6 +6367,459 @@ fn std_array_import_is_noop_no_op() {
     let (stdout, stderr, code) = compile_and_run(src, "std_array_import_noop");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "5\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 66.5 — ByteArray runtime + builtin coverage =====
+//
+// `ByteArray` is a non-generic builtin type with flat-byte payload
+// (1 byte per slot vs `Array[A]`'s 64-bit slots). The 6 core ops +
+// 3 string-interop primitives + 2 Byte helpers are registered as
+// non-generic builtin schemes (`register_builtin_byte_array_schemes`)
+// and dispatched in `lower_call`. v1 user-side wrappers
+// (`byte_from_int`, `string_from_bytes`, `from_list`, `to_list`)
+// deferred per `[DEVIATION Task 66.5]` due to flat-namespace
+// stdlib collision; tests use the runtime primitives directly.
+
+/// Allocate a 5-byte array, read it back via byte_array_length.
+#[test]
+fn std_byte_array_alloc_length_returns_5() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = byte_truncate(0);\n  \
+                 let ba: ByteArray = byte_array_alloc(5, b);\n  \
+                 perform IO.println(int_to_string(byte_array_length(ba)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_length");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n", "stderr={stderr:?}");
+}
+
+/// `byte_array_get` reads back the fill byte.
+#[test]
+fn std_byte_array_get_returns_fill() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = byte_truncate(66);\n  \
+                 let ba: ByteArray = byte_array_alloc(3, b);\n  \
+                 let read_back: Byte = byte_array_get(ba, 1);\n  \
+                 perform IO.println(int_to_string(byte_to_int(read_back)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_get");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "66\n", "stderr={stderr:?}");
+}
+
+/// `byte_array_concat` joins two arrays end-to-end.
+#[test]
+fn std_byte_array_concat_joins_lengths() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b1: Byte = byte_truncate(1);\n  \
+                 let b2: Byte = byte_truncate(2);\n  \
+                 let a: ByteArray = byte_array_alloc(3, b1);\n  \
+                 let b: ByteArray = byte_array_alloc(2, b2);\n  \
+                 let c: ByteArray = byte_array_concat(a, b);\n  \
+                 perform IO.println(int_to_string(byte_array_length(c)));\n  \
+                 perform IO.println(int_to_string(byte_to_int(byte_array_get(c, 0))));\n  \
+                 perform IO.println(int_to_string(byte_to_int(byte_array_get(c, 4))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_concat");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n1\n2\n", "stderr={stderr:?}");
+}
+
+/// `byte_array_slice(c, start, end)` extracts a subrange.
+#[test]
+fn std_byte_array_slice_extracts_subrange() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = byte_truncate(7);\n  \
+                 let ba: ByteArray = byte_array_alloc(10, b);\n  \
+                 let s: ByteArray = byte_array_slice(ba, 2, 6);\n  \
+                 perform IO.println(int_to_string(byte_array_length(s)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_slice");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "4\n", "stderr={stderr:?}");
+}
+
+/// `byte_array_empty` returns a zero-length byte-array.
+#[test]
+fn std_byte_array_empty_returns_zero_length() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let ba: ByteArray = byte_array_empty();\n  \
+                 perform IO.println(int_to_string(byte_array_length(ba)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_empty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// String round-trip: `string_to_bytes` followed by validate + alloc
+/// recovers the original ASCII string verbatim.
+#[test]
+fn std_byte_array_string_round_trip_ascii() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let bytes: ByteArray = string_to_bytes(\"hello\");\n  \
+                 let v: Int = string_from_bytes_validate(bytes);\n  \
+                 match v {\n    \
+                   -1 => perform IO.println(string_from_bytes_alloc(bytes)),\n    \
+                   _ => perform IO.println(\"invalid\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_string_round_trip");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello\n", "stderr={stderr:?}");
+}
+
+/// `byte_in_range` returns true for in-range Ints, false otherwise.
+/// Pins the gating helper for any user-side `byte_from_int` wrapper.
+#[test]
+fn std_byte_in_range_accepts_zero_to_255() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 match byte_in_range(0) {\n    \
+                   true => perform IO.println(\"in0\"),\n    \
+                   false => perform IO.println(\"out0\"),\n  \
+                 };\n  \
+                 match byte_in_range(255) {\n    \
+                   true => perform IO.println(\"in255\"),\n    \
+                   false => perform IO.println(\"out255\"),\n  \
+                 };\n  \
+                 match byte_in_range(256) {\n    \
+                   true => perform IO.println(\"in256\"),\n    \
+                   false => perform IO.println(\"out256\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_in_range");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "in0\nin255\nout256\n", "stderr={stderr:?}");
+}
+
+/// `import std.byte_array` is a no-op (skip-list path).
+#[test]
+fn std_byte_array_import_is_noop() {
+    let src = "import std.byte_array\n\
+               fn main() -> Int ![IO] {\n  \
+                 let ba: ByteArray = byte_array_empty();\n  \
+                 perform IO.println(int_to_string(byte_array_length(ba)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 66.6 — MutByteArray runtime + Mem-gated coverage =====
+
+/// Allocate a 3-byte mutable array, mutate slot 1 in place, read it
+/// back. Pin the in-place mutation contract for the byte payload.
+#[test]
+fn std_mut_byte_array_set_mutates_in_place() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let zero: Byte = byte_truncate(0);\n  \
+                 let v42: Byte = byte_truncate(42);\n  \
+                 let ba: MutByteArray = mut_byte_array_new(3, zero);\n  \
+                 mut_byte_array_set(ba, 1, v42);\n  \
+                 let v: Byte = mut_byte_array_get(ba, 1);\n  \
+                 perform IO.println(int_to_string(byte_to_int(v)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_set_in_place");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// Multiple sets accumulate in the same byte-array — no fresh
+/// allocations.
+#[test]
+fn std_mut_byte_array_set_chain_accumulates() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let zero: Byte = byte_truncate(0);\n  \
+                 let ba: MutByteArray = mut_byte_array_new(4, zero);\n  \
+                 mut_byte_array_set(ba, 0, byte_truncate(10));\n  \
+                 mut_byte_array_set(ba, 1, byte_truncate(20));\n  \
+                 mut_byte_array_set(ba, 2, byte_truncate(30));\n  \
+                 mut_byte_array_set(ba, 3, byte_truncate(40));\n  \
+                 let total: Int = byte_to_int(mut_byte_array_get(ba, 0))\n    \
+                   + byte_to_int(mut_byte_array_get(ba, 1))\n    \
+                   + byte_to_int(mut_byte_array_get(ba, 2))\n    \
+                   + byte_to_int(mut_byte_array_get(ba, 3));\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_chain");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "100\n", "stderr={stderr:?}");
+}
+
+/// 1024-byte mutable buffer — past the count cap, exercises the
+/// payload-length-word convention for typical network-buffer sizes.
+#[test]
+fn std_mut_byte_array_at_buffer_size() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let zero: Byte = byte_truncate(0);\n  \
+                 let ba: MutByteArray = mut_byte_array_new(1024, zero);\n  \
+                 mut_byte_array_set(ba, 1023, byte_truncate(99));\n  \
+                 let n: Int = mut_byte_array_length(ba);\n  \
+                 let v: Int = byte_to_int(mut_byte_array_get(ba, 1023));\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_buffer");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1024\n99\n", "stderr={stderr:?}");
+}
+
+/// Mutation propagates across function-call boundaries — passing a
+/// MutByteArray to a helper fn (declared `![Mem]`) and mutating
+/// there affects the caller's view of the same array.
+#[test]
+fn std_mut_byte_array_mutation_visible_across_fn_boundary() {
+    let src = "fn fill_at(ba: MutByteArray, i: Int, v: Byte) -> Unit ![Mem] {\n  \
+                 mut_byte_array_set(ba, i, v)\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let zero: Byte = byte_truncate(0);\n  \
+                 let ba: MutByteArray = mut_byte_array_new(3, zero);\n  \
+                 fill_at(ba, 1, byte_truncate(77));\n  \
+                 perform IO.println(int_to_string(byte_to_int(mut_byte_array_get(ba, 1))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_cross_fn");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "77\n", "stderr={stderr:?}");
+}
+
+/// `import std.mut_byte_array` is a no-op (skip-list path).
+#[test]
+fn std_mut_byte_array_import_is_noop() {
+    let src = "import std.mut_byte_array\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let zero: Byte = byte_truncate(0);\n  \
+                 let ba: MutByteArray = mut_byte_array_new(0, zero);\n  \
+                 perform IO.println(int_to_string(mut_byte_array_length(ba)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 68 — extended String primitives =====
+
+/// `string_concat` joins two strings into a fresh allocation.
+/// Pin the surface that unblocks P02's run-portion.
+#[test]
+fn std_string_concat_returns_joined() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_concat(\"hello, \", \"world\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_concat");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello, world\n", "stderr={stderr:?}");
+}
+
+/// `string_substring` extracts a half-open `[start, end)` byte range.
+#[test]
+fn std_string_substring_extracts_bytes() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_substring(\"0123456789\", 3, 7));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_substring");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3456\n", "stderr={stderr:?}");
+}
+
+/// `string_compare` returns -1 / 0 / 1 lex-order.
+#[test]
+fn std_string_compare_lt_eq_gt() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(string_compare(\"a\", \"b\")));\n  \
+                 perform IO.println(int_to_string(string_compare(\"b\", \"a\")));\n  \
+                 perform IO.println(int_to_string(string_compare(\"a\", \"a\")));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_compare");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "-1\n1\n0\n", "stderr={stderr:?}");
+}
+
+/// `string_starts_with` / `_ends_with` / `_contains` — boolean
+/// predicates over byte sequences.
+#[test]
+fn std_string_predicates_return_bools() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 match string_starts_with(\"hello world\", \"hello\") {\n    \
+                   true => perform IO.println(\"sw_yes\"),\n    \
+                   false => perform IO.println(\"sw_no\"),\n  \
+                 };\n  \
+                 match string_ends_with(\"hello world\", \"world\") {\n    \
+                   true => perform IO.println(\"ew_yes\"),\n    \
+                   false => perform IO.println(\"ew_no\"),\n  \
+                 };\n  \
+                 match string_contains(\"hello world\", \"o w\") {\n    \
+                   true => perform IO.println(\"ct_yes\"),\n    \
+                   false => perform IO.println(\"ct_no\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_predicates");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "sw_yes\new_yes\nct_yes\n", "stderr={stderr:?}");
+}
+
+/// `string_index_of` returns the byte offset of the first match;
+/// -1 when absent; 0 for an empty needle.
+#[test]
+fn std_string_index_of_returns_byte_offset() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(string_index_of(\"abcabc\", \"bc\")));\n  \
+                 perform IO.println(int_to_string(string_index_of(\"abc\", \"xyz\")));\n  \
+                 perform IO.println(int_to_string(string_index_of(\"abc\", \"\")));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_index_of");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n-1\n0\n", "stderr={stderr:?}");
+}
+
+/// `string_byte_at` returns the i-th byte; pair with `byte_to_int`
+/// to print the numeric value.
+#[test]
+fn std_string_byte_at_returns_byte() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = string_byte_at(\"ABC\", 1);\n  \
+                 perform IO.println(int_to_string(byte_to_int(b)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_byte_at");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // 'B' is ASCII 66.
+    assert_eq!(stdout, "66\n", "stderr={stderr:?}");
+}
+
+/// `string_trim` strips ASCII whitespace from both sides.
+#[test]
+fn std_string_trim_strips_whitespace() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_trim(\"  hello world  \"));\n  \
+                 perform IO.println(int_to_string(string_length(string_trim(\"   \"))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_trim");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello world\n0\n", "stderr={stderr:?}");
+}
+
+/// `string_to_int_validate` + `string_to_int_parse` round-trip on a
+/// clean decimal; rejects empty / non-decimal / overflow with
+/// distinct discriminants (1 / 2 / 3).
+#[test]
+fn std_string_to_int_validate_and_parse() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let v: Int = string_to_int_validate(\"42\");\n  \
+                 match v {\n    \
+                   0 => perform IO.println(int_to_string(string_to_int_parse(\"42\"))),\n    \
+                   _ => perform IO.println(\"unexpected\"),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(string_to_int_validate(\"\")));\n  \
+                 perform IO.println(int_to_string(string_to_int_validate(\"abc\")));\n  \
+                 perform IO.println(int_to_string(string_to_int_validate(\"9223372036854775808\")));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_to_int");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n1\n2\n3\n", "stderr={stderr:?}");
+}
+
+/// `string_length` is the surface name for the Plan A1
+/// `sigil_string_len` runtime primitive. Both ASCII and UTF-8
+/// strings report byte length.
+#[test]
+fn std_string_length_returns_byte_count() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(string_length(\"hello\")));\n  \
+                 perform IO.println(int_to_string(string_length(\"\")));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_length");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n0\n", "stderr={stderr:?}");
+}
+
+/// `import std.string` is a no-op (skip-list path).
+#[test]
+fn std_string_import_is_noop() {
+    let src = "import std.string\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_concat(\"a\", \"b\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "ab\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 70 — IO extensions =====
+
+/// `IO.print` writes without a newline, then `IO.println` finishes
+/// with one. Pin the surface against the existing IO handler frame.
+#[test]
+fn std_io_print_without_newline() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.print(\"hello \");\n  \
+                 perform IO.println(\"world\");\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_io_print");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello world\n", "stderr={stderr:?}");
+}
+
+/// `IO.read_line` reads a single line from stdin. Driving stdin
+/// from cargo test is awkward (would need to spawn the compiled
+/// binary with a piped stdin and feed it bytes); marked `#[ignore]`
+/// as a placeholder so the absence-of-coverage stays grep-findable
+/// for future test infra work. The compile-only path is exercised
+/// by the `io_read_line_returns_string` typecheck test.
+#[test]
+#[ignore = "needs piped-stdin test infrastructure; tracked for Task 78"]
+fn std_io_read_line_via_piped_stdin_pending_test_infra() {
+    // The future-shape:
+    //   - Spawn the compiled binary with a pipe to stdin.
+    //   - Write `"hello\n"` to the pipe; close it.
+    //   - Assert stdout contains `"hello\n"` (round-trip).
+    //
+    // The runtime contract is pinned by `runtime/src/io.rs`'s
+    // `sigil_read_line` Rust unit (read_line strips exactly one
+    // trailing `\n` or `\r\n`, EOF returns empty).
+    let _ = "placeholder";
+}
+
+/// `IO.write_file` then `IO.read_file` round-trips a string through
+/// the filesystem. Uses a tmp path to avoid CI / pod conflicts.
+#[test]
+fn std_io_read_write_file_round_trip() {
+    let tmp = std::env::temp_dir().join(format!("sigil_e2e_io_rw_{}.txt", std::process::id()));
+    let tmp_str = tmp.to_str().expect("tmp path utf8");
+    let src = format!(
+        "fn main() -> Int ![IO] {{\n  \
+           perform IO.write_file(\"{tmp_str}\", \"hello, file\");\n  \
+           let contents: String = perform IO.read_file(\"{tmp_str}\");\n  \
+           perform IO.println(contents);\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "std_io_read_write_file");
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello, file\n", "stderr={stderr:?}");
 }
 
 // ===== Plan C Task 64 — std/list run-and-check-output =====

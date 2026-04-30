@@ -1,19 +1,69 @@
 // sigil: 0.1
 //
-// Standard IO effect. Documentation only — this file is **not**
-// loaded by typecheck. Per `[DEVIATION Task 57] Builtin-effect
+// std/io.sigil — IO effect declaration.
+//
+// **Documentation only.** Per `[DEVIATION Task 57] Builtin-effect
 // injection (vs. full stdlib loading)` in PLAN_B_DEVIATIONS.md, the
 // `effect IO { ... }` declaration is constructed in code by
 // `compiler/src/typecheck.rs::builtin_effects()` and injected into
-// `tc.effects` at typecheck pre-pass start. `Item::Import(_)` is a
-// no-op everywhere in the pipeline today, so a user `import std.io`
-// statement parses fine but does not feed this file's contents to
-// the typechecker. A future stdlib-loading task may swap the
-// synthetic injection for a real import-resolution pipeline; until
-// then, edits to this file have no effect on compilation. The
-// builtin-injection path is the source of truth for the IO
-// effect's shape.
+// `tc.effects` at typecheck pre-pass start. The runtime arm fns
+// (`sigil_io_*_arm`) are installed at the top-level IO frame by the
+// main shim; user code does `perform IO.<op>(...)` and the
+// trampoline dispatches to the runtime arm. `import std.io` is a
+// no-op (skip-list path).
+//
+// ## ⚠️ Unsandboxed filesystem access
+//
+// `IO.read_file` and `IO.write_file` pass paths straight to
+// `std::fs::read_to_string` / `std::fs::write` without any
+// sandboxing or path validation. The compiled program inherits
+// the host process's filesystem privileges. v1's threat model is
+// "the program does what its source says"; if you don't trust
+// the source, don't compile + run it. Future v2 work may add an
+// effect handler that intercepts file ops to enforce a sandbox
+// (chroot-style root prefix, allowlist of paths, etc.) — the
+// effect declaration already gives users a place to install such
+// a handler via `handle ... with { IO.read_file(p, k) => ... }`.
+//
+// ## Operations (Plan A1 + Plan C Task 70)
+//
+// - `IO.print(s: String) -> Unit` — write `s` to stdout, no
+//   newline. (Plan C Task 70.)
+// - `IO.println(s: String) -> Unit` — write `s` to stdout
+//   followed by `"\n"`. (Plan A1; ABI shape established by
+//   Plan B Task 57.)
+// - `IO.read_line() -> String` — read a single line from stdin;
+//   trailing CR/LF stripped. EOF returns the empty string. IO
+//   error aborts. (Plan C Task 70.)
+// - `IO.read_file(path: String) -> String` — read the contents of
+//   `path` as a UTF-8 String. IO error or invalid UTF-8 aborts.
+//   (Plan C Task 70.)
+// - `IO.write_file(path: String, data: String) -> Unit` — write
+//   `data` to `path`, replacing any existing contents. IO error
+//   aborts. (Plan C Task 70.)
+//
+// ## Op-id ordering
+//
+// Op IDs are assigned alphabetically per effect. Post-Task-70 the
+// IO ordering is:
+//
+//   0 = print
+//   1 = println
+//   2 = read_file
+//   3 = read_line
+//   4 = write_file
+//
+// The `main` shim installs each runtime arm fn at its op_id.
+// Adding a new IO op is a 4-step mechanical change: extend
+// `builtin_effects()`'s IO entry, add `sigil_io_<op>_arm` to
+// `runtime/src/handlers.rs`, declare it in codegen's main shim
+// setup, and update the main shim's `arm_count` plus the per-arm
+// `install_io_arm` call list.
 
 effect IO {
+  print: (String) -> Unit,
   println: (String) -> Unit,
+  read_file: (String) -> String,
+  read_line: () -> String,
+  write_file: (String, String) -> Unit,
 }

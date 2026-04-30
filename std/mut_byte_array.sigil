@@ -1,0 +1,59 @@
+// sigil: 0.1
+//
+// std/mut_byte_array.sigil — Plan C Task 66.6.
+//
+// **Documentation only.** Like `std/io.sigil`, `std/array.sigil`,
+// `std/mut_array.sigil`, and `std/byte_array.sigil`, this file does
+// not participate in typecheck. The `MutByteArray` type and its four
+// operations are registered at the typechecker as builtins via
+// `builtin_types()` and `register_builtin_mut_byte_array_schemes()`.
+// `import std.mut_byte_array` is allowed (skip-list path) but is
+// not required.
+//
+// `MutByteArray` is the mutable companion to `ByteArray` (Task 66.5)
+// — same flat-byte payload, same Boehm-atomic GC layout, but with
+// in-place mutation gated through the `Mem` marker effect. Backs
+// network buffers, file IO, and any binary construction that wants
+// to avoid the O(n²) repeated-concat shape.
+//
+// ## Operations
+//
+// - `mut_byte_array_new(len: Int, fill: Byte) -> MutByteArray ![Mem]`
+//   Allocate a fresh mutable byte-array of `len` bytes, each
+//   initialised to `fill`.
+//
+// - `mut_byte_array_length(ba: MutByteArray) -> Int ![Mem]`
+//   Read the byte count in O(1).
+//
+// - `mut_byte_array_get(ba: MutByteArray, i: Int) -> Byte ![Mem]`
+//   Read byte `i` in O(1). Aborts on out-of-bounds.
+//
+// - `mut_byte_array_set(ba: MutByteArray, i: Int, val: Byte) -> Unit ![Mem]`
+//   Mutate byte `i` to `val` in place. Aborts on out-of-bounds.
+//
+// ## Layout
+//
+// Each `MutByteArray` is `{ header(TAG_MUT_BYTE_ARRAY=0x07,
+// count=0, bitmap=0), length: u64, byte[0..N] }`. Identical heap
+// shape to `ByteArray` but with a distinct tag so a v2 GC walker
+// can apply per-tag write-barrier semantics. v1's Boehm
+// conservative collector needs no write barrier (the mark phase
+// scans the whole heap conservatively); v2 migration to a precise /
+// moving GC will need one.
+//
+// ## Mem effect gate
+//
+// `mut_byte_array_*` ops declare `effects: vec!["Mem"]` on their
+// builtin schemes; callers without `Mem` in their effect row trip
+// E0042 at the call site. `main` declares `![Mem]` to permit
+// mutation; the type-level "top-level Mem handler" is the absence
+// of a deeper override (Mem has zero ops in v1; see
+// `[DEVIATION Task 66]`). Mutation interception via
+// `handle Mem.X with` is NOT supported in v1.
+//
+// ## v1 vs v2
+//
+// v1 ships the four primitives. A future Plan C task may add
+// helpers like `byte_array_to_mut(ba) -> MutByteArray` (clone) and
+// `mut_byte_array_freeze(mba) -> ByteArray` (no-clone freeze) once
+// the Mem effect grows generic ops in v2.

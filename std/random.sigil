@@ -1,0 +1,62 @@
+// sigil: 0.1
+//
+// std/random.sigil — Plan C Task 75.
+//
+// `Random` is a user-declared effect with a single op,
+// `rand_int() -> Int`. The stdlib ships a pseudo-random handler
+// (`run_pseudo_random`) backed by a process-global xorshift64 PRNG
+// (seeded once at first use from system clock + process ID).
+//
+// # ⚠️ NOT CRYPTOGRAPHICALLY SECURE
+//
+// `random_pseudo_int` and `run_pseudo_random` are deterministic
+// from a small number of observed outputs. **Do not use** for
+// tokens, salts, session IDs, key material, or any other
+// security-relevant context. Names use `pseudo` rather than `os` /
+// `random` to keep the non-crypto property visible at every call
+// site.
+//
+// v2 will add an `os_random_int` primitive backed by `getrandom(2)`
+// / `getentropy(3)` / `BCryptGenRandom`; the Sigil-side surface
+// gains a parallel `run_os_random` handler at that point. The
+// pseudo-random surface stays for tests and reproducibility.
+//
+// ## Design notes
+//
+// - `Int` is sigil's i64 (with the high bit reserved at the runtime
+//   Value level). The builtin `random_pseudo_int` returns a 63-bit
+//   non-negative int. Users wanting a smaller range mod the result
+//   themselves: `random_int_below(n) = random_int() % n`.
+//
+// - The plan body specifies a `seeded(Int64)` handler that installs
+//   a deterministic PRNG. That handler is **deferred to a Task 75
+//   follow-up** alongside Task 69 (Int64). An actual implementation
+//   would carry PRNG state via a `MutArray[Int]` in the handler's
+//   closure and step it on each draw, gated on `![Random, Mem]`.
+
+effect Random {
+  rand_int: () -> Int,
+}
+
+// `random_int()` is the user-facing convenience wrapper. Inside
+// any function whose effect row contains `Random`, `random_int()`
+// performs the effect and returns whatever value the active
+// handler resumes with.
+fn random_int() -> Int ![Random] {
+  perform Random.rand_int()
+}
+
+// `run_pseudo_random(body)` discharges the `Random` effect using
+// the process-global xorshift64 PRNG. Every `Random.rand_int(k)`
+// arm resumes `k` with a fresh `random_pseudo_int()` value.
+//
+// **Pseudo-random only — see top-of-file warning.**
+//
+// Higher-order helpers like this depend on Plan B' B.3 (TypeExpr::Fn
+// in parameter types) and B.4 (lambdas / generic callees inside
+// arm bodies) — both shipped in PR #39's run_state landing.
+fn run_pseudo_random[A](body: () -> A ![Random]) -> A ![] {
+  handle body() with {
+    Random.rand_int(k) => k(random_pseudo_int()),
+  }
+}

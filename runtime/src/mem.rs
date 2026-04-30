@@ -50,7 +50,7 @@
 
 use crate::counters::{self, CounterId};
 use crate::gc::sigil_alloc;
-use crate::header::{Header, TAG_MUT_ARRAY};
+use crate::header::{Header, TAG_MUT_ARRAY, TAG_MUT_BYTE_ARRAY};
 
 /// Allocate a fresh mutable array of `len` elements, each initialised
 /// to `fill`. Returns a header pointer.
@@ -140,6 +140,125 @@ pub unsafe extern "C" fn sigil_mut_array_set(arr: *mut u8, i: u64, val: u64) {
     let elems_ptr: *mut u64 = arr.add(16).cast();
     // SAFETY: gc-heap-ptr arithmetic (transient add(i) for one aligned u64 write).
     elems_ptr.add(i as usize).write(val);
+}
+
+// ===== Plan C Task 66.6 — `MutByteArray` primitives =====
+//
+// Mirrors `runtime/src/byte_array.rs`'s immutable surface but with
+// in-place mutation. Heap layout is identical: `{header, length:u64,
+// byte[0..N]}`. Bitmap is 0 (atomic GC scan); bytes are pure scalars.
+// The byte payload is rounded up to a word boundary at allocation
+// time so the object's payload-byte size is a multiple of 8.
+
+#[inline]
+fn round_up_to_word(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+#[inline]
+fn mut_byte_payload_bytes_for(len: u64) -> usize {
+    8usize.saturating_add(round_up_to_word(len as usize))
+}
+
+/// Allocate a fresh mutable byte-array of `len` bytes, each
+/// initialised to `fill`. Returns the header pointer.
+///
+/// # Safety
+///
+/// Safe to call from any thread (Boehm-managed allocation).
+#[no_mangle]
+pub extern "C" fn sigil_mut_byte_array_new(len: u64, fill: u8) -> *mut u8 {
+    if (len as i64) < 0 {
+        eprintln!("sigil_mut_byte_array_new: negative length {}", len as i64);
+        std::process::abort();
+    }
+    let payload_bytes = mut_byte_payload_bytes_for(len);
+    let h = Header::new(TAG_MUT_BYTE_ARRAY, 0, 0);
+    let obj = sigil_alloc(h.raw(), payload_bytes);
+
+    // Length word at offset 8.
+    //
+    // SAFETY: gc-heap-ptr arithmetic (transient base for one aligned u64 store).
+    unsafe {
+        let len_ptr: *mut u64 = obj.add(8).cast();
+        len_ptr.write(len);
+    }
+
+    // GC_malloc_atomic returns zeroed memory in Boehm; skip the
+    // per-byte fill loop when `fill == 0`.
+    if len > 0 && fill != 0 {
+        // SAFETY: gc-heap-ptr arithmetic (transient base for a single contiguous byte fill; bounds are `[16, 16+len)`).
+        unsafe {
+            let bytes_ptr: *mut u8 = obj.add(16);
+            std::ptr::write_bytes(bytes_ptr, fill, len as usize);
+        }
+    }
+
+    counters::incr(CounterId::MutByteArrayAllocCount);
+    counters::add(
+        CounterId::MutByteArrayAllocBytes,
+        (8 + payload_bytes) as u64,
+    );
+
+    obj
+}
+
+/// Read a mutable byte-array's length.
+///
+/// # Safety
+///
+/// `arr` must be a pointer to a valid `TAG_MUT_BYTE_ARRAY` header.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_mut_byte_array_length(arr: *const u8) -> u64 {
+    // SAFETY: gc-heap-ptr arithmetic (transient base for one u64 read).
+    let len_ptr: *const u64 = arr.add(8).cast();
+    len_ptr.read()
+}
+
+/// Read byte `i`. Aborts on out-of-bounds.
+///
+/// # Safety
+///
+/// Same as `sigil_mut_byte_array_length`.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_mut_byte_array_get(arr: *const u8, i: u64) -> u8 {
+    if (i as i64) < 0 {
+        eprintln!("sigil_mut_byte_array_get: negative index {}", i as i64);
+        std::process::abort();
+    }
+    let len = sigil_mut_byte_array_length(arr);
+    if i >= len {
+        eprintln!("sigil_mut_byte_array_get: index {i} out of bounds (len {len})");
+        std::process::abort();
+    }
+    // SAFETY: gc-heap-ptr arithmetic (transient base + bounds-checked index for one byte read).
+    let bytes_ptr: *const u8 = arr.add(16);
+    // SAFETY: gc-heap-ptr arithmetic (transient add(i) for one byte read).
+    bytes_ptr.add(i as usize).read()
+}
+
+/// Mutate byte `i` in place. Aborts on out-of-bounds. Returns Unit
+/// (zero-valued; sigil's Unit lowers to I8 zero at the surface).
+///
+/// # Safety
+///
+/// Same as `sigil_mut_byte_array_length`. Caller must ensure no
+/// concurrent reads of the same slot from another thread.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_mut_byte_array_set(arr: *mut u8, i: u64, val: u8) {
+    if (i as i64) < 0 {
+        eprintln!("sigil_mut_byte_array_set: negative index {}", i as i64);
+        std::process::abort();
+    }
+    let len = sigil_mut_byte_array_length(arr);
+    if i >= len {
+        eprintln!("sigil_mut_byte_array_set: index {i} out of bounds (len {len})");
+        std::process::abort();
+    }
+    // SAFETY: gc-heap-ptr arithmetic (transient base + bounds-checked index for one byte write).
+    let bytes_ptr: *mut u8 = arr.add(16);
+    // SAFETY: gc-heap-ptr arithmetic (transient add(i) for one byte write).
+    bytes_ptr.add(i as usize).write(val);
 }
 
 #[cfg(test)]
@@ -245,6 +364,91 @@ mod tests {
             let header = Header(header_ptr.read());
             assert_eq!(header.type_tag(), TAG_MUT_ARRAY);
             assert_ne!(header.pointer_bitmap(), 0);
+        }
+    }
+
+    // ===== Plan C Task 66.6 — MutByteArray primitives =====
+
+    #[test]
+    fn mut_byte_array_alloc_zero_length() {
+        let _guard = gc_test_lock();
+        let arr = sigil_mut_byte_array_new(0, 0);
+        unsafe {
+            assert_eq!(sigil_mut_byte_array_length(arr), 0);
+        }
+    }
+
+    #[test]
+    fn mut_byte_array_alloc_with_fill_initialises_all_bytes() {
+        let _guard = gc_test_lock();
+        let arr = sigil_mut_byte_array_new(7, 0xCC);
+        unsafe {
+            assert_eq!(sigil_mut_byte_array_length(arr), 7);
+            for i in 0..7 {
+                assert_eq!(sigil_mut_byte_array_get(arr, i), 0xCC, "byte {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn mut_byte_array_set_mutates_in_place() {
+        let _guard = gc_test_lock();
+        let arr = sigil_mut_byte_array_new(3, 0);
+        unsafe {
+            sigil_mut_byte_array_set(arr, 1, 42);
+            assert_eq!(sigil_mut_byte_array_get(arr, 0), 0);
+            assert_eq!(sigil_mut_byte_array_get(arr, 1), 42);
+            assert_eq!(sigil_mut_byte_array_get(arr, 2), 0);
+        }
+    }
+
+    #[test]
+    fn mut_byte_array_set_chain_accumulates() {
+        let _guard = gc_test_lock();
+        let arr = sigil_mut_byte_array_new(4, 0);
+        unsafe {
+            sigil_mut_byte_array_set(arr, 0, 10);
+            sigil_mut_byte_array_set(arr, 1, 20);
+            sigil_mut_byte_array_set(arr, 2, 30);
+            sigil_mut_byte_array_set(arr, 3, 40);
+            assert_eq!(sigil_mut_byte_array_get(arr, 0), 10);
+            assert_eq!(sigil_mut_byte_array_get(arr, 1), 20);
+            assert_eq!(sigil_mut_byte_array_get(arr, 2), 30);
+            assert_eq!(sigil_mut_byte_array_get(arr, 3), 40);
+        }
+    }
+
+    #[test]
+    fn mut_byte_array_alloc_at_count_field_boundary() {
+        // len=33 (mid-range) and len=64 (one past the 6-bit count
+        // cap). Pin the count-from-payload-length convention.
+        let _guard = gc_test_lock();
+        let arr_33 = sigil_mut_byte_array_new(33, 7);
+        unsafe {
+            assert_eq!(sigil_mut_byte_array_length(arr_33), 33);
+            sigil_mut_byte_array_set(arr_33, 32, 99);
+            assert_eq!(sigil_mut_byte_array_get(arr_33, 32), 99);
+            assert_eq!(sigil_mut_byte_array_get(arr_33, 0), 7);
+        }
+        let arr_64 = sigil_mut_byte_array_new(64, 11);
+        unsafe {
+            assert_eq!(sigil_mut_byte_array_length(arr_64), 64);
+            sigil_mut_byte_array_set(arr_64, 63, 200);
+            assert_eq!(sigil_mut_byte_array_get(arr_64, 63), 200);
+            assert_eq!(sigil_mut_byte_array_get(arr_64, 0), 11);
+        }
+    }
+
+    #[test]
+    fn header_tag_is_mut_byte_array() {
+        let _guard = gc_test_lock();
+        let arr = sigil_mut_byte_array_new(0, 0);
+        unsafe {
+            let header_ptr: *const u64 = arr.cast();
+            let header = Header(header_ptr.read());
+            assert_eq!(header.type_tag(), TAG_MUT_BYTE_ARRAY);
+            // Bitmap is zero — bytes are scalars, no GC pointers.
+            assert_eq!(header.pointer_bitmap(), 0);
         }
     }
 }

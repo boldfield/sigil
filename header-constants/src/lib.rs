@@ -55,6 +55,29 @@ pub const TAG_ARRAY: u8 = 0x04;
 /// array; `mut_array_set` returns Unit and mutates in place).
 pub const TAG_MUT_ARRAY: u8 = 0x05;
 
+/// Immutable byte-array layout — Plan C Task 66.5.
+/// `{header, length, byte[0], byte[1], ..., byte[N-1]}` packed.
+/// Length lives in payload word 0 (offset 8); bytes start at offset
+/// 16 with no per-element boxing. Bitmap is 0 (atomic GC scan): bytes
+/// are pure scalars, never pointers. The header `count` field is
+/// unused for the same reason as `TAG_ARRAY` (Sudoku-class lengths
+/// would overflow the 6-bit cap); allocator-tracked size scans the
+/// payload region.
+pub const TAG_BYTE_ARRAY: u8 = 0x06;
+
+/// Mutable byte-array layout — Plan C Task 66.6. Identical heap
+/// layout to `TAG_BYTE_ARRAY`: `{header, length, byte[0..N]}`. The
+/// distinct tag exists so a v2 GC walker can apply per-tag write-
+/// barrier semantics (mutation of byte slots needs no barrier in
+/// v1's Boehm conservative collector, but a precise / moving GC
+/// will need one), and so `byte_array_*` builtins reject
+/// `MutByteArray` arguments at runtime (or vice-versa) if static
+/// typecheck is bypassed. In v1 the layouts behave identically —
+/// only the surface API differs (`byte_array_concat` returns a
+/// fresh array, `mut_byte_array_set` returns Unit and mutates in
+/// place).
+pub const TAG_MUT_BYTE_ARRAY: u8 = 0x07;
+
 /// Payload-word-count field layout.
 pub const COUNT_BITS: u32 = 6;
 pub const COUNT_SHIFT: u32 = 8;
@@ -130,6 +153,8 @@ mod tests {
         assert_eq!(TAG_CLOSURE, 0x03);
         assert_eq!(TAG_ARRAY, 0x04);
         assert_eq!(TAG_MUT_ARRAY, 0x05);
+        assert_eq!(TAG_BYTE_ARRAY, 0x06);
+        assert_eq!(TAG_MUT_BYTE_ARRAY, 0x07);
         assert_eq!(TAG_EXTERNAL_DESCRIPTOR, 0xFF);
     }
 }

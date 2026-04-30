@@ -512,13 +512,54 @@ fn builtin_effects() -> Vec<EffectDecl> {
         name_span: span.clone(),
         generic_params: Vec::new(),
         resumes_many: false,
-        ops: vec![EffectOp {
-            name: "println".to_string(),
-            name_span: span.clone(),
-            params: vec![TypeExpr::Named("String".to_string(), span.clone())],
-            return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
-            span: span.clone(),
-        }],
+        ops: vec![
+            // Plan C Task 70 — `print(s)`: write `s` without newline.
+            EffectOp {
+                name: "print".to_string(),
+                name_span: span.clone(),
+                params: vec![TypeExpr::Named("String".to_string(), span.clone())],
+                return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
+                span: span.clone(),
+            },
+            // Plan A1 / Plan B Task 57 — `println(s)`.
+            EffectOp {
+                name: "println".to_string(),
+                name_span: span.clone(),
+                params: vec![TypeExpr::Named("String".to_string(), span.clone())],
+                return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
+                span: span.clone(),
+            },
+            // Plan C Task 70 — `read_file(path) -> String`. Aborts
+            // on IO error / invalid UTF-8.
+            EffectOp {
+                name: "read_file".to_string(),
+                name_span: span.clone(),
+                params: vec![TypeExpr::Named("String".to_string(), span.clone())],
+                return_type: TypeExpr::Named("String".to_string(), span.clone()),
+                span: span.clone(),
+            },
+            // Plan C Task 70 — `read_line() -> String`. Trailing CR/LF
+            // stripped. EOF without bytes returns the empty string.
+            EffectOp {
+                name: "read_line".to_string(),
+                name_span: span.clone(),
+                params: Vec::new(),
+                return_type: TypeExpr::Named("String".to_string(), span.clone()),
+                span: span.clone(),
+            },
+            // Plan C Task 70 — `write_file(path, data)`. Replaces
+            // existing contents.
+            EffectOp {
+                name: "write_file".to_string(),
+                name_span: span.clone(),
+                params: vec![
+                    TypeExpr::Named("String".to_string(), span.clone()),
+                    TypeExpr::Named("String".to_string(), span.clone()),
+                ],
+                return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
+                span: span.clone(),
+            },
+        ],
         span: span.clone(),
     });
     // Plan C Task 66 — Mem is a marker effect (zero ops). Functions
@@ -737,6 +778,20 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // Plan C Task 66 — builtin generic schemes for `mut_array_*`
     // ops, gated by the Mem marker effect.
     register_builtin_mut_array_schemes(&mut tc);
+    // Plan C Task 66.5 — non-generic builtin schemes for the byte
+    // runtime: `byte_array_*`, `string_to_bytes`,
+    // `string_from_bytes_*`, `byte_in_range`, `byte_truncate`.
+    register_builtin_byte_array_schemes(&mut tc);
+    // Plan C Task 66.6 — non-generic builtin schemes for the
+    // `mut_byte_array_*` ops, gated by the Mem marker effect.
+    register_builtin_mut_byte_array_schemes(&mut tc);
+    // Plan C Task 68 — extended String primitives (byte-indexed
+    // accessor / comparison / search / trim / parse).
+    register_builtin_string_schemes(&mut tc);
+    // Plan C Task 75 — Random pseudo-int builtin.
+    register_builtin_random_schemes(&mut tc);
+    // Plan C Task 76 — OS clock builtin.
+    register_builtin_clock_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -1133,6 +1188,28 @@ fn builtin_types(file: &str) -> Vec<TypeDecl> {
                 span: span.clone(),
             }],
             variants: Vec::new(),
+            span: span.clone(),
+        },
+        // Plan C Task 66.5 — ByteArray is opaque, non-generic.
+        // Constructed exclusively via the runtime primitives
+        // registered alongside (`byte_array_alloc`, `byte_array_empty`,
+        // `byte_array_concat`, `byte_array_slice`, `string_to_bytes`,
+        // `string_from_bytes_alloc`).
+        TypeDecl {
+            name: "ByteArray".to_string(),
+            name_span: span.clone(),
+            generic_params: Vec::new(),
+            variants: Vec::new(),
+            span: span.clone(),
+        },
+        // Plan C Task 66.6 — MutByteArray is opaque, non-generic.
+        // Constructed via `mut_byte_array_new(len, fill)` (Mem-
+        // gated). `mut_byte_array_set` mutates in place.
+        TypeDecl {
+            name: "MutByteArray".to_string(),
+            name_span: span.clone(),
+            generic_params: Vec::new(),
+            variants: Vec::new(),
             span,
         },
     ]
@@ -1261,6 +1338,253 @@ fn register_builtin_mut_array_schemes(tc: &mut Tc) {
             make_scheme(vec![mut_array_a, Ty::Int, Ty::Var(a)], Ty::Unit, vec![a]),
         );
     }
+}
+
+/// Plan C Task 66.5 — non-generic builtin schemes for the byte
+/// runtime primitives.
+///
+/// `ByteArray` is an opaque non-generic builtin type with a
+/// flat-byte payload. Operations registered here are simple
+/// concrete-typed builtins (no `forall A` quantifier needed).
+///
+/// Operations:
+/// - `byte_array_alloc(Int, Byte) -> ByteArray ![]`
+/// - `byte_array_empty() -> ByteArray ![]`
+/// - `byte_array_length(ByteArray) -> Int ![]`
+/// - `byte_array_get(ByteArray, Int) -> Byte ![]`
+/// - `byte_array_concat(ByteArray, ByteArray) -> ByteArray ![]`
+/// - `byte_array_slice(ByteArray, Int, Int) -> ByteArray ![]`
+/// - `string_to_bytes(String) -> ByteArray ![]`
+/// - `string_from_bytes_validate(ByteArray) -> Int ![]`
+/// - `string_from_bytes_alloc(ByteArray) -> String ![]`
+/// - `byte_in_range(Int) -> Bool ![]`
+/// - `byte_truncate(Int) -> Byte ![]`
+///
+/// `byte_from_int(n) -> Option[Byte]` ships in pure sigil under
+/// `std/byte_array.sigil` using `byte_in_range` + `byte_truncate`
+/// + `Option[Byte]` constructors.
+fn register_builtin_byte_array_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    let byte_array_ty = || Ty::User("ByteArray".to_string(), Vec::new());
+    tc.fn_schemes.insert(
+        "byte_array_alloc".to_string(),
+        make_scheme(vec![Ty::Int, Ty::Byte], byte_array_ty()),
+    );
+    tc.fn_schemes.insert(
+        "byte_array_empty".to_string(),
+        make_scheme(vec![], byte_array_ty()),
+    );
+    tc.fn_schemes.insert(
+        "byte_array_length".to_string(),
+        make_scheme(vec![byte_array_ty()], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "byte_array_get".to_string(),
+        make_scheme(vec![byte_array_ty(), Ty::Int], Ty::Byte),
+    );
+    tc.fn_schemes.insert(
+        "byte_array_concat".to_string(),
+        make_scheme(vec![byte_array_ty(), byte_array_ty()], byte_array_ty()),
+    );
+    tc.fn_schemes.insert(
+        "byte_array_slice".to_string(),
+        make_scheme(vec![byte_array_ty(), Ty::Int, Ty::Int], byte_array_ty()),
+    );
+    tc.fn_schemes.insert(
+        "string_to_bytes".to_string(),
+        make_scheme(vec![Ty::String], byte_array_ty()),
+    );
+    tc.fn_schemes.insert(
+        "string_from_bytes_validate".to_string(),
+        make_scheme(vec![byte_array_ty()], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_from_bytes_alloc".to_string(),
+        make_scheme(vec![byte_array_ty()], Ty::String),
+    );
+    tc.fn_schemes.insert(
+        "byte_in_range".to_string(),
+        make_scheme(vec![Ty::Int], Ty::Bool),
+    );
+    tc.fn_schemes.insert(
+        "byte_truncate".to_string(),
+        make_scheme(vec![Ty::Int], Ty::Byte),
+    );
+    tc.fn_schemes.insert(
+        "byte_to_int".to_string(),
+        make_scheme(vec![Ty::Byte], Ty::Int),
+    );
+}
+
+/// Plan C Task 66.6 — `MutByteArray` operations gated on the `Mem`
+/// effect. Mirrors `register_builtin_mut_array_schemes` shape but
+/// non-generic (byte payload is fixed at I8). Operations:
+///
+/// - `mut_byte_array_new(Int, Byte) -> MutByteArray ![Mem]`
+/// - `mut_byte_array_length(MutByteArray) -> Int ![Mem]`
+/// - `mut_byte_array_get(MutByteArray, Int) -> Byte ![Mem]`
+/// - `mut_byte_array_set(MutByteArray, Int, Byte) -> Unit ![Mem]`
+fn register_builtin_mut_byte_array_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: vec!["Mem".to_string()],
+            effect_row_var: None,
+        })),
+    };
+    let mba_ty = || Ty::User("MutByteArray".to_string(), Vec::new());
+    tc.fn_schemes.insert(
+        "mut_byte_array_new".to_string(),
+        make_scheme(vec![Ty::Int, Ty::Byte], mba_ty()),
+    );
+    tc.fn_schemes.insert(
+        "mut_byte_array_length".to_string(),
+        make_scheme(vec![mba_ty()], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "mut_byte_array_get".to_string(),
+        make_scheme(vec![mba_ty(), Ty::Int], Ty::Byte),
+    );
+    tc.fn_schemes.insert(
+        "mut_byte_array_set".to_string(),
+        make_scheme(vec![mba_ty(), Ty::Int, Ty::Byte], Ty::Unit),
+    );
+}
+
+/// Plan C Task 68 — extended String primitives.
+///
+/// All operate on `TAG_STRING` headers and use byte offsets. Code-
+/// point-aware variants (`string_char_at`, `string_chars`) and the
+/// List-returning helpers (`string_split`, `string_join`) are
+/// deferred to Task 68 part 2 (alongside the namespace fix that
+/// lets a stdlib module use `Char` + `List` + `Result` together).
+///
+/// Operations:
+/// - `string_concat(String, String) -> String ![]`
+/// - `string_substring(String, Int, Int) -> String ![]`
+/// - `string_byte_at(String, Int) -> Byte ![]`
+/// - `string_compare(String, String) -> Int ![]`
+/// - `string_starts_with(String, String) -> Bool ![]`
+/// - `string_ends_with(String, String) -> Bool ![]`
+/// - `string_contains(String, String) -> Bool ![]`
+/// - `string_index_of(String, String) -> Int ![]`
+/// - `string_trim(String) -> String ![]`
+/// - `string_to_int_validate(String) -> Int ![]`
+/// - `string_to_int_parse(String) -> Int ![]`
+/// - `string_length(String) -> Int ![]`
+fn register_builtin_string_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    tc.fn_schemes.insert(
+        "string_concat".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::String),
+    );
+    tc.fn_schemes.insert(
+        "string_substring".to_string(),
+        make_scheme(vec![Ty::String, Ty::Int, Ty::Int], Ty::String),
+    );
+    tc.fn_schemes.insert(
+        "string_byte_at".to_string(),
+        make_scheme(vec![Ty::String, Ty::Int], Ty::Byte),
+    );
+    tc.fn_schemes.insert(
+        "string_compare".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_starts_with".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::Bool),
+    );
+    tc.fn_schemes.insert(
+        "string_ends_with".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::Bool),
+    );
+    tc.fn_schemes.insert(
+        "string_contains".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::Bool),
+    );
+    tc.fn_schemes.insert(
+        "string_index_of".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_trim".to_string(),
+        make_scheme(vec![Ty::String], Ty::String),
+    );
+    tc.fn_schemes.insert(
+        "string_to_int_validate".to_string(),
+        make_scheme(vec![Ty::String], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_to_int_parse".to_string(),
+        make_scheme(vec![Ty::String], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_length".to_string(),
+        make_scheme(vec![Ty::String], Ty::Int),
+    );
+}
+
+/// Plan C Task 75 — `Random` builtin schemes.
+///
+/// `random_pseudo_int(): Int ![]` — process-global xorshift64 PRNG
+/// (NOT cryptographically secure; see `runtime/src/random.rs`).
+/// Used by the `run_pseudo_random` handler in `std/random.sigil`.
+fn register_builtin_random_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    tc.fn_schemes.insert(
+        "random_pseudo_int".to_string(),
+        make_scheme(vec![], Ty::Int),
+    );
+}
+
+/// Plan C Task 76 — `Clock` builtin schemes.
+///
+/// `clock_os_now(): Int ![]` — nanos since the Unix epoch, drawn
+/// from `SystemTime::now()`. Used by the `run_os_clock` handler
+/// in `std/clock.sigil`.
+fn register_builtin_clock_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    tc.fn_schemes
+        .insert("clock_os_now".to_string(), make_scheme(vec![], Ty::Int));
 }
 
 struct Tc {
@@ -7863,10 +8187,27 @@ mod tests {
                 .get(&("ArithError".to_string(), "mod_by_zero".to_string())),
             Some(&1)
         );
-        // IO op_ids: println.
+        // IO op_ids (alphabetical, post-Task-70):
+        // 0=print, 1=println, 2=read_file, 3=read_line, 4=write_file.
+        assert_eq!(
+            cp.op_ids.get(&("IO".to_string(), "print".to_string())),
+            Some(&0)
+        );
         assert_eq!(
             cp.op_ids.get(&("IO".to_string(), "println".to_string())),
-            Some(&0)
+            Some(&1)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("IO".to_string(), "read_file".to_string())),
+            Some(&2)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("IO".to_string(), "read_line".to_string())),
+            Some(&3)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("IO".to_string(), "write_file".to_string())),
+            Some(&4)
         );
     }
 
@@ -9332,6 +9673,393 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    // ===== Plan C Task 66.5 — ByteArray + Byte helper builtins =====
+
+    #[test]
+    fn byte_array_alloc_get_typechecks_cleanly() {
+        // Build a 5-byte array filled with 0x42, read it back. The
+        // builtin schemes guarantee `byte_array_alloc(Int, Byte) ->
+        // ByteArray` and `byte_array_get(ByteArray, Int) -> Byte`.
+        // Construct the Byte via byte_truncate (after byte_in_range
+        // gating) — a runtime-primitive-only path that doesn't need
+        // std.option.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let in_range: Bool = byte_in_range(66);\n  \
+                     let b: Byte = byte_truncate(66);\n  \
+                     let ba: ByteArray = byte_array_alloc(5, b);\n  \
+                     let n: Int = byte_array_length(ba);\n  \
+                     match in_range {\n    \
+                       true => perform IO.println(int_to_string(n)),\n    \
+                       false => perform IO.println(\"oor\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn byte_array_alloc_with_int_fill_fires_e0044() {
+        // byte_array_alloc(len, fill) requires fill: Byte, not Int.
+        // Pass a literal `0` (Int) to provoke E0044.
+        let src = "fn main() -> Int ![] {\n  \
+                     let _ba: ByteArray = byte_array_alloc(3, 0);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 from byte_array_alloc Int-vs-Byte mismatch; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn byte_array_concat_and_slice_typecheck_cleanly() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let b: Byte = byte_truncate(1);\n  \
+                     let a: ByteArray = byte_array_alloc(3, b);\n  \
+                     let b2: ByteArray = byte_array_alloc(2, b);\n  \
+                     let c: ByteArray = byte_array_concat(a, b2);\n  \
+                     let s: ByteArray = byte_array_slice(c, 1, 4);\n  \
+                     perform IO.println(int_to_string(byte_array_length(s)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_from_bytes_validate_alloc_typechecks_cleanly() {
+        // Pin the runtime-primitive UTF-8 round-trip surface. User-
+        // side `string_from_bytes` wrapper (returning Result) is
+        // deferred per `[DEVIATION Task 66.5]`; the primitives
+        // themselves are usable directly.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let bytes: ByteArray = string_to_bytes(\"hi\");\n  \
+                     let v: Int = string_from_bytes_validate(bytes);\n  \
+                     match v {\n    \
+                       -1 => perform IO.println(string_from_bytes_alloc(bytes)),\n    \
+                       _ => perform IO.println(\"bad\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_byte_array_is_doc_only_skip_list() {
+        // `import std.byte_array` is a no-op (skip-list path). The
+        // ByteArray surface is available unconditionally via builtin
+        // injection; the import provides documentation alignment
+        // only. Mirrors the std.array / std.mut_array pattern.
+        let src = "import std.byte_array\n\
+                   fn main() -> Int ![] {\n  \
+                     let _ba: ByteArray = byte_array_empty();\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn user_redeclares_byte_array_type_fires_e0113() {
+        let src = "type ByteArray = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "expected E0113 (duplicate type ByteArray); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 66.6 — MutByteArray + Mem effect =====
+
+    #[test]
+    fn mut_byte_array_new_get_set_typechecks_under_mem_row() {
+        let src = "fn main() -> Int ![IO, Mem] {\n  \
+                     let b: Byte = byte_truncate(7);\n  \
+                     let ba: MutByteArray = mut_byte_array_new(3, b);\n  \
+                     mut_byte_array_set(ba, 1, byte_truncate(99));\n  \
+                     let v: Byte = mut_byte_array_get(ba, 1);\n  \
+                     perform IO.println(int_to_string(byte_to_int(v)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn mut_byte_array_set_without_mem_in_row_fires_e0042() {
+        // Without Mem in main's row, mut_byte_array_set's `![Mem]`
+        // requirement isn't satisfied — typecheck rejects.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let b: Byte = byte_truncate(7);\n  \
+                     let ba: MutByteArray = mut_byte_array_new(3, b);\n  \
+                     mut_byte_array_set(ba, 1, byte_truncate(99));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 from missing Mem in row; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn mut_byte_array_alloc_with_int_fill_fires_e0044() {
+        // mut_byte_array_new(len, fill) requires fill: Byte.
+        let src = "fn main() -> Int ![Mem] {\n  \
+                     let _ba: MutByteArray = mut_byte_array_new(3, 0);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 from mut_byte_array_new Int-vs-Byte mismatch; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn import_std_mut_byte_array_is_doc_only_skip_list() {
+        let src = "import std.mut_byte_array\n\
+                   fn main() -> Int ![Mem] {\n  \
+                     let b: Byte = byte_truncate(0);\n  \
+                     let _ba: MutByteArray = mut_byte_array_new(0, b);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn user_redeclares_mut_byte_array_type_fires_e0113() {
+        let src = "type MutByteArray = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "expected E0113 (duplicate type MutByteArray); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 68 — extended String primitives =====
+
+    #[test]
+    fn string_concat_typechecks_cleanly() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let s: String = string_concat(\"hello, \", \"world\");\n  \
+                     perform IO.println(s);\n  \
+                     perform IO.println(int_to_string(string_length(s)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_compare_returns_int_typechecks() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let c: Int = string_compare(\"a\", \"b\");\n  \
+                     perform IO.println(int_to_string(c));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_predicates_typecheck() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let sw: Bool = string_starts_with(\"hello\", \"he\");\n  \
+                     let ew: Bool = string_ends_with(\"hello\", \"lo\");\n  \
+                     let ct: Bool = string_contains(\"hello\", \"ell\");\n  \
+                     match sw {\n    \
+                       true => perform IO.println(\"sw\"),\n    \
+                       false => perform IO.println(\"!sw\"),\n  \
+                     };\n  \
+                     match ew {\n    \
+                       true => perform IO.println(\"ew\"),\n    \
+                       false => perform IO.println(\"!ew\"),\n  \
+                     };\n  \
+                     match ct {\n    \
+                       true => perform IO.println(\"ct\"),\n    \
+                       false => perform IO.println(\"!ct\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_byte_at_returns_byte_typechecks() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let b: Byte = string_byte_at(\"abc\", 1);\n  \
+                     perform IO.println(int_to_string(byte_to_int(b)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_to_int_validate_parse_pair_typechecks() {
+        // The validate / parse pair is the v1 surface for parsing
+        // — user-side wrappers compose it into Result[Int, ...].
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let v: Int = string_to_int_validate(\"42\");\n  \
+                     match v {\n    \
+                       0 => perform IO.println(int_to_string(string_to_int_parse(\"42\"))),\n    \
+                       _ => perform IO.println(\"err\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_string_is_doc_only_skip_list() {
+        let src = "import std.string\n\
+                   fn main() -> Int ![IO] {\n  \
+                     perform IO.println(string_concat(\"a\", \"b\"));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_concat_with_int_arg_fires_e0044() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let _s: String = string_concat(\"hello\", 42);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 from string_concat Int-vs-String mismatch; got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 70 — IO extensions =====
+
+    #[test]
+    fn io_print_typechecks_under_io_row() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     perform IO.print(\"no newline\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn io_read_line_returns_string() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let line: String = perform IO.read_line();\n  \
+                     perform IO.println(line);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn io_read_file_takes_path_returns_contents() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let s: String = perform IO.read_file(\"/dev/null\");\n  \
+                     perform IO.println(s);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn io_write_file_takes_path_and_data() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     perform IO.write_file(\"/tmp/x\", \"hi\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn io_print_without_io_row_fires_e0042() {
+        let src = "fn main() -> Int ![] {\n  \
+                     perform IO.print(\"hi\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (missing IO in row); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 75 — Random effect =====
+
+    #[test]
+    fn import_std_random_typechecks_cleanly() {
+        // Loads the Random effect declaration + `random_int()` +
+        // `run_pseudo_random` higher-order helper. Exercises the
+        // typechecker's user-effect handling path for a stdlib-
+        // declared effect with a tail-`k` resume arm.
+        let src = "import std.random\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let n: Int = run_pseudo_random(random_int);\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn random_int_without_random_in_row_fires_e0042() {
+        let src = "import std.random\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let _n: Int = random_int();\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (missing Random in row); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 76 — Clock effect =====
+
+    #[test]
+    fn import_std_clock_typechecks_cleanly() {
+        let src = "import std.clock\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let t: Int = run_os_clock(now);\n  \
+                     perform IO.println(int_to_string(t));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn now_without_clock_in_row_fires_e0042() {
+        let src = "import std.clock\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let _t: Int = now();\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (missing Clock in row); got {errs:?}"
+        );
     }
 
     #[test]

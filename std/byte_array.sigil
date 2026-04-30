@@ -1,0 +1,87 @@
+// sigil: 0.1
+//
+// std/byte_array.sigil — Plan C Task 66.5.
+//
+// **Documentation only.** Like `std/io.sigil`, `std/array.sigil`,
+// and `std/mut_array.sigil`, this file does not participate in
+// typecheck. The `ByteArray` type and its core operations are
+// registered at the typechecker as builtins via `builtin_types()`
+// and `register_builtin_byte_array_schemes()`. Edits to this file
+// have no effect on compilation. `import std.byte_array` is allowed
+// (skip-list path) but is not required — the surface is available
+// unconditionally.
+//
+// `ByteArray` is an immutable, eager, heap-allocated byte sequence
+// with a flat-byte payload (one byte per slot, no per-element
+// boxing). For byte-heavy workloads — network buffers, file IO,
+// string interop — the flat layout uses 8x less memory than
+// `Array[Byte]` (which would widen each byte to a 64-bit slot, and
+// is in fact unsupported in v1; see `[DEVIATION Task 65]`).
+//
+// ## Core operations (builtin)
+//
+// - `byte_array_alloc(len: Int, fill: Byte) -> ByteArray ![]`
+//   Allocate a fresh byte-array of `len` bytes, each initialised to
+//   `fill`. Negative or absurdly-large `len` aborts the runtime.
+//
+// - `byte_array_empty() -> ByteArray ![]`
+//   Allocate a zero-length byte-array.
+//
+// - `byte_array_length(ba: ByteArray) -> Int ![]`
+//   Read the byte count in O(1).
+//
+// - `byte_array_get(ba: ByteArray, i: Int) -> Byte ![]`
+//   Read byte `i` in O(1). Aborts on out-of-bounds.
+//
+// - `byte_array_concat(a: ByteArray, b: ByteArray) -> ByteArray ![]`
+//   Return a fresh byte-array containing `a` followed by `b`.
+//
+// - `byte_array_slice(ba: ByteArray, start: Int, end: Int) -> ByteArray ![]`
+//   Return `ba[start..end)` as a fresh byte-array. Aborts when
+//   `start > end` or `end > length(ba)`.
+//
+// ## String interop (builtin primitives)
+//
+// - `string_to_bytes(s: String) -> ByteArray ![]`
+//   Copy a string's UTF-8 payload into a fresh byte-array. Always
+//   succeeds (Sigil strings are guaranteed valid UTF-8).
+//
+// - `string_from_bytes_validate(ba: ByteArray) -> Int ![]`
+//   Returns -1 if the byte payload is valid UTF-8; otherwise the
+//   byte offset of the first invalid byte.
+//
+// - `string_from_bytes_alloc(ba: ByteArray) -> String ![]`
+//   Allocate a `String` from a previously-validated byte-array.
+//   The caller is responsible for having checked
+//   `string_from_bytes_validate(ba) == -1` first; this primitive
+//   does NOT re-validate.
+//
+// ## Byte helpers (builtin)
+//
+// - `byte_in_range(n: Int) -> Bool ![]`
+//   Returns `true` iff `0 <= n < 256`.
+//
+// - `byte_truncate(n: Int) -> Byte ![]`
+//   Truncates `n` to the low 8 bits. Caller is responsible for
+//   `byte_in_range(n)` first if a defined-output guarantee matters.
+//
+// ## Layout
+//
+// Each `ByteArray` is `{ header(TAG_BYTE_ARRAY=0x06, count=0,
+// bitmap=0), length: u64, byte[0..N] }`. Bitmap=0 selects Boehm's
+// `GC_malloc_atomic`: bytes are pure scalars, never pointers, so the
+// mark phase skips the payload entirely.
+//
+// ## Higher-level helpers (deferred)
+//
+// User-side wrappers — `byte_from_int(n) -> Option[Byte]`,
+// `string_from_bytes(ba) -> Result[String, Utf8Error]`,
+// `from_list(xs: List[Byte]) -> ByteArray`, and
+// `to_list(ba) -> List[Byte]` — are deferred per
+// `[DEVIATION Task 66.5]`. The deferral is triggered by Sigil v1's
+// flat stdlib namespace: a single `import std.byte_array` cannot
+// transitively pull in `std.list` + `std.option` + `std.result`
+// without colliding on shared fn names (each declares `map`).
+// Until the namespace work shipping in Tasks 67-72 lands, callers
+// who want these wrappers write them in their own program against
+// the builtin primitives above.
