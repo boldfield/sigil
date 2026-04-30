@@ -267,3 +267,38 @@ Task 114 had a deferred gap: at `perform Raise.fail("wrong type")` under `![Rais
 **Closure path.** Stage 12 review checkpoint — std/raise.sigil + std/state.sigil + std/result.sigil migration to use the now-expressible generic shapes; closure-path edits to `[DEVIATION Task 71]` constraint #2 (`fail`'s concrete-Int return placeholder) and `[DEVIATION Task 72]` constraint #1 (parser surface for `![State[S]]`).
 
 **Implementing commit(s).** PR #55 commits across `plan-d-task-115` branch.
+
+## 2026-04-30 — [DEVIATION Stage 12 review] Sign-off + handler-discharge type-arg propagation gap
+
+**Context.** Plan D Stage 12 ships four type-system surface lifts (Tasks 113 tuples, 114 type-parameterized effect rows, 115 per-op generic params, 116 row-polymorphic Fn parameters). Per the plan body, the Stage 12 review checkpoint requires human review of: (1) AST shape consistency, (2) diagnostic quality, (3) closure-path edits to `[DEVIATION Task 71/72]`, (4) stdlib migration. This entry records sign-off across all four items, plus surfaces a deferred gap discovered during the stdlib-migration attempt.
+
+**Item 1 — AST shape consistency.** ✅ `EffectRef { name, args, span }` (AST) / `EffectInst { name, args }` (Ty) mirror Plan A3's `TypeExpr::Tuple` / `Ty::Tuple` split — spans on the AST side, span-free on the Ty side. `EffectOp.generic_params: Vec<GenericParam>` parallels FnDecl's existing field. `FnTypeExpr.effect_row_var` (pre-existing Plan B' Stage 6.8 Task 103) gained the binding-side wiring through `current_row_var_subst` in Task 116. Generic-param scoping: per-op generics layer on top of effect-decl generics with E0144 shadow check.
+
+**Item 2 — Diagnostic quality.** ✅ 5 codes:
+- **E0117** (tuple-pattern arity, Task 113) — span at the pattern.
+- **E0140** (duplicate handler arm, pre-existing Plan B Task 54) — span at the second arm. Task 114 mistakenly used E0140 for row-arg arity (collision); Task 115 renamed that to E0143. Catalog entry for E0143 documents the rename.
+- **E0143** (row-arg arity, Task 114, code introduced by Task 115's rename) — span at the row entry.
+- **E0144** (per-op generic shadowing effect-decl generic, Task 115) — span at the per-op generic-param decl.
+- **E0137** (narrowed by Task 116 from "any row-var-bearing fn-type" to "unbound row var only"; pre-existing code) — span at the unbound row-var token. Fix-suggestion renders valid Sigil syntax.
+
+**Item 3 — Closure-path edits.** ✅
+- `[DEVIATION Task 71]` (PLAN_C_DEVIATIONS.md) — constraints #1, #2, #3 marked **Closed** by Plan D Tasks 114, 115, 116.
+- `[DEVIATION Task 72]` — constraints #1, #2, #4, #5 **Closed** by Tasks 114, 113, 115, 116. Constraint #3 (wrapper-fn-frame) stays **Deferred** per Plan D Task 112; closure path is Task 117 follow-up.
+- `[DEVIATION Task 73]` — constraints #1, #5, #6 **Closed**; #2, #3, #4 (multi-shot codegen) stay open, addressed by Tasks 117/118.
+
+**Item 4 — Stdlib migration: deferred to Plan C completion** (with new gap surfaced).
+
+Migration of std/raise.sigil to `effect Raise[E] { fail[A]: (E) -> A }` + row-poly catch was attempted in this session and surfaced an additional **handler-discharge type-arg propagation gap** not flagged by Tasks 114-116's typecheck-level test corpus:
+
+**Symptom**: `fn catch[A, E](body: () -> A ![Raise[E] | e]) -> Result[A, E] ![| e] { handle Ok(body()) with { Raise.fail(e, k) => Err(e) } }` fails to typecheck. Inside the handle, the body row should be `caller_row + discharged_effects`. Today `discharged: Vec<String>` (just names) — when pushed into the body row, the discharged `Raise` becomes `EffectInst::bare("Raise")` (empty args). When `body()` is called inside the handle, body's row `![Raise[E] | e]` doesn't subsume the body row's `![Raise + e_caller]` because the structural EffectInst diff (Task 114) sees `Raise[E]` ≠ `Raise` (no args).
+
+**Root cause**: handler arms match by name only (`Raise.fail` references `Raise`, not `Raise[E]`). When discharging a generic effect-decl, the type-args have to come from somewhere. Two candidate sources: (a) infer from body's expected type (the handle's body argument has a known type with E concrete in the surrounding fn's context); (b) require explicit syntax (`handle X.op[Type] => ...`).
+
+**Closure path**: a follow-up typecheck refinement that, at handle-expression entry, walks the handle body's expected type to find the discharged effect's instantiation and uses those args when extending body_row. Estimated 1-2 typecheck.rs sites + regression test corpus.
+
+**Why deferred to Plan C completion**: the plan body's Plan-D-vs-Plan-C-completion separation puts stdlib migrations in Plan C completion. The handler-discharge gap is a fresh finding that wasn't on Plan D's task list; closing it requires its own design + implementation cycle. Plan C completion's stdlib migration PR will batch (a) the handler-discharge fix, (b) std/raise.sigil migration, (c) std/state.sigil migration to `(A, S)` tuple-return + generic E + row-poly run_state, (d) std/result.sigil verification.
+
+**Stage 12 sign-off**. ✅ Tasks 113/114/115/116 + closure-path edits land; stdlib migration deferred per the plan-overview separation. Stage 12 is complete from Plan D's perspective.
+
+**Implementing commit(s).** This entry + Tasks 71/72/73 closure-path updates in PLAN_C_DEVIATIONS.md. PR `plan-d-stage-12-checkpoint`.
+
