@@ -5757,14 +5757,41 @@ fn collect_free_vars(
     }
 }
 
+/// Plan D Task 113 — recognise patterns that are catchall against
+/// `scrut_ty` at the simple-fallback exhaustiveness layer (no
+/// access to the ctor registry; conservative for User types).
+///
+/// `Pattern::Wildcard` and `Pattern::Var` are catchall against any
+/// non-User type. For User types we conservatively return false —
+/// the User-type exhaustiveness path uses `match_witness` which
+/// handles ctor-aware enumeration.
+///
+/// `Pattern::Tuple` is catchall against `Ty::Tuple` of matching
+/// arity iff every sub-pattern is catchall against the matching
+/// element type. Nested tuples are handled recursively.
+fn pattern_is_simple_catchall(p: &Pattern, scrut_ty: &Ty) -> bool {
+    match p {
+        Pattern::Wildcard(_) => true,
+        Pattern::Var(_, _) => !matches!(scrut_ty, Ty::User(_, _)),
+        Pattern::Tuple(pats, _) => match scrut_ty {
+            Ty::Tuple(elem_tys) if pats.len() == elem_tys.len() => pats
+                .iter()
+                .zip(elem_tys.iter())
+                .all(|(sub, ety)| pattern_is_simple_catchall(sub, ety)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn is_exhaustive(scrut: &Ty, arms: &[MatchArm]) -> bool {
     if arms.is_empty() {
         return false;
     }
-    let has_wildcard = arms
+    let has_catchall = arms
         .iter()
-        .any(|a| matches!(a.pattern, Pattern::Wildcard(_)));
-    if has_wildcard {
+        .any(|a| pattern_is_simple_catchall(&a.pattern, scrut));
+    if has_catchall {
         return true;
     }
     match scrut {
