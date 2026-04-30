@@ -5,7 +5,7 @@
 // literals, addition, conditional, and let-binding; values flow
 // through an environment (cons-list of `(name, value)` bindings).
 //
-// **Effect surface.** `eval` declares `![Raise]` and uses
+// **Effect surface.** `eval` declares `![Raise[String]]` and uses
 // `raise(msg)` for both unbound-variable errors and unexpected
 // shapes. Top-level `catch` collapses the effect into a
 // `Result[Int, String]` so `main` can render Ok/Err uniformly.
@@ -37,7 +37,7 @@ type Env =
 
 // `lookup(env, name)` returns the value bound to `name`, raising
 // the canonical "unbound variable: <name>" message if absent.
-fn lookup(env: Env, name: String) -> Int ![Raise] {
+fn lookup(env: Env, name: String) -> Int ![Raise[String]] {
   match env {
     ENil => raise(string_concat("unbound variable: ", name)),
     ECons(n, v, rest) =>
@@ -51,7 +51,7 @@ fn lookup(env: Env, name: String) -> Int ![Raise] {
 // `eval(env, expr)` reduces `expr` under `env` to an integer.
 // Errors short-circuit through `Raise.fail` to the enclosing
 // `catch`.
-fn eval(env: Env, expr: Expr) -> Int ![Raise] {
+fn eval(env: Env, expr: Expr) -> Int ![Raise[String]] {
   match expr {
     EVar(name) => lookup(env, name),
     ELit(n) => n,
@@ -88,11 +88,11 @@ fn build_broken() -> Expr ![] {
   EAdd(EVar("x"), ELit(1))
 }
 
-fn run_demo() -> Int ![Raise] {
+fn run_demo() -> Int ![Raise[String]] {
   eval(ENil, build_demo())
 }
 
-fn run_broken() -> Int ![Raise] {
+fn run_broken() -> Int ![Raise[String]] {
   eval(ENil, build_broken())
 }
 
