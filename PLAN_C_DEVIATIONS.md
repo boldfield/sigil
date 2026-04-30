@@ -226,4 +226,56 @@ For Task 66.5, the workaround is:
 
 **Failure mode.** Users wanting `Option[Byte]`-shaped byte construction or `Result[String, Utf8Error]`-shaped UTF-8 decoding write a few lines of sigil against the deferred-wrapper-equivalent surface. The runtime primitives carry the same algorithmic content, so the user code is straightforward — the loss is API ergonomics, not capability.
 
-**Implementing commit(s).** Part 1 (runtime foundation): `5ec5fef`. Part 2 (compiler integration + doc-only stdlib file + typecheck/e2e tests): [HEAD].
+**Implementing commit(s).** Part 1 (runtime foundation): `5ec5fef`. Part 2 (compiler integration + doc-only stdlib file + typecheck/e2e tests): `6304ba8`.
+
+## 2026-04-30 — [DEVIATION cross-cutting] v2 path: `extern fn` + `opaque type` for stdlib FFI declarations
+
+**Context.** Sigil v1's stdlib has two classes of module:
+
+1. **Sigil-expressible.** `std/option.sigil`, `std/result.sigil`, `std/list.sigil` — variant sum types + helper fns, fully written in sigil. The user-visible source IS the implementation.
+
+2. **Opaque-runtime-backed.** `std/io.sigil`, `std/array.sigil`, `std/mut_array.sigil`, `std/byte_array.sigil`, `std/mut_byte_array.sigil` — heap-allocated objects with non-variant layouts (`{header, length, payload}`) plus FFI functions backed by `runtime/src/*.rs`. The user-visible `.sigil` file is **documentation-only**; the actual type registrations and operation schemes are injected at the typechecker via `builtin_types()` / `register_builtin_*_schemes()` and at codegen via FFI declarations + dispatch arms.
+
+The split exists because Sigil v1's surface doesn't support either:
+
+- **Opaque runtime-managed types.** No syntax says "the layout of this type lives outside sigil — the runtime knows it." Variant sum types can declare `type T = | Foo | Bar(Int)`; there's no way to declare `type ByteArray` with an opaque non-variant payload.
+- **External function bindings.** No `extern fn name(args) -> ret` syntax to declare an FFI symbol. The compiler's builtin-injection pattern (Plan B Task 57 for IO/ArithError, Plan C Tasks 65/66/66.5/66.6 for Array/MutArray/ByteArray/MutByteArray) registers schemes directly in the typechecker.
+
+The result: each opaque-runtime stdlib module has roughly the same structure — a doc-only `.sigil` file describing the surface, plus typecheck.rs / codegen.rs additions that mirror the sigil signatures one-to-one. Adding a new opaque builtin (Task 67's `string_builder`, Task 69's `int64`) repeats the pattern.
+
+**Why accepted (defer to v2).** Adding `extern fn` + `opaque type` syntax is a real language change touching parser, AST, typecheck, and a small linkage layer at codegen. Plan A1's "Do not change language semantics" guardrail (carried into Plan C) keeps language-surface work out of the stdlib-growth tasks. The current builtin-injection pattern works correctly; the cost is convention drift between stdlib modules (real vs doc-only) and a small per-module mechanical cost when adding new runtime-backed primitives.
+
+**What v2 enables.** With both features in place, `std/byte_array.sigil` could declare the full surface in sigil source:
+
+```sigil
+opaque type ByteArray
+
+extern fn byte_array_alloc(len: Int, fill: Byte) -> ByteArray ![]
+  = "sigil_byte_array_alloc"
+
+extern fn byte_array_length(ba: ByteArray) -> Int ![]
+  = "sigil_byte_array_length"
+// ... etc.
+
+// User-side wrappers stay as ordinary sigil:
+fn byte_from_int(n: Int) -> Option[Byte] ![] {
+  match byte_in_range(n) {
+    true => Some(byte_truncate(n)),
+    false => None,
+  }
+}
+```
+
+Compiler internals would consume the `extern fn` declarations directly — no `register_builtin_*_schemes()` boilerplate, no `BuiltinFuncIds` extension per primitive, no separate documentation-vs-implementation drift. `imports::BUILTIN_INJECTED` retires entirely.
+
+**Closure path.** Tracked as a v2 language-surface task. Implementation steps would touch:
+
+1. Parser: `extern fn name(args) -> ret ![row]\n = "C_symbol"` + `opaque type Name`.
+2. AST: `Item::ExternFn { name, sig, c_symbol }` and `Item::OpaqueType { name }`.
+3. Typecheck: ExternFn registers as a regular `Scheme` with no body; OpaqueType registers in `tc.types` with empty variants (mirroring today's builtin-type injection).
+4. Codegen: walk `Item::ExternFn` items at `emit_object` start to populate `BuiltinFuncIds` automatically; lower call sites via the existing dispatch mechanism (no per-name dispatch arm needed — the FFI-call lowering generalises).
+5. Stdlib migration: convert `std/io.sigil`, `std/array.sigil`, `std/mut_array.sigil`, `std/byte_array.sigil`, `std/mut_byte_array.sigil`, plus future Task 67 `string_builder`, Task 69 `int64`, etc. from doc-only to fully-declared.
+
+**Failure mode (today).** Adding a new runtime-backed stdlib primitive in v1 requires the full mechanical sweep: runtime FFI + counter/tag wiring + typecheck builtin scheme + codegen FuncId/FuncRef extension + dispatch arm + `type_of_expr` prediction + entry-walker globals + doc-only `.sigil` update + tests. PR #42 review #10 already drove the `BuiltinFuncIds` / `BuiltinFuncRefs` consolidation that absorbed most of the per-call-site cost; the remaining ~5-line-per-primitive overhead is what v2 retires.
+
+**Implementing commit(s).** Tracking entry only. Would land as a separate language-surface task; documented here so Task 67+ implementers know the convention is v1-bounded, not architectural.
