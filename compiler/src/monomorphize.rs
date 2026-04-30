@@ -1340,7 +1340,7 @@ fn ty_from_type_expr_under_subst(te: &TypeExpr, subst: &BTreeMap<String, Ty>) ->
             Ty::Fn(Box::new(crate::typecheck::FnSig {
                 params,
                 ret,
-                effects: fty.effects.clone(),
+                effects: crate::typecheck::effect_refs_to_names(&fty.effects),
                 effect_row_var: None,
             }))
         }
@@ -1458,7 +1458,7 @@ fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
             TypeExpr::Fn(Box::new(crate::ast::FnTypeExpr {
                 params,
                 ret,
-                effects: sig.effects.clone(),
+                effects: crate::typecheck::names_to_effect_refs(&sig.effects, span),
                 effect_row_var: None,
                 span: span.clone(),
             }))
@@ -1496,7 +1496,7 @@ pub(crate) fn type_expr_to_ty(te: &TypeExpr) -> Ty {
             Ty::Fn(Box::new(crate::typecheck::FnSig {
                 params,
                 ret,
-                effects: fty.effects.clone(),
+                effects: crate::typecheck::effect_refs_to_names(&fty.effects),
                 effect_row_var: None,
             }))
         }

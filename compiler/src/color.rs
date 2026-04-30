@@ -349,7 +349,7 @@ fn local_color(f: &FnDecl) -> LocalColor {
     // virtue of having no effect to discharge. See the
     // `NATIVE_EFFECT` lift framing above.
     if let Some(e) = f.effects.first() {
-        return LocalColor::Cps(format!("cps: row contains effect `{e}`"));
+        return LocalColor::Cps(format!("cps: row contains effect `{}`", e.name));
     }
 
     // (3) Walk the body for any `perform`. Pre-lift, IO performs were
@@ -975,7 +975,14 @@ mod tests {
             generic_params: Vec::new(),
             params: Vec::new(),
             return_type: TypeExpr::Named("Int".to_string(), span()),
-            effects: effects.into_iter().map(|s| s.to_string()).collect(),
+            effects: effects
+                .into_iter()
+                .map(|s| crate::ast::EffectRef {
+                    name: s.to_string(),
+                    args: Vec::new(),
+                    span: span(),
+                })
+                .collect(),
             effect_row_var: None,
             body,
             span: span(),
@@ -989,7 +996,11 @@ mod tests {
             generic_params: Vec::new(),
             params: Vec::new(),
             return_type: TypeExpr::Named("Int".to_string(), span()),
-            effects: vec!["IO".to_string()],
+            effects: vec![crate::ast::EffectRef {
+                name: "IO".to_string(),
+                args: Vec::new(),
+                span: span(),
+            }],
             effect_row_var: Some(crate::ast::RowVar {
                 name: "e".to_string(),
                 span: span(),

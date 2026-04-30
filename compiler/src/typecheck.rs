@@ -102,6 +102,36 @@ pub struct FnSig {
     pub effect_row_var: Option<u32>,
 }
 
+/// Plan D Task 114 (Phase 114a) — convert a slice of AST
+/// `EffectRef`s to a `Vec<String>` of effect names. Used at every
+/// AST → Ty boundary that builds an `FnSig` from an `FnDecl` /
+/// `FnTypeExpr` / `Expr::Lambda`'s row. Args are dropped at this
+/// boundary in Phase 114a (always empty); Phase 114d will introduce
+/// `EffectInst` to carry args structurally and migrate the Ty-level
+/// row representation alongside.
+pub(crate) fn effect_refs_to_names(rs: &[crate::ast::EffectRef]) -> Vec<String> {
+    rs.iter().map(|r| r.name.clone()).collect()
+}
+
+/// Plan D Task 114 (Phase 114a) — reverse direction: given a slice
+/// of effect names and a span to attach, build a `Vec<EffectRef>`
+/// with empty args. Used by `monomorphize::ty_to_type_expr` when
+/// reconstructing a `TypeExpr::Fn` from a `Ty::Fn` (the Ty side
+/// holds names only; the AST side requires `EffectRef`s).
+pub(crate) fn names_to_effect_refs(
+    names: &[String],
+    span: &crate::errors::Span,
+) -> Vec<crate::ast::EffectRef> {
+    names
+        .iter()
+        .map(|n| crate::ast::EffectRef {
+            name: n.clone(),
+            args: Vec::new(),
+            span: span.clone(),
+        })
+        .collect()
+}
+
 /// HM type scheme (Plan B task 48). Bound type / row variables come
 /// from `let`-generalisation at top-level fn boundaries; the body is
 /// the generalised type (typically `Ty::Fn`). A non-generic, closed-
@@ -836,7 +866,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             let sig = FnSig {
                 params,
                 ret,
-                effects: f.effects.clone(),
+                effects: effect_refs_to_names(&f.effects),
                 effect_row_var: row_var_id,
             };
             let scheme = Scheme {
@@ -3012,19 +3042,21 @@ impl Tc {
                 );
             }
             for effect in &f.effects {
-                if effect != "IO" && effect != "ArithError" && effect != "Mem" {
+                let name = effect.name.as_str();
+                if name != "IO" && name != "ArithError" && name != "Mem" {
                     self.push_error(
                         "E0041",
                         f.span.clone(),
                         format!(
                             "`fn main`'s effect row may only contain effects discharged by \
-                             the top-level shim (`IO`, `ArithError`, or `Mem`); saw `{effect}`",
+                             the top-level shim (`IO`, `ArithError`, or `Mem`); saw `{name}`",
                         ),
                     );
                 }
             }
         }
-        let body_ty = self.check_block(&f.body, &f.effects);
+        let main_row_names = effect_refs_to_names(&f.effects);
+        let body_ty = self.check_block(&f.body, &main_row_names);
 
         // Plan B task 48 — generalise the inferred signature into a
         // scheme for `fn_schemes`. Concrete (non-generic, closed-row)
@@ -3046,7 +3078,7 @@ impl Tc {
             let inferred_sig = FnSig {
                 params: param_tys,
                 ret: declared_ret,
-                effects: f.effects.clone(),
+                effects: effect_refs_to_names(&f.effects),
                 effect_row_var: row_var_id,
             };
             let resolved = self.deref(&Ty::Fn(Box::new(inferred_sig)));
@@ -3422,7 +3454,8 @@ impl Tc {
                 // currently-active row-var if present, else stays
                 // closed.
                 let _ = effect_row_var;
-                self.check_lambda(params, return_type, effects, body, span.clone())
+                let lambda_row_names = effect_refs_to_names(effects);
+                self.check_lambda(params, return_type, &lambda_row_names, body, span.clone())
             }
             // `ClosureRecord` / `ClosureEnvLoad` are post-closure-
             // conversion nodes synthesized by plan A2 task 31. They
@@ -5337,7 +5370,7 @@ pub(crate) fn ty_from_type_expr(
             Some(Ty::Fn(Box::new(FnSig {
                 params,
                 ret,
-                effects: fty.effects.clone(),
+                effects: effect_refs_to_names(&fty.effects),
                 effect_row_var: None,
             })))
         }
