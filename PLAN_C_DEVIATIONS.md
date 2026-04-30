@@ -538,3 +538,59 @@ User code calling `perform State.get()` / `perform State.set(s)` / `run_state(in
 **Failure mode.** Users wanting non-Int state types or tuple returns hit the fixed-Int / final-A-only surface. Type errors are clear at the call site (`set_state("x")` fires E0044 with String-vs-Int mismatch).
 
 **Implementing commit(s).** [HEAD].
+
+## 2026-04-30 — [DEVIATION Task 73] `Choose` ships effect-declaration only; `all_choices` / `first_choice` dischargers deferred to v2
+
+**Context.** Plan C Task 73's plan body specifies:
+
+```text
+Choose resumes: many effect + all_choices, first_choice
+```
+
+with `Choose.choose(n)` picking a value 0..n-1 and `Choose.fail()` abandoning a branch (per Task 81's Sudoku spec at PLAN_C_PROGRESS.md line 79: "`Choose.choose(9)` picks digits; `Choose.fail()` on constraint violation; `first_choice` handler returns first solution").
+
+**v1 surface gaps.** Six constraints prevent shipping the dischargers — three are inherited from Tasks 71/72 (parser, per-op generics, row-poly Fn) and three are codegen-side gaps specific to multi-shot dischargers over arbitrary-arity `choose(n)` and short-circuiting `first_choice`:
+
+1. **Parser rejects type-parameterized effect references in rows.** Same constraint as `[DEVIATION Task 71]` constraint #1 / `[DEVIATION Task 72]` constraint #1. `parse_effect_row` accepts simple effect-name idents only.
+
+2. **Static-N arm-body chain.** The arm-body recognizer at `compiler/src/codegen.rs::arm_body_n_let_then_pure_tail_shape` (line ~3665) requires arm bodies of the form `{ let r1: T = k(arg1); let r2: T = k(arg2); ...; let rN: T = k(argN); pure_tail }` — N is statically fixed at compile time. `all_choices(body) -> List[Int]` would need runtime-N dispatch (invoking `k(0)`, `k(1)`, …, `k(arg-1)` where `arg` is the perform's runtime value), which is not expressible in v1's flat let-chain shape.
+
+3. **No first-class continuations.** `arm_body_walk` at codegen.rs:1505-1518 explicitly rejects `k` referenced as a value (passed to a helper, captured into a closure, stored in a record) with the diagnostic "first-class continuations are deferred to v2". The closure path that would make `all_choices` expressible — `Choose.choose(arg, k) => list_fold(range(0, arg), Nil, fn (acc, i) => append(acc, k(i)))` — runs `k` inside a hoisted lambda whose closure env captures `k`, which closure_convert can't model in v1.
+
+4. **No conditional / branched `k`-call.** `arm_body_walk` at codegen.rs:1591-1603 rejects "computed conditional `k`-use" — `match k(0) { Some(v) => Some(v), None => k(1) }` and `if cond { k(x) } else { k(y) }` shapes are not in tail position for `k`-detection (the synth-pass detector `arm_body_tail_is_k_call` recurses only through `Expr::Block` tails). `first_choice` short-circuit semantics ("try `k(i+1)` only if `k(i)` failed") cannot be expressed without this.
+
+5. **No per-op generic params on user-declared effects.** Same as `[DEVIATION Task 71]` constraint #2 / `[DEVIATION Task 72]` constraint #4. `fail`'s declared `Int` return is a placeholder per Plan B Task 57's `ArithError.div_by_zero` precedent.
+
+6. **No row-polymorphic fn-typed parameters.** Same as `[DEVIATION Task 71]` constraint #3 / `[DEVIATION Task 72]` constraint #5. Closed-row `![]` only.
+
+The load-bearing v2 blockers specific to Task 73 are #2, #3, #4 — the multi-shot codegen surface.
+
+**Why accepted.** v1 ships:
+
+- `effect Choose resumes: many { choose: (Int) -> Int, fail: () -> Int }` — non-generic, multi-shot annotation matching the plan body and Task 81's spec. The annotation keeps the surface stable across the v1 → v2 shift; v2 dischargers consume the same declaration without a breaking change.
+
+User code uses inline single-shot handlers (always pick `k(0)`, discard-`k` on `fail`) for the cases expressible in v1. Multi-shot dischargers (`all_choices`, `first_choice`) are deferred to v2.
+
+**No perform wrappers (`pick(n)` / `fail_choice()`).** A natural ergonomic addition would be wrapper functions, but Task 72 (PR #45 CI run) discovered that wrapper-fn frames break the discharge-with-lambda pattern that multi-shot Choose handlers will need in v2 (constraint #3 there; tracked in PLAN_C_PROGRESS.md's "Plan B' Stage-6.8-followup architectural carryovers" section). Shipping wrappers in v1 would create a footgun: users would write code against the wrappers, then hit incorrect runtime behaviour when they discharge with a multi-shot handler (the v2 path). v2 ships wrappers as an additive ergonomic layer once the discharge-side gap closes alongside the multi-shot codegen surface.
+
+**What's lost vs the plan body.**
+
+- **`all_choices` / `first_choice` dischargers absent.** Users wanting full enumeration / search-with-short-circuit must write inline handlers in user code that invoke `k` from the static-N let-chain shape, restricting them to a fixed compile-time chain length. This is the load-bearing absence: Plan C Task 81 (Sudoku demo) is gated on these dischargers and defers with this entry.
+
+- **No perform wrappers.** Users do `perform Choose.choose(n)` / `perform Choose.fail()` directly. Surface is stable across v1 → v2; wrappers are additive when they ship.
+
+**Closure path.** Three orthogonal v2 surface lifts retire the deviation. The codegen-side ones cluster as a single architectural slice (planned as "Plan D" — first-class continuations + wrapper-fn-frame composition; ~4-8 weeks of work, scoped as 6 incremental PRs):
+
+1. **First-class continuations** — `k` as a passable value, captured into closures, threaded through user fns. Lifts constraint #3. Unblocks `all_choices` via the `list_fold(range(0, arg), Nil, fn (acc, i) => append(acc, k(i)))` shape.
+
+2. **Conditional / branched `k`-call** — `match k(0) { ... => k(1) }` and `if cond { k(x) } else { k(y) }` recognised as valid arm-body tails via post-arm-k synth chain extension (a `PostArmKBranchedChain` shape with join blocks). Lifts constraint #4. Unblocks `first_choice` short-circuit.
+
+3. **Wrapper-fn-frame composition** — closes the same gap tracked under `[DEVIATION Task 72]` constraint #3 / Plan B' Stage-6.8-followup carryover. Once shipped, std/choose.sigil grows `pick(n)` / `fail_choice()` wrappers as an additive ergonomic layer.
+
+The parser / per-op-generics / row-poly-Fn lifts (constraints #1, #5, #6) are orthogonal — they generalise the surface from concrete-`Int` to `Choose[A]` parametric over the pick value's type, but don't unblock the dischargers on their own.
+
+**Failure mode.** Users hitting the multi-shot expressivity wall see clear diagnostics from the existing arm-body walker — "references continuation `k` as a value", "uses continuation `k` in non-tail position outside the supported shapes". Both messages point at v2 closure. Type errors at perform sites (`perform Choose.choose("two")` → E0044) are unaffected.
+
+**Sudoku impact.** Plan C Task 81 (`examples/sudoku.sigil`, scheduled for Stage 8) defers with this entry — Sudoku's `Choose.choose(9)` per-cell + `first_choice` orchestration requires both constraint #2 (runtime-N arm body) and constraint #4 (short-circuit) lifted. Captured under PLAN_C_PROGRESS.md's plan-completion note (Task 81 will reference this deviation when the Stage 8 work begins).
+
+**Implementing commit(s).** [HEAD].

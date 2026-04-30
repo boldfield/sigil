@@ -10200,6 +10200,61 @@ mod tests {
         );
     }
 
+    // ===== Plan C Task 73 — Choose effect (decl-only, dischargers v2) =====
+
+    #[test]
+    fn import_std_choose_typechecks_cleanly() {
+        // Pin the v1 `Choose` surface: effect declaration + direct
+        // `perform Choose.choose / Choose.fail` invocations under an
+        // inline single-shot handler. Per `[DEVIATION Task 73]`,
+        // `all_choices` / `first_choice` dischargers and perform
+        // wrappers are deferred to v2 — users handle Choose inline
+        // until first-class continuations land.
+        let src = "import std.choose\n\
+                   fn pick_one() -> Int ![Choose] {\n  \
+                     perform Choose.choose(2)\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let value: Int = handle pick_one() with {\n    \
+                       Choose.choose(arg, k) => k(0),\n    \
+                       Choose.fail(k) => 0,\n  \
+                     };\n  \
+                     perform IO.println(int_to_string(value));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn perform_choose_choose_without_choose_in_row_fires_e0042() {
+        let src = "import std.choose\n\
+                   fn bad() -> Int ![] {\n  \
+                     perform Choose.choose(3)\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (missing Choose in row); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn perform_choose_choose_with_string_arg_fires_e0044() {
+        // Choose.choose takes Int; passing String should fire E0044.
+        let src = "import std.choose\n\
+                   fn bad() -> Int ![Choose] {\n  \
+                     perform Choose.choose(\"two\")\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 (Choose.choose expects Int, got String); got {errs:?}"
+        );
+    }
+
     #[test]
     fn import_std_result_map_map_err_and_then_typecheck_cleanly() {
         let src = "import std.result\n\
