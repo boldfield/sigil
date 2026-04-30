@@ -739,7 +739,7 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("string_to_int_parse".to_string());
     globals.insert("string_length".to_string());
     // Plan C Task 75 — Random builtin.
-    globals.insert("random_os_int".to_string());
+    globals.insert("random_pseudo_int".to_string());
     // Plan C Task 76 — Clock builtin.
     globals.insert("clock_os_now".to_string());
     for item in &program.items {
@@ -5161,12 +5161,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
     // Plan C Task 75 — OS-entropy random Int. Backs the `os_random`
     // handler in `std/random.sigil`.
-    // sigil_random_os_int() -> i64
-    let mut random_os_int_sig = Signature::new(isa_call_conv(&module));
-    random_os_int_sig.returns.push(AbiParam::new(types::I64));
-    let random_os_int = module
-        .declare_function("sigil_random_os_int", Linkage::Import, &random_os_int_sig)
-        .map_err(|e| format!("declare sigil_random_os_int: {e}"))?;
+    // sigil_random_pseudo_int() -> i64
+    let mut random_pseudo_int_sig = Signature::new(isa_call_conv(&module));
+    random_pseudo_int_sig
+        .returns
+        .push(AbiParam::new(types::I64));
+    let random_pseudo_int = module
+        .declare_function(
+            "sigil_random_pseudo_int",
+            Linkage::Import,
+            &random_pseudo_int_sig,
+        )
+        .map_err(|e| format!("declare sigil_random_pseudo_int: {e}"))?;
 
     // Plan C Task 76 — OS clock (nanos since epoch). Backs the
     // `os_clock` handler in `std/clock.sigil`.
@@ -6004,7 +6010,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             string_to_int_validate,
             string_to_int_parse,
             string_length,
-            random_os_int,
+            random_pseudo_int,
             clock_os_now,
         },
         handler_frame_new,
@@ -12053,12 +12059,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.inst_results(call)[0]
             }
             // Plan C Task 75 — OS-entropy random Int.
-            Expr::Ident(name, _) if name == "random_os_int" => {
-                assert_eq!(args.len(), 0, "random_os_int builtin arg count is not 0");
+            Expr::Ident(name, _) if name == "random_pseudo_int" => {
+                assert_eq!(
+                    args.len(),
+                    0,
+                    "random_pseudo_int builtin arg count is not 0"
+                );
                 let call = self
                     .builder
                     .ins()
-                    .call(self.builtins.random_os_int_ref, &[]);
+                    .call(self.builtins.random_pseudo_int_ref, &[]);
                 self.builder.inst_results(call)[0]
             }
             // Plan C Task 76 — OS clock (nanos since epoch).
@@ -13308,7 +13318,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 {
                     types::I8
                 }
-                Expr::Ident(name, _) if name == "random_os_int" => types::I64,
+                Expr::Ident(name, _) if name == "random_pseudo_int" => types::I64,
                 Expr::Ident(name, _) if name == "clock_os_now" => types::I64,
                 Expr::ClosureRecord { code_fn_name, .. } => self
                     .user_fns
@@ -13745,7 +13755,7 @@ struct BuiltinFuncIds {
     string_length: cranelift_module::FuncId,
     /// Plan C Task 75 — OS-entropy random Int. Backs the
     /// `os_random` handler in `std/random.sigil`.
-    random_os_int: cranelift_module::FuncId,
+    random_pseudo_int: cranelift_module::FuncId,
     /// Plan C Task 76 — OS clock (nanos since epoch). Backs the
     /// `os_clock` handler in `std/clock.sigil`.
     clock_os_now: cranelift_module::FuncId,
@@ -13808,7 +13818,7 @@ struct BuiltinFuncRefs {
     string_to_int_parse_ref: FuncRef,
     string_length_ref: FuncRef,
     /// Plan C Task 75 — OS-entropy Random Int FuncRef.
-    random_os_int_ref: FuncRef,
+    random_pseudo_int_ref: FuncRef,
     /// Plan C Task 76 — OS clock FuncRef.
     clock_os_now_ref: FuncRef,
 }
@@ -14021,7 +14031,7 @@ fn prepare_builtin_func_refs(
             .declare_func_in_func(ids.string_to_int_validate, builder.func),
         string_to_int_parse_ref: module.declare_func_in_func(ids.string_to_int_parse, builder.func),
         string_length_ref: module.declare_func_in_func(ids.string_length, builder.func),
-        random_os_int_ref: module.declare_func_in_func(ids.random_os_int, builder.func),
+        random_pseudo_int_ref: module.declare_func_in_func(ids.random_pseudo_int, builder.func),
         clock_os_now_ref: module.declare_func_in_func(ids.clock_os_now, builder.func),
     }
 }

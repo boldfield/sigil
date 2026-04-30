@@ -8,29 +8,47 @@
 //!
 //! ## Resolution / range
 //!
-//! Returns nanoseconds since the Unix epoch as a 63-bit `i64`. The
-//! 63-bit range covers ~292 years past 1970, sufficient through the
-//! year 2262 for v1 use. v2 `Int64` (Plan C Task 69) gives the
-//! full 64-bit range; the `frozen(Int64)` handler from the plan body
-//! is deferred to a Task 76 follow-up alongside Int64.
+//! Returns nanoseconds since the Unix epoch as a 63-bit non-negative
+//! `i64`. Sigil's `Int` type reserves the top bit at the runtime
+//! Value layer (per `runtime/src/value.rs`), so the surface is
+//! 63 bits unsigned in [0, 2^63 − 1] — about 292.47 years of
+//! nanoseconds past the Unix epoch. The implementation **saturates
+//! explicitly** at `i64::MAX` for any value beyond that bound rather
+//! than wrapping silently:
+//!
+//! - If the host's `SystemTime::now()` is at or before the Unix
+//!   epoch (e.g. clock skew on a fresh boot), returns `0`.
+//! - If the host's `SystemTime::now()` is past `1970-01-01 +
+//!   (2^63 − 1) ns ≈ year 2262-04-11`, returns `i64::MAX`. The
+//!   compiled program can detect saturation by comparing the
+//!   result against `i64::MAX`. (Year 2262 is far enough out that
+//!   v2's `Int64` (Task 69) is expected to ship long before the
+//!   bound matters.)
+//!
+//! v2 `Int64` gives the full 64-bit range; the `frozen(Int64)`
+//! handler from the plan body is deferred to a Task 76 follow-up
+//! alongside Int64.
 
 /// Returns nanoseconds since the Unix epoch as a 63-bit non-negative
-/// `i64`. On systems where `SystemTime::now()` can't compute a
-/// duration (clock skew, pre-1970 system clock), returns `0` rather
-/// than aborting.
+/// `i64`. Saturates at `0` (epoch or earlier) and `i64::MAX` (past
+/// year 2262) — see module docs for the saturation semantics.
 ///
 /// # Safety
 ///
 /// Safe to call from any thread.
 #[no_mangle]
 pub extern "C" fn sigil_clock_os_now() -> i64 {
-    let dur = std::time::SystemTime::now()
+    let dur_nanos: u128 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    // Mask to 63 bits — sigil's Int reserves the top bit at the
-    // runtime Value layer.
-    (dur & 0x7FFF_FFFF_FFFF_FFFF) as i64
+    // 63-bit non-negative bound = 2^63 − 1.
+    const MAX_NANOS: u128 = i64::MAX as u128;
+    if dur_nanos > MAX_NANOS {
+        i64::MAX
+    } else {
+        dur_nanos as i64
+    }
 }
 
 #[cfg(test)]
@@ -46,12 +64,11 @@ mod tests {
     }
 
     #[test]
-    fn clock_advances_across_calls() {
-        // Two consecutive calls should differ by at least 1ns on
-        // any reasonable system.
+    fn clock_does_not_go_backwards() {
+        // Pin the monotonicity property without claiming a specific
+        // resolution (Windows / qemu timer can stall at ns). The
+        // assertion only catches the failure mode `b < a`.
         let a = sigil_clock_os_now();
-        // Spin a tiny bit to ensure the system clock advances even
-        // on hosts with low-resolution timers.
         for _ in 0..10_000 {
             std::hint::black_box(0);
         }

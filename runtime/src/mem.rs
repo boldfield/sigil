@@ -168,6 +168,10 @@ fn mut_byte_payload_bytes_for(len: u64) -> usize {
 /// Safe to call from any thread (Boehm-managed allocation).
 #[no_mangle]
 pub extern "C" fn sigil_mut_byte_array_new(len: u64, fill: u8) -> *mut u8 {
+    if (len as i64) < 0 {
+        eprintln!("sigil_mut_byte_array_new: negative length {}", len as i64);
+        std::process::abort();
+    }
     let payload_bytes = mut_byte_payload_bytes_for(len);
     let h = Header::new(TAG_MUT_BYTE_ARRAY, 0, 0);
     let obj = sigil_alloc(h.raw(), payload_bytes);
@@ -218,6 +222,10 @@ pub unsafe extern "C" fn sigil_mut_byte_array_length(arr: *const u8) -> u64 {
 /// Same as `sigil_mut_byte_array_length`.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_mut_byte_array_get(arr: *const u8, i: u64) -> u8 {
+    if (i as i64) < 0 {
+        eprintln!("sigil_mut_byte_array_get: negative index {}", i as i64);
+        std::process::abort();
+    }
     let len = sigil_mut_byte_array_length(arr);
     if i >= len {
         eprintln!("sigil_mut_byte_array_get: index {i} out of bounds (len {len})");
@@ -238,6 +246,10 @@ pub unsafe extern "C" fn sigil_mut_byte_array_get(arr: *const u8, i: u64) -> u8 
 /// concurrent reads of the same slot from another thread.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_mut_byte_array_set(arr: *mut u8, i: u64, val: u8) {
+    if (i as i64) < 0 {
+        eprintln!("sigil_mut_byte_array_set: negative index {}", i as i64);
+        std::process::abort();
+    }
     let len = sigil_mut_byte_array_length(arr);
     if i >= len {
         eprintln!("sigil_mut_byte_array_set: index {i} out of bounds (len {len})");

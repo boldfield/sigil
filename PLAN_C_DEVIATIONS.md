@@ -279,3 +279,103 @@ Compiler internals would consume the `extern fn` declarations directly — no `r
 **Failure mode (today).** Adding a new runtime-backed stdlib primitive in v1 requires the full mechanical sweep: runtime FFI + counter/tag wiring + typecheck builtin scheme + codegen FuncId/FuncRef extension + dispatch arm + `type_of_expr` prediction + entry-walker globals + doc-only `.sigil` update + tests. PR #42 review #10 already drove the `BuiltinFuncIds` / `BuiltinFuncRefs` consolidation that absorbed most of the per-call-site cost; the remaining ~5-line-per-primitive overhead is what v2 retires.
 
 **Implementing commit(s).** Tracking entry only. Would land as a separate language-surface task; documented here so Task 67+ implementers know the convention is v1-bounded, not architectural.
+
+## 2026-04-30 — [DEVIATION Task 66.6] Plan A2's `byte_to_int` finally wired to the sigil surface
+
+**Context.** Plan A2 task 25 shipped `sigil_byte_to_int` (i.e. `Byte -> Int` widening) as a runtime FFI primitive, but never wired it through to a sigil-side builtin scheme — the surface plan called for `Char` / `Byte` work to grow incrementally and the loop closure was deferred each time. Task 66.6's e2e tests (`std_mut_byte_array_*`) need to widen a `Byte` back to `Int` for `int_to_string` + `IO.println` printing, surfacing the missing wire.
+
+**Why accepted.** Wiring it through is a 3-line change (codegen FFI declaration + dispatch arm + builtin scheme) that completes a Plan A2 carryover. The alternative — keeping `byte_to_int` as a runtime-only symbol and forcing test code to re-implement the widening via match expressions — is strictly worse and gates byte-typed test scenarios on no real architectural change.
+
+**Closure path.** Closed at this commit. `byte_to_int(Byte) -> Int ![]` is callable from sigil source. Plan A2's task 25 carryover line in `PLAN_A2_PROGRESS.md` is implicitly closed (the runtime symbol's surface exposure no longer pending).
+
+**Failure mode.** N/A — closure-completion entry.
+
+**Implementing commit(s).** `279c2d8` (the Task 66.6 commit pair).
+
+## 2026-04-30 — [DEVIATION Task 68] String surface — byte-indexed v1 + namespace-blocked v2 deferrals
+
+**Context.** Plan C Task 68's plan body lists 20 String operations: `string_length`, `string_byte_at`, `string_char_at`, `string_chars`, `string_concat`, `string_substring`, `string_compare`, `string_starts_with`, `string_ends_with`, `string_contains`, `string_index_of`, `string_split`, `string_join`, `string_trim`, `string_from_int`, `string_to_int`, `string_from_float`, `string_to_float`, `char_to_int`, `int_to_char`. Task 68 part 1 ships 12 of these; the remaining 8 are split across three deferral classes.
+
+**What ships in part 1 (12 ops).** All byte-indexed surface operations: `string_concat`, `string_substring`, `string_byte_at`, `string_compare`, `string_starts_with`, `string_ends_with`, `string_contains`, `string_index_of`, `string_trim`, `string_to_int_validate`, `string_to_int_parse`, `string_length`. Plus `byte_to_int` from the parallel Task 66.6 cleanup. Each registered via `register_builtin_string_schemes` and dispatched in `lower_call`.
+
+**Deferred class 1 — codepoint-aware ops (`string_char_at`, `string_chars`).** Both depend on a runtime UTF-8-aware iterator + the `Char` primitive promoted to user-side surface. v1 `Char` exists at the type level (Plan A2) but has no surface literal syntax; widening it to user-callable construction is a separate v2 task. Defer until the `Char` surface lands.
+
+**Deferred class 2 — List-returning helpers (`string_split`, `string_join`).** Both produce / consume `List[String]`. As with Task 66.5's `from_list` / `to_list`, putting `string_split` in `std/string.sigil` would force `import std.list`, and any user importing `std.string` + `std.option` + `std.result` together hits the flat-stdlib-namespace `fn map` collision (per `[DEVIATION Task 66.5]`). Defer until namespace qualification ships.
+
+**Deferred class 3 — Float helpers (`string_from_float`, `string_to_float`).** Sigil v1 has no `Float` primitive type. Defer until `Float` lands in v2 (the Plan C plan body doesn't queue a Float task; this is a v2 prerequisite).
+
+**Deferred class 4 — Sum-typed wrappers (`string_to_int`, `string_from_int`).** `string_to_int` ships as the validate / parse pair; the `Result[Int, ParseError]` user-facing wrapper is deferred under the same flat-namespace concern as Task 66.5. `string_from_int` is essentially `int_to_string` (which already ships from Plan A2); no new primitive needed.
+
+**Deferred class 5 — `char_to_int` / `int_to_char`.** Both depend on the user-side `Char` surface (same blocker as deferred class 1).
+
+**Why accepted.** The 12 byte-indexed ops give the rest of Stage 7's stdlib (Task 67's `string_builder`, Task 70's `IO.read_file`/`IO.write_file`, demos in Stage 8) a usable working set. The 8 deferred ops have specific, narrow blockers — none are blocked on Task 68 internals. Shipping the 12 unblocks P02's `string_concat` run-portion + P05/etc. that need substring/comparison; deferring 8 keeps Task 68 part 1 mechanical and reviewable.
+
+**Closure path.**
+- Codepoint ops: ship alongside `Char` user-surface widening (v2).
+- List ops: ship after stdlib namespace qualification.
+- Float ops: ship after `Float` primitive lands (v2).
+- Sum-typed wrappers: same as List ops (namespace).
+
+**Failure mode.** Users wanting deferred ops write equivalents in their own program against the byte-indexed primitives. Verbose but expressible for ASCII-pinned use cases.
+
+**Implementing commit(s).** `d6401b2`.
+
+## 2026-04-30 — [DEVIATION Task 70] IO op-id reordering + alphabetical ABI
+
+**Context.** Plan C Task 70 grew the builtin `IO` effect from 1 op (`println`) to 5 (`print`, `println`, `read_file`, `read_line`, `write_file`). Op IDs are assigned alphabetically per effect (per the convention from Plan B Task 55 Phase 4f's `BUILTIN_EFFECT_NAMES`). After Task 70:
+
+```
+IO.print      → op_id 0
+IO.println    → op_id 1   (was op_id 0 pre-Task-70)
+IO.read_file  → op_id 2
+IO.read_line  → op_id 3
+IO.write_file → op_id 4
+```
+
+Adding the 4 new ops shifted `println` from op_id 0 to op_id 1.
+
+**Why accepted (alphabetical ordering).** Plan B Task 55 Phase 4f committed to alphabetical-by-effect-then-by-user op_id assignment. The compiler dynamically re-assigns op_ids at typecheck (no hardcoded integer constants in production code), so the runtime ABI continues to work after the shift. The main shim's hardcoded "IO arm at op_id 0" call updated mechanically to install all 5 arms at their alphabetical positions.
+
+**The breaking-change risk.** Pre-Task-70 the partial-handler test `user_discard_k_io_handler_unwinds_helper_at_perform_site` registered a 1-arm handler `IO.println(s, k) => 0`. Post-Task-70 the handler is partial (4 of 5 IO ops uncovered) and trips E0142. **The CI regression on PR #43 (commit `25b8aec`, fixed at `8fc57b0`) is exactly this failure mode** — hardcoded per-effect handler arm sets need to grow when the effect adds ops.
+
+Architectural escalation flagged in PR #43's review: "any test loadbearing on a specific op_id ordering is now silently brittle." Audit confirmed no production code hardcodes op_ids — codegen and typecheck both look them up dynamically — so the breaking change is bounded to test-suite-level handler completeness checks.
+
+**Closure path.** Future ops added to existing builtin effects (Tasks 71-76's user-effect handlers don't touch builtins) face the same op_id-shift risk; partial-handler tests need updating in the same commit. The `extern fn` + `opaque type` v2 path doesn't change this (the typecheck-side enforcement is independent).
+
+**Failure mode.** Same as the CI regression: typecheck rejects partial handlers with E0142. The fix is mechanical (add missing arms with discharge-`k` shapes).
+
+**Implementing commit(s).** `25b8aec` (Task 70 + 74); `8fc57b0` (CI fix for the broken partial-handler test).
+
+## 2026-04-30 — [DEVIATION Task 74] Mem ships entirely as a marker effect
+
+**Context.** Plan C Task 74's plan body says: "the handler performs in-place mutation on `MutArray` and rope operations on `StringBuilder`. `main` functions that need mutation declare `![Mem, ...]` in their row." This implies Mem operations are intercepted at a top-level handler frame.
+
+**Why accepted (marker-only).** Per `[DEVIATION Task 66]` Mem ships as a marker effect with zero ops in v1: the Plan C Stage 7 design accommodates generic-typed runtime types (`MutArray[A]`, `MutByteArray`, `StringBuilder`) by gating their ops on the row rather than dispatching through perform. Task 74's "`main` declares `![Mem]`" remains true; the "top-level handler" the plan body references is the type-level absence of a deeper override (no runtime handler frame is installed because there are no ops to dispatch).
+
+**What ships.** `std/mem.sigil` documentation file added to `imports::BUILTIN_INJECTED` skip-list. Doc covers the marker-effect rationale + v2 closure path.
+
+**Closure path.** When `effect Mem[A] { new_array, get, set, ... }` ships as a generic builtin (deferred from Task 66), Task 74 closes by reframing `std/mem.sigil` from doc-only to a real importable module that declares the handler operations. User code stays surface-stable across the v1 → v2 shift.
+
+**Failure mode.** Users trying to intercept Mem operations via `handle ... with { Mem.X(...) => ... }` get E0139 (unknown op on declared effect) until v2 ships generic Mem ops. Documented in `std/mem.sigil`.
+
+**Implementing commit(s).** `25b8aec`.
+
+## 2026-04-30 — [DEVIATION Task 75 + 76] Pseudo-random naming + Int64-blocked deferred handlers
+
+**Context.** Plan C Tasks 75 and 76 specify `Random` and `Clock` effects with `os_seed()` / `seeded(Int64)` and `os_clock()` / `frozen(Int64)` handlers respectively. Two deferral classes apply.
+
+**Class 1 — Naming honesty.** The plan body's `os_seed()` handler implies OS-level entropy (`getrandom(2)` / `BCryptGenRandom`). Sigil v1 has neither a `getrandom`-class crate nor direct syscall plumbing; shipping the runtime-side primitive as `sigil_random_os_int` would mislead users into reaching for it for tokens, salts, session IDs, etc. — a footgun.
+
+**Why accepted (rename to `pseudo`).** The runtime primitive is renamed `sigil_random_pseudo_int`; the sigil-side surface is `random_pseudo_int` + `run_pseudo_random`. The `Random` effect itself stays neutral (`rand_int` op name), since `random_int` is what the user calls and the effect's quality is pinned by the active handler at the use site. Documentation in `runtime/src/random.rs` and `std/random.sigil` carries an explicit "NOT CRYPTOGRAPHICALLY SECURE" warning. v2 will add a real `os_random_int` primitive backed by `getrandom(2)` / `getentropy(3)` / `BCryptGenRandom`, with a parallel `run_os_random` handler; the pseudo-random surface stays for tests and reproducibility.
+
+**Class 2 — Int64-blocked handlers.** The plan-body `seeded(Int64)` (Task 75) and `frozen(Int64)` (Task 76) handlers depend on Plan C Task 69 (`Int64`). Both are deferred to Task 75-followup / Task 76-followup once Int64 ships.
+
+**Class 3 — Clock saturation semantics.** `Clock.now() -> Int` returns 63-bit non-negative nanos since Unix epoch (sigil's `Int` reserves the high bit at the runtime Value layer). Past year ~2262, the value would exceed `i64::MAX`; the runtime saturates at `i64::MAX` rather than wrapping silently. Documented in `runtime/src/clock.rs`.
+
+**Closure path.** Pseudo-rename closes when v2's true OS-entropy primitive lands and the parallel `run_os_random` handler ships in `std/random.sigil`. Int64-blocked handlers close when Task 69 ships. Clock saturation is a long-tail v2 concern (year 2262 ≈ 240 years out).
+
+**Failure mode (Random).** Pre-rename users would reach for `os_random` / `random_os_int` for security-sensitive contexts and get a fully-predictable PRNG. Post-rename, the `pseudo` substring + module-doc warning + std/random.sigil doc warning keep the non-crypto property visible at every call site.
+
+**Failure mode (Clock).** Saturation at year 2262 is silent at the type level (returns `i64::MAX`); user code can detect saturation by `==` comparison.
+
+**Implementing commit(s).** `91d1e55` (initial Tasks 75 + 76 land); [HEAD] (Random rename + scheme-organisation + clock saturation explicit).

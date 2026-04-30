@@ -12,6 +12,19 @@
 // trampoline dispatches to the runtime arm. `import std.io` is a
 // no-op (skip-list path).
 //
+// ## ⚠️ Unsandboxed filesystem access
+//
+// `IO.read_file` and `IO.write_file` pass paths straight to
+// `std::fs::read_to_string` / `std::fs::write` without any
+// sandboxing or path validation. The compiled program inherits
+// the host process's filesystem privileges. v1's threat model is
+// "the program does what its source says"; if you don't trust
+// the source, don't compile + run it. Future v2 work may add an
+// effect handler that intercepts file ops to enforce a sandbox
+// (chroot-style root prefix, allowlist of paths, etc.) — the
+// effect declaration already gives users a place to install such
+// a handler via `handle ... with { IO.read_file(p, k) => ... }`.
+//
 // ## Operations (Plan A1 + Plan C Task 70)
 //
 // - `IO.print(s: String) -> Unit` — write `s` to stdout, no

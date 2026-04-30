@@ -6782,6 +6782,26 @@ fn std_io_print_without_newline() {
     assert_eq!(stdout, "hello world\n", "stderr={stderr:?}");
 }
 
+/// `IO.read_line` reads a single line from stdin. Driving stdin
+/// from cargo test is awkward (would need to spawn the compiled
+/// binary with a piped stdin and feed it bytes); marked `#[ignore]`
+/// as a placeholder so the absence-of-coverage stays grep-findable
+/// for future test infra work. The compile-only path is exercised
+/// by the `io_read_line_returns_string` typecheck test.
+#[test]
+#[ignore = "needs piped-stdin test infrastructure; tracked for Task 78"]
+fn std_io_read_line_via_piped_stdin_pending_test_infra() {
+    // The future-shape:
+    //   - Spawn the compiled binary with a pipe to stdin.
+    //   - Write `"hello\n"` to the pipe; close it.
+    //   - Assert stdout contains `"hello\n"` (round-trip).
+    //
+    // The runtime contract is pinned by `runtime/src/io.rs`'s
+    // `sigil_read_line` Rust unit (read_line strips exactly one
+    // trailing `\n` or `\r\n`, EOF returns empty).
+    let _ = "placeholder";
+}
+
 /// `IO.write_file` then `IO.read_file` round-trips a string through
 /// the filesystem. Uses a tmp path to avoid CI / pod conflicts.
 #[test]

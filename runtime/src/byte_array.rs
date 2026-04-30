@@ -66,13 +66,20 @@ fn payload_bytes_for(len: u64) -> usize {
 }
 
 /// Allocate a fresh byte-array of `len` bytes, each initialised to
-/// `fill`. Returns the header pointer.
+/// `fill`. Returns the header pointer. Aborts on negative `len`
+/// (when sigil-side `Int` reinterprets to a near-`u64::MAX`) so the
+/// failure surfaces as a clear runtime message rather than an
+/// opaque allocator error.
 ///
 /// # Safety
 ///
 /// Safe to call from any thread (Boehm-managed allocation).
 #[no_mangle]
 pub extern "C" fn sigil_byte_array_alloc(len: u64, fill: u8) -> *mut u8 {
+    if (len as i64) < 0 {
+        eprintln!("sigil_byte_array_alloc: negative length {}", len as i64);
+        std::process::abort();
+    }
     let payload_bytes = payload_bytes_for(len);
     let h = Header::new(TAG_BYTE_ARRAY, 0, 0);
     let obj = sigil_alloc(h.raw(), payload_bytes);
@@ -127,6 +134,10 @@ pub unsafe extern "C" fn sigil_byte_array_length(arr: *const u8) -> u64 {
 /// Same as `sigil_byte_array_length`. `i` must be `< length(arr)`.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_byte_array_get(arr: *const u8, i: u64) -> u8 {
+    if (i as i64) < 0 {
+        eprintln!("sigil_byte_array_get: negative index {}", i as i64);
+        std::process::abort();
+    }
     let len = sigil_byte_array_length(arr);
     if i >= len {
         eprintln!("sigil_byte_array_get: index {i} out of bounds (len {len})");
@@ -148,7 +159,17 @@ pub unsafe extern "C" fn sigil_byte_array_get(arr: *const u8, i: u64) -> u8 {
 pub unsafe extern "C" fn sigil_byte_array_concat(a: *const u8, b: *const u8) -> *mut u8 {
     let la = sigil_byte_array_length(a);
     let lb = sigil_byte_array_length(b);
-    let total = la.saturating_add(lb);
+    // Abort on length overflow rather than silently producing a
+    // wrong-sized allocation. Saturating addition would truncate
+    // the requested size and leave the user with an array shorter
+    // than `la + lb`; honest abort surfaces the impossibility.
+    let total = match la.checked_add(lb) {
+        Some(n) => n,
+        None => {
+            eprintln!("sigil_byte_array_concat: length overflow ({la} + {lb} exceeds u64::MAX)");
+            std::process::abort();
+        }
+    };
     let out = sigil_byte_array_alloc(total, 0);
 
     if la > 0 {
@@ -175,6 +196,14 @@ pub unsafe extern "C" fn sigil_byte_array_concat(a: *const u8, b: *const u8) -> 
 /// `arr` must be a pointer to a valid `TAG_BYTE_ARRAY` header.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_byte_array_slice(arr: *const u8, start: u64, end: u64) -> *mut u8 {
+    if (start as i64) < 0 {
+        eprintln!("sigil_byte_array_slice: negative start {}", start as i64);
+        std::process::abort();
+    }
+    if (end as i64) < 0 {
+        eprintln!("sigil_byte_array_slice: negative end {}", end as i64);
+        std::process::abort();
+    }
     let len = sigil_byte_array_length(arr);
     if start > end {
         eprintln!("sigil_byte_array_slice: start {start} > end {end}");

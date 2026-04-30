@@ -788,6 +788,10 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // Plan C Task 68 — extended String primitives (byte-indexed
     // accessor / comparison / search / trim / parse).
     register_builtin_string_schemes(&mut tc);
+    // Plan C Task 75 — Random pseudo-int builtin.
+    register_builtin_random_schemes(&mut tc);
+    // Plan C Task 76 — OS clock builtin.
+    register_builtin_clock_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -1463,7 +1467,7 @@ fn register_builtin_mut_byte_array_schemes(tc: &mut Tc) {
 ///
 /// All operate on `TAG_STRING` headers and use byte offsets. Code-
 /// point-aware variants (`string_char_at`, `string_chars`) and the
-/// List-returning helpers (`string_split`, `string_chars`) are
+/// List-returning helpers (`string_split`, `string_join`) are
 /// deferred to Task 68 part 2 (alongside the namespace fix that
 /// lets a stdlib module use `Char` + `List` + `Result` together).
 ///
@@ -1539,12 +1543,46 @@ fn register_builtin_string_schemes(tc: &mut Tc) {
         "string_length".to_string(),
         make_scheme(vec![Ty::String], Ty::Int),
     );
-    // Plan C Task 75 — OS-entropy random Int. Used by the
-    // `os_random` handler in `std/random.sigil`.
-    tc.fn_schemes
-        .insert("random_os_int".to_string(), make_scheme(vec![], Ty::Int));
-    // Plan C Task 76 — OS clock (nanos since epoch). Used by the
-    // `os_clock` handler in `std/clock.sigil`.
+}
+
+/// Plan C Task 75 — `Random` builtin schemes.
+///
+/// `random_pseudo_int(): Int ![]` — process-global xorshift64 PRNG
+/// (NOT cryptographically secure; see `runtime/src/random.rs`).
+/// Used by the `run_pseudo_random` handler in `std/random.sigil`.
+fn register_builtin_random_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    tc.fn_schemes.insert(
+        "random_pseudo_int".to_string(),
+        make_scheme(vec![], Ty::Int),
+    );
+}
+
+/// Plan C Task 76 — `Clock` builtin schemes.
+///
+/// `clock_os_now(): Int ![]` — nanos since the Unix epoch, drawn
+/// from `SystemTime::now()`. Used by the `run_os_clock` handler
+/// in `std/clock.sigil`.
+fn register_builtin_clock_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
     tc.fn_schemes
         .insert("clock_os_now".to_string(), make_scheme(vec![], Ty::Int));
 }
@@ -9969,12 +10007,12 @@ mod tests {
     #[test]
     fn import_std_random_typechecks_cleanly() {
         // Loads the Random effect declaration + `random_int()` +
-        // `run_os_random` higher-order helper. Exercises the
+        // `run_pseudo_random` higher-order helper. Exercises the
         // typechecker's user-effect handling path for a stdlib-
         // declared effect with a tail-`k` resume arm.
         let src = "import std.random\n\
                    fn main() -> Int ![IO] {\n  \
-                     let n: Int = run_os_random(random_int);\n  \
+                     let n: Int = run_pseudo_random(random_int);\n  \
                      perform IO.println(int_to_string(n));\n  \
                      0\n\
                    }\n";

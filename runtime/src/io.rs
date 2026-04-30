@@ -71,9 +71,17 @@ pub unsafe extern "C" fn sigil_read_line() -> *mut u8 {
     if handle.read_line(&mut buf).is_err() {
         std::process::abort();
     }
-    // Strip trailing CR / LF.
-    while matches!(buf.as_bytes().last(), Some(b'\n') | Some(b'\r')) {
+    // Strip exactly one line terminator: a trailing `\n` (and a
+    // preceding `\r` if present, so `\r\n` round-trips through the
+    // `text\n` convention). Multiple trailing newlines are
+    // preserved (only the input-line-terminating newline is
+    // consumed); `read_line` itself returns at most one line so in
+    // practice `buf` ends in 0 or 1 `\n`.
+    if buf.ends_with('\n') {
         buf.pop();
+        if buf.ends_with('\r') {
+            buf.pop();
+        }
     }
     // SAFETY: gc-heap-ptr arithmetic (buf is a stack-local String, not a heap object — false-positive).
     sigil_string_new(buf.as_bytes().as_ptr(), buf.len())

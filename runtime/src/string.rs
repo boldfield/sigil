@@ -43,7 +43,17 @@ use crate::gc::{sigil_string_new, string_bytes};
 pub unsafe extern "C" fn sigil_string_concat(a: *const u8, b: *const u8) -> *mut u8 {
     let (a_bytes, a_len) = string_bytes(a);
     let (b_bytes, b_len) = string_bytes(b);
-    let total = a_len.saturating_add(b_len);
+    // Abort on length overflow rather than silently producing a
+    // wrong-sized allocation.
+    let total = match a_len.checked_add(b_len) {
+        Some(n) => n,
+        None => {
+            eprintln!(
+                "sigil_string_concat: length overflow ({a_len} + {b_len} exceeds usize::MAX)"
+            );
+            std::process::abort();
+        }
+    };
 
     if total == 0 {
         return sigil_string_new(std::ptr::null(), 0);
@@ -74,6 +84,10 @@ pub unsafe extern "C" fn sigil_string_concat(a: *const u8, b: *const u8) -> *mut
 /// `< sigil_string_len(s)`.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_string_byte_at(s: *const u8, i: u64) -> u8 {
+    if (i as i64) < 0 {
+        eprintln!("sigil_string_byte_at: negative index {}", i as i64);
+        std::process::abort();
+    }
     let (bytes, len) = string_bytes(s);
     if (i as usize) >= len {
         eprintln!("sigil_string_byte_at: index {i} out of bounds (len {len})");
@@ -91,6 +105,14 @@ pub unsafe extern "C" fn sigil_string_byte_at(s: *const u8, i: u64) -> u8 {
 /// `s` must be a valid `TAG_STRING` header pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_string_substring(s: *const u8, start: u64, end: u64) -> *mut u8 {
+    if (start as i64) < 0 {
+        eprintln!("sigil_string_substring: negative start {}", start as i64);
+        std::process::abort();
+    }
+    if (end as i64) < 0 {
+        eprintln!("sigil_string_substring: negative end {}", end as i64);
+        std::process::abort();
+    }
     let (bytes, len) = string_bytes(s);
     if start > end {
         eprintln!("sigil_string_substring: start {start} > end {end}");
@@ -267,10 +289,12 @@ pub unsafe extern "C" fn sigil_string_to_int_validate(s: *const u8) -> i64 {
 }
 
 /// Parse `s` as a signed decimal integer. The caller is responsible
-/// for having checked `sigil_string_to_int_validate(s) == 0`; on
+/// for having checked `sigil_string_to_int_validate(s) == 0` — on
 /// validated input this primitive returns the parsed value. On
-/// unvalidated input the return is unspecified (production code
-/// always pairs validate + alloc).
+/// unvalidated input the function aborts with a clear stderr
+/// message. Returning a plausible-looking placeholder (e.g. 0)
+/// would silently corrupt downstream computation; abort is the
+/// honest failure mode for an unvalidated parse.
 ///
 /// # Safety
 ///
@@ -280,8 +304,26 @@ pub unsafe extern "C" fn sigil_string_to_int_validate(s: *const u8) -> i64 {
 pub unsafe extern "C" fn sigil_string_to_int_parse(s: *const u8) -> i64 {
     let (bytes, len) = string_bytes(s);
     let slice = std::slice::from_raw_parts(bytes, len);
-    let text = std::str::from_utf8(slice).unwrap_or("0");
-    text.parse::<i64>().unwrap_or(0)
+    let text = match std::str::from_utf8(slice) {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!(
+                "sigil_string_to_int_parse: input is not valid UTF-8; \
+                 caller must invoke sigil_string_to_int_validate first"
+            );
+            std::process::abort();
+        }
+    };
+    match text.parse::<i64>() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "sigil_string_to_int_parse: failed to parse `{text}` ({e}); \
+                 caller must invoke sigil_string_to_int_validate first"
+            );
+            std::process::abort();
+        }
+    }
 }
 
 #[cfg(test)]

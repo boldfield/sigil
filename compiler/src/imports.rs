@@ -32,13 +32,32 @@ use crate::{lexer, parser, stdlib_embed};
 /// here. Entries match the embedded-tree path produced by
 /// [`path_to_module`] — with the `.sigil` suffix and `/` separators.
 ///
-/// `array.sigil`, `mut_array.sigil`, `byte_array.sigil`,
-/// `mut_byte_array.sigil`, `string.sigil`, and `mem.sigil` are
-/// documentation-only today (zero items declared) but listed here
-/// proactively: a future doctest tooling pass (Plan C Task 77) may
-/// emit `@example` blocks as standalone fns, and unguarded loading
-/// would let any future fn item in those files pollute every
-/// importer's flat namespace silently.
+/// ## When to add a stdlib module here vs. ship it as real sigil
+///
+/// **Real sigil module** (NOT in this list): the file declares
+/// user-side type / fn / effect items that the typechecker should
+/// register from sigil source. Examples: `option.sigil`,
+/// `result.sigil`, `list.sigil`, `random.sigil`, `clock.sigil` —
+/// each declares a sum type or an effect plus user-callable
+/// helpers in pure sigil.
+///
+/// **Doc-only module** (in this list): the file's user-visible
+/// surface is a runtime-managed opaque type (e.g. `ByteArray`,
+/// `MutArray`) whose layout can't be expressed in sigil syntax,
+/// or a builtin-injected effect (e.g. `IO`, `Mem`) whose ops are
+/// constructed in compiler code. Sigil v1's surface lacks `extern
+/// fn` and `opaque type` declarations (see
+/// `[DEVIATION cross-cutting] v2 path: extern fn + opaque type for
+/// stdlib FFI declarations` in `PLAN_C_DEVIATIONS.md`); until v2
+/// lands, the convention is documentation-only `.sigil` files
+/// paired with typechecker-side `register_builtin_*_schemes()` and
+/// `builtin_effects()` injection.
+///
+/// Listing the doc-only files here defends against a future doctest
+/// tooling pass (Plan C Task 77) that may emit `@example` blocks
+/// as standalone fns: unguarded loading would let any future fn
+/// item in those files pollute every importer's flat namespace
+/// silently.
 const BUILTIN_INJECTED: &[&str] = &[
     "io.sigil",
     "array.sigil",
