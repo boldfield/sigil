@@ -52,8 +52,8 @@ fn print_value(sb: StringBuilder, v: JValue) -> Unit ![Mem] {
     JNull => sb_append(sb, "null"),
     JBool(b) =>
       match b {
-        True => sb_append(sb, "true"),
-        False => sb_append(sb, "false"),
+        true => sb_append(sb, "true"),
+        false => sb_append(sb, "false"),
       },
     JInt(n) => sb_append(sb, int_to_string(n)),
     JString(s) => print_quoted(sb, s),
@@ -77,7 +77,7 @@ fn print_array(sb: StringBuilder, xs: JList) -> Unit ![Mem] {
 // `print_list_head` handles the first element with no leading
 // separator; the recursive `print_list_tail` prepends `, ` before
 // each subsequent element. Splitting the head case avoids a
-// `first: Bool` accumulator argument and the Unit-literal-on-True
+// `first: Bool` accumulator argument and the Unit-literal-on-true
 // subcase that v1 syntax can't express directly.
 fn print_list_head(sb: StringBuilder, xs: JList) -> Unit ![Mem] {
   match xs {
@@ -152,7 +152,7 @@ fn build_demo() -> JValue ![] {
     JOCons("name", JString("ada"),
     JOCons("age", JInt(36),
     JOCons("tags", tags,
-    JOCons("active", JBool(True),
+    JOCons("active", JBool(true),
     JOCons("spouse", JNull,
       JONil)))));
   JObject(fields)

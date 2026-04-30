@@ -9,10 +9,11 @@ progress, with the stdlib core (`Option`, `Result`, `List`, `Array`,
 `MutArray`, `ByteArray`, `MutByteArray`, `String`, `Int64`,
 `StringBuilder`, `IO`, `Mem`, `Random`, `Clock`, `Raise`, `State`,
 `Choose`) shipped and the interpreter + JSON pretty-printer demos in
-[`examples/`](examples). Specification authoring and a Plan-D
-architectural slice for first-class continuations (which unlocks
-arbitrary-arity `Choose` handlers and the Sudoku demo) are the
-remaining major work items.
+[`examples/`](examples). The remaining major work items are
+specification authoring (Stage 9) and a v2 architectural cluster
+covering first-class continuations + conditional-k arm bodies +
+wrapper-fn-frame composition, which together would unlock
+arbitrary-arity `Choose` dischargers and the Sudoku demo.
 
 ## Why sigil exists
 
@@ -254,23 +255,24 @@ Sigil is **under active construction**. The Plan B effect-handler
 correctness gates closed in PRs #26–#30; the remaining gaps are
 expressivity-class limits captured in
 [`PLAN_C_DEVIATIONS.md`](PLAN_C_DEVIATIONS.md) per stdlib task. The
-load-bearing remaining gap is a Plan-D-deferred architectural slice
-for **first-class continuations** that unlocks the rest of Task 73's
-`Choose` dischargers and the Sudoku demo:
+load-bearing remaining gap is a v2-deferred architectural cluster
+covering **first-class continuations** that would unlock the rest of
+Task 73's `Choose` dischargers and the Sudoku demo:
 
 | Gap | Behavior today | Closure point |
 |-----|----------------|---------------|
-| First-class continuations (`k` as a value, captured into a closure, passed to a helper) | Rejected with "first-class continuations are deferred to v2" diagnostic in `compiler/src/codegen.rs::arm_body_walk`. Single-shot and static-N let-chain multi-shot handler arms work; arbitrary-arity / fold-callback / nested-match k-call shapes do not. Blocks `std/choose.sigil`'s `all_choices` / `first_choice` dischargers and the Sudoku demo. | Plan D (planned 6-PR architectural slice) |
-| Wrapper-fn-frame composition for discharge-with-lambda | `examples/state.sigil`'s inline-perform shape works; wrapping `perform State.get/set` in a helper fn breaks the discharge-with-lambda continuation chain (the wrapper's frame doesn't re-thread state). Pinned by `#[ignore]`'d e2e test `std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix`. | Plan D (same slice) |
-| Type-parameterized effect rows (`![Raise[E]]`, `![State[S]]`) | Parser rejects type-parameterized effect references in rows; v1 ships concrete-typed effects (`Raise` over `String`, `State` over `Int`). | Plan D + parser surface lift |
+| First-class continuations (`k` as a value, captured into a closure, passed to a helper) | Rejected with "first-class continuations are deferred to v2" diagnostic in `compiler/src/codegen.rs::arm_body_walk`. Single-shot and static-N let-chain multi-shot handler arms work; arbitrary-arity / fold-callback / nested-match k-call shapes do not. Blocks `std/choose.sigil`'s `all_choices` / `first_choice` dischargers and the Sudoku demo. | v2 future architectural slice |
+| Wrapper-fn-frame composition for discharge-with-lambda | `examples/state.sigil`'s inline-perform shape works; wrapping `perform State.get/set` in a helper fn breaks the discharge-with-lambda continuation chain (the wrapper's frame doesn't re-thread state). Pinned by `#[ignore]`'d e2e test `std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix`. | v2 (same architectural slice) |
+| Type-parameterized effect rows (`![Raise[E]]`, `![State[S]]`) | Parser rejects type-parameterized effect references in rows; v1 ships concrete-typed effects (`Raise` over `String`, `State` over `Int`). | v2 (parser surface lift) |
 | Tuple type / `Pair[A, B]` stdlib | No tuples; `run_state` returns just `A` (not `(A, S)`). User code threads final state via the body return value. | v2 stdlib expansion |
 
 Each row's "Closure point" links to the corresponding `[DEVIATION
-Task NN]` entry in `PLAN_C_DEVIATIONS.md`. The Plan-D slice
-(first-class-continuation infrastructure + wrapper-fn-frame
-composition + conditional-k handler-arm tails) is scoped as 6
-incremental PRs and unlocks `all_choices` / `first_choice` over
-arbitrary-arity `Choose.choose(n)` plus the Sudoku demo (Task 81).
+Task NN]` entry in `PLAN_C_DEVIATIONS.md` for the technical
+detail. The cluster of v2 architectural lifts (first-class
+continuations, wrapper-fn-frame composition for discharge-with-
+lambda, conditional-k handler-arm tails) is the path that unlocks
+`std.choose`'s dischargers and the Sudoku demo (Task 81); scoping
+is a future-work decision.
 
 Authoritative sources:
 - [`PLAN_C_PROGRESS.md`](PLAN_C_PROGRESS.md) — current task status.
@@ -292,10 +294,8 @@ Authoritative sources:
   shipped in Plan B' Stage 6.7+6.8).
 - **Plan C** — Stages 7–10, stdlib + three demo programs + language
   specification + polish: **in progress** (~75%). Stdlib core
-  shipped (Tasks 62–76 except 67/69 part 2 deferred and 73 dischargers
-  Plan-D-deferred); interpreter + JSON pretty-printer demos shipped;
-  Sudoku demo + spec/language.md authoring + spec validation gate
-  pending.
-- **Plan D** — first-class-continuation architectural slice
-  (planned): unlocks `Choose` dischargers, Sudoku demo, and the
-  wrapper-fn-frame composition gap. Estimated 6 incremental PRs.
+  shipped (Tasks 62–76 except 67/69 part 2 deferred and Task 73's
+  `Choose` dischargers v2-deferred per
+  [`PLAN_C_DEVIATIONS.md`](PLAN_C_DEVIATIONS.md)); interpreter +
+  JSON pretty-printer demos shipped; Sudoku demo + spec
+  validation gate pending.

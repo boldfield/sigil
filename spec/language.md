@@ -174,8 +174,8 @@ fn manhattan(a: Point, b: Point) -> Int ![] {
 
 fn abs(n: Int) -> Int ![] {
   match n < 0 {
-    True => 0 - n,
-    False => n,
+    true => 0 - n,
+    false => n,
   }
 }
 
@@ -369,8 +369,8 @@ identifiers.
   `byte_from_int(n: Int) -> Option[Byte] ![]` (the latter is the
   range-checking constructor; deferred to a follow-up per
   `[DEVIATION Task 66.5]` namespace work).
-- Bool: `True` and `False` are sum-type constructors of the builtin
-  `Bool` type.
+- Bool: `true` and `false` are the literal forms of the builtin
+  `Bool` type. Pattern-match with `match b { true => ..., false => ... }`.
 
 There is no `Float` literal in v1.
 
@@ -399,7 +399,7 @@ fn main() -> Int ![IO] { 0 }                   // function
 | Type | Description |
 |------|-------------|
 | `Int` | 63-bit signed integer. |
-| `Bool` | `True` / `False`. |
+| `Bool` | `true` / `false`. |
 | `String` | Immutable UTF-8 byte sequence. |
 | `Char` | 1-byte codepoint. |
 | `Byte` | 1-byte unsigned integer (0..255). |
@@ -464,7 +464,7 @@ suggested fix.
 | Integer literal | `42` |
 | String literal | `"hello"` |
 | Char literal | `'A'` |
-| Bool literal | `True`, `False` |
+| Bool literal | `true`, `false` |
 | Identifier | `x`, `length` |
 | Function call | `f(x, y)` |
 | Lambda | `fn (x: Int) -> Int ![] => x + 1` |
@@ -629,7 +629,7 @@ Effect.op(arg, k) => {
 ```
 
 N is fixed at compile time; runtime-N variations need first-class
-continuations from Plan D.
+continuations (v2 work).
 
 #### §8.4 — Effect row inference
 
@@ -741,9 +741,9 @@ files are the authoritative API reference.
 | `std.clock` | `Clock` effect + `run_os_clock` (wall-clock nanos). |
 | `std.raise` | `Raise` effect + `raise(s)` + `catch[A]`. |
 | `std.state` | `State` effect + `run_state(initial, body)`. |
-| `std.choose` | `Choose resumes: many` effect declaration; dischargers (`all_choices`, `first_choice`) deferred to Plan D. |
+| `std.choose` | `Choose resumes: many` effect declaration; dischargers (`all_choices`, `first_choice`) deferred to v2. |
 
-### §14 — v1 limits (deferred to Plan D / v2)
+### §14 — v1 limits (deferred to v2)
 
 - **First-class continuations:** `k` cannot be passed as a value,
   captured into closures, or stored in records. Blocks

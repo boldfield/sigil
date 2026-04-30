@@ -7157,7 +7157,7 @@ fn std_int64_mul_div_mod() {
 #[test]
 fn std_int64_comparisons_match_expected() {
     let src = "fn show(b: Bool) -> String ![] {\n  \
-                 match b { True => \"T\", False => \"F\" }\n\
+                 match b { true => \"T\", false => \"F\" }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  let a: Int64 = int64_from_int(5);\n  \

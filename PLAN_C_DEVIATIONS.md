@@ -579,7 +579,7 @@ User code uses inline single-shot handlers (always pick `k(0)`, discard-`k` on `
 
 - **No perform wrappers.** Users do `perform Choose.choose(n)` / `perform Choose.fail()` directly. Surface is stable across v1 → v2; wrappers are additive when they ship.
 
-**Closure path.** Three orthogonal v2 surface lifts retire the deviation. The codegen-side ones cluster as a single architectural slice (planned as "Plan D" — first-class continuations + wrapper-fn-frame composition; ~4-8 weeks of work, scoped as 6 incremental PRs):
+**Closure path.** Three orthogonal v2 surface lifts retire the deviation. The codegen-side ones (first-class continuations + conditional-k handler-arm tails + wrapper-fn-frame composition) form a coherent architectural cluster but have not yet been scoped at the user-plan level; this deviation captures the technical detail that any such slice would address:
 
 1. **First-class continuations** — `k` as a passable value, captured into closures, threaded through user fns. Lifts constraint #3. Unblocks `all_choices` via the `list_fold(range(0, arg), Nil, fn (acc, i) => append(acc, k(i)))` shape.
 
