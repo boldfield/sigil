@@ -5518,92 +5518,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_next_step_discharged: {e}"))?;
 
-    // sigil_last_terminal_tag() -> u32
+    // sigil_run_loop(initial: *mut NextStep) -> TerminalResult { value: u64, tag: u64 }.
+    // Drives the CPS trampoline to a terminal NextStep::Done /
+    // ::Discharged and returns the packed (value, tag) pair.
     //
-    // Stage-6.8-followup Bug 2 fix: queried by the handle expression's
-    // outer codegen logic immediately after `sigil_run_loop` returns
-    // body_val. If tag == NEXT_STEP_TAG_DISCHARGED, the body
-    // terminated via op arm body's discard-`k` tail and the return
-    // arm dispatch is bypassed (body_val IS handle's overall). If
-    // tag == NEXT_STEP_TAG_DONE, the body completed normally and the
-    // return arm dispatch fires (body_val passed as `v`).
-    let mut last_terminal_tag_sig = Signature::new(isa_call_conv(&module));
-    last_terminal_tag_sig
-        .returns
-        .push(AbiParam::new(types::I32));
-    let last_terminal_tag = module
-        .declare_function(
-            "sigil_last_terminal_tag",
-            Linkage::Import,
-            &last_terminal_tag_sig,
-        )
-        .map_err(|e| format!("declare sigil_last_terminal_tag: {e}"))?;
-
-    // sigil_reset_last_terminal_tag() -> ()
-    //
-    // Stage-6.8-followup Bug 2 fix: emitted by handle expression's
-    // outer codegen logic at the start of each handle lowering,
-    // before body lowering. Resets the per-thread `LAST_TERMINAL_TAG`
-    // to `NEXT_STEP_TAG_DONE` so handles whose bodies do not invoke
-    // `sigil_run_loop` see a clean DONE state when querying after
-    // body lowering. Without this reset, the tag would carry over
-    // from any prior run_loop on the same thread, producing
-    // spurious return-arm-skips for handles whose bodies don't
-    // discharge.
-    let reset_last_terminal_tag_sig = Signature::new(isa_call_conv(&module));
-    let reset_last_terminal_tag = module
-        .declare_function(
-            "sigil_reset_last_terminal_tag",
-            Linkage::Import,
-            &reset_last_terminal_tag_sig,
-        )
-        .map_err(|e| format!("declare sigil_reset_last_terminal_tag: {e}"))?;
-
-    // sigil_last_terminal_value() -> u64
-    //
-    // Stage-6.8-followup Bug 1 fix: queried by the handle expression's
-    // outer codegen logic in the discharge_block when the body has
-    // post-perform code. Body's IR-locally-computed body_val reflects
-    // body's natural terminal (the value of body's tail expression),
-    // NOT the discharged arm's value. The runtime stores the
-    // trampoline's terminal u64 in `LAST_TERMINAL_VALUE` so codegen
-    // can recover it when the tag indicates DISCHARGED.
-    let mut last_terminal_value_sig = Signature::new(isa_call_conv(&module));
-    last_terminal_value_sig
-        .returns
-        .push(AbiParam::new(types::I64));
-    let last_terminal_value = module
-        .declare_function(
-            "sigil_last_terminal_value",
-            Linkage::Import,
-            &last_terminal_value_sig,
-        )
-        .map_err(|e| format!("declare sigil_last_terminal_value: {e}"))?;
-
-    // sigil_reset_last_terminal_value() -> ()
-    //
-    // Stage-6.8-followup Bug 1 fix: emitted alongside
-    // `sigil_reset_last_terminal_tag` at the entry of each handle
-    // lowering so a stale value from a prior run isn't observable.
-    let reset_last_terminal_value_sig = Signature::new(isa_call_conv(&module));
-    let reset_last_terminal_value = module
-        .declare_function(
-            "sigil_reset_last_terminal_value",
-            Linkage::Import,
-            &reset_last_terminal_value_sig,
-        )
-        .map_err(|e| format!("declare sigil_reset_last_terminal_value: {e}"))?;
-
-    // sigil_run_loop(initial: *mut NextStep) -> u64. Drives the CPS
-    // trampoline to a terminal NextStep::Done and returns its value.
-    // Phase 3b uses this to dispatch the NextStep::Call that
-    // `sigil_perform` returns: perform never returns a Done directly
-    // — it builds a Call to the matching arm + (k_closure, k_fn);
-    // the arm runs and returns Done(value). `sigil_run_loop` does
-    // the dispatch and returns the final Done's value as u64.
+    // Plan D Task 111: replaced the prior TLS-out-channel
+    // (`LAST_TERMINAL_TAG` / `LAST_TERMINAL_VALUE` + 4 FFI helpers)
+    // with this register-pair multi-return. Cranelift signature is
+    // `[I64, I64]`; on x86_64 SysV the pair lands in `rax:rdx`, on
+    // aarch64 AAPCS in `x0:x1` — matches Rust's
+    // `#[repr(C)] struct TerminalResult { value: u64, tag: u64 }`
+    // return ABI. Codegen captures both `inst_results[0]` (value) and
+    // `inst_results[1]` (tag, narrowed to I32 at use sites where the
+    // existing `NEXT_STEP_TAG_*` comparisons want I32) into per-fn
+    // Cranelift `Variable`s; handle expression's outer logic reads
+    // the variables at handle exit instead of the prior FFI-helper
+    // queries.
     let mut run_loop_sig = Signature::new(isa_call_conv(&module));
     run_loop_sig.params.push(AbiParam::new(pointer_ty));
-    run_loop_sig.returns.push(AbiParam::new(types::I64));
+    run_loop_sig.returns.push(AbiParam::new(types::I64)); // value
+    run_loop_sig.returns.push(AbiParam::new(types::I64)); // tag (widened from u32 to match struct ABI)
     let run_loop = module
         .declare_function("sigil_run_loop", Linkage::Import, &run_loop_sig)
         .map_err(|e| format!("declare sigil_run_loop: {e}"))?;
@@ -6216,10 +6150,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         run_loop,
         next_step_done,
         next_step_discharged,
-        last_terminal_tag,
-        reset_last_terminal_tag,
-        last_terminal_value,
-        reset_last_terminal_value,
         next_step_call,
         next_step_args_ptr,
         continuation_identity,
@@ -6271,10 +6201,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 run_loop_ref,
                 next_step_done_ref: _,
                 next_step_discharged_ref: _,
-                last_terminal_tag_ref,
-                reset_last_terminal_tag_ref,
-                last_terminal_value_ref,
-                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
@@ -6657,10 +6583,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
-                    last_terminal_tag_ref,
-                    reset_last_terminal_tag_ref,
-                    last_terminal_value_ref,
-                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
@@ -6687,6 +6609,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
+                    last_terminal_value_var: None,
+                    last_terminal_tag_var: None,
                 };
 
                 // Phase 5 — lower perform args via Lowerer; pack
@@ -6798,10 +6722,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_return_ref,
                 perform_ref,
                 run_loop_ref,
-                last_terminal_tag_ref,
-                reset_last_terminal_tag_ref,
-                last_terminal_value_ref,
-                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 handler_arm_refs_per_handle,
@@ -6856,6 +6776,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_frame_ptr_v: None,
                 arm_k_pair_self: cc.arm_k_pair_captures.get(&f.name).cloned(),
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
+                last_terminal_value_var: None,
+                last_terminal_tag_var: None,
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -7165,10 +7087,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     run_loop_ref,
                     next_step_done_ref: _,
                     next_step_discharged_ref,
-                    last_terminal_tag_ref,
-                    reset_last_terminal_tag_ref,
-                    last_terminal_value_ref,
-                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
@@ -7296,10 +7214,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
-                    last_terminal_tag_ref,
-                    reset_last_terminal_tag_ref,
-                    last_terminal_value_ref,
-                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
@@ -7332,6 +7246,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: frame_ptr_v,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
+                    last_terminal_value_var: None,
+                    last_terminal_tag_var: None,
                 };
 
                 // Plan B Task 55 (Phase 4d): route between the two
@@ -7880,10 +7796,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     run_loop_ref,
                     next_step_done_ref: _,
                     next_step_discharged_ref: _,
-                    last_terminal_tag_ref,
-                    reset_last_terminal_tag_ref,
-                    last_terminal_value_ref,
-                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
@@ -7999,10 +7911,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
-                    last_terminal_tag_ref,
-                    reset_last_terminal_tag_ref,
-                    last_terminal_value_ref,
-                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     handler_arm_refs_per_handle,
@@ -8029,6 +7937,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
+                    last_terminal_value_var: None,
+                    last_terminal_tag_var: None,
                 };
 
                 let body_value = lowerer.lower_expr(&synth.body);
@@ -8207,10 +8117,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 run_loop_ref,
                 next_step_done_ref,
                 next_step_discharged_ref: _,
-                last_terminal_tag_ref,
-                reset_last_terminal_tag_ref,
-                last_terminal_value_ref,
-                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
@@ -8237,10 +8143,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_return_ref,
                 perform_ref,
                 run_loop_ref,
-                last_terminal_tag_ref,
-                reset_last_terminal_tag_ref,
-                last_terminal_value_ref,
-                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 handler_arm_refs_per_handle,
@@ -8267,6 +8169,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_frame_ptr_v: None,
                 arm_k_pair_self: None,
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
+                last_terminal_value_var: None,
+                last_terminal_tag_var: None,
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
@@ -8484,10 +8388,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         run_loop_ref,
                         next_step_done_ref,
                         next_step_discharged_ref: _,
-                        last_terminal_tag_ref,
-                        reset_last_terminal_tag_ref,
-                        last_terminal_value_ref,
-                        reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
                         continuation_identity_ref,
@@ -8513,10 +8413,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_frame_set_return_ref,
                         perform_ref,
                         run_loop_ref,
-                        last_terminal_tag_ref,
-                        reset_last_terminal_tag_ref,
-                        last_terminal_value_ref,
-                        reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
                         handler_arm_refs_per_handle,
@@ -8543,6 +8439,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_frame_ptr_v: None,
                         arm_k_pair_self: None,
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
+                        last_terminal_value_var: None,
+                        last_terminal_tag_var: None,
                     };
 
                     match &step.role {
@@ -9121,10 +9019,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             run_loop_ref,
                             next_step_done_ref: _,
                             next_step_discharged_ref: _,
-                            last_terminal_tag_ref,
-                            reset_last_terminal_tag_ref,
-                            last_terminal_value_ref,
-                            reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             continuation_identity_ref,
@@ -9151,10 +9045,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_return_ref,
                             perform_ref,
                             run_loop_ref,
-                            last_terminal_tag_ref,
-                            reset_last_terminal_tag_ref,
-                            last_terminal_value_ref,
-                            reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             handler_arm_refs_per_handle,
@@ -9181,6 +9071,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             arm_frame_ptr_v: None,
                             arm_k_pair_self: None,
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
+                            last_terminal_value_var: None,
+                            last_terminal_tag_var: None,
                         };
 
                         match role {
@@ -9789,30 +9681,29 @@ struct Lowerer<'a, 'b> {
     /// Plan B Task 55 (Phase 3b) — `sigil_run_loop` runtime ref.
     /// Called by `lower_perform_to_value` to drive the CPS
     /// trampoline from the `NextStep::Call` returned by
-    /// `sigil_perform`. Returns the final `NextStep::Done`'s value
-    /// as u64; native code uses this directly.
+    /// `sigil_perform`. Plan D Task 111: returns a packed
+    /// `(value: u64, tag: u64)` multi-return; codegen captures both
+    /// inst_results into `last_terminal_value_var` /
+    /// `last_terminal_tag_var` Cranelift Variables for the handle
+    /// expression's outer logic to read at handle exit.
     run_loop_ref: FuncRef,
-    /// Stage-6.8-followup Bug 2 fix — `sigil_last_terminal_tag`
-    /// runtime ref. Queried by handle expression's lower_expr
-    /// immediately after `sigil_run_loop` returns body_val to
-    /// branch on whether the body terminated via DONE (dispatch
-    /// return arm) or DISCHARGED (skip return arm; body_val IS
-    /// handle's overall).
-    last_terminal_tag_ref: FuncRef,
-    /// Stage-6.8-followup Bug 2 fix — `sigil_reset_last_terminal_tag`
-    /// runtime ref. Emitted by handle expression's lower_expr
-    /// before body lowering so handles whose bodies don't run a
-    /// perform start with a clean DONE tag state.
-    reset_last_terminal_tag_ref: FuncRef,
-    /// Stage-6.8-followup Bug 1 fix — `sigil_last_terminal_value`
-    /// FuncRef. Read in the handle expression's discharge_block to
-    /// recover the trampoline's terminal value when body has post-
-    /// perform code.
-    last_terminal_value_ref: FuncRef,
-    /// Stage-6.8-followup Bug 1 fix — `sigil_reset_last_terminal_value`
-    /// FuncRef. Emitted alongside `reset_last_terminal_tag_ref` at
-    /// each handle lowering's entry.
-    reset_last_terminal_value_ref: FuncRef,
+    /// Plan D Task 111 — Cranelift `Variable` holding the most-recent
+    /// `sigil_run_loop` terminal value. Lazy-allocated on first
+    /// `Expr::Handle` (or first run_loop emit) within this fn body;
+    /// def-stored on each run_loop call site, def-reset to `0` at
+    /// each handle entry, use-read at handle exit's discharge_block.
+    /// Replaces the prior `LAST_TERMINAL_VALUE` TLS-out-channel with
+    /// a function-frame-local SSA variable so the runtime carries no
+    /// global state for terminal tracking.
+    last_terminal_value_var: Option<Variable>,
+    /// Plan D Task 111 — Cranelift `Variable` holding the most-recent
+    /// `sigil_run_loop` terminal tag (I32, narrowed from the I64
+    /// return). Lazy-allocated alongside `last_terminal_value_var`;
+    /// def-stored from the run_loop multi-return's second result,
+    /// def-reset to `NEXT_STEP_TAG_DONE` at each handle entry,
+    /// use-read at handle exit to drive the discharged-vs-done
+    /// branch.
+    last_terminal_tag_var: Option<Variable>,
     /// Plan B Task 55 (Phase 3b) — per-handle-span synthetic arm fn
     /// refs. Used by `Expr::Handle` codegen to emit `func_addr`
     /// pointers for `sigil_handler_frame_set_arm`. Keyed by the
@@ -9994,6 +9885,80 @@ struct Lowerer<'a, 'b> {
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
+    /// Plan D Task 111 — return the per-fn Cranelift `Variable`s
+    /// tracking the most-recent `sigil_run_loop` terminal `(value,
+    /// tag)` pair. Lazy-allocated on first call; subsequent calls
+    /// return the cached pair.
+    ///
+    /// Replaces the prior `LAST_TERMINAL_TAG` / `LAST_TERMINAL_VALUE`
+    /// TLS-out-channel + 4 FFI helpers. The runtime side carries no
+    /// global state for terminal tracking; codegen captures
+    /// `sigil_run_loop`'s packed `(value, tag)` multi-return into
+    /// these per-fn variables and reads them at handle exit.
+    ///
+    /// **Init semantics:** on first call, `def_var`s value to `0`
+    /// and tag to `NEXT_STEP_TAG_DONE` so a handle whose body never
+    /// invokes `sigil_run_loop` reads `DONE` at handle exit (mirrors
+    /// the prior `sigil_reset_last_terminal_tag` semantic). Subsequent
+    /// handle-entries within the same fn must call
+    /// `reset_last_terminal_vars` to restore this state — without
+    /// that reset, a second handle would observe the prior handle's
+    /// last run_loop terminal.
+    fn last_terminal_vars(&mut self) -> (Variable, Variable) {
+        if let (Some(val_var), Some(tag_var)) =
+            (self.last_terminal_value_var, self.last_terminal_tag_var)
+        {
+            return (val_var, tag_var);
+        }
+        let val_var = self.builder.declare_var(types::I64);
+        let tag_var = self.builder.declare_var(types::I32);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.builder.def_var(val_var, zero);
+        let done_tag = self
+            .builder
+            .ins()
+            .iconst(types::I32, sigil_abi::effect::NEXT_STEP_TAG_DONE as i64);
+        self.builder.def_var(tag_var, done_tag);
+        self.last_terminal_value_var = Some(val_var);
+        self.last_terminal_tag_var = Some(tag_var);
+        (val_var, tag_var)
+    }
+
+    /// Plan D Task 111 — emit `def_var` to reset the last-terminal
+    /// `(value, tag)` Variables to `(0, NEXT_STEP_TAG_DONE)`. Called
+    /// at each `Expr::Handle` entry (replaces the prior
+    /// `sigil_reset_last_terminal_tag` / `_value` FFI calls). The
+    /// reset ensures handles whose bodies never invoke
+    /// `sigil_run_loop` see a clean DONE state at handle exit
+    /// instead of inheriting the prior handle's terminal.
+    fn reset_last_terminal_vars(&mut self) {
+        let (val_var, tag_var) = self.last_terminal_vars();
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.builder.def_var(val_var, zero);
+        let done_tag = self
+            .builder
+            .ins()
+            .iconst(types::I32, sigil_abi::effect::NEXT_STEP_TAG_DONE as i64);
+        self.builder.def_var(tag_var, done_tag);
+    }
+
+    /// Plan D Task 111 — capture `sigil_run_loop`'s packed multi-return
+    /// `(value, tag)` into the per-fn last-terminal Variables. Called
+    /// from every codegen site that emits a `self.run_loop_ref` call;
+    /// the captured pair replaces the prior runtime-side TLS write.
+    /// Returns the body value (the first multi-return slot) so the
+    /// caller can use it as the body's natural return value, exactly
+    /// like the prior single-return shape.
+    fn capture_run_loop_terminal(&mut self, run_loop_call: cranelift::codegen::ir::Inst) -> Value {
+        let body_val = self.builder.inst_results(run_loop_call)[0];
+        let tag_i64 = self.builder.inst_results(run_loop_call)[1];
+        let tag_i32 = self.builder.ins().ireduce(types::I32, tag_i64);
+        let (val_var, tag_var) = self.last_terminal_vars();
+        self.builder.def_var(val_var, body_val);
+        self.builder.def_var(tag_var, tag_i32);
+        body_val
+    }
+
     /// Lower a `Block`. Returns the tail expression's value if any,
     /// `None` when the block has no tail (statement-only block, value
     /// is `Unit`).
@@ -10261,7 +10226,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .call(self.run_loop_ref, &[call_next_step]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-        let widened = self.builder.inst_results(run_loop_call)[0];
+        // Plan D Task 111: capture the packed (value, tag) multi-return
+        // into the per-fn last-terminal Variables; `widened` is the
+        // value (first multi-return slot).
+        let widened = self.capture_run_loop_terminal(run_loop_call);
 
         // Phase 4c: narrow the run_loop result back to the op's
         // declared return type. The arm fn widens its body value to
@@ -10724,18 +10692,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // run_loop's discharge tag/value doesn't shadow this
                 // handle's body completion when this body never runs
                 // a perform.
-                let reset_tag_call = self
-                    .builder
-                    .ins()
-                    .call(self.reset_last_terminal_tag_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, reset_tag_call));
-                let reset_v_call = self
-                    .builder
-                    .ins()
-                    .call(self.reset_last_terminal_value_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, reset_v_call));
+                // Plan D Task 111: reset the per-fn last-terminal
+                // Variables to (0, NEXT_STEP_TAG_DONE). Replaces the
+                // prior `sigil_reset_last_terminal_tag` /
+                // `sigil_reset_last_terminal_value` FFI calls.
+                self.reset_last_terminal_vars();
                 let body_val = self.lower_expr(body);
 
                 // Step 3: pop N frames in reverse push order. Capture
@@ -10848,10 +10809,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // DONE (dispatch return arm) or DISCHARGED (skip
                     // return arm — discharged value IS handle's
                     // overall per algebraic-effects semantics).
-                    let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, tag_call));
-                    let tag_v = self.builder.inst_results(tag_call)[0];
+                    //
+                    // Plan D Task 111: the tag now lives in the per-fn
+                    // Cranelift `Variable` updated by every
+                    // `sigil_run_loop` call site (replaces the prior
+                    // `sigil_last_terminal_tag` FFI query).
+                    let (_, tag_var) = self.last_terminal_vars();
+                    let tag_v = self.builder.use_var(tag_var);
                     let discharged_const = self.builder.ins().iconst(
                         types::I32,
                         sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
@@ -10894,41 +10858,41 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // unreachable.
                     self.builder.switch_to_block(discharge_block);
                     self.builder.seal_block(discharge_block);
-                    // Stage-6.8-followup Bug 1 fix: read the trampoline's
-                    // terminal value from `sigil_last_terminal_value`
-                    // instead of using body_val. body_val reflects body's
-                    // IR-locally-computed terminal expression (correct
-                    // only for tail-perform body where body's value IS
-                    // perform's return value). For body shapes with
-                    // post-perform code (`{ let _ = perform; tail }`),
-                    // body_val is body's tail value, NOT the discharged
-                    // arm's value — the runtime preserves the latter
-                    // in `LAST_TERMINAL_VALUE`.
+                    // Stage-6.8-followup Bug 1 fix (Plan D Task 111
+                    // refresh): read the trampoline's terminal value
+                    // from the per-fn `last_terminal_value_var`
+                    // Cranelift Variable instead of using body_val.
+                    // body_val reflects body's IR-locally-computed
+                    // terminal expression (correct only for tail-
+                    // perform body where body's value IS perform's
+                    // return value). For body shapes with post-perform
+                    // code (`{ let _ = perform; tail }`), body_val is
+                    // body's tail value, NOT the discharged arm's
+                    // value — the run_loop multi-return preserves the
+                    // latter in `last_terminal_value_var`, captured at
+                    // every run_loop call site by
+                    // `capture_run_loop_terminal`.
                     //
-                    // SAFETY (Round-3 review §7): the TLS slot
-                    // `LAST_TERMINAL_VALUE` may hold a heap-allocated
-                    // closure-record / handler-frame pointer at terminal
-                    // time. The discipline (declared at the TLS site
-                    // in `runtime/src/handlers.rs`'s `LAST_TERMINAL_VALUE`
-                    // doc) requires consuming the read into a Cranelift
-                    // SSA Value before any allocation that could trigger
-                    // GC — Boehm's conservative scan must find the
-                    // pointer in a register or spill slot. The
-                    // `inst_results(lv_call)[0]` capture below is that
-                    // SSA Value; Cranelift's regalloc threads it through
-                    // the merge_block param and into any subsequent
-                    // narrow / store / call without dropping the
-                    // reference. Inserting an alloc-triggering call
-                    // (e.g., `sigil_alloc`, another `next_step_call`)
-                    // between this load and `last_terminal_v_u64`'s
-                    // first user would silently break this invariant —
-                    // a future regression that adds such a call MUST
-                    // route the value through a stack slot or
-                    // explicitly stackmap-root the SSA value first.
-                    let lv_call = self.builder.ins().call(self.last_terminal_value_ref, &[]);
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, lv_call));
-                    let last_terminal_v_u64 = self.builder.inst_results(lv_call)[0];
+                    // SAFETY (Round-3 review §7 carry-forward): when
+                    // the trampoline's terminal value is a heap-
+                    // allocated closure-record / handler-frame pointer
+                    // (true for run_state-shaped programs), the
+                    // discipline requires consuming the value into a
+                    // Cranelift SSA position before any subsequent
+                    // GC-triggering allocation. The Variable is backed
+                    // by Cranelift's frontend SSA — `use_var` returns
+                    // a fresh SSA `Value`, and Cranelift's regalloc
+                    // threads it through the merge_block param into
+                    // subsequent narrow / store / call without
+                    // dropping the reference. Inserting an alloc-
+                    // triggering call between this `use_var` and
+                    // `last_terminal_v_u64`'s first user would
+                    // silently break the invariant — a future
+                    // regression that adds such a call MUST route the
+                    // value through a stack slot or explicitly
+                    // stackmap-root the SSA value first.
+                    let (val_var, _) = self.last_terminal_vars();
+                    let last_terminal_v_u64 = self.builder.use_var(val_var);
 
                     // Narrow u64 → handler_overall_ty.
                     let discharge_val = if handler_overall_ty == types::I64 {
@@ -11068,7 +11032,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns_ptr]);
                     self.stackmap
                         .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-                    let widened_handle_val = self.builder.inst_results(run_loop_call)[0];
+                    // Plan D Task 111: capture (value, tag) multi-return.
+                    let widened_handle_val = self.capture_run_loop_terminal(run_loop_call);
 
                     // Narrow back to the return arm body's Cranelift
                     // type. The synth return fn widens its body's
@@ -11144,10 +11109,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     body_val
                 };
 
-                let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, tag_call));
-                let tag_v = self.builder.inst_results(tag_call)[0];
+                // Plan D Task 111: read tag from per-fn Variable
+                // (replaces the prior `sigil_last_terminal_tag` FFI
+                // query).
+                let (_, tag_var) = self.last_terminal_vars();
+                let tag_v = self.builder.use_var(tag_var);
                 let discharged_const = self.builder.ins().iconst(
                     types::I32,
                     sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
@@ -11174,13 +11140,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     &[],
                 );
 
-                // Discharge block: read LAST_TERMINAL_VALUE, narrow.
+                // Discharge block: read last-terminal value from
+                // per-fn Variable (Plan D Task 111; replaces the prior
+                // `sigil_last_terminal_value` FFI query), narrow.
                 self.builder.switch_to_block(discharge_block_nra);
                 self.builder.seal_block(discharge_block_nra);
-                let lv_call = self.builder.ins().call(self.last_terminal_value_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, lv_call));
-                let lv_u64 = self.builder.inst_results(lv_call)[0];
+                let (val_var, _) = self.last_terminal_vars();
+                let lv_u64 = self.builder.use_var(val_var);
                 let discharge_val = if handler_overall_ty == types::I64 {
                     lv_u64
                 } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
@@ -11356,11 +11322,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             16,
         );
 
-        // sigil_run_loop(ns) → u64
+        // sigil_run_loop(ns) → TerminalResult { value: u64, tag: u64 }
         let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-        let widened_result = self.builder.inst_results(run_loop_call)[0];
+        // Plan D Task 111: capture (value, tag) multi-return.
+        let widened_result = self.capture_run_loop_terminal(run_loop_call);
 
         // Stage-6.8-followup Layer 3c — pop the originating handler
         // frame we re-pushed before run_loop. This restores the
@@ -11437,11 +11404,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         {
             let _synth = &self.handler_return_arm_synth[idx];
             {
-                // Query terminal tag and branch.
-                let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, tag_call));
-                let tag_v = self.builder.inst_results(tag_call)[0];
+                // Plan D Task 111: query terminal tag from per-fn
+                // Variable (replaces `sigil_last_terminal_tag` FFI).
+                let (_, tag_var) = self.last_terminal_vars();
+                let tag_v = self.builder.use_var(tag_var);
                 let discharged_const = self.builder.ins().iconst(
                     types::I32,
                     sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
@@ -11540,7 +11506,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let run_loop_call_2 = self.builder.ins().call(self.run_loop_ref, &[ns_ptr]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, run_loop_call_2));
-                let wrapped = self.builder.inst_results(run_loop_call_2)[0];
+                // Plan D Task 111: capture (value, tag) multi-return.
+                let wrapped = self.capture_run_loop_terminal(run_loop_call_2);
                 self.builder.ins().jump(merge_block, &[wrapped.into()]);
 
                 self.builder.switch_to_block(merge_block);
@@ -11733,12 +11700,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             .push_placeholder(function_code_offset(&self.builder, cps_call));
                         let next_step = self.builder.inst_results(cps_call)[0];
 
-                        // Drive the trampoline. Returns u64.
+                        // Drive the trampoline. Returns (value, tag)
+                        // multi-return; this site only consumes value.
+                        // Plan D Task 111: capture both into per-fn
+                        // last-terminal Variables for any enclosing
+                        // handle to query.
                         let run_loop_call =
                             self.builder.ins().call(self.run_loop_ref, &[next_step]);
                         self.stackmap
                             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-                        let raw_u64 = self.builder.inst_results(run_loop_call)[0];
+                        let raw_u64 = self.capture_run_loop_terminal(run_loop_call);
 
                         // Narrow `raw_u64` back to the callee's
                         // declared return type. Mirrors the
@@ -14303,31 +14274,12 @@ struct PerFnRefsCtx<'a> {
     next_step_done: cranelift_module::FuncId,
     /// Stage-6.8-followup Bug 2 fix — `sigil_next_step_discharged`
     /// FuncId. Op arm fn body's discard-`k` tail emit replaces
-    /// `next_step_done` with this so the trampoline's
-    /// `LAST_TERMINAL_TAG` records DISCHARGED at terminal; handle
-    /// expression's outer logic queries `last_terminal_tag` and skips
-    /// return arm dispatch when the body terminated via discharge.
+    /// `next_step_done` with this so the trampoline's terminal
+    /// records DISCHARGED via `sigil_run_loop`'s packed multi-return
+    /// (Plan D Task 111); handle expression's outer logic reads the
+    /// tag from a Cranelift `Variable` and skips return arm dispatch
+    /// when the body terminated via discharge.
     next_step_discharged: cranelift_module::FuncId,
-    /// Stage-6.8-followup Bug 2 fix — `sigil_last_terminal_tag`
-    /// FuncId. Queried by handle expression's `lower_expr`
-    /// immediately after `sigil_run_loop` returns body_val to decide
-    /// whether to dispatch the return arm (DONE) or use body_val
-    /// directly as handle's overall (DISCHARGED).
-    last_terminal_tag: cranelift_module::FuncId,
-    /// Stage-6.8-followup Bug 2 fix — `sigil_reset_last_terminal_tag`
-    /// FuncId. Emitted by handle expression's `lower_expr` before
-    /// body lowering so handles whose bodies don't run a perform
-    /// (no run_loop call) see a clean DONE tag state.
-    reset_last_terminal_tag: cranelift_module::FuncId,
-    /// Stage-6.8-followup Bug 1 fix — `sigil_last_terminal_value`
-    /// FuncId. Read in the handle expression's discharge_block to
-    /// recover the trampoline's terminal value when body has post-
-    /// perform code that overwrites body_val.
-    last_terminal_value: cranelift_module::FuncId,
-    /// Stage-6.8-followup Bug 1 fix — `sigil_reset_last_terminal_value`
-    /// FuncId. Emitted alongside `reset_last_terminal_tag` at the
-    /// entry of each handle lowering.
-    reset_last_terminal_value: cranelift_module::FuncId,
     next_step_call: cranelift_module::FuncId,
     next_step_args_ptr: cranelift_module::FuncId,
     continuation_identity: cranelift_module::FuncId,
@@ -14386,14 +14338,6 @@ struct PerFnRefs {
     next_step_done_ref: FuncRef,
     /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::next_step_discharged`.
     next_step_discharged_ref: FuncRef,
-    /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::last_terminal_tag`.
-    last_terminal_tag_ref: FuncRef,
-    /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::reset_last_terminal_tag`.
-    reset_last_terminal_tag_ref: FuncRef,
-    /// Stage-6.8-followup Bug 1 fix — see `PerFnRefsCtx::last_terminal_value`.
-    last_terminal_value_ref: FuncRef,
-    /// Stage-6.8-followup Bug 1 fix — see `PerFnRefsCtx::reset_last_terminal_value`.
-    reset_last_terminal_value_ref: FuncRef,
     next_step_call_ref: FuncRef,
     next_step_args_ptr_ref: FuncRef,
     continuation_identity_ref: FuncRef,
@@ -14517,13 +14461,6 @@ fn prepare_per_fn_refs(
     let next_step_done_ref = module.declare_func_in_func(ctx.next_step_done, builder.func);
     let next_step_discharged_ref =
         module.declare_func_in_func(ctx.next_step_discharged, builder.func);
-    let last_terminal_tag_ref = module.declare_func_in_func(ctx.last_terminal_tag, builder.func);
-    let reset_last_terminal_tag_ref =
-        module.declare_func_in_func(ctx.reset_last_terminal_tag, builder.func);
-    let last_terminal_value_ref =
-        module.declare_func_in_func(ctx.last_terminal_value, builder.func);
-    let reset_last_terminal_value_ref =
-        module.declare_func_in_func(ctx.reset_last_terminal_value, builder.func);
     let next_step_call_ref = module.declare_func_in_func(ctx.next_step_call, builder.func);
     let next_step_args_ptr_ref = module.declare_func_in_func(ctx.next_step_args_ptr, builder.func);
     let continuation_identity_ref =
@@ -14611,10 +14548,6 @@ fn prepare_per_fn_refs(
         run_loop_ref,
         next_step_done_ref,
         next_step_discharged_ref,
-        last_terminal_tag_ref,
-        reset_last_terminal_tag_ref,
-        last_terminal_value_ref,
-        reset_last_terminal_value_ref,
         next_step_call_ref,
         next_step_args_ptr_ref,
         continuation_identity_ref,

@@ -36,14 +36,13 @@
 //!   `sigil_handle_pop`, `sigil_perform`, `sigil_run_loop`,
 //!   `sigil_next_step_done`, `sigil_next_step_call`,
 //!   `sigil_next_step_args_ptr`, `sigil_continuation_identity` (Plan B)
-//! - `sigil_next_step_discharged`, `sigil_last_terminal_tag` (Stage
-//!   6.8-followup Bug 2 fix — distinguish op-arm-discharge from
-//!   body-normal completion so handle expression skips return arm
-//!   dispatch on discharge per algebraic-effects semantics)
-//! - `sigil_last_terminal_value`, `sigil_reset_last_terminal_value`
-//!   (Stage 6.8-followup Bug 1 fix — recover the trampoline's
-//!   terminal value at discharge time when body has post-perform
-//!   code that overwrites the synchronous body_val)
+//! - `sigil_next_step_discharged` (Stage 6.8-followup Bug 2 fix —
+//!   distinguish op-arm-discharge from body-normal completion so
+//!   handle expression skips return arm dispatch on discharge per
+//!   algebraic-effects semantics). Plan D Task 111 replaced the
+//!   companion TLS-out-channel (`sigil_last_terminal_tag` /
+//!   `sigil_last_terminal_value` and their reset helpers) with
+//!   `sigil_run_loop`'s packed multi-return.
 //! - `sigil_io_println_arm`, `sigil_arith_error_div_by_zero_arm`,
 //!   `sigil_arith_error_mod_by_zero_arm` (Plan B Task 57 — runtime-
 //!   side default arm fns installed by the `main` shim's top-level

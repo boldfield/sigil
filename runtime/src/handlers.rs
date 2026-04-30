@@ -124,6 +124,23 @@ pub use sigil_abi::effect::MAX_HANDLER_ARMS;
 /// `PLAN_B_DEVIATIONS.md`.
 pub use sigil_abi::effect::MAX_INLINE_ARGS;
 
+/// Packed terminal result returned by `sigil_run_loop`. Plan D Task 111
+/// replaces the prior TLS-out-channel (`LAST_TERMINAL_TAG` /
+/// `LAST_TERMINAL_VALUE`) with a register-pair multi-return: on x86_64
+/// SysV the two `u64` fields land in `rax:rdx`; on aarch64 AAPCS in
+/// `x0:x1`. Cranelift's matching multi-return signature on the codegen
+/// side declares two `I64` returns, so the ABI is consistent across
+/// callers.
+///
+/// `tag` is widened from the on-disk `u32` `NEXT_STEP_TAG_*` constants
+/// to `u64` so the struct is 16 bytes (two register slots). Codegen
+/// narrows on read when an `I32` comparison is wanted.
+#[repr(C)]
+pub struct TerminalResult {
+    pub value: u64,
+    pub tag: u64,
+}
+
 /// Discriminated `NextStep` record. Arena-allocated; pointer is invalid
 /// after the next `sigil_arena_reset`. The trampoline reads the
 /// discriminant + payload into stack locals before resetting.
@@ -182,60 +199,6 @@ thread_local! {
     /// `register_handler_stack_root_for_calling_thread`, idempotent
     /// per thread.
     static HANDLER_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
-    /// Per-thread last-terminal tag: records whether the most recent
-    /// `sigil_run_loop` invocation terminated via `Done` (body normal
-    /// completion, value subject to return arm wrapping) or
-    /// `Discharged` (op arm body's discard-`k` tail, value IS the
-    /// handle's final value, return arm bypassed).
-    ///
-    /// Initial value `NEXT_STEP_TAG_DONE` so any caller that queries
-    /// before any run_loop has run gets the conservative answer
-    /// (don't bypass return arm). Set by `sigil_run_loop` immediately
-    /// before returning the terminal value; queried by codegen via
-    /// `sigil_last_terminal_tag` after the run_loop call returns.
-    ///
-    /// **No GC root** — the value is `u32`, not a heap pointer. No
-    /// `register_*_for_calling_thread` is needed.
-    ///
-    /// **Single-threaded v1**: the TLS keeps the API multi-thread-safe
-    /// for future expansion; today's `sigil_run_loop` runs on a single
-    /// thread, but the per-thread design avoids globally-mutable state.
-    static LAST_TERMINAL_TAG: Cell<u32> = const { Cell::new(NEXT_STEP_TAG_DONE) };
-
-    /// Per-thread last-terminal value: records the u64 value the most
-    /// recent `sigil_run_loop` invocation returned at terminal time
-    /// (whether DONE or DISCHARGED).
-    ///
-    /// Stage-6.8-followup Bug 1 fix companion to `LAST_TERMINAL_TAG`.
-    /// Codegen at `Expr::Handle`'s `lower_expr` queries this when the
-    /// body has post-perform code (`{ let _ = perform; tail }` shape):
-    /// without it, body_val computed by synchronous body lowering
-    /// reflects the body's IR-local terminal value, NOT the discharged
-    /// arm's value. The arm's discharged value flows back through the
-    /// trampoline's terminal but gets narrowed at the perform's
-    /// narrow-back to perform's declared return type (lossy when arm
-    /// discharges a value of a different type) and then the body's
-    /// post-perform code overwrites it. By saving the run_loop's raw
-    /// terminal u64 here, the handle expression can recover the
-    /// discharged value when tag == DISCHARGED.
-    ///
-    /// Initial value `0` (any value is safe — codegen only reads when
-    /// LAST_TERMINAL_TAG == DISCHARGED, and the discharge tag is only
-    /// set by `sigil_run_loop`'s terminal). Set by `sigil_run_loop`
-    /// immediately before returning the terminal value; queried by
-    /// codegen via `sigil_last_terminal_value` after run_loop returns.
-    ///
-    /// **No GC root** — the value is u64. The TLS does NOT carry a
-    /// stable heap-pointer rooting contract; codegen must consume the
-    /// value before any GC-triggering operation that could reclaim a
-    /// heap object whose pointer was parked here. In practice the
-    /// consumer site (`Expr::Handle` discharge_block) reads the value
-    /// immediately and threads it through the merge_block's param,
-    /// where Cranelift's register / spill discipline keeps it live for
-    /// Boehm's conservative scan. A future precise-GC pass would
-    /// require either rooting this TLS or moving the value into a
-    /// stack slot at consumption time.
-    static LAST_TERMINAL_VALUE: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Register the calling thread's `HANDLER_STACK` TLS cell as a Boehm
@@ -731,83 +694,6 @@ pub unsafe extern "C" fn sigil_next_step_done(value: u64) -> *mut NextStep {
     (*ns).fn_ptr = ptr::null_mut();
     (*ns).value = value;
     ns
-}
-
-/// Read the per-thread `LAST_TERMINAL_TAG` set by the most recent
-/// `sigil_run_loop` invocation. Returns `NEXT_STEP_TAG_DONE` if the
-/// run_loop terminated via body-normal completion (return arm should
-/// fire), or `NEXT_STEP_TAG_DISCHARGED` if it terminated via op arm
-/// body's discard-`k` tail (return arm should be bypassed —
-/// discharged value IS the handle's final value per algebraic-effects
-/// semantics).
-///
-/// Initial value (before any `sigil_run_loop` runs) is
-/// `NEXT_STEP_TAG_DONE` — conservative for callers that query before
-/// running anything.
-///
-/// # Safety
-///
-/// Safe to call. Reads thread-local state without mutation.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_last_terminal_tag() -> u32 {
-    LAST_TERMINAL_TAG.with(|c| c.get())
-}
-
-/// Reset the per-thread `LAST_TERMINAL_TAG` to `NEXT_STEP_TAG_DONE`.
-/// Emitted by codegen at the entry of each `Expr::Handle` lowering
-/// before the body is lowered, so that handle bodies which do not
-/// invoke `sigil_run_loop` (e.g., `handle 5 with { ... }`) see a
-/// clean `DONE` state when their outer logic queries
-/// `sigil_last_terminal_tag` post-body. Without this reset, the tag
-/// would carry over from any prior run_loop on the same thread,
-/// producing spurious return-arm-skips for handles whose bodies
-/// never discharge.
-///
-/// # Safety
-///
-/// Safe to call. Writes thread-local state with no other side effects.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_reset_last_terminal_tag() {
-    LAST_TERMINAL_TAG.with(|c| c.set(NEXT_STEP_TAG_DONE));
-}
-
-/// Read the per-thread `LAST_TERMINAL_VALUE` set by the most recent
-/// `sigil_run_loop` invocation. Returns the raw u64 the trampoline
-/// returned at terminal time (whether DONE or DISCHARGED).
-///
-/// Stage-6.8-followup Bug 1 fix companion to `sigil_last_terminal_tag`.
-/// Codegen reads this when `LAST_TERMINAL_TAG == NEXT_STEP_TAG_DISCHARGED`
-/// to recover the discharged value when body has post-perform code that
-/// would otherwise overwrite the natural body_val with body's IR-locally-
-/// computed terminal.
-///
-/// Initial value (before any `sigil_run_loop` runs) is `0`. Codegen only
-/// reads when the tag indicates DISCHARGED, so the initial-zero is never
-/// observable in well-formed programs.
-///
-/// # Safety
-///
-/// Safe to call. Reads thread-local state without mutation.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_last_terminal_value() -> u64 {
-    LAST_TERMINAL_VALUE.with(|c| c.get())
-}
-
-/// Reset the per-thread `LAST_TERMINAL_VALUE` to `0`. Emitted alongside
-/// `sigil_reset_last_terminal_tag` at the top of each `Expr::Handle`
-/// lowering so handles whose body never runs the trampoline see a
-/// clean state instead of inheriting a prior run's value. Reading this
-/// when the tag is DONE is undefined behavior at the source level
-/// (codegen's discharge_block is gated on tag == DISCHARGED), but
-/// resetting prevents any future code path from observing a stale
-/// value.
-///
-/// # Safety
-///
-/// Safe to call. Writes thread-local state with no other side effects.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_reset_last_terminal_value() {
-    LAST_TERMINAL_VALUE.with(|c| c.set(0));
 }
 
 /// Allocate a `NEXT_STEP_TAG_DISCHARGED` record from the per-dispatch
@@ -1376,7 +1262,7 @@ pub unsafe extern "C" fn sigil_perform(
 /// `sigil_next_step_done` or `sigil_next_step_call`. The fns referenced
 /// by any `CALL` step must satisfy the CPS calling convention.
 #[no_mangle]
-pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
+pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> TerminalResult {
     let mut current = initial_step;
     // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
     // run_loop entry. On the DISCHARGED bypass terminal (introduced by
@@ -1421,8 +1307,6 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                 // site can correctly skip return arm dispatch on the
                 // R-typed discharge value.
                 if tag == NEXT_STEP_TAG_DISCHARGED {
-                    LAST_TERMINAL_TAG.with(|c| c.set(tag));
-                    LAST_TERMINAL_VALUE.with(|c| c.set(v));
                     // Drain outer_post_arm_k stack back to entry-time
                     // depth. Entries pushed by synth-cont Middle steps
                     // during this run_loop's chain stay leaked across
@@ -1458,7 +1342,10 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                     );
                     OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
                     crate::arena::sigil_arena_reset();
-                    return v;
+                    return TerminalResult {
+                        value: v,
+                        tag: tag as u64,
+                    };
                 }
                 // Plan B' Stage 6.7 multi-shot composition fix: before
                 // returning to the wrapper, check the outer post_arm_k
@@ -1522,12 +1409,13 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                      pushed without a matching terminal pop, OR popped \
                      entries belonging to an outer run_loop"
                 );
-                LAST_TERMINAL_TAG.with(|c| c.set(tag));
-                LAST_TERMINAL_VALUE.with(|c| c.set(v));
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
-                return v;
+                return TerminalResult {
+                    value: v,
+                    tag: tag as u64,
+                };
             }
             NEXT_STEP_TAG_CALL => {
                 // Copy dispatch info into stack locals before resetting
@@ -1722,7 +1610,7 @@ mod tests {
         reset_state();
         let ns = unsafe { sigil_next_step_done(99) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns) }.value;
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 99);
         assert_eq!(dispatches_after - dispatches_before, 1);
@@ -1738,7 +1626,7 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(41) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns) }.value;
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 42);
         assert_eq!(dispatches_after - dispatches_before, 2);
@@ -1755,7 +1643,7 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(5) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns) }.value;
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         // 5 -> Call(cps_call_then_plus_one, 5)
         // -> Call(cps_done_plus_one, 5+10=15)
@@ -1810,7 +1698,7 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(42) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns) }.value;
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 42);
         // 2 dispatches: one for the Call (loop dispatches identity,
@@ -2014,7 +1902,7 @@ mod tests {
             assert_eq!(depth_sum_after - depth_sum_before, 1);
 
             // Dispatch the resulting NextStep through the trampoline.
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns).value;
             assert_eq!(result, 700);
 
             // Pop the frame to leave a clean handler stack.
@@ -2047,7 +1935,7 @@ mod tests {
             let depth_after = counters::read(CounterId::HandlerWalkDepthSum);
             // Outer is on top, target is one below; walk depth = 2.
             assert_eq!(depth_after - depth_before, 2);
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns).value;
             assert_eq!(result, 300);
             let _ = sigil_handle_pop();
             let _ = sigil_handle_pop();
@@ -2180,7 +2068,7 @@ mod tests {
                 3,
                 "expected walk depth 3 (outer + middle + target)"
             );
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns).value;
             assert_eq!(result, 400);
             let _ = sigil_handle_pop();
             let _ = sigil_handle_pop();
@@ -2228,7 +2116,7 @@ mod tests {
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns).value;
             assert_eq!(result, 1100);
             let _ = sigil_handle_pop();
         }
@@ -2334,7 +2222,7 @@ mod tests {
             let arg = 9u64;
             let arg_ptr = &arg as *const u64;
             let ns = sigil_perform(4242, 0, arg_ptr, 1, ptr::null_mut(), ptr::null_mut());
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns).value;
             assert_eq!(result, 900);
             let _ = sigil_handle_pop();
         }
@@ -2394,7 +2282,7 @@ mod tests {
             // arm_read_closure_sentinel with closure_ptr = the original
             // closure; it reads the sentinel and returns it.
             let ns = sigil_perform(7777, 0, ptr::null(), 0, ptr::null_mut(), ptr::null_mut());
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns).value;
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
             let _ = sigil_handle_pop();
         }
@@ -2444,7 +2332,7 @@ mod tests {
             // would read freed bytes (could be anything; sentinel
             // mismatch would fire the assert).
             let initial = sigil_next_step_call(ptr::null_mut(), cps_alloc_then_gc as *mut u8, 0);
-            let result = sigil_run_loop(initial);
+            let result = sigil_run_loop(initial).value;
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
         }
         reset_state();
@@ -2653,7 +2541,7 @@ mod tests {
 
         unsafe {
             let initial = sigil_next_step_call(ptr::null_mut(), cps_push_then_done as *mut u8, 0);
-            let result = sigil_run_loop(initial);
+            let result = sigil_run_loop(initial).value;
             // 42 + 1 = 43; cps_done_with_arg adds 1 to its arg.
             assert_eq!(result, 43);
         }

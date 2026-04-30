@@ -49,7 +49,7 @@ Plan B' Stage-6.8-followup carryover #2 (Sync shim emission gating) is out of Pl
 ## Stage 11 — Foundation lifts
 
 - Task 111 — TLS → packed multi-return for `sigil_run_loop` terminal (Plan B' carryover #1, PR #39 §2).
-  - status: todo
+  - status: done-pending-ci ([HEAD]) — `sigil_run_loop` now returns `#[repr(C)] TerminalResult { value: u64, tag: u64 }` via Cranelift `[I64, I64]` register-pair multi-return; on x86_64 SysV the pair lands in `rax:rdx`, on aarch64 AAPCS in `x0:x1`. Runtime: 2 TLS cells (`LAST_TERMINAL_TAG`, `LAST_TERMINAL_VALUE`) and 4 FFI helpers (`sigil_last_terminal_tag` / `_value` / `sigil_reset_*`) deleted; `runtime/src/handlers.rs` carries no globals for terminal tracking; 13 in-file unit tests updated to `.value` access. Compiler: `run_loop_sig` extended with second `I64` return; deleted 4 FFI declarations + 4 `FuncId` fields on `PerFnRefsCtx` + 4 `FuncRef` fields on `PerFnRefs` and `Lowerer` + ~13 threading sites; added 2 `Option<Variable>` fields on `Lowerer` (`last_terminal_value_var`, `last_terminal_tag_var`) with `last_terminal_vars` (lazy declare-and-init), `reset_last_terminal_vars`, and `capture_run_loop_terminal` helpers; updated 5 internal `run_loop_ref` call sites to capture the multi-return into the Variables; updated 2 handle-entry reset emits and 5 handle-exit query emits to use `def_var` / `use_var`. Sync shim's run_loop call (a top-level entry point with no enclosing handle) reads only `inst_results[0]` (value); the second return slot is structurally present but ignored. pod-verify clean.
 - Task 112 — Wrapper-fn-frame composition fix (closes `[DEVIATION Task 72]` constraint #3).
   - status: todo
 
