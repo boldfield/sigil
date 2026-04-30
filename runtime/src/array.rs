@@ -279,6 +279,31 @@ mod tests {
     }
 
     #[test]
+    fn alloc_at_count_field_boundary_works() {
+        // The 6-bit header count field caps at 63. Two boundary
+        // tests: len=33 (mid-range, not yet overflowing the cap)
+        // and len=64 (one past the cap, the first size where
+        // count=0's sidestep is load-bearing). Both confirm the
+        // count-from-payload-length-word convention works
+        // end-to-end without relying on the header `count` field.
+        let _guard = gc_test_lock();
+        let arr_33 = sigil_array_alloc(33, 7);
+        unsafe {
+            assert_eq!(sigil_array_length(arr_33), 33);
+            for i in 0..33 {
+                assert_eq!(sigil_array_get(arr_33, i), 7, "slot {i} of len-33 arr");
+            }
+        }
+        let arr_64 = sigil_array_alloc(64, 11);
+        unsafe {
+            assert_eq!(sigil_array_length(arr_64), 64);
+            for i in 0..64 {
+                assert_eq!(sigil_array_get(arr_64, i), 11, "slot {i} of len-64 arr");
+            }
+        }
+    }
+
+    #[test]
     fn header_tag_is_array() {
         let _guard = gc_test_lock();
         let arr = sigil_array_alloc(0, 0);

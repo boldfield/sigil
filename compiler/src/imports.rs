@@ -43,6 +43,19 @@ const BUILTIN_INJECTED: &[&str] = &["io.sigil", "array.sigil", "mut_array.sigil"
 /// Returns a new `Program` with imported items appended, plus diagnostics
 /// for missing modules (E0032) and circular imports (E0033).
 pub fn resolve(program: Program) -> (Program, Vec<CompilerError>) {
+    resolve_with_source(program, &|m| stdlib_embed::get(m).map(String::from))
+}
+
+/// Same as [`resolve`] but with the source lookup injected — used by
+/// tests to construct synthetic stdlib modules (e.g. for cycle-detection
+/// regression coverage that doesn't require touching `std/`). Source is
+/// returned as `String` so the closure can synthesise it on demand
+/// without lifetime gymnastics; production callers wrap
+/// `stdlib_embed::get` and copy the static string.
+pub(crate) fn resolve_with_source(
+    program: Program,
+    get_source: &dyn Fn(&str) -> Option<String>,
+) -> (Program, Vec<CompilerError>) {
     let mut errs: Vec<CompilerError> = Vec::new();
     let mut loaded: BTreeSet<String> = BTreeSet::new();
     let mut in_progress: BTreeSet<String> = BTreeSet::new();
@@ -64,6 +77,7 @@ pub fn resolve(program: Program) -> (Program, Vec<CompilerError>) {
                 &mut in_progress,
                 &mut imported_items,
                 &mut errs,
+                get_source,
             );
         }
     }
@@ -103,6 +117,7 @@ fn load_module(
     in_progress: &mut BTreeSet<String>,
     out: &mut Vec<Item>,
     errs: &mut Vec<CompilerError>,
+    get_source: &dyn Fn(&str) -> Option<String>,
 ) {
     if loaded.contains(module) {
         return;
@@ -119,7 +134,7 @@ fn load_module(
         ));
         return;
     }
-    let src = match stdlib_embed::get(module) {
+    let src = match get_source(module) {
         Some(s) => s,
         None => {
             errs.push(CompilerError::new(
@@ -137,7 +152,7 @@ fn load_module(
 
     in_progress.insert(module.to_string());
 
-    let (tokens, lex_errs) = lexer::lex(module, src);
+    let (tokens, lex_errs) = lexer::lex(module, &src);
     errs.extend(lex_errs);
     let (subprog, parse_errs) = parser::parse(module, &tokens);
     errs.extend(parse_errs);
@@ -151,7 +166,15 @@ fn load_module(
             if BUILTIN_INJECTED.contains(&sub_module.as_str()) {
                 continue;
             }
-            load_module(&sub_module, &decl.span, loaded, in_progress, out, errs);
+            load_module(
+                &sub_module,
+                &decl.span,
+                loaded,
+                in_progress,
+                out,
+                errs,
+                get_source,
+            );
         }
     }
 
@@ -228,6 +251,100 @@ mod tests {
         assert!(errs.is_empty(), "errs: {errs:?}");
         // Both Item::Imports remain; nothing appended.
         assert_eq!(resolved.items.len(), 3);
+    }
+
+    #[test]
+    fn duplicate_import_appended_items_dedupe() {
+        // Through the test source-injection path: two imports of the
+        // same synthetic non-skip-list module load that module once.
+        // This exercises the `loaded.contains(module)` early return in
+        // `load_module` (the skip-list path bypasses load entirely;
+        // this is a real load + early-return). Asserts the resolved
+        // program's appended items appear once, not twice.
+        let get_source = |m: &str| match m {
+            "phantom.sigil" => Some("fn phantom_helper() -> Int ![] { 7 }\n".to_string()),
+            _ => None,
+        };
+        let user_src = "import std.phantom\n\
+                        import std.phantom\n\
+                        fn main() -> Int ![] { 0 }\n";
+        let (toks, lex_errs) = lexer::lex("user.sigil", user_src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parser::parse("user.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+        let (resolved, errs) = resolve_with_source(prog, &get_source);
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        // Original 3 user items + 1 appended (phantom_helper, loaded once).
+        assert_eq!(resolved.items.len(), 4);
+        let helper_count = resolved
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::Fn(f) if f.name == "phantom_helper"))
+            .count();
+        assert_eq!(
+            helper_count, 1,
+            "phantom_helper must be appended exactly once"
+        );
+    }
+
+    #[test]
+    fn circular_stdlib_import_is_e0033() {
+        // Two synthetic phantom modules that import each other:
+        //   phantom_a imports std.phantom_b
+        //   phantom_b imports std.phantom_a
+        // The user program imports phantom_a; load_module recurses
+        // into phantom_b which tries to load phantom_a (already in
+        // `in_progress`) — E0033 fires. Real cycle, no skip-list
+        // shortcut. Pins the cycle-detection branch in `load_module`.
+        let get_source = |m: &str| match m {
+            "phantom_a.sigil" => {
+                Some("import std.phantom_b\nfn a_helper() -> Int ![] { 1 }\n".to_string())
+            }
+            "phantom_b.sigil" => {
+                Some("import std.phantom_a\nfn b_helper() -> Int ![] { 2 }\n".to_string())
+            }
+            _ => None,
+        };
+        let user_src = "import std.phantom_a\nfn main() -> Int ![] { 0 }\n";
+        let (toks, lex_errs) = lexer::lex("user.sigil", user_src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parser::parse("user.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+        let (_resolved, errs) = resolve_with_source(prog, &get_source);
+        assert!(
+            has_code(&errs, "E0033"),
+            "expected E0033 for circular import: {errs:?}"
+        );
+        let msg = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0033")
+            .map(|e| e.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("std.phantom_a"),
+            "diagnostic should name the cycle-closing module; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn self_import_cycle_is_e0033() {
+        // Smallest possible cycle: a single module imports itself.
+        // load_module recurses into itself; the second entry hits the
+        // `in_progress` early return and fires E0033.
+        let get_source = |m: &str| match m {
+            "phantom.sigil" => Some("import std.phantom\nfn h() -> Int ![] { 1 }\n".to_string()),
+            _ => None,
+        };
+        let user_src = "import std.phantom\nfn main() -> Int ![] { 0 }\n";
+        let (toks, lex_errs) = lexer::lex("user.sigil", user_src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parser::parse("user.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+        let (_resolved, errs) = resolve_with_source(prog, &get_source);
+        assert!(
+            has_code(&errs, "E0033"),
+            "expected E0033 for self-import cycle: {errs:?}"
+        );
     }
 
     #[test]

@@ -8009,6 +8009,24 @@ mod tests {
     }
 
     #[test]
+    fn handle_op_on_mem_marker_effect_is_e0139() {
+        // Mem is a builtin marker effect with zero declared ops. Any
+        // `Mem.X(...)` arm names an op not declared on the effect, so
+        // E0139 must fire — `[DEVIATION Task 66]` calls this out as
+        // the expected diagnostic for users who try to mock Mem via
+        // a handler. Pins that future v2 generic-Mem work hasn't
+        // silently changed Mem's op surface in v1.
+        let src = "fn main() -> Int ![Mem] {\n\
+                     handle 0 with { Mem.new_array(len, fill, k) => 0 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0139"),
+            "expected E0139 for handle on marker-effect Mem: {errs:?}"
+        );
+    }
+
+    #[test]
     fn duplicate_handle_arm_is_e0140() {
         // Two arms for the same `Raise.fail`; second is unreachable.
         let src = "effect Raise { fail: (String) -> Int }\n\

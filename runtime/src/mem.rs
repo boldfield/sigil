@@ -213,6 +213,30 @@ mod tests {
     }
 
     #[test]
+    fn alloc_at_count_field_boundary_works() {
+        // Mirror of `array.rs`'s boundary test: len=33 (well below
+        // the 6-bit count cap of 63) and len=64 (one past, where
+        // count=0's sidestep first becomes load-bearing). Both
+        // confirm the count-from-payload-length-word convention is
+        // honoured for MutArray.
+        let _guard = gc_test_lock();
+        let arr_33 = sigil_mut_array_new(33, 5);
+        unsafe {
+            assert_eq!(sigil_mut_array_length(arr_33), 33);
+            sigil_mut_array_set(arr_33, 32, 999);
+            assert_eq!(sigil_mut_array_get(arr_33, 32), 999);
+            assert_eq!(sigil_mut_array_get(arr_33, 0), 5);
+        }
+        let arr_64 = sigil_mut_array_new(64, 9);
+        unsafe {
+            assert_eq!(sigil_mut_array_length(arr_64), 64);
+            sigil_mut_array_set(arr_64, 63, 1234);
+            assert_eq!(sigil_mut_array_get(arr_64, 63), 1234);
+            assert_eq!(sigil_mut_array_get(arr_64, 0), 9);
+        }
+    }
+
+    #[test]
     fn header_tag_is_mut_array() {
         let _guard = gc_test_lock();
         let arr = sigil_mut_array_new(0, 0);
