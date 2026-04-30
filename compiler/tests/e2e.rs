@@ -5943,3 +5943,544 @@ fn closure_env_load_mixed_capture_kinds_returns_47() {
          stderr={stderr:?}"
     );
 }
+
+// ===== Plan C Task 62 — std/option run-and-check-output =====
+//
+// Each test compiles a small program that imports std.option and
+// exercises one of the helpers. Pod-side typecheck-only coverage
+// lives in `compiler/src/typecheck.rs::tests` (tests prefixed with
+// `import_std_option_`). These compile + run the binary and assert
+// stdout, exit code, and the expected codepath.
+
+/// `unwrap_or(Some(x), default)` returns `x`.
+#[test]
+fn std_option_unwrap_or_some_returns_inner() {
+    let src = "import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 let v: Int = unwrap_or(Some(42), 0);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_unwrap_or_some");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `unwrap_or(None, default)` returns `default`.
+#[test]
+fn std_option_unwrap_or_none_returns_default() {
+    let src = "import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 let none_val: Option[Int] = None;\n  \
+                 let v: Int = unwrap_or(none_val, 99);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_unwrap_or_none");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "99\n", "stderr={stderr:?}");
+}
+
+/// `map(Some(x), f)` returns `Some(f(x))`.
+#[test]
+fn std_option_map_some_applies_fn() {
+    let src = "import std.option\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let mapped: Option[Int] = map(Some(21), double);\n  \
+                 let v: Int = unwrap_or(mapped, 0);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_map_some");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `map(None, f)` returns `None`; `f` is never invoked. The pinned
+/// behaviour: `unwrap_or` falls through to the default.
+#[test]
+fn std_option_map_none_returns_none() {
+    let src = "import std.option\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let none_val: Option[Int] = None;\n  \
+                 let mapped: Option[Int] = map(none_val, double);\n  \
+                 let v: Int = unwrap_or(mapped, 7);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_map_none");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stderr={stderr:?}");
+}
+
+/// `and_then(Some(x), f)` chains an Option-producing function. When
+/// `f(x) = Some(_)`, the result preserves the inner value.
+#[test]
+fn std_option_and_then_some_chains_through() {
+    let src = "import std.option\n\
+               fn safe_pos(n: Int) -> Option[Int] ![] {\n  \
+                 match n { 0 => None, _ => Some(n * 3) }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let chained: Option[Int] = and_then(Some(5), safe_pos);\n  \
+                 let v: Int = unwrap_or(chained, 0);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_and_then_some");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "15\n", "stderr={stderr:?}");
+}
+
+/// `and_then(Some(0), safe_pos)` produces `None` because `safe_pos(0)`
+/// returns `None`. Pins the short-circuit through the helper chain.
+#[test]
+fn std_option_and_then_inner_none_short_circuits() {
+    let src = "import std.option\n\
+               fn safe_pos(n: Int) -> Option[Int] ![] {\n  \
+                 match n { 0 => None, _ => Some(n * 3) }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let chained: Option[Int] = and_then(Some(0), safe_pos);\n  \
+                 let v: Int = unwrap_or(chained, 99);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_option_and_then_inner_none");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "99\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 63 — std/result run-and-check-output =====
+//
+// Result has two type parameters; each match arm constructor only
+// fixes one (`Ok(_)` → A; `Err(_)` → E). The cross-arm unification
+// in `check_match` exposed a subtle typecheck bug where the bind
+// direction in `bind_ty_var` could pin an outer-fn type-var to a
+// fresh ctor-instance var, making it look unconstrained at the
+// pending E0132 sweep. The fix: prefer to bind the higher-id var
+// to the lower-id one (lower-id is outer-canonical within a
+// single fn body). See typecheck.rs's `bind_ty_var` Plan C Task 63
+// note for the full reasoning. These e2e tests pin the user-
+// observable correctness — the typecheck-level test
+// `import_std_result_typechecks_cleanly` (in typecheck.rs) is the
+// targeted-pin for the bind-direction fix.
+
+/// `match Ok` arm in user code returns `Ok` payload via `unwrap_or`-
+/// style handling. Pinned exit value 42.
+#[test]
+fn std_result_ok_payload_round_trips() {
+    let src = "import std.result\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = Ok(42);\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_ok_payload");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `map(Ok(x), f)` rewrites the Ok payload; Err passes through untouched.
+#[test]
+fn std_result_map_ok_applies_fn() {
+    let src = "import std.result\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let mapped: Result[Int, String] = map(Ok(21), double);\n  \
+                 match mapped {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_map_ok");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `map(Err, f)` leaves Err untouched; the fn is never invoked.
+#[test]
+fn std_result_map_err_passes_through() {
+    let src = "import std.result\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let err_val: Result[Int, String] = Err(\"boom\");\n  \
+                 let mapped: Result[Int, String] = map(err_val, double);\n  \
+                 match mapped {\n    \
+                   Ok(_) => perform IO.println(\"ok\"),\n    \
+                   Err(e) => perform IO.println(e),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_map_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "boom\n", "stderr={stderr:?}");
+}
+
+/// `map_err(Err(e), f)` rewrites the Err payload; Ok passes through.
+#[test]
+fn std_result_map_err_applies_fn() {
+    let src = "import std.result\n\
+               fn err_to_label(_e: String) -> String ![] { \"transformed\" }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let err_val: Result[Int, String] = Err(\"oops\");\n  \
+                 let mapped: Result[Int, String] = map_err(err_val, err_to_label);\n  \
+                 match mapped {\n    \
+                   Ok(_) => perform IO.println(\"ok\"),\n    \
+                   Err(e) => perform IO.println(e),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_map_err_applies");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "transformed\n", "stderr={stderr:?}");
+}
+
+/// `and_then(Ok(x), f)` chains a Result-producing transformation when
+/// the input is `Ok`. The chained output's error type matches the
+/// helper's signature.
+#[test]
+fn std_result_and_then_ok_chains_through() {
+    let src = "import std.result\n\
+               fn safe_pos(n: Int) -> Result[Int, String] ![] {\n  \
+                 match n { 0 => Err(\"zero\"), _ => Ok(n * 3) }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let chained: Result[Int, String] = and_then(Ok(5), safe_pos);\n  \
+                 match chained {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_and_then_ok");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "15\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 66 — MutArray runtime + Mem-effect coverage =====
+//
+// MutArray[A] is a builtin generic type registered alongside Array.
+// The four ops (`mut_array_new` / `_length` / `_get` / `_set`)
+// declare `![Mem]` in their effect row; main declares `![Mem]` to
+// permit mutation. mut_array_set returns Unit and mutates in place.
+
+/// Allocate, set in place, read back. Pin the in-place mutation
+/// contract: a single `arr` value sees the post-set slot value.
+#[test]
+fn std_mut_array_set_mutates_in_place() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let arr: MutArray[Int] = mut_array_new(3, 0);\n  \
+                 mut_array_set(arr, 1, 42);\n  \
+                 let v: Int = mut_array_get(arr, 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_set_in_place");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// Multiple sets accumulate in the same array — no fresh allocation.
+#[test]
+fn std_mut_array_set_chain_accumulates() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let arr: MutArray[Int] = mut_array_new(4, 0);\n  \
+                 mut_array_set(arr, 0, 10);\n  \
+                 mut_array_set(arr, 1, 20);\n  \
+                 mut_array_set(arr, 2, 30);\n  \
+                 mut_array_set(arr, 3, 40);\n  \
+                 let total: Int = mut_array_get(arr, 0)\n    \
+                   + mut_array_get(arr, 1)\n    \
+                   + mut_array_get(arr, 2)\n    \
+                   + mut_array_get(arr, 3);\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_chain");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "100\n", "stderr={stderr:?}");
+}
+
+/// Sudoku-board-sized MutArray (81 elements). Pins that the
+/// count-field overflow workaround applies to MutArray identically.
+#[test]
+fn std_mut_array_at_sudoku_size() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let arr: MutArray[Int] = mut_array_new(81, 0);\n  \
+                 mut_array_set(arr, 80, 99);\n  \
+                 let n: Int = mut_array_length(arr);\n  \
+                 let v: Int = mut_array_get(arr, 80);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_sudoku");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "81\n99\n", "stderr={stderr:?}");
+}
+
+/// MutArray of String — pointer-typed elements.
+#[test]
+fn std_mut_array_of_string() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let arr: MutArray[String] = mut_array_new(2, \"init\");\n  \
+                 mut_array_set(arr, 0, \"hello\");\n  \
+                 perform IO.println(mut_array_get(arr, 0));\n  \
+                 perform IO.println(mut_array_get(arr, 1));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_string");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello\ninit\n", "stderr={stderr:?}");
+}
+
+/// Mutation propagates across function-call boundaries — passing a
+/// MutArray to a helper fn (declared `![Mem]`) and mutating there
+/// affects the caller's view of the same array.
+#[test]
+fn std_mut_array_mutation_visible_across_fn_boundary() {
+    let src = "fn fill_at(arr: MutArray[Int], i: Int, v: Int) -> Unit ![Mem] {\n  \
+                 mut_array_set(arr, i, v)\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let arr: MutArray[Int] = mut_array_new(3, 0);\n  \
+                 fill_at(arr, 1, 77);\n  \
+                 perform IO.println(int_to_string(mut_array_get(arr, 1)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_cross_fn");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "77\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 65 — Array runtime + builtin coverage =====
+//
+// `Array[A]` is a builtin generic type registered at the typechecker
+// (via `builtin_types`); its 5 operations are builtin generic schemes
+// in `tc.fn_schemes`. Codegen lowers each call to a single FFI
+// invocation against `runtime/src/array.rs`'s `sigil_array_*`
+// primitives. v1 supports `Int` and pointer-typed elements; narrower
+// scalars (Bool, Char, Byte) are deferred per `[DEVIATION Task 65]`.
+
+/// Allocate, set, and read back an Int array.
+#[test]
+fn std_array_alloc_set_get_returns_42() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let arr: Array[Int] = array_alloc(3, 0);\n  \
+                 let arr2: Array[Int] = array_set(arr, 1, 42);\n  \
+                 let v: Int = array_get(arr2, 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_alloc_set_get");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `array_set` returns a fresh array; the original is unchanged.
+#[test]
+fn std_array_set_is_immutable() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let arr: Array[Int] = array_alloc(3, 7);\n  \
+                 let arr2: Array[Int] = array_set(arr, 1, 99);\n  \
+                 let original_v: Int = array_get(arr, 1);\n  \
+                 let updated_v: Int = array_get(arr2, 1);\n  \
+                 perform IO.println(int_to_string(original_v));\n  \
+                 perform IO.println(int_to_string(updated_v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_immutable_set");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n99\n", "stderr={stderr:?}");
+}
+
+/// `array_length` works on Sudoku-board sized arrays (81 elements,
+/// past the 6-bit count-field cap of 63).
+#[test]
+fn std_array_length_at_sudoku_size() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let arr: Array[Int] = array_alloc(81, 0);\n  \
+                 let n: Int = array_length(arr);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_sudoku_length");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "81\n", "stderr={stderr:?}");
+}
+
+/// `array_empty[A]()` produces a zero-length array.
+#[test]
+fn std_array_empty_returns_zero_length() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let arr: Array[Int] = array_empty();\n  \
+                 let n: Int = array_length(arr);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_empty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// Array of String — exercises pointer-typed elements end-to-end.
+#[test]
+fn std_array_of_string_round_trips() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let arr: Array[String] = array_alloc(2, \"hi\");\n  \
+                 let arr2: Array[String] = array_set(arr, 0, \"hello\");\n  \
+                 perform IO.println(array_get(arr2, 0));\n  \
+                 perform IO.println(array_get(arr2, 1));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_string");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello\nhi\n", "stderr={stderr:?}");
+}
+
+/// `import std.array` should be accepted (no-op since the surface
+/// is already available unconditionally as a builtin).
+#[test]
+fn std_array_import_is_noop_no_op() {
+    let src = "import std.array\n\
+               fn main() -> Int ![IO] {\n  \
+                 let arr: Array[Int] = array_alloc(1, 5);\n  \
+                 perform IO.println(int_to_string(array_get(arr, 0)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 64 — std/list run-and-check-output =====
+
+/// `length(range(1, 5))` returns 4. Pin the canonical iteration
+/// idiom (`range` + non-effecting fold-like).
+#[test]
+fn std_list_range_length_returns_4() {
+    let src = "import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = range(1, 5);\n  \
+                 perform IO.println(int_to_string(length(xs)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_range_length");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "4\n", "stderr={stderr:?}");
+}
+
+/// `fold(range(1, 5), 0, add) = 1 + 2 + 3 + 4 = 10`.
+#[test]
+fn std_list_fold_sum_returns_10() {
+    let src = "import std.list\n\
+               fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = fold(range(1, 5), 0, add);\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_fold_sum");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "10\n", "stderr={stderr:?}");
+}
+
+/// `map(range(1, 4), double) = [2, 4, 6]` → fold-sum = 12.
+#[test]
+fn std_list_map_then_fold_returns_12() {
+    let src = "import std.list\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = range(1, 4);\n  \
+                 let mapped: List[Int] = map(xs, double);\n  \
+                 perform IO.println(int_to_string(fold(mapped, 0, add)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_map_fold");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "12\n", "stderr={stderr:?}");
+}
+
+/// `filter(range(1, 6), is_pos) = [1, 2, 3, 4, 5]` → length 5.
+/// Pinned trivially since `is_pos` is true for every positive Int.
+#[test]
+fn std_list_filter_returns_5() {
+    let src = "import std.list\n\
+               fn is_pos(n: Int) -> Bool ![] {\n  \
+                 match n { 0 => false, _ => true }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = range(1, 6);\n  \
+                 let kept: List[Int] = filter(xs, is_pos);\n  \
+                 perform IO.println(int_to_string(length(kept)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_filter");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n", "stderr={stderr:?}");
+}
+
+/// `reverse(range(1, 4)) = [3, 2, 1]`. Verify by folding (the order
+/// doesn't change the sum but length should be 3).
+#[test]
+fn std_list_reverse_preserves_length() {
+    let src = "import std.list\n\
+               fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = range(1, 4);\n  \
+                 let rev: List[Int] = reverse(xs);\n  \
+                 perform IO.println(int_to_string(length(rev)));\n  \
+                 perform IO.println(int_to_string(fold(rev, 0, add)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_reverse");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n6\n", "stderr={stderr:?}");
+}
+
+/// `append([1,2], [3,4,5]) = [1,2,3,4,5]` → length 5, sum 15.
+#[test]
+fn std_list_append_concatenates() {
+    let src = "import std.list\n\
+               fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = range(1, 3);\n  \
+                 let ys: List[Int] = range(3, 6);\n  \
+                 let combined: List[Int] = append(xs, ys);\n  \
+                 perform IO.println(int_to_string(length(combined)));\n  \
+                 perform IO.println(int_to_string(fold(combined, 0, add)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_append");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n15\n", "stderr={stderr:?}");
+}
+
+/// `and_then(Ok(0), safe_pos)` short-circuits to Err because the
+/// chained helper returns `Err(\"zero\")`.
+#[test]
+fn std_result_and_then_inner_err_short_circuits() {
+    let src = "import std.result\n\
+               fn safe_pos(n: Int) -> Result[Int, String] ![] {\n  \
+                 match n { 0 => Err(\"zero\"), _ => Ok(n * 3) }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let chained: Result[Int, String] = and_then(Ok(0), safe_pos);\n  \
+                 match chained {\n    \
+                   Ok(_) => perform IO.println(\"ok\"),\n    \
+                   Err(e) => perform IO.println(e),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_result_and_then_inner_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "zero\n", "stderr={stderr:?}");
+}

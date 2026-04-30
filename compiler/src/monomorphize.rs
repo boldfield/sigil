@@ -159,20 +159,28 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
     }
 }
 
-/// Quick check: does the program contain any generic decls? Skipping
-/// the entire pass on non-generic programs keeps plan A1/A2/A3 codegen
-/// budget unchanged and avoids touching the AST at all.
+/// Quick check: does the program contain any generic decls or any
+/// `TypeExpr::Apply` use sites? Skipping the entire pass on non-
+/// generic programs keeps plan A1/A2/A3 codegen budget unchanged and
+/// avoids touching the AST at all.
+///
+/// Plan C Task 65 — also returns true when any `TypeExpr::Apply` node
+/// exists anywhere in the program (delegated to `codegen::
+/// contains_apply_or_generic_ref`). Programs that use builtin generic
+/// types (e.g. `Array[Int]` in a let binding) carry Apply nodes even
+/// without user-declared generic decls; those Apply nodes must be
+/// rewritten to mangled `Named` so the codegen-entry assertion
+/// doesn't trip.
 fn program_has_generics(program: &Program) -> bool {
+    if crate::codegen::contains_apply_or_generic_ref(program) {
+        return true;
+    }
     for item in &program.items {
         match item {
             Item::Fn(f) => {
                 if !f.generic_params.is_empty() {
                     return true;
                 }
-                // Effect-row vars without type generics still need to
-                // be handled by this pass to satisfy the codegen-entry
-                // invariant — but Plan B v1 erases row vars at codegen,
-                // not here. So just type generics gate the work.
             }
             Item::Type(td) => {
                 if !td.generic_params.is_empty() {
@@ -180,14 +188,6 @@ fn program_has_generics(program: &Program) -> bool {
                 }
             }
             Item::Import(_) => {}
-            // Plan B task 53 — effect declarations carry generic params
-            // for op signatures, but Task 49's reachability-bounded
-            // monomorphizer doesn't have a clone path for them yet. Task
-            // 54+ adds the effect registry; until then, typecheck has
-            // already emitted E0133, so any Item::Effect reaching here
-            // is on the error path. Don't trigger the full mono pass
-            // just because of an Item::Effect — keep the non-generic
-            // fast path live so non-effect programs stay zero-overhead.
             Item::Effect(_) => {}
         }
     }

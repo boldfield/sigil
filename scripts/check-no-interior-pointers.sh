@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 # check-no-interior-pointers.sh — plan A1 Task 0.12
 #
-# Heuristic grep for patterns that commonly produce interior pointers into
-# GC-managed heap objects. Any match without a same-or-previous-line
-# "SAFETY: not an interior pointer" escape-hatch comment fails the script.
+# Heuristic grep for patterns that produce pointers into GC-managed heap
+# objects (often interior — `obj.add(N)` style). Any match without a
+# same-or-previous-line "SAFETY: gc-heap-ptr arithmetic" escape-hatch
+# comment fails the script.
 #
 # The check covers runtime/src/ only; compiler/src/ does not directly
 # manipulate heap-object pointers. Codegen-emitted Cranelift IR is reviewed
 # structurally (no pointer-into-struct computations) per the plan, not by
 # this script.
 #
-# This is intentionally conservative: false positives land on the safety
-# escape hatch; the value is preventing new offenders from slipping in.
+# Boehm's conservative scan tolerates interior pointers — the scan walks
+# any pointer back to the start of its containing allocation, so an
+# interior pointer alone is sufficient to keep an object live. The risk
+# this script guards against is unreviewed pointer arithmetic into heap
+# objects: each acknowledged site should briefly state why the load /
+# store is safe (alignment, bounds, transience) in the parenthetical
+# after the marker phrase.
 
 set -euo pipefail
 
@@ -42,15 +48,15 @@ while IFS= read -r -d '' file; do
         for pat in "${PATTERNS[@]}"; do
             if echo "$line" | grep -Eq "$pat"; then
                 # Is there an acknowledging SAFETY comment on this or the previous line?
-                if echo "$line" | grep -q "SAFETY: not an interior pointer"; then
+                if echo "$line" | grep -q "SAFETY: gc-heap-ptr arithmetic"; then
                     continue
                 fi
-                if echo "$prev_line" | grep -q "SAFETY: not an interior pointer"; then
+                if echo "$prev_line" | grep -q "SAFETY: gc-heap-ptr arithmetic"; then
                     continue
                 fi
-                echo "INTERIOR-POINTER RISK: $file:$line_no matches '$pat'" >&2
+                echo "GC-HEAP-PTR RISK: $file:$line_no matches '$pat'" >&2
                 echo "  $line" >&2
-                echo "  (add '// SAFETY: not an interior pointer (<reason>)' on the same or preceding line to acknowledge.)" >&2
+                echo "  (add '// SAFETY: gc-heap-ptr arithmetic (<reason>)' on the same or preceding line to acknowledge.)" >&2
                 failed=1
             fi
         done

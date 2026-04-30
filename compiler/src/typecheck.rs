@@ -470,7 +470,7 @@ pub struct CtorInfo {
 /// order (phase 2). The `main` shim hardcodes the resulting effect_
 /// ids when emitting the top-level handler frames; the reserved-low-
 /// id convention is what keeps those constants stable per program.
-pub const BUILTIN_EFFECT_NAMES: &[&str] = &["ArithError", "IO"];
+pub const BUILTIN_EFFECT_NAMES: &[&str] = &["ArithError", "IO", "Mem"];
 
 /// Plan B Task 57 — construct synthetic `EffectDecl`s for the
 /// builtin effects (`IO`, `ArithError`). Returned in the order
@@ -519,6 +519,21 @@ fn builtin_effects() -> Vec<EffectDecl> {
             return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
             span: span.clone(),
         }],
+        span: span.clone(),
+    });
+    // Plan C Task 66 — Mem is a marker effect (zero ops). Functions
+    // that mutate `MutArray[A]` declare `![Mem]` in their effect row;
+    // the compiler rejects mutation calls from rows without Mem
+    // (E0042). No runtime handler frame is installed because there
+    // are no ops to dispatch — the "top-level Mem handler" is the
+    // type-level absence of a deeper override. See
+    // `[DEVIATION Task 66]` in `PLAN_C_DEVIATIONS.md`.
+    out.push(EffectDecl {
+        name: "Mem".to_string(),
+        name_span: span.clone(),
+        generic_params: Vec::new(),
+        resumes_many: false,
+        ops: Vec::new(),
         span,
     });
     debug_assert_eq!(
@@ -545,6 +560,15 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // downstream passes always see a single canonical variant set.
     let mut types: BTreeMap<String, TypeDecl> = BTreeMap::new();
     let mut errors: Vec<CompilerError> = Vec::new();
+    // Plan C Task 65 — builtin generic types injected before user
+    // types. `Array[A]` has no user-constructible variants (its only
+    // constructors are the runtime FFI primitives `sigil_array_*`,
+    // exposed via builtin generic schemes in `fn_schemes` below). A
+    // user `type Array = ...` declaration trips E0113 (duplicate)
+    // through the existing user-type loop — Array is not shadowable.
+    for builtin in builtin_types(&program.file) {
+        types.insert(builtin.name.clone(), builtin);
+    }
     for item in &program.items {
         if let Item::Type(td) = item {
             if types.contains_key(&td.name) {
@@ -704,6 +728,15 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         handle_return_arm_captures: BTreeMap::new(),
         handle_body_ty: BTreeMap::new(),
     };
+    // Plan C Task 65 — builtin generic schemes for `array_alloc` /
+    // `array_empty` / `array_length` / `array_get` / `array_set`.
+    // Registered before the user-fn scheme pre-pass so a user
+    // `fn array_alloc(...)` declaration overwrites the builtin
+    // (same shadowing model as `int_to_string`).
+    register_builtin_array_schemes(&mut tc);
+    // Plan C Task 66 — builtin generic schemes for `mut_array_*`
+    // ops, gated by the Mem marker effect.
+    register_builtin_mut_array_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -1064,6 +1097,172 @@ fn builtin_fn_env() -> BTreeMap<String, Ty> {
     m
 }
 
+/// Plan C Task 65 — builtin generic types registered in `tc.types`
+/// before user types. `Array[A]` is opaque (no user-constructible
+/// variants); its values are produced exclusively via the builtin
+/// generic functions registered alongside in `fn_schemes`.
+///
+/// `file` is the user program's file path, used to construct
+/// synthetic spans that point at the user file rather than a
+/// fictional builtin location. Diagnostics that reference a
+/// builtin TypeDecl's span will surface against the user's own
+/// program — fine for v1's narrow surface (Array doesn't surface
+/// in user-visible diagnostics today).
+fn builtin_types(file: &str) -> Vec<TypeDecl> {
+    use crate::ast::{GenericParam, TypeDecl};
+    let span = Span::synthetic(file);
+    vec![
+        TypeDecl {
+            name: "Array".to_string(),
+            name_span: span.clone(),
+            generic_params: vec![GenericParam {
+                name: "A".to_string(),
+                span: span.clone(),
+            }],
+            variants: Vec::new(),
+            span: span.clone(),
+        },
+        // Plan C Task 66 — MutArray[A] is opaque; constructed via
+        // the Mem-effected builtin `mut_array_new`. Same layout
+        // shape as Array but tag TAG_MUT_ARRAY at runtime.
+        TypeDecl {
+            name: "MutArray".to_string(),
+            name_span: span.clone(),
+            generic_params: vec![GenericParam {
+                name: "A".to_string(),
+                span: span.clone(),
+            }],
+            variants: Vec::new(),
+            span,
+        },
+    ]
+}
+
+/// Plan C Task 65 — builtin generic function schemes for the array
+/// runtime primitives. Inserted into `tc.fn_schemes` after the
+/// generic-fn-allocation pre-pass so user fns of the same names
+/// shadow these (mirrors `int_to_string`'s shadowability via
+/// `fn_env`). Allocates fresh type-var ids per builtin so each
+/// scheme is fully resolved before instantiation at call sites.
+///
+/// Operations registered:
+/// - `array_alloc[A](Int, A) -> Array[A] ![]`
+/// - `array_empty[A]() -> Array[A] ![]`
+/// - `array_length[A](Array[A]) -> Int ![]`
+/// - `array_get[A](Array[A], Int) -> A ![]`
+/// - `array_set[A](Array[A], Int, A) -> Array[A] ![]`
+fn register_builtin_array_schemes(tc: &mut Tc) {
+    // Allocate one fresh type-var per scheme. Each scheme's `A`
+    // is independently fresh so cross-scheme unification stays
+    // sound (e.g. `array_alloc[A]` and `array_get[A]` use
+    // different `A_id` slots).
+    let make_scheme = |params: Vec<Ty>, ret: Ty, type_vars: Vec<u32>| Scheme {
+        type_vars,
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    {
+        let a = tc.fresh_ty_var();
+        let array_a = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "array_alloc".to_string(),
+            make_scheme(vec![Ty::Int, Ty::Var(a)], array_a, vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let array_a = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "array_empty".to_string(),
+            make_scheme(vec![], array_a, vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let array_a = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "array_length".to_string(),
+            make_scheme(vec![array_a], Ty::Int, vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let array_a = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "array_get".to_string(),
+            make_scheme(vec![array_a, Ty::Int], Ty::Var(a), vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let array_a = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        let array_a_clone = Ty::User("Array".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "array_set".to_string(),
+            make_scheme(vec![array_a, Ty::Int, Ty::Var(a)], array_a_clone, vec![a]),
+        );
+    }
+}
+
+/// Plan C Task 66 — builtin generic schemes for the `MutArray[A]`
+/// runtime primitives. Each declares `effects: vec!["Mem"]` so a
+/// caller without `Mem` in its effect row trips E0042 at the call
+/// site. Operations:
+///
+/// - `mut_array_new[A](Int, A) -> MutArray[A] ![Mem]`
+/// - `mut_array_length[A](MutArray[A]) -> Int ![Mem]`
+/// - `mut_array_get[A](MutArray[A], Int) -> A ![Mem]`
+/// - `mut_array_set[A](MutArray[A], Int, A) -> Unit ![Mem]`
+fn register_builtin_mut_array_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty, type_vars: Vec<u32>| Scheme {
+        type_vars,
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: vec!["Mem".to_string()],
+            effect_row_var: None,
+        })),
+    };
+    {
+        let a = tc.fresh_ty_var();
+        let mut_array_a = Ty::User("MutArray".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "mut_array_new".to_string(),
+            make_scheme(vec![Ty::Int, Ty::Var(a)], mut_array_a, vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let mut_array_a = Ty::User("MutArray".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "mut_array_length".to_string(),
+            make_scheme(vec![mut_array_a], Ty::Int, vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let mut_array_a = Ty::User("MutArray".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "mut_array_get".to_string(),
+            make_scheme(vec![mut_array_a, Ty::Int], Ty::Var(a), vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let mut_array_a = Ty::User("MutArray".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "mut_array_set".to_string(),
+            make_scheme(vec![mut_array_a, Ty::Int, Ty::Var(a)], Ty::Unit, vec![a]),
+        );
+    }
+}
+
 struct Tc {
     errors: Vec<CompilerError>,
     string_literals: Vec<(Span, String)>,
@@ -1282,7 +1481,20 @@ impl Tc {
     /// `name -> Ty::Var(id)` map plus the parallel id list (used for
     /// `Scheme.type_vars`). Empty input yields an empty map and
     /// empty id list — non-generic declarations stay zero-cost.
+    ///
+    /// **Allocation-order invariant** (load-bearing for `bind_ty_var`'s
+    /// lower-id-is-outer-canonical direction fix from Task 63). The
+    /// returned IDs are consecutive starting at the pre-call value of
+    /// `next_ty_var`. Within a single `check_fn` call this method is
+    /// invoked BEFORE any body-walk fresh-var allocation, so every
+    /// outer-fn var has a lower ID than every body-walk fresh-var.
+    /// `bind_ty_var` relies on `min(id, other)` selecting the outer-
+    /// canonical representative when both vars are unbound.
+    /// Structural pin: `fresh_ty_var_is_monotonic_counter` and
+    /// `outer_fn_vars_have_lower_ids_than_body_fresh_vars_after_typecheck`
+    /// in `mod tests`.
     fn fresh_generic_subst(&mut self, gps: &[GenericParam]) -> (BTreeMap<String, Ty>, Vec<u32>) {
+        let pre_floor = self.next_ty_var;
         let mut subst = BTreeMap::new();
         let mut ids = Vec::with_capacity(gps.len());
         for gp in gps {
@@ -1290,6 +1502,20 @@ impl Tc {
             ids.push(id);
             subst.insert(gp.name.clone(), Ty::Var(id));
         }
+        debug_assert!(
+            ids.iter()
+                .enumerate()
+                .all(|(i, id)| *id == pre_floor + i as u32),
+            "fresh_generic_subst postcondition: allocated IDs must be consecutive \
+             starting from pre-call next_ty_var (={pre_floor}); got {ids:?}"
+        );
+        debug_assert_eq!(
+            self.next_ty_var,
+            pre_floor + gps.len() as u32,
+            "fresh_generic_subst postcondition: next_ty_var advanced by exactly {} (got {})",
+            gps.len(),
+            self.next_ty_var
+        );
         (subst, ids)
     }
 
@@ -1424,6 +1650,56 @@ impl Tc {
             if *other == id {
                 return true;
             }
+            // Plan C Task 63 — when binding two unbound type-vars,
+            // prefer to point the higher-id var at the lower-id one.
+            // Outer-fn type vars (collected into `outer_fn_var_ids`
+            // from each fn's `Scheme.type_vars`) are allocated by
+            // `check_fn`'s `fresh_generic_subst` BEFORE any body
+            // fresh vars within that fn, so within a single fn body
+            // lower-id is the outer-canonical representative.
+            // Cross-arm unify in `check_match` unifies one arm's
+            // free fresh-var (e.g. `Result[A, ?fE]`'s ?fE from
+            // `Ok(x)`) with the other arm's outer-bound fresh var
+            // (`Result[?fA, E]`'s already-bound ?fA from `Err(e)`).
+            // Without this preference, the bind direction is
+            // OUTER → FRESH (`subst[outer] = Var(fresh)`), and the
+            // pending_ctor `apply_ty` walk returns the still-
+            // unbound fresh var, firing E0132 even though the
+            // program is well-typed under HM. Two-param sum types
+            // (Result[A, E]) where each ctor arm only fixes one of
+            // the two params are the canonical reproducer; List[A]
+            // with a single param never tripped this because the
+            // unbound arm-var never had a competing already-bound
+            // counterpart at cross-arm time.
+            //
+            // Invariant pins (`mod tests`):
+            //   - `fresh_ty_var_is_monotonic_counter` — the counter
+            //     is strictly increasing.
+            //   - `fresh_generic_subst_then_body_fresh_vars_have_higher_ids`
+            //     — outer-fn vars allocate before body fresh-vars
+            //     at the API level.
+            //   - `bind_ty_var_with_two_unbound_vars_picks_lower_id_as_canonical`
+            //     — this fn's load-bearing direction.
+            //   - `outer_fn_vars_have_lower_ids_than_body_fresh_vars_after_typecheck`
+            //     — end-to-end consecutiveness pin.
+            //   - `two_param_sum_type_match_each_arm_constrains_one_param_typechecks`
+            //     — the user-facing regression.
+            let canonical = (*other).min(id);
+            let other_id = (*other).max(id);
+            if canonical != other_id {
+                if self.occurs_in_ty(other_id, &Ty::Var(canonical)) {
+                    self.push_error(
+                        "E0126",
+                        span.clone(),
+                        format!(
+                            "occurs check failed: cannot construct an infinite type `?{other_id} = ?{canonical}`"
+                        ),
+                    );
+                    return false;
+                }
+                self.subst.tys.insert(other_id, Ty::Var(canonical));
+            }
+            return true;
         }
         if self.occurs_in_ty(id, &resolved) {
             self.push_error(
@@ -2244,13 +2520,13 @@ impl Tc {
                 );
             }
             for effect in &f.effects {
-                if effect != "IO" && effect != "ArithError" {
+                if effect != "IO" && effect != "ArithError" && effect != "Mem" {
                     self.push_error(
                         "E0041",
                         f.span.clone(),
                         format!(
                             "`fn main`'s effect row may only contain effects discharged by \
-                             the top-level shim (`IO` or `ArithError`); saw `{effect}`",
+                             the top-level shim (`IO`, `ArithError`, or `Mem`); saw `{effect}`",
                         ),
                     );
                 }
@@ -5082,15 +5358,17 @@ fn saturating_add(a: usize, b: usize) -> usize {
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
-    use crate::{lexer::lex, parser::parse, resolve::resolve};
+    use crate::{imports, lexer::lex, parser::parse, resolve::resolve};
 
     fn pipeline(src: &str) -> Vec<CompilerError> {
         let (toks, lex_errs) = lex("x.sigil", src);
         let (prog, parse_errs) = parse("x.sigil", &toks);
+        let (prog, import_errs) = imports::resolve(prog);
         let (rp, res_errs) = resolve(prog);
         let (_tc, tc_errs) = typecheck(rp.program);
         let mut all = lex_errs;
         all.extend(parse_errs);
+        all.extend(import_errs);
         all.extend(res_errs);
         all.extend(tc_errs);
         all
@@ -5265,6 +5543,9 @@ mod tests {
             // E0220 — one-shot continuation used more than once:
             "effect Raise { fail: (String) -> Int }\n\
              fn main() -> Int ![] { handle 0 with { Raise.fail(msg, k) => k(0) + k(1) } }\n",
+            // Plan C Task 62.0 — stdlib import resolution:
+            // E0032 — stdlib module not found:
+            "import std.does_not_exist\nfn main() -> Int ![] { 0 }\n",
         ];
         for src in programs {
             let errs = pipeline(src);
@@ -5786,6 +6067,8 @@ mod tests {
         assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
         let (prog, parse_errs) = parse("x.sigil", &toks);
         assert!(parse_errs.is_empty(), "parse: {parse_errs:?}");
+        let (prog, import_errs) = imports::resolve(prog);
+        assert!(import_errs.is_empty(), "imports: {import_errs:?}");
         let (rp, res_errs) = resolve(prog);
         assert!(res_errs.is_empty(), "resolve: {res_errs:?}");
         typecheck(rp.program)
@@ -7537,26 +7820,24 @@ mod tests {
     #[test]
     fn effect_ids_assigned_alphabetically_per_program() {
         // Plan B Task 55 + Task 57 — user effect_ids are assigned in
-        // alphabetical order, **starting at `BUILTIN_EFFECT_NAMES.len()`**
-        // (today: 2). The reserved low ids 0 (`ArithError`) and 1 (`IO`)
-        // belong to the builtin effects synthesized in `builtin_effects()`
-        // — see `[DEVIATION Task 57] Builtin-effect injection` for the
-        // reserved-low-id convention. Declaration order in source still
-        // doesn't matter for user effects; alphabetical sort over
-        // `tc.effects` keys (BTreeMap iteration) is the canonical order.
+        // alphabetical order, **starting at `BUILTIN_EFFECT_NAMES.len()`**.
+        // Plan C Task 66 added `Mem` as a third builtin (zero-op
+        // marker effect), bumping the user-id start to 3. Reserved
+        // low ids: 0 (`ArithError`), 1 (`IO`), 2 (`Mem`).
         let src = "effect Zeta { z: () -> Int }\n\
                    effect Alpha { a: () -> Int }\n\
                    effect Mu { m: () -> Int }\n\
                    fn main() -> Int ![] { 0 }\n";
         let (cp, errs) = pipeline_checked(src);
         assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
-        // Builtins occupy 0 and 1.
+        // Builtins occupy 0, 1, 2.
         assert_eq!(cp.effect_ids.get("ArithError"), Some(&0));
         assert_eq!(cp.effect_ids.get("IO"), Some(&1));
-        // User effects start at 2 in alphabetical order.
-        assert_eq!(cp.effect_ids.get("Alpha"), Some(&2));
-        assert_eq!(cp.effect_ids.get("Mu"), Some(&3));
-        assert_eq!(cp.effect_ids.get("Zeta"), Some(&4));
+        assert_eq!(cp.effect_ids.get("Mem"), Some(&2));
+        // User effects start at 3 in alphabetical order.
+        assert_eq!(cp.effect_ids.get("Alpha"), Some(&3));
+        assert_eq!(cp.effect_ids.get("Mu"), Some(&4));
+        assert_eq!(cp.effect_ids.get("Zeta"), Some(&5));
     }
 
     #[test]
@@ -7764,6 +8045,24 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0139"), "expected E0139: {errs:?}");
+    }
+
+    #[test]
+    fn handle_op_on_mem_marker_effect_is_e0139() {
+        // Mem is a builtin marker effect with zero declared ops. Any
+        // `Mem.X(...)` arm names an op not declared on the effect, so
+        // E0139 must fire — `[DEVIATION Task 66]` calls this out as
+        // the expected diagnostic for users who try to mock Mem via
+        // a handler. Pins that future v2 generic-Mem work hasn't
+        // silently changed Mem's op surface in v1.
+        let src = "fn main() -> Int ![Mem] {\n\
+                     handle 0 with { Mem.new_array(len, fill, k) => 0 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0139"),
+            "expected E0139 for handle on marker-effect Mem: {errs:?}"
+        );
     }
 
     #[test]
@@ -8592,5 +8891,476 @@ mod tests {
         assert_eq!(inner_sig.params, vec![Ty::Int]);
         assert_eq!(inner_sig.ret, Ty::Int);
         assert_eq!(outer_sig.ret, Ty::Int);
+    }
+
+    // ===== Plan C Task 62 — std/option typecheck-level coverage =====
+    //
+    // E2E run-and-check-output tests live in `compiler/tests/e2e.rs`
+    // (CI-only on the headless pod per the memory-pressure rule).
+    // These typecheck-only tests give fast pod-side feedback that
+    // `std/option.sigil` is valid sigil syntax + that the import
+    // resolver (Task 62.0) loads it cleanly.
+
+    #[test]
+    fn import_std_option_typechecks_cleanly() {
+        let src = "import std.option\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let o: Option[Int] = Some(42);\n  \
+                     let v: Int = unwrap_or(o, 0);\n  \
+                     perform IO.println(int_to_string(v));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_option_map_and_and_then_typecheck_cleanly() {
+        // `safe_pos` mimics a partial transformation without using `/`
+        // (which would require `![ArithError]` on the row per Plan B
+        // Task 57). `map` and `and_then` are pure-row helpers; this
+        // test confirms generic instantiation at A=Int, B=Int compiles.
+        let src = "import std.option\n\
+                   fn double(n: Int) -> Int ![] { n + n }\n\
+                   fn safe_pos(n: Int) -> Option[Int] ![] {\n  \
+                     match n { 0 => None, _ => Some(n * 2) }\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let a: Option[Int] = map(Some(21), double);\n  \
+                     let b: Option[Int] = and_then(Some(5), safe_pos);\n  \
+                     let v: Int = unwrap_or(a, 0) + unwrap_or(b, 0);\n  \
+                     perform IO.println(int_to_string(v));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn option_helpers_unavailable_without_import() {
+        // Without `import std.option`, the user program cannot
+        // reference `Some`, `None`, `unwrap_or`, etc. The diagnostic
+        // wording varies by which lookup fires first; this test
+        // pins that compilation fails (does not silently succeed).
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let o: Option[Int] = Some(42);\n  \
+                     let v: Int = unwrap_or(o, 0);\n  \
+                     perform IO.println(int_to_string(v));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !errs.is_empty(),
+            "expected the program to fail without `import std.option`; got clean errs"
+        );
+    }
+
+    // ===== Plan C Task 63 — std/result typecheck-level coverage =====
+
+    #[test]
+    fn fresh_ty_var_is_monotonic_counter() {
+        // Plan C Task 63 invariant pin. `bind_ty_var`'s lower-id-is-
+        // outer-canonical direction fix relies on `fresh_ty_var`
+        // returning monotonically-increasing IDs so that
+        // `fresh_generic_subst`-allocated outer-fn vars (called first
+        // in `check_fn`) have lower IDs than any subsequent body
+        // fresh-var. If a future refactor adds ID reuse / recycling
+        // here, this assertion fires and the bind direction needs
+        // re-checking.
+        let mut tc = fresh_tc();
+        let a = tc.fresh_ty_var();
+        let b = tc.fresh_ty_var();
+        let c = tc.fresh_ty_var();
+        assert!(
+            a < b,
+            "fresh_ty_var must be strictly monotonic: a={a}, b={b}"
+        );
+        assert!(
+            b < c,
+            "fresh_ty_var must be strictly monotonic: b={b}, c={c}"
+        );
+        assert_eq!(b, a + 1, "fresh_ty_var must increment by 1");
+        assert_eq!(c, b + 1, "fresh_ty_var must increment by 1");
+    }
+
+    #[test]
+    fn fresh_generic_subst_then_body_fresh_vars_have_higher_ids() {
+        // Plan C Task 63 invariant pin (API level). Within a single
+        // `check_fn` invocation, outer-fn type vars allocated via
+        // `fresh_generic_subst` must precede any body-walk fresh-vars
+        // so that lower-id-is-outer-canonical holds in `bind_ty_var`.
+        // This test simulates the calling order at the API level: a
+        // future refactor that allocates body fresh-vars BEFORE the
+        // outer-fn subst within `check_fn` would invert the property
+        // silently in production (since `check_fn` is a private
+        // method that can't be unit-tested in isolation), but this
+        // test would still pass — the test is a pin on the API
+        // contract, not the call-site discipline. Pair with
+        // `outer_fn_vars_have_lower_ids_than_body_fresh_vars_after_typecheck`
+        // for end-to-end coverage.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("test.sigil");
+        let gps = vec![
+            crate::ast::GenericParam {
+                name: "A".to_string(),
+                span: span.clone(),
+            },
+            crate::ast::GenericParam {
+                name: "E".to_string(),
+                span,
+            },
+        ];
+        let (_subst, outer_ids) = tc.fresh_generic_subst(&gps);
+        let body_id_1 = tc.fresh_ty_var();
+        let body_id_2 = tc.fresh_ty_var();
+        let outer_max = *outer_ids.iter().max().expect("outer_ids non-empty");
+        assert!(
+            body_id_1 > outer_max,
+            "body fresh-var must allocate AFTER all outer-fn vars: \
+             outer_ids={outer_ids:?}, body_id_1={body_id_1}"
+        );
+        assert!(body_id_2 > body_id_1);
+    }
+
+    #[test]
+    fn bind_ty_var_with_two_unbound_vars_picks_lower_id_as_canonical() {
+        // Plan C Task 63 direction-fix pin. Verifies the load-bearing
+        // half of the fix: when `bind_ty_var(id, Var(other))` runs
+        // with both `id` and `other` unbound and distinct, the
+        // resulting substitution maps the higher-id var to the
+        // lower-id var, NOT the other way around. Pairs with
+        // `two_param_sum_type_match_each_arm_constrains_one_param_typechecks`
+        // (the regression test for the user-facing surface).
+        let span = Span::synthetic("test.sigil");
+        let mut tc = fresh_tc();
+        let outer = tc.fresh_ty_var(); // simulates outer-fn var, lower id.
+        let body = tc.fresh_ty_var(); // simulates body fresh-var, higher id.
+        assert!(outer < body, "test setup: outer must have lower id");
+        // Bind body := Var(outer): the implementation should pick
+        // `min(body, outer) = outer` as canonical and store
+        // subst[body] = Var(outer).
+        let ok = tc.bind_ty_var(body, &Ty::Var(outer), &span);
+        assert!(ok);
+        assert_eq!(
+            tc.subst.tys.get(&body),
+            Some(&Ty::Var(outer)),
+            "bind_ty_var must map higher-id (body) to lower-id (outer); \
+             got subst.tys = {:?}",
+            tc.subst.tys
+        );
+        assert!(
+            !tc.subst.tys.contains_key(&outer),
+            "bind_ty_var must NOT map lower-id (outer) to higher-id (body); \
+             got subst.tys = {:?}",
+            tc.subst.tys
+        );
+
+        // Symmetric case: same call with arguments swapped should
+        // produce the same substitution direction.
+        let mut tc2 = fresh_tc();
+        let outer2 = tc2.fresh_ty_var();
+        let body2 = tc2.fresh_ty_var();
+        let ok2 = tc2.bind_ty_var(outer2, &Ty::Var(body2), &span);
+        assert!(ok2);
+        assert_eq!(
+            tc2.subst.tys.get(&body2),
+            Some(&Ty::Var(outer2)),
+            "bind_ty_var(outer, Var(body)) must still map body → outer"
+        );
+        assert!(!tc2.subst.tys.contains_key(&outer2));
+    }
+
+    #[test]
+    fn outer_fn_vars_have_lower_ids_than_body_fresh_vars_after_typecheck() {
+        // Plan C Task 63 invariant pin (end-to-end). Typecheck a
+        // generic fn whose body triggers ctor-site instantiations —
+        // the path that allocates body fresh-vars during
+        // `instantiate_with_vars`. After typecheck, the fn's
+        // `Scheme.type_vars` IDs must be the lowest IDs allocated
+        // for that fn's typecheck, sitting consecutively at the
+        // base of its allocation range. The post-typecheck
+        // `Tc.subst` is private (not surfaced through
+        // `CheckedProgram`) so this test pins the property via
+        // outer-id consecutiveness + the program-wide scheme
+        // layout: `id`'s outer vars must be lower than `main`'s
+        // (no) vars. The regression-test's clean typecheck under
+        // the same bind direction is the user-facing pin.
+        let src = "type Result[A, E] = | Ok(A) | Err(E)\n\
+                   fn id[A, E](r: Result[A, E]) -> Result[A, E] ![] {\n  \
+                     match r {\n    \
+                       Ok(x) => Ok(x),\n    \
+                       Err(e) => Err(e),\n  \
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (toks, _) = lex("t.sigil", src);
+        let (prog, _) = parse("t.sigil", &toks);
+        let (rp, _) = resolve(prog);
+        let (cp, errs) = typecheck(rp.program);
+        assert!(errs.is_empty(), "unexpected typecheck errors: {errs:?}");
+        let id_scheme = cp
+            .fn_schemes
+            .get("id")
+            .expect("scheme `id` should be registered");
+        let outer_ids: Vec<u32> = id_scheme.type_vars.clone();
+        assert_eq!(
+            outer_ids.len(),
+            2,
+            "fn `id[A, E]` should have 2 outer-fn type vars; got {outer_ids:?}"
+        );
+
+        // Sanity: outer IDs are consecutive (allocation-order
+        // invariant — `fresh_generic_subst` allocates them as a
+        // contiguous block).
+        let mut sorted_outer = outer_ids.clone();
+        sorted_outer.sort();
+        for w in sorted_outer.windows(2) {
+            assert_eq!(
+                w[1],
+                w[0] + 1,
+                "outer-fn vars must be allocated consecutively; got {sorted_outer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_param_sum_type_match_each_arm_constrains_one_param_typechecks() {
+        // Plan C Task 63 regression-pin for the `bind_ty_var` order
+        // fix. Before the fix, this program tripped E0132 because
+        // `Ok(x)` constrained only A and `Err(e)` constrained only
+        // E; cross-arm unify bound the outer-fn vars to the
+        // ctor-instance fresh vars, leaving them unconstrained at
+        // the pending E0132 sweep. List[A] never tripped this
+        // because there's only one type-param so an unbound arm-
+        // var has no competing already-bound counterpart. This
+        // test is a free-standing pin; the user-observable surface
+        // ships in `std/result.sigil` and `tests/std_result_*`.
+        let src = "type Result[A, E] = | Ok(A) | Err(E)\n\
+                   fn id[A, E](r: Result[A, E]) -> Result[A, E] ![] {\n  \
+                     match r {\n    \
+                       Ok(x) => Ok(x),\n    \
+                       Err(e) => Err(e),\n  \
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "two-param sum match should typecheck cleanly under bind_ty_var fix; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn import_std_result_typechecks_cleanly() {
+        let src = "import std.result\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let r: Result[Int, String] = Ok(42);\n  \
+                     match r {\n    \
+                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                       Err(_) => perform IO.println(\"err\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    // ===== Plan C Task 64 — std/list typecheck-level coverage =====
+
+    // ===== Plan C Task 65 — builtin Array typecheck-level coverage =====
+    //
+    // Array is registered as a builtin generic type via builtin_types().
+    // Array operations (`array_alloc`, `array_empty`, `array_length`,
+    // `array_get`, `array_set`) are registered as builtin generic
+    // schemes via register_builtin_array_schemes(). Both are accessible
+    // without an `import std.array` statement (Array is a primitive at
+    // the typecheck level).
+
+    #[test]
+    fn array_alloc_get_set_typechecks_cleanly() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let arr: Array[Int] = array_alloc(3, 0);\n  \
+                     let v: Int = array_get(arr, 0);\n  \
+                     let arr2: Array[Int] = array_set(arr, 1, 42);\n  \
+                     let n: Int = array_length(arr2);\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn array_empty_typechecks_with_explicit_type_annotation() {
+        // array_empty[A]() with no value args needs an explicit type
+        // annotation at the let-binding to pin A.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let arr: Array[Int] = array_empty();\n  \
+                     let n: Int = array_length(arr);\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn array_of_string_typechecks_cleanly() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let arr: Array[String] = array_alloc(2, \"hi\");\n  \
+                     let s: String = array_get(arr, 0);\n  \
+                     perform IO.println(s);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn array_get_arg_type_mismatch_fires_e0044() {
+        // array_get(arr, "not int") — the index must be Int.
+        let src = "fn main() -> Int ![] {\n  \
+                     let arr: Array[Int] = array_alloc(1, 0);\n  \
+                     let v: Int = array_get(arr, \"x\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 from array_get's index arg mismatch; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_redeclares_array_type_fires_e0113() {
+        let src = "type Array = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "expected E0113 (duplicate type Array); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 66 — MutArray + Mem effect typecheck-level coverage =====
+
+    #[test]
+    fn mut_array_new_get_set_typechecks_under_mem_row() {
+        let src = "fn main() -> Int ![IO, Mem] {\n  \
+                     let arr: MutArray[Int] = mut_array_new(3, 0);\n  \
+                     mut_array_set(arr, 1, 42);\n  \
+                     let v: Int = mut_array_get(arr, 1);\n  \
+                     perform IO.println(int_to_string(v));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn mut_array_set_without_mem_in_row_fires_e0042() {
+        // Without Mem in main's row, mut_array_set's `![Mem]` row
+        // requirement isn't satisfied — typecheck rejects.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let arr: MutArray[Int] = mut_array_new(3, 0);\n  \
+                     mut_array_set(arr, 1, 42);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 from missing Mem in row; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_redeclares_mut_array_type_fires_e0113() {
+        let src = "type MutArray = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "expected E0113 (duplicate type MutArray); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn main_with_mem_only_in_row_typechecks() {
+        // Mem alone (no IO) is acceptable in main's row.
+        let src = "fn main() -> Int ![Mem] {\n  \
+                     let arr: MutArray[Int] = mut_array_new(2, 5);\n  \
+                     mut_array_set(arr, 0, 99);\n  \
+                     mut_array_get(arr, 0)\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_list_typechecks_cleanly() {
+        let src = "import std.list\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let xs: List[Int] = Cons(10, Cons(20, Cons(30, Nil)));\n  \
+                     let n: Int = length(xs);\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_list_higher_order_helpers_typecheck_cleanly() {
+        // Predicate avoids `/` and `%` (both require ArithError per
+        // Plan B Task 57); a positive-test predicate keeps the
+        // closed `![]` row clean.
+        let src = "import std.list\n\
+                   fn double(n: Int) -> Int ![] { n + n }\n\
+                   fn is_pos(n: Int) -> Bool ![] {\n  \
+                     match n { 0 => false, _ => true }\n\
+                   }\n\
+                   fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let xs: List[Int] = range(1, 5);\n  \
+                     let mapped: List[Int] = map(xs, double);\n  \
+                     let kept: List[Int] = filter(xs, is_pos);\n  \
+                     let total: Int = fold(xs, 0, add);\n  \
+                     let rev: List[Int] = reverse(xs);\n  \
+                     let combined: List[Int] = append(xs, rev);\n  \
+                     perform IO.println(int_to_string(length(mapped) + length(kept) + total + length(combined)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_result_map_map_err_and_then_typecheck_cleanly() {
+        let src = "import std.result\n\
+                   fn double(n: Int) -> Int ![] { n + n }\n\
+                   fn err_to_default(_e: String) -> Int ![] { 0 }\n\
+                   fn safe_pos(n: Int) -> Result[Int, String] ![] {\n  \
+                     match n { 0 => Err(\"zero\"), _ => Ok(n * 3) }\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let a: Result[Int, String] = map(Ok(21), double);\n  \
+                     let b: Result[Int, Int] = map_err(Err(\"oops\"), err_to_default);\n  \
+                     let c: Result[Int, String] = and_then(Ok(5), safe_pos);\n  \
+                     match a {\n    \
+                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                       Err(_) => perform IO.println(\"err\"),\n  \
+                     };\n  \
+                     match b {\n    \
+                       Ok(_) => perform IO.println(\"ok\"),\n    \
+                       Err(n) => perform IO.println(int_to_string(n)),\n  \
+                     };\n  \
+                     match c {\n    \
+                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                       Err(_) => perform IO.println(\"err\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 }

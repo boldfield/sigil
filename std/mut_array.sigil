@@ -1,0 +1,62 @@
+// sigil: 0.1
+//
+// std/mut_array.sigil — Plan C Task 66.
+//
+// **Documentation only.** Like `std/io.sigil` and `std/array.sigil`,
+// this file does not participate in typecheck. The `MutArray[A]`
+// type and its four operations are registered at the typechecker
+// as builtins via `builtin_types()` and
+// `register_builtin_mut_array_schemes()`.
+//
+// `MutArray[A]` is a heap-allocated, in-place mutable sequence
+// with O(1) `length`, `get`, and `set`. It mirrors the heap layout
+// of immutable `Array[A]` but uses tag `TAG_MUT_ARRAY = 0x05` so
+// future GC walkers can apply distinct write-barrier treatment.
+//
+// ## Operations (each declares `![Mem]`)
+//
+// - `mut_array_new[A](len: Int, fill: A) -> MutArray[A] ![Mem]`
+//   Allocate `len` slots, each initialised to `fill`. Negative or
+//   absurdly-large `len` aborts the runtime.
+//
+// - `mut_array_length[A](arr: MutArray[A]) -> Int ![Mem]`
+//   Read the number of elements in O(1).
+//
+// - `mut_array_get[A](arr: MutArray[A], i: Int) -> A ![Mem]`
+//   Read element `i` in O(1). Aborts on out-of-bounds.
+//
+// - `mut_array_set[A](arr: MutArray[A], i: Int, val: A) -> Unit ![Mem]`
+//   Mutate element `i` in place. Aborts on out-of-bounds. Returns
+//   Unit (no fresh allocation).
+//
+// ## The Mem effect (marker, zero ops)
+//
+// The four operations declare `effects: vec!["Mem"]`. Functions
+// that mutate a `MutArray` must include `Mem` in their effect row;
+// the compiler rejects mutation calls otherwise (E0042). `main`
+// declares `![Mem]` to permit mutation; the v1 "top-level Mem
+// handler" is the type-level absence of a deeper override.
+//
+// **v1 limitation: Mem is not interceptable.** Sigil v1's builtin
+// effects don't support generic operations, so Mem ships as a
+// zero-op marker effect. A user-written `handle ... with { Mem.X
+// (...) => ... }` block trips E0139 (unknown op on declared
+// effect). v2's path: ship `effect Mem[A] { new_array: (Int, A)
+// -> MutArray[A], ... }` as a generic builtin effect; user code
+// calling `mut_array_new(...)` continues to compile unchanged
+// because the call sites are surface-stable. See
+// `[DEVIATION Task 66]` in `PLAN_C_DEVIATIONS.md`.
+//
+// ## Layout
+//
+// `MutArray[A]` heap layout:
+// `{ header(TAG_MUT_ARRAY=0x05, count=0, bitmap=1), length, elem[0..N] }`.
+// Element slots are 64-bit. The header's `count` field is unused so
+// arrays of any size (including Sudoku's 81-element board) are
+// representable.
+//
+// ## v1 type restrictions
+//
+// Element type `A` must be `Int`, `String`, or a user-defined sum
+// or record type. Narrower scalar types (`Bool`, `Char`, `Byte`)
+// are not supported in v1 — same restriction as immutable Array.

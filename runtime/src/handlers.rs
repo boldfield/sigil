@@ -256,7 +256,7 @@ pub(crate) fn register_handler_stack_root_for_calling_thread() -> (*mut c_void, 
         // Cell<*mut HandlerFrame> is one machine word (8 bytes on
         // 64-bit hosts). Compute end via byte arithmetic so the
         // cast type doesn't have to match the underlying repr.
-        // SAFETY: not an interior pointer (the result feeds an FFI
+        // SAFETY: gc-heap-ptr arithmetic (the result feeds an FFI
         // call that takes [start, end) as a half-open range, never
         // retained; the cell's TLS storage lives for the thread's
         // lifetime).
@@ -542,7 +542,7 @@ pub unsafe extern "C" fn sigil_handler_frame_new(
 
     // Frame fields begin at offset 8 (past the Sigil object header).
     //
-    // SAFETY: not an interior pointer (the cast is to a single
+    // SAFETY: gc-heap-ptr arithmetic (the cast is to a single
     // local-scope read/write target reflecting the documented layout;
     // the pointer is not stored or returned beyond this initialisation).
     let frame_ptr = obj.add(8) as *mut HandlerFrame;
@@ -561,7 +561,7 @@ pub unsafe extern "C" fn sigil_handler_frame_new(
     // `write_bytes` over ≤ 224 bytes (`16 * 14` for the arms region).
     let arms_region_start = (frame_ptr as *mut u8).add(core::mem::size_of::<HandlerFrame>());
     let arms_region_bytes = (arm_count as usize) * 16;
-    // SAFETY: not an interior pointer (the destination pointer addresses
+    // SAFETY: gc-heap-ptr arithmetic (the destination pointer addresses
     // a freshly-allocated, exclusively-owned payload region; the
     // write_bytes call zeros bytes via a single memset, not pointer
     // retention).
@@ -602,7 +602,7 @@ pub unsafe extern "C" fn sigil_handler_frame_set_arm(
         std::process::abort();
     }
     let arms_base = arms_base_ptr(frame);
-    // SAFETY: not an interior pointer (the offset is computed solely to
+    // SAFETY: gc-heap-ptr arithmetic (the offset is computed solely to
     // perform two local stores against pre-allocated, properly-aligned
     // payload memory; pointers are not retained).
     let slot = arms_base.add(op_id as usize * 2);
@@ -889,7 +889,7 @@ pub unsafe extern "C" fn sigil_next_step_args_ptr(ns: *mut NextStep) -> *mut u64
     if ns.is_null() || (*ns).tag != NEXT_STEP_TAG_CALL || (*ns).arg_count == 0 {
         return ptr::null_mut();
     }
-    // SAFETY: not an interior pointer (the result is a transient
+    // SAFETY: gc-heap-ptr arithmetic (the result is a transient
     // arena-buffer address used by the caller to write packed args; the
     // arena is not GC-managed and arena pointers are always
     // non-interior in the GC sense).
@@ -1236,7 +1236,7 @@ pub unsafe extern "C" fn sigil_perform(
             // args_ptr is a caller-owned u64 buffer. The offsets drive
             // value-copying loads/stores, not retained pointers.
             for i in 0..(args_len as usize) {
-                // SAFETY: not an interior pointer (see comment above).
+                // SAFETY: gc-heap-ptr arithmetic (see comment above).
                 ns_args.add(i).write(*args_ptr.add(i));
             }
             // Append k_closure_ptr, k_fn_ptr.
@@ -1382,7 +1382,7 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                     // builds for terminal post_arm_k dispatch.
                     let ns = sigil_next_step_call(entry.closure_ptr, entry.fn_ptr, 1);
                     let ns_args = sigil_next_step_args_ptr(ns);
-                    // SAFETY: not an interior pointer; ns_args is
+                    // SAFETY: gc-heap-ptr arithmetic; ns_args is
                     // arena-owned and only written here.
                     ns_args.write(v);
                     current = ns;
@@ -1464,7 +1464,7 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                 // fn pointer per the documented calling convention.
                 let f: CpsFn = core::mem::transmute(fn_ptr);
                 // args_buf is a stack local; the callee reads value-bytes from the pointer.
-                // SAFETY: not an interior pointer (args_buf is a stack local, no GC retention).
+                // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack local, no GC retention).
                 current = f(closure_ptr, args_buf.as_ptr(), arg_count);
             }
             _ => {
@@ -1513,7 +1513,7 @@ fn handler_frame_pointer_bitmap(arm_count: usize) -> u32 {
 /// HandlerFrame.
 #[inline]
 unsafe fn arms_base_ptr(frame: *mut HandlerFrame) -> *mut *mut u8 {
-    // SAFETY: not an interior pointer (the result is computed once per
+    // SAFETY: gc-heap-ptr arithmetic (the result is computed once per
     // accessor invocation against the documented variable-length
     // layout; not stored beyond the immediate slot read/write).
     (frame as *mut u8).add(core::mem::size_of::<HandlerFrame>()) as *mut *mut u8
@@ -1674,7 +1674,7 @@ mod tests {
         reset_state();
         let known: u64 = 0xFEEDFACE_DEADBEEF;
         let args: [u64; 1] = [known];
-        // SAFETY: not an interior pointer (stack array, non-GC, outlives the call).
+        // SAFETY: gc-heap-ptr arithmetic (stack array, non-GC, outlives the call).
         let ns = unsafe { sigil_continuation_identity(ptr::null(), args.as_ptr(), 1) };
         unsafe {
             assert_eq!((*ns).tag, NEXT_STEP_TAG_DONE);
@@ -1742,7 +1742,7 @@ mod tests {
         let known: u64 = 0xFEEDFACE_DEADBEEF;
         // [arg, post_arm_k_closure (null), post_arm_k_fn (irrelevant)]
         let args: [u64; 3] = [known, 0xCAFE, 0xBABE];
-        // SAFETY: not an interior pointer (stack array, non-GC, outlives the call).
+        // SAFETY: gc-heap-ptr arithmetic (stack array, non-GC, outlives the call).
         let ns = unsafe { sigil_continuation_identity(ptr::null(), args.as_ptr(), 3) };
         unsafe {
             assert_eq!((*ns).tag, NEXT_STEP_TAG_DONE);
@@ -1965,14 +1965,14 @@ mod tests {
             args_len: u32,
         ) -> *mut NextStep {
             assert_eq!(args_len, 4); // 2 user args + k_closure + k_fn
-                                     // SAFETY: not an interior pointer (args_ptr points at a
+                                     // SAFETY: gc-heap-ptr arithmetic (args_ptr points at a
                                      // non-GC arena buffer; reads are value loads, no GC retention).
             assert_eq!(*args_ptr, 100);
-            // SAFETY: not an interior pointer (same as above).
+            // SAFETY: gc-heap-ptr arithmetic (same as above).
             assert_eq!(*args_ptr.add(1), 200);
-            // SAFETY: not an interior pointer (same as above).
+            // SAFETY: gc-heap-ptr arithmetic (same as above).
             assert_eq!(*args_ptr.add(2) as usize, 0xCC);
-            // SAFETY: not an interior pointer (same as above).
+            // SAFETY: gc-heap-ptr arithmetic (same as above).
             assert_eq!(*args_ptr.add(3) as usize, 0xDD);
             sigil_next_step_done(0)
         }
@@ -1983,7 +1983,7 @@ mod tests {
             sigil_handle_push(frame);
             let user_args = [100u64, 200u64];
             // user_args is a stack local; the runtime copies bytes via the pointer.
-            // SAFETY: not an interior pointer (user_args is a stack local).
+            // SAFETY: gc-heap-ptr arithmetic (user_args is a stack local).
             let user_args_ptr = user_args.as_ptr();
             let ns = sigil_perform(7, 0, user_args_ptr, 2, 0xCC as *mut u8, 0xDD as *mut u8);
             let _ = sigil_run_loop(ns);

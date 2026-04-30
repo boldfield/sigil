@@ -52,7 +52,7 @@ mod tests {
         // runs end-to-end without aborting.
         sigil_gc_init();
         let src = b"hello";
-        // SAFETY: not an interior pointer (src is a static byte literal, not a heap object).
+        // SAFETY: gc-heap-ptr arithmetic (src is a static byte literal, not a heap object).
         let obj = unsafe { sigil_string_new(src.as_ptr(), src.len()) };
         unsafe { sigil_println(obj) };
     }

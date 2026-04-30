@@ -13,6 +13,7 @@ use crate::codegen;
 use crate::color;
 use crate::elaborate;
 use crate::errors::{CompilerError, DiagnosticEmitter, ErrorFormat};
+use crate::imports;
 use crate::lexer;
 use crate::link;
 use crate::monomorphize;
@@ -41,6 +42,9 @@ pub fn compile(input: &str, output: &str, format: ErrorFormat) -> Result<usize, 
 
     let (prog, parse_errs) = parser::parse(input, &tokens);
     all_errs.extend(parse_errs);
+
+    let (prog, import_errs) = imports::resolve(prog);
+    all_errs.extend(import_errs);
 
     let (resolved, resolve_errs) = resolve::resolve(prog);
     all_errs.extend(resolve_errs);
@@ -126,6 +130,9 @@ pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, DumpColorE
 
     let (prog, parse_errs) = parser::parse(input, &tokens);
     all_errs.extend(parse_errs);
+
+    let (prog, import_errs) = imports::resolve(prog);
+    all_errs.extend(import_errs);
 
     let (resolved, resolve_errs) = resolve::resolve(prog);
     all_errs.extend(resolve_errs);

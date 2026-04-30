@@ -694,6 +694,19 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
         }
     }
     globals.insert("int_to_string".to_string());
+    // Plan C Task 65 — Array runtime primitives are top-level
+    // builtins, not user-declared fns; they live in globals so
+    // the handle-walker doesn't flag references as unbound.
+    globals.insert("array_alloc".to_string());
+    globals.insert("array_empty".to_string());
+    globals.insert("array_length".to_string());
+    globals.insert("array_get".to_string());
+    globals.insert("array_set".to_string());
+    // Plan C Task 66 — MutArray builtins.
+    globals.insert("mut_array_new".to_string());
+    globals.insert("mut_array_length".to_string());
+    globals.insert("mut_array_get".to_string());
+    globals.insert("mut_array_set".to_string());
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
             if let Some(msg) = block_unsupported_handle(&f.body, &globals, &effects_resumes_many) {
@@ -4617,6 +4630,120 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_int_to_string", Linkage::Import, &int_to_string_sig)
         .map_err(|e| format!("declare sigil_int_to_string: {e}"))?;
 
+    // Plan C Task 65 — runtime Array primitives. Five FFI symbols
+    // expose `runtime/src/array.rs`'s `sigil_array_alloc` /
+    // `_empty` / `_length` / `_get` / `_set` to compiled programs.
+    // Typecheck registers builtin generic `Scheme`s for each of
+    // these in `tc.fn_schemes`; codegen dispatches via the
+    // `Expr::Ident(name)` arms in `lower_call` below.
+    //
+    // Element values use 64-bit slots — `Int` and pointer types
+    // fit directly. Narrower scalar types (`Bool` / `Char` /
+    // `Byte`) are not supported in v1; codegen-level narrow on
+    // `array_get` would require threading the per-call type-arg
+    // tuple through the Lowerer (defer to v2).
+
+    // sigil_array_alloc(len: i64, fill: u64) -> *mut u8
+    let mut array_alloc_sig = Signature::new(isa_call_conv(&module));
+    array_alloc_sig.params.push(AbiParam::new(types::I64));
+    array_alloc_sig.params.push(AbiParam::new(types::I64));
+    array_alloc_sig.returns.push(AbiParam::new(pointer_ty));
+    let array_alloc = module
+        .declare_function("sigil_array_alloc", Linkage::Import, &array_alloc_sig)
+        .map_err(|e| format!("declare sigil_array_alloc: {e}"))?;
+
+    // sigil_array_empty() -> *mut u8
+    let mut array_empty_sig = Signature::new(isa_call_conv(&module));
+    array_empty_sig.returns.push(AbiParam::new(pointer_ty));
+    let array_empty = module
+        .declare_function("sigil_array_empty", Linkage::Import, &array_empty_sig)
+        .map_err(|e| format!("declare sigil_array_empty: {e}"))?;
+
+    // sigil_array_length(arr: *const u8) -> i64
+    let mut array_length_sig = Signature::new(isa_call_conv(&module));
+    array_length_sig.params.push(AbiParam::new(pointer_ty));
+    array_length_sig.returns.push(AbiParam::new(types::I64));
+    let array_length = module
+        .declare_function("sigil_array_length", Linkage::Import, &array_length_sig)
+        .map_err(|e| format!("declare sigil_array_length: {e}"))?;
+
+    // sigil_array_get(arr: *const u8, i: i64) -> i64
+    //
+    // Element type erasure: the FFI signature returns I64 unconditionally
+    // even when the monomorphized element type is `String` or another
+    // pointer-typed user / sum type. On 64-bit Cranelift I64 and
+    // `pointer_ty` are width-equivalent, and the verifier accepts the
+    // implicit coercion when the result feeds another I64-shaped use.
+    // The deliberate I64-on-pointer encoding is documented in
+    // `[DEVIATION Task 65]`'s v1 type restrictions: Bool/Char/Byte
+    // arrays compile but `array_get`'s I64 return isn't narrowed at
+    // codegen time. v2 fix threads per-call type-arg info into the
+    // Lowerer so the FFI return type matches the element type.
+    let mut array_get_sig = Signature::new(isa_call_conv(&module));
+    array_get_sig.params.push(AbiParam::new(pointer_ty));
+    array_get_sig.params.push(AbiParam::new(types::I64));
+    array_get_sig.returns.push(AbiParam::new(types::I64));
+    let array_get = module
+        .declare_function("sigil_array_get", Linkage::Import, &array_get_sig)
+        .map_err(|e| format!("declare sigil_array_get: {e}"))?;
+
+    // sigil_array_set(arr: *const u8, i: i64, val: i64) -> *mut u8
+    let mut array_set_sig = Signature::new(isa_call_conv(&module));
+    array_set_sig.params.push(AbiParam::new(pointer_ty));
+    array_set_sig.params.push(AbiParam::new(types::I64));
+    array_set_sig.params.push(AbiParam::new(types::I64));
+    array_set_sig.returns.push(AbiParam::new(pointer_ty));
+    let array_set = module
+        .declare_function("sigil_array_set", Linkage::Import, &array_set_sig)
+        .map_err(|e| format!("declare sigil_array_set: {e}"))?;
+
+    // Plan C Task 66 — runtime MutArray primitives. Mirror Array's
+    // FFI shape with two differences: TAG is TAG_MUT_ARRAY and
+    // sigil_mut_array_set returns Unit (mutates in place).
+
+    // sigil_mut_array_new(len: i64, fill: u64) -> *mut u8
+    let mut mut_array_new_sig = Signature::new(isa_call_conv(&module));
+    mut_array_new_sig.params.push(AbiParam::new(types::I64));
+    mut_array_new_sig.params.push(AbiParam::new(types::I64));
+    mut_array_new_sig.returns.push(AbiParam::new(pointer_ty));
+    let mut_array_new = module
+        .declare_function("sigil_mut_array_new", Linkage::Import, &mut_array_new_sig)
+        .map_err(|e| format!("declare sigil_mut_array_new: {e}"))?;
+
+    // sigil_mut_array_length(arr: *const u8) -> i64
+    let mut mut_array_length_sig = Signature::new(isa_call_conv(&module));
+    mut_array_length_sig.params.push(AbiParam::new(pointer_ty));
+    mut_array_length_sig.returns.push(AbiParam::new(types::I64));
+    let mut_array_length = module
+        .declare_function(
+            "sigil_mut_array_length",
+            Linkage::Import,
+            &mut_array_length_sig,
+        )
+        .map_err(|e| format!("declare sigil_mut_array_length: {e}"))?;
+
+    // sigil_mut_array_get(arr: *const u8, i: i64) -> i64
+    //
+    // Same I64-on-pointer element-type erasure as `sigil_array_get`
+    // above; see that comment for details. v2 fix is shared.
+    let mut mut_array_get_sig = Signature::new(isa_call_conv(&module));
+    mut_array_get_sig.params.push(AbiParam::new(pointer_ty));
+    mut_array_get_sig.params.push(AbiParam::new(types::I64));
+    mut_array_get_sig.returns.push(AbiParam::new(types::I64));
+    let mut_array_get = module
+        .declare_function("sigil_mut_array_get", Linkage::Import, &mut_array_get_sig)
+        .map_err(|e| format!("declare sigil_mut_array_get: {e}"))?;
+
+    // sigil_mut_array_set(arr: *mut u8, i: i64, val: i64) -> ()
+    // Returns nothing — mutates in place.
+    let mut mut_array_set_sig = Signature::new(isa_call_conv(&module));
+    mut_array_set_sig.params.push(AbiParam::new(pointer_ty));
+    mut_array_set_sig.params.push(AbiParam::new(types::I64));
+    mut_array_set_sig.params.push(AbiParam::new(types::I64));
+    let mut_array_set = module
+        .declare_function("sigil_mut_array_set", Linkage::Import, &mut_array_set_sig)
+        .map_err(|e| format!("declare sigil_mut_array_set: {e}"))?;
+
     // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
     // Phase 3a wires the frame allocation + push/pop ABI from Task
     // 56 around every `handle` body. Arms stay null in this commit
@@ -5376,9 +5503,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // `TODO(plan-b-task-55-phase-4e/ffi-ref-extraction)` marker
     // added in `f7d4a64` is removed at this commit.
     let per_fn_refs_ctx = PerFnRefsCtx {
-        string_new,
-        alloc,
-        int_to_string,
+        builtins: BuiltinFuncIds {
+            string_new,
+            alloc,
+            int_to_string,
+            array_alloc,
+            array_empty,
+            array_length,
+            array_get,
+            array_set,
+            mut_array_new,
+            mut_array_length,
+            mut_array_get,
+            mut_array_set,
+        },
         handler_frame_new,
         handle_push,
         handle_pop,
@@ -5433,9 +5571,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // sit in `dfg.ext_funcs` without producing relocations, so
             // the emitted object code is unaffected.
             let PerFnRefs {
-                string_new_ref,
-                alloc_ref,
-                int_to_string_ref,
+                builtins,
                 handler_frame_new_ref,
                 handle_push_ref,
                 handle_pop_ref,
@@ -5824,9 +5960,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr,
                     lit_gvs,
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
+                    builtins,
                     handler_frame_new_ref,
                     handle_push_ref,
                     handle_pop_ref,
@@ -5967,9 +6101,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 pointer_ty,
                 closure_ptr,
                 lit_gvs,
-                string_new_ref,
-                alloc_ref,
-                int_to_string_ref,
+                builtins,
                 handler_frame_new_ref,
                 handle_push_ref,
                 handle_pop_ref,
@@ -6316,9 +6448,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // tail-`k` lowering refs `next_step_call_ref` and
                 // `next_step_args_ptr_ref`).
                 let PerFnRefs {
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
+                    builtins,
                     handler_frame_new_ref,
                     handle_push_ref,
                     handle_pop_ref,
@@ -6452,9 +6582,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr,
                     lit_gvs,
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
+                    builtins,
                     handler_frame_new_ref,
                     handle_push_ref,
                     handle_pop_ref,
@@ -6613,7 +6741,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let alloc_call = lowerer
                         .builder
                         .ins()
-                        .call(alloc_ref, &[header_v, payload_v]);
+                        .call(builtins.alloc_ref, &[header_v, payload_v]);
                     lowerer
                         .stackmap
                         .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
@@ -7035,9 +7163,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // expressions, which can use any expression over `v` +
                 // captures + globals).
                 let PerFnRefs {
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
+                    builtins,
                     handler_frame_new_ref,
                     handle_push_ref,
                     handle_pop_ref,
@@ -7159,9 +7285,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     pointer_ty,
                     closure_ptr,
                     lit_gvs,
-                    string_new_ref,
-                    alloc_ref,
-                    int_to_string_ref,
+                    builtins,
                     handler_frame_new_ref,
                     handle_push_ref,
                     handle_pop_ref,
@@ -7366,9 +7490,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             env.insert(post_arm_k.binding_name.clone(), r_value);
 
             let PerFnRefs {
-                string_new_ref,
-                alloc_ref,
-                int_to_string_ref,
+                builtins,
                 handler_frame_new_ref,
                 handle_push_ref,
                 handle_pop_ref,
@@ -7401,9 +7523,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 pointer_ty,
                 closure_ptr,
                 lit_gvs,
-                string_new_ref,
-                alloc_ref,
-                int_to_string_ref,
+                builtins,
                 handler_frame_new_ref,
                 handle_push_ref,
                 handle_pop_ref,
@@ -7647,9 +7767,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env.insert(step.binding_name.clone(), bound_value);
 
                     let PerFnRefs {
-                        string_new_ref,
-                        alloc_ref,
-                        int_to_string_ref,
+                        builtins,
                         handler_frame_new_ref,
                         handle_push_ref,
                         handle_pop_ref,
@@ -7681,9 +7799,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         pointer_ty,
                         closure_ptr: synth_closure_ptr,
                         lit_gvs,
-                        string_new_ref,
-                        alloc_ref,
-                        int_to_string_ref,
+                        builtins,
                         handler_frame_new_ref,
                         handle_push_ref,
                         handle_pop_ref,
@@ -7868,7 +7984,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             let alloc_call = lowerer
                                 .builder
                                 .ins()
-                                .call(lowerer.alloc_ref, &[header_v, payload_v]);
+                                .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
                             lowerer.stackmap.push_placeholder(function_code_offset(
                                 &lowerer.builder,
                                 alloc_call,
@@ -8288,9 +8404,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         }
 
                         let PerFnRefs {
-                            string_new_ref,
-                            alloc_ref,
-                            int_to_string_ref,
+                            builtins,
                             handler_frame_new_ref,
                             handle_push_ref,
                             handle_pop_ref,
@@ -8323,9 +8437,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             pointer_ty,
                             closure_ptr,
                             lit_gvs,
-                            string_new_ref,
-                            alloc_ref,
-                            int_to_string_ref,
+                            builtins,
                             handler_frame_new_ref,
                             handle_push_ref,
                             handle_pop_ref,
@@ -8444,7 +8556,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let alloc_call = lowerer
                                     .builder
                                     .ins()
-                                    .call(lowerer.alloc_ref, &[header_v, payload_v]);
+                                    .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
                                 lowerer.stackmap.push_placeholder(function_code_offset(
                                     &lowerer.builder,
                                     alloc_call,
@@ -8930,17 +9042,13 @@ struct Lowerer<'a, 'b> {
     /// desynchronise the lookup from typecheck's source-order list.
     lit_gvs: Vec<(Span, GlobalValue, usize)>,
 
-    /// Plan B Task 57 — `declare_data_in_func` refs for the arith-
-    /// panic cstrings (`"division by zero"`, `"remainder by zero"`).
-    string_new_ref: FuncRef,
-    alloc_ref: FuncRef,
-
-    /// Runtime ref for `sigil_int_to_string(i64) -> *u8`. Plan A2 task
-    /// 34 wires the language builtin `int_to_string(Int) -> String !`
-    /// to this symbol; `lower_call` dispatches to it when the callee is
-    /// `Ident("int_to_string")` and no user fn of the same name
-    /// shadows it.
-    int_to_string_ref: FuncRef,
+    /// Plan A2 + Plan C — builtin runtime-primitive FuncRefs.
+    /// Aggregates `string_new` / `alloc` / `int_to_string` plus the
+    /// `array_*` (Task 65) and `mut_array_*` (Task 66) primitives.
+    /// Adding a new runtime primitive in v2 (PR #42 review #10)
+    /// only extends [`BuiltinFuncRefs`] / [`BuiltinFuncIds`] — no
+    /// per-call-site churn here.
+    builtins: BuiltinFuncRefs,
 
     /// Plan B Task 55 (Phase 3a) — handler-frame ABI runtime refs
     /// from Task 56. `lower_expr` for `Expr::Handle` calls
@@ -10964,10 +11072,135 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "int_to_string" => {
                 assert_eq!(args.len(), 1, "int_to_string builtin arg count is not 1");
                 let arg_val = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.int_to_string_ref, &[arg_val]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.int_to_string_ref, &[arg_val]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
                 self.builder.inst_results(call)[0]
+            }
+            // Plan C Task 65 — runtime Array primitives. Each lowers to
+            // a single FFI invocation. `array_alloc` and `array_set`
+            // touch the Boehm heap, so they get a safepoint stackmap
+            // placeholder. Element values are 64-bit slots — pointer
+            // and Int types fit directly. `array_get` returns I64
+            // unconditionally; codegen-level narrow for narrower
+            // scalar types (Bool / Char / Byte) is a v2 follow-up.
+            Expr::Ident(name, _) if name == "array_alloc" => {
+                assert_eq!(args.len(), 2, "array_alloc builtin arg count is not 2");
+                let len = self.lower_expr(&args[0]);
+                let fill = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.array_alloc_ref, &[len, fill]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "array_empty" => {
+                assert_eq!(args.len(), 0, "array_empty builtin arg count is not 0");
+                let call = self.builder.ins().call(self.builtins.array_empty_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "array_length" => {
+                assert_eq!(args.len(), 1, "array_length builtin arg count is not 1");
+                let arr = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.array_length_ref, &[arr]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "array_get" => {
+                assert_eq!(args.len(), 2, "array_get builtin arg count is not 2");
+                let arr = self.lower_expr(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.array_get_ref, &[arr, idx]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "array_set" => {
+                assert_eq!(args.len(), 3, "array_set builtin arg count is not 3");
+                let arr = self.lower_expr(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let val = self.lower_expr(&args[2]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.array_set_ref, &[arr, idx, val]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            // Plan C Task 66 — runtime MutArray primitives. Same
+            // dispatch shape as Array, except `mut_array_set` returns
+            // Unit (no Cranelift result; codegen synthesises an `I8 0`
+            // sentinel for the surrounding expression).
+            //
+            // Stackmap placeholders are emitted at every call below.
+            // For `_new` this is load-bearing today: the call may
+            // allocate, and Boehm's collection point lives at the
+            // FFI boundary. For `_get` (skipped — pure read) and
+            // `_set` it is v2-forward-compat metadata only — Boehm's
+            // conservative scan handles slot mutation without either
+            // a write barrier or a safepoint (the prior pointer is
+            // reachable from heap scan if rooted elsewhere; the new
+            // value is reachable through the heap once written). When
+            // sigil moves to a precise / moving GC a write barrier
+            // becomes load-bearing here. See
+            // `[DEVIATION Task 66] mutation under v2 GC` in
+            // `PLAN_C_DEVIATIONS.md`.
+            Expr::Ident(name, _) if name == "mut_array_new" => {
+                assert_eq!(args.len(), 2, "mut_array_new builtin arg count is not 2");
+                let len = self.lower_expr(&args[0]);
+                let fill = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.mut_array_new_ref, &[len, fill]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "mut_array_length" => {
+                assert_eq!(args.len(), 1, "mut_array_length builtin arg count is not 1");
+                let arr = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.mut_array_length_ref, &[arr]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "mut_array_get" => {
+                assert_eq!(args.len(), 2, "mut_array_get builtin arg count is not 2");
+                let arr = self.lower_expr(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.mut_array_get_ref, &[arr, idx]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "mut_array_set" => {
+                assert_eq!(args.len(), 3, "mut_array_set builtin arg count is not 3");
+                let arr = self.lower_expr(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let val = self.lower_expr(&args[2]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.mut_array_set_ref, &[arr, idx, val]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                // sigil_mut_array_set returns nothing; produce the
+                // Sigil-level Unit value (I8 zero) for the caller.
+                self.builder.ins().iconst(types::I8, 0)
             }
             Expr::ClosureRecord { code_fn_name, .. } => {
                 // Evaluate the ClosureRecord first (allocates + stores
@@ -11220,7 +11453,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let alloc_call = self
             .builder
             .ins()
-            .call(self.alloc_ref, &[header_v, payload_v]);
+            .call(self.builtins.alloc_ref, &[header_v, payload_v]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, alloc_call));
         let closure_ptr = self.builder.inst_results(alloc_call)[0];
@@ -11338,7 +11571,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let alloc_call = self
             .builder
             .ins()
-            .call(self.alloc_ref, &[header_v, payload_v]);
+            .call(self.builtins.alloc_ref, &[header_v, payload_v]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, alloc_call));
         let closure_ptr = self.builder.inst_results(alloc_call)[0];
@@ -11473,7 +11706,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let header_v = self.builder.ins().iconst(types::I64, header as i64);
         let size_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
-        let alloc_call = self.builder.ins().call(self.alloc_ref, &[header_v, size_v]);
+        let alloc_call = self
+            .builder
+            .ins()
+            .call(self.builtins.alloc_ref, &[header_v, size_v]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, alloc_call));
         let ptr = self.builder.inst_results(alloc_call)[0];
@@ -11556,7 +11792,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let call = self
             .builder
             .ins()
-            .call(self.string_new_ref, &[bytes_ptr, len_v]);
+            .call(self.builtins.string_new_ref, &[bytes_ptr, len_v]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, call));
         self.builder.inst_results(call)[0]
@@ -12112,6 +12348,27 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // Plan A2 task 34: the `int_to_string` builtin returns
                 // a Sigil `String`, which is a heap pointer.
                 Expr::Ident(name, _) if name == "int_to_string" => self.pointer_ty,
+                // Plan C Task 65 — Array primitive return types.
+                // `array_alloc` / `array_empty` / `array_set` return
+                // a heap-allocated Array (pointer). `array_length`
+                // returns Int. `array_get` returns A's slot value;
+                // I64 covers Int and pointer types (the common case).
+                // Narrower scalar elements (Bool / Char / Byte) are
+                // not supported in v1 — see [DEVIATION Task 65].
+                Expr::Ident(name, _)
+                    if matches!(name.as_str(), "array_alloc" | "array_empty" | "array_set") =>
+                {
+                    self.pointer_ty
+                }
+                Expr::Ident(name, _) if name == "array_length" || name == "array_get" => types::I64,
+                // Plan C Task 66 — MutArray return-type predictions.
+                // mut_array_new returns MutArray (pointer); _length
+                // and _get return I64; _set returns Unit (I8).
+                Expr::Ident(name, _) if name == "mut_array_new" => self.pointer_ty,
+                Expr::Ident(name, _) if name == "mut_array_length" || name == "mut_array_get" => {
+                    types::I64
+                }
+                Expr::Ident(name, _) if name == "mut_array_set" => types::I8,
                 Expr::ClosureRecord { code_fn_name, .. } => self
                     .user_fns
                     .get(code_fn_name)
@@ -12482,6 +12739,55 @@ const POST_ARM_K_ARG_OFF: i32 = 0;
 const POST_ARM_K_CLOSURE_OFF: i32 = 8;
 const POST_ARM_K_FN_OFF: i32 = 16;
 
+/// Builtin runtime-primitive FuncIds, declared once at `emit_object`'s
+/// top and read by [`prepare_per_fn_refs`] when constructing the
+/// per-fn FuncRef set. Aggregated into one struct so adding a new
+/// runtime primitive in v2 (PR #42 review #10) only extends this
+/// struct + its FuncRef sibling [`BuiltinFuncRefs`] + the helper —
+/// per-fn destructure / construction sites stay unchanged.
+#[derive(Clone, Copy)]
+struct BuiltinFuncIds {
+    string_new: cranelift_module::FuncId,
+    alloc: cranelift_module::FuncId,
+    int_to_string: cranelift_module::FuncId,
+    /// Plan C Task 65 — runtime Array primitive FuncIds.
+    array_alloc: cranelift_module::FuncId,
+    array_empty: cranelift_module::FuncId,
+    array_length: cranelift_module::FuncId,
+    array_get: cranelift_module::FuncId,
+    array_set: cranelift_module::FuncId,
+    /// Plan C Task 66 — runtime MutArray primitive FuncIds.
+    mut_array_new: cranelift_module::FuncId,
+    mut_array_length: cranelift_module::FuncId,
+    mut_array_get: cranelift_module::FuncId,
+    mut_array_set: cranelift_module::FuncId,
+}
+
+/// Per-fn FuncRefs for the builtin runtime primitives. Sibling of
+/// [`BuiltinFuncIds`], populated by [`prepare_per_fn_refs`] via
+/// `module.declare_func_in_func` for each FuncId. Stored on
+/// [`PerFnRefs`] and on [`Lowerer`] so call sites in `lower_call`
+/// access via `self.builtins.array_alloc_ref` etc. — adding a new
+/// primitive in v2 extends this struct + its sibling without
+/// touching the destructure / construction surface.
+#[derive(Clone, Copy)]
+struct BuiltinFuncRefs {
+    string_new_ref: FuncRef,
+    alloc_ref: FuncRef,
+    int_to_string_ref: FuncRef,
+    /// Plan C Task 65 — runtime Array primitive FuncRefs.
+    array_alloc_ref: FuncRef,
+    array_empty_ref: FuncRef,
+    array_length_ref: FuncRef,
+    array_get_ref: FuncRef,
+    array_set_ref: FuncRef,
+    /// Plan C Task 66 — runtime MutArray primitive FuncRefs.
+    mut_array_new_ref: FuncRef,
+    mut_array_length_ref: FuncRef,
+    mut_array_get_ref: FuncRef,
+    mut_array_set_ref: FuncRef,
+}
+
 /// Plan B Task 55, Phase 4e — input context for [`prepare_per_fn_refs`].
 ///
 /// Holds the cross-fn FuncIds (declared once at `emit_object`'s top)
@@ -12499,9 +12805,11 @@ const POST_ARM_K_FN_OFF: i32 = 16;
 /// the user-fn body emit site (added in `f7d4a64`) is removed at
 /// the same commit as this helper lands.
 struct PerFnRefsCtx<'a> {
-    string_new: cranelift_module::FuncId,
-    alloc: cranelift_module::FuncId,
-    int_to_string: cranelift_module::FuncId,
+    /// Builtin runtime primitive FuncIds. Adding a new runtime
+    /// primitive in v2 (e.g. `byte_array`, `string_builder`) extends
+    /// `BuiltinFuncIds` only — no per-call-site churn here. See
+    /// PR #42 review #10 for the consolidation rationale.
+    builtins: BuiltinFuncIds,
     handler_frame_new: cranelift_module::FuncId,
     handle_push: cranelift_module::FuncId,
     handle_pop: cranelift_module::FuncId,
@@ -12582,9 +12890,10 @@ struct PerFnRefsCtx<'a> {
 /// entries in the function's external-funcs table) — there is no IR
 /// or emitted-binary impact at the three call sites.
 struct PerFnRefs {
-    string_new_ref: FuncRef,
-    alloc_ref: FuncRef,
-    int_to_string_ref: FuncRef,
+    /// Builtin runtime primitive FuncRefs. Mirror of
+    /// [`PerFnRefsCtx::builtins`]. Per-call-site dispatch reads
+    /// `self.builtins.<name>_ref` via [`Lowerer::builtins`].
+    builtins: BuiltinFuncRefs,
     handler_frame_new_ref: FuncRef,
     handle_push_ref: FuncRef,
     handle_pop_ref: FuncRef,
@@ -12637,14 +12946,33 @@ struct PerFnRefs {
 /// over-declaring here is cheap: unreferenced FuncRefs sit in the
 /// function's `dfg.ext_funcs` table without producing relocations, so
 /// the emitted object code is unaffected.
+fn prepare_builtin_func_refs(
+    module: &mut ObjectModule,
+    builder: &mut FunctionBuilder<'_>,
+    ids: &BuiltinFuncIds,
+) -> BuiltinFuncRefs {
+    BuiltinFuncRefs {
+        string_new_ref: module.declare_func_in_func(ids.string_new, builder.func),
+        alloc_ref: module.declare_func_in_func(ids.alloc, builder.func),
+        int_to_string_ref: module.declare_func_in_func(ids.int_to_string, builder.func),
+        array_alloc_ref: module.declare_func_in_func(ids.array_alloc, builder.func),
+        array_empty_ref: module.declare_func_in_func(ids.array_empty, builder.func),
+        array_length_ref: module.declare_func_in_func(ids.array_length, builder.func),
+        array_get_ref: module.declare_func_in_func(ids.array_get, builder.func),
+        array_set_ref: module.declare_func_in_func(ids.array_set, builder.func),
+        mut_array_new_ref: module.declare_func_in_func(ids.mut_array_new, builder.func),
+        mut_array_length_ref: module.declare_func_in_func(ids.mut_array_length, builder.func),
+        mut_array_get_ref: module.declare_func_in_func(ids.mut_array_get, builder.func),
+        mut_array_set_ref: module.declare_func_in_func(ids.mut_array_set, builder.func),
+    }
+}
+
 fn prepare_per_fn_refs(
     module: &mut ObjectModule,
     builder: &mut FunctionBuilder<'_>,
     ctx: &PerFnRefsCtx<'_>,
 ) -> PerFnRefs {
-    let string_new_ref = module.declare_func_in_func(ctx.string_new, builder.func);
-    let alloc_ref = module.declare_func_in_func(ctx.alloc, builder.func);
-    let int_to_string_ref = module.declare_func_in_func(ctx.int_to_string, builder.func);
+    let builtins = prepare_builtin_func_refs(module, builder, &ctx.builtins);
     let handler_frame_new_ref = module.declare_func_in_func(ctx.handler_frame_new, builder.func);
     let handle_push_ref = module.declare_func_in_func(ctx.handle_push, builder.func);
     let handle_pop_ref = module.declare_func_in_func(ctx.handle_pop, builder.func);
@@ -12742,9 +13070,7 @@ fn prepare_per_fn_refs(
         })
         .collect();
     PerFnRefs {
-        string_new_ref,
-        alloc_ref,
-        int_to_string_ref,
+        builtins,
         handler_frame_new_ref,
         handle_push_ref,
         handle_pop_ref,

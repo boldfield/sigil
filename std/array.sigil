@@ -1,0 +1,54 @@
+// sigil: 0.1
+//
+// std/array.sigil — Plan C Task 65.
+//
+// **Documentation only.** Like `std/io.sigil`, this file does not
+// participate in typecheck. The `Array[A]` type and its five
+// operations are registered at the typechecker as builtins via
+// `builtin_types()` and `register_builtin_array_schemes()`. Edits
+// to this file have no effect on compilation. `import std.array`
+// is allowed (the resolver loads this file, parses it, and finds
+// zero items to append) but is not required — the surface is
+// available unconditionally.
+//
+// `Array[A]` is an immutable, eager, heap-allocated sequence with
+// O(1) `length` and `get`, and O(n) `set` (returns a fresh array;
+// the original is unchanged). Mutable arrays land via the `Mem`
+// effect in Plan C Task 66.
+//
+// ## Operations
+//
+// - `array_alloc[A](len: Int, fill: A) -> Array[A] ![]`
+//   Allocate a fresh array of `len` slots, each initialised to
+//   `fill`. Negative or absurdly-large `len` aborts the runtime.
+//
+// - `array_empty[A]() -> Array[A] ![]`
+//   Allocate a zero-length array. Useful when the caller has no
+//   element to use as `fill` (e.g. in `from_list(Nil)`).
+//
+// - `array_length[A](arr: Array[A]) -> Int ![]`
+//   Read the number of elements in O(1).
+//
+// - `array_get[A](arr: Array[A], i: Int) -> A ![]`
+//   Read element `i` in O(1). Aborts on out-of-bounds.
+//
+// - `array_set[A](arr: Array[A], i: Int, val: A) -> Array[A] ![]`
+//   Return a fresh array with `arr[i] = val` and all other slots
+//   unchanged. The original `arr` is unchanged. O(n).
+//
+// ## Layout
+//
+// Each `Array[A]` is `{ header(TAG_ARRAY=0x04, count=0, bitmap=1),
+// length, elem[0..N] }`. Element slots are 64-bit. The header's
+// `count` field is unused so arrays of any size (limited by Boehm's
+// heap) are representable — including Sudoku's 81-element board
+// which would overflow the 6-bit `count` field.
+//
+// ## v1 type restrictions
+//
+// Element type `A` must be `Int`, `String`, or a user-defined sum/
+// record type. Narrower scalar types (`Bool`, `Char`, `Byte`) are
+// not supported in v1: codegen lacks the per-call type-arg threading
+// needed to narrow `array_get`'s I64 return to a smaller width.
+// See `[DEVIATION Task 65]` in `PLAN_C_DEVIATIONS.md` for the v2
+// closure path.
