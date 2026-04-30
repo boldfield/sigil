@@ -938,7 +938,22 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             let (gs, ty_var_ids) = tc.fresh_generic_subst(&f.generic_params);
             let row_var_id = f.effect_row_var.as_ref().map(|_| tc.fresh_row_var());
             let saved = std::mem::take(&mut tc.current_generic_subst);
+            let saved_row_subst = std::mem::take(&mut tc.current_row_var_subst);
             tc.current_generic_subst = gs;
+            // Plan D Task 116 R1 — seed the row-var subst with the
+            // SAME row-var id that's about to be installed in the
+            // Scheme. Without this seeding, inner fn-type rows
+            // (`(...) -> R ![ ... | r ]`) inside this fn's params /
+            // return resolve their `r` to None, and forward-ref
+            // callers instantiating from this Scheme see
+            // outer.effect_row_var = Some(id) but inner.effect_row_var
+            // = None — Scheme.row_vars and inner row-var ids must
+            // agree, otherwise rename_ty's row_map miss leaves the
+            // inner None and subsumption silently coerces a
+            // row-poly callee to closed.
+            if let (Some(rv), Some(id)) = (f.effect_row_var.as_ref(), row_var_id) {
+                tc.current_row_var_subst.insert(rv.name.clone(), id);
+            }
             let params: Vec<Ty> = f
                 .params
                 .iter()
@@ -947,11 +962,18 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             let ret = tc
                 .ty_from_type_expr_here(&f.return_type)
                 .unwrap_or(Ty::Unit);
+            // Plan D Task 116 R1 — `effect_refs_to_insts` for f's
+            // own row needs the active generic_subst (so a fn-decl
+            // row like `![Raise[A]]` resolves `A` correctly).
+            // Defer the restore until after the FnSig is built.
+            // Pre-existing Task 114 bug noted by R1 reviewer.
+            let effects = effect_refs_to_insts(&f.effects, &tc.types, &tc.current_generic_subst);
             tc.current_generic_subst = saved;
+            tc.current_row_var_subst = saved_row_subst;
             let sig = FnSig {
                 params,
                 ret,
-                effects: effect_refs_to_insts(&f.effects, &tc.types, &tc.current_generic_subst),
+                effects,
                 effect_row_var: row_var_id,
             };
             let scheme = Scheme {
@@ -2785,9 +2807,10 @@ impl Tc {
                             rv.span.clone(),
                             format!(
                                 "row variable `{}` is not bound by the enclosing function — \
-                                 declare it on the fn's row (e.g. `fn f(...) -> R !{}`) so the \
-                                 row variable can be referenced in inner fn-type rows",
-                                rv.name, rv.name,
+                                 declare it on the fn's row (e.g. `fn f(...) -> R ![| {}]` or \
+                                 `![<effects> | {}]`) so the row variable can be referenced in \
+                                 inner fn-type rows",
+                                rv.name, rv.name, rv.name,
                             ),
                         );
                     }
@@ -5683,7 +5706,16 @@ pub(crate) fn ty_from_type_expr_with_rows(
             }
             let mut resolved_args = Vec::with_capacity(args.len());
             for a in args {
-                resolved_args.push(ty_from_type_expr(a, types, generic_subst)?);
+                // Plan D Task 116 R1 — propagate row_var_subst into
+                // Apply args so a row-var-bearing fn-type nested
+                // inside a User type (`Box[() -> Int ![IO | r]]`)
+                // doesn't silently lose the row-var binding.
+                resolved_args.push(ty_from_type_expr_with_rows(
+                    a,
+                    types,
+                    generic_subst,
+                    row_var_subst,
+                )?);
             }
             Some(Ty::User(name.to_string(), resolved_args))
         }
@@ -5733,7 +5765,16 @@ pub(crate) fn ty_from_type_expr_with_rows(
         TypeExpr::Tuple { elems, .. } => {
             let mut elem_tys = Vec::with_capacity(elems.len());
             for e in elems {
-                elem_tys.push(ty_from_type_expr(e, types, generic_subst)?);
+                // Plan D Task 116 R1 — propagate row_var_subst into
+                // tuple elements so a row-var-bearing fn-type nested
+                // inside a tuple (`(Int, () -> Int ![IO | r])`)
+                // doesn't silently lose the row-var binding.
+                elem_tys.push(ty_from_type_expr_with_rows(
+                    e,
+                    types,
+                    generic_subst,
+                    row_var_subst,
+                )?);
             }
             Some(Ty::Tuple(elem_tys))
         }
@@ -10116,6 +10157,38 @@ mod tests {
     }
 
     #[test]
+    fn row_polymorphic_callee_called_from_earlier_caller_typechecks() {
+        // Plan D Task 116 R1 regression — pre-pass-1 (Scheme
+        // builder) must seed `current_row_var_subst` with the
+        // SAME row-var id allocated for `Scheme.row_vars`. Without
+        // it, a forward-ref caller declared earlier than the
+        // row-poly callee instantiates a Scheme whose outer
+        // `effect_row_var = Some(id)` but inner FnTypeExpr's
+        // `effect_row_var = None` — a mismatch that
+        // rename_ty's row_map miss leaves None, silently coercing
+        // the row-poly param's row tail to closed.
+        //
+        // Caller declared BEFORE callee on purpose; this is the
+        // shape that exposes the bug.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn caller() -> Int ![Raise[Int]] {\n  \
+                     passthrough(my_body)\n\
+                   }\n\
+                   fn my_body() -> Int ![Raise[Int]] {\n  \
+                     0\n\
+                   }\n\
+                   fn passthrough[A](body: () -> A ![Raise[Int] | e]) -> A ![Raise[Int] | e] {\n  \
+                     body()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "forward-ref caller of row-poly callee should typecheck; got {errs:?}"
+        );
+    }
+
+    #[test]
     fn row_polymorphic_passthrough_signature_typechecks() {
         // Plan D Task 116 smoke gate — row var on a fn-typed
         // parameter shares an id with the outer fn's row var.
@@ -10123,8 +10196,15 @@ mod tests {
         // those flow to the enclosing fn's row, which declares
         // the same Raise[String] + e. Cross-fn subsumption with
         // row vars unifies cleanly.
+        //
+        // Note: `e` is bound by the outer fn's `![| e]`, NOT by
+        // generic_params. Including `e` in `generic_params`
+        // would allocate it as a Ty::Var (unconstrained, fires
+        // E0132 at call sites). The R1 reviewer flagged this
+        // ergonomics — v1's row-var binder is the outer fn's
+        // `effect_row_var`, not generic_params.
         let src = "effect Raise[E] { fail: (E) -> Int }\n\
-                   fn passthrough[A, e](body: () -> A ![Raise[String] | e]) -> A ![Raise[String] | e] {\n  \
+                   fn passthrough[A](body: () -> A ![Raise[String] | e]) -> A ![Raise[String] | e] {\n  \
                      body()\n\
                    }\n\
                    fn main() -> Int ![] { 0 }\n";
