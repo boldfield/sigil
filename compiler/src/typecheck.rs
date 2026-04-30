@@ -785,6 +785,12 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // Plan C Task 66.6 — non-generic builtin schemes for the
     // `mut_byte_array_*` ops, gated by the Mem marker effect.
     register_builtin_mut_byte_array_schemes(&mut tc);
+    // Plan C Task 69 — boxed Int64 arithmetic / comparison /
+    // conversion / stringify primitives.
+    register_builtin_int64_schemes(&mut tc);
+    // Plan C Task 67 — StringBuilder rope primitives, gated by
+    // the Mem marker effect.
+    register_builtin_string_builder_schemes(&mut tc);
     // Plan C Task 68 — extended String primitives (byte-indexed
     // accessor / comparison / search / trim / parse).
     register_builtin_string_schemes(&mut tc);
@@ -1210,6 +1216,27 @@ fn builtin_types(file: &str) -> Vec<TypeDecl> {
             name_span: span.clone(),
             generic_params: Vec::new(),
             variants: Vec::new(),
+            span: span.clone(),
+        },
+        // Plan C Task 69 — Int64 is opaque, non-generic. Boxed
+        // 64-bit signed integer; constructed via `int64_from_int`
+        // and the arithmetic / comparison / conversion / stringify
+        // builtins.
+        TypeDecl {
+            name: "Int64".to_string(),
+            name_span: span.clone(),
+            generic_params: Vec::new(),
+            variants: Vec::new(),
+            span: span.clone(),
+        },
+        // Plan C Task 67 — StringBuilder is opaque, non-generic.
+        // Runtime-backed segmented rope; constructed via
+        // `sb_new()` and consumed by `sb_finalize` (Mem-gated).
+        TypeDecl {
+            name: "StringBuilder".to_string(),
+            name_span: span.clone(),
+            generic_params: Vec::new(),
+            variants: Vec::new(),
             span,
         },
     ]
@@ -1460,6 +1487,97 @@ fn register_builtin_mut_byte_array_schemes(tc: &mut Tc) {
     tc.fn_schemes.insert(
         "mut_byte_array_set".to_string(),
         make_scheme(vec![mba_ty(), Ty::Int, Ty::Byte], Ty::Unit),
+    );
+}
+
+/// Plan C Task 69 — boxed `Int64` builtin schemes.
+///
+/// Operations:
+/// - `int64_from_int(Int) -> Int64 ![]`
+/// - `int64_add(Int64, Int64) -> Int64 ![]` (wraps)
+/// - `int64_sub(Int64, Int64) -> Int64 ![]` (wraps)
+/// - `int64_mul(Int64, Int64) -> Int64 ![]` (wraps)
+/// - `int64_div(Int64, Int64) -> Int64 ![]` (aborts on `0` or `i64::MIN/-1`)
+/// - `int64_mod(Int64, Int64) -> Int64 ![]` (aborts on `0`)
+/// - `int64_neg(Int64) -> Int64 ![]` (wraps on `i64::MIN`)
+/// - `int64_eq` / `_lt` / `_le` / `_gt` / `_ge` `(Int64, Int64) -> Bool ![]`
+/// - `int64_to_int(Int64) -> Int ![]` (saturating)
+/// - `int64_to_string(Int64) -> String ![]`
+fn register_builtin_int64_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    let i64_ty = || Ty::User("Int64".to_string(), Vec::new());
+    tc.fn_schemes.insert(
+        "int64_from_int".to_string(),
+        make_scheme(vec![Ty::Int], i64_ty()),
+    );
+    for op in [
+        "int64_add",
+        "int64_sub",
+        "int64_mul",
+        "int64_div",
+        "int64_mod",
+    ] {
+        tc.fn_schemes.insert(
+            op.to_string(),
+            make_scheme(vec![i64_ty(), i64_ty()], i64_ty()),
+        );
+    }
+    tc.fn_schemes.insert(
+        "int64_neg".to_string(),
+        make_scheme(vec![i64_ty()], i64_ty()),
+    );
+    for cmp in ["int64_eq", "int64_lt", "int64_le", "int64_gt", "int64_ge"] {
+        tc.fn_schemes.insert(
+            cmp.to_string(),
+            make_scheme(vec![i64_ty(), i64_ty()], Ty::Bool),
+        );
+    }
+    tc.fn_schemes.insert(
+        "int64_to_int".to_string(),
+        make_scheme(vec![i64_ty()], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "int64_to_string".to_string(),
+        make_scheme(vec![i64_ty()], Ty::String),
+    );
+}
+
+/// Plan C Task 67 — `StringBuilder` builtin schemes (Mem-gated).
+///
+/// Operations:
+/// - `sb_new() -> StringBuilder ![Mem]`
+/// - `sb_append(StringBuilder, String) -> Unit ![Mem]`
+/// - `sb_finalize(StringBuilder) -> String ![Mem]`
+fn register_builtin_string_builder_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: vec!["Mem".to_string()],
+            effect_row_var: None,
+        })),
+    };
+    let sb_ty = || Ty::User("StringBuilder".to_string(), Vec::new());
+    tc.fn_schemes
+        .insert("sb_new".to_string(), make_scheme(vec![], sb_ty()));
+    tc.fn_schemes.insert(
+        "sb_append".to_string(),
+        make_scheme(vec![sb_ty(), Ty::String], Ty::Unit),
+    );
+    tc.fn_schemes.insert(
+        "sb_finalize".to_string(),
+        make_scheme(vec![sb_ty()], Ty::String),
     );
 }
 
@@ -10197,6 +10315,139 @@ mod tests {
             has_code(&errs, "E0044"),
             "expected E0044 (raise's Int placeholder return doesn't fit \
              String-returning fn); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 69 — Boxed Int64 =====
+
+    #[test]
+    fn import_std_int64_typechecks_cleanly() {
+        // Pin the boxed Int64 surface end-to-end: construct from
+        // Int, perform arithmetic + comparison, convert back, and
+        // stringify.
+        let src = "import std.int64\n\
+                   fn double_it(n: Int64) -> Int64 ![] {\n  \
+                     int64_add(n, n)\n\
+                   }\n\
+                   fn check(a: Int64, b: Int64) -> Int ![] {\n  \
+                     let _e: Bool = int64_eq(a, b);\n  \
+                     let _l: Bool = int64_lt(a, b);\n  \
+                     let _le: Bool = int64_le(a, b);\n  \
+                     let _g: Bool = int64_gt(a, b);\n  \
+                     let _ge: Bool = int64_ge(a, b);\n  \
+                     int64_to_int(int64_neg(int64_mod(int64_div(int64_mul(int64_sub(a, b), b), a), b)))\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let big: Int64 = int64_from_int(100);\n  \
+                     let bigger: Int64 = double_it(big);\n  \
+                     let formatted: String = int64_to_string(bigger);\n  \
+                     perform IO.println(formatted);\n  \
+                     check(big, bigger)\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn int64_from_int_with_string_arg_fires_e0044() {
+        let src = "import std.int64\n\
+                   fn bad() -> Int64 ![] {\n  \
+                     int64_from_int(\"not an int\")\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 (int64_from_int expects Int, got String); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn int64_add_with_int_arg_fires_e0044() {
+        // int64_add takes Int64; passing Int (not yet boxed) should fail.
+        let src = "import std.int64\n\
+                   fn bad(n: Int64) -> Int64 ![] {\n  \
+                     int64_add(n, 7)\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 (int64_add expects Int64, got Int); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_redeclares_int64_type_fires_e0113() {
+        // Int64 is a builtin opaque type; user-side `type Int64 = ...`
+        // collides with the builtin and should fire E0113 (duplicate
+        // type). Mirrors the Array / MutByteArray redeclare gate.
+        let src = "type Int64 = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "expected E0113 (duplicate Int64 declaration); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 67 — StringBuilder (Mem-gated) =====
+
+    #[test]
+    fn import_std_string_builder_typechecks_cleanly() {
+        let src = "import std.string_builder\n\
+                   fn render() -> String ![Mem] {\n  \
+                     let sb: StringBuilder = sb_new();\n  \
+                     sb_append(sb, \"hello, \");\n  \
+                     sb_append(sb, \"world\");\n  \
+                     sb_finalize(sb)\n\
+                   }\n\
+                   fn main() -> Int ![Mem, IO] {\n  \
+                     let s: String = render();\n  \
+                     perform IO.println(s);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn sb_new_without_mem_in_row_fires_e0042() {
+        let src = "import std.string_builder\n\
+                   fn bad() -> StringBuilder ![] {\n  \
+                     sb_new()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (sb_new requires Mem in row); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn sb_append_with_int_arg_fires_e0044() {
+        let src = "import std.string_builder\n\
+                   fn bad(sb: StringBuilder) -> Int ![Mem] {\n  \
+                     sb_append(sb, 42);\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 (sb_append expects String, got Int); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_redeclares_string_builder_type_fires_e0113() {
+        let src = "type StringBuilder = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "expected E0113 (duplicate StringBuilder declaration); got {errs:?}"
         );
     }
 

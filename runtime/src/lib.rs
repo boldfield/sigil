@@ -59,11 +59,13 @@ pub mod counters;
 pub mod gc;
 pub mod handlers;
 pub mod header;
+pub mod int64;
 pub mod io;
 pub mod mem;
 pub mod random;
 pub mod stackmap;
 pub mod string;
+pub mod string_builder;
 pub mod value;
 
 #[cfg(test)]

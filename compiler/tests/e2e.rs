@@ -7098,6 +7098,186 @@ fn std_choose_inline_fail_returns_minus_one() {
     assert_eq!(stdout, "-1\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 69 — boxed Int64 run-and-check-output =====
+
+/// Construct two Int64s, add them, stringify and print. Pins the
+/// allocation + arithmetic + stringify roundtrip end-to-end.
+#[test]
+fn std_int64_construct_add_to_string() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let a: Int64 = int64_from_int(40);\n  \
+                 let b: Int64 = int64_from_int(2);\n  \
+                 let s: String = int64_to_string(int64_add(a, b));\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_add_to_string");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// Negation + subtraction + `int64_to_int` round-trip on small
+/// values that fit in 63-bit Int with no saturation.
+#[test]
+fn std_int64_neg_sub_to_int_round_trips() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let a: Int64 = int64_from_int(10);\n  \
+                 let b: Int64 = int64_from_int(3);\n  \
+                 let r: Int64 = int64_sub(int64_neg(a), b);\n  \
+                 perform IO.println(int_to_string(int64_to_int(r)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_neg_sub");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "-13\n", "stderr={stderr:?}");
+}
+
+/// Multiplication, division, modulo. Pin signed-rem semantics
+/// (sign of dividend) for `int64_mod`.
+#[test]
+fn std_int64_mul_div_mod() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let a: Int64 = int64_from_int(7);\n  \
+                 let b: Int64 = int64_from_int(3);\n  \
+                 let m: Int64 = int64_mul(a, b);\n  \
+                 let q: Int64 = int64_div(a, b);\n  \
+                 let r: Int64 = int64_mod(a, b);\n  \
+                 perform IO.println(int_to_string(int64_to_int(m)));\n  \
+                 perform IO.println(int_to_string(int64_to_int(q)));\n  \
+                 perform IO.println(int_to_string(int64_to_int(r)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_mul_div_mod");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "21\n2\n1\n", "stderr={stderr:?}");
+}
+
+/// Comparison ops on equal and ordered pairs. Bool gets stringified
+/// via match → "true"/"false" branches printing the result.
+#[test]
+fn std_int64_comparisons_match_expected() {
+    let src = "fn show(b: Bool) -> String ![] {\n  \
+                 match b { True => \"T\", False => \"F\" }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int64 = int64_from_int(5);\n  \
+                 let b: Int64 = int64_from_int(7);\n  \
+                 perform IO.println(show(int64_eq(a, a)));\n  \
+                 perform IO.println(show(int64_eq(a, b)));\n  \
+                 perform IO.println(show(int64_lt(a, b)));\n  \
+                 perform IO.println(show(int64_le(a, a)));\n  \
+                 perform IO.println(show(int64_gt(b, a)));\n  \
+                 perform IO.println(show(int64_ge(a, a)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_cmp");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "T\nF\nT\nT\nT\nT\n", "stderr={stderr:?}");
+}
+
+/// `import std.int64` is a no-op (skip-list path); the surface is
+/// in scope with or without the import. Exercising the import
+/// keeps the doc-only conduit alive.
+#[test]
+fn std_int64_import_is_noop() {
+    let src = "import std.int64\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int64 = int64_from_int(123);\n  \
+                 perform IO.println(int64_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "123\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 67 — StringBuilder run-and-check-output =====
+
+/// `sb_new` then `sb_finalize` returns the empty string. Smoke
+/// test for record allocation + zero-segment finalize.
+#[test]
+fn std_string_builder_new_finalize_empty() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let sb: StringBuilder = sb_new();\n  \
+                 let s: String = sb_finalize(sb);\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_sb_new_finalize_empty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "\n", "stderr={stderr:?}");
+}
+
+/// Three appends concatenate into a single `String` in order.
+#[test]
+fn std_string_builder_three_appends_concat() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let sb: StringBuilder = sb_new();\n  \
+                 sb_append(sb, \"foo\");\n  \
+                 sb_append(sb, \"bar\");\n  \
+                 sb_append(sb, \"baz\");\n  \
+                 let s: String = sb_finalize(sb);\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_sb_three_appends");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "foobarbaz\n", "stderr={stderr:?}");
+}
+
+/// Empty-string append is a no-op. Pin idempotence around empty
+/// inputs (the runtime fast-paths zero-length appends).
+#[test]
+fn std_string_builder_empty_append_is_noop() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let sb: StringBuilder = sb_new();\n  \
+                 sb_append(sb, \"\");\n  \
+                 sb_append(sb, \"hello\");\n  \
+                 sb_append(sb, \"\");\n  \
+                 perform IO.println(sb_finalize(sb));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_sb_empty_append");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello\n", "stderr={stderr:?}");
+}
+
+/// SB mutation propagates across fn boundaries — the same
+/// builder passed into a helper accumulates writes from both
+/// caller and callee.
+#[test]
+fn std_string_builder_mutation_visible_across_fn_boundary() {
+    let src = "fn append_b(sb: StringBuilder) -> Unit ![Mem] {\n  \
+                 sb_append(sb, \"-mid-\")\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let sb: StringBuilder = sb_new();\n  \
+                 sb_append(sb, \"start\");\n  \
+                 append_b(sb);\n  \
+                 sb_append(sb, \"end\");\n  \
+                 perform IO.println(sb_finalize(sb));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_sb_cross_fn");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "start-mid-end\n", "stderr={stderr:?}");
+}
+
+/// `import std.string_builder` is a no-op (skip-list path).
+#[test]
+fn std_string_builder_import_is_noop() {
+    let src = "import std.string_builder\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let sb: StringBuilder = sb_new();\n  \
+                 sb_append(sb, \"ok\");\n  \
+                 perform IO.println(sb_finalize(sb));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_sb_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "ok\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration
