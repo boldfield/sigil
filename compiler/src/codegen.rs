@@ -719,6 +719,12 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("string_from_bytes_alloc".to_string());
     globals.insert("byte_in_range".to_string());
     globals.insert("byte_truncate".to_string());
+    globals.insert("byte_to_int".to_string());
+    // Plan C Task 66.6 — MutByteArray builtins (Mem-gated).
+    globals.insert("mut_byte_array_new".to_string());
+    globals.insert("mut_byte_array_length".to_string());
+    globals.insert("mut_byte_array_get".to_string());
+    globals.insert("mut_byte_array_set".to_string());
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
             if let Some(msg) = block_unsupported_handle(&f.body, &globals, &effects_resumes_many) {
@@ -4903,6 +4909,87 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_byte_truncate", Linkage::Import, &byte_truncate_sig)
         .map_err(|e| format!("declare sigil_byte_truncate: {e}"))?;
 
+    // sigil_byte_to_int(b: u8) -> i64
+    let mut byte_to_int_sig = Signature::new(isa_call_conv(&module));
+    byte_to_int_sig.params.push(AbiParam::new(types::I8));
+    byte_to_int_sig.returns.push(AbiParam::new(types::I64));
+    let byte_to_int = module
+        .declare_function("sigil_byte_to_int", Linkage::Import, &byte_to_int_sig)
+        .map_err(|e| format!("declare sigil_byte_to_int: {e}"))?;
+
+    // Plan C Task 66.6 — runtime MutByteArray primitives. Element
+    // type is fixed at Byte (I8); same flat-byte payload as
+    // ByteArray, with TAG_MUT_BYTE_ARRAY=0x07 and Mem-gated surface.
+
+    // sigil_mut_byte_array_new(len: i64, fill: u8) -> *mut u8
+    let mut mut_byte_array_new_sig = Signature::new(isa_call_conv(&module));
+    mut_byte_array_new_sig
+        .params
+        .push(AbiParam::new(types::I64));
+    mut_byte_array_new_sig.params.push(AbiParam::new(types::I8));
+    mut_byte_array_new_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
+    let mut_byte_array_new = module
+        .declare_function(
+            "sigil_mut_byte_array_new",
+            Linkage::Import,
+            &mut_byte_array_new_sig,
+        )
+        .map_err(|e| format!("declare sigil_mut_byte_array_new: {e}"))?;
+
+    // sigil_mut_byte_array_length(arr: *const u8) -> i64
+    let mut mut_byte_array_length_sig = Signature::new(isa_call_conv(&module));
+    mut_byte_array_length_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    mut_byte_array_length_sig
+        .returns
+        .push(AbiParam::new(types::I64));
+    let mut_byte_array_length = module
+        .declare_function(
+            "sigil_mut_byte_array_length",
+            Linkage::Import,
+            &mut_byte_array_length_sig,
+        )
+        .map_err(|e| format!("declare sigil_mut_byte_array_length: {e}"))?;
+
+    // sigil_mut_byte_array_get(arr: *const u8, i: i64) -> u8
+    let mut mut_byte_array_get_sig = Signature::new(isa_call_conv(&module));
+    mut_byte_array_get_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    mut_byte_array_get_sig
+        .params
+        .push(AbiParam::new(types::I64));
+    mut_byte_array_get_sig
+        .returns
+        .push(AbiParam::new(types::I8));
+    let mut_byte_array_get = module
+        .declare_function(
+            "sigil_mut_byte_array_get",
+            Linkage::Import,
+            &mut_byte_array_get_sig,
+        )
+        .map_err(|e| format!("declare sigil_mut_byte_array_get: {e}"))?;
+
+    // sigil_mut_byte_array_set(arr: *mut u8, i: i64, val: u8) -> ()
+    let mut mut_byte_array_set_sig = Signature::new(isa_call_conv(&module));
+    mut_byte_array_set_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    mut_byte_array_set_sig
+        .params
+        .push(AbiParam::new(types::I64));
+    mut_byte_array_set_sig.params.push(AbiParam::new(types::I8));
+    let mut_byte_array_set = module
+        .declare_function(
+            "sigil_mut_byte_array_set",
+            Linkage::Import,
+            &mut_byte_array_set_sig,
+        )
+        .map_err(|e| format!("declare sigil_mut_byte_array_set: {e}"))?;
+
     // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
     // Phase 3a wires the frame allocation + push/pop ABI from Task
     // 56 around every `handle` body. Arms stay null in this commit
@@ -5686,6 +5773,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             string_from_bytes_alloc,
             byte_in_range,
             byte_truncate,
+            byte_to_int,
+            mut_byte_array_new,
+            mut_byte_array_length,
+            mut_byte_array_get,
+            mut_byte_array_set,
         },
         handler_frame_new,
         handle_push,
@@ -11508,6 +11600,79 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.byte_truncate_ref, &[n]);
                 self.builder.inst_results(call)[0]
             }
+            Expr::Ident(name, _) if name == "byte_to_int" => {
+                assert_eq!(args.len(), 1, "byte_to_int builtin arg count is not 1");
+                let b = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.byte_to_int_ref, &[b]);
+                self.builder.inst_results(call)[0]
+            }
+            // Plan C Task 66.6 — runtime MutByteArray primitives.
+            // Mem-gated at the typechecker; mutation calls emit
+            // stackmap placeholders for v2-forward-compat (see the
+            // `mut_array_set` comment block above for the
+            // Boehm-conservative-needs-no-write-barrier rationale).
+            Expr::Ident(name, _) if name == "mut_byte_array_new" => {
+                assert_eq!(
+                    args.len(),
+                    2,
+                    "mut_byte_array_new builtin arg count is not 2"
+                );
+                let len = self.lower_expr(&args[0]);
+                let fill = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.mut_byte_array_new_ref, &[len, fill]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "mut_byte_array_length" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "mut_byte_array_length builtin arg count is not 1"
+                );
+                let arr = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.mut_byte_array_length_ref, &[arr]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "mut_byte_array_get" => {
+                assert_eq!(
+                    args.len(),
+                    2,
+                    "mut_byte_array_get builtin arg count is not 2"
+                );
+                let arr = self.lower_expr(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.mut_byte_array_get_ref, &[arr, idx]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "mut_byte_array_set" => {
+                assert_eq!(
+                    args.len(),
+                    3,
+                    "mut_byte_array_set builtin arg count is not 3"
+                );
+                let arr = self.lower_expr(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let val = self.lower_expr(&args[2]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.mut_byte_array_set_ref, &[arr, idx, val]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                // sigil_mut_byte_array_set returns nothing; produce
+                // the Sigil-level Unit value (I8 zero).
+                self.builder.ins().iconst(types::I8, 0)
+            }
             Expr::ClosureRecord { code_fn_name, .. } => {
                 // Evaluate the ClosureRecord first (allocates + stores
                 // the closure on the heap) and use its pointer as the
@@ -12704,6 +12869,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     types::I8
                 }
                 Expr::Ident(name, _) if name == "byte_in_range" => types::I8,
+                Expr::Ident(name, _) if name == "byte_to_int" => types::I64,
+                // Plan C Task 66.6 — MutByteArray return-type
+                // predictions. `_new` returns MutByteArray (pointer);
+                // `_length` returns Int; `_get` returns Byte (I8);
+                // `_set` returns Unit (I8 zero).
+                Expr::Ident(name, _) if name == "mut_byte_array_new" => self.pointer_ty,
+                Expr::Ident(name, _) if name == "mut_byte_array_length" => types::I64,
+                Expr::Ident(name, _) if name == "mut_byte_array_get" => types::I8,
+                Expr::Ident(name, _) if name == "mut_byte_array_set" => types::I8,
                 Expr::ClosureRecord { code_fn_name, .. } => self
                     .user_fns
                     .get(code_fn_name)
@@ -13111,6 +13285,16 @@ struct BuiltinFuncIds {
     /// sigil-side `byte_from_int(n) -> Option[Byte]` helper).
     byte_in_range: cranelift_module::FuncId,
     byte_truncate: cranelift_module::FuncId,
+    /// Plan C Task 66.5 — `Byte -> Int` widening (Plan A2 runtime
+    /// primitive `sigil_byte_to_int`, finally wired through the
+    /// sigil surface as a builtin in Task 66.5).
+    byte_to_int: cranelift_module::FuncId,
+    /// Plan C Task 66.6 — runtime MutByteArray primitive FuncIds.
+    /// Mem-gated at the typechecker.
+    mut_byte_array_new: cranelift_module::FuncId,
+    mut_byte_array_length: cranelift_module::FuncId,
+    mut_byte_array_get: cranelift_module::FuncId,
+    mut_byte_array_set: cranelift_module::FuncId,
 }
 
 /// Per-fn FuncRefs for the builtin runtime primitives. Sibling of
@@ -13150,6 +13334,12 @@ struct BuiltinFuncRefs {
     /// Plan C Task 66.5 — runtime Byte helpers.
     byte_in_range_ref: FuncRef,
     byte_truncate_ref: FuncRef,
+    byte_to_int_ref: FuncRef,
+    /// Plan C Task 66.6 — runtime MutByteArray primitive FuncRefs.
+    mut_byte_array_new_ref: FuncRef,
+    mut_byte_array_length_ref: FuncRef,
+    mut_byte_array_get_ref: FuncRef,
+    mut_byte_array_set_ref: FuncRef,
 }
 
 /// Plan B Task 55, Phase 4e — input context for [`prepare_per_fn_refs`].
@@ -13341,6 +13531,12 @@ fn prepare_builtin_func_refs(
             .declare_func_in_func(ids.string_from_bytes_alloc, builder.func),
         byte_in_range_ref: module.declare_func_in_func(ids.byte_in_range, builder.func),
         byte_truncate_ref: module.declare_func_in_func(ids.byte_truncate, builder.func),
+        byte_to_int_ref: module.declare_func_in_func(ids.byte_to_int, builder.func),
+        mut_byte_array_new_ref: module.declare_func_in_func(ids.mut_byte_array_new, builder.func),
+        mut_byte_array_length_ref: module
+            .declare_func_in_func(ids.mut_byte_array_length, builder.func),
+        mut_byte_array_get_ref: module.declare_func_in_func(ids.mut_byte_array_get, builder.func),
+        mut_byte_array_set_ref: module.declare_func_in_func(ids.mut_byte_array_set, builder.func),
     }
 }
 

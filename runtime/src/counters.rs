@@ -47,14 +47,22 @@ pub enum CounterId {
     /// Plan C Task 66.5 — total bytes allocated by `sigil_byte_array_*`
     /// (header + length-word + byte payload).
     ByteArrayAllocBytes = 15,
+    /// Plan C Task 66.6 — count of `sigil_mut_byte_array_new`
+    /// invocations.
+    MutByteArrayAllocCount = 16,
+    /// Plan C Task 66.6 — total bytes allocated by
+    /// `sigil_mut_byte_array_new`.
+    MutByteArrayAllocBytes = 17,
 }
 
-const COUNTER_SLOTS: usize = 16;
+const COUNTER_SLOTS: usize = 18;
 
 /// Static backing storage for all counters. Mutable only via atomic relaxed
 /// operations; never touched by reference. This is the only global atomic
 /// state the runtime owns.
 static COUNTERS: [AtomicU64; COUNTER_SLOTS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -92,6 +100,8 @@ pub const NAMES: [&str; COUNTER_SLOTS] = [
     "SIGIL_COUNTER_MUT_ARRAY_ALLOC_BYTES",
     "SIGIL_COUNTER_BYTE_ARRAY_ALLOC_COUNT",
     "SIGIL_COUNTER_BYTE_ARRAY_ALLOC_BYTES",
+    "SIGIL_COUNTER_MUT_BYTE_ARRAY_ALLOC_COUNT",
+    "SIGIL_COUNTER_MUT_BYTE_ARRAY_ALLOC_BYTES",
 ];
 
 #[inline]

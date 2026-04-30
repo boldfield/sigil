@@ -6503,6 +6503,103 @@ fn std_byte_array_import_is_noop() {
     assert_eq!(stdout, "0\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 66.6 — MutByteArray runtime + Mem-gated coverage =====
+
+/// Allocate a 3-byte mutable array, mutate slot 1 in place, read it
+/// back. Pin the in-place mutation contract for the byte payload.
+#[test]
+fn std_mut_byte_array_set_mutates_in_place() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let zero: Byte = byte_truncate(0);\n  \
+                 let v42: Byte = byte_truncate(42);\n  \
+                 let ba: MutByteArray = mut_byte_array_new(3, zero);\n  \
+                 mut_byte_array_set(ba, 1, v42);\n  \
+                 let v: Byte = mut_byte_array_get(ba, 1);\n  \
+                 perform IO.println(int_to_string(byte_to_int(v)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_set_in_place");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// Multiple sets accumulate in the same byte-array — no fresh
+/// allocations.
+#[test]
+fn std_mut_byte_array_set_chain_accumulates() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let zero: Byte = byte_truncate(0);\n  \
+                 let ba: MutByteArray = mut_byte_array_new(4, zero);\n  \
+                 mut_byte_array_set(ba, 0, byte_truncate(10));\n  \
+                 mut_byte_array_set(ba, 1, byte_truncate(20));\n  \
+                 mut_byte_array_set(ba, 2, byte_truncate(30));\n  \
+                 mut_byte_array_set(ba, 3, byte_truncate(40));\n  \
+                 let total: Int = byte_to_int(mut_byte_array_get(ba, 0))\n    \
+                   + byte_to_int(mut_byte_array_get(ba, 1))\n    \
+                   + byte_to_int(mut_byte_array_get(ba, 2))\n    \
+                   + byte_to_int(mut_byte_array_get(ba, 3));\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_chain");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "100\n", "stderr={stderr:?}");
+}
+
+/// 1024-byte mutable buffer — past the count cap, exercises the
+/// payload-length-word convention for typical network-buffer sizes.
+#[test]
+fn std_mut_byte_array_at_buffer_size() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let zero: Byte = byte_truncate(0);\n  \
+                 let ba: MutByteArray = mut_byte_array_new(1024, zero);\n  \
+                 mut_byte_array_set(ba, 1023, byte_truncate(99));\n  \
+                 let n: Int = mut_byte_array_length(ba);\n  \
+                 let v: Int = byte_to_int(mut_byte_array_get(ba, 1023));\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_buffer");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1024\n99\n", "stderr={stderr:?}");
+}
+
+/// Mutation propagates across function-call boundaries — passing a
+/// MutByteArray to a helper fn (declared `![Mem]`) and mutating
+/// there affects the caller's view of the same array.
+#[test]
+fn std_mut_byte_array_mutation_visible_across_fn_boundary() {
+    let src = "fn fill_at(ba: MutByteArray, i: Int, v: Byte) -> Unit ![Mem] {\n  \
+                 mut_byte_array_set(ba, i, v)\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let zero: Byte = byte_truncate(0);\n  \
+                 let ba: MutByteArray = mut_byte_array_new(3, zero);\n  \
+                 fill_at(ba, 1, byte_truncate(77));\n  \
+                 perform IO.println(int_to_string(byte_to_int(mut_byte_array_get(ba, 1))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_cross_fn");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "77\n", "stderr={stderr:?}");
+}
+
+/// `import std.mut_byte_array` is a no-op (skip-list path).
+#[test]
+fn std_mut_byte_array_import_is_noop() {
+    let src = "import std.mut_byte_array\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let zero: Byte = byte_truncate(0);\n  \
+                 let ba: MutByteArray = mut_byte_array_new(0, zero);\n  \
+                 perform IO.println(int_to_string(mut_byte_array_length(ba)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration

@@ -741,6 +741,9 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // runtime: `byte_array_*`, `string_to_bytes`,
     // `string_from_bytes_*`, `byte_in_range`, `byte_truncate`.
     register_builtin_byte_array_schemes(&mut tc);
+    // Plan C Task 66.6 — non-generic builtin schemes for the
+    // `mut_byte_array_*` ops, gated by the Mem marker effect.
+    register_builtin_mut_byte_array_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -1149,6 +1152,16 @@ fn builtin_types(file: &str) -> Vec<TypeDecl> {
             name_span: span.clone(),
             generic_params: Vec::new(),
             variants: Vec::new(),
+            span: span.clone(),
+        },
+        // Plan C Task 66.6 — MutByteArray is opaque, non-generic.
+        // Constructed via `mut_byte_array_new(len, fill)` (Mem-
+        // gated). `mut_byte_array_set` mutates in place.
+        TypeDecl {
+            name: "MutByteArray".to_string(),
+            name_span: span.clone(),
+            generic_params: Vec::new(),
+            variants: Vec::new(),
             span,
         },
     ]
@@ -1357,6 +1370,48 @@ fn register_builtin_byte_array_schemes(tc: &mut Tc) {
     tc.fn_schemes.insert(
         "byte_truncate".to_string(),
         make_scheme(vec![Ty::Int], Ty::Byte),
+    );
+    tc.fn_schemes.insert(
+        "byte_to_int".to_string(),
+        make_scheme(vec![Ty::Byte], Ty::Int),
+    );
+}
+
+/// Plan C Task 66.6 — `MutByteArray` operations gated on the `Mem`
+/// effect. Mirrors `register_builtin_mut_array_schemes` shape but
+/// non-generic (byte payload is fixed at I8). Operations:
+///
+/// - `mut_byte_array_new(Int, Byte) -> MutByteArray ![Mem]`
+/// - `mut_byte_array_length(MutByteArray) -> Int ![Mem]`
+/// - `mut_byte_array_get(MutByteArray, Int) -> Byte ![Mem]`
+/// - `mut_byte_array_set(MutByteArray, Int, Byte) -> Unit ![Mem]`
+fn register_builtin_mut_byte_array_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: vec!["Mem".to_string()],
+            effect_row_var: None,
+        })),
+    };
+    let mba_ty = || Ty::User("MutByteArray".to_string(), Vec::new());
+    tc.fn_schemes.insert(
+        "mut_byte_array_new".to_string(),
+        make_scheme(vec![Ty::Int, Ty::Byte], mba_ty()),
+    );
+    tc.fn_schemes.insert(
+        "mut_byte_array_length".to_string(),
+        make_scheme(vec![mba_ty()], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "mut_byte_array_get".to_string(),
+        make_scheme(vec![mba_ty(), Ty::Int], Ty::Byte),
+    );
+    tc.fn_schemes.insert(
+        "mut_byte_array_set".to_string(),
+        make_scheme(vec![mba_ty(), Ty::Int, Ty::Byte], Ty::Unit),
     );
 }
 
@@ -9528,6 +9583,76 @@ mod tests {
         assert!(
             has_code(&errs, "E0113"),
             "expected E0113 (duplicate type ByteArray); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 66.6 — MutByteArray + Mem effect =====
+
+    #[test]
+    fn mut_byte_array_new_get_set_typechecks_under_mem_row() {
+        let src = "fn main() -> Int ![IO, Mem] {\n  \
+                     let b: Byte = byte_truncate(7);\n  \
+                     let ba: MutByteArray = mut_byte_array_new(3, b);\n  \
+                     mut_byte_array_set(ba, 1, byte_truncate(99));\n  \
+                     let v: Byte = mut_byte_array_get(ba, 1);\n  \
+                     perform IO.println(int_to_string(byte_to_int(v)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn mut_byte_array_set_without_mem_in_row_fires_e0042() {
+        // Without Mem in main's row, mut_byte_array_set's `![Mem]`
+        // requirement isn't satisfied — typecheck rejects.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let b: Byte = byte_truncate(7);\n  \
+                     let ba: MutByteArray = mut_byte_array_new(3, b);\n  \
+                     mut_byte_array_set(ba, 1, byte_truncate(99));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 from missing Mem in row; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn mut_byte_array_alloc_with_int_fill_fires_e0044() {
+        // mut_byte_array_new(len, fill) requires fill: Byte.
+        let src = "fn main() -> Int ![Mem] {\n  \
+                     let _ba: MutByteArray = mut_byte_array_new(3, 0);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 from mut_byte_array_new Int-vs-Byte mismatch; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn import_std_mut_byte_array_is_doc_only_skip_list() {
+        let src = "import std.mut_byte_array\n\
+                   fn main() -> Int ![Mem] {\n  \
+                     let b: Byte = byte_truncate(0);\n  \
+                     let _ba: MutByteArray = mut_byte_array_new(0, b);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn user_redeclares_mut_byte_array_type_fires_e0113() {
+        let src = "type MutByteArray = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "expected E0113 (duplicate type MutByteArray); got {errs:?}"
         );
     }
 
