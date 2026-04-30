@@ -27,10 +27,17 @@ use crate::errors::{self, CompilerError, Severity, Span};
 use crate::{lexer, parser, stdlib_embed};
 
 /// Stdlib module paths whose contents are provided by builtin injection at
-/// the typechecker (see `builtin_effects` / `builtin_fn_env`). Importing
-/// them is a no-op here. Entries match the embedded-tree path produced by
+/// the typechecker (see `builtin_effects` / `builtin_fn_env` /
+/// `register_builtin_array_schemes` / etc.). Importing them is a no-op
+/// here. Entries match the embedded-tree path produced by
 /// [`path_to_module`] — with the `.sigil` suffix and `/` separators.
-const BUILTIN_INJECTED: &[&str] = &["io.sigil"];
+///
+/// `array.sigil` and `mut_array.sigil` are documentation-only today
+/// (zero items declared) but listed here proactively: a future doctest
+/// tooling pass (Plan C Task 77) may emit `@example` blocks as
+/// standalone fns, and unguarded loading would let any future fn item
+/// in those files pollute every importer's flat namespace silently.
+const BUILTIN_INJECTED: &[&str] = &["io.sigil", "array.sigil", "mut_array.sigil"];
 
 /// Resolve every `Item::Import` in `program` against the embedded stdlib.
 /// Returns a new `Program` with imported items appended, plus diagnostics

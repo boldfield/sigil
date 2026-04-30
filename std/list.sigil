@@ -13,6 +13,31 @@
 // supports the common pure-helper case, and callers who need
 // effects per element write a recursive helper directly via
 // `match` (the same pattern these helpers use internally).
+//
+// ## Recursion depth
+//
+// Sigil v1 does not guarantee tail-call optimisation: every
+// recursive call below grows the system stack by one frame
+// regardless of whether the call is in tail position. Each helper
+// therefore has an O(n) stack-depth bound where n is the input
+// list length:
+//
+//   length / map / filter / append    — non-tail-recursive (build
+//                                        the result on the way back
+//                                        up the call stack)
+//   fold / reverse / reverse_acc      — tail-recursive in shape
+//                                        (the same stack bound holds
+//                                        until v1 ships TCO)
+//   range                             — non-tail-recursive (Cons
+//                                        wraps the recursive call)
+//
+// In practice this is fine for inputs up to a few thousand
+// elements (typical system stack is ~1-8 MiB / 64 B per frame =
+// 16-128 K depth). Larger sequences should use `MutArray[A]`
+// (Plan C Task 66) for index-based iteration without recursion.
+// A v2 sigil compiler that emits `return_call` for tail positions
+// would lift this bound on the tail-recursive helpers; until then
+// the bound is shared across the whole module.
 
 type List[A] = | Nil | Cons(A, List[A])
 
@@ -53,13 +78,19 @@ fn fold[A, B](xs: List[A], init: B, f: (B, A) -> B ![]) -> B ![] {
 
 // `reverse(xs)` returns the list in reverse order. O(n) via accumulator.
 fn reverse[A](xs: List[A]) -> List[A] ![] {
-  reverse_acc(xs, Nil)
+  __reverse_acc(xs, Nil)
 }
 
-fn reverse_acc[A](xs: List[A], acc: List[A]) -> List[A] ![] {
+// Internal helper: prefix-double-underscore convention marks helpers
+// not intended for user code. v1 has no module-level visibility
+// (`priv` / `pub`); when stdlib imports land in the caller's flat
+// namespace, the prefix is the only signal that this is an
+// implementation detail, not a stable surface. v2 visibility
+// modifiers retire the convention.
+fn __reverse_acc[A](xs: List[A], acc: List[A]) -> List[A] ![] {
   match xs {
     Nil => acc,
-    Cons(h, t) => reverse_acc(t, Cons(h, acc)),
+    Cons(h, t) => __reverse_acc(t, Cons(h, acc)),
   }
 }
 
