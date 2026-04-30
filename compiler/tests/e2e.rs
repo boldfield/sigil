@@ -7278,6 +7278,47 @@ fn std_string_builder_import_is_noop() {
     assert_eq!(stdout, "ok\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 79 — `examples/interpreter.sigil` =====
+
+/// Exercise the demo lambda-calculus interpreter end-to-end:
+///   - `run_demo`: `let x = 10 in let y = 32 in if x then x+y else 0` → 42
+///   - `run_broken`: references unbound `x` → "error: unbound variable: x"
+///
+/// Pins both the success path (Ok converts to int_to_string) and
+/// the failure path (Err captures the raised String) under a top-
+/// level `catch` per `[DEVIATION Task 71]`.
+#[test]
+fn interpreter_example_evaluates_and_handles_unbound_var() {
+    let root = workspace_root();
+    let source = root.join("examples/interpreter.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "interpreter_example");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\nerror: unbound variable: x\n",
+        "stderr={stderr:?}"
+    );
+}
+
+// ===== Plan C Task 80 — `examples/json.sigil` =====
+
+/// Exercise the JSON pretty-printer over the demo document. Pin
+/// the rendered output byte-for-byte to confirm the StringBuilder
+/// concatenation, recursive printing, and JBool/JNull/JInt arms
+/// all behave correctly. The parser is deferred (see file's
+/// "v1 vs v2" note); the demo proves the printer side end-to-end.
+#[test]
+fn json_example_pretty_prints_demo_document() {
+    let root = workspace_root();
+    let source = root.join("examples/json.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "json_example");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout,
+        "{\"name\": \"ada\", \"age\": 36, \"tags\": [\"math\", \"programming\"], \"active\": true, \"spouse\": null}\n",
+        "stderr={stderr:?}"
+    );
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration

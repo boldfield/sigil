@@ -1,0 +1,194 @@
+// examples/json.sigil — Plan C Task 80.
+//
+// **v1 scope: JSON pretty-printer.** Build a JSON value tree
+// directly in source, render to a `String` via `StringBuilder`
+// (Plan C Task 67) under the `Mem` effect. The companion parser
+// is deferred to a Task 80 part 2 — see the "v1 vs v2" note at
+// the end of this file.
+//
+// **What the demo exercises end-to-end.**
+//   - Recursive sum types (`JValue` + `JList` + `JObject`).
+//   - `StringBuilder` Mem-gated rope construction (Task 67).
+//   - String concatenation across a non-trivial document.
+//   - `int_to_string` numeric formatting.
+//   - Mutual recursion between print helpers.
+//
+// **JValue shape.** Subset of the full RFC 8259 model:
+//   - `JNull` — `null` literal.
+//   - `JBool(Bool)` — `true` / `false`.
+//   - `JInt(Int)` — integers within Sigil's 63-bit Int range.
+//   - `JString(String)` — string literal; v1 emits the bytes as
+//     received (no escape-sequence handling). Production code
+//     would route through a real escape encoder; deferred per
+//     the v1-vs-v2 note.
+//   - `JArray(JList)` / `JObject(JObject)` — recursive
+//     containers backed by cons-list helper types because Sigil
+//     v1 has no first-class tuple / association-list type.
+
+import std.string_builder
+
+type JValue =
+  | JNull
+  | JBool(Bool)
+  | JInt(Int)
+  | JString(String)
+  | JArray(JList)
+  | JObject(JObject)
+
+type JList =
+  | JLNil
+  | JLCons(JValue, JList)
+
+type JObject =
+  | JONil
+  | JOCons(String, JValue, JObject)
+
+// `print_value` appends `v`'s JSON encoding to `sb`. Unit-returning
+// (`![Mem]`) — the SB carries the running document. Each match arm
+// returns Unit via either an `sb_append` call or a recursion into
+// another Unit-returning helper.
+fn print_value(sb: StringBuilder, v: JValue) -> Unit ![Mem] {
+  match v {
+    JNull => sb_append(sb, "null"),
+    JBool(b) =>
+      match b {
+        True => sb_append(sb, "true"),
+        False => sb_append(sb, "false"),
+      },
+    JInt(n) => sb_append(sb, int_to_string(n)),
+    JString(s) => print_quoted(sb, s),
+    JArray(items) => print_array(sb, items),
+    JObject(fields) => print_object(sb, fields),
+  }
+}
+
+fn print_quoted(sb: StringBuilder, s: String) -> Unit ![Mem] {
+  sb_append(sb, "\"");
+  sb_append(sb, s);
+  sb_append(sb, "\"")
+}
+
+fn print_array(sb: StringBuilder, xs: JList) -> Unit ![Mem] {
+  sb_append(sb, "[");
+  print_list_head(sb, xs);
+  sb_append(sb, "]")
+}
+
+// `print_list_head` handles the first element with no leading
+// separator; the recursive `print_list_tail` prepends `, ` before
+// each subsequent element. Splitting the head case avoids a
+// `first: Bool` accumulator argument and the Unit-literal-on-True
+// subcase that v1 syntax can't express directly.
+fn print_list_head(sb: StringBuilder, xs: JList) -> Unit ![Mem] {
+  match xs {
+    JLNil => sb_append(sb, ""),
+    JLCons(v, rest) => {
+      print_value(sb, v);
+      print_list_tail(sb, rest)
+    },
+  }
+}
+
+fn print_list_tail(sb: StringBuilder, xs: JList) -> Unit ![Mem] {
+  match xs {
+    JLNil => sb_append(sb, ""),
+    JLCons(v, rest) => {
+      sb_append(sb, ", ");
+      print_value(sb, v);
+      print_list_tail(sb, rest)
+    },
+  }
+}
+
+fn print_object(sb: StringBuilder, fields: JObject) -> Unit ![Mem] {
+  sb_append(sb, "{");
+  print_object_head(sb, fields);
+  sb_append(sb, "}")
+}
+
+fn print_object_head(sb: StringBuilder, fields: JObject) -> Unit ![Mem] {
+  match fields {
+    JONil => sb_append(sb, ""),
+    JOCons(name, v, rest) => {
+      print_field(sb, name, v);
+      print_object_tail(sb, rest)
+    },
+  }
+}
+
+fn print_object_tail(sb: StringBuilder, fields: JObject) -> Unit ![Mem] {
+  match fields {
+    JONil => sb_append(sb, ""),
+    JOCons(name, v, rest) => {
+      sb_append(sb, ", ");
+      print_field(sb, name, v);
+      print_object_tail(sb, rest)
+    },
+  }
+}
+
+fn print_field(sb: StringBuilder, name: String, v: JValue) -> Unit ![Mem] {
+  print_quoted(sb, name);
+  sb_append(sb, ": ");
+  print_value(sb, v)
+}
+
+// `to_string(v)` is the user-facing entry point: build a fresh
+// SB, render `v` into it, finalize.
+fn to_string(v: JValue) -> String ![Mem] {
+  let sb: StringBuilder = sb_new();
+  print_value(sb, v);
+  sb_finalize(sb)
+}
+
+// Build a representative JSON document:
+//   {"name": "ada", "age": 36, "tags": ["math", "programming"], "active": true, "spouse": null}
+fn build_demo() -> JValue ![] {
+  let tags: JValue = JArray(
+    JLCons(JString("math"),
+      JLCons(JString("programming"),
+        JLNil)));
+  let fields: JObject =
+    JOCons("name", JString("ada"),
+    JOCons("age", JInt(36),
+    JOCons("tags", tags,
+    JOCons("active", JBool(True),
+    JOCons("spouse", JNull,
+      JONil)))));
+  JObject(fields)
+}
+
+fn main() -> Int ![IO, Mem] {
+  let doc: JValue = build_demo();
+  let rendered: String = to_string(doc);
+  perform IO.println(rendered);
+  0
+}
+
+// ## v1 vs v2
+//
+// **Parser deferred to Task 80 part 2.** A correct JSON parser
+// requires position tracking (current byte index into a
+// `ByteArray`). The natural Sigil v1 expression of "stateful
+// position" is the `State` effect (`std/state.sigil`, Plan C
+// Task 72), but `[DEVIATION Task 72]` constraint #3 — the
+// wrapper-fn-frame composition gap — bites a recursive descent
+// parser the moment a non-trivial helper inlines `perform
+// State.get()` / `perform State.set(...)`. The codegen-side
+// fixes for that gap are tracked under the planned "Plan D"
+// architectural slice; once it lands, the parser can ship as
+// `parse(b: ByteArray) -> Result[JValue, String] ![]`.
+//
+// **JFloat / JInt64 deferred.** Plan body distinguishes
+// numeric ranges via `JInt` / `JInt64` / `JFloat`. v1 ships
+// `JInt` only — `Float` is not yet a v1 type, and the JInt64
+// surface lights up cleanly once the parser's numeric scanner
+// arrives (it can dispatch on overflow at parse time). Boxed
+// `Int64` runtime support shipped in Task 69 so the parser side
+// has the type ready when it lands.
+//
+// **Escape encoding.** `JString`'s rendering currently emits
+// the input bytes verbatim between `"`s. RFC 8259 mandates
+// escaping `"`, `\`, and control characters; production output
+// would route through a real escape encoder. The same Task 80
+// part 2 closure ships the encoder alongside the parser.

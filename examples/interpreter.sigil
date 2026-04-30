@@ -1,0 +1,111 @@
+// examples/interpreter.sigil — Plan C Task 79.
+//
+// Tree-walking interpreter for a small applied λ-calculus over
+// integers. The expression language has variables, integer
+// literals, addition, conditional, and let-binding; values flow
+// through an environment (cons-list of `(name, value)` bindings).
+//
+// **Effect surface.** `eval` declares `![Raise]` and uses
+// `raise(msg)` for both unbound-variable errors and unexpected
+// shapes. Top-level `catch` collapses the effect into a
+// `Result[Int, String]` so `main` can render Ok/Err uniformly.
+//
+// **v1 surface notes.**
+//   - No tuple type; use a custom `EnvEntry` cons-list (`ENil` /
+//     `ECons(name, value, rest)`).
+//   - `Raise` ships fixed-`String` per `[DEVIATION Task 71]`.
+//   - The expression language is a v1-honest subset: no first-
+//     class functions (lambdas as values would need first-class
+//     k for proper closure semantics under arbitrary handlers),
+//     no recursive `let rec`. Adding either is a Plan-D-bridged
+//     extension; not blocking for the demo.
+
+import std.raise
+import std.result
+
+type Expr =
+  | EVar(String)
+  | ELit(Int)
+  | EAdd(Expr, Expr)
+  | EMul(Expr, Expr)
+  | EIf(Expr, Expr, Expr)
+  | ELet(String, Expr, Expr)
+
+type Env =
+  | ENil
+  | ECons(String, Int, Env)
+
+// `lookup(env, name)` returns the value bound to `name`, raising
+// the canonical "unbound variable: <name>" message if absent.
+fn lookup(env: Env, name: String) -> Int ![Raise] {
+  match env {
+    ENil => raise(string_concat("unbound variable: ", name)),
+    ECons(n, v, rest) =>
+      match string_compare(n, name) {
+        0 => v,
+        _ => lookup(rest, name),
+      },
+  }
+}
+
+// `eval(env, expr)` reduces `expr` under `env` to an integer.
+// Errors short-circuit through `Raise.fail` to the enclosing
+// `catch`.
+fn eval(env: Env, expr: Expr) -> Int ![Raise] {
+  match expr {
+    EVar(name) => lookup(env, name),
+    ELit(n) => n,
+    EAdd(a, b) => eval(env, a) + eval(env, b),
+    EMul(a, b) => eval(env, a) * eval(env, b),
+    EIf(c, t, e) =>
+      match eval(env, c) {
+        0 => eval(env, e),
+        _ => eval(env, t),
+      },
+    ELet(name, val_expr, body) => {
+      let v: Int = eval(env, val_expr);
+      eval(ECons(name, v, env), body)
+    },
+  }
+}
+
+// Build the canonical demo program:
+//   let x = 10 in
+//   let y = 32 in
+//   if x then x + y else 0
+// Evaluates to 42.
+fn build_demo() -> Expr ![] {
+  ELet("x", ELit(10),
+    ELet("y", ELit(32),
+      EIf(EVar("x"),
+          EAdd(EVar("x"), EVar("y")),
+          ELit(0))))
+}
+
+// Build a deliberately-broken program that mentions an unbound
+// variable; exercises the raise / catch round-trip.
+fn build_broken() -> Expr ![] {
+  EAdd(EVar("x"), ELit(1))
+}
+
+fn run_demo() -> Int ![Raise] {
+  eval(ENil, build_demo())
+}
+
+fn run_broken() -> Int ![Raise] {
+  eval(ENil, build_broken())
+}
+
+fn main() -> Int ![IO] {
+  let demo: Result[Int, String] = catch(run_demo);
+  match demo {
+    Ok(n) => perform IO.println(int_to_string(n)),
+    Err(m) => perform IO.println(string_concat("error: ", m)),
+  };
+  let broken: Result[Int, String] = catch(run_broken);
+  match broken {
+    Ok(n) => perform IO.println(int_to_string(n)),
+    Err(m) => perform IO.println(string_concat("error: ", m)),
+  };
+  0
+}
