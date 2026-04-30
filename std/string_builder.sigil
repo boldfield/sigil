@@ -1,0 +1,120 @@
+// sigil: 0.1
+//
+// std/string_builder.sigil — Plan C Task 67. **Documentation only.**
+//
+// Listed in `compiler/src/imports.rs::BUILTIN_INJECTED` —
+// `import std.string_builder` is a no-op at the resolver. The
+// `StringBuilder` type and its operations are registered as
+// builtins via `typecheck::builtin_types()` and
+// `register_builtin_string_builder_schemes()`; codegen dispatches
+// each call site through the `BuiltinFuncIds` / `BuiltinFuncRefs`
+// aggregate. Users never need to write the import; the type and
+// ops are in scope from program start.
+//
+// ## What is `StringBuilder`?
+//
+// A heap-backed segmented rope for incremental string
+// construction under the `Mem` effect. Compare to Java's
+// `StringBuilder`, .NET's `StringBuilder`, and OCaml's `Buffer`.
+//
+// Sigil's `String` is immutable; building a long string by
+// repeated `string_concat` is O(n²) (each concat allocates a
+// fresh String containing the whole prefix). `StringBuilder`
+// fixes this: appends write into a pre-allocated 4 KiB segment;
+// once the segment fills, a new one is allocated and pushed onto
+// an internal segments-array (which itself grows by doubling).
+// `sb_finalize` walks the segments and packs everything into a
+// fresh `String` of the exact size — one final allocation, no
+// rebuilding-the-prefix work.
+//
+// ## Operations (builtin)
+//
+// All ops are gated on the `Mem` effect; user `main` declaring
+// `![Mem, ...]` (or any helper that does so) can use them.
+//
+//   - `sb_new() -> StringBuilder ![Mem]`
+//
+//     Allocate a fresh, empty StringBuilder. Initial segments
+//     array is sized for [`INITIAL_SEG_CAP`] = 4 segment slots
+//     (16 KiB before the segments-array first grows).
+//
+//   - `sb_append(sb: StringBuilder, s: String) -> Unit ![Mem]`
+//
+//     Append `s`'s UTF-8 payload to the StringBuilder. Empty
+//     strings are no-ops. Crossing a 4 KiB segment boundary
+//     allocates a new segment; running out of segment-array
+//     slots doubles the array. Both growths are O(1) amortised.
+//
+//   - `sb_finalize(sb: StringBuilder) -> String ![Mem]`
+//
+//     Walk every segment, copy bytes into a fresh
+//     `total_len`-byte `String`, return it. Does NOT clear the
+//     StringBuilder — appending after finalize extends the
+//     existing buffer, and a subsequent `sb_finalize` returns
+//     the longer combined result. (This matches Java
+//     `StringBuilder.toString()` semantics.)
+//
+// ## Layout
+//
+// StringBuilder record (4 payload words, count=4, bitmap=0b1000):
+//
+// ```text
+// offset 0  : 8-byte header (tag = TAG_STRING_BUILDER=0x08)
+// offset 8  : u64 total_len     (running total bytes appended)
+// offset 16 : u64 seg_count     (number of allocated segments)
+// offset 24 : u64 seg_used_tail (bytes used in the tail segment)
+// offset 32 : *mut u8 segments  (TAG_ARRAY of segment pointers)
+// ```
+//
+// The bitmap bit at index 3 (`0b1000`) marks `segments` as a GC
+// pointer; the three preceding scalar fields are skipped during
+// precise-walk mark-phase tracing (Boehm scans conservatively
+// in v1, so the bitmap is mostly informational; v2's precise
+// walker consumes it).
+//
+// Each segment is a `TAG_MUT_BYTE_ARRAY` of 4096 bytes, zero-
+// filled. The segments array is a `TAG_ARRAY` of 8-byte pointer
+// slots (Boehm's conservative scan finds segment pointers
+// regardless of bitmap precision).
+//
+// Counters `StringBuilderAllocCount` / `StringBuilderAllocBytes`
+// (IDs 20 / 21) tally allocations.
+//
+// ## Mem effect gate
+//
+// Calling any `sb_*` op outside an `![Mem, ...]` row fires E0042
+// at typecheck time. Same gate as `MutArray` / `MutByteArray`.
+// `Mem` is a marker effect (zero ops; no perform-dispatch); see
+// `[DEVIATION Task 66]` for the rationale.
+//
+// ## Idiomatic use
+//
+// ```sigil
+// fn render_table(rows: List[String]) -> String ![Mem] {
+//   let sb: StringBuilder = sb_new();
+//   sb_append(sb, "header\n");
+//   for_each_row(rows, sb);  // hypothetical iteration helper
+//   sb_finalize(sb)
+// }
+// ```
+//
+// The `Mem` row is closed under `for_each_row`; users compose
+// builder writes through any `![Mem]`-declaring helpers.
+//
+// ## v1 vs v2
+//
+// The plan body specifies "rope (segments of fixed max size)";
+// the v1 implementation matches: 4 KiB segments, doubling
+// segments-array. Layout details (segment size, growth factor)
+// are ABI-internal and may change in v2 without surface impact.
+//
+// Operations not yet shipped (deferred to v2 if demand surfaces):
+//
+//   - `sb_length(sb) -> Int ![Mem]` — query running `total_len`
+//     without finalizing. Trivial to add; deferred until a
+//     concrete user shows up.
+//   - `sb_clear(sb) -> Unit ![Mem]` — reset to empty without
+//     re-allocating the segments. Same.
+//   - `sb_append_char(sb, c) -> Unit ![Mem]` — append a single
+//     `Char`. Defers with the `Char` codepoint surface (Task
+//     68 part 2).

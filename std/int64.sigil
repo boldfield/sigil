@@ -1,0 +1,96 @@
+// sigil: 0.1
+//
+// std/int64.sigil — Plan C Task 69. **Documentation only.**
+//
+// This file is listed in `compiler/src/imports.rs::BUILTIN_INJECTED`
+// — `import std.int64` is a no-op at the resolver. The `Int64`
+// type and its operations are registered as builtins via
+// `typecheck::builtin_types()` and
+// `register_builtin_int64_schemes()`; codegen dispatches each call
+// site through the `BuiltinFuncIds` / `BuiltinFuncRefs` aggregate.
+// Users never need to write the import; the type and ops are in
+// scope from program start.
+//
+// ## What is `Int64`?
+//
+// Sigil's user-facing `Int` is a 63-bit signed integer (one bit is
+// reserved for the value-tag at the FFI boundary; range
+// `[-2^62, 2^62)`). For computations that need the full
+// 64-bit-signed range — Unix nanosecond timestamps, large
+// identifiers, OS entropy seeds — `Int64` ships as a boxed,
+// heap-allocated record carrying a native `i64` payload.
+//
+// Compare to:
+//   - Java's `Long` (boxed 64-bit).
+//   - Python's transparent arbitrary-precision integers.
+//   - Rust's `i64` (unboxed 64-bit).
+//
+// ## Operations (builtin)
+//
+// Construction:
+//   - `int64_from_int(n: Int) -> Int64 ![]`
+//
+// Arithmetic (each allocates a fresh box; wraps on overflow per
+// two's-complement, matching Sigil `Int`'s Plan A2 wrap semantics):
+//   - `int64_add(a: Int64, b: Int64) -> Int64 ![]`
+//   - `int64_sub(a: Int64, b: Int64) -> Int64 ![]`
+//   - `int64_mul(a: Int64, b: Int64) -> Int64 ![]`
+//   - `int64_div(a: Int64, b: Int64) -> Int64 ![]` — aborts on
+//     `b == 0` and on `i64::MIN / -1`.
+//   - `int64_mod(a: Int64, b: Int64) -> Int64 ![]` — aborts on
+//     `b == 0`.
+//   - `int64_neg(n: Int64) -> Int64 ![]` — wraps `i64::MIN` to
+//     itself.
+//
+// Comparison (do not allocate; return Sigil `Bool`):
+//   - `int64_eq(a: Int64, b: Int64) -> Bool ![]`
+//   - `int64_lt(a: Int64, b: Int64) -> Bool ![]`
+//   - `int64_le(a: Int64, b: Int64) -> Bool ![]`
+//   - `int64_gt(a: Int64, b: Int64) -> Bool ![]`
+//   - `int64_ge(a: Int64, b: Int64) -> Bool ![]`
+//
+// Conversion:
+//   - `int64_to_int(n: Int64) -> Int ![]` — saturates to
+//     `[INT_MIN, INT_MAX]` (where `INT_MIN = -2^62` and
+//     `INT_MAX = 2^62 - 1`). Lossy on values outside that
+//     range; users wanting full-range round-tripping keep
+//     values boxed.
+//   - `int64_to_string(n: Int64) -> String ![]` — decimal
+//     formatting with a leading `-` for negatives.
+//
+// ## Layout
+//
+// Each `Int64` is a heap record:
+//
+// ```text
+// offset 0  : 8-byte header (tag = TAG_INT64=0x02, count=1, bitmap=0)
+// offset 8  : i64 payload
+// ```
+//
+// `bitmap=0` (atomic alloc): the payload is a scalar, never a
+// pointer, so Boehm uses `GC_malloc_atomic` and skips scanning the
+// payload entirely. Counters `Int64AllocCount` /
+// `Int64AllocBytes` (IDs 18 / 19) tally allocations.
+//
+// ## Per-op allocation
+//
+// Every arithmetic / construction / negation / stringify op
+// allocates a fresh record. v1 ships immutable boxed values — no
+// in-place mutation, no record reuse. Tight loops over large Int64
+// ranges should expect GC pressure proportional to the op count;
+// v2 may add an arena class for short-lived intermediate Int64s.
+//
+// ## v1 vs v2
+//
+// **Deferred to v2:** `int64_from_string(String) -> Result[Int64,
+// String]`. The natural form requires `Result` in scope, which
+// trips the same flat-stdlib-namespace constraint documented in
+// `[DEVIATION Task 66.5]` (collisions on `map` between `std.list`,
+// `std.option`, `std.result`). Closes when stdlib namespacing
+// ships.
+//
+// **Deferred to v2 (operational):** `Random.seeded(Int64)` and
+// `Clock.frozen(Int64)` handlers per `[DEVIATION Task 75 + 76]`.
+// Now that Int64 is shipped, these become straightforward to
+// implement; a follow-up Task 75 part 2 + Task 76 part 2 lands the
+// deterministic handlers.

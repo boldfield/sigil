@@ -78,6 +78,27 @@ pub const TAG_BYTE_ARRAY: u8 = 0x06;
 /// place).
 pub const TAG_MUT_BYTE_ARRAY: u8 = 0x07;
 
+/// StringBuilder record layout — Plan C Task 67. A segmented rope
+/// for incremental string construction under the `Mem` effect.
+///
+/// Heap layout (record):
+///
+/// ```text
+/// offset 0  : 8-byte header (tag = TAG_STRING_BUILDER, count=4, bitmap=0b1000)
+/// offset 8  : u64 total_len (running total bytes appended)
+/// offset 16 : u64 seg_count (number of allocated segments)
+/// offset 24 : u64 seg_used  (bytes used in tail segment)
+/// offset 32 : *mut u8 segments_array (pointer to a MutArray-style
+///                                     vector of segment pointers)
+/// ```
+///
+/// The bitmap bit at index 3 (`0b1000`) marks the `segments_array`
+/// pointer for GC tracing; the three preceding payload words are
+/// scalars. Each segment is a `TAG_MUT_BYTE_ARRAY` of fixed
+/// capacity (4096 bytes); `sb_append` writes into the tail
+/// segment and grows the segments_array on overflow.
+pub const TAG_STRING_BUILDER: u8 = 0x08;
+
 /// Payload-word-count field layout.
 pub const COUNT_BITS: u32 = 6;
 pub const COUNT_SHIFT: u32 = 8;
@@ -155,6 +176,7 @@ mod tests {
         assert_eq!(TAG_MUT_ARRAY, 0x05);
         assert_eq!(TAG_BYTE_ARRAY, 0x06);
         assert_eq!(TAG_MUT_BYTE_ARRAY, 0x07);
+        assert_eq!(TAG_STRING_BUILDER, 0x08);
         assert_eq!(TAG_EXTERNAL_DESCRIPTOR, 0xFF);
     }
 }

@@ -66,6 +66,8 @@ const BUILTIN_INJECTED: &[&str] = &[
     "mut_byte_array.sigil",
     "string.sigil",
     "mem.sigil",
+    "int64.sigil",
+    "string_builder.sigil",
 ];
 
 /// Resolve every `Item::Import` in `program` against the embedded stdlib.

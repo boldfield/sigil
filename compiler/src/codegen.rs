@@ -725,6 +725,25 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("mut_byte_array_length".to_string());
     globals.insert("mut_byte_array_get".to_string());
     globals.insert("mut_byte_array_set".to_string());
+    // Plan C Task 69 — boxed Int64 builtins.
+    globals.insert("int64_from_int".to_string());
+    globals.insert("int64_add".to_string());
+    globals.insert("int64_sub".to_string());
+    globals.insert("int64_mul".to_string());
+    globals.insert("int64_div".to_string());
+    globals.insert("int64_mod".to_string());
+    globals.insert("int64_neg".to_string());
+    globals.insert("int64_eq".to_string());
+    globals.insert("int64_lt".to_string());
+    globals.insert("int64_le".to_string());
+    globals.insert("int64_gt".to_string());
+    globals.insert("int64_ge".to_string());
+    globals.insert("int64_to_int".to_string());
+    globals.insert("int64_to_string".to_string());
+    // Plan C Task 67 — StringBuilder builtins (Mem-gated).
+    globals.insert("sb_new".to_string());
+    globals.insert("sb_append".to_string());
+    globals.insert("sb_finalize".to_string());
     // Plan C Task 68 — extended String primitives.
     globals.insert("string_concat".to_string());
     globals.insert("string_substring".to_string());
@@ -5007,6 +5026,163 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_mut_byte_array_set: {e}"))?;
 
+    // Plan C Task 69 — runtime Int64 primitives. Boxed 64-bit
+    // signed integer; every arithmetic / construction / negation
+    // op allocates a fresh `TAG_INT64` record.
+
+    // sigil_int64_from_int(v: i64) -> *mut u8
+    let mut int64_from_int_sig = Signature::new(isa_call_conv(&module));
+    int64_from_int_sig.params.push(AbiParam::new(types::I64));
+    int64_from_int_sig.returns.push(AbiParam::new(pointer_ty));
+    let int64_from_int = module
+        .declare_function("sigil_int64_from_int", Linkage::Import, &int64_from_int_sig)
+        .map_err(|e| format!("declare sigil_int64_from_int: {e}"))?;
+
+    // Helper for the binary `(Int64, Int64) -> Int64` shape:
+    // arithmetic ops `add/sub/mul/div/mod`.
+    let make_int64_binop = |name: &str, sig_holder: &mut Signature| {
+        sig_holder.params.clear();
+        sig_holder.returns.clear();
+        sig_holder.params.push(AbiParam::new(pointer_ty));
+        sig_holder.params.push(AbiParam::new(pointer_ty));
+        sig_holder.returns.push(AbiParam::new(pointer_ty));
+        let _ = name;
+    };
+
+    let mut int64_add_sig = Signature::new(isa_call_conv(&module));
+    make_int64_binop("sigil_int64_add", &mut int64_add_sig);
+    let int64_add = module
+        .declare_function("sigil_int64_add", Linkage::Import, &int64_add_sig)
+        .map_err(|e| format!("declare sigil_int64_add: {e}"))?;
+
+    let mut int64_sub_sig = Signature::new(isa_call_conv(&module));
+    make_int64_binop("sigil_int64_sub", &mut int64_sub_sig);
+    let int64_sub = module
+        .declare_function("sigil_int64_sub", Linkage::Import, &int64_sub_sig)
+        .map_err(|e| format!("declare sigil_int64_sub: {e}"))?;
+
+    let mut int64_mul_sig = Signature::new(isa_call_conv(&module));
+    make_int64_binop("sigil_int64_mul", &mut int64_mul_sig);
+    let int64_mul = module
+        .declare_function("sigil_int64_mul", Linkage::Import, &int64_mul_sig)
+        .map_err(|e| format!("declare sigil_int64_mul: {e}"))?;
+
+    let mut int64_div_sig = Signature::new(isa_call_conv(&module));
+    make_int64_binop("sigil_int64_div", &mut int64_div_sig);
+    let int64_div = module
+        .declare_function("sigil_int64_div", Linkage::Import, &int64_div_sig)
+        .map_err(|e| format!("declare sigil_int64_div: {e}"))?;
+
+    let mut int64_mod_sig = Signature::new(isa_call_conv(&module));
+    make_int64_binop("sigil_int64_mod", &mut int64_mod_sig);
+    let int64_mod = module
+        .declare_function("sigil_int64_mod", Linkage::Import, &int64_mod_sig)
+        .map_err(|e| format!("declare sigil_int64_mod: {e}"))?;
+
+    // sigil_int64_neg(p: *const u8) -> *mut u8
+    let mut int64_neg_sig = Signature::new(isa_call_conv(&module));
+    int64_neg_sig.params.push(AbiParam::new(pointer_ty));
+    int64_neg_sig.returns.push(AbiParam::new(pointer_ty));
+    let int64_neg = module
+        .declare_function("sigil_int64_neg", Linkage::Import, &int64_neg_sig)
+        .map_err(|e| format!("declare sigil_int64_neg: {e}"))?;
+
+    // sigil_int64_eq / _lt / _le / _gt / _ge (Int64, Int64) -> u8 (Bool)
+    let make_int64_cmp = |sig_holder: &mut Signature, ptr_ty: types::Type| {
+        sig_holder.params.clear();
+        sig_holder.returns.clear();
+        sig_holder.params.push(AbiParam::new(ptr_ty));
+        sig_holder.params.push(AbiParam::new(ptr_ty));
+        sig_holder.returns.push(AbiParam::new(types::I8));
+    };
+
+    let mut int64_eq_sig = Signature::new(isa_call_conv(&module));
+    make_int64_cmp(&mut int64_eq_sig, pointer_ty);
+    let int64_eq = module
+        .declare_function("sigil_int64_eq", Linkage::Import, &int64_eq_sig)
+        .map_err(|e| format!("declare sigil_int64_eq: {e}"))?;
+
+    let mut int64_lt_sig = Signature::new(isa_call_conv(&module));
+    make_int64_cmp(&mut int64_lt_sig, pointer_ty);
+    let int64_lt = module
+        .declare_function("sigil_int64_lt", Linkage::Import, &int64_lt_sig)
+        .map_err(|e| format!("declare sigil_int64_lt: {e}"))?;
+
+    let mut int64_le_sig = Signature::new(isa_call_conv(&module));
+    make_int64_cmp(&mut int64_le_sig, pointer_ty);
+    let int64_le = module
+        .declare_function("sigil_int64_le", Linkage::Import, &int64_le_sig)
+        .map_err(|e| format!("declare sigil_int64_le: {e}"))?;
+
+    let mut int64_gt_sig = Signature::new(isa_call_conv(&module));
+    make_int64_cmp(&mut int64_gt_sig, pointer_ty);
+    let int64_gt = module
+        .declare_function("sigil_int64_gt", Linkage::Import, &int64_gt_sig)
+        .map_err(|e| format!("declare sigil_int64_gt: {e}"))?;
+
+    let mut int64_ge_sig = Signature::new(isa_call_conv(&module));
+    make_int64_cmp(&mut int64_ge_sig, pointer_ty);
+    let int64_ge = module
+        .declare_function("sigil_int64_ge", Linkage::Import, &int64_ge_sig)
+        .map_err(|e| format!("declare sigil_int64_ge: {e}"))?;
+
+    // sigil_int64_to_int(p: *const u8) -> i64 (saturating)
+    let mut int64_to_int_sig = Signature::new(isa_call_conv(&module));
+    int64_to_int_sig.params.push(AbiParam::new(pointer_ty));
+    int64_to_int_sig.returns.push(AbiParam::new(types::I64));
+    let int64_to_int = module
+        .declare_function("sigil_int64_to_int", Linkage::Import, &int64_to_int_sig)
+        .map_err(|e| format!("declare sigil_int64_to_int: {e}"))?;
+
+    // sigil_int64_to_string(p: *const u8) -> *mut u8
+    let mut int64_to_string_sig = Signature::new(isa_call_conv(&module));
+    int64_to_string_sig.params.push(AbiParam::new(pointer_ty));
+    int64_to_string_sig.returns.push(AbiParam::new(pointer_ty));
+    let int64_to_string = module
+        .declare_function(
+            "sigil_int64_to_string",
+            Linkage::Import,
+            &int64_to_string_sig,
+        )
+        .map_err(|e| format!("declare sigil_int64_to_string: {e}"))?;
+
+    // Plan C Task 67 — runtime StringBuilder primitives. Mem-gated
+    // segmented rope; allocates segments on overflow.
+
+    // sigil_string_builder_new() -> *mut u8
+    let sb_new_sig = {
+        let mut s = Signature::new(isa_call_conv(&module));
+        s.returns.push(AbiParam::new(pointer_ty));
+        s
+    };
+    let sb_new = module
+        .declare_function("sigil_string_builder_new", Linkage::Import, &sb_new_sig)
+        .map_err(|e| format!("declare sigil_string_builder_new: {e}"))?;
+
+    // sigil_string_builder_append(sb: *mut u8, s: *const u8) -> ()
+    let mut sb_append_sig = Signature::new(isa_call_conv(&module));
+    sb_append_sig.params.push(AbiParam::new(pointer_ty));
+    sb_append_sig.params.push(AbiParam::new(pointer_ty));
+    let sb_append = module
+        .declare_function(
+            "sigil_string_builder_append",
+            Linkage::Import,
+            &sb_append_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_builder_append: {e}"))?;
+
+    // sigil_string_builder_finalize(sb: *const u8) -> *mut u8 (TAG_STRING)
+    let mut sb_finalize_sig = Signature::new(isa_call_conv(&module));
+    sb_finalize_sig.params.push(AbiParam::new(pointer_ty));
+    sb_finalize_sig.returns.push(AbiParam::new(pointer_ty));
+    let sb_finalize = module
+        .declare_function(
+            "sigil_string_builder_finalize",
+            Linkage::Import,
+            &sb_finalize_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_builder_finalize: {e}"))?;
+
     // Plan C Task 68 — extended String primitives in
     // `runtime/src/string.rs`. All operate on `TAG_STRING` headers.
 
@@ -5998,6 +6174,23 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             mut_byte_array_length,
             mut_byte_array_get,
             mut_byte_array_set,
+            int64_from_int,
+            int64_add,
+            int64_sub,
+            int64_mul,
+            int64_div,
+            int64_mod,
+            int64_neg,
+            int64_eq,
+            int64_lt,
+            int64_le,
+            int64_gt,
+            int64_ge,
+            int64_to_int,
+            int64_to_string,
+            sb_new,
+            sb_append,
+            sb_finalize,
             string_concat,
             string_substring,
             string_byte_at,
@@ -11924,6 +12117,182 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // the Sigil-level Unit value (I8 zero).
                 self.builder.ins().iconst(types::I8, 0)
             }
+            // Plan C Task 69 — boxed Int64 primitives. Each
+            // arithmetic / construction / negation op allocates one
+            // record and so emits a stackmap placeholder. Pure
+            // comparison / conversion ops (eq/lt/le/gt/ge/to_int)
+            // do not allocate.
+            Expr::Ident(name, _) if name == "int64_from_int" => {
+                assert_eq!(args.len(), 1, "int64_from_int builtin arg count is not 1");
+                let v = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.int64_from_int_ref, &[v]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_add" => {
+                assert_eq!(args.len(), 2, "int64_add builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.int64_add_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_sub" => {
+                assert_eq!(args.len(), 2, "int64_sub builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.int64_sub_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_mul" => {
+                assert_eq!(args.len(), 2, "int64_mul builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.int64_mul_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_div" => {
+                assert_eq!(args.len(), 2, "int64_div builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.int64_div_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_mod" => {
+                assert_eq!(args.len(), 2, "int64_mod builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.int64_mod_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_neg" => {
+                assert_eq!(args.len(), 1, "int64_neg builtin arg count is not 1");
+                let v = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.int64_neg_ref, &[v]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_eq" => {
+                assert_eq!(args.len(), 2, "int64_eq builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int64_eq_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_lt" => {
+                assert_eq!(args.len(), 2, "int64_lt builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int64_lt_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_le" => {
+                assert_eq!(args.len(), 2, "int64_le builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int64_le_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_gt" => {
+                assert_eq!(args.len(), 2, "int64_gt builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int64_gt_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_ge" => {
+                assert_eq!(args.len(), 2, "int64_ge builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int64_ge_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_to_int" => {
+                assert_eq!(args.len(), 1, "int64_to_int builtin arg count is not 1");
+                let v = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.int64_to_int_ref, &[v]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int64_to_string" => {
+                assert_eq!(args.len(), 1, "int64_to_string builtin arg count is not 1");
+                let v = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.int64_to_string_ref, &[v]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            // Plan C Task 67 — runtime StringBuilder primitives.
+            // Mem-gated; sb_new and sb_finalize allocate (push
+            // stackmap placeholder), sb_append writes into existing
+            // segments and may grow the segments array (also push
+            // placeholder).
+            Expr::Ident(name, _) if name == "sb_new" => {
+                assert_eq!(args.len(), 0, "sb_new builtin arg count is not 0");
+                let call = self.builder.ins().call(self.builtins.sb_new_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "sb_append" => {
+                assert_eq!(args.len(), 2, "sb_append builtin arg count is not 2");
+                let sb = self.lower_expr(&args[0]);
+                let s = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.sb_append_ref, &[sb, s]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                // sigil_string_builder_append returns nothing;
+                // produce Sigil-level Unit (I8 zero).
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            Expr::Ident(name, _) if name == "sb_finalize" => {
+                assert_eq!(args.len(), 1, "sb_finalize builtin arg count is not 1");
+                let sb = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.sb_finalize_ref, &[sb]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
             // Plan C Task 68 — extended String primitives. All
             // dispatch through `runtime/src/string.rs`.
             Expr::Ident(name, _) if name == "string_concat" => {
@@ -13282,6 +13651,42 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 Expr::Ident(name, _) if name == "mut_byte_array_length" => types::I64,
                 Expr::Ident(name, _) if name == "mut_byte_array_get" => types::I8,
                 Expr::Ident(name, _) if name == "mut_byte_array_set" => types::I8,
+                // Plan C Task 69 — boxed Int64 return-type predictions.
+                // Constructors / arithmetic / negation return Int64
+                // (pointer); comparisons return Bool (I8); `_to_int`
+                // returns Int (I64); `_to_string` returns String
+                // (pointer).
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "int64_from_int"
+                            | "int64_add"
+                            | "int64_sub"
+                            | "int64_mul"
+                            | "int64_div"
+                            | "int64_mod"
+                            | "int64_neg"
+                            | "int64_to_string"
+                    ) =>
+                {
+                    self.pointer_ty
+                }
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "int64_eq" | "int64_lt" | "int64_le" | "int64_gt" | "int64_ge"
+                    ) =>
+                {
+                    types::I8
+                }
+                Expr::Ident(name, _) if name == "int64_to_int" => types::I64,
+                // Plan C Task 67 — StringBuilder return-type predictions.
+                // `sb_new` / `sb_finalize` return pointer; `sb_append`
+                // returns Unit (I8 zero).
+                Expr::Ident(name, _) if name == "sb_new" || name == "sb_finalize" => {
+                    self.pointer_ty
+                }
+                Expr::Ident(name, _) if name == "sb_append" => types::I8,
                 // Plan C Task 68 — extended String primitive return
                 // types. `string_concat` / `string_substring` /
                 // `string_trim` produce a fresh String (pointer);
@@ -13737,6 +14142,26 @@ struct BuiltinFuncIds {
     mut_byte_array_length: cranelift_module::FuncId,
     mut_byte_array_get: cranelift_module::FuncId,
     mut_byte_array_set: cranelift_module::FuncId,
+    /// Plan C Task 69 — boxed Int64 runtime primitive FuncIds.
+    int64_from_int: cranelift_module::FuncId,
+    int64_add: cranelift_module::FuncId,
+    int64_sub: cranelift_module::FuncId,
+    int64_mul: cranelift_module::FuncId,
+    int64_div: cranelift_module::FuncId,
+    int64_mod: cranelift_module::FuncId,
+    int64_neg: cranelift_module::FuncId,
+    int64_eq: cranelift_module::FuncId,
+    int64_lt: cranelift_module::FuncId,
+    int64_le: cranelift_module::FuncId,
+    int64_gt: cranelift_module::FuncId,
+    int64_ge: cranelift_module::FuncId,
+    int64_to_int: cranelift_module::FuncId,
+    int64_to_string: cranelift_module::FuncId,
+    /// Plan C Task 67 — runtime StringBuilder primitive FuncIds.
+    /// Mem-gated.
+    sb_new: cranelift_module::FuncId,
+    sb_append: cranelift_module::FuncId,
+    sb_finalize: cranelift_module::FuncId,
     /// Plan C Task 68 — extended String primitives (`runtime/src/string.rs`).
     string_concat: cranelift_module::FuncId,
     string_substring: cranelift_module::FuncId,
@@ -13804,6 +14229,25 @@ struct BuiltinFuncRefs {
     mut_byte_array_length_ref: FuncRef,
     mut_byte_array_get_ref: FuncRef,
     mut_byte_array_set_ref: FuncRef,
+    /// Plan C Task 69 — boxed Int64 primitive FuncRefs.
+    int64_from_int_ref: FuncRef,
+    int64_add_ref: FuncRef,
+    int64_sub_ref: FuncRef,
+    int64_mul_ref: FuncRef,
+    int64_div_ref: FuncRef,
+    int64_mod_ref: FuncRef,
+    int64_neg_ref: FuncRef,
+    int64_eq_ref: FuncRef,
+    int64_lt_ref: FuncRef,
+    int64_le_ref: FuncRef,
+    int64_gt_ref: FuncRef,
+    int64_ge_ref: FuncRef,
+    int64_to_int_ref: FuncRef,
+    int64_to_string_ref: FuncRef,
+    /// Plan C Task 67 — StringBuilder primitive FuncRefs (Mem-gated).
+    sb_new_ref: FuncRef,
+    sb_append_ref: FuncRef,
+    sb_finalize_ref: FuncRef,
     /// Plan C Task 68 — extended String primitive FuncRefs.
     string_concat_ref: FuncRef,
     string_substring_ref: FuncRef,
@@ -14018,6 +14462,23 @@ fn prepare_builtin_func_refs(
             .declare_func_in_func(ids.mut_byte_array_length, builder.func),
         mut_byte_array_get_ref: module.declare_func_in_func(ids.mut_byte_array_get, builder.func),
         mut_byte_array_set_ref: module.declare_func_in_func(ids.mut_byte_array_set, builder.func),
+        int64_from_int_ref: module.declare_func_in_func(ids.int64_from_int, builder.func),
+        int64_add_ref: module.declare_func_in_func(ids.int64_add, builder.func),
+        int64_sub_ref: module.declare_func_in_func(ids.int64_sub, builder.func),
+        int64_mul_ref: module.declare_func_in_func(ids.int64_mul, builder.func),
+        int64_div_ref: module.declare_func_in_func(ids.int64_div, builder.func),
+        int64_mod_ref: module.declare_func_in_func(ids.int64_mod, builder.func),
+        int64_neg_ref: module.declare_func_in_func(ids.int64_neg, builder.func),
+        int64_eq_ref: module.declare_func_in_func(ids.int64_eq, builder.func),
+        int64_lt_ref: module.declare_func_in_func(ids.int64_lt, builder.func),
+        int64_le_ref: module.declare_func_in_func(ids.int64_le, builder.func),
+        int64_gt_ref: module.declare_func_in_func(ids.int64_gt, builder.func),
+        int64_ge_ref: module.declare_func_in_func(ids.int64_ge, builder.func),
+        int64_to_int_ref: module.declare_func_in_func(ids.int64_to_int, builder.func),
+        int64_to_string_ref: module.declare_func_in_func(ids.int64_to_string, builder.func),
+        sb_new_ref: module.declare_func_in_func(ids.sb_new, builder.func),
+        sb_append_ref: module.declare_func_in_func(ids.sb_append, builder.func),
+        sb_finalize_ref: module.declare_func_in_func(ids.sb_finalize, builder.func),
         string_concat_ref: module.declare_func_in_func(ids.string_concat, builder.func),
         string_substring_ref: module.declare_func_in_func(ids.string_substring, builder.func),
         string_byte_at_ref: module.declare_func_in_func(ids.string_byte_at, builder.func),

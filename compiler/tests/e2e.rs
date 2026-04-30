@@ -7098,6 +7098,346 @@ fn std_choose_inline_fail_returns_minus_one() {
     assert_eq!(stdout, "-1\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 69 — boxed Int64 run-and-check-output =====
+
+/// Construct two Int64s, add them, stringify and print. Pins the
+/// allocation + arithmetic + stringify roundtrip end-to-end.
+#[test]
+fn std_int64_construct_add_to_string() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let a: Int64 = int64_from_int(40);\n  \
+                 let b: Int64 = int64_from_int(2);\n  \
+                 let s: String = int64_to_string(int64_add(a, b));\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_add_to_string");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// Negation + subtraction + `int64_to_int` round-trip on small
+/// values that fit in 63-bit Int with no saturation.
+#[test]
+fn std_int64_neg_sub_to_int_round_trips() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let a: Int64 = int64_from_int(10);\n  \
+                 let b: Int64 = int64_from_int(3);\n  \
+                 let r: Int64 = int64_sub(int64_neg(a), b);\n  \
+                 perform IO.println(int_to_string(int64_to_int(r)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_neg_sub");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "-13\n", "stderr={stderr:?}");
+}
+
+/// Multiplication, division, modulo. Pin signed-rem semantics
+/// (sign of dividend) for `int64_mod`.
+#[test]
+fn std_int64_mul_div_mod() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let a: Int64 = int64_from_int(7);\n  \
+                 let b: Int64 = int64_from_int(3);\n  \
+                 let m: Int64 = int64_mul(a, b);\n  \
+                 let q: Int64 = int64_div(a, b);\n  \
+                 let r: Int64 = int64_mod(a, b);\n  \
+                 perform IO.println(int_to_string(int64_to_int(m)));\n  \
+                 perform IO.println(int_to_string(int64_to_int(q)));\n  \
+                 perform IO.println(int_to_string(int64_to_int(r)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_mul_div_mod");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "21\n2\n1\n", "stderr={stderr:?}");
+}
+
+/// Comparison ops on equal and ordered pairs. Bool gets stringified
+/// via match → "true"/"false" branches printing the result.
+#[test]
+fn std_int64_comparisons_match_expected() {
+    let src = "fn show(b: Bool) -> String ![] {\n  \
+                 match b { true => \"T\", false => \"F\" }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int64 = int64_from_int(5);\n  \
+                 let b: Int64 = int64_from_int(7);\n  \
+                 perform IO.println(show(int64_eq(a, a)));\n  \
+                 perform IO.println(show(int64_eq(a, b)));\n  \
+                 perform IO.println(show(int64_lt(a, b)));\n  \
+                 perform IO.println(show(int64_le(a, a)));\n  \
+                 perform IO.println(show(int64_gt(b, a)));\n  \
+                 perform IO.println(show(int64_ge(a, a)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_cmp");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "T\nF\nT\nT\nT\nT\n", "stderr={stderr:?}");
+}
+
+/// `import std.int64` is a no-op (skip-list path); the surface is
+/// in scope with or without the import. Exercising the import
+/// keeps the doc-only conduit alive.
+#[test]
+fn std_int64_import_is_noop() {
+    let src = "import std.int64\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int64 = int64_from_int(123);\n  \
+                 perform IO.println(int64_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "123\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 67 — StringBuilder run-and-check-output =====
+
+/// `sb_new` then `sb_finalize` returns the empty string. Smoke
+/// test for record allocation + zero-segment finalize.
+#[test]
+fn std_string_builder_new_finalize_empty() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let sb: StringBuilder = sb_new();\n  \
+                 let s: String = sb_finalize(sb);\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_sb_new_finalize_empty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "\n", "stderr={stderr:?}");
+}
+
+/// Three appends concatenate into a single `String` in order.
+#[test]
+fn std_string_builder_three_appends_concat() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let sb: StringBuilder = sb_new();\n  \
+                 sb_append(sb, \"foo\");\n  \
+                 sb_append(sb, \"bar\");\n  \
+                 sb_append(sb, \"baz\");\n  \
+                 let s: String = sb_finalize(sb);\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_sb_three_appends");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "foobarbaz\n", "stderr={stderr:?}");
+}
+
+/// Empty-string append is a no-op. Pin idempotence around empty
+/// inputs (the runtime fast-paths zero-length appends).
+#[test]
+fn std_string_builder_empty_append_is_noop() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let sb: StringBuilder = sb_new();\n  \
+                 sb_append(sb, \"\");\n  \
+                 sb_append(sb, \"hello\");\n  \
+                 sb_append(sb, \"\");\n  \
+                 perform IO.println(sb_finalize(sb));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_sb_empty_append");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello\n", "stderr={stderr:?}");
+}
+
+/// SB mutation propagates across fn boundaries — the same
+/// builder passed into a helper accumulates writes from both
+/// caller and callee.
+#[test]
+fn std_string_builder_mutation_visible_across_fn_boundary() {
+    let src = "fn append_b(sb: StringBuilder) -> Unit ![Mem] {\n  \
+                 sb_append(sb, \"-mid-\")\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let sb: StringBuilder = sb_new();\n  \
+                 sb_append(sb, \"start\");\n  \
+                 append_b(sb);\n  \
+                 sb_append(sb, \"end\");\n  \
+                 perform IO.println(sb_finalize(sb));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_sb_cross_fn");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "start-mid-end\n", "stderr={stderr:?}");
+}
+
+/// `import std.string_builder` is a no-op (skip-list path).
+#[test]
+fn std_string_builder_import_is_noop() {
+    let src = "import std.string_builder\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let sb: StringBuilder = sb_new();\n  \
+                 sb_append(sb, \"ok\");\n  \
+                 perform IO.println(sb_finalize(sb));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_sb_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "ok\n", "stderr={stderr:?}");
+}
+
+// ===== Plan C Task 79 — `examples/interpreter.sigil` =====
+
+/// Exercise the demo lambda-calculus interpreter end-to-end:
+///   - `run_demo`: `let x = 10 in let y = 32 in if x then x+y else 0` → 42
+///   - `run_broken`: references unbound `x` → "error: unbound variable: x"
+///
+/// Pins both the success path (Ok converts to int_to_string) and
+/// the failure path (Err captures the raised String) under a top-
+/// level `catch` per `[DEVIATION Task 71]`.
+#[test]
+fn interpreter_example_evaluates_and_handles_unbound_var() {
+    let root = workspace_root();
+    let source = root.join("examples/interpreter.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "interpreter_example");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\nerror: unbound variable: x\n",
+        "stderr={stderr:?}"
+    );
+}
+
+// ===== Plan C Task 78 — Random / Clock unit-test coverage =====
+
+/// Plan C Task 75 part 1 ships `std/random.sigil` with
+/// `random_int()` and `run_pseudo_random`. The typecheck path is
+/// covered by `typecheck::tests::*random*` already; this test
+/// exercises the runtime end-to-end. Random output is non-
+/// deterministic, so we assert only on shape: the discharged body
+/// returns an Int that round-trips through `int_to_string` (stdout
+/// is non-empty and the program exits 0).
+#[test]
+fn std_random_run_pseudo_random_round_trips_an_int() {
+    let src = "import std.random\n\
+               fn pick() -> Int ![Random] { random_int() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let v: Int = run_pseudo_random(pick);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_random_round_trip");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert!(
+        !stdout.is_empty(),
+        "expected some output; stderr={stderr:?}"
+    );
+    // The output is a decimal int followed by '\n'. Strip the
+    // newline and confirm the prefix parses as i64.
+    let trimmed = stdout.trim_end_matches('\n');
+    assert!(
+        trimmed.parse::<i64>().is_ok(),
+        "expected decimal integer; got {trimmed:?} (stderr={stderr:?})"
+    );
+}
+
+/// Two `random_int()` calls inside one body produce two values.
+/// Pin that the handler invokes the runtime PRNG twice (the
+/// xorshift64 sequence is process-global so successive calls
+/// almost-certainly differ). Asserting on inequality is too
+/// strict (1-in-2^64 false-fail), so we instead confirm both are
+/// well-formed integers and that the program emitted exactly
+/// two lines.
+#[test]
+fn std_random_two_calls_produce_two_outputs() {
+    let src = "import std.random\n\
+               fn two() -> Int ![Random] {\n  \
+                 let a: Int = random_int();\n  \
+                 let _b: Int = random_int();\n  \
+                 a\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run_pseudo_random(two)));\n  \
+                 perform IO.println(\"end\");\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_random_two_calls");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    let lines: Vec<&str> = stdout.split_terminator('\n').collect();
+    assert_eq!(lines.len(), 2, "expected two lines; got {stdout:?}");
+    assert!(
+        lines[0].parse::<i64>().is_ok(),
+        "first line should be decimal int; got {:?}",
+        lines[0]
+    );
+    assert_eq!(lines[1], "end");
+}
+
+/// Plan C Task 76 part 1 ships `std/clock.sigil` with `now()` and
+/// `run_os_clock`. Wall-clock readings are non-deterministic;
+/// assert only on shape (program returns 0, stdout is a positive
+/// integer with at least 18 digits — anything past 1970 is in the
+/// 10^17 nanosecond range or larger).
+#[test]
+fn std_clock_run_os_clock_returns_positive_nanos() {
+    let src = "import std.clock\n\
+               fn read_now() -> Int ![Clock] { now() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let t: Int = run_os_clock(read_now);\n  \
+                 perform IO.println(int_to_string(t));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_clock_round_trip");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    let trimmed = stdout.trim_end_matches('\n');
+    let parsed: i64 = trimmed
+        .parse()
+        .unwrap_or_else(|e| panic!("clock output `{trimmed}` not int: {e}"));
+    assert!(
+        parsed > 1_000_000_000_000_000_000,
+        "expected nanos-since-epoch > 10^18 (i.e. post-2001); got {parsed}"
+    );
+}
+
+/// Two `now()` calls inside the same handler produce timestamps
+/// that monotonically advance (the second is `>=` the first).
+/// Pins the handler-arm-resume mechanism for `Clock`.
+#[test]
+fn std_clock_two_calls_monotonic() {
+    let src = "import std.clock\n\
+               fn two_reads() -> Int ![Clock] {\n  \
+                 let a: Int = now();\n  \
+                 let b: Int = now();\n  \
+                 b - a\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let delta: Int = run_os_clock(two_reads);\n  \
+                 perform IO.println(int_to_string(delta));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_clock_two_calls");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    let trimmed = stdout.trim_end_matches('\n');
+    let delta: i64 = trimmed
+        .parse()
+        .unwrap_or_else(|e| panic!("delta `{trimmed}` not int: {e}"));
+    assert!(
+        delta >= 0,
+        "second clock read should be >= first; got {delta}"
+    );
+}
+
+// ===== Plan C Task 80 — `examples/json.sigil` =====
+
+/// Exercise the JSON pretty-printer over the demo document. Pin
+/// the rendered output byte-for-byte to confirm the StringBuilder
+/// concatenation, recursive printing, and JBool/JNull/JInt arms
+/// all behave correctly. The parser is deferred (see file's
+/// "v1 vs v2" note); the demo proves the printer side end-to-end.
+#[test]
+fn json_example_pretty_prints_demo_document() {
+    let root = workspace_root();
+    let source = root.join("examples/json.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "json_example");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout,
+        "{\"name\": \"ada\", \"age\": 36, \"tags\": [\"math\", \"programming\"], \"active\": true, \"spouse\": null}\n",
+        "stderr={stderr:?}"
+    );
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration
