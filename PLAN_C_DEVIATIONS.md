@@ -117,7 +117,7 @@ The combined surface (Unit literal + arm-body sequencing + row-poly fn-typed par
 
 **Implementing commit(s).** [HEAD] (this entry); shipped alongside `std/list.sigil` and the seven non-`for_each` helpers in [HEAD+1].
 
-## 2026-04-29 — [DEVIATION Task 65] Split into runtime foundation (part 1) and compiler integration (part 2)
+## 2026-04-29 — [DEVIATION Task 65] [CLOSED] Split into runtime foundation (part 1) and compiler integration (part 2)
 
 **Context.** Plan C Task 65 ships immutable `Array[A]` with five operations: `array_alloc`, `array_length`, `array_get`, `array_set`, plus `from_list` / `to_list` (per the plan body). Unlike Tasks 62–64 (`std/option`, `std/result`, `std/list`), Task 65 explicitly requires "runtime support for array allocation; extend `runtime/`." That extension is the foundation for Tasks 66 (`mut_array`), 66.5 (`byte_array`), 66.6 (`mut_byte_array`), 67 (`string_builder`), and 69 (`int64`) — all of which need similar TAG / heap-layout / FFI work.
 
@@ -141,7 +141,23 @@ The full Task 65 (runtime + compiler integration + sigil source + tests) is a ~6
 
 **Failure mode.** Stage-7 progress is bottlenecked on part 2 — Tasks 66+ depend on a working `Array[A]` for some demo programs (sudoku.sigil uses `MutArray[Int]`). Part 2 is non-optional Plan C work, just sequenced after part 1.
 
-**Implementing commit(s).** [HEAD] runtime foundation; **part 2 PENDING** — to be shipped in a follow-up commit pair.
+**Implementing commit(s).** Part 1 runtime foundation: `1ec8ce3`. Part 2 compiler integration: `3b4b7ab` + monomorphize fix `fe14243`. Closure-path satisfied: `Array[A]` is reachable from sigil source with the immutable surface working end-to-end across e2e.
+
+## 2026-04-30 — [DEVIATION Task 65] `array_empty` ships in place of `from_list` / `to_list`
+
+**Context.** Plan C Task 65 plan body lists `array_alloc`, `array_length`, `array_get`, `array_set`, plus `from_list` / `to_list` as the Array surface. What part 2 actually shipped: those four plus a fifth FFI primitive `array_empty()` — and `from_list` / `to_list` are absent. Two related but distinct deviations from the plan body; each calls for its own justification.
+
+**Why `array_empty` was added.** Codegen lowers `Expr::Ident("array_empty")` against a generic builtin scheme `forall A. () -> Array[A]`. With zero value args there is no caller-supplied default to pass to `sigil_array_alloc(len, fill)`. A pure-codegen workaround (synthesise a default by element type) would require monomorph-time knowledge of `A` and a per-type default-value table; cleaner to expose `sigil_array_empty()` as a separate FFI symbol that allocates a zero-length array without touching `fill`. Mechanically trivial in `runtime/src/array.rs:96` (`sigil_array_empty` delegates to `sigil_array_alloc(0, 0)` — the fill byte is irrelevant when there are no slots).
+
+**Why `from_list` / `to_list` are deferred.** Both are pure-sigil-implementable once Tasks 71–76 ship the effect-handler stdlib (`Raise`, `State`, `Choose`, `Mem`). Concretely: `from_list[A](xs: List[A]) -> Array[A]` walks the list while threading a `MutArray[A]` index counter (needs `Mem`), then returns the immutable snapshot via `array_freeze` (would need either an `Array[A] <-> MutArray[A]` cast op or a dedicated runtime primitive). `to_list[A](arr: Array[A]) -> List[A]` is structurally a fold from `array_length(arr) - 1` down to `0`, building `Cons(get(arr, i), acc)` — straightforward in pure sigil once recursive typecheck on `Array[A]` indexing types stabilises in Stage 7. Today's Task 65 surface (alloc/empty/length/get/set) is sufficient for Sudoku (Stage 8) and the spec-validation prompts that exercise array work.
+
+**Why accepted.** Pushing `from_list` / `to_list` to a separate stdlib task keeps Task 65 focused on the runtime + compiler-integration foundation. The closure path is mechanical (write-in-sigil, no codegen surface change); deferring it does not block Tasks 66+ or the Stage 8 demos.
+
+**Closure path.** Lands as a follow-up commit (or as part of Task 67 / 68 string work if scheduling overlaps) once `Mem` mutation is available, OR as a doctest authoring exercise alongside Task 78. Implementing surface: `std/array.sigil` gains documentation comments + the user-side `from_list` / `to_list` helpers; no runtime change required.
+
+**Failure mode.** Users wanting `Array <-> List` interop in v1 must hand-roll a recursive `match` over `List[A]` plus immutable `array_set` chaining. Verbose but expressible.
+
+**Implementing commit(s).** This deviation entry only — closes a documentation gap from PR #42 mid-flight review #6.
 
 ## 2026-04-30 — [DEVIATION Task 66] `Mem` ships as a marker effect; MutArray ops are gated-by-row, not perform-dispatched
 
