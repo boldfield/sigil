@@ -6761,8 +6761,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                    current_fn_name: f.name.clone(),
                     local_fn_types: BTreeMap::new(),
-                    local_var_tys: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
                     captured_fn_sigs: BTreeMap::new(),
                     arm_k_closure_v: None,
@@ -6903,6 +6904,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
                 match_scrut_tys: &checked.match_scrut_tys,
+                match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                current_fn_name: f.name.clone(),
                 local_fn_types: {
                     // Plan B' Stage 6.8 Task 104 — seed with fn-typed
                     // parameters so `lower_call`'s indirect path can
@@ -6912,17 +6915,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         if let crate::ast::TypeExpr::Fn(fty) = &p.ty {
                             m.insert(p.name.clone(), (**fty).clone());
                         }
-                    }
-                    m
-                },
-                local_var_tys: {
-                    // Plan D Task 113 — seed with each param's
-                    // (post-mono concrete) Ty so `lower_match` can
-                    // recover a clone-safe scrutinee type from an
-                    // `Expr::Ident(param_name)`.
-                    let mut m: BTreeMap<String, Ty> = BTreeMap::new();
-                    for p in &f.params {
-                        m.insert(p.name.clone(), crate::monomorphize::type_expr_to_ty(&p.ty));
                     }
                     m
                 },
@@ -7412,8 +7404,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                    current_fn_name: String::new(),
                     local_fn_types: BTreeMap::new(),
-                    local_var_tys: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
                     captured_fn_sigs: BTreeMap::new(),
                     // Plan B' Stage 6.8 Task 107 Phase B — expose
@@ -8116,8 +8109,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                    current_fn_name: String::new(),
                     local_fn_types: BTreeMap::new(),
-                    local_var_tys: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
                     captured_fn_sigs: BTreeMap::new(),
                     arm_k_closure_v: None,
@@ -8355,8 +8349,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
                 match_scrut_tys: &checked.match_scrut_tys,
+                match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                current_fn_name: String::new(),
                 local_fn_types: BTreeMap::new(),
-                local_var_tys: BTreeMap::new(),
                 call_callee_tys: &checked.call_callee_tys,
                 captured_fn_sigs: BTreeMap::new(),
                 arm_k_closure_v: None,
@@ -8632,8 +8627,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         type_layouts: &type_layouts,
                         ctor_index: &ctor_index,
                         match_scrut_tys: &checked.match_scrut_tys,
+                        match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                        current_fn_name: String::new(),
                         local_fn_types: BTreeMap::new(),
-                        local_var_tys: BTreeMap::new(),
                         call_callee_tys: &checked.call_callee_tys,
                         captured_fn_sigs: BTreeMap::new(),
                         arm_k_closure_v: None,
@@ -9271,8 +9267,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             type_layouts: &type_layouts,
                             ctor_index: &ctor_index,
                             match_scrut_tys: &checked.match_scrut_tys,
+                            match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                            current_fn_name: String::new(),
                             local_fn_types: BTreeMap::new(),
-                            local_var_tys: BTreeMap::new(),
                             call_callee_tys: &checked.call_callee_tys,
                             captured_fn_sigs: BTreeMap::new(),
                             arm_k_closure_v: None,
@@ -10030,22 +10027,26 @@ struct Lowerer<'a, 'b> {
     /// arm-fn / cps continuation lowering surfaces.
     local_fn_types: BTreeMap<String, crate::ast::FnTypeExpr>,
 
-    /// Plan D Task 113 — local Tys for params + `let`-bindings in
-    /// scope, keyed by binding name. Derived from each binding's
-    /// declared `TypeExpr` via `monomorphize::type_expr_to_ty`. Used
-    /// by `lower_match` to recover a *concrete* scrutinee `Ty` when
-    /// the scrutinee is `Expr::Ident(name)`. The span-keyed
-    /// `match_scrut_tys` side-table is shared across all
-    /// monomorphized clones of a generic fn, so for a clone like
-    /// `fst$Int$String` the entry can still hold `Ty::Var(A)`-bearing
-    /// types from the pre-mono parent. Per-clone `local_var_tys` are
-    /// populated at construction with the post-mono concrete param
-    /// types, so an `Ident` scrutinee resolves correctly even when
-    /// the side-table entry is stale. Non-Ident scrutinees (e.g.
-    /// `match (1,2) { ... }`) still rely on the span-keyed side-
-    /// table (correct in that case because the scrutinee carries no
-    /// generic type-vars).
-    local_var_tys: BTreeMap<String, Ty>,
+    /// Plan D Task 113 R1 finding 2 — per-clone resolved
+    /// `match_scrut_tys` keyed by `(clone_fn_name, match_span)`.
+    /// Populated by `monomorphize` for every Match expression
+    /// rewritten inside a generic clone; entries hold the
+    /// post-substitution scrutinee `Ty` so codegen recovers
+    /// concrete element types regardless of scrutinee shape.
+    /// `lower_match` and the `type_of_expr` Match arm consult
+    /// `(current_fn_name, span)` here first; on miss they fall
+    /// back to the span-keyed `match_scrut_tys` side-table (which
+    /// is correct for non-generic surfaces and synth helper fns
+    /// whose match scrutinees carry no `Ty::Var(_)`).
+    match_scrut_tys_resolved: &'b crate::monomorphize::MatchScrutTysResolved,
+
+    /// Plan D Task 113 R1 finding 2 — fn name this Lowerer is
+    /// emitting code for. User fns use `f.name`; synth helpers
+    /// (handler arm fns, lifted lambdas, sync shims, post-arm-k
+    /// continuations) use their declared mangled name. Read by
+    /// `lower_match` / `type_of_expr` to key into
+    /// `match_scrut_tys_resolved`.
+    current_fn_name: String,
 
     /// Plan B' Stage 6.8 Phase C+ — typecheck-resolved callee `Ty::Fn`
     /// for indirect calls, keyed on the call expression's span.
@@ -10152,14 +10153,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 if let crate::ast::TypeExpr::Fn(fty) = &l.ty {
                     self.local_fn_types.insert(l.name.clone(), (**fty).clone());
                 }
-                // Plan D Task 113 — track every let-binding's Ty so
-                // `lower_match` can recover a clone-safe scrutinee
-                // type from `Expr::Ident(let_name)` (the span-keyed
-                // `match_scrut_tys` side-table is shared across
-                // generic clones and may be stale for tuple-typed
-                // scrutinees).
-                self.local_var_tys
-                    .insert(l.name.clone(), crate::monomorphize::type_expr_to_ty(&l.ty));
             }
             Stmt::Expr(e) => {
                 let _ = self.lower_expr(e);
@@ -11345,7 +11338,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             // sum-type ctor pattern but without the discriminant word
             // (tuples have a single constructor per arity).
             Expr::Tuple { elems, .. } => {
-                use sigil_header_constants::{header_word, TAG_TUPLE};
+                use sigil_header_constants::{header_word, MAX_TUPLE_ARITY, TAG_TUPLE};
                 // Lower elements first — they may have side effects in
                 // source order. Capture the surface Cranelift type of
                 // each so we know whether to widen on store and whether
@@ -11358,33 +11351,35 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
                 let n = elem_vals.len();
                 debug_assert!(
-                    n <= 31,
-                    "codegen: tuple arity {n} exceeds 31-bit pointer-bitmap layout"
+                    n <= MAX_TUPLE_ARITY,
+                    "codegen: tuple arity {n} exceeds MAX_TUPLE_ARITY = {MAX_TUPLE_ARITY} \
+                     (32-bit pointer bitmap, one bit per element)"
                 );
                 // Pointer bitmap: bit i set iff element i is pointer-
                 // typed (heap-allocated value). Sub-word integer types
-                // (I8, I32) and I64 are scalars; pointer_ty values are
-                // GC pointers.
+                // (I8, I32) and I64 are scalars; pointer_ty values
+                // (always I64 on supported 64-bit targets) are GC
+                // pointers.
+                //
+                // Plan D Task 113 R1 finding 3 — `pointer_ty` is I64
+                // on every target sigil currently builds for. lower_
+                // expr returns the same Cranelift type (I64) for both
+                // scalar `Int` values and pointer-typed values
+                // (`String`, `Closure`, `User`, `Tuple`), so we
+                // cannot distinguish them at this site without
+                // typecheck info threaded through. **Conservative
+                // choice:** mark every I64 element as a pointer.
+                // Boehm tolerates false positives — a non-pointer
+                // `Int` marked as pointer becomes a conservative root
+                // (harmless on 64-bit hosts where every Int value is
+                // misinterpretable as a pointer anyway). Refining
+                // this requires plumbing element `Ty`s from typecheck
+                // through monomorphize → codegen for tuple ctor sites
+                // (the same plumbing already used by `lower_record_
+                // lit` for record fields).
                 let mut bitmap: u32 = 0;
                 for (i, (_, ty)) in elem_vals.iter().enumerate() {
-                    if *ty == self.pointer_ty && self.pointer_ty != types::I64 {
-                        // 32-bit pointer_ty future-proofing path.
-                        bitmap |= 1u32 << i;
-                    } else if *ty == self.pointer_ty {
-                        // pointer_ty == I64 on supported targets; an I64
-                        // result that is pointer-typed by surface (e.g.,
-                        // String, Closure, User, Tuple) needs the bit.
-                        // Distinguishable from scalar I64 via the
-                        // surface Cranelift type — but lower_expr's
-                        // result type IS I64 for both Int and pointer-
-                        // typed values. We can't distinguish at this
-                        // site without typecheck info threaded through.
-                        // **Conservative choice:** mark the bit. Boehm
-                        // tolerates false positives (a non-pointer Int
-                        // marked as pointer becomes a conservative
-                        // root, harmless on 64-bit hosts where every
-                        // Int value is misinterpretable as a pointer
-                        // anyway).
+                    if *ty == self.pointer_ty {
                         bitmap |= 1u32 << i;
                     }
                 }
@@ -13324,23 +13319,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match_span: &Span,
     ) -> Value {
         let s = self.lower_expr(scrutinee);
-        // Plan D Task 113 — prefer per-Lowerer `local_var_tys` (post-
-        // mono concrete types, populated at fn entry from params and
-        // at `Stmt::Let`) when the scrutinee is `Expr::Ident(name)`.
-        // The span-keyed `match_scrut_tys` side-table is shared
-        // across all monomorphized clones of a generic fn; for a
-        // clone like `fst$Int$String` the entry can hold
-        // `Ty::Var(_)`-bearing types from the pre-mono parent.
-        // Falling back to the side-table covers non-Ident scrutinees
-        // (e.g. `match (1,2) { ... }`) which carry no generic vars.
-        let scrut_ty = if let crate::ast::Expr::Ident(name, _) = scrutinee {
-            self.local_var_tys
-                .get(name)
-                .cloned()
-                .or_else(|| self.match_scrut_tys.get(match_span).cloned())
-        } else {
-            self.match_scrut_tys.get(match_span).cloned()
-        };
+        // Plan D Task 113 R1 finding 2 — prefer the per-clone
+        // resolved scrutinee Ty keyed by (current_fn_name, span).
+        // monomorphize populates this map for every Match
+        // expression rewritten inside a generic clone with the
+        // post-substitution `Ty`, so codegen recovers concrete
+        // element types regardless of scrutinee shape (Ident, Call,
+        // nested Match, …). Span-keyed fallback is correct for
+        // non-generic surfaces and synth helper fns whose match
+        // scrutinees carry no `Ty::Var(_)`.
+        let scrut_ty = self
+            .match_scrut_tys_resolved
+            .get(&(self.current_fn_name.clone(), match_span.clone()))
+            .cloned()
+            .or_else(|| self.match_scrut_tys.get(match_span).cloned());
 
         // Predict the result type from the first arm's body. Pattern
         // bindings introduced by the first arm are added to a preview
@@ -13824,28 +13816,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 UnOp::Neg => types::I64,
                 UnOp::Not => types::I8,
             },
-            Expr::Match {
-                scrutinee,
-                arms,
-                span,
-            } => {
+            Expr::Match { arms, span, .. } => {
                 // Propagate the preview down, extending with any pattern
                 // bindings this inner match's first arm introduces so
                 // nested-match result-type prediction sees them.
                 //
-                // Plan D Task 113 — mirror `lower_match`'s
-                // local_var_tys-first lookup so a tuple-typed Ident
-                // scrutinee resolves to its concrete (post-mono)
-                // `Ty::Tuple` even when the span-keyed side-table
-                // entry contains generic `Ty::Var` elements.
-                let inner_scrut_ty = if let crate::ast::Expr::Ident(name, _) = scrutinee.as_ref() {
-                    self.local_var_tys
-                        .get(name)
-                        .cloned()
-                        .or_else(|| self.match_scrut_tys.get(span).cloned())
-                } else {
-                    self.match_scrut_tys.get(span).cloned()
-                };
+                // Plan D Task 113 R1 finding 2 — mirror
+                // `lower_match`'s per-clone resolved-first lookup so
+                // a tuple-typed scrutinee resolves to its concrete
+                // (post-mono) Ty regardless of scrutinee shape.
+                let inner_scrut_ty = self
+                    .match_scrut_tys_resolved
+                    .get(&(self.current_fn_name.clone(), span.clone()))
+                    .cloned()
+                    .or_else(|| self.match_scrut_tys.get(span).cloned());
                 let mut inner_preview = preview.clone();
                 self.predict_pattern_bindings(
                     &arms[0].pattern,
@@ -15046,12 +15030,16 @@ fn expr_is_pure(e: &crate::ast::Expr) -> bool {
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => false,
-        // Plan D Task 113 — tuple values are heap-allocated; treat as
-        // not-pure (allocation has side effects). Conservative; matches
-        // RecordLit's all-pure-elements approach would require a
-        // future refinement, but for the perform-side classifier
-        // gating that calls this fn, conservative-not-pure is correct.
-        Expr::Tuple { .. } => false,
+        // Plan D Task 113 — tuple values are heap-allocated, but
+        // allocation alone doesn't prevent purity in this
+        // classifier's sense (RecordLit returns true when its fields
+        // are pure — allocation is intrinsic to value construction).
+        // A tuple of pure elements has no observable side effects
+        // beyond the heap alloc, identical to RecordLit. Plan D
+        // Task 113 R1 finding 4 — flipped from `false` to mirror the
+        // RecordLit shape so generic helpers using tuple ctor
+        // values aren't rejected by the perform-side classifier.
+        Expr::Tuple { elems, .. } => elems.iter().all(expr_is_pure),
     }
 }
 
@@ -16565,6 +16553,7 @@ mod tests {
         let mono = MonoProgram {
             anf,
             lambda_captures_resolved: std::collections::BTreeMap::new(),
+            match_scrut_tys_resolved: std::collections::BTreeMap::new(),
         };
         let colored = crate::color::infer_colors(mono);
         assert_eq!(
@@ -16644,6 +16633,7 @@ mod tests {
         let mono = MonoProgram {
             anf,
             lambda_captures_resolved: std::collections::BTreeMap::new(),
+            match_scrut_tys_resolved: std::collections::BTreeMap::new(),
         };
         // Build ColoredProgram manually with `colors[("f")] = Native`,
         // overriding what `infer_colors` would have returned. This is
@@ -16913,6 +16903,7 @@ mod tests {
             let mono = crate::monomorphize::MonoProgram {
                 anf,
                 lambda_captures_resolved: std::collections::BTreeMap::new(),
+                match_scrut_tys_resolved: std::collections::BTreeMap::new(),
             };
             crate::color::infer_colors(mono)
         };

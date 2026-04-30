@@ -152,3 +152,46 @@ Category (c) is empty.
 **Closure path.** None required. Logged as transparency — future-session executors reading the plan should expect ~3 ignored tests at plan start, not ~12.
 
 **Implementing commit.** `[HEAD]` (this entry + Stage 10.5 scaffolding).
+
+## 2026-04-30 — [DEVIATION Task 113] Per-clone `match_scrut_tys_resolved` map; arity-1 tuple value rejection; `MAX_TUPLE_ARITY` named constant; `expr_is_pure` allows tuples of pure elements
+
+**Context.** Task 113 shipped tuple syntax + `std/pair.sigil` across PR #53. R1 review surfaced two bugs and several documentation / API-shape cleanups. Both bugs and all cleanups landed within PR #53 ahead of merge per the per-task-PR cadence.
+
+**Findings.**
+
+### Finding 1 — `(e,)` produced an arity-1 `Expr::Tuple`
+
+The value-side parser at `compiler/src/parser.rs:1080+` accepted a trailing comma after a single element and emitted `Expr::Tuple` with `elems.len() == 1`. The AST docstring documents arity ≥ 2; the codegen `debug_assert!(n <= MAX_TUPLE_ARITY)` doesn't catch arity-1 (1 ≤ 31), so an arity-1 heap object was synthesized that the type system has no surface spelling for. Type-side parsing was correct (the `while !RParen` loop eats trailing commas without recursing).
+
+**Fix.** Parser explicitly rejects arity-1 tuple values with a diagnostic naming the policy: "tuple values require arity ≥ 2 — `(e,)` with a trailing comma is not a valid tuple. Use `(e1, e2, ...)` for a tuple, or remove the trailing comma to write a parenthesised expression `(e)`." Pinned by `parser_rejects_arity_one_tuple_with_trailing_comma`.
+
+### Finding 2 — `match_scrut_tys` is span-keyed and shared across mono clones; non-Ident scrutinees in generic fns leak `Ty::Var(_)` into codegen
+
+The pre-fix `Lowerer.local_var_tys` papered over the symptom for `Expr::Ident` scrutinees only. A `Call` / nested `Match` / etc. scrutinee in a generic fn fell back to `match_scrut_tys[span]` which (per its docstring) is shared across mono clones and stale for generic clones — `Ty::Var(_)` reached `cranelift_ty_of_ty`'s unreachable.
+
+**Fix.** Per-clone `match_scrut_tys_resolved: BTreeMap<(String, Span), Ty>` populated by `monomorphize` for every `Expr::Match` rewritten inside a generic clone. Codegen's `lower_match` and `type_of_expr`'s Match arm look up `(current_fn_name, span)` first; fall back to span-keyed for non-clone surfaces. Removes the `Ident`-vs-non-Ident discrimination entirely. `local_var_tys` is gone. Pinned by `generic_tuple_scrutinee_via_call_resolves`.
+
+**Synth-fn gap.** Synth helper fns produced by closure_convert (lifted lambdas, handler-arm fns, sync-shim fns, post-arm-k continuations) have a `current_fn_name` distinct from the originating clone fn — the per-clone resolved map is keyed by the clone fn name, so the synth fn's `(synth_name, span)` lookup misses and falls back to the span-keyed side-table. For non-generic synth bodies this is correct (the side-table entry has no `Ty::Var`). For synth fns whose body inherits a Match expression from a generic clone (i.e., a generic fn with a handler block whose arm contains a tuple match), the fallback would still leak `Ty::Var`. **No test exercises this gap today** — it is logged for closure if Tasks 114–116 (which extend the generic surface) surface a failure. Closure path: thread the originating clone fn name into each synth struct (or the closure_convert side-table) and key the resolved-map lookup by the parent clone name when emitting synth fn bodies.
+
+### Finding 3 — `MAX_TUPLE_ARITY` documented as 63 but actually 31; offset documentation said `16+8*i` but actual is `8+8*i`
+
+`header-constants/src/lib.rs:114` referenced a `MAX_TUPLE_ARITY = 63` constant that didn't exist; the actual cap is 31 (32-bit pointer bitmap, one bit reserved). `compiler/src/ast.rs:492` and `compiler/src/typecheck.rs:75` both said tuple elements live at offsets `16+8*i` (sum-type ctor layout); the actual layout is `8+8*i` (no discriminant word — tuples have one ctor per arity). The codegen tuple ctor's "32-bit pointer_ty future-proofing" branch was dead code (sigil targets only 64-bit).
+
+**Fix.** Added `pub const MAX_TUPLE_ARITY: usize = 31;` in `header-constants` with a `max_tuple_arity_matches_pointer_bitmap` test pinning the value vs `BITMAP_BITS`. Codegen's `debug_assert!` reads the constant. Docstrings corrected. Dead 32-bit branch removed.
+
+### Finding 4 — `expr_is_pure` returned `false` for `Expr::Tuple` even when elements are pure
+
+The perform-side classifier rejected helper bodies producing tuple values as not-pure even when every element is a literal / Ident — symmetry with `Expr::RecordLit`'s `all-elements-pure` shape was missed.
+
+**Fix.** Flipped to `elems.iter().all(expr_is_pure)`. Heap allocation alone doesn't break purity in this classifier's sense — `RecordLit` already returns true under the same shape.
+
+**Why accepted.** All four findings are within-PR cleanups that don't change any user-visible test outcome but tighten the surface and remove the per-Lowerer `local_var_tys` band-aid in favor of the structural per-clone fix. Per the per-task-PR cadence, addressed in PR #53 directly rather than a follow-up.
+
+**Failure mode.** Synth-fn-inheriting-from-generic-clone gap (Finding 2) — already described above; no test surfaces it today.
+
+**Closure path.**
+
+- Findings 1, 3, 4 — fully closed by the cited code changes.
+- Finding 2 — structurally closed for user-fn surface; synth-fn surface gap awaits Tasks 114–116 if exercised.
+
+**Implementing commit.** `[HEAD]` (this entry + the four code fixes).

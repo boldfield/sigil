@@ -71,9 +71,11 @@ pub enum Ty {
     /// Plan D Task 113 — tuple type `(T1, T2, ...)`. Arity ≥ 2.
     /// Element-wise unification (each `elems[i]` must unify
     /// position-by-position with the other tuple's `elems[i]`). The
-    /// codegen-side runtime layout is a heap record with one slot
-    /// per element at offsets 16+8*i; the GC pointer bitmap reflects
-    /// per-slot pointer-ness.
+    /// codegen-side runtime layout is a heap record `{header, elem
+    /// [0], ..., elem[N-1]}` with elements at offsets `8 + 8*i`
+    /// (tuples have no discriminant word; sum-type ctors lay fields
+    /// at `16 + 8*i` after the discriminant). The GC pointer bitmap
+    /// reflects per-slot pointer-ness.
     Tuple(Vec<Ty>),
 }
 

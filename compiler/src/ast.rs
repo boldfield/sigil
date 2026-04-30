@@ -484,13 +484,18 @@ pub enum Expr {
         span: Span,
     },
     /// Plan D Task 113 — tuple value: `(e1, e2, ...)`. Arity ≥ 2;
-    /// single-element parens fall through to paren-grouping, and
-    /// zero-element parens are reserved (parser rejects). Maps to
-    /// [`crate::typecheck::Ty::Tuple`] for HM unification (element-
-    /// wise inference); codegen allocates a heap record with one
-    /// slot per element, identical layout to a single-constructor
-    /// sum type's payload at offsets 16+8*i, with the GC pointer
-    /// bitmap reflecting per-slot pointer-ness.
+    /// single-element parens fall through to paren-grouping (the
+    /// parser returns the inner expression directly), zero-element
+    /// `()` is reserved for a future Unit-literal spelling, and
+    /// `(e,)` with a trailing comma is rejected (Plan D Task 113 R1
+    /// finding 1: trailing-comma single-element tuples are not a
+    /// valid syntax). Maps to [`crate::typecheck::Ty::Tuple`] for
+    /// HM unification (element-wise inference); codegen allocates a
+    /// heap record `{header, elem[0], ..., elem[N-1]}` with elements
+    /// at offsets `8 + 8*i` (no discriminant word — tuples have one
+    /// constructor per arity, unlike sum-type ctors which lay
+    /// fields out at `16 + 8*i` after the discriminant). The GC
+    /// pointer bitmap reflects per-slot pointer-ness.
     Tuple {
         elems: Vec<Expr>,
         span: Span,

@@ -1173,6 +1173,7 @@ mod tests {
         MonoProgram {
             anf,
             lambda_captures_resolved: BTreeMap::new(),
+            match_scrut_tys_resolved: BTreeMap::new(),
         }
     }
 

@@ -1100,7 +1100,14 @@ impl<'a> Parser<'a> {
                 }
                 let first = self.parse_expr()?;
                 if matches!(self.peek().kind, TokenKind::Comma) {
-                    // Tuple value.
+                    // Tuple value (arity ≥ 2). `(e,)` with a trailing
+                    // comma but no second element is rejected to
+                    // preserve the symmetry with type-side parsing
+                    // (where arity-1 falls through to paren-grouping
+                    // and `(T,)` is currently not a recognised
+                    // syntax). The R1 reviewer surfaced that the
+                    // initial implementation silently produced an
+                    // arity-1 `Expr::Tuple` here; we now diagnose.
                     let mut elems = vec![first];
                     while matches!(self.peek().kind, TokenKind::Comma) {
                         self.advance();
@@ -1113,6 +1120,16 @@ impl<'a> Parser<'a> {
                     }
                     self.no_record_lits = saved;
                     self.expect(&TokenKind::RParen, "`)` closing tuple value")?;
+                    if elems.len() < 2 {
+                        self.err(
+                            lparen_span.clone(),
+                            "tuple values require arity ≥ 2 — `(e,)` with a trailing \
+                             comma is not a valid tuple. Use `(e1, e2, ...)` for a \
+                             tuple, or remove the trailing comma to write a \
+                             parenthesised expression `(e)`",
+                        );
+                        return None;
+                    }
                     Some(Expr::Tuple {
                         elems,
                         span: lparen_span,

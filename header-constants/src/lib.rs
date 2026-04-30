@@ -100,20 +100,33 @@ pub const TAG_MUT_BYTE_ARRAY: u8 = 0x07;
 pub const TAG_STRING_BUILDER: u8 = 0x08;
 
 /// Tuple record layout — Plan D Task 113.
-/// `{header, elem[0], elem[1], ..., elem[N-1]}`. Each element is a
-/// 64-bit slot — `Int` and pointer types fit directly; narrower
-/// types (`Bool`, `Char`, `Byte`) are widened at write and narrowed
-/// at read by codegen. The pointer bitmap reflects per-element
-/// pointer-ness (bit `i` set iff element `i` is a GC-managed
-/// pointer). Tuples have no discriminant word — there is only one
-/// constructor per arity.
+/// `{header, elem[0], elem[1], ..., elem[N-1]}`. Elements are stored
+/// at byte offsets `8 + 8*i` from the object pointer (header at
+/// offset 0). Each element is a 64-bit slot — `Int` and pointer
+/// types fit directly; narrower types (`Bool`, `Char`, `Byte`) are
+/// widened at write and narrowed at read by codegen. The pointer
+/// bitmap reflects per-element pointer-ness (bit `i` set iff
+/// element `i` is a GC-managed pointer). Tuples have no
+/// discriminant word — there is only one constructor per arity, so
+/// element layout starts immediately after the header (unlike
+/// sum-type ctors which reserve word 0 of the payload for the
+/// discriminant and lay fields out at `16 + 8*i`).
 ///
-/// Tuple arity is bounded by the 6-bit `count` field (63), which is
-/// far above any reasonable v1 user-program tuple. For arity-2 (the
-/// `Pair[A, B]` case from `std/pair.sigil`) this is comfortable; the
-/// MAX_TUPLE_ARITY = 63 constant is documented in the codegen
-/// allocator.
+/// Tuple arity is bounded by the 32-bit pointer bitmap, not the
+/// 6-bit `count` field — `BITMAP_BITS = 32` lets each element have
+/// its own pointer/non-pointer bit, so the binding limit is
+/// `MAX_TUPLE_ARITY = 31` (one less than the bitmap to leave bit 0
+/// reserved for parity with the closure-record bitmap convention).
+/// Codegen's allocator emits a `debug_assert!(n <= 31)` against this
+/// constant. The 6-bit `count` field has plenty of headroom (up to
+/// 63 payload words) — bitmap is the binding limit.
 pub const TAG_TUPLE: u8 = 0x09;
+
+/// Plan D Task 113 R1 finding 3 — bound on tuple arity, matching the
+/// 32-bit pointer bitmap minus one reserved bit. Codegen's tuple
+/// allocator asserts `n <= MAX_TUPLE_ARITY` rather than using a
+/// literal `31`. See `TAG_TUPLE` for the rationale.
+pub const MAX_TUPLE_ARITY: usize = 31;
 
 /// Payload-word-count field layout.
 pub const COUNT_BITS: u32 = 6;
@@ -195,5 +208,15 @@ mod tests {
         assert_eq!(TAG_STRING_BUILDER, 0x08);
         assert_eq!(TAG_TUPLE, 0x09);
         assert_eq!(TAG_EXTERNAL_DESCRIPTOR, 0xFF);
+    }
+
+    #[test]
+    fn max_tuple_arity_matches_pointer_bitmap() {
+        // Plan D Task 113 R1 finding 3 — MAX_TUPLE_ARITY is bound by
+        // the 32-bit pointer bitmap with bit 0 reserved (parity with
+        // the closure-record bitmap convention), giving 31 usable
+        // bits.
+        assert_eq!(MAX_TUPLE_ARITY, 31);
+        assert!(MAX_TUPLE_ARITY < BITMAP_BITS as usize);
     }
 }
