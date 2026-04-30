@@ -1974,13 +1974,22 @@ fn user_discard_k_io_handler_unwinds_helper_at_perform_site() {
     //
     // The fix-PR un-ignores + verifies the assertion. No source
     // edits to this test should be required at fix time.
+    // Plan C Task 70 expanded `IO` from 1 op (println) to 5 (print,
+    // println, read_file, read_line, write_file). The user handler
+    // must be exhaustive — the discard-k semantics this test pins
+    // apply uniformly across all ops; only the println arm is
+    // exercised at runtime since helper() performs only println.
     let src = "fn helper() -> Int ![IO] {\n  \
                  perform IO.println(\"a\");\n  \
                  1\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle helper() with {\n    \
-                   IO.println(s, k) => 0,\n  \
+                   IO.print(s, k) => 0,\n    \
+                   IO.println(s, k) => 0,\n    \
+                   IO.read_file(p, k) => 0,\n    \
+                   IO.read_line(k) => 0,\n    \
+                   IO.write_file(p, d, k) => 0,\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
