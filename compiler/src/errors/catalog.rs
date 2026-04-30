@@ -878,10 +878,16 @@ pub const CATALOG: &[ErrorEntry] = &[
     ErrorEntry {
         code: "E0143",
         short: "row-site effect-arg arity does not match the effect-decl's generic-param count",
-        long: "Plan D Task 114: a row entry references an effect with a \
-               type-arg list (e.g. `![Raise[Int]]`) whose arity does not \
-               match the effect-decl's `generic_params` count. Three \
-               shapes fire E0143:\n\n\
+        long: "Plan D Task 114 introduced this check; Plan D Task 115 \
+               (PR #55) renamed the code from E0140 → E0143 to \
+               disambiguate from the existing E0140 (duplicate-handler-\
+               arm) — a future agent reading older PR descriptions / \
+               commit messages will see references to the original \
+               E0140 number and should treat them as referring to this \
+               diagnostic. A row entry references an effect with a \
+               type-arg list (e.g. `![Raise[Int]]`) whose arity does \
+               not match the effect-decl's `generic_params` count. \
+               Three shapes fire E0143:\n\n\
                1. **Non-generic effect-decl referenced with args** — \
                   e.g. `![IO[Int]]` when `IO` is non-generic.\n\
                2. **Generic effect-decl referenced bare** — e.g. \

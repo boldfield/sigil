@@ -230,3 +230,40 @@ This mirrors the Plan A3 / Plan D Task 113 pattern: `TypeExpr::Tuple { elems, sp
 - **Task 115** — per-op generic params close the perform-site substitution gap.
 
 **Implementing commit(s).** PR commits across `plan-d-task-114` branch.
+
+## 2026-04-30 — [DEVIATION Task 115] E0140/E0143 audit fix; per-op generics shadowing E0144; perform-site E-substitution closure (Task 114 R1)
+
+**Context.** Task 115's PR (#55) ships per-op generic params on user-declared effects (`fail[A]: (E) -> A`) and closes the Task 114 R1 deferred perform-site E-substitution gap. The PR also surfaced two audit findings during execution that warrant log entries here so future readers (and `gh pr view` of merged PR descriptions) can trace the cross-task context.
+
+**Audit finding 1 — E0140/E0143 code collision.**
+
+Task 114 (PR #54) introduced a row-arg arity-mismatch diagnostic and allocated it as **E0140**. E0140 was already taken by Plan B Task 54's *duplicate-handler-arm* code. Both lived in the catalog briefly, with the second registration silently shadowing the first. The bug was masked because the duplicate-arm test asserted `has_code(&errs, "E0140")` (true regardless of which entry served), and Task 114's row-arity tests asserted the same (also true). The catalog has a build-time invariant check, but it didn't trip because the registration happened in two unrelated arrays whose dedup wasn't enforced cross-array.
+
+Task 115's PR catches it during the per-op-generics implementation, where `E0144` was the next available code in the 0140-series — prompting a recount of 0140-0144 and discovery of the conflict. **Fix:** migrated row-arg arity from E0140 → E0143 with full catalog entry. The duplicate-handler-arm code stays at E0140 unchanged. Tests renamed `*_fires_e0140` → `*_fires_e0143`. Doc rot in `ast.rs`, `typecheck.rs`, and test docstrings swept to E0143 references. Catalog entry for E0143 explicitly notes: "Plan D Task 114 introduced this check; Plan D Task 115 (PR #55) renamed the code from E0140 → E0143 to disambiguate from the existing E0140 (duplicate-handler-arm). A future agent reading older PR descriptions / commit messages will see references to the original E0140 number and should treat them as referring to this diagnostic."
+
+**Audit finding 2 — `check_handle` per-op generic layering bug.**
+
+The PR R1 review caught a real bug: `check_handle` resolved arm op param / return types under the effect-decl substitution **only** — no per-op generic layer. For an op declared `fail[A]: (E) -> A`, `ty_from_type_expr_here` couldn't find `A` in `current_generic_subst` and returned `None`, falling back to `Ty::Unit`. Two silent miscompiles followed:
+
+- `k_param_ty` (the continuation's arg type) collapsed to `Ty::Unit`, so `k(int_value)` would fire E0044 against `Unit`, or worse, `k(())` would silently typecheck under a wrong contract.
+- `user_param_tys[i]` for any per-op-generic-typed binding (e.g. `op[A]: (A) -> Int`) collapsed to `Ty::Unit`.
+
+None of the new Task 115 typecheck tests exercised `handle` over a per-op-generic op, so the original PR corpus didn't flag the bug.
+
+**Fix:** mirror the per-op `fresh_generic_subst` + insert pattern from `check_perform` inside the arm-typing block at `compiler/src/typecheck.rs:4287-4295`. Layer per-op generics on top of `eff_subst` before computing `user_param_tys` / `op_ret_ty`. Added regression test `handle_arm_over_per_op_generic_op_typechecks` exercising `handle 0 with { Raise.fail(e, k) => k(42) }` for `effect Raise[E] { fail[A]: (E) -> A }` — the call `k(42)` requires `k` to type as `Fn(A_var) -> Int`, not `Fn(Unit) -> Int`.
+
+**Audit finding 3 — perform-site E-substitution closure (Task 114 R1 deferred gap).**
+
+Task 114 had a deferred gap: at `perform Raise.fail("wrong type")` under `![Raise[Int]]`, the row-site type-args `[Int]` weren't threaded into `fail`'s op signature. The op was checked under a fresh Ty::Var for E, so wrong-typed args silently bound `E := String` instead of firing E0044 against the row-instantiated `E := Int`. Task 114's PR pinned this with `perform_site_e_substitution_deferred_to_task_115` — a closure-point test marked **INVERT THIS TEST AT TASK 115 LANDING**.
+
+**Fix:** `check_perform` consults the surrounding fn's row entry for the effect; if its args match the effect-decl's arity, builds the substitution from them (precedence: handler-scope subst → fn-row args → fresh). The deferred test inverts to `perform_site_e_substitution_closed_by_task_115`, asserting E0044 fires.
+
+**E0144 introduction.** Per-op generic param shadowing an effect-decl one fires E0144. Catalog entry covers the shadowing rule with a fix-example using canonical Koka idiom (`E` for effect-decl, `A` for per-op).
+
+**Why accepted.** All three findings land in PR #55 within the per-task-PR cadence — the per-op-generics surface and the perform-site E-substitution are tightly coupled (both flow through `check_perform`'s substitution machinery), and the E0140/E0143 audit was discovered during Task 115's catalog walk so it's natural to fold it in here rather than defer. The R1 review caught the `check_handle` gap before merge; the fix + regression test land in the same PR.
+
+**Failure mode.** None remaining at the user-visible surface for the cases shipped. std/raise.sigil migration to `effect Raise[E] { fail[A]: (E) -> A }` continues to defer to Stage 12 review per the plan body.
+
+**Closure path.** Stage 12 review checkpoint — std/raise.sigil + std/state.sigil + std/result.sigil migration to use the now-expressible generic shapes; closure-path edits to `[DEVIATION Task 71]` constraint #2 (`fail`'s concrete-Int return placeholder) and `[DEVIATION Task 72]` constraint #1 (parser surface for `![State[S]]`).
+
+**Implementing commit(s).** PR #55 commits across `plan-d-task-115` branch.

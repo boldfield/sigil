@@ -151,7 +151,7 @@ impl EffectInst {
 /// converted via `ty_from_type_expr`; the surrounding fn's generic
 /// substitution lets `Raise[E]` resolve `E` to its outer-fn binding.
 /// `effects_registry` argument carries the program's effect-decl
-/// registry so arity-check (E0140) can fire when the row-site arg
+/// registry so arity-check (E0143) can fire when the row-site arg
 /// count diverges from the decl's `generic_params` len.
 pub(crate) fn effect_refs_to_insts(
     rs: &[crate::ast::EffectRef],
@@ -1048,8 +1048,10 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                                 "E0144",
                                 gp.span.clone(),
                                 format!(
-                                    "per-op generic parameter `{}` shadows effect-decl generic parameter `{}` declared on `effect {}`; use a distinct name for the per-op generic",
-                                    gp.name, gp.name, ed.name,
+                                    "per-op generic parameter `{}` shadows the effect-decl \
+                                     generic of the same name (`effect {}[{}, ...]`); use a \
+                                     distinct name for the per-op generic",
+                                    gp.name, ed.name, gp.name,
                                 ),
                             );
                         }
@@ -2741,7 +2743,7 @@ impl Tc {
                 // EffectRef args get their own E0107 (unknown type)
                 // diagnostics, plus arity-check the row's
                 // generic-effect references against their declared
-                // generic-param count (E0140).
+                // generic-param count (E0143).
                 for eref in &fty.effects {
                     for a in &eref.args {
                         self.check_type_expr_known(a);
@@ -2788,7 +2790,8 @@ impl Tc {
     ///    so unknown-effect references at row sites surface with
     ///    the same code paths that already exist for unknown
     ///    effects at perform sites).
-    /// 2. **E0140** (new code) if the row-site arg list arity
+    /// 2. **E0143** (Task 114; renamed from E0140 by Task 115's
+    ///    audit — see catalog entry) if the row-site arg list arity
     ///    diverges from the decl's `generic_params`. A bare-name
     ///    reference to a generic effect-decl (`![Raise]` when the
     ///    decl is `Raise[E]`) and a referenced effect-decl with
@@ -3513,7 +3516,7 @@ impl Tc {
         // fresh Ty::Var allocations. Add to the effect-level
         // substitution (op-level shadows on collision; E0144 already
         // fired at the effect-decl pre-pass for shadowing).
-        let (op_subst, _op_ty_var_ids) = self.fresh_generic_subst(&op.generic_params);
+        let (op_subst, _) = self.fresh_generic_subst(&op.generic_params);
         for (k, v) in op_subst {
             eff_subst.insert(k, v);
         }
@@ -4284,8 +4287,24 @@ impl Tc {
                             // checking (which runs with caller's
                             // subst) sees the surrounding fn's
                             // generics, not the effect's.
+                            //
+                            // Plan D Task 115 R1 — layer per-op generic
+                            // params on top of the effect-decl subst
+                            // for ops declared with their own generics
+                            // (e.g. `fail[A]: (E) -> A`). Without this
+                            // layer, `ty_from_type_expr_here` returns
+                            // None for `A` references in op signatures
+                            // and the user-param / k-arg types
+                            // collapse to Ty::Unit, silently
+                            // miscompiling arms over per-op-generic
+                            // ops.
+                            let mut arm_subst = eff_subst.clone();
+                            let (op_subst, _) = self.fresh_generic_subst(&op.generic_params);
+                            for (k, v) in op_subst {
+                                arm_subst.insert(k, v);
+                            }
                             let saved = std::mem::take(&mut self.current_generic_subst);
-                            self.current_generic_subst = eff_subst;
+                            self.current_generic_subst = arm_subst;
                             user_param_tys = op
                                 .params
                                 .iter()
@@ -7795,7 +7814,7 @@ mod tests {
     #[test]
     fn generic_effect_decl_with_wrong_arity_fires_e0143() {
         // `effect Raise[E] { ... }` declared with one type-param;
-        // a row site uses two args (`Raise[Int, String]`). E0140
+        // a row site uses two args (`Raise[Int, String]`). E0143
         // surfaces the mismatch.
         let src = "effect Raise[E] { fail: (E) -> Int }\n\
                    fn risky() -> Int ![Raise[Int, String]] {\n  \
@@ -7812,7 +7831,7 @@ mod tests {
     #[test]
     fn bare_name_reference_to_generic_effect_fires_e0143() {
         // `effect Raise[E] { ... }` declared generic; bare
-        // `![Raise]` (no type-arg list) should fire E0140 because
+        // `![Raise]` (no type-arg list) should fire E0143 because
         // E is unresolved at the row site.
         let src = "effect Raise[E] { fail: (E) -> Int }\n\
                    fn risky() -> Int ![Raise] {\n  \
@@ -7822,7 +7841,7 @@ mod tests {
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0143"),
-            "bare `![Raise]` of a generic effect-decl should fire E0140; got {errs:?}"
+            "bare `![Raise]` of a generic effect-decl should fire E0143; got {errs:?}"
         );
     }
 
@@ -7908,6 +7927,36 @@ mod tests {
     }
 
     #[test]
+    fn handle_arm_over_per_op_generic_op_typechecks() {
+        // Plan D Task 115 R1 regression: `check_handle` previously
+        // resolved op param/return types under the effect-decl
+        // substitution only, so per-op generics like `A` in
+        // `fail[A]: (E) -> A` resolved to `None` and silently
+        // collapsed to `Ty::Unit`. The continuation `k`'s arg type
+        // was `Unit` instead of `A_var`, and `k(42)` would have
+        // fired E0044 (Int vs Unit).
+        //
+        // The fix layers per-op generics on top of the effect-decl
+        // subst when typing each arm. The arm here invokes
+        // `k(42)` — post-fix, `k` types as `Fn(A_var) -> Int`,
+        // `A_var` unifies to `Int` from the call, and the arm
+        // body's type matches `handler_overall = Int`.
+        let src = "effect Raise[E] { fail[A]: (E) -> A }\n\
+                   fn main() -> Int ![] {\n  \
+                     handle 0 with {\n    \
+                       Raise.fail(e, k) => k(42)\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "handler arm over `fail[A]: (E) -> A` should typecheck; \
+             pre-fix `k` typed as Fn(Unit) -> Int and `k(42)` fired E0044; \
+             got {errs:?}"
+        );
+    }
+
+    #[test]
     fn multi_arg_per_op_generic_typechecks() {
         // `effect Choose[A] { choose[B]: (B, B) -> A }` —
         // multiple per-op generics + an effect-decl generic.
@@ -7967,7 +8016,7 @@ mod tests {
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0143"),
-            "`![IO[Int]]` on non-generic IO should fire E0140; got {errs:?}"
+            "`![IO[Int]]` on non-generic IO should fire E0143; got {errs:?}"
         );
     }
 
