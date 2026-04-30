@@ -51,9 +51,9 @@ Plan B' Stage-6.8-followup carryover #2 (Sync shim emission gating) is out of Pl
 - Task 111 — TLS → packed multi-return for `sigil_run_loop` terminal (Plan B' carryover #1, PR #39 §2).
   - status: **deferred** — see `[DEVIATION Task 111]`. Three implementation attempts on PR #50 demonstrated that the plan body's "register-pair multi-return" framing is structurally insufficient for the actual cross-fn discharge propagation requirement. Cross-fn visibility was the unstated semantic role of the OLD TLS; replacing it with any per-call mechanism (multi-return, out-pointer, per-fn stack slot, or Cranelift Variables) breaks the Sync-ABI call chain's discharge propagation. Closure path: defer to Task 117 first-class-k follow-up or a separate architectural slice. Plan B' carryover #1 stays open with revised closure scope.
 - Task 112 — Wrapper-fn-frame composition fix (closes `[DEVIATION Task 72]` constraint #3).
-  - status: todo
+  - status: **deferred** — see `[DEVIATION Task 112]`. The discharge-with-lambda pattern in `std/state.sigil` arms is set up for chained-let-yield body shape; wrapper-fn calls in the body force Sync ABI, which lacks the synth-cont chain the discharge-with-lambda pattern requires for `k`-chaining. Architecturally similar to Task 111: cross-fn behavior (cross-fn synth-cont chain in this case). User-visible inline-perform state threading continues to work; wrappers stay deferred. Closure path: defer to Task 117 first-class-k follow-up (same as Task 111).
 
-**Stage 11 review checkpoint** (per the plan body): TLS-removal correctness; wrapper-fn-frame fix scope (depth ceiling vs Plan C `state.sigil` test surface); incidental `#[ignore]` closures, if any.
+**Stage 11 review checkpoint** — both Task 111 and Task 112 deferred; no Stage 11 lifts shipped. Stage 11 collapses; Plan D proceeds directly to Stage 12. Defer-checkpoint covers both tasks.
 
 ## Stage 12 — Type-system surface
 
