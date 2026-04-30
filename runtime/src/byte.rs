@@ -71,6 +71,24 @@ pub extern "C" fn sigil_byte_sub(a: u8, b: u8) -> u8 {
     a.wrapping_sub(b)
 }
 
+/// `Byte`-domain check used to gate `Option[Byte]` construction in
+/// the sigil-side `byte_from_int` helper. Returns `true` iff `n` is
+/// representable as a `Byte` (`0 ≤ n < 256`). Plan C Task 66.5
+/// wires this up; see `std/byte_array.sigil` for the user surface.
+#[no_mangle]
+pub extern "C" fn sigil_byte_in_range(n: i64) -> bool {
+    (0..256).contains(&n)
+}
+
+/// Truncate `Int` to the low 8 bits. Caller is responsible for
+/// having verified `sigil_byte_in_range(n)`; out-of-range values
+/// silently take the low 8 bits (mod 256). Plan C Task 66.5 wires
+/// this up.
+#[no_mangle]
+pub extern "C" fn sigil_byte_truncate(n: i64) -> u8 {
+    n as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +144,30 @@ mod tests {
         assert_eq!(sigil_byte_sub(5, 3), 2);
         assert_eq!(sigil_byte_sub(0, 1), 255);
         assert_eq!(sigil_byte_sub(10, 255), 11); // (10 - 255) mod 256 = 11
+    }
+
+    #[test]
+    fn byte_in_range_accepts_zero_and_255() {
+        assert!(sigil_byte_in_range(0));
+        assert!(sigil_byte_in_range(255));
+        assert!(sigil_byte_in_range(127));
+    }
+
+    #[test]
+    fn byte_in_range_rejects_negative_and_overflow() {
+        assert!(!sigil_byte_in_range(-1));
+        assert!(!sigil_byte_in_range(256));
+        assert!(!sigil_byte_in_range(i64::MAX));
+        assert!(!sigil_byte_in_range(i64::MIN));
+    }
+
+    #[test]
+    fn byte_truncate_keeps_low_8_bits() {
+        assert_eq!(sigil_byte_truncate(0), 0);
+        assert_eq!(sigil_byte_truncate(255), 255);
+        // Mod 256 truncation; the in-range guard is the user's
+        // responsibility (sigil-side `byte_from_int` enforces it).
+        assert_eq!(sigil_byte_truncate(256), 0);
+        assert_eq!(sigil_byte_truncate(257), 1);
     }
 }

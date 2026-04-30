@@ -182,3 +182,48 @@ The marker-effect shape preserves every user-observable invariant Plan C cares a
 **Failure mode.** A v2 user trying to mock Mem via `handle ... with { Mem.new_array(args, k) => ... }` gets E0139 (unknown op on declared effect) until v2 ships generic Mem ops. Documented in `std/mut_array.sigil`.
 
 **Implementing commit(s).** [HEAD+1] (this commit lands the deviation; the next commit lands the implementation).
+
+## 2026-04-30 — [DEVIATION Task 66.5] User-side `byte_from_int` / `string_from_bytes` / `from_list` / `to_list` wrappers deferred
+
+**Context.** Plan C Task 66.5's plan body lists six core ops (`length`, `get`, `concat`, `slice`, `from_list(List[Byte]) -> ByteArray`, `to_list(ByteArray) -> List[Byte]`) plus String interop (`string_to_bytes(s) -> ByteArray`, `string_from_bytes(ba) -> Result[String, Utf8Error]`) plus the `Byte` primitive wired up via `byte_from_int(n: Int) -> Option[Byte]`.
+
+The four user-facing wrappers — `byte_from_int(n) -> Option[Byte]`, `string_from_bytes(ba) -> Result[String, Utf8Error]`, `from_list(xs: List[Byte]) -> ByteArray`, `to_list(ba: ByteArray) -> List[Byte]` — each depend on a different stdlib type:
+
+- `byte_from_int` returns `Option[Byte]` → needs `import std.option`.
+- `string_from_bytes` returns `Result[String, Utf8Error]` → needs `import std.result` (and a `Utf8Error` declaration).
+- `from_list` / `to_list` consume / produce `List[Byte]` → need `import std.list`.
+
+A natural shape for `std/byte_array.sigil` is a single module that imports all three and ships all four wrappers. **That shape collides on the flat namespace.** Each of `std/option.sigil`, `std/result.sigil`, `std/list.sigil` declares a `fn map`; loading all three from one transitive import path produces a duplicated `map` scheme registration where the last-loaded module wins. Inside `std/list.sigil`'s own `map` body, the recursive `map(t, f)` call then resolves to whichever module was registered last — the typechecker reports `expected Result[?,?], got List[?]` cascades inside list.sigil with no obvious user-visible cause.
+
+**Why accepted (defer the wrappers).** The collision is the architectural concern PR #42 review #2 (architectural concerns section) flagged: "Single flat namespace for stdlib imports... collision likelihood grows. The escape hatch (E0136 / duplicate-fn) is correct but loud-by-design." The proper fix is module-qualified names (`std.list.map` vs `std.option.map`), which is a separate Plan C task (queued for the namespace-architecture work in Tasks 67–72 if the collision surfaces sharper).
+
+For Task 66.5, the workaround is:
+
+- Ship the **runtime layer** + **builtin primitives** — these don't need user-side imports.
+- Ship `std/byte_array.sigil` as **documentation-only** (mirrors `std/array.sigil` / `std/mut_array.sigil`), added to `BUILTIN_INJECTED` skip-list.
+- Defer the four wrappers. Until the namespace fix lands, callers who want them write them in their own program.
+
+**What ships in Task 66.5:**
+
+1. Runtime `runtime/src/byte_array.rs` with 9 FFI primitives:
+   `sigil_byte_array_alloc` / `_empty` / `_length` / `_get` / `_concat` / `_slice` (6 ops) plus `sigil_string_to_bytes` / `sigil_string_from_bytes_validate` / `sigil_string_from_bytes_alloc` (3 string-interop ops).
+2. Two new helpers in `runtime/src/byte.rs`: `sigil_byte_in_range(n: i64) -> bool`, `sigil_byte_truncate(n: i64) -> u8`. These factor what would have been `byte_from_int`'s body so user-side code can construct `Option[Byte]` directly: `match byte_in_range(n) { true => Some(byte_truncate(n)), false => None }`.
+3. New `TAG_BYTE_ARRAY = 0x06` in `header-constants` + 2 counter slots.
+4. `ByteArray` registered as a non-generic builtin type (`builtin_types`).
+5. 11 builtin schemes (`register_builtin_byte_array_schemes`) covering all 6 ops + 3 string-interop primitives + 2 Byte helpers.
+6. Codegen FFI declarations + `lower_call` dispatch arms + `type_of_expr` predictions, all flowing through `BuiltinFuncIds` / `BuiltinFuncRefs` (no per-call-site churn — see PR #42 review #10's consolidation).
+7. `std/byte_array.sigil` documentation file, added to `imports::BUILTIN_INJECTED`.
+
+**What doesn't ship (deferred to the namespace-fix task):**
+
+1. `byte_from_int(n: Int) -> Option[Byte]` — user-side wrapper around `byte_in_range` + `byte_truncate`.
+2. `string_from_bytes(ba: ByteArray) -> Result[String, Utf8Error]` — user-side wrapper around `string_from_bytes_validate` + `string_from_bytes_alloc`.
+3. `from_list(xs: List[Byte]) -> ByteArray` — recursive concat.
+4. `to_list(ba: ByteArray) -> List[Byte]` — recursive build via accumulator.
+5. `type Utf8Error = | InvalidUtf8(Int)` — user-side declaration alongside `string_from_bytes`.
+
+**Closure path.** Closes when stdlib namespace qualification ships (e.g. `std.list.map` vs `std.option.map`, OR per-module re-export with explicit aliasing). At that point, `std/byte_array.sigil` flips from doc-only to a real importable module that ships the four wrappers + `Utf8Error`. Removing the entry from `BUILTIN_INJECTED` is the structural step. The runtime and builtin-scheme surface stays unchanged.
+
+**Failure mode.** Users wanting `Option[Byte]`-shaped byte construction or `Result[String, Utf8Error]`-shaped UTF-8 decoding write a few lines of sigil against the deferred-wrapper-equivalent surface. The runtime primitives carry the same algorithmic content, so the user code is straightforward — the loss is API ergonomics, not capability.
+
+**Implementing commit(s).** Part 1 (runtime foundation): `5ec5fef`. Part 2 (compiler integration + doc-only stdlib file + typecheck/e2e tests): [HEAD].

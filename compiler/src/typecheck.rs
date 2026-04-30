@@ -737,6 +737,10 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // Plan C Task 66 — builtin generic schemes for `mut_array_*`
     // ops, gated by the Mem marker effect.
     register_builtin_mut_array_schemes(&mut tc);
+    // Plan C Task 66.5 — non-generic builtin schemes for the byte
+    // runtime: `byte_array_*`, `string_to_bytes`,
+    // `string_from_bytes_*`, `byte_in_range`, `byte_truncate`.
+    register_builtin_byte_array_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -1133,6 +1137,18 @@ fn builtin_types(file: &str) -> Vec<TypeDecl> {
                 span: span.clone(),
             }],
             variants: Vec::new(),
+            span: span.clone(),
+        },
+        // Plan C Task 66.5 — ByteArray is opaque, non-generic.
+        // Constructed exclusively via the runtime primitives
+        // registered alongside (`byte_array_alloc`, `byte_array_empty`,
+        // `byte_array_concat`, `byte_array_slice`, `string_to_bytes`,
+        // `string_from_bytes_alloc`).
+        TypeDecl {
+            name: "ByteArray".to_string(),
+            name_span: span.clone(),
+            generic_params: Vec::new(),
+            variants: Vec::new(),
             span,
         },
     ]
@@ -1261,6 +1277,87 @@ fn register_builtin_mut_array_schemes(tc: &mut Tc) {
             make_scheme(vec![mut_array_a, Ty::Int, Ty::Var(a)], Ty::Unit, vec![a]),
         );
     }
+}
+
+/// Plan C Task 66.5 — non-generic builtin schemes for the byte
+/// runtime primitives.
+///
+/// `ByteArray` is an opaque non-generic builtin type with a
+/// flat-byte payload. Operations registered here are simple
+/// concrete-typed builtins (no `forall A` quantifier needed).
+///
+/// Operations:
+/// - `byte_array_alloc(Int, Byte) -> ByteArray ![]`
+/// - `byte_array_empty() -> ByteArray ![]`
+/// - `byte_array_length(ByteArray) -> Int ![]`
+/// - `byte_array_get(ByteArray, Int) -> Byte ![]`
+/// - `byte_array_concat(ByteArray, ByteArray) -> ByteArray ![]`
+/// - `byte_array_slice(ByteArray, Int, Int) -> ByteArray ![]`
+/// - `string_to_bytes(String) -> ByteArray ![]`
+/// - `string_from_bytes_validate(ByteArray) -> Int ![]`
+/// - `string_from_bytes_alloc(ByteArray) -> String ![]`
+/// - `byte_in_range(Int) -> Bool ![]`
+/// - `byte_truncate(Int) -> Byte ![]`
+///
+/// `byte_from_int(n) -> Option[Byte]` ships in pure sigil under
+/// `std/byte_array.sigil` using `byte_in_range` + `byte_truncate`
+/// + `Option[Byte]` constructors.
+fn register_builtin_byte_array_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    let byte_array_ty = || Ty::User("ByteArray".to_string(), Vec::new());
+    tc.fn_schemes.insert(
+        "byte_array_alloc".to_string(),
+        make_scheme(vec![Ty::Int, Ty::Byte], byte_array_ty()),
+    );
+    tc.fn_schemes.insert(
+        "byte_array_empty".to_string(),
+        make_scheme(vec![], byte_array_ty()),
+    );
+    tc.fn_schemes.insert(
+        "byte_array_length".to_string(),
+        make_scheme(vec![byte_array_ty()], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "byte_array_get".to_string(),
+        make_scheme(vec![byte_array_ty(), Ty::Int], Ty::Byte),
+    );
+    tc.fn_schemes.insert(
+        "byte_array_concat".to_string(),
+        make_scheme(vec![byte_array_ty(), byte_array_ty()], byte_array_ty()),
+    );
+    tc.fn_schemes.insert(
+        "byte_array_slice".to_string(),
+        make_scheme(vec![byte_array_ty(), Ty::Int, Ty::Int], byte_array_ty()),
+    );
+    tc.fn_schemes.insert(
+        "string_to_bytes".to_string(),
+        make_scheme(vec![Ty::String], byte_array_ty()),
+    );
+    tc.fn_schemes.insert(
+        "string_from_bytes_validate".to_string(),
+        make_scheme(vec![byte_array_ty()], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_from_bytes_alloc".to_string(),
+        make_scheme(vec![byte_array_ty()], Ty::String),
+    );
+    tc.fn_schemes.insert(
+        "byte_in_range".to_string(),
+        make_scheme(vec![Ty::Int], Ty::Bool),
+    );
+    tc.fn_schemes.insert(
+        "byte_truncate".to_string(),
+        make_scheme(vec![Ty::Int], Ty::Byte),
+    );
 }
 
 struct Tc {
@@ -9332,6 +9429,106 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    // ===== Plan C Task 66.5 — ByteArray + Byte helper builtins =====
+
+    #[test]
+    fn byte_array_alloc_get_typechecks_cleanly() {
+        // Build a 5-byte array filled with 0x42, read it back. The
+        // builtin schemes guarantee `byte_array_alloc(Int, Byte) ->
+        // ByteArray` and `byte_array_get(ByteArray, Int) -> Byte`.
+        // Construct the Byte via byte_truncate (after byte_in_range
+        // gating) — a runtime-primitive-only path that doesn't need
+        // std.option.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let in_range: Bool = byte_in_range(66);\n  \
+                     let b: Byte = byte_truncate(66);\n  \
+                     let ba: ByteArray = byte_array_alloc(5, b);\n  \
+                     let n: Int = byte_array_length(ba);\n  \
+                     match in_range {\n    \
+                       true => perform IO.println(int_to_string(n)),\n    \
+                       false => perform IO.println(\"oor\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn byte_array_alloc_with_int_fill_fires_e0044() {
+        // byte_array_alloc(len, fill) requires fill: Byte, not Int.
+        // Pass a literal `0` (Int) to provoke E0044.
+        let src = "fn main() -> Int ![] {\n  \
+                     let _ba: ByteArray = byte_array_alloc(3, 0);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 from byte_array_alloc Int-vs-Byte mismatch; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn byte_array_concat_and_slice_typecheck_cleanly() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let b: Byte = byte_truncate(1);\n  \
+                     let a: ByteArray = byte_array_alloc(3, b);\n  \
+                     let b2: ByteArray = byte_array_alloc(2, b);\n  \
+                     let c: ByteArray = byte_array_concat(a, b2);\n  \
+                     let s: ByteArray = byte_array_slice(c, 1, 4);\n  \
+                     perform IO.println(int_to_string(byte_array_length(s)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_from_bytes_validate_alloc_typechecks_cleanly() {
+        // Pin the runtime-primitive UTF-8 round-trip surface. User-
+        // side `string_from_bytes` wrapper (returning Result) is
+        // deferred per `[DEVIATION Task 66.5]`; the primitives
+        // themselves are usable directly.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let bytes: ByteArray = string_to_bytes(\"hi\");\n  \
+                     let v: Int = string_from_bytes_validate(bytes);\n  \
+                     match v {\n    \
+                       -1 => perform IO.println(string_from_bytes_alloc(bytes)),\n    \
+                       _ => perform IO.println(\"bad\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_byte_array_is_doc_only_skip_list() {
+        // `import std.byte_array` is a no-op (skip-list path). The
+        // ByteArray surface is available unconditionally via builtin
+        // injection; the import provides documentation alignment
+        // only. Mirrors the std.array / std.mut_array pattern.
+        let src = "import std.byte_array\n\
+                   fn main() -> Int ![] {\n  \
+                     let _ba: ByteArray = byte_array_empty();\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn user_redeclares_byte_array_type_fires_e0113() {
+        let src = "type ByteArray = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "expected E0113 (duplicate type ByteArray); got {errs:?}"
+        );
     }
 
     #[test]

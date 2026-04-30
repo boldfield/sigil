@@ -707,6 +707,18 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("mut_array_length".to_string());
     globals.insert("mut_array_get".to_string());
     globals.insert("mut_array_set".to_string());
+    // Plan C Task 66.5 — ByteArray + Byte helper builtins.
+    globals.insert("byte_array_alloc".to_string());
+    globals.insert("byte_array_empty".to_string());
+    globals.insert("byte_array_length".to_string());
+    globals.insert("byte_array_get".to_string());
+    globals.insert("byte_array_concat".to_string());
+    globals.insert("byte_array_slice".to_string());
+    globals.insert("string_to_bytes".to_string());
+    globals.insert("string_from_bytes_validate".to_string());
+    globals.insert("string_from_bytes_alloc".to_string());
+    globals.insert("byte_in_range".to_string());
+    globals.insert("byte_truncate".to_string());
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
             if let Some(msg) = block_unsupported_handle(&f.body, &globals, &effects_resumes_many) {
@@ -4744,6 +4756,153 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_mut_array_set", Linkage::Import, &mut_array_set_sig)
         .map_err(|e| format!("declare sigil_mut_array_set: {e}"))?;
 
+    // Plan C Task 66.5 — runtime ByteArray primitives. Element type
+    // is fixed at `Byte` (I8), so unlike Array / MutArray's
+    // I64-on-pointer-element-erasure (see comment at sigil_array_get
+    // above), `byte_array_get` returns the narrow I8 directly.
+
+    // sigil_byte_array_alloc(len: i64, fill: u8) -> *mut u8
+    let mut byte_array_alloc_sig = Signature::new(isa_call_conv(&module));
+    byte_array_alloc_sig.params.push(AbiParam::new(types::I64));
+    byte_array_alloc_sig.params.push(AbiParam::new(types::I8));
+    byte_array_alloc_sig.returns.push(AbiParam::new(pointer_ty));
+    let byte_array_alloc = module
+        .declare_function(
+            "sigil_byte_array_alloc",
+            Linkage::Import,
+            &byte_array_alloc_sig,
+        )
+        .map_err(|e| format!("declare sigil_byte_array_alloc: {e}"))?;
+
+    // sigil_byte_array_empty() -> *mut u8
+    let mut byte_array_empty_sig = Signature::new(isa_call_conv(&module));
+    byte_array_empty_sig.returns.push(AbiParam::new(pointer_ty));
+    let byte_array_empty = module
+        .declare_function(
+            "sigil_byte_array_empty",
+            Linkage::Import,
+            &byte_array_empty_sig,
+        )
+        .map_err(|e| format!("declare sigil_byte_array_empty: {e}"))?;
+
+    // sigil_byte_array_length(arr: *const u8) -> i64
+    let mut byte_array_length_sig = Signature::new(isa_call_conv(&module));
+    byte_array_length_sig.params.push(AbiParam::new(pointer_ty));
+    byte_array_length_sig
+        .returns
+        .push(AbiParam::new(types::I64));
+    let byte_array_length = module
+        .declare_function(
+            "sigil_byte_array_length",
+            Linkage::Import,
+            &byte_array_length_sig,
+        )
+        .map_err(|e| format!("declare sigil_byte_array_length: {e}"))?;
+
+    // sigil_byte_array_get(arr: *const u8, i: i64) -> u8
+    let mut byte_array_get_sig = Signature::new(isa_call_conv(&module));
+    byte_array_get_sig.params.push(AbiParam::new(pointer_ty));
+    byte_array_get_sig.params.push(AbiParam::new(types::I64));
+    byte_array_get_sig.returns.push(AbiParam::new(types::I8));
+    let byte_array_get = module
+        .declare_function("sigil_byte_array_get", Linkage::Import, &byte_array_get_sig)
+        .map_err(|e| format!("declare sigil_byte_array_get: {e}"))?;
+
+    // sigil_byte_array_concat(a: *const u8, b: *const u8) -> *mut u8
+    let mut byte_array_concat_sig = Signature::new(isa_call_conv(&module));
+    byte_array_concat_sig.params.push(AbiParam::new(pointer_ty));
+    byte_array_concat_sig.params.push(AbiParam::new(pointer_ty));
+    byte_array_concat_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
+    let byte_array_concat = module
+        .declare_function(
+            "sigil_byte_array_concat",
+            Linkage::Import,
+            &byte_array_concat_sig,
+        )
+        .map_err(|e| format!("declare sigil_byte_array_concat: {e}"))?;
+
+    // sigil_byte_array_slice(arr: *const u8, start: i64, end: i64) -> *mut u8
+    let mut byte_array_slice_sig = Signature::new(isa_call_conv(&module));
+    byte_array_slice_sig.params.push(AbiParam::new(pointer_ty));
+    byte_array_slice_sig.params.push(AbiParam::new(types::I64));
+    byte_array_slice_sig.params.push(AbiParam::new(types::I64));
+    byte_array_slice_sig.returns.push(AbiParam::new(pointer_ty));
+    let byte_array_slice = module
+        .declare_function(
+            "sigil_byte_array_slice",
+            Linkage::Import,
+            &byte_array_slice_sig,
+        )
+        .map_err(|e| format!("declare sigil_byte_array_slice: {e}"))?;
+
+    // Plan C Task 66.5 — String<->ByteArray conversion FFI.
+
+    // sigil_string_to_bytes(s: *const u8) -> *mut u8
+    let mut string_to_bytes_sig = Signature::new(isa_call_conv(&module));
+    string_to_bytes_sig.params.push(AbiParam::new(pointer_ty));
+    string_to_bytes_sig.returns.push(AbiParam::new(pointer_ty));
+    let string_to_bytes = module
+        .declare_function(
+            "sigil_string_to_bytes",
+            Linkage::Import,
+            &string_to_bytes_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_to_bytes: {e}"))?;
+
+    // sigil_string_from_bytes_validate(arr: *const u8) -> i64
+    // Returns -1 if valid UTF-8, else byte offset of first invalid byte.
+    let mut string_from_bytes_validate_sig = Signature::new(isa_call_conv(&module));
+    string_from_bytes_validate_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    string_from_bytes_validate_sig
+        .returns
+        .push(AbiParam::new(types::I64));
+    let string_from_bytes_validate = module
+        .declare_function(
+            "sigil_string_from_bytes_validate",
+            Linkage::Import,
+            &string_from_bytes_validate_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_from_bytes_validate: {e}"))?;
+
+    // sigil_string_from_bytes_alloc(arr: *const u8) -> *mut u8
+    let mut string_from_bytes_alloc_sig = Signature::new(isa_call_conv(&module));
+    string_from_bytes_alloc_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    string_from_bytes_alloc_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
+    let string_from_bytes_alloc = module
+        .declare_function(
+            "sigil_string_from_bytes_alloc",
+            Linkage::Import,
+            &string_from_bytes_alloc_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_from_bytes_alloc: {e}"))?;
+
+    // Plan C Task 66.5 — `Byte` helpers used by sigil-side
+    // `byte_from_int(n) -> Option[Byte]`.
+
+    // sigil_byte_in_range(n: i64) -> bool (I8)
+    let mut byte_in_range_sig = Signature::new(isa_call_conv(&module));
+    byte_in_range_sig.params.push(AbiParam::new(types::I64));
+    byte_in_range_sig.returns.push(AbiParam::new(types::I8));
+    let byte_in_range = module
+        .declare_function("sigil_byte_in_range", Linkage::Import, &byte_in_range_sig)
+        .map_err(|e| format!("declare sigil_byte_in_range: {e}"))?;
+
+    // sigil_byte_truncate(n: i64) -> u8
+    let mut byte_truncate_sig = Signature::new(isa_call_conv(&module));
+    byte_truncate_sig.params.push(AbiParam::new(types::I64));
+    byte_truncate_sig.returns.push(AbiParam::new(types::I8));
+    let byte_truncate = module
+        .declare_function("sigil_byte_truncate", Linkage::Import, &byte_truncate_sig)
+        .map_err(|e| format!("declare sigil_byte_truncate: {e}"))?;
+
     // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
     // Phase 3a wires the frame allocation + push/pop ABI from Task
     // 56 around every `handle` body. Arms stay null in this commit
@@ -5516,6 +5675,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             mut_array_length,
             mut_array_get,
             mut_array_set,
+            byte_array_alloc,
+            byte_array_empty,
+            byte_array_length,
+            byte_array_get,
+            byte_array_concat,
+            byte_array_slice,
+            string_to_bytes,
+            string_from_bytes_validate,
+            string_from_bytes_alloc,
+            byte_in_range,
+            byte_truncate,
         },
         handler_frame_new,
         handle_push,
@@ -11202,6 +11372,142 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // Sigil-level Unit value (I8 zero) for the caller.
                 self.builder.ins().iconst(types::I8, 0)
             }
+            // Plan C Task 66.5 — runtime ByteArray primitives.
+            // Element type is fixed at `Byte` (I8), so unlike
+            // `array_get` / `mut_array_get`, `byte_array_get` returns
+            // the narrow I8 directly without the I64-on-pointer
+            // erasure.
+            Expr::Ident(name, _) if name == "byte_array_alloc" => {
+                assert_eq!(args.len(), 2, "byte_array_alloc builtin arg count is not 2");
+                let len = self.lower_expr(&args[0]);
+                let fill = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.byte_array_alloc_ref, &[len, fill]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "byte_array_empty" => {
+                assert_eq!(args.len(), 0, "byte_array_empty builtin arg count is not 0");
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.byte_array_empty_ref, &[]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "byte_array_length" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "byte_array_length builtin arg count is not 1"
+                );
+                let arr = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.byte_array_length_ref, &[arr]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "byte_array_get" => {
+                assert_eq!(args.len(), 2, "byte_array_get builtin arg count is not 2");
+                let arr = self.lower_expr(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.byte_array_get_ref, &[arr, idx]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "byte_array_concat" => {
+                assert_eq!(
+                    args.len(),
+                    2,
+                    "byte_array_concat builtin arg count is not 2"
+                );
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.byte_array_concat_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "byte_array_slice" => {
+                assert_eq!(args.len(), 3, "byte_array_slice builtin arg count is not 3");
+                let arr = self.lower_expr(&args[0]);
+                let start = self.lower_expr(&args[1]);
+                let end = self.lower_expr(&args[2]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.byte_array_slice_ref, &[arr, start, end]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_to_bytes" => {
+                assert_eq!(args.len(), 1, "string_to_bytes builtin arg count is not 1");
+                let s = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_to_bytes_ref, &[s]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_from_bytes_validate" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "string_from_bytes_validate builtin arg count is not 1"
+                );
+                let arr = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_from_bytes_validate_ref, &[arr]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_from_bytes_alloc" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "string_from_bytes_alloc builtin arg count is not 1"
+                );
+                let arr = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_from_bytes_alloc_ref, &[arr]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "byte_in_range" => {
+                assert_eq!(args.len(), 1, "byte_in_range builtin arg count is not 1");
+                let n = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.byte_in_range_ref, &[n]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "byte_truncate" => {
+                assert_eq!(args.len(), 1, "byte_truncate builtin arg count is not 1");
+                let n = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.byte_truncate_ref, &[n]);
+                self.builder.inst_results(call)[0]
+            }
             Expr::ClosureRecord { code_fn_name, .. } => {
                 // Evaluate the ClosureRecord first (allocates + stores
                 // the closure on the heap) and use its pointer as the
@@ -12369,6 +12675,35 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     types::I64
                 }
                 Expr::Ident(name, _) if name == "mut_array_set" => types::I8,
+                // Plan C Task 66.5 — ByteArray return-type predictions.
+                // The element type is fixed at Byte (I8) so the
+                // I64-on-pointer-erasure that affects Array / MutArray
+                // doesn't apply here.
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "byte_array_alloc"
+                            | "byte_array_empty"
+                            | "byte_array_concat"
+                            | "byte_array_slice"
+                            | "string_to_bytes"
+                            | "string_from_bytes_alloc"
+                    ) =>
+                {
+                    self.pointer_ty
+                }
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "byte_array_length" | "string_from_bytes_validate"
+                    ) =>
+                {
+                    types::I64
+                }
+                Expr::Ident(name, _) if name == "byte_array_get" || name == "byte_truncate" => {
+                    types::I8
+                }
+                Expr::Ident(name, _) if name == "byte_in_range" => types::I8,
                 Expr::ClosureRecord { code_fn_name, .. } => self
                     .user_fns
                     .get(code_fn_name)
@@ -12761,6 +13096,21 @@ struct BuiltinFuncIds {
     mut_array_length: cranelift_module::FuncId,
     mut_array_get: cranelift_module::FuncId,
     mut_array_set: cranelift_module::FuncId,
+    /// Plan C Task 66.5 — runtime ByteArray primitive FuncIds.
+    byte_array_alloc: cranelift_module::FuncId,
+    byte_array_empty: cranelift_module::FuncId,
+    byte_array_length: cranelift_module::FuncId,
+    byte_array_get: cranelift_module::FuncId,
+    byte_array_concat: cranelift_module::FuncId,
+    byte_array_slice: cranelift_module::FuncId,
+    /// Plan C Task 66.5 — runtime String<->ByteArray FuncIds.
+    string_to_bytes: cranelift_module::FuncId,
+    string_from_bytes_validate: cranelift_module::FuncId,
+    string_from_bytes_alloc: cranelift_module::FuncId,
+    /// Plan C Task 66.5 — runtime Byte helpers (gating the
+    /// sigil-side `byte_from_int(n) -> Option[Byte]` helper).
+    byte_in_range: cranelift_module::FuncId,
+    byte_truncate: cranelift_module::FuncId,
 }
 
 /// Per-fn FuncRefs for the builtin runtime primitives. Sibling of
@@ -12786,6 +13136,20 @@ struct BuiltinFuncRefs {
     mut_array_length_ref: FuncRef,
     mut_array_get_ref: FuncRef,
     mut_array_set_ref: FuncRef,
+    /// Plan C Task 66.5 — runtime ByteArray primitive FuncRefs.
+    byte_array_alloc_ref: FuncRef,
+    byte_array_empty_ref: FuncRef,
+    byte_array_length_ref: FuncRef,
+    byte_array_get_ref: FuncRef,
+    byte_array_concat_ref: FuncRef,
+    byte_array_slice_ref: FuncRef,
+    /// Plan C Task 66.5 — runtime String<->ByteArray FuncRefs.
+    string_to_bytes_ref: FuncRef,
+    string_from_bytes_validate_ref: FuncRef,
+    string_from_bytes_alloc_ref: FuncRef,
+    /// Plan C Task 66.5 — runtime Byte helpers.
+    byte_in_range_ref: FuncRef,
+    byte_truncate_ref: FuncRef,
 }
 
 /// Plan B Task 55, Phase 4e — input context for [`prepare_per_fn_refs`].
@@ -12964,6 +13328,19 @@ fn prepare_builtin_func_refs(
         mut_array_length_ref: module.declare_func_in_func(ids.mut_array_length, builder.func),
         mut_array_get_ref: module.declare_func_in_func(ids.mut_array_get, builder.func),
         mut_array_set_ref: module.declare_func_in_func(ids.mut_array_set, builder.func),
+        byte_array_alloc_ref: module.declare_func_in_func(ids.byte_array_alloc, builder.func),
+        byte_array_empty_ref: module.declare_func_in_func(ids.byte_array_empty, builder.func),
+        byte_array_length_ref: module.declare_func_in_func(ids.byte_array_length, builder.func),
+        byte_array_get_ref: module.declare_func_in_func(ids.byte_array_get, builder.func),
+        byte_array_concat_ref: module.declare_func_in_func(ids.byte_array_concat, builder.func),
+        byte_array_slice_ref: module.declare_func_in_func(ids.byte_array_slice, builder.func),
+        string_to_bytes_ref: module.declare_func_in_func(ids.string_to_bytes, builder.func),
+        string_from_bytes_validate_ref: module
+            .declare_func_in_func(ids.string_from_bytes_validate, builder.func),
+        string_from_bytes_alloc_ref: module
+            .declare_func_in_func(ids.string_from_bytes_alloc, builder.func),
+        byte_in_range_ref: module.declare_func_in_func(ids.byte_in_range, builder.func),
+        byte_truncate_ref: module.declare_func_in_func(ids.byte_truncate, builder.func),
     }
 }
 

@@ -6360,6 +6360,149 @@ fn std_array_import_is_noop_no_op() {
     assert_eq!(stdout, "5\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 66.5 — ByteArray runtime + builtin coverage =====
+//
+// `ByteArray` is a non-generic builtin type with flat-byte payload
+// (1 byte per slot vs `Array[A]`'s 64-bit slots). The 6 core ops +
+// 3 string-interop primitives + 2 Byte helpers are registered as
+// non-generic builtin schemes (`register_builtin_byte_array_schemes`)
+// and dispatched in `lower_call`. v1 user-side wrappers
+// (`byte_from_int`, `string_from_bytes`, `from_list`, `to_list`)
+// deferred per `[DEVIATION Task 66.5]` due to flat-namespace
+// stdlib collision; tests use the runtime primitives directly.
+
+/// Allocate a 5-byte array, read it back via byte_array_length.
+#[test]
+fn std_byte_array_alloc_length_returns_5() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = byte_truncate(0);\n  \
+                 let ba: ByteArray = byte_array_alloc(5, b);\n  \
+                 perform IO.println(int_to_string(byte_array_length(ba)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_length");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n", "stderr={stderr:?}");
+}
+
+/// `byte_array_get` reads back the fill byte.
+#[test]
+fn std_byte_array_get_returns_fill() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = byte_truncate(66);\n  \
+                 let ba: ByteArray = byte_array_alloc(3, b);\n  \
+                 let read_back: Byte = byte_array_get(ba, 1);\n  \
+                 perform IO.println(int_to_string(byte_to_int(read_back)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_get");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "66\n", "stderr={stderr:?}");
+}
+
+/// `byte_array_concat` joins two arrays end-to-end.
+#[test]
+fn std_byte_array_concat_joins_lengths() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b1: Byte = byte_truncate(1);\n  \
+                 let b2: Byte = byte_truncate(2);\n  \
+                 let a: ByteArray = byte_array_alloc(3, b1);\n  \
+                 let b: ByteArray = byte_array_alloc(2, b2);\n  \
+                 let c: ByteArray = byte_array_concat(a, b);\n  \
+                 perform IO.println(int_to_string(byte_array_length(c)));\n  \
+                 perform IO.println(int_to_string(byte_to_int(byte_array_get(c, 0))));\n  \
+                 perform IO.println(int_to_string(byte_to_int(byte_array_get(c, 4))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_concat");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n1\n2\n", "stderr={stderr:?}");
+}
+
+/// `byte_array_slice(c, start, end)` extracts a subrange.
+#[test]
+fn std_byte_array_slice_extracts_subrange() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = byte_truncate(7);\n  \
+                 let ba: ByteArray = byte_array_alloc(10, b);\n  \
+                 let s: ByteArray = byte_array_slice(ba, 2, 6);\n  \
+                 perform IO.println(int_to_string(byte_array_length(s)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_slice");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "4\n", "stderr={stderr:?}");
+}
+
+/// `byte_array_empty` returns a zero-length byte-array.
+#[test]
+fn std_byte_array_empty_returns_zero_length() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let ba: ByteArray = byte_array_empty();\n  \
+                 perform IO.println(int_to_string(byte_array_length(ba)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_empty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// String round-trip: `string_to_bytes` followed by validate + alloc
+/// recovers the original ASCII string verbatim.
+#[test]
+fn std_byte_array_string_round_trip_ascii() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let bytes: ByteArray = string_to_bytes(\"hello\");\n  \
+                 let v: Int = string_from_bytes_validate(bytes);\n  \
+                 match v {\n    \
+                   -1 => perform IO.println(string_from_bytes_alloc(bytes)),\n    \
+                   _ => perform IO.println(\"invalid\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_string_round_trip");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello\n", "stderr={stderr:?}");
+}
+
+/// `byte_in_range` returns true for in-range Ints, false otherwise.
+/// Pins the gating helper for any user-side `byte_from_int` wrapper.
+#[test]
+fn std_byte_in_range_accepts_zero_to_255() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 match byte_in_range(0) {\n    \
+                   true => perform IO.println(\"in0\"),\n    \
+                   false => perform IO.println(\"out0\"),\n  \
+                 };\n  \
+                 match byte_in_range(255) {\n    \
+                   true => perform IO.println(\"in255\"),\n    \
+                   false => perform IO.println(\"out255\"),\n  \
+                 };\n  \
+                 match byte_in_range(256) {\n    \
+                   true => perform IO.println(\"in256\"),\n    \
+                   false => perform IO.println(\"out256\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_in_range");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "in0\nin255\nout256\n", "stderr={stderr:?}");
+}
+
+/// `import std.byte_array` is a no-op (skip-list path).
+#[test]
+fn std_byte_array_import_is_noop() {
+    let src = "import std.byte_array\n\
+               fn main() -> Int ![IO] {\n  \
+                 let ba: ByteArray = byte_array_empty();\n  \
+                 perform IO.println(int_to_string(byte_array_length(ba)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration
