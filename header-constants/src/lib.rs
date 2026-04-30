@@ -44,6 +44,17 @@ pub const TAG_CLOSURE: u8 = 0x03;
 /// type descriptor (the v2 typed walker fixes this).
 pub const TAG_ARRAY: u8 = 0x04;
 
+/// Mutable Array layout — Plan C Task 66. Identical heap layout to
+/// `TAG_ARRAY`: `{header, length, elem[0], ..., elem[N-1]}`. The
+/// distinct tag exists so a v2 GC walker can tell mutable arrays
+/// (which need write-barrier consideration) apart from immutable
+/// ones, and so `array_*` builtins reject `MutArray[A]` arguments
+/// at runtime (or vice-versa) if static type checking is bypassed.
+/// In v1 with conservative scanning, the layouts behave identically
+/// — only the surface API differs (`array_set` returns a fresh
+/// array; `mut_array_set` returns Unit and mutates in place).
+pub const TAG_MUT_ARRAY: u8 = 0x05;
+
 /// Payload-word-count field layout.
 pub const COUNT_BITS: u32 = 6;
 pub const COUNT_SHIFT: u32 = 8;
@@ -118,6 +129,7 @@ mod tests {
         assert_eq!(TAG_INT64, 0x02);
         assert_eq!(TAG_CLOSURE, 0x03);
         assert_eq!(TAG_ARRAY, 0x04);
+        assert_eq!(TAG_MUT_ARRAY, 0x05);
         assert_eq!(TAG_EXTERNAL_DESCRIPTOR, 0xFF);
     }
 }

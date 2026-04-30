@@ -58,6 +58,7 @@ pub mod gc;
 pub mod handlers;
 pub mod header;
 pub mod io;
+pub mod mem;
 pub mod stackmap;
 pub mod value;
 

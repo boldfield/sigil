@@ -20,7 +20,7 @@
 //! immediates inline at each allocation site in generated code.
 
 pub use sigil_header_constants::{
-    TAG_ARRAY, TAG_CLOSURE, TAG_EXTERNAL_DESCRIPTOR, TAG_INT64, TAG_STRING,
+    TAG_ARRAY, TAG_CLOSURE, TAG_EXTERNAL_DESCRIPTOR, TAG_INT64, TAG_MUT_ARRAY, TAG_STRING,
 };
 
 use sigil_header_constants::{header_word, BITMAP_MASK, BITMAP_SHIFT, COUNT_MASK, COUNT_SHIFT};

@@ -6164,6 +6164,102 @@ fn std_result_and_then_ok_chains_through() {
     assert_eq!(stdout, "15\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 66 — MutArray runtime + Mem-effect coverage =====
+//
+// MutArray[A] is a builtin generic type registered alongside Array.
+// The four ops (`mut_array_new` / `_length` / `_get` / `_set`)
+// declare `![Mem]` in their effect row; main declares `![Mem]` to
+// permit mutation. mut_array_set returns Unit and mutates in place.
+
+/// Allocate, set in place, read back. Pin the in-place mutation
+/// contract: a single `arr` value sees the post-set slot value.
+#[test]
+fn std_mut_array_set_mutates_in_place() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let arr: MutArray[Int] = mut_array_new(3, 0);\n  \
+                 mut_array_set(arr, 1, 42);\n  \
+                 let v: Int = mut_array_get(arr, 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_set_in_place");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// Multiple sets accumulate in the same array — no fresh allocation.
+#[test]
+fn std_mut_array_set_chain_accumulates() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let arr: MutArray[Int] = mut_array_new(4, 0);\n  \
+                 mut_array_set(arr, 0, 10);\n  \
+                 mut_array_set(arr, 1, 20);\n  \
+                 mut_array_set(arr, 2, 30);\n  \
+                 mut_array_set(arr, 3, 40);\n  \
+                 let total: Int = mut_array_get(arr, 0)\n    \
+                   + mut_array_get(arr, 1)\n    \
+                   + mut_array_get(arr, 2)\n    \
+                   + mut_array_get(arr, 3);\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_chain");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "100\n", "stderr={stderr:?}");
+}
+
+/// Sudoku-board-sized MutArray (81 elements). Pins that the
+/// count-field overflow workaround applies to MutArray identically.
+#[test]
+fn std_mut_array_at_sudoku_size() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let arr: MutArray[Int] = mut_array_new(81, 0);\n  \
+                 mut_array_set(arr, 80, 99);\n  \
+                 let n: Int = mut_array_length(arr);\n  \
+                 let v: Int = mut_array_get(arr, 80);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_sudoku");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "81\n99\n", "stderr={stderr:?}");
+}
+
+/// MutArray of String — pointer-typed elements.
+#[test]
+fn std_mut_array_of_string() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let arr: MutArray[String] = mut_array_new(2, \"init\");\n  \
+                 mut_array_set(arr, 0, \"hello\");\n  \
+                 perform IO.println(mut_array_get(arr, 0));\n  \
+                 perform IO.println(mut_array_get(arr, 1));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_string");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello\ninit\n", "stderr={stderr:?}");
+}
+
+/// Mutation propagates across function-call boundaries — passing a
+/// MutArray to a helper fn (declared `![Mem]`) and mutating there
+/// affects the caller's view of the same array.
+#[test]
+fn std_mut_array_mutation_visible_across_fn_boundary() {
+    let src = "fn fill_at(arr: MutArray[Int], i: Int, v: Int) -> Unit ![Mem] {\n  \
+                 mut_array_set(arr, i, v)\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let arr: MutArray[Int] = mut_array_new(3, 0);\n  \
+                 fill_at(arr, 1, 77);\n  \
+                 perform IO.println(int_to_string(mut_array_get(arr, 1)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_cross_fn");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "77\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 65 — Array runtime + builtin coverage =====
 //
 // `Array[A]` is a builtin generic type registered at the typechecker

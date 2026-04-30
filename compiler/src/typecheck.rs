@@ -470,7 +470,7 @@ pub struct CtorInfo {
 /// order (phase 2). The `main` shim hardcodes the resulting effect_
 /// ids when emitting the top-level handler frames; the reserved-low-
 /// id convention is what keeps those constants stable per program.
-pub const BUILTIN_EFFECT_NAMES: &[&str] = &["ArithError", "IO"];
+pub const BUILTIN_EFFECT_NAMES: &[&str] = &["ArithError", "IO", "Mem"];
 
 /// Plan B Task 57 — construct synthetic `EffectDecl`s for the
 /// builtin effects (`IO`, `ArithError`). Returned in the order
@@ -519,6 +519,21 @@ fn builtin_effects() -> Vec<EffectDecl> {
             return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
             span: span.clone(),
         }],
+        span: span.clone(),
+    });
+    // Plan C Task 66 — Mem is a marker effect (zero ops). Functions
+    // that mutate `MutArray[A]` declare `![Mem]` in their effect row;
+    // the compiler rejects mutation calls from rows without Mem
+    // (E0042). No runtime handler frame is installed because there
+    // are no ops to dispatch — the "top-level Mem handler" is the
+    // type-level absence of a deeper override. See
+    // `[DEVIATION Task 66]` in `PLAN_C_DEVIATIONS.md`.
+    out.push(EffectDecl {
+        name: "Mem".to_string(),
+        name_span: span.clone(),
+        generic_params: Vec::new(),
+        resumes_many: false,
+        ops: Vec::new(),
         span,
     });
     debug_assert_eq!(
@@ -719,6 +734,9 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // `fn array_alloc(...)` declaration overwrites the builtin
     // (same shadowing model as `int_to_string`).
     register_builtin_array_schemes(&mut tc);
+    // Plan C Task 66 — builtin generic schemes for `mut_array_*`
+    // ops, gated by the Mem marker effect.
+    register_builtin_mut_array_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -1093,16 +1111,31 @@ fn builtin_fn_env() -> BTreeMap<String, Ty> {
 fn builtin_types(file: &str) -> Vec<TypeDecl> {
     use crate::ast::{GenericParam, TypeDecl};
     let span = Span::synthetic(file);
-    vec![TypeDecl {
-        name: "Array".to_string(),
-        name_span: span.clone(),
-        generic_params: vec![GenericParam {
-            name: "A".to_string(),
+    vec![
+        TypeDecl {
+            name: "Array".to_string(),
+            name_span: span.clone(),
+            generic_params: vec![GenericParam {
+                name: "A".to_string(),
+                span: span.clone(),
+            }],
+            variants: Vec::new(),
             span: span.clone(),
-        }],
-        variants: Vec::new(),
-        span,
-    }]
+        },
+        // Plan C Task 66 — MutArray[A] is opaque; constructed via
+        // the Mem-effected builtin `mut_array_new`. Same layout
+        // shape as Array but tag TAG_MUT_ARRAY at runtime.
+        TypeDecl {
+            name: "MutArray".to_string(),
+            name_span: span.clone(),
+            generic_params: vec![GenericParam {
+                name: "A".to_string(),
+                span: span.clone(),
+            }],
+            variants: Vec::new(),
+            span,
+        },
+    ]
 }
 
 /// Plan C Task 65 — builtin generic function schemes for the array
@@ -1172,6 +1205,60 @@ fn register_builtin_array_schemes(tc: &mut Tc) {
         tc.fn_schemes.insert(
             "array_set".to_string(),
             make_scheme(vec![array_a, Ty::Int, Ty::Var(a)], array_a_clone, vec![a]),
+        );
+    }
+}
+
+/// Plan C Task 66 — builtin generic schemes for the `MutArray[A]`
+/// runtime primitives. Each declares `effects: vec!["Mem"]` so a
+/// caller without `Mem` in its effect row trips E0042 at the call
+/// site. Operations:
+///
+/// - `mut_array_new[A](Int, A) -> MutArray[A] ![Mem]`
+/// - `mut_array_length[A](MutArray[A]) -> Int ![Mem]`
+/// - `mut_array_get[A](MutArray[A], Int) -> A ![Mem]`
+/// - `mut_array_set[A](MutArray[A], Int, A) -> Unit ![Mem]`
+fn register_builtin_mut_array_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty, type_vars: Vec<u32>| Scheme {
+        type_vars,
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: vec!["Mem".to_string()],
+            effect_row_var: None,
+        })),
+    };
+    {
+        let a = tc.fresh_ty_var();
+        let mut_array_a = Ty::User("MutArray".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "mut_array_new".to_string(),
+            make_scheme(vec![Ty::Int, Ty::Var(a)], mut_array_a, vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let mut_array_a = Ty::User("MutArray".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "mut_array_length".to_string(),
+            make_scheme(vec![mut_array_a], Ty::Int, vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let mut_array_a = Ty::User("MutArray".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "mut_array_get".to_string(),
+            make_scheme(vec![mut_array_a, Ty::Int], Ty::Var(a), vec![a]),
+        );
+    }
+    {
+        let a = tc.fresh_ty_var();
+        let mut_array_a = Ty::User("MutArray".to_string(), vec![Ty::Var(a)]);
+        tc.fn_schemes.insert(
+            "mut_array_set".to_string(),
+            make_scheme(vec![mut_array_a, Ty::Int, Ty::Var(a)], Ty::Unit, vec![a]),
         );
     }
 }
@@ -2394,13 +2481,13 @@ impl Tc {
                 );
             }
             for effect in &f.effects {
-                if effect != "IO" && effect != "ArithError" {
+                if effect != "IO" && effect != "ArithError" && effect != "Mem" {
                     self.push_error(
                         "E0041",
                         f.span.clone(),
                         format!(
                             "`fn main`'s effect row may only contain effects discharged by \
-                             the top-level shim (`IO` or `ArithError`); saw `{effect}`",
+                             the top-level shim (`IO`, `ArithError`, or `Mem`); saw `{effect}`",
                         ),
                     );
                 }
@@ -7694,26 +7781,24 @@ mod tests {
     #[test]
     fn effect_ids_assigned_alphabetically_per_program() {
         // Plan B Task 55 + Task 57 — user effect_ids are assigned in
-        // alphabetical order, **starting at `BUILTIN_EFFECT_NAMES.len()`**
-        // (today: 2). The reserved low ids 0 (`ArithError`) and 1 (`IO`)
-        // belong to the builtin effects synthesized in `builtin_effects()`
-        // — see `[DEVIATION Task 57] Builtin-effect injection` for the
-        // reserved-low-id convention. Declaration order in source still
-        // doesn't matter for user effects; alphabetical sort over
-        // `tc.effects` keys (BTreeMap iteration) is the canonical order.
+        // alphabetical order, **starting at `BUILTIN_EFFECT_NAMES.len()`**.
+        // Plan C Task 66 added `Mem` as a third builtin (zero-op
+        // marker effect), bumping the user-id start to 3. Reserved
+        // low ids: 0 (`ArithError`), 1 (`IO`), 2 (`Mem`).
         let src = "effect Zeta { z: () -> Int }\n\
                    effect Alpha { a: () -> Int }\n\
                    effect Mu { m: () -> Int }\n\
                    fn main() -> Int ![] { 0 }\n";
         let (cp, errs) = pipeline_checked(src);
         assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
-        // Builtins occupy 0 and 1.
+        // Builtins occupy 0, 1, 2.
         assert_eq!(cp.effect_ids.get("ArithError"), Some(&0));
         assert_eq!(cp.effect_ids.get("IO"), Some(&1));
-        // User effects start at 2 in alphabetical order.
-        assert_eq!(cp.effect_ids.get("Alpha"), Some(&2));
-        assert_eq!(cp.effect_ids.get("Mu"), Some(&3));
-        assert_eq!(cp.effect_ids.get("Zeta"), Some(&4));
+        assert_eq!(cp.effect_ids.get("Mem"), Some(&2));
+        // User effects start at 3 in alphabetical order.
+        assert_eq!(cp.effect_ids.get("Alpha"), Some(&3));
+        assert_eq!(cp.effect_ids.get("Mu"), Some(&4));
+        assert_eq!(cp.effect_ids.get("Zeta"), Some(&5));
     }
 
     #[test]
@@ -8932,6 +9017,60 @@ mod tests {
             has_code(&errs, "E0113"),
             "expected E0113 (duplicate type Array); got {errs:?}"
         );
+    }
+
+    // ===== Plan C Task 66 — MutArray + Mem effect typecheck-level coverage =====
+
+    #[test]
+    fn mut_array_new_get_set_typechecks_under_mem_row() {
+        let src = "fn main() -> Int ![IO, Mem] {\n  \
+                     let arr: MutArray[Int] = mut_array_new(3, 0);\n  \
+                     mut_array_set(arr, 1, 42);\n  \
+                     let v: Int = mut_array_get(arr, 1);\n  \
+                     perform IO.println(int_to_string(v));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn mut_array_set_without_mem_in_row_fires_e0042() {
+        // Without Mem in main's row, mut_array_set's `![Mem]` row
+        // requirement isn't satisfied — typecheck rejects.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let arr: MutArray[Int] = mut_array_new(3, 0);\n  \
+                     mut_array_set(arr, 1, 42);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 from missing Mem in row; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_redeclares_mut_array_type_fires_e0113() {
+        let src = "type MutArray = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "expected E0113 (duplicate type MutArray); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn main_with_mem_only_in_row_typechecks() {
+        // Mem alone (no IO) is acceptable in main's row.
+        let src = "fn main() -> Int ![Mem] {\n  \
+                     let arr: MutArray[Int] = mut_array_new(2, 5);\n  \
+                     mut_array_set(arr, 0, 99);\n  \
+                     mut_array_get(arr, 0)\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
