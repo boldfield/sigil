@@ -528,10 +528,10 @@ The `run_state` implementation reuses `examples/state.sigil`'s state-bearing-lam
 
 **Closure path.** Four orthogonal v2 lifts retire the deviation:
 
-1. Parser surface for type-parameterized effect references in rows (`![State[S]]`).
-2. Tuple type / `Pair[A, B]` stdlib (or `(A, S)` syntax). `run_state` then returns `(A, S)`.
-3. Wrapper-fn frame composition fix for the discharge-with-lambda pattern. After this lands, std/state.sigil grows `get_state` / `set_state` ergonomic wrappers.
-4. Row-poly Fn type parameters (`(() -> A ![State[S] | e]) -> ...`).
+1. Parser surface for type-parameterized effect references in rows (`![State[S]]`). **Open** — Plan D Task 114.
+2. Tuple type / `Pair[A, B]` stdlib (or `(A, S)` syntax). **Closed** by Plan D Task 113 (PR #53). Tuple types `(T1, T2, ...)`, tuple values `(e1, e2, ...)`, `Pattern::Tuple` element-wise unification + destructure, and `std/pair.sigil` with `fst[A,B]` / `snd[A,B]` over binary tuples shipped. `run_state` returning `(A, S)` is now expressible at the surface; updating `std/state.sigil` to actually return `(A, S)` is a follow-up Plan-C-completion task — the v1 blocker was the syntax, not the discharge mechanism.
+3. Wrapper-fn frame composition fix for the discharge-with-lambda pattern. After this lands, std/state.sigil grows `get_state` / `set_state` ergonomic wrappers. **Deferred** — Plan D Task 112 deferred to Task 117 follow-up; see `PLAN_D_DEVIATIONS.md` `[DEVIATION Task 112]`.
+4. Row-poly Fn type parameters (`(() -> A ![State[S] | e]) -> ...`). **Open** — Plan D Task 116.
 
 User code calling `perform State.get()` / `perform State.set(s)` / `run_state(init, body)` stays surface-stable across the v1 → v2 shift; the v2 wrapper-fn additions are additive (don't break existing call sites).
 

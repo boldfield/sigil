@@ -136,6 +136,14 @@ pub enum TypeExpr {
     /// pushes `Stmt::Let` and `Expr::Lambda` past clippy's
     /// `large_enum_variant` limit).
     Fn(Box<FnTypeExpr>),
+    /// Plan D Task 113 — tuple type: `(T1, T2, ...)`. Arity ≥ 2;
+    /// single-element parens fall through to paren-grouping over the
+    /// inner type, and zero-element parens are reserved (parser
+    /// rejects). Allowed in any type position. Maps to
+    /// [`crate::typecheck::Ty::Tuple`] for HM unification (element-
+    /// wise); codegen emits a heap-allocated record with one slot
+    /// per element.
+    Tuple { elems: Vec<TypeExpr>, span: Span },
 }
 
 /// Boxed payload of [`TypeExpr::Fn`]. See that variant's docstring
@@ -156,6 +164,7 @@ impl TypeExpr {
             TypeExpr::Named(_, s) => s.clone(),
             TypeExpr::Apply { span, .. } => span.clone(),
             TypeExpr::Fn(fty) => fty.span.clone(),
+            TypeExpr::Tuple { span, .. } => span.clone(),
         }
     }
 
@@ -172,6 +181,7 @@ impl TypeExpr {
             TypeExpr::Named(n, _) => n,
             TypeExpr::Apply { name, .. } => name,
             TypeExpr::Fn(_) => "Fn",
+            TypeExpr::Tuple { .. } => "Tuple",
         }
     }
 }
@@ -473,6 +483,23 @@ pub enum Expr {
         op_arms: Vec<HandleOpArm>,
         span: Span,
     },
+    /// Plan D Task 113 — tuple value: `(e1, e2, ...)`. Arity ≥ 2;
+    /// single-element parens fall through to paren-grouping (the
+    /// parser returns the inner expression directly), zero-element
+    /// `()` is reserved for a future Unit-literal spelling, and
+    /// `(e,)` with a trailing comma is rejected (Plan D Task 113 R1
+    /// finding 1: trailing-comma single-element tuples are not a
+    /// valid syntax). Maps to [`crate::typecheck::Ty::Tuple`] for
+    /// HM unification (element-wise inference); codegen allocates a
+    /// heap record `{header, elem[0], ..., elem[N-1]}` with elements
+    /// at offsets `8 + 8*i` (no discriminant word — tuples have one
+    /// constructor per arity, unlike sum-type ctors which lay
+    /// fields out at `16 + 8*i` after the discriminant). The GC
+    /// pointer bitmap reflects per-slot pointer-ness.
+    Tuple {
+        elems: Vec<Expr>,
+        span: Span,
+    },
 }
 
 /// Plan B task 53 — the optional `return(v) => body` arm of a
@@ -668,7 +695,8 @@ impl Expr {
             | Expr::ClosureRecord { span: s, .. }
             | Expr::ClosureEnvLoad { span: s, .. }
             | Expr::RecordLit { span: s, .. }
-            | Expr::Handle { span: s, .. } => s.clone(),
+            | Expr::Handle { span: s, .. }
+            | Expr::Tuple { span: s, .. } => s.clone(),
             Expr::Perform(p) => p.span.clone(),
             Expr::Block(b) => b.span.clone(),
         }

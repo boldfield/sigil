@@ -343,7 +343,7 @@ fn cranelift_ty_of_ty(ty: &crate::typecheck::Ty, pointer_ty: Type) -> Type {
         Ty::Int => types::I64,
         Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
         Ty::Char => types::I32,
-        Ty::String | Ty::Fn(_) | Ty::User(_, _) => pointer_ty,
+        Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => pointer_ty,
         Ty::Var(id) => unreachable!(
             "codegen: Ty::Var({id}) reached cranelift_ty_of_ty — \
              typecheck must resolve every var through unification \
@@ -478,6 +478,15 @@ fn type_expr_uses_apply_or_param(
                 }
             }
             type_expr_uses_apply_or_param(&fty.ret, params)
+        }
+        // Plan D Task 113 — recurse into tuple element types.
+        TypeExpr::Tuple { elems, .. } => {
+            for e in elems {
+                if type_expr_uses_apply_or_param(e, params) {
+                    return true;
+                }
+            }
+            false
         }
     }
 }
@@ -634,6 +643,14 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
             }
             for arm in op_arms {
                 if expr_uses_generic(&arm.body, params) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                if expr_uses_generic(e, params) {
                     return true;
                 }
             }
@@ -978,6 +995,14 @@ fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
         | Expr::CharLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => None,
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                if let Some(m) = expr_unsupported_indirect_call(e) {
+                    return Some(m);
+                }
+            }
+            None
+        }
     }
 }
 
@@ -1268,6 +1293,14 @@ fn expr_unsupported_handle(
             if let Some(ra) = return_arm {
                 if let Some(msg) = expr_unsupported_handle(&ra.body, globals, effects_resumes_many)
                 {
+                    return Some(msg);
+                }
+            }
+            None
+        }
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                if let Some(msg) = expr_unsupported_handle(e, globals, effects_resumes_many) {
                     return Some(msg);
                 }
             }
@@ -1756,6 +1789,14 @@ fn arm_body_walk(
                 scopes.pop();
                 if r.is_some() {
                     return r;
+                }
+            }
+            None
+        }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                if let Some(r) = arm_body_walk(el, scopes, k_name, globals, false) {
+                    return Some(r);
                 }
             }
             None
@@ -2518,6 +2559,9 @@ fn slot_kind_for_type_expr_post_mono(te: &crate::ast::TypeExpr) -> EnvSlotKind {
         // allocated closure records; treat as a pointer slot
         // (Closure kind matches the codegen-time runtime layout).
         crate::ast::TypeExpr::Fn(_) => EnvSlotKind::Closure,
+        // Plan D Task 113 — tuple values are heap-allocated records
+        // with one slot per element; treat as User pointer slot.
+        crate::ast::TypeExpr::Tuple { .. } => EnvSlotKind::User,
     }
 }
 
@@ -2649,6 +2693,11 @@ fn walk_collect_captures(
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => {}
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                walk_collect_captures(el, bound, helper_params, out);
+            }
+        }
     }
 }
 
@@ -2740,6 +2789,11 @@ fn walk_collect_arm_captures(
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => {}
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                walk_collect_arm_captures(el, bound, arm_params, out);
+            }
+        }
     }
 }
 
@@ -3526,6 +3580,12 @@ fn collect_handle_arms_in_expr(
             );
             Ok(())
         }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                collect_handle_arms_in_expr(el, module, ctx, out)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3945,6 +4005,20 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
              a caller bypassed `expr_is_pure`",
             std::any::type_name::<Expr>()
         )),
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                if let Some(msg) = arm_body_post_arm_k_tail_free_vars_ok(
+                    el,
+                    binding_name,
+                    k_name,
+                    globals,
+                    extra_bindings,
+                ) {
+                    return Some(msg);
+                }
+            }
+            None
+        }
     }
 }
 
@@ -4116,6 +4190,7 @@ fn find_closure_env_load_lambda_source(
             Expr::RecordLit { fields, .. } => fields.iter().find_map(|f| scan_expr(&f.value, name)),
             Expr::Handle { body, op_arms, .. } => scan_expr(body, name)
                 .or_else(|| op_arms.iter().find_map(|a| scan_expr(&a.body, name))),
+            Expr::Tuple { elems, .. } => elems.iter().find_map(|e| scan_expr(e, name)),
         }
     }
     fn scan_block(b: &Block, name: &str) -> Option<(usize, crate::ast::EnvSlotKind)> {
@@ -4379,6 +4454,13 @@ fn rewrite_expr(
                 span: span.clone(),
             }
         }
+        Expr::Tuple { elems, span } => Expr::Tuple {
+            elems: elems
+                .iter()
+                .map(|el| rewrite_expr(el, captures, scopes))
+                .collect(),
+            span: span.clone(),
+        },
     }
 }
 
@@ -6679,6 +6761,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                    current_fn_name: f.name.clone(),
                     local_fn_types: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
                     captured_fn_sigs: BTreeMap::new(),
@@ -6820,6 +6904,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
                 match_scrut_tys: &checked.match_scrut_tys,
+                match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                current_fn_name: f.name.clone(),
                 local_fn_types: {
                     // Plan B' Stage 6.8 Task 104 — seed with fn-typed
                     // parameters so `lower_call`'s indirect path can
@@ -7318,6 +7404,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                    current_fn_name: String::new(),
                     local_fn_types: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
                     captured_fn_sigs: BTreeMap::new(),
@@ -8021,6 +8109,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     type_layouts: &type_layouts,
                     ctor_index: &ctor_index,
                     match_scrut_tys: &checked.match_scrut_tys,
+                    match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                    current_fn_name: String::new(),
                     local_fn_types: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
                     captured_fn_sigs: BTreeMap::new(),
@@ -8259,6 +8349,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 type_layouts: &type_layouts,
                 ctor_index: &ctor_index,
                 match_scrut_tys: &checked.match_scrut_tys,
+                match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                current_fn_name: String::new(),
                 local_fn_types: BTreeMap::new(),
                 call_callee_tys: &checked.call_callee_tys,
                 captured_fn_sigs: BTreeMap::new(),
@@ -8535,6 +8627,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         type_layouts: &type_layouts,
                         ctor_index: &ctor_index,
                         match_scrut_tys: &checked.match_scrut_tys,
+                        match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                        current_fn_name: String::new(),
                         local_fn_types: BTreeMap::new(),
                         call_callee_tys: &checked.call_callee_tys,
                         captured_fn_sigs: BTreeMap::new(),
@@ -9173,6 +9267,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             type_layouts: &type_layouts,
                             ctor_index: &ctor_index,
                             match_scrut_tys: &checked.match_scrut_tys,
+                            match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                            current_fn_name: String::new(),
                             local_fn_types: BTreeMap::new(),
                             call_callee_tys: &checked.call_callee_tys,
                             captured_fn_sigs: BTreeMap::new(),
@@ -9930,6 +10026,27 @@ struct Lowerer<'a, 'b> {
     /// lowering (`Stmt::Let` with `TypeExpr::Fn`). Empty for synth
     /// arm-fn / cps continuation lowering surfaces.
     local_fn_types: BTreeMap<String, crate::ast::FnTypeExpr>,
+
+    /// Plan D Task 113 R1 finding 2 — per-clone resolved
+    /// `match_scrut_tys` keyed by `(clone_fn_name, match_span)`.
+    /// Populated by `monomorphize` for every Match expression
+    /// rewritten inside a generic clone; entries hold the
+    /// post-substitution scrutinee `Ty` so codegen recovers
+    /// concrete element types regardless of scrutinee shape.
+    /// `lower_match` and the `type_of_expr` Match arm consult
+    /// `(current_fn_name, span)` here first; on miss they fall
+    /// back to the span-keyed `match_scrut_tys` side-table (which
+    /// is correct for non-generic surfaces and synth helper fns
+    /// whose match scrutinees carry no `Ty::Var(_)`).
+    match_scrut_tys_resolved: &'b crate::monomorphize::MatchScrutTysResolved,
+
+    /// Plan D Task 113 R1 finding 2 — fn name this Lowerer is
+    /// emitting code for. User fns use `f.name`; synth helpers
+    /// (handler arm fns, lifted lambdas, sync shims, post-arm-k
+    /// continuations) use their declared mangled name. Read by
+    /// `lower_match` / `type_of_expr` to key into
+    /// `match_scrut_tys_resolved`.
+    current_fn_name: String,
 
     /// Plan B' Stage 6.8 Phase C+ — typecheck-resolved callee `Ty::Fn`
     /// for indirect calls, keyed on the call expression's span.
@@ -11213,6 +11330,82 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.switch_to_block(merge_block_nra);
                 self.builder.seal_block(merge_block_nra);
                 self.builder.block_params(merge_block_nra)[0]
+            }
+            // Plan D Task 113 — tuple constructor. Heap-allocate a
+            // record with `header (TAG_TUPLE, count=N, bitmap)` plus
+            // N 64-bit element slots, then store each element's
+            // widened value at offset `8 + 8*i`. Layout matches the
+            // sum-type ctor pattern but without the discriminant word
+            // (tuples have a single constructor per arity).
+            Expr::Tuple { elems, .. } => {
+                use sigil_header_constants::{header_word, MAX_TUPLE_ARITY, TAG_TUPLE};
+                // Lower elements first — they may have side effects in
+                // source order. Capture the surface Cranelift type of
+                // each so we know whether to widen on store and whether
+                // to mark the pointer bitmap bit.
+                let mut elem_vals: Vec<(Value, Type)> = Vec::with_capacity(elems.len());
+                for el in elems {
+                    let v = self.lower_expr(el);
+                    let ty = self.builder.func.dfg.value_type(v);
+                    elem_vals.push((v, ty));
+                }
+                let n = elem_vals.len();
+                debug_assert!(
+                    n <= MAX_TUPLE_ARITY,
+                    "codegen: tuple arity {n} exceeds MAX_TUPLE_ARITY = {MAX_TUPLE_ARITY} \
+                     (32-bit pointer bitmap, one bit per element)"
+                );
+                // Pointer bitmap: bit i set iff element i is pointer-
+                // typed (heap-allocated value). Sub-word integer types
+                // (I8, I32) and I64 are scalars; pointer_ty values
+                // (always I64 on supported 64-bit targets) are GC
+                // pointers.
+                //
+                // Plan D Task 113 R1 finding 3 — `pointer_ty` is I64
+                // on every target sigil currently builds for. lower_
+                // expr returns the same Cranelift type (I64) for both
+                // scalar `Int` values and pointer-typed values
+                // (`String`, `Closure`, `User`, `Tuple`), so we
+                // cannot distinguish them at this site without
+                // typecheck info threaded through. **Conservative
+                // choice:** mark every I64 element as a pointer.
+                // Boehm tolerates false positives — a non-pointer
+                // `Int` marked as pointer becomes a conservative root
+                // (harmless on 64-bit hosts where every Int value is
+                // misinterpretable as a pointer anyway). Refining
+                // this requires plumbing element `Ty`s from typecheck
+                // through monomorphize → codegen for tuple ctor sites
+                // (the same plumbing already used by `lower_record_
+                // lit` for record fields).
+                let mut bitmap: u32 = 0;
+                for (i, (_, ty)) in elem_vals.iter().enumerate() {
+                    if *ty == self.pointer_ty {
+                        bitmap |= 1u32 << i;
+                    }
+                }
+                let header = header_word(TAG_TUPLE, n as u8, bitmap);
+                let header_v = self.builder.ins().iconst(types::I64, header as i64);
+                let payload_bytes: i64 = (n as i64) * 8;
+                let size_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
+                let alloc_call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.alloc_ref, &[header_v, size_v]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, alloc_call));
+                let ptr = self.builder.inst_results(alloc_call)[0];
+                for (i, (val, val_ty)) in elem_vals.into_iter().enumerate() {
+                    let store_val = if val_ty == types::I64 || val_ty == self.pointer_ty {
+                        val
+                    } else {
+                        self.builder.ins().uextend(types::I64, val)
+                    };
+                    let offset: i32 = 8 + 8 * i as i32;
+                    self.builder
+                        .ins()
+                        .store(MemFlags::trusted(), store_val, ptr, offset);
+                }
+                ptr
             }
         }
     }
@@ -13126,7 +13319,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match_span: &Span,
     ) -> Value {
         let s = self.lower_expr(scrutinee);
-        let scrut_ty = self.match_scrut_tys.get(match_span).cloned();
+        // Plan D Task 113 R1 finding 2 — prefer the per-clone
+        // resolved scrutinee Ty keyed by (current_fn_name, span).
+        // monomorphize populates this map for every Match
+        // expression rewritten inside a generic clone with the
+        // post-substitution `Ty`, so codegen recovers concrete
+        // element types regardless of scrutinee shape (Ident, Call,
+        // nested Match, …). Span-keyed fallback is correct for
+        // non-generic surfaces and synth helper fns whose match
+        // scrutinees carry no `Ty::Var(_)`.
+        let scrut_ty = self
+            .match_scrut_tys_resolved
+            .get(&(self.current_fn_name.clone(), match_span.clone()))
+            .cloned()
+            .or_else(|| self.match_scrut_tys.get(match_span).cloned());
 
         // Predict the result type from the first arm's body. Pattern
         // bindings introduced by the first arm are added to a preview
@@ -13299,10 +13505,41 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     }
                 }
             }
-            Pattern::Tuple(_, _) => {
-                unreachable!(
-                    "codegen: Pattern::Tuple reaches lowering (typecheck should reject with E0117)"
-                )
+            // Plan D Task 113 — tuple pattern destructure. Loads each
+            // element from the heap record at offset `8 + 8*i`,
+            // narrows to the element's surface type, and recurses
+            // with the sub-pattern. No discriminant check — tuples
+            // have a single constructor per arity; typecheck E0117
+            // already rejected arity mismatches.
+            Pattern::Tuple(pats, _) => {
+                let elem_tys = match scrut_ty {
+                    Some(Ty::Tuple(ts)) if ts.len() == pats.len() => ts.clone(),
+                    _ => unreachable!(
+                        "codegen: Pattern::Tuple expected scrut_ty = Ty::Tuple of matching arity \
+                         (typecheck E0117 should have rejected mismatched shapes)"
+                    ),
+                };
+                for (i, (sub, elem_ty)) in pats.iter().zip(elem_tys.iter()).enumerate() {
+                    let raw = self.builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        scrut,
+                        8 + 8 * i as i32,
+                    );
+                    let elem_val = match elem_ty {
+                        Ty::Int => raw,
+                        Ty::Bool | Ty::Byte | Ty::Unit => {
+                            self.builder.ins().ireduce(types::I8, raw)
+                        }
+                        Ty::Char => self.builder.ins().ireduce(types::I32, raw),
+                        Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+                        Ty::Var(_) => unreachable!(
+                            "codegen: Ty::Var in tuple element type — typecheck \
+                             E0132 should have rejected"
+                        ),
+                    };
+                    self.emit_pattern_test(sub, elem_val, Some(elem_ty), next, bindings);
+                }
             }
         }
     }
@@ -13349,7 +13586,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Ty::Int => raw,
             Ty::Bool | Ty::Byte | Ty::Unit => self.builder.ins().ireduce(types::I8, raw),
             Ty::Char => self.builder.ins().ireduce(types::I32, raw),
-            Ty::String | Ty::Fn(_) | Ty::User(_, _) => raw,
+            Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
             // Plan B task 48 invariant — codegen-entry walker
             // (`contains_apply_or_generic_ref`) rejects programs
             // whose AST has surface generic syntax, so a stray
@@ -13398,6 +13635,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match pat {
             Pattern::Wildcard(_) => true,
             Pattern::Var(name, _) => self.nullary_ctor_promotion(name, scrut_ty).is_none(),
+            // Plan D Task 113 — `Pattern::Tuple` is *structurally
+            // present* even when every sub-pattern is catchall, because
+            // the bindings inside still need to be installed into the
+            // arm body's env. The conditional path (via
+            // `emit_pattern_test`) is the place that walks tuple
+            // sub-patterns and accumulates `(name, Value)` pairs; the
+            // catchall fast-path here only knows how to bind a single
+            // top-level `Pattern::Var`. Returning `false` here forces
+            // tuples through the conditional path so destructure
+            // bindings reach the arm body.
             _ => false,
         }
     }
@@ -13466,7 +13713,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     }
                 }
             }
-            Pattern::Tuple(_, _) => {}
+            // Plan D Task 113 — tuple pattern recurses into each
+            // element with the matching element type. Pattern arity
+            // matches Ty::Tuple arity (typecheck E0117 already
+            // rejected mismatches).
+            Pattern::Tuple(pats, _) => {
+                if let Some(Ty::Tuple(elem_tys)) = scrut_ty {
+                    if pats.len() == elem_tys.len() {
+                        for (sub, ety) in pats.iter().zip(elem_tys.iter()) {
+                            self.predict_pattern_bindings(sub, Some(ety), out);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -13561,7 +13820,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // Propagate the preview down, extending with any pattern
                 // bindings this inner match's first arm introduces so
                 // nested-match result-type prediction sees them.
-                let inner_scrut_ty = self.match_scrut_tys.get(span).cloned();
+                //
+                // Plan D Task 113 R1 finding 2 — mirror
+                // `lower_match`'s per-clone resolved-first lookup so
+                // a tuple-typed scrutinee resolves to its concrete
+                // (post-mono) Ty regardless of scrutinee shape.
+                let inner_scrut_ty = self
+                    .match_scrut_tys_resolved
+                    .get(&(self.current_fn_name.clone(), span.clone()))
+                    .cloned()
+                    .or_else(|| self.match_scrut_tys.get(span).cloned());
                 let mut inner_preview = preview.clone();
                 self.predict_pattern_bindings(
                     &arms[0].pattern,
@@ -13790,24 +14058,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 body, return_arm, ..
             } => match return_arm {
                 Some(ra) => {
-                    // Plan B Task 55 (Phase 4g) review-fix #2:
-                    // pre-bind `v` into a forked preview before
-                    // recursing. Without this, callers that don't
-                    // pre-bind `v` (e.g., `lower_match`'s arm-body
-                    // type predictor at codegen.rs:8323-8325; any
-                    // path that reaches `type_of_expr` against a
-                    // handle expression nested inside another shape
-                    // — `match scrut { _ => handle ... with {
-                    // return(v) => v, ... } }`) would recurse into
-                    // an `Expr::Ident("v")` against a preview
-                    // without `v` and trip the `unreachable!`
-                    // ident-lookup path at codegen.rs around line
-                    // 9020. The Phase 4g handle-exit dispatch site
-                    // (codegen.rs:8060) already inserts `v: body_ty`
-                    // before this same call; the fix here makes
-                    // the preview-injection self-contained inside
-                    // `type_of_expr` so every other caller is safe
-                    // by construction.
                     let body_ty = self.type_of_expr(body, preview);
                     let mut p2 = preview.clone();
                     p2.insert(ra.binding.clone(), body_ty);
@@ -13815,6 +14065,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
                 None => self.type_of_expr(body, preview),
             },
+            // Plan D Task 113 — tuple values lower to a heap-allocated
+            // record pointer; the surface Cranelift type is pointer_ty.
+            Expr::Tuple { .. } => self.pointer_ty,
         }
     }
 }
@@ -14030,6 +14283,9 @@ fn arm_body_has_k_pair_lambda(
         | Expr::StringLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => false,
+        Expr::Tuple { elems, .. } => elems
+            .iter()
+            .any(|e| arm_body_has_k_pair_lambda(e, arm_k_pair_captures)),
     }
 }
 
@@ -14774,6 +15030,16 @@ fn expr_is_pure(e: &crate::ast::Expr) -> bool {
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => false,
+        // Plan D Task 113 — tuple values are heap-allocated, but
+        // allocation alone doesn't prevent purity in this
+        // classifier's sense (RecordLit returns true when its fields
+        // are pure — allocation is intrinsic to value construction).
+        // A tuple of pure elements has no observable side effects
+        // beyond the heap alloc, identical to RecordLit. Plan D
+        // Task 113 R1 finding 4 — flipped from `false` to mirror the
+        // RecordLit shape so generic helpers using tuple ctor
+        // values aren't rejected by the perform-side classifier.
+        Expr::Tuple { elems, .. } => elems.iter().all(expr_is_pure),
     }
 }
 
@@ -16287,6 +16553,7 @@ mod tests {
         let mono = MonoProgram {
             anf,
             lambda_captures_resolved: std::collections::BTreeMap::new(),
+            match_scrut_tys_resolved: std::collections::BTreeMap::new(),
         };
         let colored = crate::color::infer_colors(mono);
         assert_eq!(
@@ -16366,6 +16633,7 @@ mod tests {
         let mono = MonoProgram {
             anf,
             lambda_captures_resolved: std::collections::BTreeMap::new(),
+            match_scrut_tys_resolved: std::collections::BTreeMap::new(),
         };
         // Build ColoredProgram manually with `colors[("f")] = Native`,
         // overriding what `infer_colors` would have returned. This is
@@ -16635,6 +16903,7 @@ mod tests {
             let mono = crate::monomorphize::MonoProgram {
                 anf,
                 lambda_captures_resolved: std::collections::BTreeMap::new(),
+                match_scrut_tys_resolved: std::collections::BTreeMap::new(),
             };
             crate::color::infer_colors(mono)
         };

@@ -513,6 +513,14 @@ fn find_any_perform_in_expr(e: &Expr) -> Option<(String, String)> {
             }
             None
         }
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                if let Some(p) = find_any_perform_in_expr(e) {
+                    return Some(p);
+                }
+            }
+            None
+        }
     }
 }
 
@@ -634,6 +642,11 @@ fn collect_calls_in_expr(
             }
             for arm in op_arms {
                 collect_calls_in_expr(&arm.body, fn_index, calls, out);
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                collect_calls_in_expr(e, fn_index, calls, out);
             }
         }
     }
@@ -1110,6 +1123,11 @@ mod tests {
                     walk_expr_for_fn_idents(&arm.body, fn_names, out);
                 }
             }
+            Expr::Tuple { elems, .. } => {
+                for el in elems {
+                    walk_expr_for_fn_idents(el, fn_names, out);
+                }
+            }
         }
     }
 
@@ -1155,6 +1173,7 @@ mod tests {
         MonoProgram {
             anf,
             lambda_captures_resolved: BTreeMap::new(),
+            match_scrut_tys_resolved: BTreeMap::new(),
         }
     }
 

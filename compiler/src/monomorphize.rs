@@ -109,6 +109,10 @@ use crate::typecheck::{GenericInstantiation, Scheme, Ty};
 /// `lambda_captures`. See `MonoProgram::lambda_captures_resolved`.
 pub type LambdaCapturesResolved = BTreeMap<(String, Span), Vec<(String, Ty)>>;
 
+/// Plan D Task 113 R1 finding 2 — per-clone resolved
+/// `match_scrut_tys`. See `MonoProgram::match_scrut_tys_resolved`.
+pub type MatchScrutTysResolved = BTreeMap<(String, Span), Ty>;
+
 #[derive(Clone, Debug)]
 pub struct MonoProgram {
     pub anf: AnfProgram,
@@ -122,6 +126,23 @@ pub struct MonoProgram {
     /// fn clone populates per-(fn_name, span) entries with
     /// `Ty::Var` resolved through the active substitution.
     pub lambda_captures_resolved: LambdaCapturesResolved,
+    /// Plan D Task 113 R1 finding 2 — per-clone resolved
+    /// `match_scrut_tys` keyed by (clone_fn_name, match_span). The
+    /// span-keyed `CheckedProgram::match_scrut_tys` side-table is
+    /// shared across every clone of a generic fn (spans are
+    /// preserved across cloning by design, so a single source
+    /// `match` expression has one span regardless of which clone is
+    /// being lowered). For generic clones, the entry holds
+    /// `Ty::Var(_)`-bearing types from the pre-mono parent; codegen
+    /// reading those would trip `cranelift_ty_of_ty`'s `Ty::Var`
+    /// guard. This per-clone map records the post-substitution
+    /// scrutinee `Ty` keyed by `(clone_fn_name, match_span)` so
+    /// codegen's `lower_match` can recover the concrete type
+    /// regardless of scrutinee shape (Ident, Call, nested Match,
+    /// etc.). For non-generic programs (the fast-path skip), this
+    /// map is empty and codegen falls back to the span-keyed
+    /// `CheckedProgram` side-table.
+    pub match_scrut_tys_resolved: MatchScrutTysResolved,
 }
 
 /// Run monomorphization on the post-elaborate IR. Returns the input
@@ -134,10 +155,11 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
         return MonoProgram {
             anf,
             lambda_captures_resolved: BTreeMap::new(),
+            match_scrut_tys_resolved: BTreeMap::new(),
         };
     }
 
-    let (new_items, lambda_captures_resolved) = {
+    let (new_items, lambda_captures_resolved, match_scrut_tys_resolved) = {
         let mono = Monomorphizer::new(&anf.checked);
         mono.run_with_lambda_captures()
     };
@@ -156,6 +178,7 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
     MonoProgram {
         anf,
         lambda_captures_resolved,
+        match_scrut_tys_resolved,
     }
 }
 
@@ -233,6 +256,14 @@ pub fn canon_ty(ty: &Ty) -> String {
                 }
                 s
             }
+        }
+        Ty::Tuple(elems) => {
+            let mut s = String::from("Tuple");
+            for e in elems {
+                s.push('$');
+                s.push_str(&canon_ty(e));
+            }
+            s
         }
         Ty::Var(id) => {
             // Reachability-bounded mono never sees an unresolved var
@@ -391,6 +422,13 @@ struct Monomorphizer<'a> {
     /// lambda_span) → resolved-captures entries in
     /// `lambda_captures_resolved`.
     current_clone_fn_name: Option<String>,
+    /// Plan D Task 113 R1 finding 2 — per-clone resolved
+    /// `match_scrut_tys` populated by the Match arm of `rewrite_expr`,
+    /// keyed by (clone_fn_name, match_span). Lifted into
+    /// `MonoProgram` at the end of monomorphize so codegen can read
+    /// concrete (post-substitution) scrutinee types regardless of
+    /// scrutinee expression shape.
+    match_scrut_tys_resolved: MatchScrutTysResolved,
 }
 
 impl<'a> Monomorphizer<'a> {
@@ -436,6 +474,7 @@ impl<'a> Monomorphizer<'a> {
             lambda_captures: &checked.lambda_captures,
             lambda_captures_resolved: BTreeMap::new(),
             current_clone_fn_name: None,
+            match_scrut_tys_resolved: BTreeMap::new(),
         }
     }
 
@@ -444,10 +483,16 @@ impl<'a> Monomorphizer<'a> {
     /// fn cloning. Used by the slow path of `monomorphize()` so the
     /// downstream `closure_convert` pass can read substituted Tys
     /// for each clone's lambdas.
-    fn run_with_lambda_captures(self) -> (Vec<Item>, LambdaCapturesResolved) {
+    fn run_with_lambda_captures(
+        self,
+    ) -> (Vec<Item>, LambdaCapturesResolved, MatchScrutTysResolved) {
         let mut this = self;
         let items = this.run_inner_borrowed();
-        (items, this.lambda_captures_resolved)
+        (
+            items,
+            this.lambda_captures_resolved,
+            this.match_scrut_tys_resolved,
+        )
     }
 
     fn run_inner_borrowed(&mut self) -> Vec<Item> {
@@ -718,6 +763,13 @@ impl<'a> Monomorphizer<'a> {
                 effect_row_var: fty.effect_row_var.clone(),
                 span: fty.span.clone(),
             })),
+            TypeExpr::Tuple { elems, span } => TypeExpr::Tuple {
+                elems: elems
+                    .iter()
+                    .map(|e| self.rewrite_type_expr(e, subst))
+                    .collect(),
+                span: span.clone(),
+            },
         }
     }
 
@@ -858,6 +910,23 @@ impl<'a> Monomorphizer<'a> {
                 // monomorph runs inside a generic clone).
                 let scrut_ty_concrete: Option<Ty> =
                     self.match_scrut_tys.get(span).map(|t| subst.apply_to_ty(t));
+                // Plan D Task 113 R1 finding 2 — record the post-
+                // substitution scrutinee Ty into the per-clone
+                // resolved map so codegen can recover the concrete
+                // type at the same span without requiring scrutinee-
+                // shape-specific fallbacks (`local_var_tys` only
+                // worked for `Expr::Ident` scrutinees; non-Ident
+                // scrutinees in generic fns would still leak
+                // `Ty::Var(_)` into codegen). Spans are preserved
+                // across cloning, so per-(clone_fn_name, span)
+                // keying disambiguates between independent
+                // instantiations of the same generic source fn.
+                if let (Some(fn_name), Some(scrut_ty)) =
+                    (&self.current_clone_fn_name, &scrut_ty_concrete)
+                {
+                    self.match_scrut_tys_resolved
+                        .insert((fn_name.clone(), span.clone()), scrut_ty.clone());
+                }
                 Expr::Match {
                     scrutinee: Box::new(self.rewrite_expr(scrutinee, subst)),
                     arms: arms
@@ -1014,6 +1083,10 @@ impl<'a> Monomorphizer<'a> {
                     span: span.clone(),
                 }
             }
+            Expr::Tuple { elems, span } => Expr::Tuple {
+                elems: elems.iter().map(|e| self.rewrite_expr(e, subst)).collect(),
+                span: span.clone(),
+            },
         }
     }
 
@@ -1271,6 +1344,12 @@ fn ty_from_type_expr_under_subst(te: &TypeExpr, subst: &BTreeMap<String, Ty>) ->
                 effect_row_var: None,
             }))
         }
+        TypeExpr::Tuple { elems, .. } => Ty::Tuple(
+            elems
+                .iter()
+                .map(|e| ty_from_type_expr_under_subst(e, subst))
+                .collect(),
+        ),
     }
 }
 
@@ -1302,6 +1381,7 @@ impl Substitution {
                 name.clone(),
                 args.iter().map(|a| self.apply_to_ty(a)).collect(),
             ),
+            Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|e| self.apply_to_ty(e)).collect()),
             Ty::Fn(sig) => Ty::Fn(Box::new(crate::typecheck::FnSig {
                 params: sig.params.iter().map(|p| self.apply_to_ty(p)).collect(),
                 ret: self.apply_to_ty(&sig.ret),
@@ -1383,13 +1463,17 @@ fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
                 span: span.clone(),
             }))
         }
+        Ty::Tuple(elems) => TypeExpr::Tuple {
+            elems: elems.iter().map(|e| ty_to_type_expr(e, span)).collect(),
+            span: span.clone(),
+        },
     }
 }
 
 /// Convert a fully-rewritten `TypeExpr` (no `Apply`, no generic-param
 /// references, no `Var`) into a `Ty`. Used when resolving the args
 /// of a `TypeExpr::Apply` recursively.
-fn type_expr_to_ty(te: &TypeExpr) -> Ty {
+pub(crate) fn type_expr_to_ty(te: &TypeExpr) -> Ty {
     match te {
         TypeExpr::Named(n, _) => match n.as_str() {
             "Int" => Ty::Int,
@@ -1416,6 +1500,7 @@ fn type_expr_to_ty(te: &TypeExpr) -> Ty {
                 effect_row_var: None,
             }))
         }
+        TypeExpr::Tuple { elems, .. } => Ty::Tuple(elems.iter().map(type_expr_to_ty).collect()),
     }
 }
 

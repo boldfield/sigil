@@ -68,6 +68,15 @@ pub enum Ty {
     /// through `Subst::apply_ty`; the codegen-entry walker asserts the
     /// post-monomorphization IR is var-free.
     Var(u32),
+    /// Plan D Task 113 — tuple type `(T1, T2, ...)`. Arity ≥ 2.
+    /// Element-wise unification (each `elems[i]` must unify
+    /// position-by-position with the other tuple's `elems[i]`). The
+    /// codegen-side runtime layout is a heap record `{header, elem
+    /// [0], ..., elem[N-1]}` with elements at offsets `8 + 8*i`
+    /// (tuples have no discriminant word; sum-type ctors lay fields
+    /// at `16 + 8*i` after the discriminant). The GC pointer bitmap
+    /// reflects per-slot pointer-ness.
+    Tuple(Vec<Ty>),
 }
 
 /// Structural function signature. Used in `Ty::Fn` and built for
@@ -207,6 +216,9 @@ impl Subst {
                 name.clone(),
                 args.iter().map(|a| self.apply_ty_inner(a, seen)).collect(),
             ),
+            Ty::Tuple(elems) => {
+                Ty::Tuple(elems.iter().map(|e| self.apply_ty_inner(e, seen)).collect())
+            }
             Ty::Fn(sig) => {
                 let new_sig = FnSig {
                     params: sig
@@ -2045,6 +2057,12 @@ impl Tc {
                     .map(|a| Self::rename_ty(a, ty_map, row_map))
                     .collect(),
             ),
+            Ty::Tuple(elems) => Ty::Tuple(
+                elems
+                    .iter()
+                    .map(|e| Self::rename_ty(e, ty_map, row_map))
+                    .collect(),
+            ),
             Ty::Fn(sig) => {
                 let new_sig = FnSig {
                     params: sig
@@ -2072,6 +2090,7 @@ impl Tc {
             Ty::Int | Ty::String | Ty::Unit | Ty::Bool | Ty::Char | Ty::Byte => false,
             Ty::Var(other) => other == id,
             Ty::User(_, args) => args.iter().any(|a| self.occurs_in_ty(id, a)),
+            Ty::Tuple(elems) => elems.iter().any(|e| self.occurs_in_ty(id, e)),
             Ty::Fn(sig) => {
                 sig.params.iter().any(|p| self.occurs_in_ty(id, p))
                     || self.occurs_in_ty(id, &sig.ret)
@@ -2215,6 +2234,29 @@ impl Tc {
                 let mut ok = true;
                 for (pa, pb) in args_a.iter().zip(args_b.iter()) {
                     if !self.unify_ty(pa, pb, span) {
+                        ok = false;
+                    }
+                }
+                ok
+            }
+            // Plan D Task 113 — tuple unification: arity must match;
+            // elements unify position-by-position.
+            (Ty::Tuple(elems_a), Ty::Tuple(elems_b)) => {
+                if elems_a.len() != elems_b.len() {
+                    self.push_error(
+                        "E0044",
+                        span.clone(),
+                        format!(
+                            "tuple arity mismatch: expected `{}`, got `{}`",
+                            ty_display(&a),
+                            ty_display(&b)
+                        ),
+                    );
+                    return false;
+                }
+                let mut ok = true;
+                for (ea, eb) in elems_a.iter().zip(elems_b.iter()) {
+                    if !self.unify_ty(ea, eb, span) {
                         ok = false;
                     }
                 }
@@ -2541,6 +2583,14 @@ impl Tc {
                          Plan B' Stage 6.8 Task 103 limits"
                             .to_string(),
                     );
+                }
+            }
+            // Plan D Task 113 — recurse into tuple element types so
+            // any nested unknown-type / Apply errors still surface
+            // against the inner spans.
+            TypeExpr::Tuple { elems, .. } => {
+                for e in elems {
+                    self.check_type_expr_known(e);
                 }
             }
         }
@@ -3404,6 +3454,21 @@ impl Tc {
                 op_arms,
                 span,
             } => self.check_handle(body, return_arm.as_deref(), op_arms, row, span),
+            // Plan D Task 113 — tuple value: `(e1, e2, ...)`. Check each
+            // element under the active row; the tuple's type is the
+            // element-wise Ty::Tuple. Empty tuples are rejected by the
+            // parser (zero-arity reserved); single-element parens are
+            // paren-grouping and never reach this arm.
+            Expr::Tuple { elems, .. } => {
+                let elem_tys: Vec<Ty> = elems
+                    .iter()
+                    .map(|e| {
+                        self.check_expr(e, row)
+                            .unwrap_or(Ty::Var(self.fresh_ty_var()))
+                    })
+                    .collect();
+                Some(Ty::Tuple(elem_tys))
+            }
         }
     }
 
@@ -4678,6 +4743,43 @@ impl Tc {
                 }
                 None
             }
+            // Plan D Task 113 — tuple scrutinee. A Pattern::Tuple of the
+            // matching arity is the only constructor; if any of the
+            // patterns is a wildcard / Var catchall, the
+            // pattern_is_catchall guard above already returned None.
+            // Otherwise the tuple has no other constructors, so we
+            // descend element-wise to find the first un-covered element
+            // and synthesize a witness with `_` placeholders elsewhere.
+            Ty::Tuple(elem_tys) => {
+                let tuple_rows: Vec<&Vec<Pattern>> = patterns
+                    .iter()
+                    .filter_map(|p| match p {
+                        Pattern::Tuple(pats, _) if pats.len() == elem_tys.len() => Some(pats),
+                        _ => None,
+                    })
+                    .collect();
+                if tuple_rows.is_empty() {
+                    let placeholders = vec!["_"; elem_tys.len()].join(", ");
+                    return Some(format!("({placeholders})"));
+                }
+                for (elem_idx, elem_ty) in elem_tys.iter().enumerate() {
+                    let elem_patterns: Vec<&Pattern> =
+                        tuple_rows.iter().map(|row| &row[elem_idx]).collect();
+                    if let Some(sub) = self.match_witness(elem_ty, &elem_patterns) {
+                        let parts: Vec<String> = (0..elem_tys.len())
+                            .map(|i| {
+                                if i == elem_idx {
+                                    sub.clone()
+                                } else {
+                                    "_".to_string()
+                                }
+                            })
+                            .collect();
+                        return Some(format!("({})", parts.join(", ")));
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -4705,6 +4807,20 @@ impl Tc {
                     }
                 }
                 true
+            }
+            // Plan D Task 113 — a tuple pattern is catchall iff every
+            // sub-pattern is catchall against the corresponding tuple
+            // element type. Arity must match the scrut_ty's arity.
+            Pattern::Tuple(pats, _) => {
+                if let Ty::Tuple(elem_tys) = scrut_ty {
+                    if pats.len() == elem_tys.len() {
+                        return pats
+                            .iter()
+                            .zip(elem_tys.iter())
+                            .all(|(sub, ety)| self.pattern_is_catchall(sub, ety));
+                    }
+                }
+                false
             }
             _ => false,
         }
@@ -4849,22 +4965,48 @@ impl Tc {
                 bindings.push((name.clone(), scrut_ty.clone()));
             }
             Pattern::Tuple(pats, span) => {
-                // Plan A3 v1 has no tuple types in the surface; a
-                // tuple pattern never matches any scrutinee type. We
-                // still recurse into sub-patterns with the scrutinee
-                // type as a conservative placeholder so any inner
-                // pattern-shape errors still surface, but emit E0117
-                // at the top-level tuple pattern.
-                self.push_error(
-                    "E0117",
-                    span.clone(),
-                    format!(
-                        "tuple pattern does not match scrutinee type `{}` (no tuple types in Plan A3 v1)",
-                        ty_display(scrut_ty)
-                    ),
-                );
-                for sub in pats {
-                    self.check_pattern(sub, scrut_ty, bindings);
+                // Plan D Task 113 — tuple pattern matches a Ty::Tuple
+                // scrutinee element-wise. Arity must match; element
+                // types unify position-by-position. Pattern arity ≥ 2
+                // is the parser's invariant (single-elem parens are
+                // paren-grouping, zero-elem rejected).
+                let resolved = self.deref(scrut_ty);
+                match resolved {
+                    Ty::Tuple(elem_tys) => {
+                        if pats.len() != elem_tys.len() {
+                            self.push_error(
+                                "E0117",
+                                span.clone(),
+                                format!(
+                                    "tuple pattern with {} elements does not match scrutinee type `{}`",
+                                    pats.len(),
+                                    ty_display(scrut_ty)
+                                ),
+                            );
+                            // Still recurse with the scrutinee type so
+                            // inner shape errors surface.
+                            for sub in pats {
+                                self.check_pattern(sub, scrut_ty, bindings);
+                            }
+                        } else {
+                            for (sub, elem_ty) in pats.iter().zip(elem_tys.iter()) {
+                                self.check_pattern(sub, elem_ty, bindings);
+                            }
+                        }
+                    }
+                    _ => {
+                        self.push_error(
+                            "E0117",
+                            span.clone(),
+                            format!(
+                                "tuple pattern does not match scrutinee type `{}` (expected a tuple type)",
+                                ty_display(scrut_ty)
+                            ),
+                        );
+                        for sub in pats {
+                            self.check_pattern(sub, scrut_ty, bindings);
+                        }
+                    }
                 }
             }
             Pattern::Ctor { name, fields, span } => {
@@ -5079,8 +5221,27 @@ fn type_is(t: &TypeExpr, name: &str) -> bool {
     t.head_name() == name
 }
 
-fn type_name(t: &TypeExpr) -> &str {
-    t.head_name()
+fn type_name(t: &TypeExpr) -> String {
+    // Plan D Task 113 — tuple types render in surface form
+    // `(T1, T2, ...)` so error messages stay readable for the new
+    // type surface. Other variants delegate to head_name (a stable
+    // identifier-shaped string suitable for short error formats).
+    match t {
+        TypeExpr::Tuple { elems, .. } => {
+            let parts: Vec<String> = elems.iter().map(type_name).collect();
+            format!("({})", parts.join(", "))
+        }
+        TypeExpr::Fn(fty) => {
+            let params: Vec<String> = fty.params.iter().map(type_name).collect();
+            let ret = type_name(&fty.ret);
+            format!("({}) -> {}", params.join(", "), ret)
+        }
+        TypeExpr::Apply { name, args, .. } => {
+            let argstr: Vec<String> = args.iter().map(type_name).collect();
+            format!("{}[{}]", name, argstr.join(", "))
+        }
+        TypeExpr::Named(n, _) => n.clone(),
+    }
 }
 
 /// Lift a surface `TypeExpr` into the checker's `Ty` lattice. Resolves
@@ -5180,6 +5341,14 @@ pub(crate) fn ty_from_type_expr(
                 effect_row_var: None,
             })))
         }
+        // Plan D Task 113 — TypeExpr::Tuple maps element-wise to Ty::Tuple.
+        TypeExpr::Tuple { elems, .. } => {
+            let mut elem_tys = Vec::with_capacity(elems.len());
+            for e in elems {
+                elem_tys.push(ty_from_type_expr(e, types, generic_subst)?);
+            }
+            Some(Ty::Tuple(elem_tys))
+        }
     }
 }
 
@@ -5217,6 +5386,10 @@ fn ty_display(t: &Ty) -> String {
                 let argstr = args.iter().map(ty_display).collect::<Vec<_>>().join(", ");
                 format!("{n}[{argstr}]")
             }
+        }
+        Ty::Tuple(elems) => {
+            let parts: Vec<String> = elems.iter().map(ty_display).collect();
+            format!("({})", parts.join(", "))
         }
         Ty::Var(id) => format!("?{id}"),
     }
@@ -5533,6 +5706,13 @@ fn collect_free_vars(
                     *locals = saved;
                 }
             }
+            // Plan D Task 113 — tuple values: walk each element to
+            // collect captures from sub-expressions.
+            Expr::Tuple { elems, .. } => {
+                for e in elems {
+                    walk(e, outer_names, param_names, locals, captures);
+                }
+            }
         }
     }
 
@@ -5579,14 +5759,41 @@ fn collect_free_vars(
     }
 }
 
+/// Plan D Task 113 — recognise patterns that are catchall against
+/// `scrut_ty` at the simple-fallback exhaustiveness layer (no
+/// access to the ctor registry; conservative for User types).
+///
+/// `Pattern::Wildcard` and `Pattern::Var` are catchall against any
+/// non-User type. For User types we conservatively return false —
+/// the User-type exhaustiveness path uses `match_witness` which
+/// handles ctor-aware enumeration.
+///
+/// `Pattern::Tuple` is catchall against `Ty::Tuple` of matching
+/// arity iff every sub-pattern is catchall against the matching
+/// element type. Nested tuples are handled recursively.
+fn pattern_is_simple_catchall(p: &Pattern, scrut_ty: &Ty) -> bool {
+    match p {
+        Pattern::Wildcard(_) => true,
+        Pattern::Var(_, _) => !matches!(scrut_ty, Ty::User(_, _)),
+        Pattern::Tuple(pats, _) => match scrut_ty {
+            Ty::Tuple(elem_tys) if pats.len() == elem_tys.len() => pats
+                .iter()
+                .zip(elem_tys.iter())
+                .all(|(sub, ety)| pattern_is_simple_catchall(sub, ety)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn is_exhaustive(scrut: &Ty, arms: &[MatchArm]) -> bool {
     if arms.is_empty() {
         return false;
     }
-    let has_wildcard = arms
+    let has_catchall = arms
         .iter()
-        .any(|a| matches!(a.pattern, Pattern::Wildcard(_)));
-    if has_wildcard {
+        .any(|a| pattern_is_simple_catchall(&a.pattern, scrut));
+    if has_catchall {
         return true;
     }
     match scrut {
@@ -5612,6 +5819,12 @@ fn is_exhaustive(scrut: &Ty, arms: &[MatchArm]) -> bool {
         // (`match o { None => .., Some(_) => .. }`) still fires E0066
         // until 38.4 teaches the checker to enumerate variants.
         Ty::User(_, _) => false,
+        // Plan D Task 113 — tuple scrutinees: only structural
+        // exhaustiveness (Pattern::Tuple of matching arity covering
+        // every cell) can saturate. Without a wildcard, the heuristic
+        // here returns false; Maranget's algorithm in
+        // `match_witness` does the actual coverage analysis.
+        Ty::Tuple(_) => false,
         // Plan B task 48: still-polymorphic scrutinees can't reach
         // shape-based exhaustiveness; defer the diagnostic to the
         // upstream unification site that left the variable free.
@@ -5756,6 +5969,15 @@ fn count_in_expr(e: &Expr, k_name: &str) -> usize {
                 }
             }
             saturating_add(nb, nra.max(max_arm))
+        }
+        // Plan D Task 113 — tuple values: each element is a sequential
+        // sub-expression; sum k-counts across elements.
+        Expr::Tuple { elems, .. } => {
+            let mut n = 0usize;
+            for e in elems {
+                n = saturating_add(n, count_in_expr(e, k_name));
+            }
+            n
         }
     }
 }

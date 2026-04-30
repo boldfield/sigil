@@ -60,7 +60,7 @@ Plan B' Stage-6.8-followup carryover #2 (Sync shim emission gating) is out of Pl
 Internal ordering: 114 must precede 115; 113 and 116 are independent.
 
 - Task 113 — Tuples / `Pair[A, B]`.
-  - status: todo
+  - status: **done** — PR #53 (squash). Full tuple syntax `(T1, T2, ...)` types and `(e1, e2, ...)` values, `Pattern::Tuple` element-wise unification + destructure, `MAX_TUPLE_ARITY = 31` (32-bit pointer bitmap, one bit reserved), `std/pair.sigil` with `fst` / `snd` over binary tuples. Code lands across AST + parser + typecheck + monomorphize + closure_convert + color + elaborate + codegen + header-constants. Five positive-path e2e tests + four negative-path e2e tests (parser empty `()`, parser `(e,)`, E0117 arity mismatch, E0066 non-catchall) + one generic-non-Ident-scrutinee positive test pin the surface. PR R1 surfaced two architectural findings closed in this PR — see `PLAN_D_DEVIATIONS.md` `[DEVIATION Task 113]` for the per-clone `match_scrut_tys_resolved` map (Bug 2) and `MAX_TUPLE_ARITY` named constant (R1 finding 3). PR R1 also flagged `[DEVIATION Task 72]` constraint #2's tuple-type prerequisite as now closed; constraint #2's `run_state` `(A, S)` shape closure remains a follow-up Plan-C-completion item. Closes Plan A3-deferred tuple work consolidated into this task.
 - Task 114 — Type-parameterized effect rows (`![Raise[E]]`, `![State[S]]`).
   - status: todo
 - Task 115 — Per-op generic params on user-declared effects (`fail[A]: (E) -> A`).

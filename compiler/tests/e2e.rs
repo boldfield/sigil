@@ -7562,3 +7562,196 @@ fn std_result_and_then_inner_err_short_circuits() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "zero\n", "stderr={stderr:?}");
 }
+
+// ===== Plan D Task 113 — tuples / Pair[A, B] =====
+//
+// Tuples ship as a first-class type+value surface. `(T1, T2, ...)`
+// type expressions and `(e1, e2, ...)` value expressions parse;
+// `Pattern::Tuple` (already in the AST since Plan A3) now matches
+// against `Ty::Tuple` element-wise. Codegen allocates a heap record
+// with `header(TAG_TUPLE, count=N, bitmap)` plus N 8-byte slots.
+// `std/pair.sigil` provides `fst` / `snd` over binary tuples.
+
+/// Construct a binary tuple, destructure with `match`, extract first
+/// element. Pins the round-trip (alloc + indexed load).
+#[test]
+fn tuple_construct_destructure_int_string() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let p: (Int, String) = (42, \"hi\");\n  \
+                 let result: Int = match p {\n    \
+                   (a, _) => a,\n  \
+                 };\n  \
+                 result\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tuple_construct_destructure");
+    assert_eq!(code, 42, "exit code expected 42; stderr={stderr:?}");
+    assert_eq!(stdout, "", "no stdout expected; stderr={stderr:?}");
+}
+
+/// Tuple value flows through std.pair's `fst` and `snd` over the
+/// binary tuple `(Int, String)`. Smoke gate for Task 113.
+#[test]
+fn std_pair_fst_returns_first_element() {
+    let src = "import std.pair\n\
+               fn main() -> Int ![IO] {\n  \
+                 let p: (Int, String) = (42, \"hi\");\n  \
+                 let n: Int = fst(p);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_pair_fst");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_pair_snd_returns_second_element() {
+    let src = "import std.pair\n\
+               fn main() -> Int ![IO] {\n  \
+                 let p: (Int, String) = (42, \"hi\");\n  \
+                 let s: String = snd(p);\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_pair_snd");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hi\n", "stderr={stderr:?}");
+}
+
+/// Nested tuple. Pins recursive destructure across heap-pointer
+/// element types.
+#[test]
+fn tuple_nested_destructure() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let p: ((Int, Int), Int) = ((1, 2), 3);\n  \
+                 let result: Int = match p {\n    \
+                   ((a, _), c) => a + c,\n  \
+                 };\n  \
+                 result\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tuple_nested");
+    assert_eq!(code, 4, "exit code expected 4; stderr={stderr:?}");
+    assert_eq!(stdout, "", "no stdout expected; stderr={stderr:?}");
+}
+
+/// Arity-3 tuple: pin that the indexed-load discipline scales beyond
+/// the binary case. Element-wise sum returns 6.
+#[test]
+fn tuple_arity_three_destructure() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let t: (Int, Int, Int) = (1, 2, 3);\n  \
+                 let result: Int = match t {\n    \
+                   (a, b, c) => a + b + c,\n  \
+                 };\n  \
+                 result\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tuple_arity_three");
+    assert_eq!(code, 6, "exit code expected 6; stderr={stderr:?}");
+    assert_eq!(stdout, "", "no stdout expected; stderr={stderr:?}");
+}
+
+// Plan D Task 113 R1 — negative-path tests pinning the diagnostic
+// surface for tuple-related malformed source.
+
+/// Empty parens `()` are reserved for a future Unit-literal spelling
+/// and rejected by the parser. Pins the diagnostic so a future
+/// re-purposing of `()` doesn't silently slip through.
+#[test]
+fn parser_rejects_empty_parens_as_value() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let p: (Int, Int) = ();\n  \
+                 0\n\
+               }\n";
+    assert_compile_fails_with_code(
+        src,
+        "error",
+        &["empty `()` is not a valid expression"],
+        "parser_rejects_empty_parens_value",
+    );
+}
+
+/// `(e,)` with a trailing comma but no second element is rejected —
+/// arity-1 tuples are not a valid syntax (R1 finding 1). Without
+/// this guard the parser silently produced an arity-1 `Expr::Tuple`
+/// that subsequent passes had no surface spelling for.
+#[test]
+fn parser_rejects_arity_one_tuple_with_trailing_comma() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let p: Int = (42,);\n  \
+                 0\n\
+               }\n";
+    assert_compile_fails_with_code(
+        src,
+        "error",
+        &["tuple values require arity ≥ 2"],
+        "parser_rejects_arity_one_tuple",
+    );
+}
+
+/// Pattern arity must match the tuple's declared arity. `(Int, Int,
+/// Int)` scrutinee with a 2-element pattern fires E0117.
+#[test]
+fn tuple_pattern_arity_mismatch_fires_e0117() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let t: (Int, Int, Int) = (1, 2, 3);\n  \
+                 let result: Int = match t {\n    \
+                   (a, b) => a,\n  \
+                 };\n  \
+                 result\n\
+               }\n";
+    assert_compile_fails_with_code(src, "E0117", &[], "tuple_pattern_arity_mismatch");
+}
+
+/// Non-exhaustive match over a tuple with literal element pins
+/// fires E0066. The catchall recognizer must NOT classify
+/// `(1, _)` as a complete pattern.
+#[test]
+fn tuple_match_with_literal_pattern_no_catchall_fires_e0066() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let p: (Int, Int) = (1, 2);\n  \
+                 let result: Int = match p {\n    \
+                   (1, _) => 0,\n  \
+                 };\n  \
+                 result\n\
+               }\n";
+    assert_compile_fails_with_code(src, "E0066", &[], "tuple_match_literal_no_catchall");
+}
+
+/// Tuple-as-fn-return-value + caller destructuring. Pins the round-
+/// trip needed for std/state.sigil's `run_state` -> `(A, S)` shape
+/// (separate change). Pre-fix this only failed at the std/state
+/// follow-up; pinning here surfaces issues earlier.
+#[test]
+fn tuple_returned_from_fn_round_trips() {
+    let src = "fn make_pair() -> (Int, Int) ![] { (10, 32) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let p: (Int, Int) = make_pair();\n  \
+                 let result: Int = match p {\n    \
+                   (a, b) => a + b,\n  \
+                 };\n  \
+                 result\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tuple_returned_from_fn");
+    assert_eq!(code, 42, "exit code expected 42; stderr={stderr:?}");
+    assert_eq!(stdout, "", "no stdout expected; stderr={stderr:?}");
+}
+
+/// R1 finding 2 — generic fn with a non-Ident match scrutinee
+/// (Call result). Pre-fix this panicked at codegen.rs:347 because
+/// the per-clone `match_scrut_tys` substitution wasn't propagated;
+/// the fix populates a `(clone_fn_name, span)`-keyed resolved map
+/// so codegen recovers concrete element types regardless of
+/// scrutinee shape.
+#[test]
+fn generic_tuple_scrutinee_via_call_resolves() {
+    let src = "fn make_pair[A, B](a: A, b: B) -> (A, B) ![] { (a, b) }\n\
+               fn extract_first[A, B](a: A, b: B) -> A ![] {\n  \
+                 match make_pair(a, b) { (x, _) => x }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 extract_first(42, 7)\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "generic_tuple_scrutinee_via_call");
+    assert_eq!(code, 42, "exit code expected 42; stderr={stderr:?}");
+    assert_eq!(stdout, "", "no stdout expected; stderr={stderr:?}");
+}

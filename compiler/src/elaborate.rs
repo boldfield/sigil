@@ -553,6 +553,31 @@ impl Elaborator {
                     Vec::new(),
                 )
             }
+            // Plan D Task 113 — tuple values: elaborate each element
+            // without trivializing (mirrors Call's path; Tuple's
+            // element types depend on inference, so the surface
+            // doesn't synthesize a let-binding here even when
+            // `need_trivial`). Compound elaboration of inner exprs
+            // (e.g., a nested Binary) still happens via the recursive
+            // elab_expr.
+            Expr::Tuple { elems, span } => {
+                let mut hoisted = Vec::new();
+                let new_elems: Vec<Expr> = elems
+                    .into_iter()
+                    .map(|e| {
+                        let (e_elab, h) = self.elab_expr(e, false);
+                        hoisted.extend(h);
+                        e_elab
+                    })
+                    .collect();
+                (
+                    Expr::Tuple {
+                        elems: new_elems,
+                        span,
+                    },
+                    hoisted,
+                )
+            }
         }
     }
 
