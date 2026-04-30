@@ -107,7 +107,9 @@ pub struct RowVar {
 /// row-site `EffectRef` must match the decl's arity post-parse, with
 /// element-wise type-arg substitution via the surrounding fn's
 /// generic-param scope. Bare-name refs to a generic effect-decl are
-/// rejected at typecheck (E0140 — new code introduced by Task 114).
+/// rejected at typecheck (E0143 — introduced by Task 114 as E0140,
+/// renamed in Task 115's audit to disambiguate from the existing
+/// E0140 duplicate-handler-arm code).
 ///
 /// Spans cover the entire reference: for `Raise[E]` the span runs
 /// from the `R` of `Raise` through the closing `]` of the arg list.
@@ -245,10 +247,22 @@ pub struct EffectDecl {
 /// Plan B task 53 — a single operation declared inside an
 /// `effect` body: `name : ( T1, T2, ... ) -> R`. Empty parameter
 /// lists are written `name: () -> R`.
+///
+/// Plan D Task 115 — per-op generic params: each op may declare its
+/// own generic parameters bound *only* inside the op's signature,
+/// distinct from the enclosing effect-decl's `generic_params`. The
+/// canonical shape is `fail[A]: (E) -> A` — `A` is the op's per-call
+/// return-type generic (Koka's "never returns" idiom), bound only
+/// inside `fail`'s signature; `E` is the effect-decl's generic
+/// param bound at `effect Raise[E] { ... }`. Empty for ops without
+/// per-op generics (the dominant pre-Task-115 surface). Per-op
+/// generics shadow effect-decl-level generics (E0144 fires when a
+/// per-op generic param has the same name as an effect-decl one).
 #[derive(Clone, Debug)]
 pub struct EffectOp {
     pub name: String,
     pub name_span: Span,
+    pub generic_params: Vec<GenericParam>,
     pub params: Vec<TypeExpr>,
     pub return_type: TypeExpr,
     pub span: Span,

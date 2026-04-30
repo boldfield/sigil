@@ -15423,6 +15423,7 @@ mod tests {
                     ops: vec![EffectOp {
                         name: "fail".to_string(),
                         name_span: span.clone(),
+                        generic_params: Vec::new(),
                         params: vec![TypeExpr::Named("String".to_string(), span.clone())],
                         return_type: TypeExpr::Named("Int".to_string(), span.clone()),
                         span: span.clone(),

@@ -804,6 +804,11 @@ impl<'a> Parser<'a> {
                 return None;
             }
         };
+        // Plan D Task 115 — per-op generic params after the op name.
+        // `parse_generic_params` short-circuits to `Vec::new()` when
+        // the next token isn't `[`, so the bare-name surface
+        // (`fail: (E) -> Int`) parses unchanged.
+        let generic_params = self.parse_generic_params()?;
         self.expect(&TokenKind::Colon, "`:` after operation name")?;
         self.expect(&TokenKind::LParen, "`(` opening operation parameter list")?;
         let mut params: Vec<TypeExpr> = Vec::new();
@@ -821,6 +826,7 @@ impl<'a> Parser<'a> {
         Some(EffectOp {
             name,
             name_span: name_span.clone(),
+            generic_params,
             params,
             return_type,
             span: name_span,
