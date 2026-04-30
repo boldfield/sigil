@@ -7677,7 +7677,7 @@ fn parser_rejects_empty_parens_as_value() {
 #[test]
 fn parser_rejects_arity_one_tuple_with_trailing_comma() {
     let src = "fn main() -> Int ![IO] {\n  \
-                 let p = (42,);\n  \
+                 let p: Int = (42,);\n  \
                  0\n\
                }\n";
     assert_compile_fails_with_code(
