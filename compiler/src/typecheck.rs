@@ -977,8 +977,23 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     for item in &program.items {
         if let Item::Fn(f) = item {
             let saved_generic_subst = std::mem::take(&mut tc.current_generic_subst);
+            let saved_row_var_subst = std::mem::take(&mut tc.current_row_var_subst);
             let (gs, _) = tc.fresh_generic_subst(&f.generic_params);
             tc.current_generic_subst = gs;
+            // Plan D Task 116 — seed the row-var subst with the
+            // fn's own row variable (if any). This lets the
+            // pre-pass walk resolve inner fn-type row variables
+            // (`(...) -> R ![ ... | r ]`) against the enclosing
+            // fn's row var when the names match. Allocates a
+            // fresh id mirroring `check_fn`'s behavior at line
+            // 3239 area; the id is not retained between pre-pass
+            // and check_fn (each phase does its own allocation
+            // for its own subst), but the surface-name → id map
+            // shape is consistent.
+            if let Some(rv) = &f.effect_row_var {
+                let id = tc.fresh_row_var();
+                tc.current_row_var_subst.insert(rv.name.clone(), id);
+            }
             for p in &f.params {
                 tc.check_type_expr_known(&p.ty);
             }
@@ -992,6 +1007,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 tc.check_effect_ref_arity(eref);
             }
             tc.current_generic_subst = saved_generic_subst;
+            tc.current_row_var_subst = saved_row_var_subst;
         }
     }
     for item in &program.items {
@@ -2069,7 +2085,12 @@ impl Tc {
     /// to the fn's freshly-allocated `Ty::Var`; outside generic
     /// scope this falls through to the empty-subst behavior.
     fn ty_from_type_expr_here(&self, t: &TypeExpr) -> Option<Ty> {
-        ty_from_type_expr(t, &self.types, &self.current_generic_subst)
+        ty_from_type_expr_with_rows(
+            t,
+            &self.types,
+            &self.current_generic_subst,
+            &self.current_row_var_subst,
+        )
     }
 
     fn fresh_row_var(&mut self) -> u32 {
@@ -2750,16 +2771,26 @@ impl Tc {
                     }
                     self.check_effect_ref_arity(eref);
                 }
-                if fty.effect_row_var.is_some() {
-                    self.push_error(
-                        "E0137",
-                        t.span(),
-                        "row-variable-bearing first-class function types \
-                         (`(...) -> R ![..|r]`) are not yet supported in v1; \
-                         use a closed row (e.g. `![]` or `![IO]`) — \
-                         Plan B' Stage 6.8 Task 103 limits"
-                            .to_string(),
-                    );
+                // Plan D Task 116 — row-variable-bearing first-class
+                // function types are now accepted. The row-var name
+                // must already be bound at the enclosing fn's
+                // `effect_row_var` (currently the only legal
+                // binder; multi-row-var fns are deferred). When
+                // unbound, fire E0137 with a precise diagnostic
+                // pointing to the missing declaration.
+                if let Some(rv) = &fty.effect_row_var {
+                    if !self.current_row_var_subst.contains_key(&rv.name) {
+                        self.push_error(
+                            "E0137",
+                            rv.span.clone(),
+                            format!(
+                                "row variable `{}` is not bound by the enclosing function — \
+                                 declare it on the fn's row (e.g. `fn f(...) -> R !{}`) so the \
+                                 row variable can be referenced in inner fn-type rows",
+                                rv.name, rv.name,
+                            ),
+                        );
+                    }
                 }
             }
             // Plan D Task 113 — recurse into tuple element types so
@@ -5589,6 +5620,26 @@ pub(crate) fn ty_from_type_expr(
     types: &BTreeMap<String, TypeDecl>,
     generic_subst: &BTreeMap<String, Ty>,
 ) -> Option<Ty> {
+    let empty_rows: BTreeMap<String, u32> = BTreeMap::new();
+    ty_from_type_expr_with_rows(t, types, generic_subst, &empty_rows)
+}
+
+/// Plan D Task 116 — variant of `ty_from_type_expr` that threads a
+/// row-variable substitution through. The row-var subst maps a
+/// surface name (`e`) to its allocated id. Used by
+/// `Tc::ty_from_type_expr_here` to resolve inner fn-type row-var
+/// references against the enclosing fn's `current_row_var_subst`.
+/// External callers (monomorphize / non-Tc walks) call the wrapper
+/// `ty_from_type_expr` with an empty row-var map, falling back to
+/// `effect_row_var: None` — those paths walk over already-resolved
+/// or row-var-free shapes (the codegen-entry guard rejects any IR
+/// still carrying surface row-var refs after monomorphize).
+pub(crate) fn ty_from_type_expr_with_rows(
+    t: &TypeExpr,
+    types: &BTreeMap<String, TypeDecl>,
+    generic_subst: &BTreeMap<String, Ty>,
+    row_var_subst: &BTreeMap<String, u32>,
+) -> Option<Ty> {
     match t {
         TypeExpr::Named(name, _) => match name.as_str() {
             "Int" => Some(Ty::Int),
@@ -5637,27 +5688,45 @@ pub(crate) fn ty_from_type_expr(
             Some(Ty::User(name.to_string(), resolved_args))
         }
         // Plan B' Stage 6.8 Task 103 — first-class function type
-        // surface maps to Ty::Fn under HM. Closed rows only in v1
-        // (row-variable-bearing fn-types are rejected at
-        // `check_type_expr_known` with E0137); the surface still
-        // *parses* with a row var but typecheck cannot resolve it
-        // here (no row-var allocator in this `&` context), so we
-        // return None and let the E0137 path provide the user
-        // diagnostic.
+        // surface maps to Ty::Fn under HM.
+        //
+        // Plan D Task 116 — row variables in inner fn-type rows
+        // (`(A) -> B ![ ... | r ]`) resolve through the empty
+        // row-var subst at this `&` context (used by the
+        // monomorphize-time / pre-pass walk where row-var
+        // bindings are not in scope). Tc-method `ty_from_type_-
+        // expr_here` calls `ty_from_type_expr_with_rows` instead,
+        // passing `self.current_row_var_subst`. Inner row-vars
+        // here either resolve via the supplied row-var subst or
+        // fall back to `effect_row_var: None` — `check_type_-
+        // expr_known`'s E0137 walk has already pushed a precise
+        // diagnostic for unbound row-var names, so a `None` here
+        // is a recovery shape, not a silent demotion.
         TypeExpr::Fn(fty) => {
-            if fty.effect_row_var.is_some() {
-                return None;
-            }
             let mut params = Vec::with_capacity(fty.params.len());
             for p in &fty.params {
-                params.push(ty_from_type_expr(p, types, generic_subst)?);
+                params.push(ty_from_type_expr_with_rows(
+                    p,
+                    types,
+                    generic_subst,
+                    row_var_subst,
+                )?);
             }
-            let ret = ty_from_type_expr(&fty.ret, types, generic_subst)?;
+            let ret = ty_from_type_expr_with_rows(&fty.ret, types, generic_subst, row_var_subst)?;
+            // Plan D Task 116 — resolve the inner fn-type's
+            // `effect_row_var` (if any) by name through the supplied
+            // row-var subst. None when no row-var subst entry exists
+            // for the name (the row-var was unbound; E0137 already
+            // surfaced it at `check_type_expr_known` time).
+            let effect_row_var = fty
+                .effect_row_var
+                .as_ref()
+                .and_then(|rv| row_var_subst.get(&rv.name).copied());
             Some(Ty::Fn(Box::new(FnSig {
                 params,
                 ret,
                 effects: effect_refs_to_insts(&fty.effects, types, generic_subst),
-                effect_row_var: None,
+                effect_row_var,
             })))
         }
         // Plan D Task 113 — TypeExpr::Tuple maps element-wise to Ty::Tuple.
@@ -10016,13 +10085,53 @@ mod tests {
     }
 
     #[test]
-    fn fn_type_with_row_variable_is_e0137() {
+    fn fn_type_with_unbound_row_variable_fires_e0137() {
+        // Plan D Task 116 — E0137 now fires only when the inner
+        // fn-type's row variable is NOT bound by the enclosing fn's
+        // row-var (the outer fn here declares `![]`, so no row var
+        // is in scope; `r` inside g's row is unbound).
         let src = "fn f(g: (Int) -> Int ![IO | r]) -> Int ![] { 0 }\n\
                    fn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0137"),
-            "row-var-bearing fn-type must E0137: {errs:?}"
+            "unbound inner-fn-type row variable must E0137: {errs:?}"
+        );
+    }
+
+    // Plan D Task 116 smoke gate — row-polymorphic Fn parameters.
+
+    #[test]
+    fn fn_type_with_row_var_bound_by_enclosing_fn_typechecks() {
+        // The row var `r` on `g`'s inner fn-type row references the
+        // outer fn's row var (declared via `f`'s `!r` row). Both
+        // should resolve to the same row id at typecheck.
+        let src = "fn f(g: (Int) -> Int ![IO | r]) -> Int ![IO | r] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "row-var-bearing fn-type bound by enclosing fn should typecheck; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn row_polymorphic_passthrough_signature_typechecks() {
+        // Plan D Task 116 smoke gate — row var on a fn-typed
+        // parameter shares an id with the outer fn's row var.
+        // Calling `body()` performs Raise[String] + e effects;
+        // those flow to the enclosing fn's row, which declares
+        // the same Raise[String] + e. Cross-fn subsumption with
+        // row vars unifies cleanly.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn passthrough[A, e](body: () -> A ![Raise[String] | e]) -> A ![Raise[String] | e] {\n  \
+                     body()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "row-polymorphic passthrough signature should typecheck; got {errs:?}"
         );
     }
 
