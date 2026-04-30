@@ -495,18 +495,20 @@ Three v1 surface gaps prevent shipping the literal shape — the same trio Task 
    - Define `type Pair[A, B] = | Pair(A, B)` in std/pair.sigil (would need its own Plan C task).
    - Drop the `(A, S)` part and return just `A` (matching `examples/state.sigil` precedent).
    - Custom record per use case in user code.
-   We pick the second option for v1 — `run_state` returns the body's final value only. Users wanting the final state capture it explicitly via a sentinel `set_state` at body's end (or wait for v2's tuple return).
+   We pick the second option for v1 — `run_state` returns the body's final value only. Users wanting the final state capture it explicitly via the body's return value.
 
-3. **No per-op generic params on user-declared effects.** Same constraint as Task 71's `Raise.fail: (E) -> Int` placeholder. State's ops aren't affected (`get: () -> Int`, `set: (Int) -> Int` are concrete-typed at the signature level), but the underlying gap is shared.
+3. **No `get_state` / `set_state` wrapper functions in v1.** A natural ergonomic addition is wrapper functions `fn get_state() -> Int ![State] { perform State.get() }` and `fn set_state(s: Int) -> Int ![State] { perform State.set(s) }`. **Discovered at PR #45 CI run:** wrappers introduce a function-call frame between the user's call site and the perform; the discharge-with-lambda pattern's `k` continuation captures correctly through the wrapper, but threading the state-bearing lambda chain through that captured frame produces the wrong runtime result (`run_state(5, comp_via_wrappers)` returns `5` instead of the threaded `11` from the canonical set-then-get-plus-1 body). Plan B' Stage 6.8's PR #39 verified the discharge-with-lambda pattern only for *inline* `perform State.set/get` invocations; the wrapper-fn frame composition is a v1 gap. Users do `perform State.get()` / `perform State.set(s)` directly until v2 closes this.
 
-4. **No row-polymorphic fn-typed parameters.** Same closed-row constraint as Task 71's `catch`. `run_state` accepts `body: () -> Int ![State]` only; row-poly passthrough lands in v2.
+4. **No per-op generic params on user-declared effects.** Same constraint as Task 71's `Raise.fail: (E) -> Int` placeholder. State's ops aren't affected (`get: () -> Int`, `set: (Int) -> Int` are concrete-typed at the signature level), but the underlying gap is shared.
+
+5. **No row-polymorphic fn-typed parameters.** Same closed-row constraint as Task 71's `catch`. `run_state` accepts `body: () -> Int ![State]` only; row-poly passthrough lands in v2.
 
 **Why accepted.** v1 ships:
 
 - `effect State resumes: many { get: () -> Int, set: (Int) -> Int }` — non-generic, concrete `Int` state, multi-shot annotation matching `examples/state.sigil`.
-- `fn get_state() -> Int ![State]` — convenience wrapper.
-- `fn set_state(s: Int) -> Int ![State]` — convenience wrapper; returns the previous state value for ergonomic chaining.
 - `fn run_state(initial: Int, body: () -> Int ![State]) -> Int ![]` — discharges State by threading state through the body's perform sites; returns the body's final value.
+
+User code uses inline `perform State.get()` / `perform State.set(s)` directly (per constraint #3 above).
 
 The `run_state` implementation reuses `examples/state.sigil`'s state-bearing-lambda pattern (each handler arm returns `(Int) -> Int ![]`; the handle expression's overall is the chain; applying it to `initial` drives the state through). All Plan B' machinery (B.3 TypeExpr::Fn, B.4 lambda arm bodies, return arm wrap, captures+) is exercised. `examples/state.sigil` is the verified precedent — Plan B' Stage 6.8's PR #39 closed the six-layer canonical run_state runtime chain fix that makes this shape correct end-to-end.
 
@@ -524,13 +526,14 @@ The `run_state` implementation reuses `examples/state.sigil`'s state-bearing-lam
   i.e., have the body return the state value when caller wants both. Awkward but expressible.
 - No effect passthrough (closed `![State]` row).
 
-**Closure path.** Three orthogonal v2 lifts retire the deviation:
+**Closure path.** Four orthogonal v2 lifts retire the deviation:
 
 1. Parser surface for type-parameterized effect references in rows (`![State[S]]`).
 2. Tuple type / `Pair[A, B]` stdlib (or `(A, S)` syntax). `run_state` then returns `(A, S)`.
-3. Row-poly Fn type parameters (`(() -> A ![State[S] | e]) -> ...`).
+3. Wrapper-fn frame composition fix for the discharge-with-lambda pattern. After this lands, std/state.sigil grows `get_state` / `set_state` ergonomic wrappers.
+4. Row-poly Fn type parameters (`(() -> A ![State[S] | e]) -> ...`).
 
-User code calling `get_state()` / `set_state(s)` / `run_state(init, body)` stays surface-stable across the v1 → v2 shift.
+User code calling `perform State.get()` / `perform State.set(s)` / `run_state(init, body)` stays surface-stable across the v1 → v2 shift; the v2 wrapper-fn additions are additive (don't break existing call sites).
 
 **Failure mode.** Users wanting non-Int state types or tuple returns hit the fixed-Int / final-A-only surface. Type errors are clear at the call site (`set_state("x")` fires E0044 with String-vs-Int mismatch).
 

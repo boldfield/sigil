@@ -10123,15 +10123,18 @@ mod tests {
 
     #[test]
     fn import_std_state_typechecks_cleanly() {
-        // Pin `State` + `get_state` + `set_state` + `run_state`
-        // surface end-to-end. Body sets state to 10, gets it back,
-        // returns get-result + 1; run_state(5, comp) discharges
-        // and threads state. Same shape as examples/state.sigil's
-        // canonical trace (Plan B' Stage 6.8 demo).
+        // Pin `State` + `run_state` surface end-to-end. Body sets
+        // state to 10, gets it back, returns get-result + 1;
+        // run_state(5, comp) discharges and threads state. Same
+        // shape as examples/state.sigil's canonical trace
+        // (Plan B' Stage 6.8 demo). Uses direct `perform State.x`
+        // invocations per `[DEVIATION Task 72]` v1 constraint #3
+        // (wrapper fns don't compose with the discharge-with-
+        // lambda pattern in v1).
         let src = "import std.state\n\
                    fn comp() -> Int ![State] {\n  \
-                     let _: Int = set_state(10);\n  \
-                     let v: Int = get_state();\n  \
+                     let _: Int = perform State.set(10);\n  \
+                     let v: Int = perform State.get();\n  \
                      v + 1\n\
                    }\n\
                    fn main() -> Int ![IO] {\n  \
@@ -10144,10 +10147,10 @@ mod tests {
     }
 
     #[test]
-    fn get_state_without_state_in_row_fires_e0042() {
+    fn perform_state_get_without_state_in_row_fires_e0042() {
         let src = "import std.state\n\
                    fn bad() -> Int ![] {\n  \
-                     get_state()\n\
+                     perform State.get()\n\
                    }\n\
                    fn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
@@ -10158,17 +10161,17 @@ mod tests {
     }
 
     #[test]
-    fn set_state_with_string_arg_fires_e0044() {
-        // set_state takes Int; passing String should fire E0044.
+    fn perform_state_set_with_string_arg_fires_e0044() {
+        // State.set takes Int; passing String should fire E0044.
         let src = "import std.state\n\
                    fn bad() -> Int ![State] {\n  \
-                     set_state(\"not an int\")\n\
+                     perform State.set(\"not an int\")\n\
                    }\n\
                    fn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
-            "expected E0044 (set_state expects Int, got String); got {errs:?}"
+            "expected E0044 (State.set expects Int, got String); got {errs:?}"
         );
     }
 

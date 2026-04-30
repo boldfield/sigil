@@ -6923,15 +6923,15 @@ fn std_raise_nested_catch_with_re_raise() {
 
 // ===== Plan C Task 72 — State + run_state =====
 
-/// Canonical run_state demo: body sets state to 10, gets it back,
-/// returns 10 + 1 = 11. The initial 5 is discarded by the body's
-/// set. Mirrors `examples/state.sigil`'s Plan B' Stage 6.8 trace.
+/// Canonical run_state demo using direct `perform State.set/get`.
+/// Body sets state to 10, gets it back, returns 10 + 1 = 11.
+/// Mirrors `examples/state.sigil`'s Plan B' Stage 6.8 trace.
 #[test]
 fn std_state_run_state_set_get_returns_11() {
     let src = "import std.state\n\
                fn comp() -> Int ![State] {\n  \
-                 let _: Int = set_state(10);\n  \
-                 let v: Int = get_state();\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
                  v + 1\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
@@ -6945,11 +6945,12 @@ fn std_state_run_state_set_get_returns_11() {
 }
 
 /// Body that only reads state (no set) sees the initial value.
-/// `run_state(42, get_only)` returns 42.
+/// `run_state(42, get_only)` returns 42 — exercises the
+/// initial-value pass-through path.
 #[test]
 fn std_state_run_state_get_only_reflects_initial() {
     let src = "import std.state\n\
-               fn get_only() -> Int ![State] { get_state() }\n\
+               fn get_only() -> Int ![State] { perform State.get() }\n\
                fn main() -> Int ![IO] {\n  \
                  let result: Int = run_state(42, get_only);\n  \
                  perform IO.println(int_to_string(result));\n  \
