@@ -153,12 +153,6 @@ impl EffectInst {
 /// `effects_registry` argument carries the program's effect-decl
 /// registry so arity-check (E0140) can fire when the row-site arg
 /// count diverges from the decl's `generic_params` len.
-///
-/// Phase 114d switches the per-fn AST → Ty boundary at
-/// `check_fn_decl` / `check_lambda` from `effect_refs_to_names_only`
-/// to this richer helper once the arity check + perform-site
-/// substitution surface lands.
-#[allow(dead_code)]
 pub(crate) fn effect_refs_to_insts(
     rs: &[crate::ast::EffectRef],
     types: &std::collections::BTreeMap<String, crate::ast::TypeDecl>,
@@ -182,14 +176,6 @@ pub(crate) fn effect_refs_to_insts(
             }
         })
         .collect()
-}
-
-/// Plan D Task 114 — name-only conversion (for sites that don't
-/// have a generic substitution context handy, like synth fixtures
-/// or test helpers). Args are dropped — only safe when the caller
-/// knows the effects are bare-name (e.g., `IO`, `Mem`).
-pub(crate) fn effect_refs_to_names_only(rs: &[crate::ast::EffectRef]) -> Vec<EffectInst> {
-    rs.iter().map(|r| EffectInst::bare(&r.name)).collect()
 }
 
 /// Plan D Task 114 — reverse direction (Ty -> AST). Given a slice
@@ -3251,8 +3237,10 @@ impl Tc {
                 }
             }
         }
-        let main_row_names = effect_refs_to_names_only(&f.effects);
-        let body_ty = self.check_block(&f.body, &main_row_names);
+        // Plan D Task 114 — body row carries args so per-call
+        // subsumption sees `Raise[Int]` rather than bare `Raise`.
+        let body_row = effect_refs_to_insts(&f.effects, &self.types, &self.current_generic_subst);
+        let body_ty = self.check_block(&f.body, &body_row);
 
         // Plan B task 48 — generalise the inferred signature into a
         // scheme for `fn_schemes`. Concrete (non-generic, closed-row)
@@ -3656,8 +3644,11 @@ impl Tc {
                 // currently-active row-var if present, else stays
                 // closed.
                 let _ = effect_row_var;
-                let lambda_row_names = effect_refs_to_names_only(effects);
-                self.check_lambda(params, return_type, &lambda_row_names, body, span.clone())
+                // Plan D Task 114 — lambda's row carries args (same
+                // shape as the enclosing fn's body row).
+                let lambda_row =
+                    effect_refs_to_insts(effects, &self.types, &self.current_generic_subst);
+                self.check_lambda(params, return_type, &lambda_row, body, span.clone())
             }
             // `ClosureRecord` / `ClosureEnvLoad` are post-closure-
             // conversion nodes synthesized by plan A2 task 31. They
@@ -7763,6 +7754,46 @@ mod tests {
         assert!(
             has_code(&errs, "E0140"),
             "bare `![Raise]` of a generic effect-decl should fire E0140; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn cross_fn_row_with_concrete_type_arg_unifies() {
+        // Caller `![Raise[Int]]` calls callee declared `![Raise[Int]]`:
+        // both sides carry the same `EffectInst { name: "Raise",
+        // args: [Ty::Int] }`. unify_row's structural set diff
+        // matches them as equal; subsume_row sees the callee's
+        // effect already in the caller's row. Pinned so cross-fn
+        // composition with type-parameterized effects doesn't
+        // regress when the typecheck rewires its row machinery.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky() -> Int ![Raise[Int]] { 0 }\n\
+                   fn outer() -> Int ![Raise[Int]] { risky() }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "cross-fn row `![Raise[Int]]` should unify; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn cross_fn_row_with_distinct_type_args_fires_e0042() {
+        // Caller `![Raise[Int]]` calls callee `![Raise[String]]`:
+        // they share the effect-decl name but instantiate it
+        // distinctly. Structural row matching on `EffectInst`
+        // detects the mismatch and fires E0042 ("calling a
+        // function that performs `Raise[String]` requires ...
+        // `Raise[String]` ... in the enclosing function's effect
+        // row").
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky_str() -> Int ![Raise[String]] { 0 }\n\
+                   fn outer() -> Int ![Raise[Int]] { risky_str() }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "Raise[Int] caller can't subsume Raise[String] callee; got {errs:?}"
         );
     }
 
