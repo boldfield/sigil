@@ -148,10 +148,10 @@ pub(crate) fn register_arena_root_for_calling_thread() -> (*mut c_void, *mut c_v
     ARENA.with(|cell| {
         let mut arena = cell.borrow_mut();
         ensure_capacity_or_abort(&mut arena);
-        // SAFETY: not an interior pointer (passed to GC_add_roots as range start; not retained).
+        // SAFETY: gc-heap-ptr arithmetic (passed to GC_add_roots as range start; not retained).
         let start = arena.as_mut_ptr() as *mut c_void;
         let end_bytes = arena.capacity() * 8;
-        // SAFETY: not an interior pointer (the result feeds an FFI
+        // SAFETY: gc-heap-ptr arithmetic (the result feeds an FFI
         // call that takes [start, end) as a half-open range, never
         // retained; the storage lives for the thread's lifetime).
         let end = unsafe { (start as *mut u8).add(end_bytes) as *mut c_void };
@@ -205,7 +205,7 @@ fn ensure_capacity_or_abort(arena: &mut Vec<u64>) {
         // thread per program lifetime — negligible.
         arena.resize(INITIAL_CAPACITY_WORDS, 0);
         // Length back to zero; capacity preserved with zeroed bytes.
-        // SAFETY: not an interior pointer (set_len does not produce a
+        // SAFETY: gc-heap-ptr arithmetic (set_len does not produce a
         // pointer; the bytes we just wrote remain valid in capacity).
         unsafe { arena.set_len(0) };
     }
@@ -262,7 +262,7 @@ pub unsafe extern "C" fn sigil_arena_alloc(size: usize) -> *mut u8 {
         // without reallocating — pointers handed out by earlier calls
         // in this iteration stay valid.
         arena.set_len(new_len_words);
-        // SAFETY: not an interior pointer (arena is GC-rooted region, see comment above).
+        // SAFETY: gc-heap-ptr arithmetic (arena is GC-rooted region, see comment above).
         arena.as_mut_ptr().add(start_words) as *mut u8
     })
 }
@@ -295,10 +295,10 @@ pub unsafe extern "C" fn sigil_arena_reset() {
             // pointer is produced or retained. The arena's backing
             // storage outlives this call; the write_bytes call only
             // touches bytes about to be reused.
-            // SAFETY: not an interior pointer (arena reset zero-fill, see comment above).
+            // SAFETY: gc-heap-ptr arithmetic (arena reset zero-fill, see comment above).
             arena.as_mut_ptr().write_bytes(0, used_words);
         }
-        // SAFETY: not an interior pointer (set_len(0) does not produce
+        // SAFETY: gc-heap-ptr arithmetic (set_len(0) does not produce
         // a pointer; this is bookkeeping only). Capacity preserved.
         unsafe { arena.set_len(0) };
     });
@@ -328,7 +328,7 @@ pub unsafe extern "C" fn sigil_arena_promote(
 
     let obj = crate::gc::sigil_alloc(header, payload_bytes);
     if payload_bytes > 0 && !src.is_null() {
-        // SAFETY: not an interior pointer (the destination pointer is
+        // SAFETY: gc-heap-ptr arithmetic (the destination pointer is
         // computed from the just-allocated `obj` purely to drive a
         // single byte-range copy; it is neither stored nor returned to
         // the caller).
@@ -345,7 +345,7 @@ pub unsafe extern "C" fn sigil_arena_promote(
 pub(crate) fn force_capacity_for_test(words: usize) {
     ARENA.with(|cell| {
         let mut arena = cell.borrow_mut();
-        // SAFETY: not an interior pointer (set_len(0) only updates the
+        // SAFETY: gc-heap-ptr arithmetic (set_len(0) only updates the
         // bookkeeping; no pointer is produced).
         unsafe { arena.set_len(0) };
         // Drop-and-rebuild: `Vec` does not expose an API to shrink

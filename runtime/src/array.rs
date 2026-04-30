@@ -36,15 +36,28 @@
 //! `sigil_array_get` and `sigil_array_set` abort on out-of-bounds
 //! indices. v2 may surface this as a `Raise[BoundsError]` effect; v1
 //! aborts directly so the rest of the runtime stays simple.
+//!
+//! ## Interior-pointer arithmetic
+//!
+//! Reads and writes against the length word and element slots use
+//! `obj.add(8)` / `obj.add(16)` — literal interior pointers into the
+//! GC-allocated object. Boehm's conservative scan tolerates interior
+//! pointers (the scan walks any pointer back to the start of its
+//! containing allocation), so an interior pointer alone is sufficient
+//! to keep the object live. The `gc-heap-ptr arithmetic` SAFETY
+//! markers below acknowledge each such site; the parenthetical
+//! reasoning notes that each interior pointer is transient (used for
+//! a single aligned read or write) and never escapes into long-lived
+//! storage.
 
 use crate::counters::{self, CounterId};
 use crate::gc::sigil_alloc;
 use crate::header::{Header, TAG_ARRAY};
 
 /// Allocate a fresh array of `len` elements, each initialised to
-/// `fill`. Returns a pointer to the array's header (never an interior
-/// pointer to the payload). `len` is the number of elements; the
-/// total allocation is `8 (header) + 8 (length) + 8*len (elements)`.
+/// `fill`. Returns the header pointer (the start of the GC-allocated
+/// object). `len` is the number of elements; the total allocation is
+/// `8 (header) + 8 (length) + 8*len (elements)`.
 ///
 /// # Safety
 ///
@@ -60,7 +73,7 @@ pub extern "C" fn sigil_array_alloc(len: u64, fill: u64) -> *mut u8 {
 
     // Length word at offset 8.
     //
-    // SAFETY: not an interior pointer (used transiently for a single
+    // SAFETY: gc-heap-ptr arithmetic (used transiently for a single
     // aligned u64 store). `obj` was just returned by `sigil_alloc` and
     // owns at least `8 + payload_bytes` bytes.
     unsafe {
@@ -71,10 +84,10 @@ pub extern "C" fn sigil_array_alloc(len: u64, fill: u64) -> *mut u8 {
     // Fill element slots at offsets 16, 24, 32, ...
     if len > 0 {
         unsafe {
-            // SAFETY: not an interior pointer (offset 16 is used for a transient u64 store base; indices stay within the allocated payload).
+            // SAFETY: gc-heap-ptr arithmetic (offset 16 is used for a transient u64 store base; indices stay within the allocated payload).
             let elems_ptr: *mut u64 = obj.add(16).cast();
             for i in 0..(len as usize) {
-                // SAFETY: not an interior pointer (transient elems_ptr.add(i) for one aligned u64 write).
+                // SAFETY: gc-heap-ptr arithmetic (transient elems_ptr.add(i) for one aligned u64 write).
                 elems_ptr.add(i).write(fill);
             }
         }
@@ -106,7 +119,7 @@ pub extern "C" fn sigil_array_empty() -> *mut u8 {
 /// `sigil_array_set`).
 #[no_mangle]
 pub unsafe extern "C" fn sigil_array_length(arr: *const u8) -> u64 {
-    // SAFETY: not an interior pointer (used transiently for one read).
+    // SAFETY: gc-heap-ptr arithmetic (used transiently for one read).
     let len_ptr: *const u64 = arr.add(8).cast();
     len_ptr.read()
 }
@@ -126,9 +139,9 @@ pub unsafe extern "C" fn sigil_array_get(arr: *const u8, i: u64) -> u64 {
         eprintln!("sigil_array_get: index {i} out of bounds (len {len})");
         std::process::abort();
     }
-    // SAFETY: not an interior pointer (offset 16 is a transient base for one aligned u64 read; bounds-checked above).
+    // SAFETY: gc-heap-ptr arithmetic (offset 16 is a transient base for one aligned u64 read; bounds-checked above).
     let elems_ptr: *const u64 = arr.add(16).cast();
-    // SAFETY: not an interior pointer (transient add(i) for one aligned u64 read).
+    // SAFETY: gc-heap-ptr arithmetic (transient add(i) for one aligned u64 read).
     elems_ptr.add(i as usize).read()
 }
 
@@ -149,27 +162,27 @@ pub unsafe extern "C" fn sigil_array_set(arr: *const u8, i: u64, val: u64) -> *m
         std::process::abort();
     }
 
-    // Allocate a fresh array of the same length, using the original
-    // slot's bit pattern as the fill (any value typed at A is GC-
-    // scan-safe; we overwrite at `i` below anyway).
-    //
-    // SAFETY: not an interior pointer (transient base + add for one aligned u64 read; bounds-checked above).
-    let src_ptr: *const u64 = arr.add(16).cast();
-    // SAFETY: not an interior pointer (transient add(i) for one aligned u64 read).
-    let placeholder = src_ptr.add(i as usize).read();
-    let new_arr = sigil_array_alloc(len, placeholder);
+    // Allocate a fresh array of the same length, zero-filled. Zero is
+    // a GC-safe bit pattern for any A: a null pointer is reachable as
+    // null, and an integer zero is harmless. The fill is overwritten
+    // immediately by the `copy_nonoverlapping` below; passing zero
+    // avoids the wasted per-slot fill loop inside `sigil_array_alloc`
+    // for the case where every slot will be replaced.
+    let new_arr = sigil_array_alloc(len, 0);
 
     // Copy the original elements into the new array.
+    // SAFETY: gc-heap-ptr arithmetic (transient base for one contiguous u64 region copy; both arrays have the same len by construction).
+    let src_ptr: *const u64 = arr.add(16).cast();
     if len > 0 {
-        // SAFETY: not an interior pointer (transient base for one contiguous u64 region copy; both arrays have the same len by construction).
+        // SAFETY: gc-heap-ptr arithmetic (transient base for one contiguous u64 region copy; both arrays have the same len by construction).
         let dst_ptr: *mut u64 = new_arr.add(16).cast();
         std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len as usize);
     }
 
     // Overwrite slot `i`.
-    // SAFETY: not an interior pointer (transient base + add for one aligned u64 write; bounds-checked above).
+    // SAFETY: gc-heap-ptr arithmetic (transient base + add for one aligned u64 write; bounds-checked above).
     let dst_ptr: *mut u64 = new_arr.add(16).cast();
-    // SAFETY: not an interior pointer (transient add(i) for one aligned u64 write).
+    // SAFETY: gc-heap-ptr arithmetic (transient add(i) for one aligned u64 write).
     dst_ptr.add(i as usize).write(val);
 
     new_arr

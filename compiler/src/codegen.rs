@@ -4668,6 +4668,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .map_err(|e| format!("declare sigil_array_length: {e}"))?;
 
     // sigil_array_get(arr: *const u8, i: i64) -> i64
+    //
+    // Element type erasure: the FFI signature returns I64 unconditionally
+    // even when the monomorphized element type is `String` or another
+    // pointer-typed user / sum type. On 64-bit Cranelift I64 and
+    // `pointer_ty` are width-equivalent, and the verifier accepts the
+    // implicit coercion when the result feeds another I64-shaped use.
+    // The deliberate I64-on-pointer encoding is documented in
+    // `[DEVIATION Task 65]`'s v1 type restrictions: Bool/Char/Byte
+    // arrays compile but `array_get`'s I64 return isn't narrowed at
+    // codegen time. v2 fix threads per-call type-arg info into the
+    // Lowerer so the FFI return type matches the element type.
     let mut array_get_sig = Signature::new(isa_call_conv(&module));
     array_get_sig.params.push(AbiParam::new(pointer_ty));
     array_get_sig.params.push(AbiParam::new(types::I64));
@@ -4712,6 +4723,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .map_err(|e| format!("declare sigil_mut_array_length: {e}"))?;
 
     // sigil_mut_array_get(arr: *const u8, i: i64) -> i64
+    //
+    // Same I64-on-pointer element-type erasure as `sigil_array_get`
+    // above; see that comment for details. v2 fix is shared.
     let mut mut_array_get_sig = Signature::new(isa_call_conv(&module));
     mut_array_get_sig.params.push(AbiParam::new(pointer_ty));
     mut_array_get_sig.params.push(AbiParam::new(types::I64));
@@ -11282,9 +11296,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             // Plan C Task 66 — runtime MutArray primitives. Same
             // dispatch shape as Array, except `mut_array_set` returns
             // Unit (no Cranelift result; codegen synthesises an `I8 0`
-            // sentinel for the surrounding expression). Mutation calls
-            // are safepoints (allocation in `_new`, mutation needs GC
-            // visibility for the slot's prior pointer-shaped value).
+            // sentinel for the surrounding expression).
+            //
+            // Stackmap placeholders are emitted at every call below.
+            // For `_new` this is load-bearing today: the call may
+            // allocate, and Boehm's collection point lives at the
+            // FFI boundary. For `_get` (skipped — pure read) and
+            // `_set` it is v2-forward-compat metadata only — Boehm's
+            // conservative scan handles slot mutation without either
+            // a write barrier or a safepoint (the prior pointer is
+            // reachable from heap scan if rooted elsewhere; the new
+            // value is reachable through the heap once written). When
+            // sigil moves to a precise / moving GC a write barrier
+            // becomes load-bearing here. See
+            // `[DEVIATION Task 66] mutation under v2 GC` in
+            // `PLAN_C_DEVIATIONS.md`.
             Expr::Ident(name, _) if name == "mut_array_new" => {
                 assert_eq!(args.len(), 2, "mut_array_new builtin arg count is not 2");
                 let len = self.lower_expr(&args[0]);

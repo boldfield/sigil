@@ -25,6 +25,28 @@
 //!
 //! `sigil_mut_array_get` and `sigil_mut_array_set` abort on out-
 //! of-bounds indices, mirroring the immutable Array behaviour.
+//!
+//! ## Interior-pointer arithmetic
+//!
+//! As with `array.rs`, slot reads and writes use `obj.add(N)` —
+//! literal interior pointers into the GC-allocated object. Boehm's
+//! conservative scan tolerates interior pointers (it walks back to
+//! the object's base), and every site below uses the pointer
+//! transiently for a single aligned read or write before discarding
+//! it. The `gc-heap-ptr arithmetic` SAFETY markers acknowledge each
+//! site.
+//!
+//! ## GC reachability under mutation
+//!
+//! v1's collector is Boehm conservative — slot writes do not need a
+//! write barrier (Boehm's mark phase scans the whole heap and finds
+//! pointers wherever they live, so a freshly stored slot is reachable
+//! by the next collection without explicit help) and do not need a
+//! safepoint (stackmaps and safepoints serve precise / moving
+//! collectors; Boehm scans conservatively at allocation points). v2
+//! migration to a precise / moving GC will need both. See
+//! `[DEVIATION Task 66] mutation under v2 GC` (a future entry) for
+//! the closure path.
 
 use crate::counters::{self, CounterId};
 use crate::gc::sigil_alloc;
@@ -44,7 +66,7 @@ pub extern "C" fn sigil_mut_array_new(len: u64, fill: u64) -> *mut u8 {
 
     // Length word at offset 8.
     //
-    // SAFETY: not an interior pointer (transient base for one aligned u64 store).
+    // SAFETY: gc-heap-ptr arithmetic (transient base for one aligned u64 store).
     unsafe {
         let len_ptr: *mut u64 = obj.add(8).cast();
         len_ptr.write(len);
@@ -52,10 +74,10 @@ pub extern "C" fn sigil_mut_array_new(len: u64, fill: u64) -> *mut u8 {
 
     if len > 0 {
         unsafe {
-            // SAFETY: not an interior pointer (offset 16 is a transient u64 store base; indices stay within the allocated payload).
+            // SAFETY: gc-heap-ptr arithmetic (offset 16 is a transient u64 store base; indices stay within the allocated payload).
             let elems_ptr: *mut u64 = obj.add(16).cast();
             for i in 0..(len as usize) {
-                // SAFETY: not an interior pointer (transient elems_ptr.add(i) for one aligned u64 write).
+                // SAFETY: gc-heap-ptr arithmetic (transient elems_ptr.add(i) for one aligned u64 write).
                 elems_ptr.add(i).write(fill);
             }
         }
@@ -74,7 +96,7 @@ pub extern "C" fn sigil_mut_array_new(len: u64, fill: u64) -> *mut u8 {
 /// `arr` must be a pointer to a valid `TAG_MUT_ARRAY` header.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_mut_array_length(arr: *const u8) -> u64 {
-    // SAFETY: not an interior pointer (transient base for one u64 read).
+    // SAFETY: gc-heap-ptr arithmetic (transient base for one u64 read).
     let len_ptr: *const u64 = arr.add(8).cast();
     len_ptr.read()
 }
@@ -91,9 +113,9 @@ pub unsafe extern "C" fn sigil_mut_array_get(arr: *const u8, i: u64) -> u64 {
         eprintln!("sigil_mut_array_get: index {i} out of bounds (len {len})");
         std::process::abort();
     }
-    // SAFETY: not an interior pointer (offset 16 base + bounds-checked index).
+    // SAFETY: gc-heap-ptr arithmetic (offset 16 base + bounds-checked index).
     let elems_ptr: *const u64 = arr.add(16).cast();
-    // SAFETY: not an interior pointer (transient add(i) for one aligned u64 read).
+    // SAFETY: gc-heap-ptr arithmetic (transient add(i) for one aligned u64 read).
     elems_ptr.add(i as usize).read()
 }
 
@@ -114,9 +136,9 @@ pub unsafe extern "C" fn sigil_mut_array_set(arr: *mut u8, i: u64, val: u64) {
         eprintln!("sigil_mut_array_set: index {i} out of bounds (len {len})");
         std::process::abort();
     }
-    // SAFETY: not an interior pointer (transient base + bounds-checked index for one aligned u64 write).
+    // SAFETY: gc-heap-ptr arithmetic (transient base + bounds-checked index for one aligned u64 write).
     let elems_ptr: *mut u64 = arr.add(16).cast();
-    // SAFETY: not an interior pointer (transient add(i) for one aligned u64 write).
+    // SAFETY: gc-heap-ptr arithmetic (transient add(i) for one aligned u64 write).
     elems_ptr.add(i as usize).write(val);
 }
 

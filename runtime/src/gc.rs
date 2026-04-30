@@ -232,7 +232,7 @@ pub unsafe extern "C" fn sigil_string_new(src: *const u8, len: usize) -> *mut u8
 
     // Write the length word at offset 8.
     //
-    // SAFETY: not an interior pointer (pointer arithmetic is to local stack
+    // SAFETY: gc-heap-ptr arithmetic (pointer arithmetic is to local stack
     // variables inside runtime, computed only to drive a single aligned
     // store, not stored or passed). obj+8 is still inside the object but
     // the write and the read below are transient.
@@ -241,7 +241,7 @@ pub unsafe extern "C" fn sigil_string_new(src: *const u8, len: usize) -> *mut u8
 
     // Copy the byte payload at offset 16.
     //
-    // SAFETY: not an interior pointer (temporary pointers used only for a
+    // SAFETY: gc-heap-ptr arithmetic (temporary pointers used only for a
     // single byte-range copy, never returned to caller).
     if len > 0 && !src.is_null() {
         let dst = obj.add(16);
@@ -260,7 +260,7 @@ pub unsafe extern "C" fn sigil_string_new(src: *const u8, len: usize) -> *mut u8
 /// by `sigil_string_new`.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_string_len(obj: *const u8) -> usize {
-    // SAFETY: not an interior pointer (used transiently for a single read).
+    // SAFETY: gc-heap-ptr arithmetic (used transiently for a single read).
     let len_ptr: *const u64 = obj.add(8).cast();
     len_ptr.read() as usize
 }
@@ -275,7 +275,7 @@ pub unsafe extern "C" fn sigil_string_len(obj: *const u8) -> usize {
 /// Boehm ensures for the duration of the call chain).
 pub(crate) unsafe fn string_bytes(obj: *const u8) -> (*const u8, usize) {
     let len = sigil_string_len(obj);
-    // SAFETY: not an interior pointer (immediately consumed by the caller
+    // SAFETY: gc-heap-ptr arithmetic (immediately consumed by the caller
     // for a single write syscall; never stored or passed back across
     // FFI or module boundaries).
     let bytes = obj.add(16);
@@ -306,7 +306,7 @@ mod tests {
         sigil_gc_init();
         let before_count = counters::read(CounterId::BoehmAllocCount);
         let src = b"hi";
-        // SAFETY: not an interior pointer (src is a static byte literal, not a heap object).
+        // SAFETY: gc-heap-ptr arithmetic (src is a static byte literal, not a heap object).
         let obj = unsafe { sigil_string_new(src.as_ptr(), src.len()) };
         assert!(!obj.is_null());
         let after_count = counters::read(CounterId::BoehmAllocCount);

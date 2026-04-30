@@ -42,7 +42,7 @@ use crate::gc::sigil_string_new;
 pub extern "C" fn sigil_int_to_string(n: i64) -> *mut u8 {
     let formatted = n.to_string();
     let bytes = formatted.as_bytes();
-    // SAFETY: not an interior pointer (`formatted` is a Rust `String` on the system allocator, not Boehm-managed; copied into a fresh Boehm allocation before the call returns).
+    // SAFETY: gc-heap-ptr arithmetic (`formatted` is a Rust `String` on the system allocator, not Boehm-managed; copied into a fresh Boehm allocation before the call returns).
     unsafe { sigil_string_new(bytes.as_ptr(), bytes.len()) }
 }
 
