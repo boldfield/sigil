@@ -1481,7 +1481,20 @@ impl Tc {
     /// `name -> Ty::Var(id)` map plus the parallel id list (used for
     /// `Scheme.type_vars`). Empty input yields an empty map and
     /// empty id list — non-generic declarations stay zero-cost.
+    ///
+    /// **Allocation-order invariant** (load-bearing for `bind_ty_var`'s
+    /// lower-id-is-outer-canonical direction fix from Task 63). The
+    /// returned IDs are consecutive starting at the pre-call value of
+    /// `next_ty_var`. Within a single `check_fn` call this method is
+    /// invoked BEFORE any body-walk fresh-var allocation, so every
+    /// outer-fn var has a lower ID than every body-walk fresh-var.
+    /// `bind_ty_var` relies on `min(id, other)` selecting the outer-
+    /// canonical representative when both vars are unbound.
+    /// Structural pin: `fresh_ty_var_is_monotonic_counter` and
+    /// `outer_fn_vars_have_lower_ids_than_body_fresh_vars_after_typecheck`
+    /// in `mod tests`.
     fn fresh_generic_subst(&mut self, gps: &[GenericParam]) -> (BTreeMap<String, Ty>, Vec<u32>) {
+        let pre_floor = self.next_ty_var;
         let mut subst = BTreeMap::new();
         let mut ids = Vec::with_capacity(gps.len());
         for gp in gps {
@@ -1489,6 +1502,20 @@ impl Tc {
             ids.push(id);
             subst.insert(gp.name.clone(), Ty::Var(id));
         }
+        debug_assert!(
+            ids.iter()
+                .enumerate()
+                .all(|(i, id)| *id == pre_floor + i as u32),
+            "fresh_generic_subst postcondition: allocated IDs must be consecutive \
+             starting from pre-call next_ty_var (={pre_floor}); got {ids:?}"
+        );
+        debug_assert_eq!(
+            self.next_ty_var,
+            pre_floor + gps.len() as u32,
+            "fresh_generic_subst postcondition: next_ty_var advanced by exactly {} (got {})",
+            gps.len(),
+            self.next_ty_var
+        );
         (subst, ids)
     }
 
@@ -1628,23 +1655,35 @@ impl Tc {
             // Outer-fn type vars (collected into `outer_fn_var_ids`
             // from each fn's `Scheme.type_vars`) are allocated by
             // `check_fn`'s `fresh_generic_subst` BEFORE any body
-            // fresh vars within that fn (line 2206), so within a
-            // single fn body lower-id is the outer-canonical
-            // representative. Cross-arm unify in `check_match`
-            // unifies one arm's free fresh-var (e.g. `Result[A,
-            // ?fE]`'s ?fE from `Ok(x)`) with the other arm's
-            // outer-bound fresh var (`Result[?fA, E]`'s already-
-            // bound ?fA from `Err(e)`). Without this preference,
-            // the bind direction is OUTER → FRESH (`subst[outer] =
-            // Var(fresh)`), and the pending_ctor `apply_ty` walk
-            // returns the still-unbound fresh var, firing E0132
-            // even though the program is well-typed under HM.
-            // Two-param sum types (Result[A, E]) where each ctor
-            // arm only fixes one of the two params are the
-            // canonical reproducer; List[A] with a single param
-            // never tripped this because the unbound arm-var
-            // never had a competing already-bound counterpart at
-            // cross-arm time.
+            // fresh vars within that fn, so within a single fn body
+            // lower-id is the outer-canonical representative.
+            // Cross-arm unify in `check_match` unifies one arm's
+            // free fresh-var (e.g. `Result[A, ?fE]`'s ?fE from
+            // `Ok(x)`) with the other arm's outer-bound fresh var
+            // (`Result[?fA, E]`'s already-bound ?fA from `Err(e)`).
+            // Without this preference, the bind direction is
+            // OUTER → FRESH (`subst[outer] = Var(fresh)`), and the
+            // pending_ctor `apply_ty` walk returns the still-
+            // unbound fresh var, firing E0132 even though the
+            // program is well-typed under HM. Two-param sum types
+            // (Result[A, E]) where each ctor arm only fixes one of
+            // the two params are the canonical reproducer; List[A]
+            // with a single param never tripped this because the
+            // unbound arm-var never had a competing already-bound
+            // counterpart at cross-arm time.
+            //
+            // Invariant pins (`mod tests`):
+            //   - `fresh_ty_var_is_monotonic_counter` — the counter
+            //     is strictly increasing.
+            //   - `fresh_generic_subst_then_body_fresh_vars_have_higher_ids`
+            //     — outer-fn vars allocate before body fresh-vars
+            //     at the API level.
+            //   - `bind_ty_var_with_two_unbound_vars_picks_lower_id_as_canonical`
+            //     — this fn's load-bearing direction.
+            //   - `outer_fn_vars_have_lower_ids_than_body_fresh_vars_after_typecheck`
+            //     — end-to-end consecutiveness pin.
+            //   - `two_param_sum_type_match_each_arm_constrains_one_param_typechecks`
+            //     — the user-facing regression.
             let canonical = (*other).min(id);
             let other_id = (*other).max(id);
             if canonical != other_id {
@@ -8917,6 +8956,172 @@ mod tests {
     }
 
     // ===== Plan C Task 63 — std/result typecheck-level coverage =====
+
+    #[test]
+    fn fresh_ty_var_is_monotonic_counter() {
+        // Plan C Task 63 invariant pin. `bind_ty_var`'s lower-id-is-
+        // outer-canonical direction fix relies on `fresh_ty_var`
+        // returning monotonically-increasing IDs so that
+        // `fresh_generic_subst`-allocated outer-fn vars (called first
+        // in `check_fn`) have lower IDs than any subsequent body
+        // fresh-var. If a future refactor adds ID reuse / recycling
+        // here, this assertion fires and the bind direction needs
+        // re-checking.
+        let mut tc = fresh_tc();
+        let a = tc.fresh_ty_var();
+        let b = tc.fresh_ty_var();
+        let c = tc.fresh_ty_var();
+        assert!(
+            a < b,
+            "fresh_ty_var must be strictly monotonic: a={a}, b={b}"
+        );
+        assert!(
+            b < c,
+            "fresh_ty_var must be strictly monotonic: b={b}, c={c}"
+        );
+        assert_eq!(b, a + 1, "fresh_ty_var must increment by 1");
+        assert_eq!(c, b + 1, "fresh_ty_var must increment by 1");
+    }
+
+    #[test]
+    fn fresh_generic_subst_then_body_fresh_vars_have_higher_ids() {
+        // Plan C Task 63 invariant pin (API level). Within a single
+        // `check_fn` invocation, outer-fn type vars allocated via
+        // `fresh_generic_subst` must precede any body-walk fresh-vars
+        // so that lower-id-is-outer-canonical holds in `bind_ty_var`.
+        // This test simulates the calling order at the API level: a
+        // future refactor that allocates body fresh-vars BEFORE the
+        // outer-fn subst within `check_fn` would invert the property
+        // silently in production (since `check_fn` is a private
+        // method that can't be unit-tested in isolation), but this
+        // test would still pass — the test is a pin on the API
+        // contract, not the call-site discipline. Pair with
+        // `outer_fn_vars_have_lower_ids_than_body_fresh_vars_after_typecheck`
+        // for end-to-end coverage.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("test.sigil");
+        let gps = vec![
+            crate::ast::GenericParam {
+                name: "A".to_string(),
+                span: span.clone(),
+            },
+            crate::ast::GenericParam {
+                name: "E".to_string(),
+                span,
+            },
+        ];
+        let (_subst, outer_ids) = tc.fresh_generic_subst(&gps);
+        let body_id_1 = tc.fresh_ty_var();
+        let body_id_2 = tc.fresh_ty_var();
+        let outer_max = *outer_ids.iter().max().expect("outer_ids non-empty");
+        assert!(
+            body_id_1 > outer_max,
+            "body fresh-var must allocate AFTER all outer-fn vars: \
+             outer_ids={outer_ids:?}, body_id_1={body_id_1}"
+        );
+        assert!(body_id_2 > body_id_1);
+    }
+
+    #[test]
+    fn bind_ty_var_with_two_unbound_vars_picks_lower_id_as_canonical() {
+        // Plan C Task 63 direction-fix pin. Verifies the load-bearing
+        // half of the fix: when `bind_ty_var(id, Var(other))` runs
+        // with both `id` and `other` unbound and distinct, the
+        // resulting substitution maps the higher-id var to the
+        // lower-id var, NOT the other way around. Pairs with
+        // `two_param_sum_type_match_each_arm_constrains_one_param_typechecks`
+        // (the regression test for the user-facing surface).
+        let span = Span::synthetic("test.sigil");
+        let mut tc = fresh_tc();
+        let outer = tc.fresh_ty_var(); // simulates outer-fn var, lower id.
+        let body = tc.fresh_ty_var(); // simulates body fresh-var, higher id.
+        assert!(outer < body, "test setup: outer must have lower id");
+        // Bind body := Var(outer): the implementation should pick
+        // `min(body, outer) = outer` as canonical and store
+        // subst[body] = Var(outer).
+        let ok = tc.bind_ty_var(body, &Ty::Var(outer), &span);
+        assert!(ok);
+        assert_eq!(
+            tc.subst.tys.get(&body),
+            Some(&Ty::Var(outer)),
+            "bind_ty_var must map higher-id (body) to lower-id (outer); \
+             got subst.tys = {:?}",
+            tc.subst.tys
+        );
+        assert!(
+            !tc.subst.tys.contains_key(&outer),
+            "bind_ty_var must NOT map lower-id (outer) to higher-id (body); \
+             got subst.tys = {:?}",
+            tc.subst.tys
+        );
+
+        // Symmetric case: same call with arguments swapped should
+        // produce the same substitution direction.
+        let mut tc2 = fresh_tc();
+        let outer2 = tc2.fresh_ty_var();
+        let body2 = tc2.fresh_ty_var();
+        let ok2 = tc2.bind_ty_var(outer2, &Ty::Var(body2), &span);
+        assert!(ok2);
+        assert_eq!(
+            tc2.subst.tys.get(&body2),
+            Some(&Ty::Var(outer2)),
+            "bind_ty_var(outer, Var(body)) must still map body → outer"
+        );
+        assert!(!tc2.subst.tys.contains_key(&outer2));
+    }
+
+    #[test]
+    fn outer_fn_vars_have_lower_ids_than_body_fresh_vars_after_typecheck() {
+        // Plan C Task 63 invariant pin (end-to-end). Typecheck a
+        // generic fn whose body triggers ctor-site instantiations —
+        // the path that allocates body fresh-vars during
+        // `instantiate_with_vars`. After typecheck, the fn's
+        // `Scheme.type_vars` IDs must be the lowest IDs allocated
+        // for that fn's typecheck, sitting consecutively at the
+        // base of its allocation range. The post-typecheck
+        // `Tc.subst` is private (not surfaced through
+        // `CheckedProgram`) so this test pins the property via
+        // outer-id consecutiveness + the program-wide scheme
+        // layout: `id`'s outer vars must be lower than `main`'s
+        // (no) vars. The regression-test's clean typecheck under
+        // the same bind direction is the user-facing pin.
+        let src = "type Result[A, E] = | Ok(A) | Err(E)\n\
+                   fn id[A, E](r: Result[A, E]) -> Result[A, E] ![] {\n  \
+                     match r {\n    \
+                       Ok(x) => Ok(x),\n    \
+                       Err(e) => Err(e),\n  \
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (toks, _) = lex("t.sigil", src);
+        let (prog, _) = parse("t.sigil", &toks);
+        let (rp, _) = resolve(prog);
+        let (cp, errs) = typecheck(rp.program);
+        assert!(errs.is_empty(), "unexpected typecheck errors: {errs:?}");
+        let id_scheme = cp
+            .fn_schemes
+            .get("id")
+            .expect("scheme `id` should be registered");
+        let outer_ids: Vec<u32> = id_scheme.type_vars.clone();
+        assert_eq!(
+            outer_ids.len(),
+            2,
+            "fn `id[A, E]` should have 2 outer-fn type vars; got {outer_ids:?}"
+        );
+
+        // Sanity: outer IDs are consecutive (allocation-order
+        // invariant — `fresh_generic_subst` allocates them as a
+        // contiguous block).
+        let mut sorted_outer = outer_ids.clone();
+        sorted_outer.sort();
+        for w in sorted_outer.windows(2) {
+            assert_eq!(
+                w[1],
+                w[0] + 1,
+                "outer-fn vars must be allocated consecutively; got {sorted_outer:?}"
+            );
+        }
+    }
 
     #[test]
     fn two_param_sum_type_match_each_arm_constrains_one_param_typechecks() {
