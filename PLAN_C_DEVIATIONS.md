@@ -459,3 +459,20 @@ similar. Type errors are clear at the call site (`raise(42)`
 fires E0044 with String-vs-Int mismatch).
 
 **Implementing commit(s).** [HEAD].
+
+### Subsequent fixup (PR #44 review #1) — return-arm catch idiom deferred
+
+PR #44 review #1 suggested switching `catch`'s implementation from `handle Ok(body()) with { Raise.fail(e, k) => Err(e) }` to the explicit return-arm shape:
+
+```sigil
+handle body() with {
+  return(v) => Ok(v),
+  Raise.fail(e, k) => Err(e),
+}
+```
+
+The return-arm shape is cleaner in principle and matches `examples/state.sigil`'s convention. **Attempting it tripped a v1 typechecker gap** — when `catch[A]` is monomorphized at a use site, the cross-arm unification (`Ok(v)`'s `Result[A, ?E]` vs `Err(e)`'s `Result[?A, String]` against the declared `Result[A, String]`) typechecks but does not propagate the `?E = String` binding into the return arm's monomorphize pass. Codegen then panics at `cranelift_ty_of_ty` with a `Ty::Var` leak.
+
+`examples/state.sigil` sidesteps this because it is non-generic — A is concrete `Int` everywhere, so no Ty::Var survives.
+
+**Closure path for the return-arm shape.** A v2 typecheck refinement that pins all unconstrained type-vars in handler-arm bodies against the declared handle-overall type (via the same Ty::Var-back-propagation mechanism that pinned the Plan C Task 63 cross-arm unify direction-fix). After v2 lands, `catch` swaps to the cleaner return-arm shape; the `Ok(body())` form below is the v1-compatible workaround documented inline in `std/raise.sigil`.

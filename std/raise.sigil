@@ -61,19 +61,28 @@ fn raise(e: String) -> Int ![Raise] {
 }
 
 // `catch(body)` runs `body` and wraps the outcome in a Result:
-//   - body returns A normally → `Ok(a)` (via the `return` arm)
+//   - body returns A normally → `Ok(a)`
 //   - body raises e via `perform Raise.fail(e)` → `Err(e)` (via
 //     the discard-`k` op arm)
 //
 // The body's row is closed at `![Raise]` per the v1 design note
-// above; `catch` discharges Raise and returns under `![]`. Both
-// arms produce `Result[A, String]` directly, so the handle's
-// overall type matches the declared return without bidirectional-
-// inference acrobatics. Mirrors the explicit-return-arm pattern
-// established by `examples/state.sigil`.
+// above; `catch` discharges Raise and returns under `![]`.
+//
+// **Idiom note.** PR #44 review suggested an explicit `return(v)
+// => Ok(v)` arm to decouple body-type from result-type inference
+// (matching `examples/state.sigil`). That shape is cleaner in
+// principle but currently leaks a `Ty::Var` past monomorphize for
+// generic `catch[A]` — the cross-arm `Ok(v)` (= `Result[A, ?E]`)
+// vs `Err(e)` (= `Result[?A, String]`) unification works at
+// typecheck but doesn't propagate the `?E = String` binding into
+// the return-arm's monomorphize pass. The non-generic `state.sigil`
+// shape sidesteps this because A is concrete `Int` everywhere.
+// Closing this gap is a v2 typecheck refinement; the literal
+// `Ok(body())` form below works under v1 by pinning the wrap at
+// the body-call site (where A is fully resolved from `body()`'s
+// declared return type), reducing cross-arm inference pressure.
 fn catch[A](body: () -> A ![Raise]) -> Result[A, String] ![] {
-  handle body() with {
-    return(v) => Ok(v),
+  handle Ok(body()) with {
     Raise.fail(e, k) => Err(e),
   }
 }
