@@ -958,7 +958,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             let sig = FnSig {
                 params,
                 ret,
-                effects: effect_refs_to_names_only(&f.effects),
+                effects: effect_refs_to_insts(&f.effects, &tc.types, &tc.current_generic_subst),
                 effect_row_var: row_var_id,
             };
             let scheme = Scheme {
@@ -990,6 +990,14 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 tc.check_type_expr_known(&p.ty);
             }
             tc.check_type_expr_known(&f.return_type);
+            // Plan D Task 114 — walk the fn-decl row's effect-refs
+            // for arity / unknown-effect diagnostics.
+            for eref in &f.effects {
+                for a in &eref.args {
+                    tc.check_type_expr_known(a);
+                }
+                tc.check_effect_ref_arity(eref);
+            }
             tc.current_generic_subst = saved_generic_subst;
         }
     }
@@ -2712,6 +2720,17 @@ impl Tc {
                     self.check_type_expr_known(p);
                 }
                 self.check_type_expr_known(&fty.ret);
+                // Plan D Task 114 — also walk effect-row entries so
+                // EffectRef args get their own E0107 (unknown type)
+                // diagnostics, plus arity-check the row's
+                // generic-effect references against their declared
+                // generic-param count (E0140).
+                for eref in &fty.effects {
+                    for a in &eref.args {
+                        self.check_type_expr_known(a);
+                    }
+                    self.check_effect_ref_arity(eref);
+                }
                 if fty.effect_row_var.is_some() {
                     self.push_error(
                         "E0137",
@@ -2744,6 +2763,74 @@ impl Tc {
     ///
     /// On success returns `Some(Ty::User(...))`. On shape mismatch,
     /// emits E0115 and returns `None`.
+    /// Plan D Task 114 — validate one row-site `EffectRef` against
+    /// its declared `EffectDecl`. Two checks:
+    ///
+    /// 1. **E0042** if the effect is not declared at all (mirrors
+    ///    the existing legacy diagnostic vocabulary; we widen here
+    ///    so unknown-effect references at row sites surface with
+    ///    the same code paths that already exist for unknown
+    ///    effects at perform sites).
+    /// 2. **E0140** (new code) if the row-site arg list arity
+    ///    diverges from the decl's `generic_params`. A bare-name
+    ///    reference to a generic effect-decl (`![Raise]` when the
+    ///    decl is `Raise[E]`) and a referenced effect-decl with
+    ///    too few or too many args (`Raise[Int, String]` when the
+    ///    decl is `Raise[E]`) both fire E0140 with a precise
+    ///    arity message. Bare-name refs to non-generic
+    ///    effect-decls (the dominant pre-Task-114 surface)
+    ///    continue to typecheck cleanly.
+    fn check_effect_ref_arity(&mut self, eref: &crate::ast::EffectRef) {
+        let decl = match self.effects.get(&eref.name) {
+            Some(d) => d.clone(),
+            None => {
+                self.push_error(
+                    "E0042",
+                    eref.span.clone(),
+                    format!(
+                        "effect `{}` is not declared (declare it with `effect {} {{ ... }}` \
+                         before referencing it in an effect row)",
+                        eref.name, eref.name,
+                    ),
+                );
+                return;
+            }
+        };
+        let expected = decl.generic_params.len();
+        let got = eref.args.len();
+        if expected != got {
+            let expected_names: Vec<&str> = decl
+                .generic_params
+                .iter()
+                .map(|gp| gp.name.as_str())
+                .collect();
+            let header = if expected == 0 {
+                format!(
+                    "effect `{}` is not generic — drop the type-arg list to write `{}` instead of `{}`",
+                    eref.name, eref.name, eref.name,
+                )
+            } else if got == 0 {
+                format!(
+                    "effect `{}` is generic over [{}] — write `{}[{}]` with explicit type arguments \
+                     (bare `{}` refers to the un-instantiated declaration)",
+                    eref.name,
+                    expected_names.join(", "),
+                    eref.name,
+                    expected_names.join(", "),
+                    eref.name,
+                )
+            } else {
+                format!(
+                    "effect `{}` is declared with {expected} type parameter(s) [{}], but {got} \
+                     argument(s) were provided in the row site",
+                    eref.name,
+                    expected_names.join(", "),
+                )
+            };
+            self.push_error("E0140", eref.span.clone(), header);
+        }
+    }
+
     fn resolve_ctor_unit_use(&mut self, name: &str, span: &Span) -> Option<Ty> {
         let info = self.ctors.get(name).cloned()?;
         let td = self.types.get(&info.type_name)?.clone();
@@ -3187,7 +3274,7 @@ impl Tc {
             let inferred_sig = FnSig {
                 params: param_tys,
                 ret: declared_ret,
-                effects: effect_refs_to_names_only(&f.effects),
+                effects: effect_refs_to_insts(&f.effects, &self.types, &self.current_generic_subst),
                 effect_row_var: row_var_id,
             };
             let resolved = self.deref(&Ty::Fn(Box::new(inferred_sig)));
@@ -5490,7 +5577,7 @@ pub(crate) fn ty_from_type_expr(
             Some(Ty::Fn(Box::new(FnSig {
                 params,
                 ret,
-                effects: effect_refs_to_names_only(&fty.effects),
+                effects: effect_refs_to_insts(&fty.effects, types, generic_subst),
                 effect_row_var: None,
             })))
         }
@@ -7606,6 +7693,87 @@ mod tests {
         assert!(
             has_code(&errs, "E0112"),
             "expected E0112 (unknown type) without a List declaration; got {errs:?}",
+        );
+    }
+
+    // Plan D Task 114 smoke gate — type-parameterized effect rows.
+
+    #[test]
+    fn generic_effect_decl_with_type_param_typechecks() {
+        // `effect Raise[E] { fail: (E) -> Int }` declares fine —
+        // op signatures already use the effect-decl's
+        // generic_subst (line 941-948 in this file's pre-pass);
+        // Task 114 just wires the row-site surface to substitute
+        // the actual type-arg in.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "generic effect-decl `Raise[E]` should typecheck cleanly; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_parameterized_row_typechecks() {
+        // `![Raise[Int]]` — bare-name effect with a type-arg list
+        // resolves the effect-decl + substitutes Int for E. The
+        // body's perform site is concrete-Int so check_perform's
+        // op-arg unification accepts the call.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky() -> Int ![Raise[Int]] {\n  \
+                     perform Raise.fail(42)\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "row `![Raise[Int]]` should typecheck; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn generic_effect_decl_with_wrong_arity_fires_e0140() {
+        // `effect Raise[E] { ... }` declared with one type-param;
+        // a row site uses two args (`Raise[Int, String]`). E0140
+        // surfaces the mismatch.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky() -> Int ![Raise[Int, String]] {\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0140"),
+            "row-arg arity mismatch should fire E0140; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn bare_name_reference_to_generic_effect_fires_e0140() {
+        // `effect Raise[E] { ... }` declared generic; bare
+        // `![Raise]` (no type-arg list) should fire E0140 because
+        // E is unresolved at the row site.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky() -> Int ![Raise] {\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0140"),
+            "bare `![Raise]` of a generic effect-decl should fire E0140; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_args_on_non_generic_effect_fires_e0140() {
+        // Builtin `IO` is not generic; `![IO[Int]]` is malformed.
+        let src = "fn main() -> Int ![IO[Int]] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0140"),
+            "`![IO[Int]]` on non-generic IO should fire E0140; got {errs:?}"
         );
     }
 

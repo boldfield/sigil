@@ -1344,10 +1344,27 @@ fn ty_from_type_expr_under_subst(te: &TypeExpr, subst: &BTreeMap<String, Ty>) ->
                 .map(|p| ty_from_type_expr_under_subst(p, subst))
                 .collect();
             let ret = ty_from_type_expr_under_subst(&fty.ret, subst);
+            // Plan D Task 114 — substitute row-arg type vars
+            // through the active mono substitution.
+            let effects: Vec<crate::typecheck::EffectInst> = fty
+                .effects
+                .iter()
+                .map(|r| {
+                    let args = r
+                        .args
+                        .iter()
+                        .map(|t| ty_from_type_expr_under_subst(t, subst))
+                        .collect();
+                    crate::typecheck::EffectInst {
+                        name: r.name.clone(),
+                        args,
+                    }
+                })
+                .collect();
             Ty::Fn(Box::new(crate::typecheck::FnSig {
                 params,
                 ret,
-                effects: crate::typecheck::effect_refs_to_names_only(&fty.effects),
+                effects,
                 effect_row_var: None,
             }))
         }
@@ -1500,10 +1517,23 @@ pub(crate) fn type_expr_to_ty(te: &TypeExpr) -> Ty {
         TypeExpr::Fn(fty) => {
             let params = fty.params.iter().map(type_expr_to_ty).collect();
             let ret = type_expr_to_ty(&fty.ret);
+            // Plan D Task 114 — type_expr_to_ty runs *after* monomorphize
+            // has substituted all generic params; rewrite_type_expr's
+            // outputs feed in here so effect-row args are already
+            // concrete (no Ty::Var residue). Build EffectInst directly
+            // from the AST's args via type_expr_to_ty.
+            let effects: Vec<crate::typecheck::EffectInst> = fty
+                .effects
+                .iter()
+                .map(|r| crate::typecheck::EffectInst {
+                    name: r.name.clone(),
+                    args: r.args.iter().map(type_expr_to_ty).collect(),
+                })
+                .collect();
             Ty::Fn(Box::new(crate::typecheck::FnSig {
                 params,
                 ret,
-                effects: crate::typecheck::effect_refs_to_names_only(&fty.effects),
+                effects,
                 effect_row_var: None,
             }))
         }
