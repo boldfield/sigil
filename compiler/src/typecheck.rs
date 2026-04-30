@@ -2263,7 +2263,25 @@ impl Tc {
                         .map(|p| Self::rename_ty(p, ty_map, row_map))
                         .collect(),
                     ret: Self::rename_ty(&sig.ret, ty_map, row_map),
-                    effects: sig.effects.clone(),
+                    // Plan D Stage 12 — rename type-var ids inside
+                    // each EffectInst's args. Without this, a
+                    // generic fn whose row carries `Raise[E]`
+                    // doesn't get its E renamed at scheme
+                    // instantiation, leaving the row's E
+                    // disconnected from the fresh `Var(E_fresh)`
+                    // bound by arg unification.
+                    effects: sig
+                        .effects
+                        .iter()
+                        .map(|ei| EffectInst {
+                            name: ei.name.clone(),
+                            args: ei
+                                .args
+                                .iter()
+                                .map(|a| Self::rename_ty(a, ty_map, row_map))
+                                .collect(),
+                        })
+                        .collect(),
                     effect_row_var: sig
                         .effect_row_var
                         .map(|id| row_map.get(&id).copied().unwrap_or(id)),
@@ -2520,22 +2538,47 @@ impl Tc {
         if a == b {
             return true;
         }
-        // Plan D Task 114 — structural set-difference over `EffectInst`
-        // (full `(name, args)` equality). `Raise[Int]` and `Raise[String]`
-        // compare unequal even though they share a name; the row
-        // unification preserves the distinction so handler dispatch
-        // resolves to the correct instantiation.
-        let only_a: Vec<EffectInst> = a
-            .effects
-            .iter()
-            .filter(|e| !b.effects.contains(*e))
-            .cloned()
-            .collect();
+        // Plan D Stage 12 — name-based matching with arg unification.
+        // For each effect-name shared between rows, unify the args
+        // pairwise (E0044 if args mismatch). Effect-names appearing on
+        // only one side go to `only_a` / `only_b`. This is the
+        // unification-semantics fix for the structural-equality diff
+        // that pre-Stage-12 produced spurious E0042/E0128 when two
+        // rows shared a name but carried Ty::Var args (e.g.,
+        // handle-discharge body row vs body's expected row inside
+        // `catch[A, E](body: () -> A ![Raise[E]]) -> ...`).
+        //
+        // Caveat: each effect-name is assumed to appear at most once
+        // per row. Multi-instantiation rows like `![Raise[Int],
+        // Raise[String]]` are possible but unusual; if both rows
+        // carry multiple entries of the same name, only the first
+        // pair gets unified — rest fall through to only_a/only_b.
+        let mut only_a: Vec<EffectInst> = Vec::new();
+        let mut matched_b: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for ea in &a.effects {
+            match b
+                .effects
+                .iter()
+                .enumerate()
+                .find(|(idx, eb)| !matched_b.contains(idx) && eb.name == ea.name)
+            {
+                Some((idx, eb)) => {
+                    matched_b.insert(idx);
+                    if ea.args.len() == eb.args.len() {
+                        for (ax, bx) in ea.args.iter().zip(eb.args.iter()) {
+                            self.unify_ty(ax, bx, span);
+                        }
+                    }
+                }
+                None => only_a.push(ea.clone()),
+            }
+        }
         let only_b: Vec<EffectInst> = b
             .effects
             .iter()
-            .filter(|e| !a.effects.contains(*e))
-            .cloned()
+            .enumerate()
+            .filter(|(idx, _)| !matched_b.contains(idx))
+            .map(|(_, eb)| eb.clone())
             .collect();
         match (a.tail, b.tail) {
             (None, None) => {
@@ -2653,13 +2696,32 @@ impl Tc {
     fn subsume_row(&mut self, callee_row: &Row, caller_row: &Row, span: &Span) -> bool {
         let callee = self.subst.apply_row(callee_row);
         let caller = self.subst.apply_row(caller_row);
-        // Plan D Task 114 — structural set-difference over `EffectInst`.
-        let missing: Vec<EffectInst> = callee
-            .effects
-            .iter()
-            .filter(|e| !caller.effects.contains(*e))
-            .cloned()
-            .collect();
+        // Plan D Stage 12 — name-based matching with arg unification
+        // (matches `unify_row`'s post-Stage-12 semantics). For each
+        // callee effect, find a caller effect with the same name; if
+        // matched, unify args (E0044 fires on mismatch). Names not
+        // in the caller's row go to `missing` (E0042).
+        let mut missing: Vec<EffectInst> = Vec::new();
+        let mut matched_caller: std::collections::BTreeSet<usize> =
+            std::collections::BTreeSet::new();
+        for ce in &callee.effects {
+            match caller
+                .effects
+                .iter()
+                .enumerate()
+                .find(|(idx, ec)| !matched_caller.contains(idx) && ec.name == ce.name)
+            {
+                Some((idx, ec)) => {
+                    matched_caller.insert(idx);
+                    if ce.args.len() == ec.args.len() {
+                        for (ax, bx) in ce.args.iter().zip(ec.args.iter()) {
+                            self.unify_ty(ax, bx, span);
+                        }
+                    }
+                }
+                None => missing.push(ce.clone()),
+            }
+        }
         if !missing.is_empty() {
             // Callee performs effects the caller doesn't permit.
             // Use the legacy E0042 diagnostic to keep error messages
@@ -2678,13 +2740,15 @@ impl Tc {
         }
         if let Some(callee_tail) = callee.tail {
             // Callee has an open row var — it absorbs caller's
-            // leftover effects + caller's tail. This binds *only*
+            // leftover effects (caller-side names not matched to
+            // any callee name) + caller's tail. This binds *only*
             // the callee's row var.
             let leftover: Vec<EffectInst> = caller
                 .effects
                 .iter()
-                .filter(|e| !callee.effects.contains(*e))
-                .cloned()
+                .enumerate()
+                .filter(|(idx, _)| !matched_caller.contains(idx))
+                .map(|(_, ec)| ec.clone())
                 .collect();
             self.bind_row_var(
                 callee_tail,
@@ -8100,22 +8164,25 @@ mod tests {
     }
 
     #[test]
-    fn cross_fn_row_with_distinct_type_args_fires_e0042() {
+    fn cross_fn_row_with_distinct_type_args_fires_e0044() {
         // Caller `![Raise[Int]]` calls callee `![Raise[String]]`:
         // they share the effect-decl name but instantiate it
-        // distinctly. Structural row matching on `EffectInst`
-        // detects the mismatch and fires E0042 ("calling a
-        // function that performs `Raise[String]` requires ...
-        // `Raise[String]` ... in the enclosing function's effect
-        // row").
+        // distinctly. Plan D Stage 12 — the row-matching logic in
+        // `subsume_row` matches by name then unifies args
+        // pairwise; the type mismatch surfaces as **E0044** at the
+        // arg-unify step (Int vs String), not E0042 (which fires
+        // for "name not in caller's row"). The previous
+        // structural-equality diff fired E0042 here; the
+        // arg-unification semantics give a more precise
+        // diagnostic — the user knows which arg type is wrong.
         let src = "effect Raise[E] { fail: (E) -> Int }\n\
                    fn risky_str() -> Int ![Raise[String]] { 0 }\n\
                    fn outer() -> Int ![Raise[Int]] { risky_str() }\n\
                    fn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
         assert!(
-            has_code(&errs, "E0042"),
-            "Raise[Int] caller can't subsume Raise[String] callee; got {errs:?}"
+            has_code(&errs, "E0044"),
+            "Raise[Int] caller calling Raise[String] callee should fire E0044 (Int vs String arg type mismatch); got {errs:?}"
         );
     }
 
@@ -11164,13 +11231,13 @@ mod tests {
         // `raise(...)`; the caller wraps with `catch` to get
         // `Result[Int, String]`.
         let src = "import std.raise\n\
-                   fn parse_pos(n: Int) -> Int ![Raise] {\n  \
+                   fn parse_pos(n: Int) -> Int ![Raise[String]] {\n  \
                      match n {\n    \
                        0 => raise(\"zero\"),\n    \
                        _ => n,\n  \
                      }\n\
                    }\n\
-                   fn parse_pos_three() -> Int ![Raise] { parse_pos(3) }\n\
+                   fn parse_pos_three() -> Int ![Raise[String]] { parse_pos(3) }\n\
                    fn main() -> Int ![IO] {\n  \
                      let r: Result[Int, String] = catch(parse_pos_three);\n  \
                      match r {\n    \
@@ -11199,16 +11266,21 @@ mod tests {
 
     #[test]
     fn raise_with_int_arg_fires_e0044() {
-        // raise takes String error; passing Int should fire E0044.
+        // raise[A, E] takes an E-typed error. The enclosing fn
+        // declares `![Raise[String]]`, so the row site fixes
+        // E := String. Calling `raise(42)` infers E := Int from
+        // the arg, which conflicts with the row's Raise[String].
+        // Plan D Stage 12's name-based arg-unification fires
+        // E0044 (Int vs String).
         let src = "import std.raise\n\
-                   fn fail_with_code() -> Int ![Raise] {\n  \
+                   fn fail_with_code() -> Int ![Raise[String]] {\n  \
                      raise(42)\n\
                    }\n\
                    fn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
-            "expected E0044 (raise expects String, got Int); got {errs:?}"
+            "expected E0044 (Int arg vs String row instantiation); got {errs:?}"
         );
     }
 
@@ -11269,27 +11341,26 @@ mod tests {
     }
 
     #[test]
-    fn raise_int_return_in_string_returning_fn_fires_e0044_v1_gap_pin() {
-        // Plan C Task 71 v1 gap pin per `[DEVIATION Task 71]`:
-        // `Raise.fail` declares `Int` return (placeholder; the perform
-        // never resumes under catch's discharge-k handler). When a
-        // user fn returns `String` and tries to raise inline, the
-        // declared `Int` return doesn't fit the use site → E0044.
-        // The deviation entry calls this out as the v1 ergonomic gap
-        // resolved by v2's per-op generic params (`fail[A]: (E) -> A`).
-        // This test pins the diagnostic so users hitting the error
-        // get a searchable reference and so the error class doesn't
-        // silently change shape when v2 generalisation lands.
+    fn raise_in_string_returning_fn_typechecks_post_task_115() {
+        // Plan C Task 71's v1 gap is **closed by Plan D Task 115**:
+        // `Raise.fail` no longer declares a fixed `Int` return —
+        // it's `fail[A]: (E) -> A`, so `raise[A, E](e: E) -> A`
+        // is polymorphic in the return type. A String-returning
+        // fn that calls `raise(s)` now typechecks cleanly because
+        // A instantiates to String at the use site.
+        //
+        // Was `raise_int_return_in_string_returning_fn_fires_e0044_v1_gap_pin`
+        // pre-Stage-12; renamed and inverted at Stage 12 review.
         let src = "import std.raise\n\
-                   fn parse_or_fail(s: String) -> String ![Raise] {\n  \
+                   fn parse_or_fail(s: String) -> String ![Raise[String]] {\n  \
                      raise(s)\n\
                    }\n\
                    fn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
         assert!(
-            has_code(&errs, "E0044"),
-            "expected E0044 (raise's Int placeholder return doesn't fit \
-             String-returning fn); got {errs:?}"
+            errs.is_empty(),
+            "raise's per-op A return should fit any context; \
+             got {errs:?}"
         );
     }
 

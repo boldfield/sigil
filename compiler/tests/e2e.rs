@@ -6831,7 +6831,7 @@ fn std_io_read_write_file_round_trip() {
 #[test]
 fn std_raise_catch_converts_raise_to_err() {
     let src = "import std.raise\n\
-               fn always_fails() -> Int ![Raise] {\n  \
+               fn always_fails() -> Int ![Raise[String]] {\n  \
                  raise(\"boom\")\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
@@ -6851,7 +6851,7 @@ fn std_raise_catch_converts_raise_to_err() {
 #[test]
 fn std_raise_catch_passes_through_success() {
     let src = "import std.raise\n\
-               fn always_succeeds() -> Int ![Raise] { 42 }\n\
+               fn always_succeeds() -> Int ![Raise[String]] { 42 }\n\
                fn main() -> Int ![IO] {\n  \
                  let r: Result[Int, String] = catch(always_succeeds);\n  \
                  match r {\n    \
@@ -6874,7 +6874,7 @@ fn std_raise_catch_passes_through_success() {
 fn std_raise_catch_with_captured_message() {
     let src = "import std.raise\n\
                fn run_with_msg(msg: String) -> Result[Int, String] ![] {\n  \
-                 catch(fn () -> Int ![Raise] => raise(msg))\n\
+                 catch(fn () -> Int ![Raise[String]] => raise(msg))\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  match run_with_msg(\"captured-message\") {\n    \
@@ -6896,14 +6896,14 @@ fn std_raise_catch_with_captured_message() {
 #[test]
 fn std_raise_nested_catch_with_re_raise() {
     let src = "import std.raise\n\
-               fn might_fail(should_fail: Int) -> Int ![Raise] {\n  \
+               fn might_fail(should_fail: Int) -> Int ![Raise[String]] {\n  \
                  match should_fail {\n    \
                    0 => 7,\n    \
                    _ => raise(\"inner\"),\n  \
                  }\n\
                }\n\
-               fn might_fail_yes() -> Int ![Raise] { might_fail(1) }\n\
-               fn outer() -> Int ![Raise] {\n  \
+               fn might_fail_yes() -> Int ![Raise[String]] { might_fail(1) }\n\
+               fn outer() -> Int ![Raise[String]] {\n  \
                  match catch(might_fail_yes) {\n    \
                    Ok(v) => v + 100,\n    \
                    Err(_) => raise(\"outer-rewrap\"),\n  \
@@ -6928,14 +6928,14 @@ fn std_raise_nested_catch_with_re_raise() {
 #[test]
 fn std_raise_catch_conditional_branch() {
     let src = "import std.raise\n\
-               fn check_pos(n: Int) -> Int ![Raise] {\n  \
+               fn check_pos(n: Int) -> Int ![Raise[String]] {\n  \
                  match n {\n    \
                    0 => raise(\"zero\"),\n    \
                    _ => n + 100,\n  \
                  }\n\
                }\n\
-               fn check_three() -> Int ![Raise] { check_pos(3) }\n\
-               fn check_zero() -> Int ![Raise] { check_pos(0) }\n\
+               fn check_three() -> Int ![Raise[String]] { check_pos(3) }\n\
+               fn check_zero() -> Int ![Raise[String]] { check_pos(0) }\n\
                fn main() -> Int ![IO] {\n  \
                  match catch(check_three) {\n    \
                    Ok(v) => perform IO.println(int_to_string(v)),\n    \
