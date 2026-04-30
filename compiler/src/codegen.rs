@@ -343,7 +343,7 @@ fn cranelift_ty_of_ty(ty: &crate::typecheck::Ty, pointer_ty: Type) -> Type {
         Ty::Int => types::I64,
         Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
         Ty::Char => types::I32,
-        Ty::String | Ty::Fn(_) | Ty::User(_, _) => pointer_ty,
+        Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => pointer_ty,
         Ty::Var(id) => unreachable!(
             "codegen: Ty::Var({id}) reached cranelift_ty_of_ty — \
              typecheck must resolve every var through unification \
@@ -478,6 +478,15 @@ fn type_expr_uses_apply_or_param(
                 }
             }
             type_expr_uses_apply_or_param(&fty.ret, params)
+        }
+        // Plan D Task 113 — recurse into tuple element types.
+        TypeExpr::Tuple { elems, .. } => {
+            for e in elems {
+                if type_expr_uses_apply_or_param(e, params) {
+                    return true;
+                }
+            }
+            false
         }
     }
 }
@@ -634,6 +643,14 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
             }
             for arm in op_arms {
                 if expr_uses_generic(&arm.body, params) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                if expr_uses_generic(e, params) {
                     return true;
                 }
             }
@@ -978,6 +995,14 @@ fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
         | Expr::CharLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => None,
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                if let Some(m) = expr_unsupported_indirect_call(e) {
+                    return Some(m);
+                }
+            }
+            None
+        }
     }
 }
 
@@ -1268,6 +1293,14 @@ fn expr_unsupported_handle(
             if let Some(ra) = return_arm {
                 if let Some(msg) = expr_unsupported_handle(&ra.body, globals, effects_resumes_many)
                 {
+                    return Some(msg);
+                }
+            }
+            None
+        }
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                if let Some(msg) = expr_unsupported_handle(e, globals, effects_resumes_many) {
                     return Some(msg);
                 }
             }
@@ -1756,6 +1789,14 @@ fn arm_body_walk(
                 scopes.pop();
                 if r.is_some() {
                     return r;
+                }
+            }
+            None
+        }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                if let Some(r) = arm_body_walk(el, scopes, k_name, globals, false) {
+                    return Some(r);
                 }
             }
             None
@@ -2518,6 +2559,9 @@ fn slot_kind_for_type_expr_post_mono(te: &crate::ast::TypeExpr) -> EnvSlotKind {
         // allocated closure records; treat as a pointer slot
         // (Closure kind matches the codegen-time runtime layout).
         crate::ast::TypeExpr::Fn(_) => EnvSlotKind::Closure,
+        // Plan D Task 113 — tuple values are heap-allocated records
+        // with one slot per element; treat as User pointer slot.
+        crate::ast::TypeExpr::Tuple { .. } => EnvSlotKind::User,
     }
 }
 
@@ -2649,6 +2693,11 @@ fn walk_collect_captures(
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => {}
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                walk_collect_captures(el, bound, helper_params, out);
+            }
+        }
     }
 }
 
@@ -2740,6 +2789,11 @@ fn walk_collect_arm_captures(
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => {}
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                walk_collect_arm_captures(el, bound, arm_params, out);
+            }
+        }
     }
 }
 
@@ -3526,6 +3580,12 @@ fn collect_handle_arms_in_expr(
             );
             Ok(())
         }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                collect_handle_arms_in_expr(el, module, ctx, out)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3945,6 +4005,20 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
              a caller bypassed `expr_is_pure`",
             std::any::type_name::<Expr>()
         )),
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                if let Some(msg) = arm_body_post_arm_k_tail_free_vars_ok(
+                    el,
+                    binding_name,
+                    k_name,
+                    globals,
+                    extra_bindings,
+                ) {
+                    return Some(msg);
+                }
+            }
+            None
+        }
     }
 }
 
@@ -4116,6 +4190,7 @@ fn find_closure_env_load_lambda_source(
             Expr::RecordLit { fields, .. } => fields.iter().find_map(|f| scan_expr(&f.value, name)),
             Expr::Handle { body, op_arms, .. } => scan_expr(body, name)
                 .or_else(|| op_arms.iter().find_map(|a| scan_expr(&a.body, name))),
+            Expr::Tuple { elems, .. } => elems.iter().find_map(|e| scan_expr(e, name)),
         }
     }
     fn scan_block(b: &Block, name: &str) -> Option<(usize, crate::ast::EnvSlotKind)> {
@@ -4379,6 +4454,13 @@ fn rewrite_expr(
                 span: span.clone(),
             }
         }
+        Expr::Tuple { elems, span } => Expr::Tuple {
+            elems: elems
+                .iter()
+                .map(|el| rewrite_expr(el, captures, scopes))
+                .collect(),
+            span: span.clone(),
+        },
     }
 }
 
@@ -11214,6 +11296,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.seal_block(merge_block_nra);
                 self.builder.block_params(merge_block_nra)[0]
             }
+            Expr::Tuple { .. } => unimplemented!(
+                "Plan D Task 113 — tuple constructor codegen pending; \
+                 the AST scaffolding lands first, then heap allocation + \
+                 N-slot field stores ship in a follow-up commit"
+            ),
         }
     }
 
@@ -13349,7 +13436,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Ty::Int => raw,
             Ty::Bool | Ty::Byte | Ty::Unit => self.builder.ins().ireduce(types::I8, raw),
             Ty::Char => self.builder.ins().ireduce(types::I32, raw),
-            Ty::String | Ty::Fn(_) | Ty::User(_, _) => raw,
+            Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
             // Plan B task 48 invariant — codegen-entry walker
             // (`contains_apply_or_generic_ref`) rejects programs
             // whose AST has surface generic syntax, so a stray
@@ -13790,24 +13877,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 body, return_arm, ..
             } => match return_arm {
                 Some(ra) => {
-                    // Plan B Task 55 (Phase 4g) review-fix #2:
-                    // pre-bind `v` into a forked preview before
-                    // recursing. Without this, callers that don't
-                    // pre-bind `v` (e.g., `lower_match`'s arm-body
-                    // type predictor at codegen.rs:8323-8325; any
-                    // path that reaches `type_of_expr` against a
-                    // handle expression nested inside another shape
-                    // — `match scrut { _ => handle ... with {
-                    // return(v) => v, ... } }`) would recurse into
-                    // an `Expr::Ident("v")` against a preview
-                    // without `v` and trip the `unreachable!`
-                    // ident-lookup path at codegen.rs around line
-                    // 9020. The Phase 4g handle-exit dispatch site
-                    // (codegen.rs:8060) already inserts `v: body_ty`
-                    // before this same call; the fix here makes
-                    // the preview-injection self-contained inside
-                    // `type_of_expr` so every other caller is safe
-                    // by construction.
                     let body_ty = self.type_of_expr(body, preview);
                     let mut p2 = preview.clone();
                     p2.insert(ra.binding.clone(), body_ty);
@@ -13815,6 +13884,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
                 None => self.type_of_expr(body, preview),
             },
+            // Plan D Task 113 — tuple values lower to a heap-allocated
+            // record pointer; the surface Cranelift type is pointer_ty.
+            Expr::Tuple { .. } => self.pointer_ty,
         }
     }
 }
@@ -14030,6 +14102,9 @@ fn arm_body_has_k_pair_lambda(
         | Expr::StringLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => false,
+        Expr::Tuple { elems, .. } => elems
+            .iter()
+            .any(|e| arm_body_has_k_pair_lambda(e, arm_k_pair_captures)),
     }
 }
 
@@ -14774,6 +14849,12 @@ fn expr_is_pure(e: &crate::ast::Expr) -> bool {
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => false,
+        // Plan D Task 113 — tuple values are heap-allocated; treat as
+        // not-pure (allocation has side effects). Conservative; matches
+        // RecordLit's all-pure-elements approach would require a
+        // future refinement, but for the perform-side classifier
+        // gating that calls this fn, conservative-not-pure is correct.
+        Expr::Tuple { .. } => false,
     }
 }
 

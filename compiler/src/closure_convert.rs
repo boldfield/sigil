@@ -536,6 +536,13 @@ impl Converter {
                 }
             }
             Expr::Block(b) => Expr::Block(Box::new(self.rewrite_block(*b, locals, captures))),
+            Expr::Tuple { elems, span } => Expr::Tuple {
+                elems: elems
+                    .into_iter()
+                    .map(|e| self.rewrite_expr(e, locals, captures))
+                    .collect(),
+                span,
+            },
             Expr::Call { callee, args, span } => {
                 // Plan B' Stage 6.8 Task 104 — preserve direct dispatch
                 // for `Call { callee: Ident(top_level_fn), .. }`. The
@@ -804,6 +811,10 @@ pub(crate) fn slot_kind_for_ty(ty: &Ty) -> EnvSlotKind {
         Ty::String => EnvSlotKind::String,
         Ty::Fn(_) => EnvSlotKind::Closure,
         Ty::User(_, _) => EnvSlotKind::User,
+        // Plan D Task 113 — tuple values are heap-allocated records
+        // with one slot per element; the captured value is a pointer
+        // into the GC heap. Use the same slot kind as user types.
+        Ty::Tuple(_) => EnvSlotKind::User,
         // Plan B task 48 — post-typecheck IR shouldn't have unbound
         // type variables in capture types: the codegen-entry walker
         // (`contains_apply_or_generic_ref`) rejects programs whose

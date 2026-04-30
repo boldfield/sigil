@@ -234,6 +234,14 @@ pub fn canon_ty(ty: &Ty) -> String {
                 s
             }
         }
+        Ty::Tuple(elems) => {
+            let mut s = String::from("Tuple");
+            for e in elems {
+                s.push('$');
+                s.push_str(&canon_ty(e));
+            }
+            s
+        }
         Ty::Var(id) => {
             // Reachability-bounded mono never sees an unresolved var
             // because (a) the E0132 ambiguous-polymorphism check at
@@ -718,6 +726,13 @@ impl<'a> Monomorphizer<'a> {
                 effect_row_var: fty.effect_row_var.clone(),
                 span: fty.span.clone(),
             })),
+            TypeExpr::Tuple { elems, span } => TypeExpr::Tuple {
+                elems: elems
+                    .iter()
+                    .map(|e| self.rewrite_type_expr(e, subst))
+                    .collect(),
+                span: span.clone(),
+            },
         }
     }
 
@@ -1014,6 +1029,10 @@ impl<'a> Monomorphizer<'a> {
                     span: span.clone(),
                 }
             }
+            Expr::Tuple { elems, span } => Expr::Tuple {
+                elems: elems.iter().map(|e| self.rewrite_expr(e, subst)).collect(),
+                span: span.clone(),
+            },
         }
     }
 
@@ -1271,6 +1290,12 @@ fn ty_from_type_expr_under_subst(te: &TypeExpr, subst: &BTreeMap<String, Ty>) ->
                 effect_row_var: None,
             }))
         }
+        TypeExpr::Tuple { elems, .. } => Ty::Tuple(
+            elems
+                .iter()
+                .map(|e| ty_from_type_expr_under_subst(e, subst))
+                .collect(),
+        ),
     }
 }
 
@@ -1302,6 +1327,7 @@ impl Substitution {
                 name.clone(),
                 args.iter().map(|a| self.apply_to_ty(a)).collect(),
             ),
+            Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|e| self.apply_to_ty(e)).collect()),
             Ty::Fn(sig) => Ty::Fn(Box::new(crate::typecheck::FnSig {
                 params: sig.params.iter().map(|p| self.apply_to_ty(p)).collect(),
                 ret: self.apply_to_ty(&sig.ret),
@@ -1383,6 +1409,10 @@ fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
                 span: span.clone(),
             }))
         }
+        Ty::Tuple(elems) => TypeExpr::Tuple {
+            elems: elems.iter().map(|e| ty_to_type_expr(e, span)).collect(),
+            span: span.clone(),
+        },
     }
 }
 
@@ -1416,6 +1446,7 @@ fn type_expr_to_ty(te: &TypeExpr) -> Ty {
                 effect_row_var: None,
             }))
         }
+        TypeExpr::Tuple { elems, .. } => Ty::Tuple(elems.iter().map(type_expr_to_ty).collect()),
     }
 }
 

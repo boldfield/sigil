@@ -136,6 +136,17 @@ pub enum TypeExpr {
     /// pushes `Stmt::Let` and `Expr::Lambda` past clippy's
     /// `large_enum_variant` limit).
     Fn(Box<FnTypeExpr>),
+    /// Plan D Task 113 — tuple type: `(T1, T2, ...)`. Arity ≥ 2;
+    /// single-element parens fall through to paren-grouping over the
+    /// inner type, and zero-element parens are reserved (parser
+    /// rejects). Allowed in any type position. Maps to
+    /// [`crate::typecheck::Ty::Tuple`] for HM unification (element-
+    /// wise); codegen emits a heap-allocated record with one slot
+    /// per element.
+    Tuple {
+        elems: Vec<TypeExpr>,
+        span: Span,
+    },
 }
 
 /// Boxed payload of [`TypeExpr::Fn`]. See that variant's docstring
@@ -156,6 +167,7 @@ impl TypeExpr {
             TypeExpr::Named(_, s) => s.clone(),
             TypeExpr::Apply { span, .. } => span.clone(),
             TypeExpr::Fn(fty) => fty.span.clone(),
+            TypeExpr::Tuple { span, .. } => span.clone(),
         }
     }
 
@@ -172,6 +184,7 @@ impl TypeExpr {
             TypeExpr::Named(n, _) => n,
             TypeExpr::Apply { name, .. } => name,
             TypeExpr::Fn(_) => "Fn",
+            TypeExpr::Tuple { .. } => "Tuple",
         }
     }
 }
@@ -473,6 +486,18 @@ pub enum Expr {
         op_arms: Vec<HandleOpArm>,
         span: Span,
     },
+    /// Plan D Task 113 — tuple value: `(e1, e2, ...)`. Arity ≥ 2;
+    /// single-element parens fall through to paren-grouping, and
+    /// zero-element parens are reserved (parser rejects). Maps to
+    /// [`crate::typecheck::Ty::Tuple`] for HM unification (element-
+    /// wise inference); codegen allocates a heap record with one
+    /// slot per element, identical layout to a single-constructor
+    /// sum type's payload at offsets 16+8*i, with the GC pointer
+    /// bitmap reflecting per-slot pointer-ness.
+    Tuple {
+        elems: Vec<Expr>,
+        span: Span,
+    },
 }
 
 /// Plan B task 53 — the optional `return(v) => body` arm of a
@@ -668,7 +693,8 @@ impl Expr {
             | Expr::ClosureRecord { span: s, .. }
             | Expr::ClosureEnvLoad { span: s, .. }
             | Expr::RecordLit { span: s, .. }
-            | Expr::Handle { span: s, .. } => s.clone(),
+            | Expr::Handle { span: s, .. }
+            | Expr::Tuple { span: s, .. } => s.clone(),
             Expr::Perform(p) => p.span.clone(),
             Expr::Block(b) => b.span.clone(),
         }
