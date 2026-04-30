@@ -13585,6 +13585,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match pat {
             Pattern::Wildcard(_) => true,
             Pattern::Var(name, _) => self.nullary_ctor_promotion(name, scrut_ty).is_none(),
+            // Plan D Task 113 — tuple pattern catchall iff sub-patterns
+            // are catchall against matching tuple element types.
+            Pattern::Tuple(pats, _) => match scrut_ty {
+                Some(Ty::Tuple(elem_tys)) if pats.len() == elem_tys.len() => pats
+                    .iter()
+                    .zip(elem_tys.iter())
+                    .all(|(sub, ety)| self.is_catchall_pattern(sub, Some(ety))),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -13653,7 +13662,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     }
                 }
             }
-            Pattern::Tuple(_, _) => {}
+            // Plan D Task 113 — tuple pattern recurses into each
+            // element with the matching element type. Pattern arity
+            // matches Ty::Tuple arity (typecheck E0117 already
+            // rejected mismatches).
+            Pattern::Tuple(pats, _) => {
+                if let Some(Ty::Tuple(elem_tys)) = scrut_ty {
+                    if pats.len() == elem_tys.len() {
+                        for (sub, ety) in pats.iter().zip(elem_tys.iter()) {
+                            self.predict_pattern_bindings(sub, Some(ety), out);
+                        }
+                    }
+                }
+            }
         }
     }
 
