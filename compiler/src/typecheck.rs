@@ -2237,6 +2237,29 @@ impl Tc {
                 }
                 ok
             }
+            // Plan D Task 113 — tuple unification: arity must match;
+            // elements unify position-by-position.
+            (Ty::Tuple(elems_a), Ty::Tuple(elems_b)) => {
+                if elems_a.len() != elems_b.len() {
+                    self.push_error(
+                        "E0044",
+                        span.clone(),
+                        format!(
+                            "tuple arity mismatch: expected `{}`, got `{}`",
+                            ty_display(&a),
+                            ty_display(&b)
+                        ),
+                    );
+                    return false;
+                }
+                let mut ok = true;
+                for (ea, eb) in elems_a.iter().zip(elems_b.iter()) {
+                    if !self.unify_ty(ea, eb, span) {
+                        ok = false;
+                    }
+                }
+                ok
+            }
             (Ty::Fn(sig_a), Ty::Fn(sig_b)) => {
                 if sig_a.params.len() != sig_b.params.len() {
                     self.push_error(
@@ -4783,6 +4806,20 @@ impl Tc {
                 }
                 true
             }
+            // Plan D Task 113 — a tuple pattern is catchall iff every
+            // sub-pattern is catchall against the corresponding tuple
+            // element type. Arity must match the scrut_ty's arity.
+            Pattern::Tuple(pats, _) => {
+                if let Ty::Tuple(elem_tys) = scrut_ty {
+                    if pats.len() == elem_tys.len() {
+                        return pats
+                            .iter()
+                            .zip(elem_tys.iter())
+                            .all(|(sub, ety)| self.pattern_is_catchall(sub, ety));
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -5182,8 +5219,27 @@ fn type_is(t: &TypeExpr, name: &str) -> bool {
     t.head_name() == name
 }
 
-fn type_name(t: &TypeExpr) -> &str {
-    t.head_name()
+fn type_name(t: &TypeExpr) -> String {
+    // Plan D Task 113 — tuple types render in surface form
+    // `(T1, T2, ...)` so error messages stay readable for the new
+    // type surface. Other variants delegate to head_name (a stable
+    // identifier-shaped string suitable for short error formats).
+    match t {
+        TypeExpr::Tuple { elems, .. } => {
+            let parts: Vec<String> = elems.iter().map(type_name).collect();
+            format!("({})", parts.join(", "))
+        }
+        TypeExpr::Fn(fty) => {
+            let params: Vec<String> = fty.params.iter().map(type_name).collect();
+            let ret = type_name(&fty.ret);
+            format!("({}) -> {}", params.join(", "), ret)
+        }
+        TypeExpr::Apply { name, args, .. } => {
+            let argstr: Vec<String> = args.iter().map(type_name).collect();
+            format!("{}[{}]", name, argstr.join(", "))
+        }
+        TypeExpr::Named(n, _) => n.clone(),
+    }
 }
 
 /// Lift a surface `TypeExpr` into the checker's `Ty` lattice. Resolves
