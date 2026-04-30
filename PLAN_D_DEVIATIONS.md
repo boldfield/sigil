@@ -43,6 +43,58 @@ Splits allocate sub-task numbers (117a / 117b / ...) into `PLAN_D_PROGRESS.md`; 
 
 **Implementing commit(s):** Foundation `[HEAD]` (this entry + Stage 10.5 scaffolding) — Tasks 10.5.1-6 commit. Subsequent commits address each task in the order specified by Plan D (`docs/plans/2026-04-30-sigil-plan-d.md` in `boldfield/designs/in-progress/`). Closeout commits at the end of each stage land the prior-stage hash flips per the Plan B / B' / C precedent.
 
+## 2026-04-30 — [DEVIATION Task 111] Deferred — cross-fn discharge propagation requires shared state, not a per-call mechanism
+
+**Context.** Plan D Task 111 calls for replacing the `LAST_TERMINAL_TAG` / `LAST_TERMINAL_VALUE` thread-local out-channel with a "packed (value, tag) Cranelift multi-return on `sigil_run_loop`." The plan body's framing assumed the TLS was a per-call out-channel that could be inlined into the call return. Three implementation attempts (PR #50) demonstrated this framing is **structurally insufficient**: the TLS's actual semantic role is **cross-function shared state**, not per-call return marshalling.
+
+**Three attempts, three identical failures.** PR #50:
+
+| Attempt | Commit | Mechanism | Failure |
+|---|---|---|---|
+| 1 | `4dfdbc7` | Cranelift `[I64, I64]` register-pair multi-return + Rust `#[repr(C)] struct { u64, u64 }` return | 10 e2e tests fail with discharge-class shapes |
+| 2 | `670f7a1` | Out-pointer ABI (`*mut TerminalResult` arg) + Cranelift `Variable` per-fn last-terminal vars | Same 10 tests fail with same shapes |
+| 3 | `5e2686e` | Out-pointer ABI + per-fn `StackSlot` (explicit `stack_store`/`stack_load` memory ops) | Same 10 tests fail with same shapes |
+
+**Diagnostic confirmation.** A diagnostic eprintln commit (`4086307`) on PR #50 surfaced the actual run_loop terminal writes per-test. For `catch_example_recovers_with_42`:
+
+```
+[DEBUG run_loop] DISCHARGED bypass: writing (value=42, tag=2) to out=0x7ffc6c12aac8
+[DEBUG run_loop] top-level terminal: writing (value=0, tag=0) to out=0x7ffc6c12ab00
+```
+
+The DISCHARGED bypass fires correctly with `(value=42, tag=2)`. The bug: the bypass writes to a stack slot at `0x...aac8` (in `risky`'s frame), but the user-main `handle` expression's exit reads a DIFFERENT slot at `0x...ab00` (in `user-main`'s frame, written later by the unrelated `IO.println` run_loop). Per-fn stack slots don't share across function frames.
+
+**Root cause is architectural.**
+
+1. `risky` has `UserFnAbi::Sync` (its body shape — `let result = raise(...); result + input` — doesn't match any of the three Cps body classifiers; the let-RHS is a fn call, not a `Perform`).
+2. `risky`'s body sequentially lowers: `lower_call(raise)` → CPS-callee synch wrap → `emit_run_loop_and_capture` allocates **risky's** `last_terminal_slot` and writes (42, DISCHARGED) to it.
+3. `risky`'s body then continues: `result = 42; result + input = 49`. `risky` returns 49 via Sync ABI.
+4. `user-main`'s `lower_call(risky)` takes the Sync path (direct call, no run_loop drive); body_val = 49.
+5. `user-main`'s handle exit reads **user-main's** slot — never written to by risky's discharge — sees `(0, DONE)` → normal path → recovered = 49.
+
+The OLD TLS approach worked because TLS is **thread-global** — risky's run_loop wrote TLS, user-main's handle read TLS, same storage. Per-fn stack slots, register-pair multi-returns, and Cranelift Variables all fail because they're scoped to the immediate caller, not visible across the synchronous call chain.
+
+**Why accepted (deferral over re-attempt).** Closing the cross-fn visibility gap requires either:
+
+- (C) Threading `*mut TerminalResult` through every function ABI as an extra parameter — high-cost refactor, every fn signature gets +1 arg, every call site threads the pointer.
+- (D) Reintroducing a Rust `thread_local` for the (value, tag) accessed via FFI helpers — functionally identical to the OLD design, defeats the plan body's stated goal of "no runtime globals."
+- A small architectural-doc framework that lets the discharge tag PIGGYBACK on the synchronous Sync-ABI call's existing return value without a separate channel — speculative, requires Sync ABI extension.
+
+Plan D's hard rule "Do not introduce dependencies beyond the existing crate set" and the per-task PR cadence rule both argue against landing such a refactor as a sub-task of Task 111. The motivation for Task 111 (forward-compatibility with Task 117 first-class continuations) does not require the lift to land BEFORE Task 117 — Task 117 can be designed against either the OLD TLS or a future (C/D) shape, and the choice can be informed by Task 117's actual ABI requirements rather than guessed in advance.
+
+**Failure mode.** None at the user-visible surface — the OLD TLS approach continues to work for all e2e tests. The internal motivation for cleanup remains valid but is now scoped as a future task rather than a Plan D blocker.
+
+**Closure path.** Two orthogonal paths are now open:
+
+1. **Defer to a future task that lands alongside Task 117 first-class-k.** Task 117's continuation-as-value lift will modify the same surface area (run_loop terminal channel); a co-shipped lift can use whatever ABI Task 117 settles on without introducing a separate Plan D-internal pivot point. **This is the recommended path.**
+2. **Re-scope to option (C) — thread `*mut TerminalResult` through every fn ABI** — as its own multi-PR architectural slice (comparable to Plan B' B.3 TypeExpr::Fn lift). Out of scope for Plan D unless explicitly authorized.
+
+Plan B' Stage-6.8-followup carryover #1 (TLS → packed multi-return) status updates to "deferred to Task 117 follow-up or a future architectural slice; closure path described in `[DEVIATION Task 111]`."
+
+**Implementing commit.** [HEAD] (this entry).
+
+**Reverted commits (do NOT cherry-pick):** `4dfdbc7`, `670f7a1`, `5e2686e`, `4086307` — all on the abandoned `plan-d-task-111` branch (closed without merge per PR #50). The branch is preserved for the diagnostic record.
+
 ## 2026-04-30 — [DEVIATION Stage 10.5.5] `#[ignore]` survey count diverges from plan estimate (3 actual vs ~12 expected)
 
 **Context.** Plan D's Stage 10.5.5 instructs the executor to pre-survey the `#[ignore]` inventory and partition into (a) Plan D closure-targets, (b) non-architectural test-infrastructure gaps, and (c) other v2-pending tests. The plan body includes the estimate "Expected total: ~12 ignored tests at plan start (verify on execution)."

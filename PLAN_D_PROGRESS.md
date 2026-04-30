@@ -49,7 +49,7 @@ Plan B' Stage-6.8-followup carryover #2 (Sync shim emission gating) is out of Pl
 ## Stage 11 — Foundation lifts
 
 - Task 111 — TLS → packed multi-return for `sigil_run_loop` terminal (Plan B' carryover #1, PR #39 §2).
-  - status: todo
+  - status: **deferred** — see `[DEVIATION Task 111]`. Three implementation attempts on PR #50 demonstrated that the plan body's "register-pair multi-return" framing is structurally insufficient for the actual cross-fn discharge propagation requirement. Cross-fn visibility was the unstated semantic role of the OLD TLS; replacing it with any per-call mechanism (multi-return, out-pointer, per-fn stack slot, or Cranelift Variables) breaks the Sync-ABI call chain's discharge propagation. Closure path: defer to Task 117 first-class-k follow-up or a separate architectural slice. Plan B' carryover #1 stays open with revised closure scope.
 - Task 112 — Wrapper-fn-frame composition fix (closes `[DEVIATION Task 72]` constraint #3).
   - status: todo
 
