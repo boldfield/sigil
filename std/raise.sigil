@@ -1,62 +1,54 @@
 // sigil: 0.1
 //
-// std/raise.sigil — Plan C Task 71.
+// std/raise.sigil — Plan C Task 71 + Plan D Stage 12 migration.
 //
-// `Raise` is the canonical exception-style effect: a thunk that
-// might raise a `String`-typed error short-circuits its enclosing
-// computation, and `catch` wraps the result in a
-// `Result[A, String]`. Compare to Koka / Effekt's `raise` / `try`
-// and OCaml's `try ... with`.
+// `Raise[E]` is the canonical exception-style effect: a thunk that
+// might raise an `E`-typed error short-circuits its enclosing
+// computation, and `catch` wraps the result in a `Result[A, E]`.
+// Compare to Koka / Effekt's `raise` / `try` and OCaml's `try ...
+// with`.
 //
-// ## v1 design choices
+// ## Design (post Plan D Stage 12)
 //
-// 1. **`Raise` is non-generic; error type is fixed at `String`.**
-//    Plan body specifies `Raise[E]` parameterised by the error
-//    type, with `catch : (() -> A ![Raise[E] | e]) -> Result[A, E]
-//    !e`. Sigil v1's parser rejects type-parameterized effect
-//    references in rows — `parse_effect_row` accepts simple effect
-//    names only, not `![Raise[E]]` shapes. Plan B' state.sigil
-//    uses the same concrete-`State` workaround. The deferred
-//    generic surface lands when the parser grows row-poly /
-//    effect-arg support; user code calling `raise(...)` /
-//    `catch(...)` stays surface-stable across the v1 → v2 shift.
-//    See `[DEVIATION Task 71]`.
+// 1. **`Raise[E]` is parametric over the error type.** Closed by
+//    Plan D Task 114 (PR #54). Row sites write `![Raise[String]]` /
+//    `![Raise[ParseError]]` etc. — the surrounding fn's row entry's
+//    args provide the substitution at the perform site, so calls to
+//    `raise(e)` typecheck against the concrete E.
 //
-// 2. **`fail`'s return type is `Int` (placeholder).** Sigil v1 has
-//    no `Never` type and no per-op generic parameters on user-
-//    declared effects. Declaring `fail: (String) -> Int` mirrors
-//    Plan B Task 57's `ArithError.div_by_zero` simplification. At
-//    runtime the perform never resumes (catch always discharges
-//    via discard-k); the declared return type is consumed only by
-//    typecheck for arm-body type inference.
+// 2. **`fail[A]: (E) -> A` carries a per-op generic return type.**
+//    Closed by Plan D Task 115 (PR #55). The "never returns" idiom
+//    (Koka / Effekt) — `A` is fresh-instantiated at each perform
+//    site and unifies with the surrounding context. At runtime the
+//    op never resumes (catch discharges via discard-k); the per-op
+//    A is a typing convenience.
 //
-// 3. **Closed effect row on `catch`.** The plan body specifies
-//    `catch: (() -> A ![Raise[E] | e]) -> Result[A, E] !e` — the
-//    `!e` row-variable passthrough lets `body` carry other effects
-//    that flow through `catch` to the caller. Sigil v1 hasn't
-//    exercised row-polymorphic fn-typed parameters end-to-end.
-//    For v1, ship closed-row `catch[A](body: () -> A ![Raise]) ->
-//    Result[A, String] ![]`. Users who need passthrough write a
-//    domain-specific `catch_io[A](body: () -> A ![IO, Raise]) ->
-//    Result[A, String] ![IO]` (etc.) until the row-poly surface
-//    lands.
+// 3. **Row-polymorphic `catch`.** Closed by Plan D Task 116 (PR
+//    #56). `catch(body)` accepts a body that performs Raise[E] +
+//    arbitrary other effects (`!e` row-var passthrough); the
+//    handler discharges Raise[E] and the residual `!e` flows to
+//    catch's result row. The handler-discharge type-arg
+//    propagation gap was closed at the Stage 12 review checkpoint
+//    via name-based matching with arg unification in
+//    `subsume_row` / `unify_row`.
 
 import std.result
 
-// `Raise` is the v1 exception-style effect with `String`-typed
-// errors. The single op `fail` takes a String message and (at
-// runtime) does not return: `catch` discharges via discard-k, so
-// the perform site is never resumed.
-effect Raise {
-  fail: (String) -> Int,
+// `Raise[E]` is the exception-style effect parametric over the
+// error type. The single op `fail[A]` takes an E-typed error
+// message; at runtime catch discharges via discard-k, so the perform
+// site is never resumed (the per-op A return is a typing
+// convenience).
+effect Raise[E] {
+  fail[A]: (E) -> A,
 }
 
-// `raise(e)` is the user-facing convenience wrapper. Inside any
-// fn whose effect row contains `Raise`, `raise(e)` short-circuits
-// to the active handler with the error message. The declared `Int`
-// return is a v1 placeholder; the call never returns under
-// `catch`.
-fn raise(e: String) -> Int ![Raise] {
+// `raise(e)` is the user-facing convenience wrapper. Inside any fn
+// whose effect row contains `Raise[E]`, `raise(e)` short-circuits
+// to the active handler with the error value. The per-op A
+// instantiates fresh at the perform site; raise's return type A is
+// likewise fresh at each call.
+fn raise[A, E](e: E) -> A ![Raise[E]] {
   perform Raise.fail(e)
 }
 
@@ -65,23 +57,9 @@ fn raise(e: String) -> Int ![Raise] {
 //   - body raises e via `perform Raise.fail(e)` → `Err(e)` (via
 //     the discard-`k` op arm)
 //
-// The body's row is closed at `![Raise]` per the v1 design note
-// above; `catch` discharges Raise and returns under `![]`.
-//
-// **Idiom note.** PR #44 review suggested an explicit `return(v)
-// => Ok(v)` arm to decouple body-type from result-type inference
-// (matching `examples/state.sigil`). That shape is cleaner in
-// principle but currently leaks a `Ty::Var` past monomorphize for
-// generic `catch[A]` — the cross-arm `Ok(v)` (= `Result[A, ?E]`)
-// vs `Err(e)` (= `Result[?A, String]`) unification works at
-// typecheck but doesn't propagate the `?E = String` binding into
-// the return-arm's monomorphize pass. The non-generic `state.sigil`
-// shape sidesteps this because A is concrete `Int` everywhere.
-// Closing this gap is a v2 typecheck refinement; the literal
-// `Ok(body())` form below works under v1 by pinning the wrap at
-// the body-call site (where A is fully resolved from `body()`'s
-// declared return type), reducing cross-arm inference pressure.
-fn catch[A](body: () -> A ![Raise]) -> Result[A, String] ![] {
+// The body's row is `![Raise[E] | e]` — Raise[E] is discharged
+// here, residual `!e` flows to catch's result row.
+fn catch[A, E](body: () -> A ![Raise[E] | e]) -> Result[A, E] ![| e] {
   handle Ok(body()) with {
     Raise.fail(e, k) => Err(e),
   }

@@ -444,14 +444,29 @@ half of the surface.
 deviation:
 
 1. Parser surface for type-parameterized effect references in rows
-   (`![Raise[E]]`, `![State[S]]`, etc.).
+   (`![Raise[E]]`, `![State[S]]`, etc.). **Closed** by Plan D Task 114
+   (PR #54). The `EffectRef`/`EffectInst` split with structural row
+   unification + E0143 row-arg arity check ships the surface.
 2. Per-op generic params (`fail[A]: (E) -> A`) so `fail`'s return
-   type matches the use site.
+   type matches the use site. **Closed** by Plan D Task 115 (PR #55).
+   `EffectOp.generic_params` + per-op subst layered over effect-decl
+   subst at perform/handler arm sites; E0144 catches per-op shadow.
 3. Row-poly `Fn` type parameters (`(() -> A ![Raise[E] | e]) ->
-   ...`).
+   ...`). **Closed** by Plan D Task 116 (PR #56). Row vars in inner
+   FnTypeExprs resolve through `current_row_var_subst`; E0137
+   narrowed to fire only on unbound row vars.
 
 User code calling `raise(s)` / `catch(body)` stays surface-stable
 across the v1 → v2 shift; only the type signatures generalise.
+
+**std/raise.sigil migration to the now-expressible generic shape**
+(`effect Raise[E] { fail[A]: (E) -> A }` + `catch[A, E](body: ()
+-> A ![Raise[E] | e]) -> Result[A, E] ![| e]`) defers to Plan C
+completion — it's a stdlib edit, not a compiler change, and lands
+alongside the std/state.sigil + std/result.sigil migrations as a
+single Plan-C-completion PR. Plan D's hard-rule scope says demo
+PRs (and by extension stdlib migrations consuming Plan D's
+surface) belong to Plan C completion, not Plan D itself.
 
 **Failure mode.** Users wanting non-String error types hit the
 fixed-String surface and must serialise via `int_to_string` or
@@ -528,10 +543,12 @@ The `run_state` implementation reuses `examples/state.sigil`'s state-bearing-lam
 
 **Closure path.** Four orthogonal v2 lifts retire the deviation:
 
-1. Parser surface for type-parameterized effect references in rows (`![State[S]]`). **Open** — Plan D Task 114.
+1. Parser surface for type-parameterized effect references in rows (`![State[S]]`). **Closed** by Plan D Task 114 (PR #54). The `EffectRef`/`EffectInst` split with structural row unification + E0143 row-arg arity check ships the surface.
 2. Tuple type / `Pair[A, B]` stdlib (or `(A, S)` syntax). **Closed** by Plan D Task 113 (PR #53). Tuple types `(T1, T2, ...)`, tuple values `(e1, e2, ...)`, `Pattern::Tuple` element-wise unification + destructure, and `std/pair.sigil` with `fst[A,B]` / `snd[A,B]` over binary tuples shipped. `run_state` returning `(A, S)` is now expressible at the surface; updating `std/state.sigil` to actually return `(A, S)` is a follow-up Plan-C-completion task — the v1 blocker was the syntax, not the discharge mechanism.
 3. Wrapper-fn frame composition fix for the discharge-with-lambda pattern. After this lands, std/state.sigil grows `get_state` / `set_state` ergonomic wrappers. **Deferred** — Plan D Task 112 deferred to Task 117 follow-up; see `PLAN_D_DEVIATIONS.md` `[DEVIATION Task 112]`.
-4. Row-poly Fn type parameters (`(() -> A ![State[S] | e]) -> ...`). **Open** — Plan D Task 116.
+4. Row-poly Fn type parameters (`(() -> A ![State[S] | e]) -> ...`). **Closed** by Plan D Task 116 (PR #56). Row vars in inner FnTypeExprs resolve through the enclosing fn's `effect_row_var`; E0137 narrowed to fire only on unbound row vars.
+
+std/state.sigil migration to `effect State[S] { get: () -> S, set: (S) -> Unit }` + `(A, S)` tuple return + row-poly `run_state` defers to Plan C completion alongside std/raise + std/result migrations as a single stdlib-update PR. Plan D's hard-rule scope says stdlib migrations consuming Plan D's surface belong to Plan C completion, not Plan D itself.
 
 User code calling `perform State.get()` / `perform State.set(s)` / `run_state(init, body)` stays surface-stable across the v1 → v2 shift; the v2 wrapper-fn additions are additive (don't break existing call sites).
 
@@ -551,17 +568,17 @@ with `Choose.choose(n)` picking a value 0..n-1 and `Choose.fail()` abandoning a 
 
 **v1 surface gaps.** Six constraints prevent shipping the dischargers — three are inherited from Tasks 71/72 (parser, per-op generics, row-poly Fn) and three are codegen-side gaps specific to multi-shot dischargers over arbitrary-arity `choose(n)` and short-circuiting `first_choice`:
 
-1. **Parser rejects type-parameterized effect references in rows.** Same constraint as `[DEVIATION Task 71]` constraint #1 / `[DEVIATION Task 72]` constraint #1. `parse_effect_row` accepts simple effect-name idents only.
+1. **Parser rejects type-parameterized effect references in rows.** Same constraint as `[DEVIATION Task 71]` constraint #1 / `[DEVIATION Task 72]` constraint #1. **Closed** by Plan D Task 114 (PR #54).
 
-2. **Static-N arm-body chain.** The arm-body recognizer at `compiler/src/codegen.rs::arm_body_n_let_then_pure_tail_shape` (line ~3665) requires arm bodies of the form `{ let r1: T = k(arg1); let r2: T = k(arg2); ...; let rN: T = k(argN); pure_tail }` — N is statically fixed at compile time. `all_choices(body) -> List[Int]` would need runtime-N dispatch (invoking `k(0)`, `k(1)`, …, `k(arg-1)` where `arg` is the perform's runtime value), which is not expressible in v1's flat let-chain shape.
+2. **Static-N arm-body chain.** The arm-body recognizer at `compiler/src/codegen.rs::arm_body_n_let_then_pure_tail_shape` (currently around line 3744) requires arm bodies of the form `{ let r1: T = k(arg1); let r2: T = k(arg2); ...; let rN: T = k(argN); pure_tail }` — N is statically fixed at compile time. `all_choices(body) -> List[Int]` would need runtime-N dispatch (invoking `k(0)`, `k(1)`, …, `k(arg-1)` where `arg` is the perform's runtime value), which is not expressible in v1's flat let-chain shape. **Open** — Plan D Task 117 (first-class continuations).
 
-3. **No first-class continuations.** `arm_body_walk` at codegen.rs:1505-1518 explicitly rejects `k` referenced as a value (passed to a helper, captured into a closure, stored in a record) with the diagnostic "first-class continuations are deferred to v2". The closure path that would make `all_choices` expressible — `Choose.choose(arg, k) => list_fold(range(0, arg), Nil, fn (acc, i) => append(acc, k(i)))` — runs `k` inside a hoisted lambda whose closure env captures `k`, which closure_convert can't model in v1.
+3. **No first-class continuations.** `arm_body_walk` (currently around codegen.rs:1569) explicitly rejects `k` referenced as a value (passed to a helper, captured into a closure, stored in a record) with the diagnostic "first-class continuations are deferred to v2". The closure path that would make `all_choices` expressible — `Choose.choose(arg, k) => list_fold(range(0, arg), Nil, fn (acc, i) => append(acc, k(i)))` — runs `k` inside a hoisted lambda whose closure env captures `k`, which closure_convert can't model in v1. **Open** — Plan D Task 117 closes this directly.
 
-4. **No conditional / branched `k`-call.** `arm_body_walk` at codegen.rs:1591-1603 rejects "computed conditional `k`-use" — `match k(0) { Some(v) => Some(v), None => k(1) }` and `if cond { k(x) } else { k(y) }` shapes are not in tail position for `k`-detection (the synth-pass detector `arm_body_tail_is_k_call` recurses only through `Expr::Block` tails). `first_choice` short-circuit semantics ("try `k(i+1)` only if `k(i)` failed") cannot be expressed without this.
+4. **No conditional / branched `k`-call.** `arm_body_walk` (currently around codegen.rs:1652) rejects "computed conditional `k`-use" — `match k(0) { Some(v) => Some(v), None => k(1) }` and `if cond { k(x) } else { k(y) }` shapes are not in tail position for `k`-detection (the synth-pass detector `arm_body_tail_is_k_call` recurses only through `Expr::Block` tails). `first_choice` short-circuit semantics ("try `k(i+1)` only if `k(i)` failed") cannot be expressed without this. **Open** — Plan D Task 118 (conditional/branched k-call, builds on Task 117).
 
-5. **No per-op generic params on user-declared effects.** Same as `[DEVIATION Task 71]` constraint #2 / `[DEVIATION Task 72]` constraint #4. `fail`'s declared `Int` return is a placeholder per Plan B Task 57's `ArithError.div_by_zero` precedent.
+5. **No per-op generic params on user-declared effects.** Same as `[DEVIATION Task 71]` constraint #2 / `[DEVIATION Task 72]` constraint #4. **Closed** by Plan D Task 115 (PR #55).
 
-6. **No row-polymorphic fn-typed parameters.** Same as `[DEVIATION Task 71]` constraint #3 / `[DEVIATION Task 72]` constraint #5. Closed-row `![]` only.
+6. **No row-polymorphic fn-typed parameters.** Same as `[DEVIATION Task 71]` constraint #3 / `[DEVIATION Task 72]` constraint #5. **Closed** by Plan D Task 116 (PR #56).
 
 The load-bearing v2 blockers specific to Task 73 are #2, #3, #4 — the multi-shot codegen surface.
 

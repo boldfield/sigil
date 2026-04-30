@@ -35,7 +35,7 @@
 
 import std.raise
 
-fn risky(input: Int) -> Int ![Raise] {
+fn risky(input: Int) -> Int ![Raise[String]] {
   let result: Int = raise("attempt");
   result + input
 }

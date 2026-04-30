@@ -267,3 +267,64 @@ Task 114 had a deferred gap: at `perform Raise.fail("wrong type")` under `![Rais
 **Closure path.** Stage 12 review checkpoint — std/raise.sigil + std/state.sigil + std/result.sigil migration to use the now-expressible generic shapes; closure-path edits to `[DEVIATION Task 71]` constraint #2 (`fail`'s concrete-Int return placeholder) and `[DEVIATION Task 72]` constraint #1 (parser surface for `![State[S]]`).
 
 **Implementing commit(s).** PR #55 commits across `plan-d-task-115` branch.
+
+## 2026-04-30 — [DEVIATION Stage 12 review] Sign-off + handler-discharge type-arg propagation gap
+
+**Context.** Plan D Stage 12 ships four type-system surface lifts (Tasks 113 tuples, 114 type-parameterized effect rows, 115 per-op generic params, 116 row-polymorphic Fn parameters). Per the plan body, the Stage 12 review checkpoint requires human review of: (1) AST shape consistency, (2) diagnostic quality, (3) closure-path edits to `[DEVIATION Task 71/72]`, (4) stdlib migration. This entry records sign-off across all four items, plus surfaces a deferred gap discovered during the stdlib-migration attempt.
+
+**Item 1 — AST shape consistency.** ✅ `EffectRef { name, args, span }` (AST) / `EffectInst { name, args }` (Ty) mirror Plan A3's `TypeExpr::Tuple` / `Ty::Tuple` split — spans on the AST side, span-free on the Ty side. `EffectOp.generic_params: Vec<GenericParam>` parallels FnDecl's existing field. `FnTypeExpr.effect_row_var` (pre-existing Plan B' Stage 6.8 Task 103) gained the binding-side wiring through `current_row_var_subst` in Task 116. Generic-param scoping: per-op generics layer on top of effect-decl generics with E0144 shadow check.
+
+**Item 2 — Diagnostic quality.** ✅ 5 codes:
+- **E0117** (tuple-pattern arity, Task 113) — span at the pattern.
+- **E0140** (duplicate handler arm, pre-existing Plan B Task 54) — span at the second arm. Task 114 mistakenly used E0140 for row-arg arity (collision); Task 115 renamed that to E0143. Catalog entry for E0143 documents the rename.
+- **E0143** (row-arg arity, Task 114, code introduced by Task 115's rename) — span at the row entry.
+- **E0144** (per-op generic shadowing effect-decl generic, Task 115) — span at the per-op generic-param decl.
+- **E0137** (narrowed by Task 116 from "any row-var-bearing fn-type" to "unbound row var only"; pre-existing code) — span at the unbound row-var token. Fix-suggestion renders valid Sigil syntax.
+
+**Item 3 — Closure-path edits.** ✅
+- `[DEVIATION Task 71]` (PLAN_C_DEVIATIONS.md) — constraints #1, #2, #3 marked **Closed** by Plan D Tasks 114, 115, 116.
+- `[DEVIATION Task 72]` — constraints #1, #2, #4, #5 **Closed** by Tasks 114, 113, 115, 116. Constraint #3 (wrapper-fn-frame) stays **Deferred** per Plan D Task 112; closure path is Task 117 follow-up.
+- `[DEVIATION Task 73]` — constraints #1, #5, #6 **Closed**; #2, #3, #4 (multi-shot codegen) stay open, addressed by Tasks 117/118.
+
+**Item 4 — Stdlib migration: std/raise.sigil shipped; std/state + std/result deferred to Plan C completion.**
+
+The first commit of this PR took the conservative interpretation of the plan-overview separation and deferred the entire stdlib migration. R1 reviewer pushed back: *"you didn't include the stdlib migration"*. R2 review accepted std/raise as in-scope (the plan body asks "Are stdlibs updated to use the now-expressible generic shapes?" as a Stage 12 review criterion); the migration ships in this PR. std/state + std/result remain deferred — both have additional shape considerations (state's discharge-with-lambda pattern under generic E + tuple return; result's existing surface needs only a verification pass not a migration).
+
+**What shipped in this PR for std/raise**:
+
+- `effect Raise[E] { fail[A]: (E) -> A }` — generic over error type E (Plan D Task 114) + per-op return-type generic A (Plan D Task 115).
+- `raise[A, E](e: E) -> A ![Raise[E]]` — fully polymorphic.
+- `catch[A, E](body: () -> A ![Raise[E] | e]) -> Result[A, E] ![| e]` — row-polymorphic via the outer fn's `effect_row_var` (Plan D Task 116).
+- 5 e2e tests + 3 typecheck tests updated from `![Raise]` to `![Raise[String]]`.
+- 2 example files migrated (`examples/catch.sigil`, `examples/interpreter.sigil`).
+- `raise_int_return_in_string_returning_fn_fires_e0044_v1_gap_pin` inverted to `_typechecks_post_task_115` — the v1 gap is closed.
+
+**Three architectural gaps surfaced + fixed during the migration:**
+
+1. **Handler-discharge type-arg propagation** (initially documented as deferred, now fixed). `Tc::check_handle` pushed bare-name `EffectInst::bare(e)` into body_row at the discharge site, losing the discharged effect's instantiation. **Fix**: at the discharge site, look up the effect-decl's `generic_params` and use the active handler subst (`effect_substs[name]`) to recover the args. The handler arm's existing op-typing already allocates these substs; reusing them ensures the body row's `Raise[E_var]` matches body's expected `Raise[E_body_var]` via subsume_row's arg unification. Falls back to bare-name (no args) when the effect-decl declares no generic_params — preserves pre-Stage-12 behavior for non-generic effects (`IO`, `Mem`).
+
+2. **`Tc::rename_ty` Ty::Fn arm didn't rename Ty::Var ids inside EffectInst args.** At scheme instantiation, a row carrying `Raise[E]` left `Var(E_decl_id)` unrenamed; the fresh `Var(E_fresh)` from arg unification was disconnected from the row. **Fix**: rename_ty now walks each EffectInst's args with the same ty_map.
+
+3. **`Subst::apply_ty` and `Subst::apply_row` cloned EffectInst args without applying the substitution.** Symmetric with #2 but at substitution-application sites instead of scheme-instantiation sites. Without this, `apply_ty(Ty::Fn(.. effects: [Raise[Var(N)]] ..))` returned the row with `Var(N)` still unbound even after the unifier bound it elsewhere. **Fix**: both sites now walk EffectInst args via `apply_ty_inner`.
+
+**`unify_row` / `subsume_row` rewrite — name-based matching with arg unification.**
+
+The structural EffectInst-equality diff (Task 114) was correct for concrete-args rows but wrong for Ty::Var-bearing rows: `Raise[Var(N)]` and `Raise[Concrete]` should unify N := Concrete, not error out. The rewrite matches by name first, then unifies args pairwise via `unify_ty`. R3 reviewer flagged that the original silent-skip-on-arity-mismatch was a soundness hole; fixed: arg-arity mismatch now fires E0042 (subsume_row) / E0128 (unify_row) with explicit arity-mismatch messages.
+
+`unify_row` and `subsume_row` thread `unify_ty`'s bool return through to the overall return value — a false from arg-unification (E0044) now fails the row check, not just pushes the error and returns true.
+
+**Diagnostic shape change**: `cross_fn_row_with_distinct_type_args` (Raise[Int] caller calling Raise[String] callee) previously fired E0042 ("row mismatch"); now fires E0044 ("Int vs String type mismatch") at the arg-unification step. The new diagnostic is more precise (points at which arg type is wrong rather than just "row mismatch"). E0042 catalog entry kept as-is — it still fires for the missing-effect case and the new arg-arity-mismatch case at subsume_row.
+
+**Stage 12 sign-off**. ✅ Tasks 113/114/115/116 + closure-path edits + std/raise migration + handler-discharge / scheme-rename / subst-application gap fixes land. std/state + std/result migrations remain deferred to Plan C completion (state needs the lambda-discharge under generic E exercise; result needs only verification).
+
+**Estimated cost reconciliation** (R2 reviewer noted "1-2 sites" was an underestimate). Actual: 4 sites + ~150 lines:
+- `apply_ty_inner` Ty::Fn arm — args walking.
+- `apply_row_inner` — args walking on r.effects + resolved-row chain.
+- `rename_ty` Ty::Fn arm — args renaming.
+- `unify_row` / `subsume_row` — name-match-with-arg-unify rewrite.
+- `check_handle` — discharge-site EffectInst-with-args push.
+
+The original 1-2 sites estimate was based on a "discharge site only" closure path; the actual fix needed substitution / renaming / row-matching to compose correctly. This pattern (changes at multiple typing layers had to land together) recurred across Tasks 114/115/116 R1 reviews; the cost-estimation lesson is real.
+
+**Implementing commit(s).** This entry + Tasks 71/72/73 closure-path updates in PLAN_C_DEVIATIONS.md + std/raise.sigil migration + handler-discharge/scheme-rename/subst-application fixes. PR `plan-d-stage-12-checkpoint`.
+
