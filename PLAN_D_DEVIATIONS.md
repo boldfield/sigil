@@ -195,3 +195,38 @@ The perform-side classifier rejected helper bodies producing tuple values as not
 - Finding 2 — structurally closed for user-fn surface; synth-fn surface gap awaits Tasks 114–116 if exercised.
 
 **Implementing commit.** `[HEAD]` (this entry + the four code fixes).
+
+## 2026-04-30 — [DEVIATION Task 114] EffectRef/EffectInst split mirrors Tuple; perform-site E-substitution deferred to Task 115
+
+**Context.** Plan D Task 114 introduces type-parameterized effect rows. The plan body specified one structural addition — `RowEntry::Effect { name, args, span }` at the AST — but the practical migration extended into a parallel Ty-level type for clean unification + display.
+
+**Architectural shape.**
+
+- **AST level** — `ast::EffectRef { name: String, args: Vec<TypeExpr>, span: Span }` carries source-attributed effect references. Three AST sites flip to `Vec<EffectRef>`: `FnDecl.effects`, `FnTypeExpr.effects`, `Expr::Lambda.effects`.
+- **Ty level** — `typecheck::EffectInst { name: String, args: Vec<Ty> }` (no span — Ty-level structures are span-free across the codebase). `FnSig.effects` and `Row.effects` flip to `Vec<EffectInst>`.
+
+This mirrors the Plan A3 / Plan D Task 113 pattern: `TypeExpr::Tuple { elems, span }` (AST) parallels `Ty::Tuple(Vec<Ty>)` (Ty). The boundary helpers `effect_refs_to_insts` / `insts_to_effect_refs` translate at AST↔Ty crossings.
+
+**Why structural EffectInst over a flat names-list with parallel args.** The pre-114 surface stored rows as `Vec<String>` and matched on string-set diff via `BTreeSet<&String>`. To support `Raise[Int]` distinctly from `Raise[String]`, structural matching is required — two rows sharing a name but instantiating differently must compare unequal. Carrying args structurally on a single `EffectInst` makes `Vec` containment via `iter().any(|e| e == target)` a one-pass diff; alternative shapes (parallel `Vec<Vec<Ty>>` for args, or external arg-table keyed by name) tangle invariants and make `Row::canonicalise` ambiguous.
+
+**`Ord` not derived on `EffectInst`.** `Ty` itself has no total order (Plan B' decision: equality is well-defined but a total order would require choosing among many `FnSig` shapes). `Row::canonicalise` sorts by `name` first (the dominant disambiguator; bare-name effects like `IO`, `Mem` are uniquely identified by name) then dedups by full structural equality — distinct instantiations of the same effect-decl name remain in the row.
+
+**Perform-site E-substitution gap (deferred).** Today, `perform Raise.fail("oops")` under `![Raise[String]]` does NOT thread `E := String` into `fail`'s op-arg unification at the perform site. The op signatures are checked under the effect-decl's local `generic_subst` (built at the effect-decl pre-pass via `fresh_generic_subst`), so for now perform-site arg typing succeeds at op-level `Ty::Var` without the row-site substitution.
+
+**Why deferred.** Threading the row-site type-args into the op-call substitution is intertwined with Task 115 (per-op generic params: `fail[A]: (E) -> A`) — once `fail` itself can be generic per-call, the substitution machinery at the perform site has to handle BOTH effect-decl-level generics AND per-op generics in one step. Doing the effect-decl-only substitution now and re-doing it for per-op generics later would double-touch the same call paths. Task 115 closes both at once.
+
+**std/raise.sigil migration to `effect Raise[E] { fail: (E) -> A }`** also defers to the Stage 12 review checkpoint for the same reason — the v2 shape relies on per-op generics for fail's `A` return type. Today's std/raise.sigil ships with concrete-String per `[DEVIATION Task 71]`; the migration lands as a Stage 12 review item once Tasks 114 + 115 + 116 are all shipped.
+
+**E0140 arity check.** Three message shapes:
+1. *Non-generic effect-decl referenced with args*: "effect `IO` is not generic — drop the type-arg list to write `IO` instead of `IO[Int]`".
+2. *Generic effect-decl referenced bare*: "effect `Raise` is generic over [E] — write `Raise[E]` with explicit type arguments (bare `Raise` refers to the un-instantiated declaration)".
+3. *Arity divergence*: "effect `Raise` is declared with 1 type parameter(s) [E], but 2 argument(s) were provided in the row site".
+
+**Failure mode.** None at the user-visible surface for non-generic effects. Generic effect-decls are now expressible at row sites; the runtime smoke gate (`std/raise.sigil` end-to-end) defers to Task 115 + Stage 12 review per the closure path above.
+
+**Closure path.**
+
+- **Stage 12 review checkpoint** — std/raise.sigil migration; std/state.sigil tuple-return + generic E migration; std/result.sigil generic-error update.
+- **Task 115** — per-op generic params close the perform-site substitution gap.
+
+**Implementing commit(s).** PR commits across `plan-d-task-114` branch.

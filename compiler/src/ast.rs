@@ -65,7 +65,7 @@ pub struct FnDecl {
     pub generic_params: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub return_type: TypeExpr,
-    pub effects: Vec<String>,
+    pub effects: Vec<EffectRef>,
     /// Plan B Task 47 — explicit row variable in the effect row,
     /// `![IO | e]` introduces row variable `e`. `None` means a
     /// closed row (default before Plan B). Semantic consumption (row
@@ -92,6 +92,29 @@ pub struct GenericParam {
 #[derive(Clone, Debug)]
 pub struct RowVar {
     pub name: String,
+    pub span: Span,
+}
+
+/// Plan D Task 114 — effect-row entry: a reference to an effect at a
+/// row site (`![Raise]`, `![Raise[E]]`, etc.). The pre-Task-114 row
+/// representation was `Vec<String>` over bare effect names; Task 114
+/// extends it to a structured shape so type-parameterized effects
+/// can be referenced in rows. `args.is_empty()` is the bare-name
+/// case (e.g., `IO`, `ArithError`); non-empty `args` represents a
+/// type-parameterized reference (e.g., `Raise[E]`, `State[Int]`).
+///
+/// Each effect-decl carries `generic_params: Vec<GenericParam>`; a
+/// row-site `EffectRef` must match the decl's arity post-parse, with
+/// element-wise type-arg substitution via the surrounding fn's
+/// generic-param scope. Bare-name refs to a generic effect-decl are
+/// rejected at typecheck (E0140 — new code introduced by Task 114).
+///
+/// Spans cover the entire reference: for `Raise[E]` the span runs
+/// from the `R` of `Raise` through the closing `]` of the arg list.
+#[derive(Clone, Debug)]
+pub struct EffectRef {
+    pub name: String,
+    pub args: Vec<TypeExpr>,
     pub span: Span,
 }
 
@@ -152,7 +175,7 @@ pub enum TypeExpr {
 pub struct FnTypeExpr {
     pub params: Vec<TypeExpr>,
     pub ret: TypeExpr,
-    pub effects: Vec<String>,
+    pub effects: Vec<EffectRef>,
     pub effect_row_var: Option<RowVar>,
     pub span: Span,
 }
@@ -395,7 +418,7 @@ pub enum Expr {
     Lambda {
         params: Vec<Param>,
         return_type: TypeExpr,
-        effects: Vec<String>,
+        effects: Vec<EffectRef>,
         /// Plan B Task 47 — explicit row variable in the lambda's
         /// effect row. Mirrors `FnDecl::effect_row_var`.
         effect_row_var: Option<RowVar>,

@@ -296,12 +296,19 @@ pub fn canon_ty(ty: &Ty) -> String {
                 s.push_str("$Eff");
                 // Sort for stable mangling regardless of declaration
                 // order (parser keeps source order; effect rows are
-                // semantically a set).
-                let mut effs: Vec<&String> = sig.effects.iter().collect();
-                effs.sort();
+                // semantically a set). Plan D Task 114 — mangle as
+                // `Eff$<name>` (bare) or `Eff$<name>$<arg1>$<arg2>$...`
+                // (type-parameterized) so distinct instantiations of
+                // a generic effect-decl produce distinct symbols.
+                let mut effs: Vec<&crate::typecheck::EffectInst> = sig.effects.iter().collect();
+                effs.sort_by(|a, b| a.name.cmp(&b.name));
                 for e in effs {
                     s.push('$');
-                    s.push_str(e);
+                    s.push_str(&e.name);
+                    for a in &e.args {
+                        s.push('$');
+                        s.push_str(&canon_ty(a));
+                    }
                 }
             }
             s
@@ -1337,10 +1344,27 @@ fn ty_from_type_expr_under_subst(te: &TypeExpr, subst: &BTreeMap<String, Ty>) ->
                 .map(|p| ty_from_type_expr_under_subst(p, subst))
                 .collect();
             let ret = ty_from_type_expr_under_subst(&fty.ret, subst);
+            // Plan D Task 114 — substitute row-arg type vars
+            // through the active mono substitution.
+            let effects: Vec<crate::typecheck::EffectInst> = fty
+                .effects
+                .iter()
+                .map(|r| {
+                    let args = r
+                        .args
+                        .iter()
+                        .map(|t| ty_from_type_expr_under_subst(t, subst))
+                        .collect();
+                    crate::typecheck::EffectInst {
+                        name: r.name.clone(),
+                        args,
+                    }
+                })
+                .collect();
             Ty::Fn(Box::new(crate::typecheck::FnSig {
                 params,
                 ret,
-                effects: fty.effects.clone(),
+                effects,
                 effect_row_var: None,
             }))
         }
@@ -1421,7 +1445,7 @@ impl Substitution {
 /// For generic user-type instantiations, renders as `Named(mangled,
 /// span)` — the same name the type-cloning pass produces, so codegen
 /// looks up the concrete `TypeDecl` directly.
-fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
+pub(crate) fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
     match ty {
         Ty::Int => TypeExpr::Named("Int".to_string(), span.clone()),
         Ty::String => TypeExpr::Named("String".to_string(), span.clone()),
@@ -1458,7 +1482,7 @@ fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
             TypeExpr::Fn(Box::new(crate::ast::FnTypeExpr {
                 params,
                 ret,
-                effects: sig.effects.clone(),
+                effects: crate::typecheck::insts_to_effect_refs(&sig.effects, span),
                 effect_row_var: None,
                 span: span.clone(),
             }))
@@ -1493,10 +1517,23 @@ pub(crate) fn type_expr_to_ty(te: &TypeExpr) -> Ty {
         TypeExpr::Fn(fty) => {
             let params = fty.params.iter().map(type_expr_to_ty).collect();
             let ret = type_expr_to_ty(&fty.ret);
+            // Plan D Task 114 — type_expr_to_ty runs *after* monomorphize
+            // has substituted all generic params; rewrite_type_expr's
+            // outputs feed in here so effect-row args are already
+            // concrete (no Ty::Var residue). Build EffectInst directly
+            // from the AST's args via type_expr_to_ty.
+            let effects: Vec<crate::typecheck::EffectInst> = fty
+                .effects
+                .iter()
+                .map(|r| crate::typecheck::EffectInst {
+                    name: r.name.clone(),
+                    args: r.args.iter().map(type_expr_to_ty).collect(),
+                })
+                .collect();
             Ty::Fn(Box::new(crate::typecheck::FnSig {
                 params,
                 ret,
-                effects: fty.effects.clone(),
+                effects,
                 effect_row_var: None,
             }))
         }
@@ -1597,7 +1634,10 @@ mod tests {
         let t = Ty::Fn(Box::new(crate::typecheck::FnSig {
             params: vec![Ty::Int, Ty::Bool],
             ret: Ty::Unit,
-            effects: vec!["IO".to_string(), "Choose".to_string()],
+            effects: vec![
+                crate::typecheck::EffectInst::bare("IO"),
+                crate::typecheck::EffectInst::bare("Choose"),
+            ],
             effect_row_var: None,
         }));
         // Effects sort: Choose < IO.
@@ -1612,13 +1652,19 @@ mod tests {
         let a = Ty::Fn(Box::new(crate::typecheck::FnSig {
             params: vec![Ty::Int],
             ret: Ty::Int,
-            effects: vec!["IO".to_string(), "Choose".to_string()],
+            effects: vec![
+                crate::typecheck::EffectInst::bare("IO"),
+                crate::typecheck::EffectInst::bare("Choose"),
+            ],
             effect_row_var: None,
         }));
         let b = Ty::Fn(Box::new(crate::typecheck::FnSig {
             params: vec![Ty::Int],
             ret: Ty::Int,
-            effects: vec!["Choose".to_string(), "IO".to_string()],
+            effects: vec![
+                crate::typecheck::EffectInst::bare("Choose"),
+                crate::typecheck::EffectInst::bare("IO"),
+            ],
             effect_row_var: None,
         }));
         assert_eq!(canon_ty(&a), canon_ty(&b));

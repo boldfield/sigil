@@ -98,8 +98,115 @@ pub enum Ty {
 pub struct FnSig {
     pub params: Vec<Ty>,
     pub ret: Ty,
-    pub effects: Vec<String>,
+    pub effects: Vec<EffectInst>,
     pub effect_row_var: Option<u32>,
+}
+
+/// Plan D Task 114 — Ty-level analogue of `ast::EffectRef`. Rows
+/// store effect references with their type-arg lists so generic
+/// effect declarations (`effect Raise[E]`) can be referenced
+/// distinctly under different instantiations (`![Raise[Int]]` vs
+/// `![Raise[String]]`). Bare-name references (`IO`, `Mem`) carry
+/// `args: vec![]`; non-empty `args` are the substituted type-args
+/// at the row site.
+///
+/// Equality is structural over `(name, args)`. Two `EffectInst`s
+/// with the same name but different args (`Raise[Int]` and
+/// `Raise[String]`) compare unequal — row unification must
+/// propagate this distinction. `Ord` is **not** derived because
+/// `Ty` itself has no total order; `Row::canonicalise` sorts by
+/// `name` and dedups by full structural equality, preserving
+/// distinct instantiations of the same effect-decl name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectInst {
+    pub name: String,
+    pub args: Vec<Ty>,
+}
+
+impl EffectInst {
+    /// Convenience constructor for the bare-name case (the dominant
+    /// shape pre-Task-114-surface and for builtins).
+    pub fn bare(name: impl Into<String>) -> Self {
+        EffectInst {
+            name: name.into(),
+            args: Vec::new(),
+        }
+    }
+
+    /// Render to surface form: `Raise` for bare-name refs,
+    /// `Raise[Int, String]` for type-parameterized. Used by
+    /// `ty_display` and diagnostic messages.
+    pub fn display_str(&self) -> String {
+        if self.args.is_empty() {
+            self.name.clone()
+        } else {
+            let parts: Vec<String> = self.args.iter().map(ty_display).collect();
+            format!("{}[{}]", self.name, parts.join(", "))
+        }
+    }
+}
+
+/// Plan D Task 114 — convert a slice of AST `EffectRef`s to
+/// `Vec<EffectInst>` for installation in `FnSig.effects`. Args are
+/// converted via `ty_from_type_expr`; the surrounding fn's generic
+/// substitution lets `Raise[E]` resolve `E` to its outer-fn binding.
+/// `effects_registry` argument carries the program's effect-decl
+/// registry so arity-check (E0140) can fire when the row-site arg
+/// count diverges from the decl's `generic_params` len.
+pub(crate) fn effect_refs_to_insts(
+    rs: &[crate::ast::EffectRef],
+    types: &std::collections::BTreeMap<String, crate::ast::TypeDecl>,
+    generic_subst: &std::collections::BTreeMap<String, Ty>,
+) -> Vec<EffectInst> {
+    rs.iter()
+        .map(|r| {
+            let args: Vec<Ty> = r
+                .args
+                .iter()
+                // Fallback to Ty::Unit on resolution failure; the
+                // caller's `check_type_expr_known` walk will have
+                // already pushed the precise diagnostic. This
+                // mirrors `ty_from_type_expr_here`'s defensive
+                // unwrap pattern at line ~5440.
+                .map(|t| ty_from_type_expr(t, types, generic_subst).unwrap_or(Ty::Unit))
+                .collect();
+            EffectInst {
+                name: r.name.clone(),
+                args,
+            }
+        })
+        .collect()
+}
+
+/// Plan D Task 114 — reverse direction (Ty -> AST). Given a slice
+/// of `EffectInst`s and a span, build `Vec<EffectRef>` for AST-
+/// reconstruction sites (`monomorphize::ty_to_type_expr`). Args
+/// flow through `ty_to_type_expr` element-wise.
+pub(crate) fn insts_to_effect_refs(
+    insts: &[EffectInst],
+    span: &crate::errors::Span,
+) -> Vec<crate::ast::EffectRef> {
+    insts
+        .iter()
+        .map(|e| crate::ast::EffectRef {
+            name: e.name.clone(),
+            args: e
+                .args
+                .iter()
+                .map(|t| crate::monomorphize::ty_to_type_expr(t, span))
+                .collect(),
+            span: span.clone(),
+        })
+        .collect()
+}
+
+/// Render a slice of `EffectInst`s as a comma-separated surface
+/// string. Used by E0042 / E0128 / E0136 diagnostics.
+pub(crate) fn effects_display(es: &[EffectInst]) -> String {
+    es.iter()
+        .map(|e| e.display_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// HM type scheme (Plan B task 48). Bound type / row variables come
@@ -141,12 +248,12 @@ pub struct GenericInstantiation {
 /// equality reduces to vector equality.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
-    pub effects: Vec<String>,
+    pub effects: Vec<EffectInst>,
     pub tail: Option<u32>,
 }
 
 impl Row {
-    pub fn closed(effects: Vec<String>) -> Self {
+    pub fn closed(effects: Vec<EffectInst>) -> Self {
         let mut r = Row {
             effects,
             tail: None,
@@ -154,7 +261,7 @@ impl Row {
         r.canonicalise();
         r
     }
-    pub fn open(effects: Vec<String>, tail: u32) -> Self {
+    pub fn open(effects: Vec<EffectInst>, tail: u32) -> Self {
         let mut r = Row {
             effects,
             tail: Some(tail),
@@ -163,8 +270,8 @@ impl Row {
         r
     }
     pub fn canonicalise(&mut self) {
-        self.effects.sort();
-        self.effects.dedup();
+        self.effects.sort_by(|a, b| a.name.cmp(&b.name));
+        self.effects.dedup_by(|a, b| a == b);
     }
 }
 
@@ -250,9 +357,10 @@ impl Subst {
                 seen,
             );
             // Merge resolved row into the sig's effects + tail.
-            let mut merged: Vec<String> = sig.effects.iter().cloned().chain(row.effects).collect();
-            merged.sort();
-            merged.dedup();
+            let mut merged: Vec<EffectInst> =
+                sig.effects.iter().cloned().chain(row.effects).collect();
+            merged.sort_by(|a, b| a.name.cmp(&b.name));
+            merged.dedup_by(|a, b| a == b);
             sig.effects = merged;
             sig.effect_row_var = row.tail;
         }
@@ -836,7 +944,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             let sig = FnSig {
                 params,
                 ret,
-                effects: f.effects.clone(),
+                effects: effect_refs_to_insts(&f.effects, &tc.types, &tc.current_generic_subst),
                 effect_row_var: row_var_id,
             };
             let scheme = Scheme {
@@ -868,6 +976,14 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 tc.check_type_expr_known(&p.ty);
             }
             tc.check_type_expr_known(&f.return_type);
+            // Plan D Task 114 — walk the fn-decl row's effect-refs
+            // for arity / unknown-effect diagnostics.
+            for eref in &f.effects {
+                for a in &eref.args {
+                    tc.check_type_expr_known(a);
+                }
+                tc.check_effect_ref_arity(eref);
+            }
             tc.current_generic_subst = saved_generic_subst;
         }
     }
@@ -1341,7 +1457,7 @@ fn register_builtin_mut_array_schemes(tc: &mut Tc) {
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
-            effects: vec!["Mem".to_string()],
+            effects: vec![EffectInst::bare("Mem")],
             effect_row_var: None,
         })),
     };
@@ -1479,7 +1595,7 @@ fn register_builtin_mut_byte_array_schemes(tc: &mut Tc) {
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
-            effects: vec!["Mem".to_string()],
+            effects: vec![EffectInst::bare("Mem")],
             effect_row_var: None,
         })),
     };
@@ -1576,7 +1692,7 @@ fn register_builtin_string_builder_schemes(tc: &mut Tc) {
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
-            effects: vec!["Mem".to_string()],
+            effects: vec![EffectInst::bare("Mem")],
             effect_row_var: None,
         })),
     };
@@ -2328,10 +2444,23 @@ impl Tc {
         if a == b {
             return true;
         }
-        let set_a: std::collections::BTreeSet<&String> = a.effects.iter().collect();
-        let set_b: std::collections::BTreeSet<&String> = b.effects.iter().collect();
-        let only_a: Vec<String> = set_a.difference(&set_b).map(|s| (*s).clone()).collect();
-        let only_b: Vec<String> = set_b.difference(&set_a).map(|s| (*s).clone()).collect();
+        // Plan D Task 114 — structural set-difference over `EffectInst`
+        // (full `(name, args)` equality). `Raise[Int]` and `Raise[String]`
+        // compare unequal even though they share a name; the row
+        // unification preserves the distinction so handler dispatch
+        // resolves to the correct instantiation.
+        let only_a: Vec<EffectInst> = a
+            .effects
+            .iter()
+            .filter(|e| !b.effects.contains(*e))
+            .cloned()
+            .collect();
+        let only_b: Vec<EffectInst> = b
+            .effects
+            .iter()
+            .filter(|e| !a.effects.contains(*e))
+            .cloned()
+            .collect();
         match (a.tail, b.tail) {
             (None, None) => {
                 // Both closed: must be set-equal.
@@ -2341,8 +2470,8 @@ impl Tc {
                         span.clone(),
                         format!(
                             "effect row mismatch: closed row `![{}]` cannot unify with closed row `![{}]`",
-                            a.effects.join(", "),
-                            b.effects.join(", ")
+                            effects_display(&a.effects),
+                            effects_display(&b.effects)
                         ),
                     );
                     return false;
@@ -2358,9 +2487,9 @@ impl Tc {
                         span.clone(),
                         format!(
                             "effect row mismatch: closed row `![{}]` is missing `{}` required by row `![{} | ?{b_tail}]`",
-                            a.effects.join(", "),
-                            only_b.join(", "),
-                            b.effects.join(", ")
+                            effects_display(&a.effects),
+                            effects_display(&only_b),
+                            effects_display(&b.effects)
                         ),
                     );
                     return false;
@@ -2381,9 +2510,9 @@ impl Tc {
                         span.clone(),
                         format!(
                             "effect row mismatch: closed row `![{}]` is missing `{}` required by row `![{} | ?{a_tail}]`",
-                            b.effects.join(", "),
-                            only_a.join(", "),
-                            a.effects.join(", ")
+                            effects_display(&b.effects),
+                            effects_display(&only_a),
+                            effects_display(&a.effects)
                         ),
                     );
                     return false;
@@ -2404,8 +2533,8 @@ impl Tc {
                         span.clone(),
                         format!(
                             "effect row mismatch: rows share tail `?{a_tail}` but differ in known effects ({} vs {})",
-                            a.effects.join(", "),
-                            b.effects.join(", ")
+                            effects_display(&a.effects),
+                            effects_display(&b.effects)
                         ),
                     );
                     return false;
@@ -2448,22 +2577,24 @@ impl Tc {
     fn subsume_row(&mut self, callee_row: &Row, caller_row: &Row, span: &Span) -> bool {
         let callee = self.subst.apply_row(callee_row);
         let caller = self.subst.apply_row(caller_row);
-        let caller_set: std::collections::BTreeSet<&String> = caller.effects.iter().collect();
-        let callee_set: std::collections::BTreeSet<&String> = callee.effects.iter().collect();
-        let missing: Vec<String> = callee_set
-            .difference(&caller_set)
-            .map(|s| (*s).clone())
+        // Plan D Task 114 — structural set-difference over `EffectInst`.
+        let missing: Vec<EffectInst> = callee
+            .effects
+            .iter()
+            .filter(|e| !caller.effects.contains(*e))
+            .cloned()
             .collect();
         if !missing.is_empty() {
             // Callee performs effects the caller doesn't permit.
             // Use the legacy E0042 diagnostic to keep error messages
             // consistent with Plan A1/A2/A3's effect-row check.
             for e in &missing {
+                let s = e.display_str();
                 self.push_error(
                     "E0042",
                     span.clone(),
                     format!(
-                        "calling a function that performs `{e}` requires `{e}` in the enclosing function's effect row",
+                        "calling a function that performs `{s}` requires `{s}` in the enclosing function's effect row",
                     ),
                 );
             }
@@ -2473,9 +2604,11 @@ impl Tc {
             // Callee has an open row var — it absorbs caller's
             // leftover effects + caller's tail. This binds *only*
             // the callee's row var.
-            let leftover: Vec<String> = caller_set
-                .difference(&callee_set)
-                .map(|s| (*s).clone())
+            let leftover: Vec<EffectInst> = caller
+                .effects
+                .iter()
+                .filter(|e| !callee.effects.contains(*e))
+                .cloned()
                 .collect();
             self.bind_row_var(
                 callee_tail,
@@ -2573,6 +2706,17 @@ impl Tc {
                     self.check_type_expr_known(p);
                 }
                 self.check_type_expr_known(&fty.ret);
+                // Plan D Task 114 — also walk effect-row entries so
+                // EffectRef args get their own E0107 (unknown type)
+                // diagnostics, plus arity-check the row's
+                // generic-effect references against their declared
+                // generic-param count (E0140).
+                for eref in &fty.effects {
+                    for a in &eref.args {
+                        self.check_type_expr_known(a);
+                    }
+                    self.check_effect_ref_arity(eref);
+                }
                 if fty.effect_row_var.is_some() {
                     self.push_error(
                         "E0137",
@@ -2605,6 +2749,74 @@ impl Tc {
     ///
     /// On success returns `Some(Ty::User(...))`. On shape mismatch,
     /// emits E0115 and returns `None`.
+    /// Plan D Task 114 — validate one row-site `EffectRef` against
+    /// its declared `EffectDecl`. Two checks:
+    ///
+    /// 1. **E0042** if the effect is not declared at all (mirrors
+    ///    the existing legacy diagnostic vocabulary; we widen here
+    ///    so unknown-effect references at row sites surface with
+    ///    the same code paths that already exist for unknown
+    ///    effects at perform sites).
+    /// 2. **E0140** (new code) if the row-site arg list arity
+    ///    diverges from the decl's `generic_params`. A bare-name
+    ///    reference to a generic effect-decl (`![Raise]` when the
+    ///    decl is `Raise[E]`) and a referenced effect-decl with
+    ///    too few or too many args (`Raise[Int, String]` when the
+    ///    decl is `Raise[E]`) both fire E0140 with a precise
+    ///    arity message. Bare-name refs to non-generic
+    ///    effect-decls (the dominant pre-Task-114 surface)
+    ///    continue to typecheck cleanly.
+    fn check_effect_ref_arity(&mut self, eref: &crate::ast::EffectRef) {
+        let decl = match self.effects.get(&eref.name) {
+            Some(d) => d.clone(),
+            None => {
+                self.push_error(
+                    "E0042",
+                    eref.span.clone(),
+                    format!(
+                        "effect `{}` is not declared (declare it with `effect {} {{ ... }}` \
+                         before referencing it in an effect row)",
+                        eref.name, eref.name,
+                    ),
+                );
+                return;
+            }
+        };
+        let expected = decl.generic_params.len();
+        let got = eref.args.len();
+        if expected != got {
+            let expected_names: Vec<&str> = decl
+                .generic_params
+                .iter()
+                .map(|gp| gp.name.as_str())
+                .collect();
+            let header = if expected == 0 {
+                format!(
+                    "effect `{}` is not generic — drop the type-arg list to write `{}` instead of `{}`",
+                    eref.name, eref.name, eref.name,
+                )
+            } else if got == 0 {
+                format!(
+                    "effect `{}` is generic over [{}] — write `{}[{}]` with explicit type arguments \
+                     (bare `{}` refers to the un-instantiated declaration)",
+                    eref.name,
+                    expected_names.join(", "),
+                    eref.name,
+                    expected_names.join(", "),
+                    eref.name,
+                )
+            } else {
+                format!(
+                    "effect `{}` is declared with {expected} type parameter(s) [{}], but {got} \
+                     argument(s) were provided in the row site",
+                    eref.name,
+                    expected_names.join(", "),
+                )
+            };
+            self.push_error("E0140", eref.span.clone(), header);
+        }
+    }
+
     fn resolve_ctor_unit_use(&mut self, name: &str, span: &Span) -> Option<Ty> {
         let info = self.ctors.get(name).cloned()?;
         let td = self.types.get(&info.type_name)?.clone();
@@ -2667,7 +2879,7 @@ impl Tc {
         name: &str,
         args: &[Expr],
         span: &Span,
-        row: &[String],
+        row: &[EffectInst],
     ) -> Option<Ty> {
         let info = self.ctors.get(name).cloned()?;
         let td = self.types.get(&info.type_name)?.clone();
@@ -2780,7 +2992,7 @@ impl Tc {
         name: &str,
         fields: &[RecordFieldLit],
         span: &Span,
-        row: &[String],
+        row: &[EffectInst],
     ) -> Option<Ty> {
         let info = match self.ctors.get(name).cloned() {
             Some(i) => i,
@@ -3012,19 +3224,23 @@ impl Tc {
                 );
             }
             for effect in &f.effects {
-                if effect != "IO" && effect != "ArithError" && effect != "Mem" {
+                let name = effect.name.as_str();
+                if name != "IO" && name != "ArithError" && name != "Mem" {
                     self.push_error(
                         "E0041",
                         f.span.clone(),
                         format!(
                             "`fn main`'s effect row may only contain effects discharged by \
-                             the top-level shim (`IO`, `ArithError`, or `Mem`); saw `{effect}`",
+                             the top-level shim (`IO`, `ArithError`, or `Mem`); saw `{name}`",
                         ),
                     );
                 }
             }
         }
-        let body_ty = self.check_block(&f.body, &f.effects);
+        // Plan D Task 114 — body row carries args so per-call
+        // subsumption sees `Raise[Int]` rather than bare `Raise`.
+        let body_row = effect_refs_to_insts(&f.effects, &self.types, &self.current_generic_subst);
+        let body_ty = self.check_block(&f.body, &body_row);
 
         // Plan B task 48 — generalise the inferred signature into a
         // scheme for `fn_schemes`. Concrete (non-generic, closed-row)
@@ -3046,7 +3262,7 @@ impl Tc {
             let inferred_sig = FnSig {
                 params: param_tys,
                 ret: declared_ret,
-                effects: f.effects.clone(),
+                effects: effect_refs_to_insts(&f.effects, &self.types, &self.current_generic_subst),
                 effect_row_var: row_var_id,
             };
             let resolved = self.deref(&Ty::Fn(Box::new(inferred_sig)));
@@ -3073,7 +3289,7 @@ impl Tc {
     /// caller distinguish "the block's tail didn't typecheck" (`None`) from
     /// "the block is a statement sequence with no tail" (`Some(Unit)`),
     /// which matters for `if`-branch unification.
-    fn check_block(&mut self, b: &Block, row: &[String]) -> Option<Ty> {
+    fn check_block(&mut self, b: &Block, row: &[EffectInst]) -> Option<Ty> {
         for s in &b.stmts {
             match s {
                 Stmt::Expr(e) => {
@@ -3143,8 +3359,14 @@ impl Tc {
     /// returns whether the row contains `effect_name` for callers
     /// that want to skip downstream registry lookups on missing rows
     /// (today no caller uses the return).
-    fn register_effect_use(&mut self, effect_name: &str, row: &[String], span: Span, ctx: &str) {
-        if !row.iter().any(|e| e == effect_name) {
+    fn register_effect_use(
+        &mut self,
+        effect_name: &str,
+        row: &[EffectInst],
+        span: Span,
+        ctx: &str,
+    ) {
+        if !row.iter().any(|e| e.name == effect_name) {
             self.push_error(
                 "E0042",
                 span,
@@ -3153,7 +3375,7 @@ impl Tc {
         }
     }
 
-    fn check_perform(&mut self, p: &PerformExpr, row: &[String]) -> Option<Ty> {
+    fn check_perform(&mut self, p: &PerformExpr, row: &[EffectInst]) -> Option<Ty> {
         let ctx = format!("perform {}.{}", p.effect, p.op);
         self.register_effect_use(&p.effect, row, p.span.clone(), &ctx);
         // Plan B task 54 + Task 57 — every effect (including the
@@ -3260,7 +3482,7 @@ impl Tc {
         op_ret_ty.map(|t| self.deref(&t))
     }
 
-    fn check_expr(&mut self, e: &Expr, row: &[String]) -> Option<Ty> {
+    fn check_expr(&mut self, e: &Expr, row: &[EffectInst]) -> Option<Ty> {
         match e {
             Expr::IntLit(_, _) => Some(Ty::Int),
             Expr::StringLit(s, span) => {
@@ -3422,7 +3644,11 @@ impl Tc {
                 // currently-active row-var if present, else stays
                 // closed.
                 let _ = effect_row_var;
-                self.check_lambda(params, return_type, effects, body, span.clone())
+                // Plan D Task 114 — lambda's row carries args (same
+                // shape as the enclosing fn's body row).
+                let lambda_row =
+                    effect_refs_to_insts(effects, &self.types, &self.current_generic_subst);
+                self.check_lambda(params, return_type, &lambda_row, body, span.clone())
             }
             // `ClosureRecord` / `ClosureEnvLoad` are post-closure-
             // conversion nodes synthesized by plan A2 task 31. They
@@ -3609,7 +3835,7 @@ impl Tc {
         callee: &Expr,
         args: &[Expr],
         span: Span,
-        row: &[String],
+        row: &[EffectInst],
     ) -> Option<Ty> {
         let callee_ty = self.check_expr(callee, row);
         // Always type-check args so we surface any errors in them.
@@ -3748,7 +3974,7 @@ impl Tc {
         &mut self,
         params: &[Param],
         return_type: &TypeExpr,
-        effects: &[String],
+        effects: &[EffectInst],
         body: &Expr,
         span: Span,
     ) -> Option<Ty> {
@@ -3905,7 +4131,7 @@ impl Tc {
         body: &Expr,
         return_arm: Option<&HandleReturnArm>,
         op_arms: &[HandleOpArm],
-        row: &[String],
+        row: &[EffectInst],
         // Plan B Task 55 (Phase 4d): handle span used to key the
         // `handle_arm_captures` side-table populated below.
         handle_span: &Span,
@@ -4118,10 +4344,15 @@ impl Tc {
         // call row check is literal-membership only; the active row
         // variable on `self.current_row_var_subst` continues to
         // apply for downstream call-site subsumption.
-        let mut body_row: Vec<String> = row.to_vec();
+        // Plan D Task 114 — body_row is a row over `EffectInst`,
+        // not bare names. Discharged effects from `handle X.op =>
+        // ...` enter the body row as bare-name `EffectInst`s
+        // (surface `handle` has no type-arg form yet — Phase 114d
+        // / Task 115 territory; for now bare names only).
+        let mut body_row: Vec<EffectInst> = row.to_vec();
         for e in &discharged {
-            if !body_row.contains(e) {
-                body_row.push(e.clone());
+            if !body_row.iter().any(|inst| inst.name == *e) {
+                body_row.push(EffectInst::bare(e));
             }
         }
         // Push handler scope for this body's `perform` sites.
@@ -4424,7 +4655,7 @@ impl Tc {
         scrutinee: &Expr,
         arms: &[MatchArm],
         span: Span,
-        row: &[String],
+        row: &[EffectInst],
     ) -> Option<Ty> {
         let scrut_ty = self.check_expr(scrutinee, row);
 
@@ -5337,7 +5568,7 @@ pub(crate) fn ty_from_type_expr(
             Some(Ty::Fn(Box::new(FnSig {
                 params,
                 ret,
-                effects: fty.effects.clone(),
+                effects: effect_refs_to_insts(&fty.effects, types, generic_subst),
                 effect_row_var: None,
             })))
         }
@@ -5372,7 +5603,7 @@ fn ty_display(t: &Ty) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             let ret = ty_display(&sig.ret);
-            let effects = sig.effects.join(", ");
+            let effects = effects_display(&sig.effects);
             let row_var = sig
                 .effect_row_var
                 .map(|id| format!(" | ?{id}"))
@@ -7456,6 +7687,163 @@ mod tests {
         );
     }
 
+    // Plan D Task 114 smoke gate — type-parameterized effect rows.
+
+    #[test]
+    fn generic_effect_decl_with_type_param_typechecks() {
+        // `effect Raise[E] { fail: (E) -> Int }` declares fine —
+        // op signatures already use the effect-decl's
+        // generic_subst (line 941-948 in this file's pre-pass);
+        // Task 114 just wires the row-site surface to substitute
+        // the actual type-arg in.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "generic effect-decl `Raise[E]` should typecheck cleanly; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_parameterized_row_typechecks() {
+        // `![Raise[Int]]` — bare-name effect with a type-arg list
+        // resolves the effect-decl + substitutes Int for E. The
+        // body's perform site is concrete-Int so check_perform's
+        // op-arg unification accepts the call.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky() -> Int ![Raise[Int]] {\n  \
+                     perform Raise.fail(42)\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "row `![Raise[Int]]` should typecheck; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn generic_effect_decl_with_wrong_arity_fires_e0140() {
+        // `effect Raise[E] { ... }` declared with one type-param;
+        // a row site uses two args (`Raise[Int, String]`). E0140
+        // surfaces the mismatch.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky() -> Int ![Raise[Int, String]] {\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0140"),
+            "row-arg arity mismatch should fire E0140; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn bare_name_reference_to_generic_effect_fires_e0140() {
+        // `effect Raise[E] { ... }` declared generic; bare
+        // `![Raise]` (no type-arg list) should fire E0140 because
+        // E is unresolved at the row site.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky() -> Int ![Raise] {\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0140"),
+            "bare `![Raise]` of a generic effect-decl should fire E0140; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn perform_site_e_substitution_deferred_to_task_115() {
+        // Plan D Task 114 R1 — pin the v1 state of the deferred
+        // perform-site E-substitution gap. Today, `perform
+        // Raise.fail("wrong type")` under `![Raise[Int]]` does NOT
+        // fire E0044 even though `fail`'s declared signature is
+        // `(E) -> Int` and the row instantiates `E := Int`. The
+        // op signature is checked under the effect-decl's local
+        // generic_subst (built fresh per effect-decl pre-pass), so
+        // perform-site arg typing succeeds at op-level Ty::Var
+        // without the row-site substitution applied.
+        //
+        // **INVERT THIS TEST AT TASK 115 LANDING.** Task 115's
+        // per-op generic params (`fail[A]: (E) -> A`) close the
+        // gap by threading the row-site type-args + per-call
+        // instantiation through a single substitution at perform
+        // time. Once shipped, this assertion flips: `errs` should
+        // contain E0044 for the String-vs-Int arg mismatch.
+        //
+        // The test exists primarily as a closure-point trail —
+        // without it a future agent might silently close the gap
+        // and miss that the test corpus didn't cover the edge.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky() -> Int ![Raise[Int]] {\n  \
+                     perform Raise.fail(\"wrong type\")\n  \
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        // Document v1 behavior; NOT a correctness assertion.
+        // Marker for Task 115's closure point.
+        assert!(
+            errs.is_empty(),
+            "v1 perform-site E-substitution gap (Task 115 closes); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn cross_fn_row_with_concrete_type_arg_unifies() {
+        // Caller `![Raise[Int]]` calls callee declared `![Raise[Int]]`:
+        // both sides carry the same `EffectInst { name: "Raise",
+        // args: [Ty::Int] }`. unify_row's structural set diff
+        // matches them as equal; subsume_row sees the callee's
+        // effect already in the caller's row. Pinned so cross-fn
+        // composition with type-parameterized effects doesn't
+        // regress when the typecheck rewires its row machinery.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky() -> Int ![Raise[Int]] { 0 }\n\
+                   fn outer() -> Int ![Raise[Int]] { risky() }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "cross-fn row `![Raise[Int]]` should unify; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn cross_fn_row_with_distinct_type_args_fires_e0042() {
+        // Caller `![Raise[Int]]` calls callee `![Raise[String]]`:
+        // they share the effect-decl name but instantiate it
+        // distinctly. Structural row matching on `EffectInst`
+        // detects the mismatch and fires E0042 ("calling a
+        // function that performs `Raise[String]` requires ...
+        // `Raise[String]` ... in the enclosing function's effect
+        // row").
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky_str() -> Int ![Raise[String]] { 0 }\n\
+                   fn outer() -> Int ![Raise[Int]] { risky_str() }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "Raise[Int] caller can't subsume Raise[String] callee; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_args_on_non_generic_effect_fires_e0140() {
+        // Builtin `IO` is not generic; `![IO[Int]]` is malformed.
+        let src = "fn main() -> Int ![IO[Int]] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0140"),
+            "`![IO[Int]]` on non-generic IO should fire E0140; got {errs:?}"
+        );
+    }
+
     #[test]
     fn closed_row_caller_calls_closed_row_callee_typechecks() {
         // Closed-vs-closed under set containment: callee declares
@@ -7907,8 +8295,8 @@ mod tests {
         // pinned now so the E0128 emission path stays exercised.
         let mut tc = fresh_tc();
         let span = Span::synthetic("x.sigil");
-        let row_a = Row::closed(vec!["IO".to_string()]);
-        let row_b = Row::closed(vec!["Raise".to_string()]);
+        let row_a = Row::closed(vec![EffectInst::bare("IO")]);
+        let row_b = Row::closed(vec![EffectInst::bare("Raise")]);
         let ok = tc.unify_row(&row_a, &row_b, &span);
         assert!(!ok, "two distinct closed rows must not unify");
         assert!(
@@ -7926,8 +8314,8 @@ mod tests {
         let mut tc = fresh_tc();
         let span = Span::synthetic("x.sigil");
         let r = tc.fresh_row_var();
-        let open = Row::open(vec!["IO".to_string(), "Raise".to_string()], r);
-        let closed = Row::closed(vec!["IO".to_string(), "Raise".to_string()]);
+        let open = Row::open(vec![EffectInst::bare("IO"), EffectInst::bare("Raise")], r);
+        let closed = Row::closed(vec![EffectInst::bare("IO"), EffectInst::bare("Raise")]);
         let ok = tc.unify_row(&open, &closed, &span);
         assert!(ok, "open(IO,Raise|r) must unify with closed(IO,Raise)");
         let resolved = tc.subst.apply_row(&Row {
@@ -7945,7 +8333,7 @@ mod tests {
         let mut tc = fresh_tc();
         let span = Span::synthetic("x.sigil");
         let r = tc.fresh_row_var();
-        let open = Row::open(vec!["IO".to_string()], r);
+        let open = Row::open(vec![EffectInst::bare("IO")], r);
         let closed = Row::closed(Vec::new());
         let ok = tc.unify_row(&open, &closed, &span);
         assert!(!ok, "closed `[]` cannot supply `IO` to open `[IO | r]`");
@@ -7966,8 +8354,8 @@ mod tests {
         let span = Span::synthetic("x.sigil");
         let a_tail = tc.fresh_row_var();
         let b_tail = tc.fresh_row_var();
-        let row_a = Row::open(vec!["IO".to_string()], a_tail);
-        let row_b = Row::open(vec!["Raise".to_string()], b_tail);
+        let row_a = Row::open(vec![EffectInst::bare("IO")], a_tail);
+        let row_b = Row::open(vec![EffectInst::bare("Raise")], b_tail);
         let ok = tc.unify_row(&row_a, &row_b, &span);
         assert!(ok, "open(IO|a) must unify with open(Raise|b)");
         // After the merge, a_tail's resolution should mention Raise.
@@ -7976,7 +8364,7 @@ mod tests {
             tail: Some(a_tail),
         });
         assert!(
-            a_resolved.effects.contains(&"Raise".to_string()),
+            a_resolved.effects.iter().any(|e| e.name == "Raise"),
             "a_tail should absorb Raise; got {:?}",
             a_resolved
         );
@@ -9430,7 +9818,7 @@ mod tests {
         };
         assert_eq!(sig.params, vec![Ty::Int]);
         assert_eq!(sig.ret, Ty::String);
-        assert_eq!(sig.effects, vec!["IO".to_string()]);
+        assert_eq!(sig.effects, vec![EffectInst::bare("IO")]);
     }
 
     #[test]

@@ -16861,7 +16861,18 @@ mod tests {
                 generic_params: Vec::new(),
                 params: helper_params.clone(),
                 return_type: TypeExpr::Named("Int".to_string(), span.clone()),
-                effects: vec!["Raise".to_string(), "IO".to_string()],
+                effects: vec![
+                    crate::ast::EffectRef {
+                        name: "Raise".to_string(),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    },
+                    crate::ast::EffectRef {
+                        name: "IO".to_string(),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    },
+                ],
                 effect_row_var: None,
                 body,
                 span: span.clone(),

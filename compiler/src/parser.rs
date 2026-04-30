@@ -340,15 +340,48 @@ impl<'a> Parser<'a> {
     /// `IO, Foo, Bar` or `IO | e` (row-variable). Caller already
     /// consumed the opening `[`; this method consumes through the
     /// closing `]`. Returns (effects, optional row variable).
-    fn parse_effect_row(&mut self) -> Option<(Vec<String>, Option<RowVar>)> {
-        let mut effects = Vec::new();
+    fn parse_effect_row(&mut self) -> Option<(Vec<EffectRef>, Option<RowVar>)> {
+        let mut effects: Vec<EffectRef> = Vec::new();
         let mut row_var = None;
         while !matches!(
             self.peek().kind,
             TokenKind::RBracket | TokenKind::Pipe | TokenKind::Eof
         ) {
-            let e = self.parse_ident("effect name")?;
-            effects.push(e);
+            let name_tok = self.peek().clone();
+            let name = self.parse_ident("effect name")?;
+            // Plan D Task 114 — accept type-parameterized effect
+            // references in row position: `![Raise[E]]`. The parser
+            // here only captures the syntactic form; the typechecker
+            // checks the args' arity against the declared
+            // `EffectDecl::generic_params` and substitutes them at
+            // the row site. Bare-name refs (the pre-Task-114 surface)
+            // produce `args: vec![]` and remain the dominant shape
+            // for non-generic effects (`IO`, `Mem`, `ArithError`).
+            let mut args: Vec<TypeExpr> = Vec::new();
+            let mut end_span = name_tok.span.clone();
+            if matches!(self.peek().kind, TokenKind::LBracket) {
+                self.advance();
+                while !matches!(self.peek().kind, TokenKind::RBracket | TokenKind::Eof) {
+                    let arg = self.parse_type()?;
+                    args.push(arg);
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                let close = self.peek().span.clone();
+                self.expect(&TokenKind::RBracket, "`]` closing effect type-arg list")?;
+                end_span = close;
+            }
+            let span = Span {
+                file: name_tok.span.file.clone(),
+                line: name_tok.span.line,
+                column: name_tok.span.column,
+                end_line: end_span.end_line,
+                end_column: end_span.end_column,
+            };
+            effects.push(EffectRef { name, args, span });
             if matches!(self.peek().kind, TokenKind::Comma) {
                 self.advance();
             } else {
@@ -1829,7 +1862,13 @@ mod tests {
             panic!()
         };
         assert_eq!(f.name, "main");
-        assert_eq!(f.effects, vec!["IO".to_string()]);
+        assert_eq!(
+            f.effects
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["IO"]
+        );
         assert_eq!(f.body.stmts.len(), 1);
         let Some(Expr::IntLit(0, _)) = f.body.tail else {
             panic!()
@@ -2201,7 +2240,10 @@ mod tests {
                 assert_eq!(params.len(), 2);
                 assert_eq!(params[0].name, "a");
                 assert_eq!(params[1].name, "b");
-                assert_eq!(effects, vec!["IO".to_string()]);
+                assert_eq!(
+                    effects.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+                    vec!["IO"]
+                );
                 match *body {
                     Expr::Binary { op, .. } => assert_eq!(op, BinOp::Add),
                     other => panic!("body not Binary, got {other:?}"),
@@ -2766,7 +2808,13 @@ mod tests {
     fn explicit_row_variable_parses() {
         let p = parse_str("fn f(x: Int) -> Int ![IO | e] { x }\n");
         let f = first_fn(&p);
-        assert_eq!(f.effects, vec!["IO".to_string()]);
+        assert_eq!(
+            f.effects
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["IO"]
+        );
         let rv = f
             .effect_row_var
             .as_ref()
@@ -2837,7 +2885,10 @@ mod tests {
                 effect_row_var,
                 ..
             } => {
-                assert_eq!(effects, vec!["IO".to_string()]);
+                assert_eq!(
+                    effects.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+                    vec!["IO"]
+                );
                 assert_eq!(effect_row_var.map(|r| r.name), Some("e".to_string()));
             }
             other => panic!("expected Lambda, got {other:?}"),
@@ -2849,7 +2900,13 @@ mod tests {
         // Regression-guard: pre-Plan-B `![IO]` parses as closed row.
         let p = parse_str("fn f(x: Int) -> Int ![IO] { x }\n");
         let f = first_fn(&p);
-        assert_eq!(f.effects, vec!["IO".to_string()]);
+        assert_eq!(
+            f.effects
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["IO"]
+        );
         assert!(f.effect_row_var.is_none());
     }
 
@@ -3342,7 +3399,13 @@ mod tests {
         assert_eq!(fty.params.len(), 1);
         assert_eq!(fty.params[0].head_name(), "Int");
         assert_eq!(fty.ret.head_name(), "String");
-        assert_eq!(fty.effects, vec!["IO".to_string()]);
+        assert_eq!(
+            fty.effects
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["IO"]
+        );
     }
 
     #[test]
@@ -3355,7 +3418,13 @@ mod tests {
         assert_eq!(fty.params[0].head_name(), "Int");
         assert_eq!(fty.params[1].head_name(), "String");
         assert_eq!(fty.ret.head_name(), "Bool");
-        assert_eq!(fty.effects, vec!["IO".to_string(), "Choose".to_string()]);
+        assert_eq!(
+            fty.effects
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["IO", "Choose"]
+        );
     }
 
     #[test]
@@ -3364,7 +3433,13 @@ mod tests {
         let TypeExpr::Fn(fty) = te else {
             panic!("expected TypeExpr::Fn, got {te:?}")
         };
-        assert_eq!(fty.effects, vec!["IO".to_string()]);
+        assert_eq!(
+            fty.effects
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["IO"]
+        );
         let rv = fty.effect_row_var.as_ref().expect("row var present");
         assert_eq!(rv.name, "r");
     }
