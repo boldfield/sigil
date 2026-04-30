@@ -6757,6 +6757,42 @@ fn std_string_import_is_noop() {
     assert_eq!(stdout, "ab\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 70 — IO extensions =====
+
+/// `IO.print` writes without a newline, then `IO.println` finishes
+/// with one. Pin the surface against the existing IO handler frame.
+#[test]
+fn std_io_print_without_newline() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.print(\"hello \");\n  \
+                 perform IO.println(\"world\");\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_io_print");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello world\n", "stderr={stderr:?}");
+}
+
+/// `IO.write_file` then `IO.read_file` round-trips a string through
+/// the filesystem. Uses a tmp path to avoid CI / pod conflicts.
+#[test]
+fn std_io_read_write_file_round_trip() {
+    let tmp = std::env::temp_dir().join(format!("sigil_e2e_io_rw_{}.txt", std::process::id()));
+    let tmp_str = tmp.to_str().expect("tmp path utf8");
+    let src = format!(
+        "fn main() -> Int ![IO] {{\n  \
+           perform IO.write_file(\"{tmp_str}\", \"hello, file\");\n  \
+           let contents: String = perform IO.read_file(\"{tmp_str}\");\n  \
+           perform IO.println(contents);\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "std_io_read_write_file");
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello, file\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration

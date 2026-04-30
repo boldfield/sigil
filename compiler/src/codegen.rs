@@ -5481,6 +5481,33 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_io_println_arm", Linkage::Import, &io_println_arm_sig)
         .map_err(|e| format!("declare sigil_io_println_arm: {e}"))?;
 
+    // Plan C Task 70 — additional IO arm fns. Same ABI shape as
+    // `sigil_io_println_arm`.
+    let io_print_arm = module
+        .declare_function("sigil_io_print_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_io_print_arm: {e}"))?;
+    let io_read_file_arm = module
+        .declare_function(
+            "sigil_io_read_file_arm",
+            Linkage::Import,
+            &io_println_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_io_read_file_arm: {e}"))?;
+    let io_read_line_arm = module
+        .declare_function(
+            "sigil_io_read_line_arm",
+            Linkage::Import,
+            &io_println_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_io_read_line_arm: {e}"))?;
+    let io_write_file_arm = module
+        .declare_function(
+            "sigil_io_write_file_arm",
+            Linkage::Import,
+            &io_println_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_io_write_file_arm: {e}"))?;
+
     // Plan B Task 57 — sigil_arith_error_div_by_zero_arm and
     // sigil_arith_error_mod_by_zero_arm, the two runtime-side default
     // handler arm fns for `ArithError`. Same CPS arm fn ABI as
@@ -6698,6 +6725,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let handle_push_ref = module.declare_func_in_func(handle_push, builder.func);
         let handle_pop_ref = module.declare_func_in_func(handle_pop, builder.func);
         let io_println_arm_ref = module.declare_func_in_func(io_println_arm, builder.func);
+        // Plan C Task 70 — additional IO arm fns.
+        let io_print_arm_ref = module.declare_func_in_func(io_print_arm, builder.func);
+        let io_read_file_arm_ref = module.declare_func_in_func(io_read_file_arm, builder.func);
+        let io_read_line_arm_ref = module.declare_func_in_func(io_read_line_arm, builder.func);
+        let io_write_file_arm_ref = module.declare_func_in_func(io_write_file_arm, builder.func);
         let arith_div_arm_ref = module.declare_func_in_func(arith_error_div_arm, builder.func);
         let arith_mod_arm_ref = module.declare_func_in_func(arith_error_mod_arm, builder.func);
 
@@ -6752,25 +6784,37 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         stackmap.push_placeholder(function_code_offset(&builder, arith_push_call));
 
         // ────── IO handler frame (last-pushed, first-popped) ──────
-        // effect_id=1, arm_count=1 (single op `println`).
+        // effect_id=1, arm_count=5. Op IDs assigned alphabetically:
+        // 0=print, 1=println, 2=read_file, 3=read_line, 4=write_file.
+        // (Plan C Task 70 added the four non-`println` ops; their
+        // alphabetical positions shifted `println` from op_id 0 to 1.)
         let io_effect_id_v = builder.ins().iconst(types::I32, 1);
-        let io_arm_count_v = builder.ins().iconst(types::I32, 1);
+        let io_arm_count_v = builder.ins().iconst(types::I32, 5);
         let io_frame_new_call = builder
             .ins()
             .call(frame_new_ref, &[io_effect_id_v, io_arm_count_v]);
         stackmap.push_placeholder(function_code_offset(&builder, io_frame_new_call));
         let io_frame_ptr = builder.inst_results(io_frame_new_call)[0];
 
-        // Set arm op_id 0 (`println`) to `sigil_io_println_arm`.
-        // closure_ptr=null (the runtime arm fn is closure-less).
-        let io_op_id_v = builder.ins().iconst(types::I32, 0);
-        let io_arm_fn_ptr = builder.ins().func_addr(pointer_ty, io_println_arm_ref);
         let io_null_closure = builder.ins().iconst(pointer_ty, 0);
-        let set_arm_call = builder.ins().call(
-            frame_set_arm_ref,
-            &[io_frame_ptr, io_op_id_v, io_arm_fn_ptr, io_null_closure],
-        );
-        stackmap.push_placeholder(function_code_offset(&builder, set_arm_call));
+        // Helper for installing each IO arm at its op_id.
+        let install_io_arm = |builder: &mut FunctionBuilder<'_>,
+                              stackmap: &mut StackMapBuilder,
+                              op_id: i64,
+                              arm_fn_ref: FuncRef| {
+            let op_id_v = builder.ins().iconst(types::I32, op_id);
+            let arm_fn_ptr = builder.ins().func_addr(pointer_ty, arm_fn_ref);
+            let set_arm_call = builder.ins().call(
+                frame_set_arm_ref,
+                &[io_frame_ptr, op_id_v, arm_fn_ptr, io_null_closure],
+            );
+            stackmap.push_placeholder(function_code_offset(builder, set_arm_call));
+        };
+        install_io_arm(&mut builder, &mut stackmap, 0, io_print_arm_ref); // print
+        install_io_arm(&mut builder, &mut stackmap, 1, io_println_arm_ref); // println
+        install_io_arm(&mut builder, &mut stackmap, 2, io_read_file_arm_ref); // read_file
+        install_io_arm(&mut builder, &mut stackmap, 3, io_read_line_arm_ref); // read_line
+        install_io_arm(&mut builder, &mut stackmap, 4, io_write_file_arm_ref); // write_file
 
         // Push the IO frame.
         let push_call = builder.ins().call(handle_push_ref, &[io_frame_ptr]);

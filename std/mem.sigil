@@ -1,0 +1,54 @@
+// sigil: 0.1
+//
+// std/mem.sigil — Plan C Task 74.
+//
+// **Documentation only.** The `Mem` effect ships as a synthetic
+// builtin in Plan C Task 66 (`[DEVIATION Task 66]` in
+// `PLAN_C_DEVIATIONS.md`); see also Plan B Task 57's builtin-effect
+// injection pattern. Edits to this file have no effect on
+// compilation. `import std.mem` is allowed (skip-list path) but is
+// not required — the `Mem` effect is in scope unconditionally.
+//
+// ## Surface
+//
+// `Mem` is a **marker effect** with zero declared operations.
+// Functions that mutate any of the runtime-managed mutable
+// collections declare `![Mem]` in their effect row; functions
+// without `Mem` in their row trip E0042 at any mutation call site.
+//
+// Operations gated behind `Mem`:
+//
+// - `MutArray[A]` (Plan C Task 66): `mut_array_new`,
+//   `mut_array_length`, `mut_array_get`, `mut_array_set`.
+// - `MutByteArray` (Plan C Task 66.6): `mut_byte_array_new`,
+//   `mut_byte_array_length`, `mut_byte_array_get`,
+//   `mut_byte_array_set`.
+// - `StringBuilder` (Plan C Task 67, when shipped): `sb_new`,
+//   `sb_append`, `sb_finalize`.
+//
+// ## Top-level handler wiring
+//
+// `main` declares `![Mem]` to permit mutation. There is no
+// runtime handler frame to install — the type-level "top-level
+// Mem handler" is the absence of a deeper override. Mem has zero
+// ops in v1, so there's no per-op arm fn for the main shim to
+// register.
+//
+// ## v1 vs v2
+//
+// In v1, `Mem` cannot be intercepted via `handle ... with { Mem.X(...) => ... }`
+// because there are no Mem ops to intercept. v2's path (per
+// `[DEVIATION Task 66]`) ships `effect Mem[A] { ... }` as a generic
+// builtin effect, allowing handler-swap of mutation primitives for
+// testing patterns. Plan C-era user code (`mut_array_*` /
+// `mut_byte_array_*` / `sb_*` call sites) stays surface-stable
+// across the v1 → v2 shift; only the lowering changes.
+//
+// ## Why mutations need an effect at all
+//
+// Sigil's effect system makes mutation visible at type level:
+// callers who want to remain pure declare `![]` (or specific non-Mem
+// rows) and are blocked from accidentally invoking mutating helpers.
+// Library authors document mutability via the `Mem` annotation in
+// their fn signatures rather than burying it in implementation
+// details.

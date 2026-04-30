@@ -46,7 +46,7 @@ Tracks Plan C's execution against `boldfield/designs/in-progress/2026-04-21-sigi
 - Task 69 — Write `std/int64.sigil` — boxed `Int64`. Runtime support: `Int64` as a heap-allocated record; each arithmetic op allocates one record.
   - status: todo
 - Task 70 — Extend `std/io.sigil` with `print`, `println`, `read_line`, `read_file`, `write_file`. Add corresponding runtime primitives.
-  - status: todo
+  - status: **done-pending-ci** ([HEAD]). Builtin `IO` effect grew from 1 op (`println`) to 5 ops (`print`, `println`, `read_file`, `read_line`, `write_file` — alphabetical order assigns ops 0..4). Runtime layer: 4 new helpers in `runtime/src/io.rs` (`sigil_print`, `sigil_read_line`, `sigil_read_file`, `sigil_write_file`); 4 new arm fns in `runtime/src/handlers.rs` (`sigil_io_print_arm`, `sigil_io_read_line_arm`, `sigil_io_read_file_arm`, `sigil_io_write_file_arm`) all conforming to the Phase 4 CPS arm fn ABI. Main shim's IO frame `arm_count` extended from 1 to 5 with each arm installed at its op_id; `println` shifts from op_id 0 to 1 (alphabetically after `print`). All existing IO tests continue to pass — typecheck assigns op_ids dynamically, so the shift is structural. `std/io.sigil` documentation file updated to reflect the full surface and the alphabetical op-id ordering. 5 typecheck unit tests + 2 e2e tests cover the new ops (1 simple `IO.print` no-newline test + 1 round-trip `write_file` → `read_file` exercising the filesystem path). The `builtin_effects_present_in_every_program` test was extended to assert all 5 IO op_ids.
 - Task 71 — Write `std/raise.sigil` — `Raise[E]` effect + `catch : (() -> A ![Raise[E] | e]) -> Result[A, E] !e`.
   - status: todo
 - Task 72 — Write `std/state.sigil` — `State[S]` effect + `run_state: (S, () -> A ![State[S] | e]) -> (A, S) !e`.
@@ -54,7 +54,7 @@ Tracks Plan C's execution against `boldfield/designs/in-progress/2026-04-21-sigi
 - Task 73 — Write `std/choose.sigil` — `Choose resumes: many` effect + `all_choices`, `first_choice`.
   - status: todo
 - Task 74 — Write `std/mem.sigil` — `Mem` effect declaration + top-level handler wiring. The handler performs in-place mutation on `MutArray` and rope operations on `StringBuilder`. `main` functions that need mutation declare `![Mem, ...]` in their row.
-  - status: todo
+  - status: **done-pending-ci** ([HEAD]) — `Mem` ships as a marker effect (zero ops, no perform-dispatch) per `[DEVIATION Task 66]`; the surface this task documents is fully implemented across Tasks 66 (MutArray), 66.6 (MutByteArray), and 67 (StringBuilder, when shipped). `std/mem.sigil` is documentation-only (added to `BUILTIN_INJECTED` skip-list); the doc covers the marker-effect rationale, the v2 generic-Mem path, the operations gated behind `![Mem]`, and the type-level "top-level Mem handler" semantics (`main` declares `![Mem]`; no runtime handler frame, just absence of a deeper override).
 - Task 75 — Write `std/random.sigil` — `Random` effect; `os_seed()` handler reads from OS entropy, `seeded(Int64)` handler installs a deterministic PRNG.
   - status: todo
 - Task 76 — Write `std/clock.sigil` — `Clock` effect; `os_clock()` handler reads OS, `frozen(Int64)` handler returns a fixed timestamp.

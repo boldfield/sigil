@@ -512,13 +512,54 @@ fn builtin_effects() -> Vec<EffectDecl> {
         name_span: span.clone(),
         generic_params: Vec::new(),
         resumes_many: false,
-        ops: vec![EffectOp {
-            name: "println".to_string(),
-            name_span: span.clone(),
-            params: vec![TypeExpr::Named("String".to_string(), span.clone())],
-            return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
-            span: span.clone(),
-        }],
+        ops: vec![
+            // Plan C Task 70 — `print(s)`: write `s` without newline.
+            EffectOp {
+                name: "print".to_string(),
+                name_span: span.clone(),
+                params: vec![TypeExpr::Named("String".to_string(), span.clone())],
+                return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
+                span: span.clone(),
+            },
+            // Plan A1 / Plan B Task 57 — `println(s)`.
+            EffectOp {
+                name: "println".to_string(),
+                name_span: span.clone(),
+                params: vec![TypeExpr::Named("String".to_string(), span.clone())],
+                return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
+                span: span.clone(),
+            },
+            // Plan C Task 70 — `read_file(path) -> String`. Aborts
+            // on IO error / invalid UTF-8.
+            EffectOp {
+                name: "read_file".to_string(),
+                name_span: span.clone(),
+                params: vec![TypeExpr::Named("String".to_string(), span.clone())],
+                return_type: TypeExpr::Named("String".to_string(), span.clone()),
+                span: span.clone(),
+            },
+            // Plan C Task 70 — `read_line() -> String`. Trailing CR/LF
+            // stripped. EOF without bytes returns the empty string.
+            EffectOp {
+                name: "read_line".to_string(),
+                name_span: span.clone(),
+                params: Vec::new(),
+                return_type: TypeExpr::Named("String".to_string(), span.clone()),
+                span: span.clone(),
+            },
+            // Plan C Task 70 — `write_file(path, data)`. Replaces
+            // existing contents.
+            EffectOp {
+                name: "write_file".to_string(),
+                name_span: span.clone(),
+                params: vec![
+                    TypeExpr::Named("String".to_string(), span.clone()),
+                    TypeExpr::Named("String".to_string(), span.clone()),
+                ],
+                return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
+                span: span.clone(),
+            },
+        ],
         span: span.clone(),
     });
     // Plan C Task 66 — Mem is a marker effect (zero ops). Functions
@@ -8100,10 +8141,27 @@ mod tests {
                 .get(&("ArithError".to_string(), "mod_by_zero".to_string())),
             Some(&1)
         );
-        // IO op_ids: println.
+        // IO op_ids (alphabetical, post-Task-70):
+        // 0=print, 1=println, 2=read_file, 3=read_line, 4=write_file.
+        assert_eq!(
+            cp.op_ids.get(&("IO".to_string(), "print".to_string())),
+            Some(&0)
+        );
         assert_eq!(
             cp.op_ids.get(&("IO".to_string(), "println".to_string())),
-            Some(&0)
+            Some(&1)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("IO".to_string(), "read_file".to_string())),
+            Some(&2)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("IO".to_string(), "read_line".to_string())),
+            Some(&3)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("IO".to_string(), "write_file".to_string())),
+            Some(&4)
         );
     }
 
@@ -9838,6 +9896,63 @@ mod tests {
         assert!(
             has_code(&errs, "E0044"),
             "expected E0044 from string_concat Int-vs-String mismatch; got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 70 — IO extensions =====
+
+    #[test]
+    fn io_print_typechecks_under_io_row() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     perform IO.print(\"no newline\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn io_read_line_returns_string() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let line: String = perform IO.read_line();\n  \
+                     perform IO.println(line);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn io_read_file_takes_path_returns_contents() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let s: String = perform IO.read_file(\"/dev/null\");\n  \
+                     perform IO.println(s);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn io_write_file_takes_path_and_data() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     perform IO.write_file(\"/tmp/x\", \"hi\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn io_print_without_io_row_fires_e0042() {
+        let src = "fn main() -> Int ![] {\n  \
+                     perform IO.print(\"hi\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (missing IO in row); got {errs:?}"
         );
     }
 
