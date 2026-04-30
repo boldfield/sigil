@@ -1,57 +1,48 @@
 // examples/catch.sigil
 //
-// Plan B Task 59 — Raise handler, one-shot. Demonstrates the
-// canonical algebraic-effects "catch" pattern: an inner fn signals
-// failure via `perform Raise.fail()`; the caller wraps the call in
-// `handle ... with { Raise.fail(k) => recovery }` and the arm
-// discards `k` to short-circuit the failure path with a recovery
-// value.
+// Plan C Task 71 — real-world demo of the `std/raise.sigil` surface.
+// (Originally Plan B Task 59; migrated from a locally-declared
+// `effect Raise { fail: () -> Int }` to the stdlib `Raise` /
+// `raise` / `catch` surface in PR #44 review fixups.)
 //
-// **Why discarding `k` flows the recovery value back as the handle's
-// value (not through helper's tail).** Phase 4e captures+ shipped the
-// colorer's handler-discharge refinement (PR #26): when the arm
-// doesn't reference `k`, the synth-cont never runs, helper's
-// rest-of-body is dropped, and the arm's value (here `42`) flows
-// directly to the handle expression's `let recovered = handle ... ;`
-// binding. Pre-Phase-4e, the synchronous shape would have run
-// helper's tail anyway and bound the perform's value to `result` —
-// the discard semantics is what makes this a true "catch and
-// recover" rather than a "catch and continue with default".
+// **What this demonstrates.** A helper fn (`risky`) that may raise
+// short-circuits via `raise(message)`; the caller wraps the call
+// with a `handle ... with { Raise.fail(_, k) => 42 }` discard-`k`
+// arm. Because `k` is discarded, the arm's body value (`42`)
+// becomes the handle expression's value — `risky`'s post-perform
+// tail is dropped per Phase 4e captures+ closed (PR #26's
+// discard-`k` correctness across function-call boundaries).
 //
 // **Helper body shape.** `risky(input)` body:
 //
-//   `let result: Int = perform Raise.fail(); result + input`
+//   `let result: Int = raise("attempt"); result + input`
 //
-// is the `LetBindThenTail` synth-cont shape (codegen.rs:10301-10327),
-// captures-bearing because `input` is a user param referenced in the
-// pure tail. The synth-cont closure record holds `input`; if the arm
-// USED `k(value)` instead of discarding, the synth-cont would bind
-// `result = value`, lower `result + input`, return Done(value + 7).
-// This example uses the discard path; the use-`k` path is exercised
-// by existing e2e tests (`captures_bearing_synth_cont_arity_n_helper
-// _use_k`).
+// is the `LetBindThenTail` synth-cont shape, captures-bearing
+// because `input` is a user param referenced in the pure tail.
+// The arm here uses the discard-`k` path; the use-`k` path is
+// exercised by existing e2e tests
+// (`captures_bearing_synth_cont_arity_n_helper_use_k`).
 //
-// **Why the example registers no `set` companion.** `Raise` is a
-// single-op effect (`fail` only) — no Phase 4f latent op_id/arm_count
-// gap to cover (the examples/div_recover.sigil precedent of
-// registering both ops applies to multi-op effects like `ArithError`
-// with `div_by_zero` + `mod_by_zero`).
+// **Why the example doesn't go through `catch` (the std helper).**
+// `catch` returns `Result[A, String]` and forces a match-on-Result
+// at the use site. This example uses the lower-level `handle ...
+// with` directly to keep the recovery shape simple and to
+// demonstrate the discard-`k` semantic without the Result wrap.
+// `examples/raise_via_catch.sigil` (when added) will exercise the
+// `catch` user-helper path.
 //
 // Invariant: stdout reads `42\n` and the program exits 0.
-//
-// See `[DEVIATION Task 59]` in `boldfield/designs/PLAN_B_DEVIATIONS.md`
-// for the architectural framing of all three Task 59 demos.
 
-effect Raise { fail: () -> Int }
+import std.raise
 
-fn risky(input: Int) -> Int ![Raise, IO] {
-  let result: Int = perform Raise.fail();
+fn risky(input: Int) -> Int ![Raise] {
+  let result: Int = raise("attempt");
   result + input
 }
 
 fn main() -> Int ![IO] {
   let recovered: Int = handle risky(7) with {
-    Raise.fail(k) => 42,
+    Raise.fail(_msg, k) => 42,
   };
   perform IO.println(int_to_string(recovered));
   0

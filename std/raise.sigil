@@ -61,13 +61,19 @@ fn raise(e: String) -> Int ![Raise] {
 }
 
 // `catch(body)` runs `body` and wraps the outcome in a Result:
-//   - body returns A normally → `Ok(a)`
-//   - body raises e via `perform Raise.fail(e)` → `Err(e)`
+//   - body returns A normally → `Ok(a)` (via the `return` arm)
+//   - body raises e via `perform Raise.fail(e)` → `Err(e)` (via
+//     the discard-`k` op arm)
 //
 // The body's row is closed at `![Raise]` per the v1 design note
-// above; `catch` discharges Raise and returns under `![]`.
+// above; `catch` discharges Raise and returns under `![]`. Both
+// arms produce `Result[A, String]` directly, so the handle's
+// overall type matches the declared return without bidirectional-
+// inference acrobatics. Mirrors the explicit-return-arm pattern
+// established by `examples/state.sigil`.
 fn catch[A](body: () -> A ![Raise]) -> Result[A, String] ![] {
-  handle Ok(body()) with {
+  handle body() with {
+    return(v) => Ok(v),
     Raise.fail(e, k) => Err(e),
   }
 }

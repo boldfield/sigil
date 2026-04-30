@@ -10120,6 +10120,31 @@ mod tests {
     }
 
     #[test]
+    fn raise_int_return_in_string_returning_fn_fires_e0044_v1_gap_pin() {
+        // Plan C Task 71 v1 gap pin per `[DEVIATION Task 71]`:
+        // `Raise.fail` declares `Int` return (placeholder; the perform
+        // never resumes under catch's discharge-k handler). When a
+        // user fn returns `String` and tries to raise inline, the
+        // declared `Int` return doesn't fit the use site → E0044.
+        // The deviation entry calls this out as the v1 ergonomic gap
+        // resolved by v2's per-op generic params (`fail[A]: (E) -> A`).
+        // This test pins the diagnostic so users hitting the error
+        // get a searchable reference and so the error class doesn't
+        // silently change shape when v2 generalisation lands.
+        let src = "import std.raise\n\
+                   fn parse_or_fail(s: String) -> String ![Raise] {\n  \
+                     raise(s)\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 (raise's Int placeholder return doesn't fit \
+             String-returning fn); got {errs:?}"
+        );
+    }
+
+    #[test]
     fn import_std_result_map_map_err_and_then_typecheck_cleanly() {
         let src = "import std.result\n\
                    fn double(n: Int) -> Int ![] { n + n }\n\

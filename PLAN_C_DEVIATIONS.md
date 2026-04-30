@@ -342,7 +342,7 @@ Architectural escalation flagged in PR #43's review: "any test loadbearing on a 
 
 **Closure path.** Future ops added to existing builtin effects (Tasks 71-76's user-effect handlers don't touch builtins) face the same op_id-shift risk; partial-handler tests need updating in the same commit. The `extern fn` + `opaque type` v2 path doesn't change this (the typecheck-side enforcement is independent).
 
-**Failure mode.** Same as the CI regression: typecheck rejects partial handlers with E0142. The fix is mechanical (add missing arms with discharge-`k` shapes).
+**Failure mode.** Same as the CI regression: typecheck rejects partial handlers with E0142. The fix is mechanical (add missing arms with discard-`k` shapes).
 
 **Implementing commit(s).** `25b8aec` (Task 70 + 74); `8fc57b0` (CI fix for the broken partial-handler test).
 
@@ -421,7 +421,7 @@ Three v1 constraints prevent shipping the literal shape:
   closed effect row.
 
 The catch implementation is a single `handle Ok(body()) with {
-Raise.fail(e, k) => Err(e), }` discharge-`k` arm. Plan B Task 55
+Raise.fail(e, k) => Err(e), }` discard-`k` arm. Plan B Task 55
 Phase 4d MVP closure-capture + tail-position `k` (PR #25) covers
 the success path; the discard-`k` arm shape that Phase 4e
 captures+ closed (PR #26 — discard-`k` correctness across
