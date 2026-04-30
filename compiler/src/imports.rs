@@ -110,6 +110,27 @@ fn render_module_for_diagnostic(module: &str) -> String {
     format!("std.{}", stem.replace('/', "."))
 }
 
+/// Wrap a lex / parse error from a stdlib module load with an
+/// "internal compiler error" framing so users can tell the failure
+/// is in stdlib code, not their own. The original message is
+/// preserved verbatim after the framing prefix; the span points at
+/// the stdlib file for stdlib-author debugging.
+fn wrap_stdlib_error(err: CompilerError, module_pretty: &str) -> CompilerError {
+    let new_message = format!(
+        "internal compiler error in stdlib module `{module_pretty}`: {}",
+        err.message
+    );
+    let mut wrapped = CompilerError::new(err.severity, err.code, err.span, new_message);
+    wrapped.hint = err.hint.or_else(|| {
+        Some(
+            "this is a sigil compiler bug — please report at the sigil repo with \
+             the failing program attached"
+                .to_string(),
+        )
+    });
+    wrapped
+}
+
 fn load_module(
     module: &str,
     import_span: &Span,
@@ -152,10 +173,25 @@ fn load_module(
 
     in_progress.insert(module.to_string());
 
+    let module_pretty = render_module_for_diagnostic(module);
+
+    // Transform lex / parse errors that originate from stdlib source
+    // so users see "internal compiler error in stdlib module `std.X`"
+    // framing instead of a raw lex/parse diagnostic over a path they
+    // didn't write. CI catches stdlib breakage before release; this
+    // path is the in-development safety net for stdlib-author edits.
     let (tokens, lex_errs) = lexer::lex(module, &src);
-    errs.extend(lex_errs);
+    errs.extend(
+        lex_errs
+            .into_iter()
+            .map(|e| wrap_stdlib_error(e, &module_pretty)),
+    );
     let (subprog, parse_errs) = parser::parse(module, &tokens);
-    errs.extend(parse_errs);
+    errs.extend(
+        parse_errs
+            .into_iter()
+            .map(|e| wrap_stdlib_error(e, &module_pretty)),
+    );
 
     for sub_item in &subprog.items {
         if let Item::Import(decl) = sub_item {
@@ -323,6 +359,45 @@ mod tests {
         assert!(
             msg.contains("std.phantom_a"),
             "diagnostic should name the cycle-closing module; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn stdlib_lex_or_parse_failure_wraps_with_internal_framing() {
+        // When a synthetic stdlib module has a lex/parse failure,
+        // the propagated diagnostic must carry "internal compiler
+        // error in stdlib module `std.X`" framing so the user
+        // doesn't think it's their code. CI catches real stdlib
+        // breakage before release; this path is the safety-net for
+        // stdlib-author edits in development.
+        let get_source = |m: &str| match m {
+            "broken.sigil" => Some("@@!! not valid sigil ##^^\n".to_string()),
+            _ => None,
+        };
+        let user_src = "import std.broken\nfn main() -> Int ![] { 0 }\n";
+        let (toks, lex_errs) = lexer::lex("user.sigil", user_src);
+        assert!(lex_errs.is_empty(), "user lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parser::parse("user.sigil", &toks);
+        assert!(parse_errs.is_empty(), "user parse errs: {parse_errs:?}");
+        let (_resolved, errs) = resolve_with_source(prog, &get_source);
+        assert!(!errs.is_empty(), "broken stdlib should produce errors");
+        let any_internal_framed = errs.iter().any(|e| {
+            e.message
+                .contains("internal compiler error in stdlib module `std.broken`")
+        });
+        assert!(
+            any_internal_framed,
+            "at least one diagnostic should carry internal-stdlib framing; \
+             got: {errs:?}"
+        );
+        let any_with_hint = errs.iter().any(|e| {
+            e.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("compiler bug"))
+        });
+        assert!(
+            any_with_hint,
+            "wrapped diagnostics should carry the 'report at the sigil repo' hint"
         );
     }
 
