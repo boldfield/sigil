@@ -7758,6 +7758,42 @@ mod tests {
     }
 
     #[test]
+    fn perform_site_e_substitution_deferred_to_task_115() {
+        // Plan D Task 114 R1 — pin the v1 state of the deferred
+        // perform-site E-substitution gap. Today, `perform
+        // Raise.fail("wrong type")` under `![Raise[Int]]` does NOT
+        // fire E0044 even though `fail`'s declared signature is
+        // `(E) -> Int` and the row instantiates `E := Int`. The
+        // op signature is checked under the effect-decl's local
+        // generic_subst (built fresh per effect-decl pre-pass), so
+        // perform-site arg typing succeeds at op-level Ty::Var
+        // without the row-site substitution applied.
+        //
+        // **INVERT THIS TEST AT TASK 115 LANDING.** Task 115's
+        // per-op generic params (`fail[A]: (E) -> A`) close the
+        // gap by threading the row-site type-args + per-call
+        // instantiation through a single substitution at perform
+        // time. Once shipped, this assertion flips: `errs` should
+        // contain E0044 for the String-vs-Int arg mismatch.
+        //
+        // The test exists primarily as a closure-point trail —
+        // without it a future agent might silently close the gap
+        // and miss that the test corpus didn't cover the edge.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn risky() -> Int ![Raise[Int]] {\n  \
+                     perform Raise.fail(\"wrong type\")\n  \
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        // Document v1 behavior; NOT a correctness assertion.
+        // Marker for Task 115's closure point.
+        assert!(
+            errs.is_empty(),
+            "v1 perform-site E-substitution gap (Task 115 closes); got {errs:?}"
+        );
+    }
+
+    #[test]
     fn cross_fn_row_with_concrete_type_arg_unifies() {
         // Caller `![Raise[Int]]` calls callee declared `![Raise[Int]]`:
         // both sides carry the same `EffectInst { name: "Raise",
