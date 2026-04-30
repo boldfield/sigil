@@ -142,3 +142,27 @@ The full Task 65 (runtime + compiler integration + sigil source + tests) is a ~6
 **Failure mode.** Stage-7 progress is bottlenecked on part 2 — Tasks 66+ depend on a working `Array[A]` for some demo programs (sudoku.sigil uses `MutArray[Int]`). Part 2 is non-optional Plan C work, just sequenced after part 1.
 
 **Implementing commit(s).** [HEAD] runtime foundation; **part 2 PENDING** — to be shipped in a follow-up commit pair.
+
+## 2026-04-30 — [DEVIATION Task 66] `Mem` ships as a marker effect; MutArray ops are gated-by-row, not perform-dispatched
+
+**Context.** Plan C Task 66's plan-body wording — "`MutArray[A]` operations exposed through the `Mem` effect. Runtime support in `runtime/src/mem.rs`: in-place array mutation under the top-level `Mem` handler" — admits two implementation shapes:
+
+1. **Effect-dispatch shape.** `effect Mem { new_array_int: (Int, Int) -> MutArray, ... }` declared as a builtin; user calls `perform Mem.new_array_int(10, 0)`; the runtime arm fn for `Mem.new_array_int` allocates and returns. A top-level Mem handler frame in the main shim wires each op to a runtime arm fn (mirrors Plan B Task 57's IO + ArithError pattern).
+2. **Marker-effect shape.** `effect Mem { /* zero ops */ }` declared as a builtin; `MutArray[A]` is a builtin generic type alongside `Array[A]`; the four operations (`mut_array_new` / `_length` / `_get` / `_set`) are builtin generic functions whose effect rows declare `![Mem]`. Users in fns whose row includes `Mem` can call them; users without `Mem` in their row get E0042. No runtime Mem handler frame; no `perform` machinery.
+
+**Why accepted (marker-effect shape).** The effect-dispatch shape requires generic operations on a non-generic effect (`Mem.new_array_int` has return type `MutArray[A]` for the caller's `A`), which Sigil v1's effect declarations don't currently support cleanly — `effect Mem[A] { ops }` works syntactically per Plan B Task 53, but builtin_effects()'s shape is non-generic. Per-element-type op variants (`new_array_int`, `new_array_string`, ...) would balloon the effect surface and tie API ergonomics to the typechecker's primitive-type set.
+
+The marker-effect shape preserves every user-observable invariant Plan C cares about:
+
+- Code that mutates declares `![Mem]` in its row.
+- The compiler rejects mutation calls from rows that don't contain Mem (E0042).
+- `main` declares `![Mem]` to permit mutation; the type-level "top-level Mem handler" is the absence of a deeper override.
+- Runtime mutation primitives live in `runtime/src/mem.rs` per the plan.
+
+**What's lost.** Users cannot intercept Mem operations via `handle ... with { Mem.X(...) => ... }` — there are no Mem ops to intercept. A v2 path that ships `effect Mem[A] { ... }` (generic-effect builtin support) restores this. The handler-swap testing pattern Plan C documents in Stage 9's spec applies to user-declared effects (`Raise`, `State`, `Choose`); Mem mutations are intentionally non-overridable in v1, mirroring how `IO.println` wasn't user-overridable until Plan B Task 57's row-polymorphic refactor.
+
+**Closure path.** Closes when (a) `effect Mem[A] { new_array: (Int, A) -> MutArray[A], ... }` ships as a generic builtin effect, OR (b) Sigil grows per-op generic params `effect Mem { new_array[A]: (Int, A) -> MutArray[A], ... }`. Either path lets v2 swap Mem to true effect-dispatch shape without changing Plan C-era user code (call sites stay `mut_array_new(...)`; only the lowering changes).
+
+**Failure mode.** A v2 user trying to mock Mem via `handle ... with { Mem.new_array(args, k) => ... }` gets E0139 (unknown op on declared effect) until v2 ships generic Mem ops. Documented in `std/mut_array.sigil`.
+
+**Implementing commit(s).** [HEAD+1] (this commit lands the deviation; the next commit lands the implementation).
