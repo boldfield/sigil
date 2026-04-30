@@ -1,0 +1,88 @@
+// sigil: 0.1
+//
+// std/choose.sigil — Plan C Task 73.
+//
+// `Choose` is the canonical nondeterminism / backtracking effect:
+// a computation performs `Choose.choose(n)` to pick a value
+// 0..n-1, and `Choose.fail()` to abandon a branch. Multi-shot
+// handlers enumerate all branches (`all_choices`) or search for
+// the first non-failing leaf (`first_choice`).
+//
+// Compare to Koka / Effekt's `choose` / `flip` and the
+// Hutton-Wright list-of-successes backtracking monad.
+//
+// ## Usage (v1, inline handler)
+//
+// ```sigil
+// import std.choose
+//
+// fn pick_and_combine() -> Int ![Choose] {
+//   let a: Int = perform Choose.choose(2);
+//   a + 10
+// }
+//
+// fn main() -> Int ![IO] {
+//   let value: Int = handle pick_and_combine() with {
+//     Choose.choose(arg, k) => k(0),    // pick first
+//     Choose.fail(k) => 0,              // discard k on fail
+//   };
+//   perform IO.println(int_to_string(value));  // prints 10
+//   0
+// }
+// ```
+//
+// ## v1 design choices
+//
+// 1. **Effect declaration only; `all_choices` / `first_choice`
+//    dischargers are deferred to v2.** The plan body specifies:
+//
+//    ```text
+//    Choose resumes: many effect + all_choices, first_choice
+//    ```
+//
+//    Both dischargers require codegen surface that Sigil v1 doesn't
+//    provide. `all_choices(body) -> List[Int]` needs runtime-N
+//    multi-shot dispatch (invoking `k(0)`, `k(1)`, …, `k(arg-1)`
+//    where `arg` is the perform's runtime value); v1's arm-body
+//    recognizer `arm_body_n_let_then_pure_tail_shape` only accepts
+//    statically-fixed N let-chains of direct `k(arg_i)` calls.
+//    `first_choice(body) -> Option[Int]` additionally needs
+//    short-circuit semantics (`match k(0) { Some(v) => Some(v),
+//    None => k(1) }`), which v1's walker rejects as "computed
+//    conditional `k`-use" at codegen.rs:1591-1603. Both shapes
+//    require pulling first-class continuations forward from v2 — a
+//    multi-PR architectural slice (~4-8 weeks). See `[DEVIATION
+//    Task 73]` for the full closure path.
+//
+// 2. **`choose` and `fail` are non-generic.** Plan body's spec is
+//    `Choose resumes: many` — left implicit on the value type.
+//    Sigil v1's parser rejects type-parameterized effect references
+//    in rows (same constraint as Tasks 71/72). v1 ships
+//    `choose: (Int) -> Int` and `fail: () -> Int` (Int placeholder
+//    for fail per Plan B Task 57's `ArithError.div_by_zero`
+//    precedent — at runtime the perform never returns when fail is
+//    discharged via discard-k).
+//
+// 3. **No perform wrappers (`pick(n)` / `fail_choice()`).**
+//    Wrapper functions would introduce a function-call frame
+//    between the user's call site and the perform. Task 72 (PR #45
+//    CI) discovered that wrapper-fn frames break the discharge-with-
+//    lambda pattern that multi-shot Choose handlers need; until v2
+//    closes the wrapper-fn-frame composition gap (see Plan B'
+//    Stage-6.8-followup architectural carryovers in
+//    PLAN_C_PROGRESS.md), wrappers around `perform Choose.X` are a
+//    footgun. Users do `perform Choose.choose(n)` /
+//    `perform Choose.fail()` directly. v2 ships wrappers as an
+//    additive ergonomic layer once the discharge-side gap closes.
+//
+// 4. **`resumes: many` annotation despite no v1 multi-shot
+//    discharger.** The annotation matches the plan body's
+//    `Choose resumes: many` and keeps the effect-declaration
+//    surface stable across the v1 → v2 shift: when v2 ships the
+//    multi-shot dischargers, the same effect declaration consumes
+//    them without a breaking change.
+
+effect Choose resumes: many {
+  choose: (Int) -> Int,
+  fail: () -> Int,
+}

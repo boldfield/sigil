@@ -7039,6 +7039,65 @@ fn std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix() {
     );
 }
 
+// ===== Plan C Task 73 — Choose effect (decl-only) =====
+//
+// Per `[DEVIATION Task 73]`, std/choose.sigil ships the effect
+// declaration only — `all_choices` / `first_choice` dischargers
+// require first-class continuations / runtime-N multi-shot dispatch
+// that v1's arm-body recognizer doesn't accept. Users handle Choose
+// inline with single-shot semantics (pick a fixed value via `k(0)`)
+// or via discard-`k` for `fail`. The two tests below pin those
+// modes end-to-end.
+
+/// Inline single-shot handler that always picks 0 from `Choose.choose(arg)`.
+/// Body is `perform Choose.choose(7) + 10`, so resuming with 0
+/// yields 10. Confirms the v1 effect declaration compiles and
+/// dispatches through the existing tail-position k-call lowering
+/// (no multi-shot resume; this is the "discharge by always picking
+/// first" baseline).
+#[test]
+fn std_choose_inline_first_pick_returns_10() {
+    let src = "import std.choose\n\
+               fn pick_then_add() -> Int ![Choose] {\n  \
+                 let v: Int = perform Choose.choose(7);\n  \
+                 v + 10\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = handle pick_then_add() with {\n    \
+                   Choose.choose(arg, k) => k(0),\n    \
+                   Choose.fail(k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_inline_first");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "10\n", "stderr={stderr:?}");
+}
+
+/// `Choose.fail()` discharged via discard-`k`. Body unconditionally
+/// fails; the fail arm returns -1 without resuming, and the result
+/// flows out as the handle expression's value. Confirms the
+/// fail/discard-k path matches Raise's catch-shape precedent.
+#[test]
+fn std_choose_inline_fail_returns_minus_one() {
+    let src = "import std.choose\n\
+               fn always_fail() -> Int ![Choose] {\n  \
+                 perform Choose.fail()\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = handle always_fail() with {\n    \
+                   Choose.choose(arg, k) => k(0),\n    \
+                   Choose.fail(k) => 0 - 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_inline_fail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "-1\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration
