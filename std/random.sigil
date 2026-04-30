@@ -1,0 +1,50 @@
+// sigil: 0.1
+//
+// std/random.sigil — Plan C Task 75.
+//
+// `Random` is a user-declared effect with a single op,
+// `rand_int() -> Int`. The stdlib ships an OS-entropy handler
+// (`run_os_random`) that delegates to `random_os_int` (a runtime
+// builtin reading from a process-global xorshift64 PRNG seeded once
+// from the system clock).
+//
+// ## Design notes
+//
+// - `Int` is sigil's i64 (with the high bit reserved at the runtime
+//   Value level). The builtin `random_os_int` returns a 63-bit
+//   non-negative int. Users wanting a smaller range mod the result
+//   themselves: `random_int_below(n) = random_int() % n`.
+//
+// - The plan body specifies a `seeded(Int64)` handler that installs
+//   a deterministic PRNG. That handler is **deferred to a Task 75
+//   follow-up** alongside Task 69 (Int64). The closure-skeleton
+//   below shows what the implementation would look like; it
+//   compiles in v1 *if* the user supplies their own state-update
+//   logic via `MutArray[Int]` from `![Mem]` — but ergonomic
+//   handler-arm-with-mutation patterns are part of the v2
+//   namespace + multi-statement-arm-body lifts.
+
+effect Random {
+  rand_int: () -> Int,
+}
+
+// `random_int()` is the user-facing convenience wrapper. Inside
+// any function whose effect row contains `Random`, `random_int()`
+// performs the effect and returns whatever value the active
+// handler resumes with.
+fn random_int() -> Int ![Random] {
+  perform Random.rand_int()
+}
+
+// `run_os_random(body)` discharges the `Random` effect using the
+// process-global OS-entropy PRNG. Every `Random.rand_int(k)` arm
+// resumes `k` with a fresh `random_os_int()` value.
+//
+// Higher-order helpers like this depend on Plan B' B.3 (TypeExpr::Fn
+// in parameter types) and B.4 (lambdas / generic callees inside
+// arm bodies) — both shipped in PR #39's run_state landing.
+fn run_os_random[A](body: () -> A ![Random]) -> A ![] {
+  handle body() with {
+    Random.rand_int(k) => k(random_os_int()),
+  }
+}

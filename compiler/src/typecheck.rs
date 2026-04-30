@@ -1539,6 +1539,14 @@ fn register_builtin_string_schemes(tc: &mut Tc) {
         "string_length".to_string(),
         make_scheme(vec![Ty::String], Ty::Int),
     );
+    // Plan C Task 75 — OS-entropy random Int. Used by the
+    // `os_random` handler in `std/random.sigil`.
+    tc.fn_schemes
+        .insert("random_os_int".to_string(), make_scheme(vec![], Ty::Int));
+    // Plan C Task 76 — OS clock (nanos since epoch). Used by the
+    // `os_clock` handler in `std/clock.sigil`.
+    tc.fn_schemes
+        .insert("clock_os_now".to_string(), make_scheme(vec![], Ty::Int));
 }
 
 struct Tc {
@@ -9953,6 +9961,66 @@ mod tests {
         assert!(
             has_code(&errs, "E0042"),
             "expected E0042 (missing IO in row); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 75 — Random effect =====
+
+    #[test]
+    fn import_std_random_typechecks_cleanly() {
+        // Loads the Random effect declaration + `random_int()` +
+        // `run_os_random` higher-order helper. Exercises the
+        // typechecker's user-effect handling path for a stdlib-
+        // declared effect with a tail-`k` resume arm.
+        let src = "import std.random\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let n: Int = run_os_random(random_int);\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn random_int_without_random_in_row_fires_e0042() {
+        let src = "import std.random\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let _n: Int = random_int();\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (missing Random in row); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 76 — Clock effect =====
+
+    #[test]
+    fn import_std_clock_typechecks_cleanly() {
+        let src = "import std.clock\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let t: Int = run_os_clock(now);\n  \
+                     perform IO.println(int_to_string(t));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn now_without_clock_in_row_fires_e0042() {
+        let src = "import std.clock\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let _t: Int = now();\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (missing Clock in row); got {errs:?}"
         );
     }
 
