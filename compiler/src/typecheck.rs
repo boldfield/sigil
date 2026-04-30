@@ -334,7 +334,24 @@ impl Subst {
                         .map(|p| self.apply_ty_inner(p, seen))
                         .collect(),
                     ret: self.apply_ty_inner(&sig.ret, seen),
-                    effects: sig.effects.clone(),
+                    // Plan D Stage 12 R3 — apply substitution to
+                    // each EffectInst's args. Without this, a row
+                    // carrying `Raise[Var(N)]` survives subst
+                    // application unchanged even after Var(N) was
+                    // bound — symmetric with rename_ty's Stage 12
+                    // fix for scheme instantiation.
+                    effects: sig
+                        .effects
+                        .iter()
+                        .map(|ei| EffectInst {
+                            name: ei.name.clone(),
+                            args: ei
+                                .args
+                                .iter()
+                                .map(|a| self.apply_ty_inner(a, seen))
+                                .collect(),
+                        })
+                        .collect(),
                     effect_row_var: sig.effect_row_var,
                 };
                 let resolved = self.apply_row_to_sig(new_sig, seen);
@@ -377,7 +394,23 @@ impl Subst {
     }
 
     fn apply_row_inner(&self, r: &Row, seen: &mut std::collections::BTreeSet<u32>) -> Row {
-        let mut effects = r.effects.clone();
+        // Plan D Stage 12 R3 — apply substitution to each
+        // EffectInst's args. Without this, a row carrying
+        // `Raise[Var(N)]` survives subst application unchanged
+        // even after Var(N) was bound elsewhere. Symmetric with
+        // `apply_ty_inner`'s Ty::Fn fix.
+        let mut effects: Vec<EffectInst> = r
+            .effects
+            .iter()
+            .map(|ei| EffectInst {
+                name: ei.name.clone(),
+                args: ei
+                    .args
+                    .iter()
+                    .map(|a| self.apply_ty_inner(a, seen))
+                    .collect(),
+            })
+            .collect();
         let mut tail = r.tail;
         while let Some(id) = tail {
             if seen.contains(&id) {
@@ -387,7 +420,18 @@ impl Subst {
                 None => break,
                 Some(resolved) => {
                     seen.insert(id);
-                    effects.extend(resolved.effects.iter().cloned());
+                    // Apply subst to args of resolved-row's effects
+                    // too — same reason.
+                    for ei in &resolved.effects {
+                        effects.push(EffectInst {
+                            name: ei.name.clone(),
+                            args: ei
+                                .args
+                                .iter()
+                                .map(|a| self.apply_ty_inner(a, seen))
+                                .collect(),
+                        });
+                    }
                     tail = resolved.tail;
                 }
             }
@@ -2555,6 +2599,10 @@ impl Tc {
         // pair gets unified — rest fall through to only_a/only_b.
         let mut only_a: Vec<EffectInst> = Vec::new();
         let mut matched_b: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        // Plan D Stage 12 R3 — thread unify_ty's bool through; a
+        // false from arg-unification is a real error and the
+        // overall unify_row return must reflect it.
+        let mut args_ok = true;
         for ea in &a.effects {
             match b
                 .effects
@@ -2566,8 +2614,29 @@ impl Tc {
                     matched_b.insert(idx);
                     if ea.args.len() == eb.args.len() {
                         for (ax, bx) in ea.args.iter().zip(eb.args.iter()) {
-                            self.unify_ty(ax, bx, span);
+                            if !self.unify_ty(ax, bx, span) {
+                                args_ok = false;
+                            }
                         }
+                    } else {
+                        // Arg-arity mismatch between two same-named
+                        // effect references in the same row — this
+                        // is a real error, not graceful recovery.
+                        // E0143 catches it at the row-decl site;
+                        // here we surface a row-level diagnostic so
+                        // the user sees the inconsistency.
+                        self.push_error(
+                            "E0128",
+                            span.clone(),
+                            format!(
+                                "effect `{}` is referenced with {} type arg(s) on one side and {} on the other in the same unification — \
+                                 the effect-decl's generic-param count must match consistently across both rows",
+                                ea.name,
+                                ea.args.len(),
+                                eb.args.len(),
+                            ),
+                        );
+                        args_ok = false;
                     }
                 }
                 None => only_a.push(ea.clone()),
@@ -2595,7 +2664,7 @@ impl Tc {
                     );
                     return false;
                 }
-                true
+                args_ok
             }
             (None, Some(b_tail)) => {
                 // a closed, b open: a's effects must cover b's
@@ -2620,7 +2689,7 @@ impl Tc {
                         tail: None,
                     },
                     span,
-                )
+                ) && args_ok
             }
             (Some(a_tail), None) => {
                 if !only_a.is_empty() {
@@ -2643,7 +2712,7 @@ impl Tc {
                         tail: None,
                     },
                     span,
-                )
+                ) && args_ok
             }
             (Some(a_tail), Some(b_tail)) if a_tail == b_tail => {
                 if !only_a.is_empty() || !only_b.is_empty() {
@@ -2658,7 +2727,7 @@ impl Tc {
                     );
                     return false;
                 }
-                true
+                args_ok
             }
             (Some(a_tail), Some(b_tail)) => {
                 let fresh = self.fresh_row_var();
@@ -2678,7 +2747,7 @@ impl Tc {
                     },
                     span,
                 );
-                ok_a && ok_b
+                ok_a && ok_b && args_ok
             }
         }
     }
@@ -2704,6 +2773,8 @@ impl Tc {
         let mut missing: Vec<EffectInst> = Vec::new();
         let mut matched_caller: std::collections::BTreeSet<usize> =
             std::collections::BTreeSet::new();
+        // Plan D Stage 12 R3 — thread unify_ty's bool through.
+        let mut args_ok = true;
         for ce in &callee.effects {
             match caller
                 .effects
@@ -2715,8 +2786,26 @@ impl Tc {
                     matched_caller.insert(idx);
                     if ce.args.len() == ec.args.len() {
                         for (ax, bx) in ce.args.iter().zip(ec.args.iter()) {
-                            self.unify_ty(ax, bx, span);
+                            if !self.unify_ty(ax, bx, span) {
+                                args_ok = false;
+                            }
                         }
+                    } else {
+                        // Arg-arity mismatch between same-named
+                        // effect refs in callee vs caller — real
+                        // error, not graceful recovery.
+                        self.push_error(
+                            "E0042",
+                            span.clone(),
+                            format!(
+                                "calling a function whose `{}` row entry has {} type arg(s) requires the enclosing function's `{}` row entry to have the same arity (got {})",
+                                ce.name,
+                                ce.args.len(),
+                                ce.name,
+                                ec.args.len(),
+                            ),
+                        );
+                        args_ok = false;
                     }
                 }
                 None => missing.push(ce.clone()),
@@ -2757,9 +2846,9 @@ impl Tc {
                     tail: caller.tail,
                 },
                 span,
-            )
+            ) && args_ok
         } else {
-            true
+            args_ok
         }
     }
 
@@ -4552,13 +4641,36 @@ impl Tc {
         // apply for downstream call-site subsumption.
         // Plan D Task 114 — body_row is a row over `EffectInst`,
         // not bare names. Discharged effects from `handle X.op =>
-        // ...` enter the body row as bare-name `EffectInst`s
-        // (surface `handle` has no type-arg form yet — Phase 114d
-        // / Task 115 territory; for now bare names only).
+        // ...` enter the body row.
+        //
+        // Plan D Stage 12 R3 — when the discharged effect-decl is
+        // generic (`effect Raise[E] { ... }`), use the active
+        // handler subst (`effect_substs[name]`) to recover the
+        // type-args at the discharge site. The handler arm's
+        // op-typing code (lines 4347-4361 area) already allocated
+        // these substs; reusing them here ensures the body row's
+        // discharged `Raise[E_var]` matches body's expected
+        // `Raise[E_body_var]` via subsume_row's arg unification.
+        // Falls back to bare-name (`EffectInst::bare`) when no
+        // generic_params declared — preserves the pre-Stage-12
+        // behavior for non-generic effects (`IO`, `Mem`).
         let mut body_row: Vec<EffectInst> = row.to_vec();
         for e in &discharged {
             if !body_row.iter().any(|inst| inst.name == *e) {
-                body_row.push(EffectInst::bare(e));
+                let args: Vec<Ty> = match (
+                    self.effects.get(e).map(|d| d.generic_params.clone()),
+                    effect_substs.get(e),
+                ) {
+                    (Some(gps), Some(subst)) if !gps.is_empty() => gps
+                        .iter()
+                        .map(|gp| subst.get(&gp.name).cloned().unwrap_or(Ty::Unit))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                body_row.push(EffectInst {
+                    name: e.clone(),
+                    args,
+                });
             }
         }
         // Push handler scope for this body's `perform` sites.
@@ -8160,6 +8272,39 @@ mod tests {
         assert!(
             errs.is_empty(),
             "cross-fn row `![Raise[Int]]` should unify; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn subsume_row_arg_arity_mismatch_fires_e0042() {
+        // Plan D Stage 12 R3 regression — subsume_row's name-match
+        // arg-unify path used to silently skip when arg-counts
+        // differed. Now it fires E0042 with an arity-mismatch
+        // message. This pin locks the behavior so a future
+        // contributor doesn't accidentally restore the silent
+        // skip (which had a soundness hole — discharged effects
+        // could match no-args body_row entries against args-bearing
+        // body rows without binding anything).
+        //
+        // Reaching this from surface code requires constructing a
+        // row mismatch at typecheck time. We exercise it via a
+        // direct unit test of subsume_row.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("x.sigil");
+        let callee = Row::closed(vec![EffectInst {
+            name: "Raise".to_string(),
+            args: vec![Ty::Int],
+        }]);
+        let caller = Row::closed(vec![EffectInst {
+            name: "Raise".to_string(),
+            args: Vec::new(),
+        }]);
+        let ok = tc.subsume_row(&callee, &caller, &span);
+        assert!(!ok, "arg-arity mismatch must fail subsumption");
+        assert!(
+            has_code(&tc.errors, "E0042"),
+            "expected E0042 (arg-arity mismatch); got {:?}",
+            tc.errors
         );
     }
 

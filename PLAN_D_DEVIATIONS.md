@@ -286,19 +286,45 @@ Task 114 had a deferred gap: at `perform Raise.fail("wrong type")` under `![Rais
 - `[DEVIATION Task 72]` — constraints #1, #2, #4, #5 **Closed** by Tasks 114, 113, 115, 116. Constraint #3 (wrapper-fn-frame) stays **Deferred** per Plan D Task 112; closure path is Task 117 follow-up.
 - `[DEVIATION Task 73]` — constraints #1, #5, #6 **Closed**; #2, #3, #4 (multi-shot codegen) stay open, addressed by Tasks 117/118.
 
-**Item 4 — Stdlib migration: deferred to Plan C completion** (with new gap surfaced).
+**Item 4 — Stdlib migration: std/raise.sigil shipped; std/state + std/result deferred to Plan C completion.**
 
-Migration of std/raise.sigil to `effect Raise[E] { fail[A]: (E) -> A }` + row-poly catch was attempted in this session and surfaced an additional **handler-discharge type-arg propagation gap** not flagged by Tasks 114-116's typecheck-level test corpus:
+The first commit of this PR took the conservative interpretation of the plan-overview separation and deferred the entire stdlib migration. R1 reviewer pushed back: *"you didn't include the stdlib migration"*. R2 review accepted std/raise as in-scope (the plan body asks "Are stdlibs updated to use the now-expressible generic shapes?" as a Stage 12 review criterion); the migration ships in this PR. std/state + std/result remain deferred — both have additional shape considerations (state's discharge-with-lambda pattern under generic E + tuple return; result's existing surface needs only a verification pass not a migration).
 
-**Symptom**: `fn catch[A, E](body: () -> A ![Raise[E] | e]) -> Result[A, E] ![| e] { handle Ok(body()) with { Raise.fail(e, k) => Err(e) } }` fails to typecheck. Inside the handle, the body row should be `caller_row + discharged_effects`. Today `discharged: Vec<String>` (just names) — when pushed into the body row, the discharged `Raise` becomes `EffectInst::bare("Raise")` (empty args). When `body()` is called inside the handle, body's row `![Raise[E] | e]` doesn't subsume the body row's `![Raise + e_caller]` because the structural EffectInst diff (Task 114) sees `Raise[E]` ≠ `Raise` (no args).
+**What shipped in this PR for std/raise**:
 
-**Root cause**: handler arms match by name only (`Raise.fail` references `Raise`, not `Raise[E]`). When discharging a generic effect-decl, the type-args have to come from somewhere. Two candidate sources: (a) infer from body's expected type (the handle's body argument has a known type with E concrete in the surrounding fn's context); (b) require explicit syntax (`handle X.op[Type] => ...`).
+- `effect Raise[E] { fail[A]: (E) -> A }` — generic over error type E (Plan D Task 114) + per-op return-type generic A (Plan D Task 115).
+- `raise[A, E](e: E) -> A ![Raise[E]]` — fully polymorphic.
+- `catch[A, E](body: () -> A ![Raise[E] | e]) -> Result[A, E] ![| e]` — row-polymorphic via the outer fn's `effect_row_var` (Plan D Task 116).
+- 5 e2e tests + 3 typecheck tests updated from `![Raise]` to `![Raise[String]]`.
+- 2 example files migrated (`examples/catch.sigil`, `examples/interpreter.sigil`).
+- `raise_int_return_in_string_returning_fn_fires_e0044_v1_gap_pin` inverted to `_typechecks_post_task_115` — the v1 gap is closed.
 
-**Closure path**: a follow-up typecheck refinement that, at handle-expression entry, walks the handle body's expected type to find the discharged effect's instantiation and uses those args when extending body_row. Estimated 1-2 typecheck.rs sites + regression test corpus.
+**Three architectural gaps surfaced + fixed during the migration:**
 
-**Why deferred to Plan C completion**: the plan body's Plan-D-vs-Plan-C-completion separation puts stdlib migrations in Plan C completion. The handler-discharge gap is a fresh finding that wasn't on Plan D's task list; closing it requires its own design + implementation cycle. Plan C completion's stdlib migration PR will batch (a) the handler-discharge fix, (b) std/raise.sigil migration, (c) std/state.sigil migration to `(A, S)` tuple-return + generic E + row-poly run_state, (d) std/result.sigil verification.
+1. **Handler-discharge type-arg propagation** (initially documented as deferred, now fixed). `Tc::check_handle` pushed bare-name `EffectInst::bare(e)` into body_row at the discharge site, losing the discharged effect's instantiation. **Fix**: at the discharge site, look up the effect-decl's `generic_params` and use the active handler subst (`effect_substs[name]`) to recover the args. The handler arm's existing op-typing already allocates these substs; reusing them ensures the body row's `Raise[E_var]` matches body's expected `Raise[E_body_var]` via subsume_row's arg unification. Falls back to bare-name (no args) when the effect-decl declares no generic_params — preserves pre-Stage-12 behavior for non-generic effects (`IO`, `Mem`).
 
-**Stage 12 sign-off**. ✅ Tasks 113/114/115/116 + closure-path edits land; stdlib migration deferred per the plan-overview separation. Stage 12 is complete from Plan D's perspective.
+2. **`Tc::rename_ty` Ty::Fn arm didn't rename Ty::Var ids inside EffectInst args.** At scheme instantiation, a row carrying `Raise[E]` left `Var(E_decl_id)` unrenamed; the fresh `Var(E_fresh)` from arg unification was disconnected from the row. **Fix**: rename_ty now walks each EffectInst's args with the same ty_map.
 
-**Implementing commit(s).** This entry + Tasks 71/72/73 closure-path updates in PLAN_C_DEVIATIONS.md. PR `plan-d-stage-12-checkpoint`.
+3. **`Subst::apply_ty` and `Subst::apply_row` cloned EffectInst args without applying the substitution.** Symmetric with #2 but at substitution-application sites instead of scheme-instantiation sites. Without this, `apply_ty(Ty::Fn(.. effects: [Raise[Var(N)]] ..))` returned the row with `Var(N)` still unbound even after the unifier bound it elsewhere. **Fix**: both sites now walk EffectInst args via `apply_ty_inner`.
+
+**`unify_row` / `subsume_row` rewrite — name-based matching with arg unification.**
+
+The structural EffectInst-equality diff (Task 114) was correct for concrete-args rows but wrong for Ty::Var-bearing rows: `Raise[Var(N)]` and `Raise[Concrete]` should unify N := Concrete, not error out. The rewrite matches by name first, then unifies args pairwise via `unify_ty`. R3 reviewer flagged that the original silent-skip-on-arity-mismatch was a soundness hole; fixed: arg-arity mismatch now fires E0042 (subsume_row) / E0128 (unify_row) with explicit arity-mismatch messages.
+
+`unify_row` and `subsume_row` thread `unify_ty`'s bool return through to the overall return value — a false from arg-unification (E0044) now fails the row check, not just pushes the error and returns true.
+
+**Diagnostic shape change**: `cross_fn_row_with_distinct_type_args` (Raise[Int] caller calling Raise[String] callee) previously fired E0042 ("row mismatch"); now fires E0044 ("Int vs String type mismatch") at the arg-unification step. The new diagnostic is more precise (points at which arg type is wrong rather than just "row mismatch"). E0042 catalog entry kept as-is — it still fires for the missing-effect case and the new arg-arity-mismatch case at subsume_row.
+
+**Stage 12 sign-off**. ✅ Tasks 113/114/115/116 + closure-path edits + std/raise migration + handler-discharge / scheme-rename / subst-application gap fixes land. std/state + std/result migrations remain deferred to Plan C completion (state needs the lambda-discharge under generic E exercise; result needs only verification).
+
+**Estimated cost reconciliation** (R2 reviewer noted "1-2 sites" was an underestimate). Actual: 4 sites + ~150 lines:
+- `apply_ty_inner` Ty::Fn arm — args walking.
+- `apply_row_inner` — args walking on r.effects + resolved-row chain.
+- `rename_ty` Ty::Fn arm — args renaming.
+- `unify_row` / `subsume_row` — name-match-with-arg-unify rewrite.
+- `check_handle` — discharge-site EffectInst-with-args push.
+
+The original 1-2 sites estimate was based on a "discharge site only" closure path; the actual fix needed substitution / renaming / row-matching to compose correctly. This pattern (changes at multiple typing layers had to land together) recurred across Tasks 114/115/116 R1 reviews; the cost-estimation lesson is real.
+
+**Implementing commit(s).** This entry + Tasks 71/72/73 closure-path updates in PLAN_C_DEVIATIONS.md + std/raise.sigil migration + handler-discharge/scheme-rename/subst-application fixes. PR `plan-d-stage-12-checkpoint`.
 
