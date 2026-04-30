@@ -46,7 +46,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use cranelift::codegen::ir::{
-    condcodes::IntCC, AbiParam, BlockArg, FuncRef, GlobalValue, Inst, Signature, UserFuncName,
+    condcodes::IntCC, AbiParam, BlockArg, FuncRef, GlobalValue, Inst, Signature, StackSlot,
+    UserFuncName,
 };
 use cranelift::codegen::isa;
 use cranelift::codegen::settings;
@@ -6609,8 +6610,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
-                    last_terminal_value_var: None,
-                    last_terminal_tag_var: None,
+                    last_terminal_slot: None,
                 };
 
                 // Phase 5 — lower perform args via Lowerer; pack
@@ -6776,8 +6776,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_frame_ptr_v: None,
                 arm_k_pair_self: cc.arm_k_pair_captures.get(&f.name).cloned(),
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
-                last_terminal_value_var: None,
-                last_terminal_tag_var: None,
+                last_terminal_slot: None,
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -7246,8 +7245,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: frame_ptr_v,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
-                    last_terminal_value_var: None,
-                    last_terminal_tag_var: None,
+                    last_terminal_slot: None,
                 };
 
                 // Plan B Task 55 (Phase 4d): route between the two
@@ -7937,8 +7935,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
-                    last_terminal_value_var: None,
-                    last_terminal_tag_var: None,
+                    last_terminal_slot: None,
                 };
 
                 let body_value = lowerer.lower_expr(&synth.body);
@@ -8169,8 +8166,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_frame_ptr_v: None,
                 arm_k_pair_self: None,
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
-                last_terminal_value_var: None,
-                last_terminal_tag_var: None,
+                last_terminal_slot: None,
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
@@ -8439,8 +8435,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_frame_ptr_v: None,
                         arm_k_pair_self: None,
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
-                        last_terminal_value_var: None,
-                        last_terminal_tag_var: None,
+                        last_terminal_slot: None,
                     };
 
                     match &step.role {
@@ -9071,8 +9066,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             arm_frame_ptr_v: None,
                             arm_k_pair_self: None,
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
-                            last_terminal_value_var: None,
-                            last_terminal_tag_var: None,
+                            last_terminal_slot: None,
                         };
 
                         match role {
@@ -9694,23 +9688,32 @@ struct Lowerer<'a, 'b> {
     /// `last_terminal_tag_var` Cranelift Variables for the handle
     /// expression's outer logic to read at handle exit.
     run_loop_ref: FuncRef,
-    /// Plan D Task 111 — Cranelift `Variable` holding the most-recent
-    /// `sigil_run_loop` terminal value. Lazy-allocated on first
-    /// `Expr::Handle` (or first run_loop emit) within this fn body;
-    /// def-stored on each run_loop call site, def-reset to `0` at
-    /// each handle entry, use-read at handle exit's discharge_block.
-    /// Replaces the prior `LAST_TERMINAL_VALUE` TLS-out-channel with
-    /// a function-frame-local SSA variable so the runtime carries no
-    /// global state for terminal tracking.
-    last_terminal_value_var: Option<Variable>,
-    /// Plan D Task 111 — Cranelift `Variable` holding the most-recent
-    /// `sigil_run_loop` terminal tag (I32, narrowed from the I64
-    /// return). Lazy-allocated alongside `last_terminal_value_var`;
-    /// def-stored from the run_loop multi-return's second result,
-    /// def-reset to `NEXT_STEP_TAG_DONE` at each handle entry,
-    /// use-read at handle exit to drive the discharged-vs-done
-    /// branch.
-    last_terminal_tag_var: Option<Variable>,
+    /// Plan D Task 111 — per-fn 16-byte stack slot mirroring the
+    /// runtime's `TerminalResult { value: u64, tag: u64 }` layout.
+    /// Field offsets (0 for value, 8 for tag) are the canonical
+    /// contract; the slot's pointer is passed as `sigil_run_loop`'s
+    /// out-pointer parameter, so run_loop writes the terminal pair
+    /// directly into this slot. Reads at handle exit use
+    /// `stack_load(I64, slot, 0)` (value) and `stack_load(I64, slot,
+    /// 8)` (tag, narrowed to I32 for `NEXT_STEP_TAG_*` comparisons).
+    /// Reset at handle entry: `stack_store(0, slot, 0)` and
+    /// `stack_store(NEXT_STEP_TAG_DONE, slot, 8)`.
+    ///
+    /// Lazy-allocated on first call to `last_terminal_slot()`;
+    /// subsequent calls return the cached slot.
+    ///
+    /// **Why `StackSlot` instead of Cranelift `Variable`.** Per
+    /// `[DEVIATION Task 111]`: name-based `Variable` plumbing
+    /// (def_var/use_var) failed under control-flow shapes where some
+    /// paths to the post-handle `use_var` did not pass through the
+    /// run_loop's `def_var`. Cranelift's frontend SSA fills phi-
+    /// nodes only when every reachable path has a def — when the
+    /// body's IR has paths that don't hit `emit_run_loop_and_capture`,
+    /// the post-handle read sees the lazy-init's `(0, DONE)` and
+    /// takes the wrong branch. Stack slots sidestep the issue
+    /// entirely: reads/writes are explicit memory operations, no
+    /// dominance constraints.
+    last_terminal_slot: Option<StackSlot>,
     /// Plan B Task 55 (Phase 3b) — per-handle-span synthetic arm fn
     /// refs. Used by `Expr::Handle` codegen to emit `func_addr`
     /// pointers for `sigil_handler_frame_set_arm`. Keyed by the
@@ -9911,79 +9914,96 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// `reset_last_terminal_vars` to restore this state — without
     /// that reset, a second handle would observe the prior handle's
     /// last run_loop terminal.
-    fn last_terminal_vars(&mut self) -> (Variable, Variable) {
-        if let (Some(val_var), Some(tag_var)) =
-            (self.last_terminal_value_var, self.last_terminal_tag_var)
-        {
-            return (val_var, tag_var);
+    fn last_terminal_slot(&mut self) -> StackSlot {
+        if let Some(slot) = self.last_terminal_slot {
+            return slot;
         }
-        let val_var = self.builder.declare_var(types::I64);
-        let tag_var = self.builder.declare_var(types::I32);
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            16,
+            3,
+        ));
         let zero = self.builder.ins().iconst(types::I64, 0);
-        self.builder.def_var(val_var, zero);
+        self.builder.ins().stack_store(zero, slot, 0);
         let done_tag = self
             .builder
             .ins()
-            .iconst(types::I32, sigil_abi::effect::NEXT_STEP_TAG_DONE as i64);
-        self.builder.def_var(tag_var, done_tag);
-        self.last_terminal_value_var = Some(val_var);
-        self.last_terminal_tag_var = Some(tag_var);
-        (val_var, tag_var)
+            .iconst(types::I64, sigil_abi::effect::NEXT_STEP_TAG_DONE as i64);
+        self.builder.ins().stack_store(done_tag, slot, 8);
+        self.last_terminal_slot = Some(slot);
+        slot
     }
 
-    /// Plan D Task 111 — emit `def_var` to reset the last-terminal
-    /// `(value, tag)` Variables to `(0, NEXT_STEP_TAG_DONE)`. Called
-    /// at each `Expr::Handle` entry (replaces the prior
+    /// Plan D Task 111 — emit `stack_store` to reset the
+    /// last-terminal slot to `(0, NEXT_STEP_TAG_DONE)`. Called at
+    /// each `Expr::Handle` entry (replaces the prior
     /// `sigil_reset_last_terminal_tag` / `_value` FFI calls). The
     /// reset ensures handles whose bodies never invoke
     /// `sigil_run_loop` see a clean DONE state at handle exit
     /// instead of inheriting the prior handle's terminal.
-    fn reset_last_terminal_vars(&mut self) {
-        let (val_var, tag_var) = self.last_terminal_vars();
+    fn reset_last_terminal_slot(&mut self) {
+        let slot = self.last_terminal_slot();
         let zero = self.builder.ins().iconst(types::I64, 0);
-        self.builder.def_var(val_var, zero);
+        self.builder.ins().stack_store(zero, slot, 0);
         let done_tag = self
             .builder
             .ins()
-            .iconst(types::I32, sigil_abi::effect::NEXT_STEP_TAG_DONE as i64);
-        self.builder.def_var(tag_var, done_tag);
+            .iconst(types::I64, sigil_abi::effect::NEXT_STEP_TAG_DONE as i64);
+        self.builder.ins().stack_store(done_tag, slot, 8);
     }
 
-    /// Plan D Task 111 — emit a `sigil_run_loop(initial_step, out)`
-    /// call against the per-fn last-terminal slot, capture the
-    /// `(value, tag)` pair into the per-fn last-terminal Variables,
-    /// and return the value half so callers can use it as the body's
-    /// natural return value (exactly like the prior single-u64-return
-    /// shape).
+    /// Plan D Task 111 — emit a `sigil_run_loop(initial_step,
+    /// last_terminal_slot_ptr)` call. The runtime writes `(value,
+    /// tag)` directly into the per-fn last-terminal slot before
+    /// returning. After the call, read the value half via
+    /// `stack_load(I64, slot, 0)` and return it so the caller can
+    /// use it as the body's natural return value (exactly like the
+    /// prior single-u64-return shape). Tag reads are deferred to
+    /// the handle expression's outer logic via
+    /// `last_terminal_tag_value()`.
     ///
     /// Replaces the prior runtime-side TLS write + 4 FFI-helper
     /// queries. The `TerminalResult` struct's field offsets (0 for
     /// value, 8 for tag) are the canonical contract; the runtime's
     /// definition in `runtime/src/handlers.rs` is the authoritative
     /// cross-reference.
+    ///
+    /// **Why per-fn `StackSlot` instead of Cranelift `Variable`.**
+    /// See `[DEVIATION Task 111]`: name-based Variable plumbing
+    /// (def_var/use_var) failed under control-flow shapes where some
+    /// paths to the post-handle `use_var` did not pass through the
+    /// run_loop's `def_var`. Stack slots sidestep the issue
+    /// entirely: reads/writes are explicit memory operations, no
+    /// dominance constraints, no φ-node placement.
     fn emit_run_loop_and_capture(&mut self, ns_ptr: Value) -> Value {
-        let result_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            16,
-            3,
-        ));
-        let result_ptr = self
-            .builder
-            .ins()
-            .stack_addr(self.pointer_ty, result_slot, 0);
+        let slot = self.last_terminal_slot();
+        let slot_ptr = self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
         let run_loop_call = self
             .builder
             .ins()
-            .call(self.run_loop_ref, &[ns_ptr, result_ptr]);
+            .call(self.run_loop_ref, &[ns_ptr, slot_ptr]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-        let body_val = self.builder.ins().stack_load(types::I64, result_slot, 0);
-        let tag_i64 = self.builder.ins().stack_load(types::I64, result_slot, 8);
-        let tag_i32 = self.builder.ins().ireduce(types::I32, tag_i64);
-        let (val_var, tag_var) = self.last_terminal_vars();
-        self.builder.def_var(val_var, body_val);
-        self.builder.def_var(tag_var, tag_i32);
-        body_val
+        self.builder.ins().stack_load(types::I64, slot, 0)
+    }
+
+    /// Plan D Task 111 — read the last-terminal tag from the per-fn
+    /// stack slot, narrowed to `I32` for `NEXT_STEP_TAG_*`
+    /// comparisons. Replaces the prior `sigil_last_terminal_tag` FFI
+    /// query.
+    fn last_terminal_tag_value(&mut self) -> Value {
+        let slot = self.last_terminal_slot();
+        let tag_i64 = self.builder.ins().stack_load(types::I64, slot, 8);
+        self.builder.ins().ireduce(types::I32, tag_i64)
+    }
+
+    /// Plan D Task 111 — read the last-terminal value from the per-fn
+    /// stack slot. Replaces the prior `sigil_last_terminal_value` FFI
+    /// query. Returns the raw `I64` u64 the trampoline wrote at
+    /// terminal time; callers narrow to their declared overall type.
+    fn last_terminal_value(&mut self) -> Value {
+        let slot = self.last_terminal_slot();
+        self.builder.ins().stack_load(types::I64, slot, 0)
     }
 
     /// Lower a `Block`. Returns the tail expression's value if any,
@@ -10717,7 +10737,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // Variables to (0, NEXT_STEP_TAG_DONE). Replaces the
                 // prior `sigil_reset_last_terminal_tag` /
                 // `sigil_reset_last_terminal_value` FFI calls.
-                self.reset_last_terminal_vars();
+                self.reset_last_terminal_slot();
                 let body_val = self.lower_expr(body);
 
                 // Step 3: pop N frames in reverse push order. Capture
@@ -10835,8 +10855,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // Cranelift `Variable` updated by every
                     // `sigil_run_loop` call site (replaces the prior
                     // `sigil_last_terminal_tag` FFI query).
-                    let (_, tag_var) = self.last_terminal_vars();
-                    let tag_v = self.builder.use_var(tag_var);
+                    let tag_v = self.last_terminal_tag_value();
                     let discharged_const = self.builder.ins().iconst(
                         types::I32,
                         sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
@@ -10912,8 +10931,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // regression that adds such a call MUST route the
                     // value through a stack slot or explicitly
                     // stackmap-root the SSA value first.
-                    let (val_var, _) = self.last_terminal_vars();
-                    let last_terminal_v_u64 = self.builder.use_var(val_var);
+                    let last_terminal_v_u64 = self.last_terminal_value();
 
                     // Narrow u64 → handler_overall_ty.
                     let discharge_val = if handler_overall_ty == types::I64 {
@@ -11131,8 +11149,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // Plan D Task 111: read tag from per-fn Variable
                 // (replaces the prior `sigil_last_terminal_tag` FFI
                 // query).
-                let (_, tag_var) = self.last_terminal_vars();
-                let tag_v = self.builder.use_var(tag_var);
+                let tag_v = self.last_terminal_tag_value();
                 let discharged_const = self.builder.ins().iconst(
                     types::I32,
                     sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
@@ -11164,8 +11181,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // `sigil_last_terminal_value` FFI query), narrow.
                 self.builder.switch_to_block(discharge_block_nra);
                 self.builder.seal_block(discharge_block_nra);
-                let (val_var, _) = self.last_terminal_vars();
-                let lv_u64 = self.builder.use_var(val_var);
+                let lv_u64 = self.last_terminal_value();
                 let discharge_val = if handler_overall_ty == types::I64 {
                     lv_u64
                 } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
@@ -11422,8 +11438,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             {
                 // Plan D Task 111: query terminal tag from per-fn
                 // Variable (replaces `sigil_last_terminal_tag` FFI).
-                let (_, tag_var) = self.last_terminal_vars();
-                let tag_v = self.builder.use_var(tag_var);
+                let tag_v = self.last_terminal_tag_value();
                 let discharged_const = self.builder.ins().iconst(
                     types::I32,
                     sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,

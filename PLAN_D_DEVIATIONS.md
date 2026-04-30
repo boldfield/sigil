@@ -43,6 +43,26 @@ Splits allocate sub-task numbers (117a / 117b / ...) into `PLAN_D_PROGRESS.md`; 
 
 **Implementing commit(s):** Foundation `[HEAD]` (this entry + Stage 10.5 scaffolding) — Tasks 10.5.1-6 commit. Subsequent commits address each task in the order specified by Plan D (`docs/plans/2026-04-30-sigil-plan-d.md` in `boldfield/designs/in-progress/`). Closeout commits at the end of each stage land the prior-stage hash flips per the Plan B / B' / C precedent.
 
+## 2026-04-30 — [DEVIATION Task 111] Cross-fn terminal-tracking lift required two pivots to land
+
+**Context.** Plan D Task 111 calls for replacing the prior `LAST_TERMINAL_TAG` / `LAST_TERMINAL_VALUE` thread-local out-channel with a packed-multi-return convention. The plan body's literal phrasing — "register-pair multi-return" — turned out to be insufficient framing for the actual semantic requirement.
+
+**Pivot 1: Cranelift `[I64, I64]` register-pair multi-return → out-pointer ABI.** PR #50 first attempt declared `run_loop_sig.returns = [I64, I64]` matched against Rust `extern "C" fn() -> #[repr(C)] struct TerminalResult { value: u64, tag: u64 }`. Both signatures should use `rax:rdx` on x86_64 SysV per the ABI, but PR #50's first CI run failed 10 e2e tests with discharge-class symptoms (`catch_example_recovers_with_42` returned 49 vs 42; `state_example_canonical_run_state_returns_11` returned the lambda heap pointer vs 11). The pivot to out-pointer convention — `sigil_run_loop(initial, out: *mut TerminalResult)` writes the pair to `*out` before returning, codegen reads via `stack_load(I64, slot, 0)` / `stack_load(I64, slot, 8)` — sidesteps the multi-return register-pair ABI ambiguity.
+
+**Pivot 2: Cranelift `Variable` per-fn last-terminal vars → per-fn stack slot.** PR #50 second attempt (post-Pivot-1) failed CI with the **same 10 tests in the same shapes**. Reviewer comment on PR #50 (boldfield, 2026-04-30) diagnosed the residual bug as the **Variable plumbing across blocks** — Cranelift's frontend SSA for `def_var` / `use_var` requires every `use_var` path to have a dominating `def_var`; if the body's lowering creates a control-flow shape where some paths don't reach `emit_run_loop_and_capture`, the post-handle `use_var(tag_var)` reads the lazy-init's `(0, DONE)` instead of the run_loop's actual `(value, DISCHARGED)`. Diagnostic match: the observed `49 = 42 + 7` failure shape is exactly "handle takes the DONE path with body_val = discharge value, then the synth-cont chain's `result + input` runs with `result = 42, input = 7`."
+
+The fix is to switch from name-based Cranelift Variables to a single per-fn `StackSlot`. Reads/writes are explicit memory operations (`stack_store` / `stack_load`); no φ-node placement, no SSA reasoning, no dominance constraints. The slot is allocated lazily on first use and threaded through all 5 internal `run_loop_ref` call sites.
+
+**Why accepted.** Each pivot reduces the failure surface area: register-pair multi-return → out-pointer eliminates ABI marshalling questions; Variables → stack slot eliminates SSA dataflow questions. The combination is structurally equivalent to the OLD TLS approach (cross-call shared mutable state in memory) without the runtime-side TLS globals — which is the plan's stated goal.
+
+**What's lost.** The "thread (value, tag) directly through Cranelift values" framing the plan body suggested is not realized. The implementation reads through memory at each call site. The out-pointer + stack-slot path adds 1 stack store + 1 stack load per run_loop call vs. the (failed) register-pair return + Variable path. Performance impact is bounded — `sigil_run_loop`'s internal work dominates; the ABI adjustment is one register-passed pointer + two memory writes.
+
+**Closure path.** None. The architectural intent (delete TLS globals; carry no runtime-side state for terminal tracking) is achieved. Step 117 (first-class continuations) modifies the same surface area; the stack-slot convention extends naturally.
+
+**Implementing commit(s).** 4dfdbc7 (initial register-pair multi-return attempt; failed CI), 670f7a1 (Pivot 1: out-pointer ABI; still failed CI on the same tests), [HEAD] (Pivot 2: per-fn stack slot for last-terminal tracking; this entry is the closure log).
+
+**Reviewer credit.** Pivot 2 diagnosis is from PR #50's review comment by boldfield (2026-04-30). The hypothesis #2 ("Variable plumbing across blocks") was specifically called out and recommended.
+
 ## 2026-04-30 — [DEVIATION Stage 10.5.5] `#[ignore]` survey count diverges from plan estimate (3 actual vs ~12 expected)
 
 **Context.** Plan D's Stage 10.5.5 instructs the executor to pre-survey the `#[ignore]` inventory and partition into (a) Plan D closure-targets, (b) non-architectural test-infrastructure gaps, and (c) other v2-pending tests. The plan body includes the estimate "Expected total: ~12 ignored tests at plan start (verify on execution)."
