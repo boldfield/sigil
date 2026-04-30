@@ -1356,6 +1356,9 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep, out: *mut T
                     );
                     OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
                     crate::arena::sigil_arena_reset();
+                    eprintln!(
+                        "[DEBUG run_loop] DISCHARGED bypass: writing (value={v}, tag={tag}) to out={out:p}"
+                    );
                     out.write(TerminalResult {
                         value: v,
                         tag: tag as u64,
@@ -1427,6 +1430,9 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep, out: *mut T
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
+                eprintln!(
+                    "[DEBUG run_loop] top-level terminal: writing (value={v}, tag={tag}) to out={out:p}"
+                );
                 out.write(TerminalResult {
                     value: v,
                     tag: tag as u64,
