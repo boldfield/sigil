@@ -5518,26 +5518,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_next_step_discharged: {e}"))?;
 
-    // sigil_run_loop(initial: *mut NextStep) -> TerminalResult { value: u64, tag: u64 }.
+    // sigil_run_loop(initial: *mut NextStep, out: *mut TerminalResult).
     // Drives the CPS trampoline to a terminal NextStep::Done /
-    // ::Discharged and returns the packed (value, tag) pair.
+    // ::Discharged; writes the (value, tag) pair to `*out` and returns.
     //
-    // Plan D Task 111: replaced the prior TLS-out-channel
+    // Plan D Task 111: replaces the prior TLS-out-channel
     // (`LAST_TERMINAL_TAG` / `LAST_TERMINAL_VALUE` + 4 FFI helpers)
-    // with this register-pair multi-return. Cranelift signature is
-    // `[I64, I64]`; on x86_64 SysV the pair lands in `rax:rdx`, on
-    // aarch64 AAPCS in `x0:x1` — matches Rust's
-    // `#[repr(C)] struct TerminalResult { value: u64, tag: u64 }`
-    // return ABI. Codegen captures both `inst_results[0]` (value) and
-    // `inst_results[1]` (tag, narrowed to I32 at use sites where the
-    // existing `NEXT_STEP_TAG_*` comparisons want I32) into per-fn
-    // Cranelift `Variable`s; handle expression's outer logic reads
-    // the variables at handle exit instead of the prior FFI-helper
-    // queries.
+    // with an out-pointer convention. Codegen stack-allocates a
+    // 16-byte `TerminalResult` slot per call site, passes its pointer
+    // as the second argument, reads the fields back via
+    // `stack_load(I64, slot, 0)` (value) and `stack_load(I64, slot, 8)`
+    // (tag) after the call. The struct's field offsets are the
+    // canonical contract on both sides — sidesteps the multi-return
+    // register-pair ABI ambiguity that broke PR #50's first attempt.
+    // Captured tag is narrowed to `I32` at use sites where the
+    // existing `NEXT_STEP_TAG_*` comparisons want I32; both halves
+    // are written into per-fn Cranelift `Variable`s and the handle
+    // expression's outer logic reads the variables at handle exit.
     let mut run_loop_sig = Signature::new(isa_call_conv(&module));
-    run_loop_sig.params.push(AbiParam::new(pointer_ty));
-    run_loop_sig.returns.push(AbiParam::new(types::I64)); // value
-    run_loop_sig.returns.push(AbiParam::new(types::I64)); // tag (widened from u32 to match struct ABI)
+    run_loop_sig.params.push(AbiParam::new(pointer_ty)); // initial_step
+    run_loop_sig.params.push(AbiParam::new(pointer_ty)); // out: *mut TerminalResult
     let run_loop = module
         .declare_function("sigil_run_loop", Linkage::Import, &run_loop_sig)
         .map_err(|e| format!("declare sigil_run_loop: {e}"))?;
@@ -9532,10 +9532,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             .call(cps_fn_ref, &[closure_ptr_v, args_ptr, args_len_v]);
         let next_step = builder.inst_results(cps_call)[0];
 
-        // Drive the trampoline.
+        // Drive the trampoline. Plan D Task 111: out-pointer ABI.
+        // Stack-allocate a 16-byte TerminalResult slot, pass its
+        // pointer as the second argument, read `value` back via
+        // `stack_load(I64, slot, 0)`. The shim doesn't consume the
+        // tag — top-level entry has no enclosing handle.
         let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
-        let run_loop_call = builder.ins().call(run_loop_ref, &[next_step]);
-        let raw_u64 = builder.inst_results(run_loop_call)[0];
+        let result_slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3));
+        let result_ptr = builder.ins().stack_addr(pointer_ty, result_slot, 0);
+        let _run_loop_call = builder.ins().call(run_loop_ref, &[next_step, result_ptr]);
+        let raw_u64 = builder.ins().stack_load(types::I64, result_slot, 0);
 
         // Narrow to ret_ty.
         let ret_v = if ret_ty == types::I64 {
@@ -9942,16 +9949,36 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.builder.def_var(tag_var, done_tag);
     }
 
-    /// Plan D Task 111 — capture `sigil_run_loop`'s packed multi-return
-    /// `(value, tag)` into the per-fn last-terminal Variables. Called
-    /// from every codegen site that emits a `self.run_loop_ref` call;
-    /// the captured pair replaces the prior runtime-side TLS write.
-    /// Returns the body value (the first multi-return slot) so the
-    /// caller can use it as the body's natural return value, exactly
-    /// like the prior single-return shape.
-    fn capture_run_loop_terminal(&mut self, run_loop_call: cranelift::codegen::ir::Inst) -> Value {
-        let body_val = self.builder.inst_results(run_loop_call)[0];
-        let tag_i64 = self.builder.inst_results(run_loop_call)[1];
+    /// Plan D Task 111 — emit a `sigil_run_loop(initial_step, out)`
+    /// call against the per-fn last-terminal slot, capture the
+    /// `(value, tag)` pair into the per-fn last-terminal Variables,
+    /// and return the value half so callers can use it as the body's
+    /// natural return value (exactly like the prior single-u64-return
+    /// shape).
+    ///
+    /// Replaces the prior runtime-side TLS write + 4 FFI-helper
+    /// queries. The `TerminalResult` struct's field offsets (0 for
+    /// value, 8 for tag) are the canonical contract; the runtime's
+    /// definition in `runtime/src/handlers.rs` is the authoritative
+    /// cross-reference.
+    fn emit_run_loop_and_capture(&mut self, ns_ptr: Value) -> Value {
+        let result_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            16,
+            3,
+        ));
+        let result_ptr = self
+            .builder
+            .ins()
+            .stack_addr(self.pointer_ty, result_slot, 0);
+        let run_loop_call = self
+            .builder
+            .ins()
+            .call(self.run_loop_ref, &[ns_ptr, result_ptr]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
+        let body_val = self.builder.ins().stack_load(types::I64, result_slot, 0);
+        let tag_i64 = self.builder.ins().stack_load(types::I64, result_slot, 8);
         let tag_i32 = self.builder.ins().ireduce(types::I32, tag_i64);
         let (val_var, tag_var) = self.last_terminal_vars();
         self.builder.def_var(val_var, body_val);
@@ -10220,16 +10247,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // dispatches the Call (invokes the arm), then any further
         // Calls the arm returns, until a terminal `Done(value)`.
         // Returns u64.
-        let run_loop_call = self
-            .builder
-            .ins()
-            .call(self.run_loop_ref, &[call_next_step]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-        // Plan D Task 111: capture the packed (value, tag) multi-return
-        // into the per-fn last-terminal Variables; `widened` is the
-        // value (first multi-return slot).
-        let widened = self.capture_run_loop_terminal(run_loop_call);
+        // Plan D Task 111: emit run_loop with out-pointer; capture
+        // (value, tag) into per-fn last-terminal Variables; `widened`
+        // is the value half.
+        let widened = self.emit_run_loop_and_capture(call_next_step);
 
         // Phase 4c: narrow the run_loop result back to the op's
         // declared return type. The arm fn widens its body value to
@@ -11029,11 +11050,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // the trampoline calls identity which returns
                     // Done(tail_widened); run_loop returns the value
                     // as u64.
-                    let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns_ptr]);
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-                    // Plan D Task 111: capture (value, tag) multi-return.
-                    let widened_handle_val = self.capture_run_loop_terminal(run_loop_call);
+                    // Plan D Task 111: emit run_loop with out-pointer
+                    // and capture (value, tag) into per-fn Variables.
+                    let widened_handle_val = self.emit_run_loop_and_capture(ns_ptr);
 
                     // Narrow back to the return arm body's Cranelift
                     // type. The synth return fn widens its body's
@@ -11322,12 +11341,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             16,
         );
 
-        // sigil_run_loop(ns) → TerminalResult { value: u64, tag: u64 }
-        let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-        // Plan D Task 111: capture (value, tag) multi-return.
-        let widened_result = self.capture_run_loop_terminal(run_loop_call);
+        // Plan D Task 111: emit sigil_run_loop with out-pointer; capture
+        // (value, tag) into per-fn Variables.
+        let widened_result = self.emit_run_loop_and_capture(ns);
 
         // Stage-6.8-followup Layer 3c — pop the originating handler
         // frame we re-pushed before run_loop. This restores the
@@ -11503,11 +11519,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     POST_ARM_K_FN_OFF,
                 );
 
-                let run_loop_call_2 = self.builder.ins().call(self.run_loop_ref, &[ns_ptr]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, run_loop_call_2));
-                // Plan D Task 111: capture (value, tag) multi-return.
-                let wrapped = self.capture_run_loop_terminal(run_loop_call_2);
+                // Plan D Task 111: emit run_loop with out-pointer;
+                // capture (value, tag) into per-fn Variables.
+                let wrapped = self.emit_run_loop_and_capture(ns_ptr);
                 self.builder.ins().jump(merge_block, &[wrapped.into()]);
 
                 self.builder.switch_to_block(merge_block);
@@ -11700,16 +11714,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             .push_placeholder(function_code_offset(&self.builder, cps_call));
                         let next_step = self.builder.inst_results(cps_call)[0];
 
-                        // Drive the trampoline. Returns (value, tag)
-                        // multi-return; this site only consumes value.
-                        // Plan D Task 111: capture both into per-fn
-                        // last-terminal Variables for any enclosing
-                        // handle to query.
-                        let run_loop_call =
-                            self.builder.ins().call(self.run_loop_ref, &[next_step]);
-                        self.stackmap
-                            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-                        let raw_u64 = self.capture_run_loop_terminal(run_loop_call);
+                        // Plan D Task 111: emit run_loop with out-pointer;
+                        // capture (value, tag) into per-fn Variables.
+                        // `raw_u64` is the value half.
+                        let raw_u64 = self.emit_run_loop_and_capture(next_step);
 
                         // Narrow `raw_u64` back to the callee's
                         // declared return type. Mirrors the

@@ -124,17 +124,31 @@ pub use sigil_abi::effect::MAX_HANDLER_ARMS;
 /// `PLAN_B_DEVIATIONS.md`.
 pub use sigil_abi::effect::MAX_INLINE_ARGS;
 
-/// Packed terminal result returned by `sigil_run_loop`. Plan D Task 111
-/// replaces the prior TLS-out-channel (`LAST_TERMINAL_TAG` /
-/// `LAST_TERMINAL_VALUE`) with a register-pair multi-return: on x86_64
-/// SysV the two `u64` fields land in `rax:rdx`; on aarch64 AAPCS in
-/// `x0:x1`. Cranelift's matching multi-return signature on the codegen
-/// side declares two `I64` returns, so the ABI is consistent across
-/// callers.
+/// Terminal result written by `sigil_run_loop` via an out-pointer
+/// parameter. Plan D Task 111 replaces the prior TLS-out-channel
+/// (`LAST_TERMINAL_TAG` / `LAST_TERMINAL_VALUE`) with this struct +
+/// out-pointer convention: caller stack-allocates a `TerminalResult`,
+/// passes its pointer as `sigil_run_loop`'s second argument, run_loop
+/// writes the packed `(value, tag)` pair before returning, caller reads
+/// both fields off the stack slot.
 ///
-/// `tag` is widened from the on-disk `u32` `NEXT_STEP_TAG_*` constants
-/// to `u64` so the struct is 16 bytes (two register slots). Codegen
-/// narrows on read when an `I32` comparison is wanted.
+/// **Why out-pointer instead of register-pair multi-return.** Initial
+/// PR #50 implementation used a multi-return signature with a
+/// `#[repr(C)] struct { u64, u64 }` Rust return type. On x86_64 SysV
+/// register-pair returns SHOULD use rax:rdx for both Cranelift's
+/// `[I64, I64]` sig and Rust's struct-return ABI, but the actual
+/// codegen produced inconsistent slot ordering — codegen-side
+/// `inst_results[0]` / `[1]` did not always match the runtime's
+/// `value` / `tag` field order, causing every handle expression's
+/// discharged-vs-done branch to misclassify (catch test returned 49
+/// instead of 42; run_state returned the lambda heap pointer instead
+/// of 11). The out-pointer convention sidesteps the ambiguity — the
+/// struct's field offsets (0 for value, 8 for tag) are the canonical
+/// contract on both sides.
+///
+/// Tag is widened from the on-disk `u32` `NEXT_STEP_TAG_*` constants
+/// to `u64` for stable 16-byte layout. Codegen narrows on read when
+/// an `I32` comparison is wanted.
 #[repr(C)]
 pub struct TerminalResult {
     pub value: u64,
@@ -1262,7 +1276,7 @@ pub unsafe extern "C" fn sigil_perform(
 /// `sigil_next_step_done` or `sigil_next_step_call`. The fns referenced
 /// by any `CALL` step must satisfy the CPS calling convention.
 #[no_mangle]
-pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> TerminalResult {
+pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep, out: *mut TerminalResult) {
     let mut current = initial_step;
     // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
     // run_loop entry. On the DISCHARGED bypass terminal (introduced by
@@ -1342,10 +1356,11 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> Terminal
                     );
                     OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
                     crate::arena::sigil_arena_reset();
-                    return TerminalResult {
+                    out.write(TerminalResult {
                         value: v,
                         tag: tag as u64,
-                    };
+                    });
+                    return;
                 }
                 // Plan B' Stage 6.7 multi-shot composition fix: before
                 // returning to the wrapper, check the outer post_arm_k
@@ -1412,10 +1427,11 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> Terminal
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
-                return TerminalResult {
+                out.write(TerminalResult {
                     value: v,
                     tag: tag as u64,
-                };
+                });
+                return;
             }
             NEXT_STEP_TAG_CALL => {
                 // Copy dispatch info into stack locals before resetting
@@ -1610,7 +1626,9 @@ mod tests {
         reset_state();
         let ns = unsafe { sigil_next_step_done(99) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) }.value;
+        let mut out = TerminalResult { value: 0, tag: 0 };
+        unsafe { sigil_run_loop(ns, &mut out) };
+        let v = out.value;
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 99);
         assert_eq!(dispatches_after - dispatches_before, 1);
@@ -1626,7 +1644,9 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(41) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) }.value;
+        let mut out = TerminalResult { value: 0, tag: 0 };
+        unsafe { sigil_run_loop(ns, &mut out) };
+        let v = out.value;
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 42);
         assert_eq!(dispatches_after - dispatches_before, 2);
@@ -1643,7 +1663,9 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(5) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) }.value;
+        let mut out = TerminalResult { value: 0, tag: 0 };
+        unsafe { sigil_run_loop(ns, &mut out) };
+        let v = out.value;
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         // 5 -> Call(cps_call_then_plus_one, 5)
         // -> Call(cps_done_plus_one, 5+10=15)
@@ -1698,7 +1720,9 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(42) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) }.value;
+        let mut out = TerminalResult { value: 0, tag: 0 };
+        unsafe { sigil_run_loop(ns, &mut out) };
+        let v = out.value;
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 42);
         // 2 dispatches: one for the Call (loop dispatches identity,
@@ -1902,7 +1926,9 @@ mod tests {
             assert_eq!(depth_sum_after - depth_sum_before, 1);
 
             // Dispatch the resulting NextStep through the trampoline.
-            let result = sigil_run_loop(ns).value;
+            let mut out = TerminalResult { value: 0, tag: 0 };
+            sigil_run_loop(ns, &mut out);
+            let result = out.value;
             assert_eq!(result, 700);
 
             // Pop the frame to leave a clean handler stack.
@@ -1935,7 +1961,9 @@ mod tests {
             let depth_after = counters::read(CounterId::HandlerWalkDepthSum);
             // Outer is on top, target is one below; walk depth = 2.
             assert_eq!(depth_after - depth_before, 2);
-            let result = sigil_run_loop(ns).value;
+            let mut out = TerminalResult { value: 0, tag: 0 };
+            sigil_run_loop(ns, &mut out);
+            let result = out.value;
             assert_eq!(result, 300);
             let _ = sigil_handle_pop();
             let _ = sigil_handle_pop();
@@ -1978,7 +2006,8 @@ mod tests {
             // SAFETY: gc-heap-ptr arithmetic (user_args is a stack local).
             let user_args_ptr = user_args.as_ptr();
             let ns = sigil_perform(7, 0, user_args_ptr, 2, 0xCC as *mut u8, 0xDD as *mut u8);
-            let _ = sigil_run_loop(ns);
+            let mut out = TerminalResult { value: 0, tag: 0 };
+            sigil_run_loop(ns, &mut out);
             let _ = sigil_handle_pop();
         }
         reset_state();
@@ -2068,7 +2097,9 @@ mod tests {
                 3,
                 "expected walk depth 3 (outer + middle + target)"
             );
-            let result = sigil_run_loop(ns).value;
+            let mut out = TerminalResult { value: 0, tag: 0 };
+            sigil_run_loop(ns, &mut out);
+            let result = out.value;
             assert_eq!(result, 400);
             let _ = sigil_handle_pop();
             let _ = sigil_handle_pop();
@@ -2116,7 +2147,9 @@ mod tests {
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
-            let result = sigil_run_loop(ns).value;
+            let mut out = TerminalResult { value: 0, tag: 0 };
+            sigil_run_loop(ns, &mut out);
+            let result = out.value;
             assert_eq!(result, 1100);
             let _ = sigil_handle_pop();
         }
@@ -2222,7 +2255,9 @@ mod tests {
             let arg = 9u64;
             let arg_ptr = &arg as *const u64;
             let ns = sigil_perform(4242, 0, arg_ptr, 1, ptr::null_mut(), ptr::null_mut());
-            let result = sigil_run_loop(ns).value;
+            let mut out = TerminalResult { value: 0, tag: 0 };
+            sigil_run_loop(ns, &mut out);
+            let result = out.value;
             assert_eq!(result, 900);
             let _ = sigil_handle_pop();
         }
@@ -2282,7 +2317,9 @@ mod tests {
             // arm_read_closure_sentinel with closure_ptr = the original
             // closure; it reads the sentinel and returns it.
             let ns = sigil_perform(7777, 0, ptr::null(), 0, ptr::null_mut(), ptr::null_mut());
-            let result = sigil_run_loop(ns).value;
+            let mut out = TerminalResult { value: 0, tag: 0 };
+            sigil_run_loop(ns, &mut out);
+            let result = out.value;
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
             let _ = sigil_handle_pop();
         }
@@ -2332,7 +2369,9 @@ mod tests {
             // would read freed bytes (could be anything; sentinel
             // mismatch would fire the assert).
             let initial = sigil_next_step_call(ptr::null_mut(), cps_alloc_then_gc as *mut u8, 0);
-            let result = sigil_run_loop(initial).value;
+            let mut out = TerminalResult { value: 0, tag: 0 };
+            sigil_run_loop(initial, &mut out);
+            let result = out.value;
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
         }
         reset_state();
@@ -2541,7 +2580,9 @@ mod tests {
 
         unsafe {
             let initial = sigil_next_step_call(ptr::null_mut(), cps_push_then_done as *mut u8, 0);
-            let result = sigil_run_loop(initial).value;
+            let mut out = TerminalResult { value: 0, tag: 0 };
+            sigil_run_loop(initial, &mut out);
+            let result = out.value;
             // 42 + 1 = 43; cps_done_with_arg adds 1 to its arg.
             assert_eq!(result, 43);
         }
