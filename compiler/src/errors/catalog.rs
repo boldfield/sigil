@@ -876,6 +876,51 @@ pub const CATALOG: &[ErrorEntry] = &[
                       }",
     },
     ErrorEntry {
+        code: "E0143",
+        short: "row-site effect-arg arity does not match the effect-decl's generic-param count",
+        long: "Plan D Task 114: a row entry references an effect with a \
+               type-arg list (e.g. `![Raise[Int]]`) whose arity does not \
+               match the effect-decl's `generic_params` count. Three \
+               shapes fire E0143:\n\n\
+               1. **Non-generic effect-decl referenced with args** — \
+                  e.g. `![IO[Int]]` when `IO` is non-generic.\n\
+               2. **Generic effect-decl referenced bare** — e.g. \
+                  `![Raise]` when the decl is `effect Raise[E]`. The \
+                  bare reference has no way to instantiate `E`, so \
+                  perform sites of `Raise.fail` would fail elsewhere; \
+                  E0143 surfaces the issue at the row site.\n\
+               3. **Wrong arity** — e.g. `![Raise[Int, String]]` when \
+                  the decl is `effect Raise[E]` (one type param). The \
+                  row-site arg count must match the decl's \
+                  `generic_params` length.\n\n\
+               The fix is to align the row-site arg list with the \
+               effect-decl's declared generics.",
+        fix_example: "// Wrong (Raise[E] is generic, ![Raise] doesn't instantiate E):\n\
+                      effect Raise[E] { fail: (E) -> Int }\n\
+                      fn risky() -> Int ![Raise] { 0 }   // E0143 here\n\n\
+                      // Right (instantiate E at the row site):\n\
+                      effect Raise[E] { fail: (E) -> Int }\n\
+                      fn risky() -> Int ![Raise[Int]] { 0 }",
+    },
+    ErrorEntry {
+        code: "E0144",
+        short: "per-op generic parameter shadows an effect-decl generic parameter",
+        long: "Plan D Task 115: a per-op generic parameter declared on an \
+               effect operation has the same name as a generic parameter \
+               on the enclosing effect declaration. Shadowing per-op \
+               generics is forbidden because the effect-decl's parameter \
+               is in scope inside the op's signature, and an inner shadow \
+               would silently mask it for the op's params / return.\n\n\
+               The fix is to use a distinct name for the per-op generic \
+               (the canonical Koka / Effekt idiom uses single-letter \
+               names: `E` for the effect-decl-level generic, `A` / `B` \
+               for per-op generics).",
+        fix_example: "// Wrong (per-op `E` shadows effect-decl `E`):\n\
+                      effect Raise[E] { fail[E]: (E) -> Int }   // E0144 here\n\n\
+                      // Right (use distinct names):\n\
+                      effect Raise[E] { fail[A]: (E) -> A }",
+    },
+    ErrorEntry {
         code: "E0220",
         short: "one-shot continuation used more than once on a code path",
         long: "Plan B task 54: in a handler arm for a one-shot effect, \
