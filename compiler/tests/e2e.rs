@@ -6822,6 +6822,136 @@ fn std_io_read_write_file_round_trip() {
     assert_eq!(stdout, "hello, file\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 71 — Raise + catch run-and-check-output =====
+
+/// `catch` over a body that raises converts the raise into an
+/// `Err(message)`. The body's `raise(...)` discharges-`k` so
+/// `catch`'s return-arm (`Ok(v)`) is bypassed; the op-arm
+/// (`Err(e)`) flows directly to the handle expression.
+#[test]
+fn std_raise_catch_converts_raise_to_err() {
+    let src = "import std.raise\n\
+               fn always_fails() -> Int ![Raise] {\n  \
+                 raise(\"boom\")\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = catch(always_fails);\n  \
+                 match r {\n    \
+                   Ok(_) => perform IO.println(\"ok-unexpected\"),\n    \
+                   Err(msg) => perform IO.println(msg),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_raise_catch_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "boom\n", "stderr={stderr:?}");
+}
+
+/// `catch` over a body that doesn't raise returns `Ok(value)`.
+#[test]
+fn std_raise_catch_passes_through_success() {
+    let src = "import std.raise\n\
+               fn always_succeeds() -> Int ![Raise] { 42 }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = catch(always_succeeds);\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err-unexpected\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_raise_catch_ok");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `catch` over a body that captures from its enclosing scope.
+/// The body lambda closes over `prefix`; the runtime closure
+/// record carries `prefix` past the `handle` boundary. Pin the
+/// captures-bearing-body path through Phase 4e captures+ closed
+/// (PR #26).
+#[test]
+fn std_raise_catch_with_captured_message() {
+    let src = "import std.raise\n\
+               fn run_with_msg(msg: String) -> Result[Int, String] ![] {\n  \
+                 catch(fn () -> Int ![Raise] => raise(msg))\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 match run_with_msg(\"captured-message\") {\n    \
+                   Ok(_) => perform IO.println(\"ok-unexpected\"),\n    \
+                   Err(m) => perform IO.println(m),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_raise_catch_captured");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "captured-message\n", "stderr={stderr:?}");
+}
+
+/// Nested `catch` — inner catch handles its own raise, outer fn
+/// re-raises with a different message that the outer catch
+/// converts into `Err`. Pins compositional discharge: inner
+/// handler doesn't shadow the outer handler's perform site
+/// because the inner discharges before the outer runs.
+#[test]
+fn std_raise_nested_catch_with_re_raise() {
+    let src = "import std.raise\n\
+               fn might_fail(should_fail: Int) -> Int ![Raise] {\n  \
+                 match should_fail {\n    \
+                   0 => 7,\n    \
+                   _ => raise(\"inner\"),\n  \
+                 }\n\
+               }\n\
+               fn might_fail_yes() -> Int ![Raise] { might_fail(1) }\n\
+               fn outer() -> Int ![Raise] {\n  \
+                 match catch(might_fail_yes) {\n    \
+                   Ok(v) => v + 100,\n    \
+                   Err(_) => raise(\"outer-rewrap\"),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 match catch(outer) {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(m) => perform IO.println(m),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_raise_nested_catch");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "outer-rewrap\n", "stderr={stderr:?}");
+}
+
+/// `catch` over a body that conditionally raises (data-driven).
+/// Pin the discard-k semantics: when raise fires, catch returns
+/// `Err`; when it doesn't, catch returns `Ok` with the body's
+/// natural value.
+#[test]
+fn std_raise_catch_conditional_branch() {
+    let src = "import std.raise\n\
+               fn check_pos(n: Int) -> Int ![Raise] {\n  \
+                 match n {\n    \
+                   0 => raise(\"zero\"),\n    \
+                   _ => n + 100,\n  \
+                 }\n\
+               }\n\
+               fn check_three() -> Int ![Raise] { check_pos(3) }\n\
+               fn check_zero() -> Int ![Raise] { check_pos(0) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 match catch(check_three) {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err1\"),\n  \
+                 };\n  \
+                 match catch(check_zero) {\n    \
+                   Ok(_) => perform IO.println(\"ok2\"),\n    \
+                   Err(msg) => perform IO.println(msg),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_raise_catch_branch");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "103\nzero\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration
