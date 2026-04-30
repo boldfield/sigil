@@ -214,12 +214,9 @@ impl Subst {
                 name.clone(),
                 args.iter().map(|a| self.apply_ty_inner(a, seen)).collect(),
             ),
-            Ty::Tuple(elems) => Ty::Tuple(
-                elems
-                    .iter()
-                    .map(|e| self.apply_ty_inner(e, seen))
-                    .collect(),
-            ),
+            Ty::Tuple(elems) => {
+                Ty::Tuple(elems.iter().map(|e| self.apply_ty_inner(e, seen)).collect())
+            }
             Ty::Fn(sig) => {
                 let new_sig = FnSig {
                     params: sig
@@ -3440,7 +3437,10 @@ impl Tc {
             Expr::Tuple { elems, .. } => {
                 let elem_tys: Vec<Ty> = elems
                     .iter()
-                    .map(|e| self.check_expr(e, row).unwrap_or(Ty::Var(self.fresh_ty_var())))
+                    .map(|e| {
+                        self.check_expr(e, row)
+                            .unwrap_or(Ty::Var(self.fresh_ty_var()))
+                    })
                     .collect();
                 Some(Ty::Tuple(elem_tys))
             }
@@ -4926,22 +4926,48 @@ impl Tc {
                 bindings.push((name.clone(), scrut_ty.clone()));
             }
             Pattern::Tuple(pats, span) => {
-                // Plan A3 v1 has no tuple types in the surface; a
-                // tuple pattern never matches any scrutinee type. We
-                // still recurse into sub-patterns with the scrutinee
-                // type as a conservative placeholder so any inner
-                // pattern-shape errors still surface, but emit E0117
-                // at the top-level tuple pattern.
-                self.push_error(
-                    "E0117",
-                    span.clone(),
-                    format!(
-                        "tuple pattern does not match scrutinee type `{}` (no tuple types in Plan A3 v1)",
-                        ty_display(scrut_ty)
-                    ),
-                );
-                for sub in pats {
-                    self.check_pattern(sub, scrut_ty, bindings);
+                // Plan D Task 113 — tuple pattern matches a Ty::Tuple
+                // scrutinee element-wise. Arity must match; element
+                // types unify position-by-position. Pattern arity ≥ 2
+                // is the parser's invariant (single-elem parens are
+                // paren-grouping, zero-elem rejected).
+                let resolved = self.deref(scrut_ty);
+                match resolved {
+                    Ty::Tuple(elem_tys) => {
+                        if pats.len() != elem_tys.len() {
+                            self.push_error(
+                                "E0117",
+                                span.clone(),
+                                format!(
+                                    "tuple pattern with {} elements does not match scrutinee type `{}`",
+                                    pats.len(),
+                                    ty_display(scrut_ty)
+                                ),
+                            );
+                            // Still recurse with the scrutinee type so
+                            // inner shape errors surface.
+                            for sub in pats {
+                                self.check_pattern(sub, scrut_ty, bindings);
+                            }
+                        } else {
+                            for (sub, elem_ty) in pats.iter().zip(elem_tys.iter()) {
+                                self.check_pattern(sub, elem_ty, bindings);
+                            }
+                        }
+                    }
+                    _ => {
+                        self.push_error(
+                            "E0117",
+                            span.clone(),
+                            format!(
+                                "tuple pattern does not match scrutinee type `{}` (expected a tuple type)",
+                                ty_display(scrut_ty)
+                            ),
+                        );
+                        for sub in pats {
+                            self.check_pattern(sub, scrut_ty, bindings);
+                        }
+                    }
                 }
             }
             Pattern::Ctor { name, fields, span } => {

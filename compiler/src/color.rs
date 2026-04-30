@@ -1123,6 +1123,11 @@ mod tests {
                     walk_expr_for_fn_idents(&arm.body, fn_names, out);
                 }
             }
+            Expr::Tuple { elems, .. } => {
+                for el in elems {
+                    walk_expr_for_fn_idents(el, fn_names, out);
+                }
+            }
         }
     }
 

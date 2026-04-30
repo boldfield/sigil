@@ -143,10 +143,7 @@ pub enum TypeExpr {
     /// [`crate::typecheck::Ty::Tuple`] for HM unification (element-
     /// wise); codegen emits a heap-allocated record with one slot
     /// per element.
-    Tuple {
-        elems: Vec<TypeExpr>,
-        span: Span,
-    },
+    Tuple { elems: Vec<TypeExpr>, span: Span },
 }
 
 /// Boxed payload of [`TypeExpr::Fn`]. See that variant's docstring

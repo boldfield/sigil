@@ -11296,11 +11296,80 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.seal_block(merge_block_nra);
                 self.builder.block_params(merge_block_nra)[0]
             }
-            Expr::Tuple { .. } => unimplemented!(
-                "Plan D Task 113 — tuple constructor codegen pending; \
-                 the AST scaffolding lands first, then heap allocation + \
-                 N-slot field stores ship in a follow-up commit"
-            ),
+            // Plan D Task 113 — tuple constructor. Heap-allocate a
+            // record with `header (TAG_TUPLE, count=N, bitmap)` plus
+            // N 64-bit element slots, then store each element's
+            // widened value at offset `8 + 8*i`. Layout matches the
+            // sum-type ctor pattern but without the discriminant word
+            // (tuples have a single constructor per arity).
+            Expr::Tuple { elems, .. } => {
+                use sigil_header_constants::{header_word, TAG_TUPLE};
+                // Lower elements first — they may have side effects in
+                // source order. Capture the surface Cranelift type of
+                // each so we know whether to widen on store and whether
+                // to mark the pointer bitmap bit.
+                let mut elem_vals: Vec<(Value, Type)> = Vec::with_capacity(elems.len());
+                for el in elems {
+                    let v = self.lower_expr(el);
+                    let ty = self.builder.func.dfg.value_type(v);
+                    elem_vals.push((v, ty));
+                }
+                let n = elem_vals.len();
+                debug_assert!(
+                    n <= 31,
+                    "codegen: tuple arity {n} exceeds 31-bit pointer-bitmap layout"
+                );
+                // Pointer bitmap: bit i set iff element i is pointer-
+                // typed (heap-allocated value). Sub-word integer types
+                // (I8, I32) and I64 are scalars; pointer_ty values are
+                // GC pointers.
+                let mut bitmap: u32 = 0;
+                for (i, (_, ty)) in elem_vals.iter().enumerate() {
+                    if *ty == self.pointer_ty && self.pointer_ty != types::I64 {
+                        // 32-bit pointer_ty future-proofing path.
+                        bitmap |= 1u32 << i;
+                    } else if *ty == self.pointer_ty {
+                        // pointer_ty == I64 on supported targets; an I64
+                        // result that is pointer-typed by surface (e.g.,
+                        // String, Closure, User, Tuple) needs the bit.
+                        // Distinguishable from scalar I64 via the
+                        // surface Cranelift type — but lower_expr's
+                        // result type IS I64 for both Int and pointer-
+                        // typed values. We can't distinguish at this
+                        // site without typecheck info threaded through.
+                        // **Conservative choice:** mark the bit. Boehm
+                        // tolerates false positives (a non-pointer Int
+                        // marked as pointer becomes a conservative
+                        // root, harmless on 64-bit hosts where every
+                        // Int value is misinterpretable as a pointer
+                        // anyway).
+                        bitmap |= 1u32 << i;
+                    }
+                }
+                let header = header_word(TAG_TUPLE, n as u8, bitmap);
+                let header_v = self.builder.ins().iconst(types::I64, header as i64);
+                let payload_bytes: i64 = (n as i64) * 8;
+                let size_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
+                let alloc_call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.alloc_ref, &[header_v, size_v]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, alloc_call));
+                let ptr = self.builder.inst_results(alloc_call)[0];
+                for (i, (val, val_ty)) in elem_vals.into_iter().enumerate() {
+                    let store_val = if val_ty == types::I64 || val_ty == self.pointer_ty {
+                        val
+                    } else {
+                        self.builder.ins().uextend(types::I64, val)
+                    };
+                    let offset: i32 = 8 + 8 * i as i32;
+                    self.builder
+                        .ins()
+                        .store(MemFlags::trusted(), store_val, ptr, offset);
+                }
+                ptr
+            }
         }
     }
 
@@ -13386,10 +13455,41 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     }
                 }
             }
-            Pattern::Tuple(_, _) => {
-                unreachable!(
-                    "codegen: Pattern::Tuple reaches lowering (typecheck should reject with E0117)"
-                )
+            // Plan D Task 113 — tuple pattern destructure. Loads each
+            // element from the heap record at offset `8 + 8*i`,
+            // narrows to the element's surface type, and recurses
+            // with the sub-pattern. No discriminant check — tuples
+            // have a single constructor per arity; typecheck E0117
+            // already rejected arity mismatches.
+            Pattern::Tuple(pats, _) => {
+                let elem_tys = match scrut_ty {
+                    Some(Ty::Tuple(ts)) if ts.len() == pats.len() => ts.clone(),
+                    _ => unreachable!(
+                        "codegen: Pattern::Tuple expected scrut_ty = Ty::Tuple of matching arity \
+                         (typecheck E0117 should have rejected mismatched shapes)"
+                    ),
+                };
+                for (i, (sub, elem_ty)) in pats.iter().zip(elem_tys.iter()).enumerate() {
+                    let raw = self.builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        scrut,
+                        8 + 8 * i as i32,
+                    );
+                    let elem_val = match elem_ty {
+                        Ty::Int => raw,
+                        Ty::Bool | Ty::Byte | Ty::Unit => {
+                            self.builder.ins().ireduce(types::I8, raw)
+                        }
+                        Ty::Char => self.builder.ins().ireduce(types::I32, raw),
+                        Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+                        Ty::Var(_) => unreachable!(
+                            "codegen: Ty::Var in tuple element type — typecheck \
+                             E0132 should have rejected"
+                        ),
+                    };
+                    self.emit_pattern_test(sub, elem_val, Some(elem_ty), next, bindings);
+                }
             }
         }
     }

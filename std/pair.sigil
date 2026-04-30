@@ -1,0 +1,40 @@
+// sigil: 0.1
+//
+// std/pair.sigil — Plan D Task 113.
+//
+// `Pair[A, B]` is informal shorthand for the binary tuple type
+// `(A, B)`. This module provides `fst` and `snd` accessors over
+// binary tuples; users can construct binary-tuple values directly
+// via `(a, b)` syntax (Plan D Task 113 ships the surface).
+//
+// Larger tuples (`(A, B, C)`, etc.) are also supported; this module
+// just covers the binary case. User code that needs accessors on
+// arity-N tuples can pattern-match: `let (x, y, z) = triple; x`.
+//
+// ## Usage
+//
+// ```sigil
+// import std.pair
+//
+// fn main() -> Int ![IO] {
+//   let p: (Int, String) = (42, "hi");
+//   let n: Int = fst(p);
+//   let s: String = snd(p);
+//   perform IO.println(s);
+//   n
+// }
+// ```
+
+// `fst((a, b))` returns the first element.
+fn fst[A, B](p: (A, B)) -> A ![] {
+  match p {
+    (a, _) => a,
+  }
+}
+
+// `snd((a, b))` returns the second element.
+fn snd[A, B](p: (A, B)) -> B ![] {
+  match p {
+    (_, b) => b,
+  }
+}

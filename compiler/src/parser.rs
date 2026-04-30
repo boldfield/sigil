@@ -420,9 +420,12 @@ impl<'a> Parser<'a> {
     fn parse_type(&mut self) -> Option<TypeExpr> {
         let tok = self.peek().clone();
         // Plan B' Stage 6.8 Task 102 — first-class function type:
-        // `(T1, ..., Tn) -> R ![E1, ..., En]`. Discriminated by the
-        // leading `(`; everything else falls through to the
-        // Ident-headed Named/Apply path below.
+        // `(T1, ..., Tn) -> R ![E1, ..., En]`.
+        // Plan D Task 113 — tuple type: `(T1, T2, ...)` (arity ≥ 2)
+        // when NOT followed by `->`. Arity-1 `(T)` is paren-grouping
+        // (returns the inner T directly). Discriminated by the
+        // trailing `->` or `Comma` — the `(` opens both shapes, and
+        // we look ahead at `)` to decide.
         if matches!(tok.kind, TokenKind::LParen) {
             self.advance();
             let mut params = Vec::new();
@@ -435,7 +438,30 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            self.expect(&TokenKind::RParen, "`)` closing fn-type parameter list")?;
+            self.expect(&TokenKind::RParen, "`)` closing parenthesised type")?;
+            // Plan D Task 113 — tuple-vs-fn-type discrimination: if
+            // the next token is NOT `->`, this is either a tuple type
+            // (arity ≥ 2) or paren-grouping (arity 1). Empty parens
+            // `()` are reserved for a future Unit-type spelling and
+            // are rejected here.
+            if !matches!(self.peek().kind, TokenKind::Arrow) {
+                if params.is_empty() {
+                    self.err(
+                        tok.span.clone(),
+                        "empty `()` is not a valid type — use `Unit` for the unit type, \
+                         or `(T1, T2, ...)` for a tuple type with arity ≥ 2",
+                    );
+                    return None;
+                }
+                if params.len() == 1 {
+                    // Paren-grouping over a single type: return inner.
+                    return params.into_iter().next();
+                }
+                return Some(TypeExpr::Tuple {
+                    elems: params,
+                    span: tok.span,
+                });
+            }
             self.expect(&TokenKind::Arrow, "`->` fn-type return arrow")?;
             let ret = self.parse_type()?;
             // Plan B' Stage 6.8 R5 Finding 4 — per-arrow `![..]`
@@ -1052,15 +1078,50 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Perform => self.parse_perform_expr().map(Expr::Perform),
             TokenKind::LParen => {
-                // Parenthesized expression for precedence override.
-                // Record literals are always re-enabled inside `(...)`.
+                // Plan D Task 113 — parenthesised expression OR tuple
+                // value. Discriminated by whether a `,` follows the
+                // first inner expression: `(e)` is paren-grouping,
+                // `(e1, e2, ...)` is a tuple value (arity ≥ 2). Empty
+                // `()` is reserved for a future Unit-literal spelling
+                // and rejected here.
+                let lparen_span = self.peek().span.clone();
                 self.advance();
                 let saved = self.no_record_lits;
                 self.no_record_lits = false;
-                let inner = self.parse_expr()?;
-                self.no_record_lits = saved;
-                self.expect(&TokenKind::RParen, "`)` closing parenthesized expression")?;
-                Some(inner)
+                if matches!(self.peek().kind, TokenKind::RParen) {
+                    self.no_record_lits = saved;
+                    self.advance();
+                    self.err(
+                        lparen_span,
+                        "empty `()` is not a valid expression — use a Unit constructor \
+                         when one is in scope, or `(e1, e2, ...)` for a tuple value",
+                    );
+                    return None;
+                }
+                let first = self.parse_expr()?;
+                if matches!(self.peek().kind, TokenKind::Comma) {
+                    // Tuple value.
+                    let mut elems = vec![first];
+                    while matches!(self.peek().kind, TokenKind::Comma) {
+                        self.advance();
+                        // Allow trailing comma before `)`.
+                        if matches!(self.peek().kind, TokenKind::RParen) {
+                            break;
+                        }
+                        let e = self.parse_expr()?;
+                        elems.push(e);
+                    }
+                    self.no_record_lits = saved;
+                    self.expect(&TokenKind::RParen, "`)` closing tuple value")?;
+                    Some(Expr::Tuple {
+                        elems,
+                        span: lparen_span,
+                    })
+                } else {
+                    self.no_record_lits = saved;
+                    self.expect(&TokenKind::RParen, "`)` closing parenthesised expression")?;
+                    Some(first)
+                }
             }
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),

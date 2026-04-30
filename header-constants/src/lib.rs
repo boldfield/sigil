@@ -99,6 +99,22 @@ pub const TAG_MUT_BYTE_ARRAY: u8 = 0x07;
 /// segment and grows the segments_array on overflow.
 pub const TAG_STRING_BUILDER: u8 = 0x08;
 
+/// Tuple record layout — Plan D Task 113.
+/// `{header, elem[0], elem[1], ..., elem[N-1]}`. Each element is a
+/// 64-bit slot — `Int` and pointer types fit directly; narrower
+/// types (`Bool`, `Char`, `Byte`) are widened at write and narrowed
+/// at read by codegen. The pointer bitmap reflects per-element
+/// pointer-ness (bit `i` set iff element `i` is a GC-managed
+/// pointer). Tuples have no discriminant word — there is only one
+/// constructor per arity.
+///
+/// Tuple arity is bounded by the 6-bit `count` field (63), which is
+/// far above any reasonable v1 user-program tuple. For arity-2 (the
+/// `Pair[A, B]` case from `std/pair.sigil`) this is comfortable; the
+/// MAX_TUPLE_ARITY = 63 constant is documented in the codegen
+/// allocator.
+pub const TAG_TUPLE: u8 = 0x09;
+
 /// Payload-word-count field layout.
 pub const COUNT_BITS: u32 = 6;
 pub const COUNT_SHIFT: u32 = 8;
@@ -177,6 +193,7 @@ mod tests {
         assert_eq!(TAG_BYTE_ARRAY, 0x06);
         assert_eq!(TAG_MUT_BYTE_ARRAY, 0x07);
         assert_eq!(TAG_STRING_BUILDER, 0x08);
+        assert_eq!(TAG_TUPLE, 0x09);
         assert_eq!(TAG_EXTERNAL_DESCRIPTOR, 0xFF);
     }
 }
