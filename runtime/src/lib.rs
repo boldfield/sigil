@@ -61,6 +61,7 @@ pub mod header;
 pub mod io;
 pub mod mem;
 pub mod stackmap;
+pub mod string;
 pub mod value;
 
 #[cfg(test)]

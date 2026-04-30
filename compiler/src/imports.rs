@@ -32,18 +32,20 @@ use crate::{lexer, parser, stdlib_embed};
 /// here. Entries match the embedded-tree path produced by
 /// [`path_to_module`] — with the `.sigil` suffix and `/` separators.
 ///
-/// `array.sigil`, `mut_array.sigil`, `byte_array.sigil`, and
-/// `mut_byte_array.sigil` are documentation-only today (zero items
-/// declared) but listed here proactively: a future doctest tooling
-/// pass (Plan C Task 77) may emit `@example` blocks as standalone
-/// fns, and unguarded loading would let any future fn item in those
-/// files pollute every importer's flat namespace silently.
+/// `array.sigil`, `mut_array.sigil`, `byte_array.sigil`,
+/// `mut_byte_array.sigil`, and `string.sigil` are documentation-only
+/// today (zero items declared) but listed here proactively: a
+/// future doctest tooling pass (Plan C Task 77) may emit `@example`
+/// blocks as standalone fns, and unguarded loading would let any
+/// future fn item in those files pollute every importer's flat
+/// namespace silently.
 const BUILTIN_INJECTED: &[&str] = &[
     "io.sigil",
     "array.sigil",
     "mut_array.sigil",
     "byte_array.sigil",
     "mut_byte_array.sigil",
+    "string.sigil",
 ];
 
 /// Resolve every `Item::Import` in `program` against the embedded stdlib.

@@ -725,6 +725,19 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("mut_byte_array_length".to_string());
     globals.insert("mut_byte_array_get".to_string());
     globals.insert("mut_byte_array_set".to_string());
+    // Plan C Task 68 — extended String primitives.
+    globals.insert("string_concat".to_string());
+    globals.insert("string_substring".to_string());
+    globals.insert("string_byte_at".to_string());
+    globals.insert("string_compare".to_string());
+    globals.insert("string_starts_with".to_string());
+    globals.insert("string_ends_with".to_string());
+    globals.insert("string_contains".to_string());
+    globals.insert("string_index_of".to_string());
+    globals.insert("string_trim".to_string());
+    globals.insert("string_to_int_validate".to_string());
+    globals.insert("string_to_int_parse".to_string());
+    globals.insert("string_length".to_string());
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
             if let Some(msg) = block_unsupported_handle(&f.body, &globals, &effects_resumes_many) {
@@ -4990,6 +5003,158 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_mut_byte_array_set: {e}"))?;
 
+    // Plan C Task 68 — extended String primitives in
+    // `runtime/src/string.rs`. All operate on `TAG_STRING` headers.
+
+    // sigil_string_concat(a: *const u8, b: *const u8) -> *mut u8
+    let mut string_concat_sig = Signature::new(isa_call_conv(&module));
+    string_concat_sig.params.push(AbiParam::new(pointer_ty));
+    string_concat_sig.params.push(AbiParam::new(pointer_ty));
+    string_concat_sig.returns.push(AbiParam::new(pointer_ty));
+    let string_concat = module
+        .declare_function("sigil_string_concat", Linkage::Import, &string_concat_sig)
+        .map_err(|e| format!("declare sigil_string_concat: {e}"))?;
+
+    // sigil_string_substring(s, start: i64, end: i64) -> *mut u8
+    let mut string_substring_sig = Signature::new(isa_call_conv(&module));
+    string_substring_sig.params.push(AbiParam::new(pointer_ty));
+    string_substring_sig.params.push(AbiParam::new(types::I64));
+    string_substring_sig.params.push(AbiParam::new(types::I64));
+    string_substring_sig.returns.push(AbiParam::new(pointer_ty));
+    let string_substring = module
+        .declare_function(
+            "sigil_string_substring",
+            Linkage::Import,
+            &string_substring_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_substring: {e}"))?;
+
+    // sigil_string_byte_at(s, i: i64) -> u8
+    let mut string_byte_at_sig = Signature::new(isa_call_conv(&module));
+    string_byte_at_sig.params.push(AbiParam::new(pointer_ty));
+    string_byte_at_sig.params.push(AbiParam::new(types::I64));
+    string_byte_at_sig.returns.push(AbiParam::new(types::I8));
+    let string_byte_at = module
+        .declare_function("sigil_string_byte_at", Linkage::Import, &string_byte_at_sig)
+        .map_err(|e| format!("declare sigil_string_byte_at: {e}"))?;
+
+    // sigil_string_compare(a, b) -> i64
+    let mut string_compare_sig = Signature::new(isa_call_conv(&module));
+    string_compare_sig.params.push(AbiParam::new(pointer_ty));
+    string_compare_sig.params.push(AbiParam::new(pointer_ty));
+    string_compare_sig.returns.push(AbiParam::new(types::I64));
+    let string_compare = module
+        .declare_function("sigil_string_compare", Linkage::Import, &string_compare_sig)
+        .map_err(|e| format!("declare sigil_string_compare: {e}"))?;
+
+    // sigil_string_starts_with(s, prefix) -> bool
+    let mut string_starts_with_sig = Signature::new(isa_call_conv(&module));
+    string_starts_with_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    string_starts_with_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    string_starts_with_sig
+        .returns
+        .push(AbiParam::new(types::I8));
+    let string_starts_with = module
+        .declare_function(
+            "sigil_string_starts_with",
+            Linkage::Import,
+            &string_starts_with_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_starts_with: {e}"))?;
+
+    // sigil_string_ends_with(s, suffix) -> bool
+    let mut string_ends_with_sig = Signature::new(isa_call_conv(&module));
+    string_ends_with_sig.params.push(AbiParam::new(pointer_ty));
+    string_ends_with_sig.params.push(AbiParam::new(pointer_ty));
+    string_ends_with_sig.returns.push(AbiParam::new(types::I8));
+    let string_ends_with = module
+        .declare_function(
+            "sigil_string_ends_with",
+            Linkage::Import,
+            &string_ends_with_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_ends_with: {e}"))?;
+
+    // sigil_string_contains(s, needle) -> bool
+    let mut string_contains_sig = Signature::new(isa_call_conv(&module));
+    string_contains_sig.params.push(AbiParam::new(pointer_ty));
+    string_contains_sig.params.push(AbiParam::new(pointer_ty));
+    string_contains_sig.returns.push(AbiParam::new(types::I8));
+    let string_contains = module
+        .declare_function(
+            "sigil_string_contains",
+            Linkage::Import,
+            &string_contains_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_contains: {e}"))?;
+
+    // sigil_string_index_of(s, needle) -> i64
+    let mut string_index_of_sig = Signature::new(isa_call_conv(&module));
+    string_index_of_sig.params.push(AbiParam::new(pointer_ty));
+    string_index_of_sig.params.push(AbiParam::new(pointer_ty));
+    string_index_of_sig.returns.push(AbiParam::new(types::I64));
+    let string_index_of = module
+        .declare_function(
+            "sigil_string_index_of",
+            Linkage::Import,
+            &string_index_of_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_index_of: {e}"))?;
+
+    // sigil_string_trim(s) -> *mut u8
+    let mut string_trim_sig = Signature::new(isa_call_conv(&module));
+    string_trim_sig.params.push(AbiParam::new(pointer_ty));
+    string_trim_sig.returns.push(AbiParam::new(pointer_ty));
+    let string_trim = module
+        .declare_function("sigil_string_trim", Linkage::Import, &string_trim_sig)
+        .map_err(|e| format!("declare sigil_string_trim: {e}"))?;
+
+    // sigil_string_to_int_validate(s) -> i64 (0 = ok, 1/2/3 = error)
+    let mut string_to_int_validate_sig = Signature::new(isa_call_conv(&module));
+    string_to_int_validate_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    string_to_int_validate_sig
+        .returns
+        .push(AbiParam::new(types::I64));
+    let string_to_int_validate = module
+        .declare_function(
+            "sigil_string_to_int_validate",
+            Linkage::Import,
+            &string_to_int_validate_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_to_int_validate: {e}"))?;
+
+    // sigil_string_to_int_parse(s) -> i64
+    let mut string_to_int_parse_sig = Signature::new(isa_call_conv(&module));
+    string_to_int_parse_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    string_to_int_parse_sig
+        .returns
+        .push(AbiParam::new(types::I64));
+    let string_to_int_parse = module
+        .declare_function(
+            "sigil_string_to_int_parse",
+            Linkage::Import,
+            &string_to_int_parse_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_to_int_parse: {e}"))?;
+
+    // sigil_string_len(s) -> usize  (Plan A1; surface name
+    // `string_length`).  The returned usize is treated as I64 on
+    // 64-bit hosts.
+    let mut string_length_sig = Signature::new(isa_call_conv(&module));
+    string_length_sig.params.push(AbiParam::new(pointer_ty));
+    string_length_sig.returns.push(AbiParam::new(types::I64));
+    let string_length = module
+        .declare_function("sigil_string_len", Linkage::Import, &string_length_sig)
+        .map_err(|e| format!("declare sigil_string_len: {e}"))?;
+
     // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
     // Phase 3a wires the frame allocation + push/pop ABI from Task
     // 56 around every `handle` body. Arms stay null in this commit
@@ -5778,6 +5943,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             mut_byte_array_length,
             mut_byte_array_get,
             mut_byte_array_set,
+            string_concat,
+            string_substring,
+            string_byte_at,
+            string_compare,
+            string_starts_with,
+            string_ends_with,
+            string_contains,
+            string_index_of,
+            string_trim,
+            string_to_int_validate,
+            string_to_int_parse,
+            string_length,
         },
         handler_frame_new,
         handle_push,
@@ -11673,6 +11850,140 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // the Sigil-level Unit value (I8 zero).
                 self.builder.ins().iconst(types::I8, 0)
             }
+            // Plan C Task 68 — extended String primitives. All
+            // dispatch through `runtime/src/string.rs`.
+            Expr::Ident(name, _) if name == "string_concat" => {
+                assert_eq!(args.len(), 2, "string_concat builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_concat_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_substring" => {
+                assert_eq!(args.len(), 3, "string_substring builtin arg count is not 3");
+                let s = self.lower_expr(&args[0]);
+                let start = self.lower_expr(&args[1]);
+                let end = self.lower_expr(&args[2]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_substring_ref, &[s, start, end]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_byte_at" => {
+                assert_eq!(args.len(), 2, "string_byte_at builtin arg count is not 2");
+                let s = self.lower_expr(&args[0]);
+                let i = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_byte_at_ref, &[s, i]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_compare" => {
+                assert_eq!(args.len(), 2, "string_compare builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_compare_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_starts_with" => {
+                assert_eq!(
+                    args.len(),
+                    2,
+                    "string_starts_with builtin arg count is not 2"
+                );
+                let s = self.lower_expr(&args[0]);
+                let p = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_starts_with_ref, &[s, p]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_ends_with" => {
+                assert_eq!(args.len(), 2, "string_ends_with builtin arg count is not 2");
+                let s = self.lower_expr(&args[0]);
+                let p = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_ends_with_ref, &[s, p]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_contains" => {
+                assert_eq!(args.len(), 2, "string_contains builtin arg count is not 2");
+                let s = self.lower_expr(&args[0]);
+                let p = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_contains_ref, &[s, p]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_index_of" => {
+                assert_eq!(args.len(), 2, "string_index_of builtin arg count is not 2");
+                let s = self.lower_expr(&args[0]);
+                let p = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_index_of_ref, &[s, p]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_trim" => {
+                assert_eq!(args.len(), 1, "string_trim builtin arg count is not 1");
+                let s = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.string_trim_ref, &[s]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_to_int_validate" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "string_to_int_validate builtin arg count is not 1"
+                );
+                let s = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_to_int_validate_ref, &[s]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_to_int_parse" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "string_to_int_parse builtin arg count is not 1"
+                );
+                let s = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_to_int_parse_ref, &[s]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_length" => {
+                assert_eq!(args.len(), 1, "string_length builtin arg count is not 1");
+                let s = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_length_ref, &[s]);
+                self.builder.inst_results(call)[0]
+            }
             Expr::ClosureRecord { code_fn_name, .. } => {
                 // Evaluate the ClosureRecord first (allocates + stores
                 // the closure on the heap) and use its pointer as the
@@ -12878,6 +13189,42 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 Expr::Ident(name, _) if name == "mut_byte_array_length" => types::I64,
                 Expr::Ident(name, _) if name == "mut_byte_array_get" => types::I8,
                 Expr::Ident(name, _) if name == "mut_byte_array_set" => types::I8,
+                // Plan C Task 68 — extended String primitive return
+                // types. `string_concat` / `string_substring` /
+                // `string_trim` produce a fresh String (pointer);
+                // `string_byte_at` returns Byte (I8); `_compare` /
+                // `_index_of` / `_to_int_*` / `_length` return Int
+                // (I64); `_starts_with` / `_ends_with` / `_contains`
+                // return Bool (I8).
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "string_concat" | "string_substring" | "string_trim"
+                    ) =>
+                {
+                    self.pointer_ty
+                }
+                Expr::Ident(name, _) if name == "string_byte_at" => types::I8,
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "string_compare"
+                            | "string_index_of"
+                            | "string_to_int_validate"
+                            | "string_to_int_parse"
+                            | "string_length"
+                    ) =>
+                {
+                    types::I64
+                }
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "string_starts_with" | "string_ends_with" | "string_contains"
+                    ) =>
+                {
+                    types::I8
+                }
                 Expr::ClosureRecord { code_fn_name, .. } => self
                     .user_fns
                     .get(code_fn_name)
@@ -13295,6 +13642,22 @@ struct BuiltinFuncIds {
     mut_byte_array_length: cranelift_module::FuncId,
     mut_byte_array_get: cranelift_module::FuncId,
     mut_byte_array_set: cranelift_module::FuncId,
+    /// Plan C Task 68 — extended String primitives (`runtime/src/string.rs`).
+    string_concat: cranelift_module::FuncId,
+    string_substring: cranelift_module::FuncId,
+    string_byte_at: cranelift_module::FuncId,
+    string_compare: cranelift_module::FuncId,
+    string_starts_with: cranelift_module::FuncId,
+    string_ends_with: cranelift_module::FuncId,
+    string_contains: cranelift_module::FuncId,
+    string_index_of: cranelift_module::FuncId,
+    string_trim: cranelift_module::FuncId,
+    string_to_int_validate: cranelift_module::FuncId,
+    string_to_int_parse: cranelift_module::FuncId,
+    /// `string_length` aliases the Plan A1 `sigil_string_len`
+    /// symbol; the surface name is finally wired through as a
+    /// builtin in Task 68.
+    string_length: cranelift_module::FuncId,
 }
 
 /// Per-fn FuncRefs for the builtin runtime primitives. Sibling of
@@ -13340,6 +13703,19 @@ struct BuiltinFuncRefs {
     mut_byte_array_length_ref: FuncRef,
     mut_byte_array_get_ref: FuncRef,
     mut_byte_array_set_ref: FuncRef,
+    /// Plan C Task 68 — extended String primitive FuncRefs.
+    string_concat_ref: FuncRef,
+    string_substring_ref: FuncRef,
+    string_byte_at_ref: FuncRef,
+    string_compare_ref: FuncRef,
+    string_starts_with_ref: FuncRef,
+    string_ends_with_ref: FuncRef,
+    string_contains_ref: FuncRef,
+    string_index_of_ref: FuncRef,
+    string_trim_ref: FuncRef,
+    string_to_int_validate_ref: FuncRef,
+    string_to_int_parse_ref: FuncRef,
+    string_length_ref: FuncRef,
 }
 
 /// Plan B Task 55, Phase 4e — input context for [`prepare_per_fn_refs`].
@@ -13537,6 +13913,19 @@ fn prepare_builtin_func_refs(
             .declare_func_in_func(ids.mut_byte_array_length, builder.func),
         mut_byte_array_get_ref: module.declare_func_in_func(ids.mut_byte_array_get, builder.func),
         mut_byte_array_set_ref: module.declare_func_in_func(ids.mut_byte_array_set, builder.func),
+        string_concat_ref: module.declare_func_in_func(ids.string_concat, builder.func),
+        string_substring_ref: module.declare_func_in_func(ids.string_substring, builder.func),
+        string_byte_at_ref: module.declare_func_in_func(ids.string_byte_at, builder.func),
+        string_compare_ref: module.declare_func_in_func(ids.string_compare, builder.func),
+        string_starts_with_ref: module.declare_func_in_func(ids.string_starts_with, builder.func),
+        string_ends_with_ref: module.declare_func_in_func(ids.string_ends_with, builder.func),
+        string_contains_ref: module.declare_func_in_func(ids.string_contains, builder.func),
+        string_index_of_ref: module.declare_func_in_func(ids.string_index_of, builder.func),
+        string_trim_ref: module.declare_func_in_func(ids.string_trim, builder.func),
+        string_to_int_validate_ref: module
+            .declare_func_in_func(ids.string_to_int_validate, builder.func),
+        string_to_int_parse_ref: module.declare_func_in_func(ids.string_to_int_parse, builder.func),
+        string_length_ref: module.declare_func_in_func(ids.string_length, builder.func),
     }
 }
 

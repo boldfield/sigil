@@ -6600,6 +6600,163 @@ fn std_mut_byte_array_import_is_noop() {
     assert_eq!(stdout, "0\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 68 — extended String primitives =====
+
+/// `string_concat` joins two strings into a fresh allocation.
+/// Pin the surface that unblocks P02's run-portion.
+#[test]
+fn std_string_concat_returns_joined() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_concat(\"hello, \", \"world\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_concat");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello, world\n", "stderr={stderr:?}");
+}
+
+/// `string_substring` extracts a half-open `[start, end)` byte range.
+#[test]
+fn std_string_substring_extracts_bytes() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_substring(\"0123456789\", 3, 7));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_substring");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3456\n", "stderr={stderr:?}");
+}
+
+/// `string_compare` returns -1 / 0 / 1 lex-order.
+#[test]
+fn std_string_compare_lt_eq_gt() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(string_compare(\"a\", \"b\")));\n  \
+                 perform IO.println(int_to_string(string_compare(\"b\", \"a\")));\n  \
+                 perform IO.println(int_to_string(string_compare(\"a\", \"a\")));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_compare");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "-1\n1\n0\n", "stderr={stderr:?}");
+}
+
+/// `string_starts_with` / `_ends_with` / `_contains` — boolean
+/// predicates over byte sequences.
+#[test]
+fn std_string_predicates_return_bools() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 match string_starts_with(\"hello world\", \"hello\") {\n    \
+                   true => perform IO.println(\"sw_yes\"),\n    \
+                   false => perform IO.println(\"sw_no\"),\n  \
+                 };\n  \
+                 match string_ends_with(\"hello world\", \"world\") {\n    \
+                   true => perform IO.println(\"ew_yes\"),\n    \
+                   false => perform IO.println(\"ew_no\"),\n  \
+                 };\n  \
+                 match string_contains(\"hello world\", \"o w\") {\n    \
+                   true => perform IO.println(\"ct_yes\"),\n    \
+                   false => perform IO.println(\"ct_no\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_predicates");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "sw_yes\new_yes\nct_yes\n", "stderr={stderr:?}");
+}
+
+/// `string_index_of` returns the byte offset of the first match;
+/// -1 when absent; 0 for an empty needle.
+#[test]
+fn std_string_index_of_returns_byte_offset() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(string_index_of(\"abcabc\", \"bc\")));\n  \
+                 perform IO.println(int_to_string(string_index_of(\"abc\", \"xyz\")));\n  \
+                 perform IO.println(int_to_string(string_index_of(\"abc\", \"\")));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_index_of");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n-1\n0\n", "stderr={stderr:?}");
+}
+
+/// `string_byte_at` returns the i-th byte; pair with `byte_to_int`
+/// to print the numeric value.
+#[test]
+fn std_string_byte_at_returns_byte() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = string_byte_at(\"ABC\", 1);\n  \
+                 perform IO.println(int_to_string(byte_to_int(b)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_byte_at");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // 'B' is ASCII 66.
+    assert_eq!(stdout, "66\n", "stderr={stderr:?}");
+}
+
+/// `string_trim` strips ASCII whitespace from both sides.
+#[test]
+fn std_string_trim_strips_whitespace() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_trim(\"  hello world  \"));\n  \
+                 perform IO.println(int_to_string(string_length(string_trim(\"   \"))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_trim");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello world\n0\n", "stderr={stderr:?}");
+}
+
+/// `string_to_int_validate` + `string_to_int_parse` round-trip on a
+/// clean decimal; rejects empty / non-decimal / overflow with
+/// distinct discriminants (1 / 2 / 3).
+#[test]
+fn std_string_to_int_validate_and_parse() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let v: Int = string_to_int_validate(\"42\");\n  \
+                 match v {\n    \
+                   0 => perform IO.println(int_to_string(string_to_int_parse(\"42\"))),\n    \
+                   _ => perform IO.println(\"unexpected\"),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(string_to_int_validate(\"\")));\n  \
+                 perform IO.println(int_to_string(string_to_int_validate(\"abc\")));\n  \
+                 perform IO.println(int_to_string(string_to_int_validate(\"9223372036854775808\")));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_to_int");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n1\n2\n3\n", "stderr={stderr:?}");
+}
+
+/// `string_length` is the surface name for the Plan A1
+/// `sigil_string_len` runtime primitive. Both ASCII and UTF-8
+/// strings report byte length.
+#[test]
+fn std_string_length_returns_byte_count() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(string_length(\"hello\")));\n  \
+                 perform IO.println(int_to_string(string_length(\"\")));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_length");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n0\n", "stderr={stderr:?}");
+}
+
+/// `import std.string` is a no-op (skip-list path).
+#[test]
+fn std_string_import_is_noop() {
+    let src = "import std.string\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_concat(\"a\", \"b\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_import_noop");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "ab\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration

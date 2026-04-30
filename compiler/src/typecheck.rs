@@ -744,6 +744,9 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // Plan C Task 66.6 — non-generic builtin schemes for the
     // `mut_byte_array_*` ops, gated by the Mem marker effect.
     register_builtin_mut_byte_array_schemes(&mut tc);
+    // Plan C Task 68 — extended String primitives (byte-indexed
+    // accessor / comparison / search / trim / parse).
+    register_builtin_string_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -1412,6 +1415,88 @@ fn register_builtin_mut_byte_array_schemes(tc: &mut Tc) {
     tc.fn_schemes.insert(
         "mut_byte_array_set".to_string(),
         make_scheme(vec![mba_ty(), Ty::Int, Ty::Byte], Ty::Unit),
+    );
+}
+
+/// Plan C Task 68 — extended String primitives.
+///
+/// All operate on `TAG_STRING` headers and use byte offsets. Code-
+/// point-aware variants (`string_char_at`, `string_chars`) and the
+/// List-returning helpers (`string_split`, `string_chars`) are
+/// deferred to Task 68 part 2 (alongside the namespace fix that
+/// lets a stdlib module use `Char` + `List` + `Result` together).
+///
+/// Operations:
+/// - `string_concat(String, String) -> String ![]`
+/// - `string_substring(String, Int, Int) -> String ![]`
+/// - `string_byte_at(String, Int) -> Byte ![]`
+/// - `string_compare(String, String) -> Int ![]`
+/// - `string_starts_with(String, String) -> Bool ![]`
+/// - `string_ends_with(String, String) -> Bool ![]`
+/// - `string_contains(String, String) -> Bool ![]`
+/// - `string_index_of(String, String) -> Int ![]`
+/// - `string_trim(String) -> String ![]`
+/// - `string_to_int_validate(String) -> Int ![]`
+/// - `string_to_int_parse(String) -> Int ![]`
+/// - `string_length(String) -> Int ![]`
+fn register_builtin_string_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    tc.fn_schemes.insert(
+        "string_concat".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::String),
+    );
+    tc.fn_schemes.insert(
+        "string_substring".to_string(),
+        make_scheme(vec![Ty::String, Ty::Int, Ty::Int], Ty::String),
+    );
+    tc.fn_schemes.insert(
+        "string_byte_at".to_string(),
+        make_scheme(vec![Ty::String, Ty::Int], Ty::Byte),
+    );
+    tc.fn_schemes.insert(
+        "string_compare".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_starts_with".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::Bool),
+    );
+    tc.fn_schemes.insert(
+        "string_ends_with".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::Bool),
+    );
+    tc.fn_schemes.insert(
+        "string_contains".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::Bool),
+    );
+    tc.fn_schemes.insert(
+        "string_index_of".to_string(),
+        make_scheme(vec![Ty::String, Ty::String], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_trim".to_string(),
+        make_scheme(vec![Ty::String], Ty::String),
+    );
+    tc.fn_schemes.insert(
+        "string_to_int_validate".to_string(),
+        make_scheme(vec![Ty::String], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_to_int_parse".to_string(),
+        make_scheme(vec![Ty::String], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_length".to_string(),
+        make_scheme(vec![Ty::String], Ty::Int),
     );
 }
 
@@ -9653,6 +9738,106 @@ mod tests {
         assert!(
             has_code(&errs, "E0113"),
             "expected E0113 (duplicate type MutByteArray); got {errs:?}"
+        );
+    }
+
+    // ===== Plan C Task 68 — extended String primitives =====
+
+    #[test]
+    fn string_concat_typechecks_cleanly() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let s: String = string_concat(\"hello, \", \"world\");\n  \
+                     perform IO.println(s);\n  \
+                     perform IO.println(int_to_string(string_length(s)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_compare_returns_int_typechecks() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let c: Int = string_compare(\"a\", \"b\");\n  \
+                     perform IO.println(int_to_string(c));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_predicates_typecheck() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let sw: Bool = string_starts_with(\"hello\", \"he\");\n  \
+                     let ew: Bool = string_ends_with(\"hello\", \"lo\");\n  \
+                     let ct: Bool = string_contains(\"hello\", \"ell\");\n  \
+                     match sw {\n    \
+                       true => perform IO.println(\"sw\"),\n    \
+                       false => perform IO.println(\"!sw\"),\n  \
+                     };\n  \
+                     match ew {\n    \
+                       true => perform IO.println(\"ew\"),\n    \
+                       false => perform IO.println(\"!ew\"),\n  \
+                     };\n  \
+                     match ct {\n    \
+                       true => perform IO.println(\"ct\"),\n    \
+                       false => perform IO.println(\"!ct\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_byte_at_returns_byte_typechecks() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let b: Byte = string_byte_at(\"abc\", 1);\n  \
+                     perform IO.println(int_to_string(byte_to_int(b)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_to_int_validate_parse_pair_typechecks() {
+        // The validate / parse pair is the v1 surface for parsing
+        // — user-side wrappers compose it into Result[Int, ...].
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let v: Int = string_to_int_validate(\"42\");\n  \
+                     match v {\n    \
+                       0 => perform IO.println(int_to_string(string_to_int_parse(\"42\"))),\n    \
+                       _ => perform IO.println(\"err\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_string_is_doc_only_skip_list() {
+        let src = "import std.string\n\
+                   fn main() -> Int ![IO] {\n  \
+                     perform IO.println(string_concat(\"a\", \"b\"));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_concat_with_int_arg_fires_e0044() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let _s: String = string_concat(\"hello\", 42);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 from string_concat Int-vs-String mismatch; got {errs:?}"
         );
     }
 

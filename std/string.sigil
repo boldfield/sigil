@@ -1,0 +1,76 @@
+// sigil: 0.1
+//
+// std/string.sigil — Plan C Task 68 part 1.
+//
+// **Documentation only.** The `String` primitive type and its
+// operations are registered at the typechecker as builtins via
+// `register_builtin_string_schemes()`. Edits to this file have no
+// effect on compilation. `import std.string` is allowed (skip-list
+// path) but is not required.
+//
+// All operations treat strings as **byte sequences**, not codepoint
+// sequences — `string_byte_at`, `string_substring`, and
+// `string_index_of` operate on byte offsets. Codepoint-aware
+// variants (`string_char_at`, `string_chars`, `string_split`,
+// `string_join`) are deferred to Task 68 part 2 (they need either
+// the `Char` primitive widened to user surface or
+// `List`-returning helpers; both run into the flat-stdlib-namespace
+// collision per `[DEVIATION Task 66.5]`).
+//
+// ## Builtin operations
+//
+// Length:
+// - `string_length(s: String) -> Int ![]`  — byte length.
+// - `string_byte_at(s: String, i: Int) -> Byte ![]`  — i-th byte;
+//   aborts on out-of-bounds.
+//
+// Slicing:
+// - `string_substring(s: String, start: Int, end: Int) -> String ![]`
+//   — half-open `[start, end)` range; aborts on `start > end` or
+//   `end > length(s)`. Empty range returns the empty string.
+//
+// Construction:
+// - `string_concat(a: String, b: String) -> String ![]`  — fresh
+//   allocation.
+//
+// Comparison:
+// - `string_compare(a: String, b: String) -> Int ![]`  —
+//   lexicographic byte compare; returns -1, 0, or 1.
+// - `string_starts_with(s: String, prefix: String) -> Bool ![]`
+// - `string_ends_with(s: String, suffix: String) -> Bool ![]`
+// - `string_contains(s: String, needle: String) -> Bool ![]`
+// - `string_index_of(s: String, needle: String) -> Int ![]`  —
+//   byte offset of first occurrence; -1 if absent. Empty needle
+//   returns 0.
+//
+// Whitespace:
+// - `string_trim(s: String) -> String ![]`  — strips ASCII
+//   whitespace (` `, `\t`, `\n`, `\r`) from both sides.
+//
+// Parsing:
+// - `string_to_int_validate(s: String) -> Int ![]`  — returns 0 on
+//   success, 1 if empty, 2 if non-decimal, 3 on overflow.
+// - `string_to_int_parse(s: String) -> Int ![]`  — caller must
+//   have validated; on validated input returns the parsed integer.
+//
+// ## Composition pattern for parsing
+//
+// User code wraps the validate / parse pair into a sum-typed
+// surface like `Result[Int, ParseError]`:
+//
+// ```sigil
+// type ParseError = | Empty | NonDecimal | Overflow
+//
+// fn parse_int(s: String) -> Result[Int, ParseError] ![] {
+//   match string_to_int_validate(s) {
+//     0 => Ok(string_to_int_parse(s)),
+//     1 => Err(Empty),
+//     2 => Err(NonDecimal),
+//     _ => Err(Overflow),
+//   }
+// }
+// ```
+//
+// (`Result` ships in `std/result.sigil`; the wrapper is left to
+// user code per the same flat-namespace concern as other byte/string
+// stdlib helpers.)
