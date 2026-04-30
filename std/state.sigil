@@ -1,0 +1,86 @@
+// sigil: 0.1
+//
+// std/state.sigil — Plan C Task 72.
+//
+// `State` is the canonical mutable-state-via-effect surface: a
+// computation accesses an `Int`-typed state slot via `get_state()`
+// / `set_state(...)`, and `run_state(initial, body)` discharges
+// the effect by threading state through the body's perform sites,
+// returning the body's final value.
+//
+// Compare to Koka / Effekt's `state` / `runState` and OCaml's
+// `State` monad.
+//
+// ## v1 design choices
+//
+// 1. **`State` is non-generic; state type is fixed at `Int`.**
+//    Plan body specifies `State[S]` parameterised by the state
+//    type. Sigil v1's parser rejects type-parameterized effect
+//    references in rows (`![State[S]]` doesn't parse) — same
+//    constraint as `[DEVIATION Task 71]`'s `Raise` simplification.
+//    `examples/state.sigil` (Plan B' Stage 6.8 demo) uses the
+//    same workaround. v2 generalises to `State[S]` when the
+//    parser surface lands; user code calling `get_state()` /
+//    `set_state(...)` / `run_state(...)` stays surface-stable.
+//
+// 2. **`run_state` returns just `A` (body's final value), not
+//    `(A, S)`.** Plan body specifies `(A, S) !e` — body's final
+//    value paired with the final state. Sigil v1 lacks a tuple
+//    type and no `Pair[A, B]` is in the stdlib (would need its
+//    own task). For v1, ship `run_state` returning the body's A
+//    value directly (matches `examples/state.sigil` precedent).
+//    Users wanting the final state can capture it explicitly via
+//    a `set_state` that retains the value, or wait for v2's
+//    `(A, S)` tuple return.
+//
+// 3. **Closed effect row on `run_state`.** Same row-poly Fn
+//    deferral as Task 71's `catch`. The `!e` passthrough lands
+//    when row-poly Fn parameters ship in v2.
+//
+// See `[DEVIATION Task 72]` in `PLAN_C_DEVIATIONS.md`.
+
+// `State` is the v1 mutable-state effect with `Int`-typed state.
+// `resumes: many` matches `examples/state.sigil`'s shape — though
+// `run_state` invokes `k` exactly once per arm activation in
+// practice, the `many` annotation keeps the option open for
+// future multi-shot patterns built on `State`.
+effect State resumes: many {
+  get: () -> Int,
+  set: (Int) -> Int,
+}
+
+// `get_state()` reads the current state. Inside any fn whose
+// effect row contains `State`, this returns the value the active
+// `run_state` handler is threading through.
+fn get_state() -> Int ![State] {
+  perform State.get()
+}
+
+// `set_state(s)` writes a new state value. Returns the previous
+// state (before the write) for ergonomic chaining; ignore the
+// return value when not needed.
+fn set_state(s: Int) -> Int ![State] {
+  perform State.set(s)
+}
+
+// `run_state(initial, body)` discharges the State effect by
+// threading state through every `State.get` / `State.set` perform
+// in `body`. Returns the body's final value.
+//
+// **Implementation shape.** Each handler arm returns a state-
+// bearing lambda `(Int) -> Int ![]`; the handle expression's
+// overall is the lambda chain that, when applied to `initial`,
+// drives the state through the body. The return arm wraps the
+// body's final value in a no-op state-bearing lambda; the get
+// arm threads the current state into k twice (once as the
+// resume value, once as the next state); the set arm threads
+// `arg` similarly. See `examples/state.sigil` for the detailed
+// trace.
+fn run_state(initial: Int, body: () -> Int ![State]) -> Int ![] {
+  let state_fn: (Int) -> Int ![] = handle body() with {
+    return(v) => fn (s: Int) -> Int ![] => v,
+    State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),
+    State.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),
+  };
+  state_fn(initial)
+}

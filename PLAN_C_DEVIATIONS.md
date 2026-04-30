@@ -476,3 +476,62 @@ The return-arm shape is cleaner in principle and matches `examples/state.sigil`'
 `examples/state.sigil` sidesteps this because it is non-generic — A is concrete `Int` everywhere, so no Ty::Var survives.
 
 **Closure path for the return-arm shape.** A v2 typecheck refinement that pins all unconstrained type-vars in handler-arm bodies against the declared handle-overall type (via the same Ty::Var-back-propagation mechanism that pinned the Plan C Task 63 cross-arm unify direction-fix). After v2 lands, `catch` swaps to the cleaner return-arm shape; the `Ok(body())` form below is the v1-compatible workaround documented inline in `std/raise.sigil`.
+
+## 2026-04-30 — [DEVIATION Task 72] `State` ships non-generic concrete-`Int`; `run_state` returns A only
+
+**Context.** Plan C Task 72's plan body specifies:
+
+```text
+State[S] effect + run_state: (S, () -> A ![State[S] | e]) -> (A, S) !e
+```
+
+Three v1 surface gaps prevent shipping the literal shape — the same trio Task 71's `[DEVIATION Task 71]` enumerated, plus a fourth tuple-return gap.
+
+**v1 constraints, in priority order:**
+
+1. **Parser rejects type-parameterized effect references in rows.** `parse_effect_row` accepts simple effect-name idents only. `effect State[S] { ... }` declares fine but `![State[S]]` doesn't parse. Plan B' state.sigil established the concrete-`State` workaround (`examples/state.sigil` declares `effect State resumes: many { get: () -> Int, set: (Int) -> Int }` over fixed `Int`).
+
+2. **No tuple type, no stdlib `Pair[A, B]`.** Sigil v1 has variant sum types, records, and primitives, but no tuple syntax. The plan-body `(A, S)` return is not expressible directly. Options for v1:
+   - Define `type Pair[A, B] = | Pair(A, B)` in std/pair.sigil (would need its own Plan C task).
+   - Drop the `(A, S)` part and return just `A` (matching `examples/state.sigil` precedent).
+   - Custom record per use case in user code.
+   We pick the second option for v1 — `run_state` returns the body's final value only. Users wanting the final state capture it explicitly via a sentinel `set_state` at body's end (or wait for v2's tuple return).
+
+3. **No per-op generic params on user-declared effects.** Same constraint as Task 71's `Raise.fail: (E) -> Int` placeholder. State's ops aren't affected (`get: () -> Int`, `set: (Int) -> Int` are concrete-typed at the signature level), but the underlying gap is shared.
+
+4. **No row-polymorphic fn-typed parameters.** Same closed-row constraint as Task 71's `catch`. `run_state` accepts `body: () -> Int ![State]` only; row-poly passthrough lands in v2.
+
+**Why accepted.** v1 ships:
+
+- `effect State resumes: many { get: () -> Int, set: (Int) -> Int }` — non-generic, concrete `Int` state, multi-shot annotation matching `examples/state.sigil`.
+- `fn get_state() -> Int ![State]` — convenience wrapper.
+- `fn set_state(s: Int) -> Int ![State]` — convenience wrapper; returns the previous state value for ergonomic chaining.
+- `fn run_state(initial: Int, body: () -> Int ![State]) -> Int ![]` — discharges State by threading state through the body's perform sites; returns the body's final value.
+
+The `run_state` implementation reuses `examples/state.sigil`'s state-bearing-lambda pattern (each handler arm returns `(Int) -> Int ![]`; the handle expression's overall is the chain; applying it to `initial` drives the state through). All Plan B' machinery (B.3 TypeExpr::Fn, B.4 lambda arm bodies, return arm wrap, captures+) is exercised. `examples/state.sigil` is the verified precedent — Plan B' Stage 6.8's PR #39 closed the six-layer canonical run_state runtime chain fix that makes this shape correct end-to-end.
+
+**What's lost vs the plan body.**
+
+- Single state type per State (always `Int`). Users wanting `State[String]` for string accumulators write a String wrapper (e.g., a `MutByteArray`-backed accumulator) or wait for v2's generic generalisation.
+- No final-state observation in `run_state`'s return. Users wanting `(A, S)` capture state explicitly, e.g.:
+  ```sigil
+  fn comp_returning_final() -> Int ![State] {
+    // ... do work ...
+    let final_s: Int = get_state();
+    final_s  // body's return value IS the final state
+  }
+  ```
+  i.e., have the body return the state value when caller wants both. Awkward but expressible.
+- No effect passthrough (closed `![State]` row).
+
+**Closure path.** Three orthogonal v2 lifts retire the deviation:
+
+1. Parser surface for type-parameterized effect references in rows (`![State[S]]`).
+2. Tuple type / `Pair[A, B]` stdlib (or `(A, S)` syntax). `run_state` then returns `(A, S)`.
+3. Row-poly Fn type parameters (`(() -> A ![State[S] | e]) -> ...`).
+
+User code calling `get_state()` / `set_state(s)` / `run_state(init, body)` stays surface-stable across the v1 → v2 shift.
+
+**Failure mode.** Users wanting non-Int state types or tuple returns hit the fixed-Int / final-A-only surface. Type errors are clear at the call site (`set_state("x")` fires E0044 with String-vs-Int mismatch).
+
+**Implementing commit(s).** [HEAD].

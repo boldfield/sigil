@@ -6921,6 +6921,45 @@ fn std_raise_nested_catch_with_re_raise() {
     assert_eq!(stdout, "outer-rewrap\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 72 — State + run_state =====
+
+/// Canonical run_state demo: body sets state to 10, gets it back,
+/// returns 10 + 1 = 11. The initial 5 is discarded by the body's
+/// set. Mirrors `examples/state.sigil`'s Plan B' Stage 6.8 trace.
+#[test]
+fn std_state_run_state_set_get_returns_11() {
+    let src = "import std.state\n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = set_state(10);\n  \
+                 let v: Int = get_state();\n  \
+                 v + 1\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_state_run_set_get");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "11\n", "stderr={stderr:?}");
+}
+
+/// Body that only reads state (no set) sees the initial value.
+/// `run_state(42, get_only)` returns 42.
+#[test]
+fn std_state_run_state_get_only_reflects_initial() {
+    let src = "import std.state\n\
+               fn get_only() -> Int ![State] { get_state() }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(42, get_only);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_state_get_only");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
 /// `catch` over a body that conditionally raises (data-driven).
 /// Pin the discard-k semantics: when raise fires, catch returns
 /// `Err`; when it doesn't, catch returns `Ok` with the body's
