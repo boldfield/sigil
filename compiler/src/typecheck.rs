@@ -10062,6 +10062,63 @@ mod tests {
         );
     }
 
+    // ===== Plan C Task 71 — Raise effect + catch =====
+
+    #[test]
+    fn import_std_raise_typechecks_cleanly() {
+        // Pin the `Raise` + `raise` + `catch` surface end-to-end:
+        // a fallible `parse_pos` returns `Int ![Raise]` via
+        // `raise(...)`; the caller wraps with `catch` to get
+        // `Result[Int, String]`.
+        let src = "import std.raise\n\
+                   fn parse_pos(n: Int) -> Int ![Raise] {\n  \
+                     match n {\n    \
+                       0 => raise(\"zero\"),\n    \
+                       _ => n,\n  \
+                     }\n\
+                   }\n\
+                   fn parse_pos_three() -> Int ![Raise] { parse_pos(3) }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let r: Result[Int, String] = catch(parse_pos_three);\n  \
+                     match r {\n    \
+                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                       Err(_) => perform IO.println(\"err\"),\n  \
+                     };\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn raise_without_raise_in_row_fires_e0042() {
+        let src = "import std.raise\n\
+                   fn bad() -> Int ![] {\n  \
+                     raise(\"oops\")\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (missing Raise in row); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn raise_with_int_arg_fires_e0044() {
+        // raise takes String error; passing Int should fire E0044.
+        let src = "import std.raise\n\
+                   fn fail_with_code() -> Int ![Raise] {\n  \
+                     raise(42)\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 (raise expects String, got Int); got {errs:?}"
+        );
+    }
+
     #[test]
     fn import_std_result_map_map_err_and_then_typecheck_cleanly() {
         let src = "import std.result\n\

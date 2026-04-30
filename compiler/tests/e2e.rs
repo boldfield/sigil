@@ -6822,6 +6822,77 @@ fn std_io_read_write_file_round_trip() {
     assert_eq!(stdout, "hello, file\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C Task 71 — Raise + catch run-and-check-output =====
+
+/// `catch` over a body that raises returns `Err(message)`.
+#[test]
+fn std_raise_catch_propagates_error() {
+    let src = "import std.raise\n\
+               fn always_fails() -> Int ![Raise] {\n  \
+                 raise(\"boom\")\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = catch(always_fails);\n  \
+                 match r {\n    \
+                   Ok(_) => perform IO.println(\"ok-unexpected\"),\n    \
+                   Err(msg) => perform IO.println(msg),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_raise_catch_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "boom\n", "stderr={stderr:?}");
+}
+
+/// `catch` over a body that doesn't raise returns `Ok(value)`.
+#[test]
+fn std_raise_catch_passes_through_success() {
+    let src = "import std.raise\n\
+               fn always_succeeds() -> Int ![Raise] { 42 }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = catch(always_succeeds);\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err-unexpected\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_raise_catch_ok");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+}
+
+/// `catch` over a body that conditionally raises (data-driven).
+/// Pin the discard-k semantics: when raise fires, catch returns
+/// `Err`; when it doesn't, catch returns `Ok` with the body's
+/// natural value.
+#[test]
+fn std_raise_catch_conditional_branch() {
+    let src = "import std.raise\n\
+               fn check_pos(n: Int) -> Int ![Raise] {\n  \
+                 match n {\n    \
+                   0 => raise(\"zero\"),\n    \
+                   _ => n + 100,\n  \
+                 }\n\
+               }\n\
+               fn check_three() -> Int ![Raise] { check_pos(3) }\n\
+               fn check_zero() -> Int ![Raise] { check_pos(0) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 match catch(check_three) {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err1\"),\n  \
+                 };\n  \
+                 match catch(check_zero) {\n    \
+                   Ok(_) => perform IO.println(\"ok2\"),\n    \
+                   Err(msg) => perform IO.println(msg),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_raise_catch_branch");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "103\nzero\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 64 — std/list run-and-check-output =====
 
 /// `length(range(1, 5))` returns 4. Pin the canonical iteration

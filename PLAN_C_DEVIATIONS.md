@@ -379,3 +379,83 @@ Architectural escalation flagged in PR #43's review: "any test loadbearing on a 
 **Failure mode (Clock).** Saturation at year 2262 is silent at the type level (returns `i64::MAX`); user code can detect saturation by `==` comparison.
 
 **Implementing commit(s).** `91d1e55` (initial Tasks 75 + 76 land); [HEAD] (Random rename + scheme-organisation + clock saturation explicit).
+
+## 2026-04-30 — [DEVIATION Task 71] `Raise` ships non-generic; closed-row `catch`; v2 path to `Raise[E]`
+
+**Context.** Plan C Task 71's plan body specifies:
+
+```text
+Raise[E] effect + catch : (() -> A ![Raise[E] | e]) -> Result[A, E] !e
+```
+
+Three v1 constraints prevent shipping the literal shape:
+
+1. **Parser rejects type-parameterized effect references in rows.**
+   `parse_effect_row` in `compiler/src/parser.rs` accepts simple
+   effect names (idents) only — `Vec<String>`. The sigil
+   `effect Raise[E] { ... }` declaration parses (Plan B Task 53),
+   but the row reference `![Raise[E]]` does not. Plan B' state.sigil
+   uses the same workaround: a non-generic `effect State { get,
+   set }` with concrete `Int` everywhere (per
+   `examples/state.sigil`).
+
+2. **No per-op generic params on user-declared effects.** v1
+   `effect E { op }` declarations don't accept `op[A]: ...` syntax
+   for op-level generics, so `fail: forall a. E -> a` (Koka /
+   Effekt's "never returns" shape) is not expressible. Plan B Task
+   57's `ArithError.div_by_zero -> Int` placeholder is the
+   precedent for "declare `Int` and never resume."
+
+3. **No row-polymorphic fn-typed parameters yet.** The `!e`
+   passthrough in `(() -> A ![Raise[E] | e]) -> Result[A, E] !e`
+   would require row-poly `Fn` types; Plan B' B.3 ships closed-row
+   `Fn` only.
+
+**Why accepted.** v1 ships:
+
+- `effect Raise { fail: (String) -> Int }` — non-generic, fixed
+  String error type, `Int` placeholder return.
+- `fn raise(e: String) -> Int ![Raise]` — convenience wrapper.
+- `fn catch[A](body: () -> A ![Raise]) -> Result[A, String] ![]` —
+  generic over body's success type `A`, fixed `String` error,
+  closed effect row.
+
+The catch implementation is a single `handle Ok(body()) with {
+Raise.fail(e, k) => Err(e), }` discharge-`k` arm. Plan B Task 55
+Phase 4d MVP closure-capture + tail-position `k` (PR #25) covers
+the success path; the discard-`k` arm shape that Phase 4e
+captures+ closed (PR #26 — discard-`k` correctness across
+function-call boundaries) covers the raise path. Both are
+already-verified machinery; Task 71 exercises the user-overridable
+half of the surface.
+
+**What's lost vs the plan body.**
+
+- Single error type per Raise (always String). Users wanting
+  `Raise[Int]` for error codes write a String wrapper
+  (`int_to_string` is in scope), or write their own concrete
+  `RaiseInt` effect with the same shape. v2 generalises.
+- No effect passthrough — `catch` body must be `![Raise]`-only.
+  Users wanting IO + Raise inside the body write a domain-specific
+  `catch_io[A](body: () -> A ![IO, Raise]) -> Result[A, String]
+  ![IO]` until row-poly Fn lands.
+
+**Closure path.** Three orthogonal v2 surface lifts retire the
+deviation:
+
+1. Parser surface for type-parameterized effect references in rows
+   (`![Raise[E]]`, `![State[S]]`, etc.).
+2. Per-op generic params (`fail[A]: (E) -> A`) so `fail`'s return
+   type matches the use site.
+3. Row-poly `Fn` type parameters (`(() -> A ![Raise[E] | e]) ->
+   ...`).
+
+User code calling `raise(s)` / `catch(body)` stays surface-stable
+across the v1 → v2 shift; only the type signatures generalise.
+
+**Failure mode.** Users wanting non-String error types hit the
+fixed-String surface and must serialise via `int_to_string` or
+similar. Type errors are clear at the call site (`raise(42)`
+fires E0044 with String-vs-Int mismatch).
+
+**Implementing commit(s).** [HEAD].
