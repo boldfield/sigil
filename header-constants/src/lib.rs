@@ -55,6 +55,16 @@ pub const TAG_ARRAY: u8 = 0x04;
 /// array; `mut_array_set` returns Unit and mutates in place).
 pub const TAG_MUT_ARRAY: u8 = 0x05;
 
+/// Immutable byte-array layout — Plan C Task 66.5.
+/// `{header, length, byte[0], byte[1], ..., byte[N-1]}` packed.
+/// Length lives in payload word 0 (offset 8); bytes start at offset
+/// 16 with no per-element boxing. Bitmap is 0 (atomic GC scan): bytes
+/// are pure scalars, never pointers. The header `count` field is
+/// unused for the same reason as `TAG_ARRAY` (Sudoku-class lengths
+/// would overflow the 6-bit cap); allocator-tracked size scans the
+/// payload region.
+pub const TAG_BYTE_ARRAY: u8 = 0x06;
+
 /// Payload-word-count field layout.
 pub const COUNT_BITS: u32 = 6;
 pub const COUNT_SHIFT: u32 = 8;
@@ -130,6 +140,7 @@ mod tests {
         assert_eq!(TAG_CLOSURE, 0x03);
         assert_eq!(TAG_ARRAY, 0x04);
         assert_eq!(TAG_MUT_ARRAY, 0x05);
+        assert_eq!(TAG_BYTE_ARRAY, 0x06);
         assert_eq!(TAG_EXTERNAL_DESCRIPTOR, 0xFF);
     }
 }

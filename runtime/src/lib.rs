@@ -53,6 +53,7 @@ pub mod arena;
 pub mod arith;
 pub mod array;
 pub mod byte;
+pub mod byte_array;
 pub mod counters;
 pub mod gc;
 pub mod handlers;
