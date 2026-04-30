@@ -10119,6 +10119,62 @@ mod tests {
         );
     }
 
+    // ===== Plan C Task 72 — State effect + run_state =====
+
+    #[test]
+    fn import_std_state_typechecks_cleanly() {
+        // Pin `State` + `run_state` surface end-to-end. Body sets
+        // state to 10, gets it back, returns get-result + 1;
+        // run_state(5, comp) discharges and threads state. Same
+        // shape as examples/state.sigil's canonical trace
+        // (Plan B' Stage 6.8 demo). Uses direct `perform State.x`
+        // invocations per `[DEVIATION Task 72]` v1 constraint #3
+        // (wrapper fns don't compose with the discharge-with-
+        // lambda pattern in v1).
+        let src = "import std.state\n\
+                   fn comp() -> Int ![State] {\n  \
+                     let _: Int = perform State.set(10);\n  \
+                     let v: Int = perform State.get();\n  \
+                     v + 1\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let result: Int = run_state(5, comp);\n  \
+                     perform IO.println(int_to_string(result));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn perform_state_get_without_state_in_row_fires_e0042() {
+        let src = "import std.state\n\
+                   fn bad() -> Int ![] {\n  \
+                     perform State.get()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (missing State in row); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn perform_state_set_with_string_arg_fires_e0044() {
+        // State.set takes Int; passing String should fire E0044.
+        let src = "import std.state\n\
+                   fn bad() -> Int ![State] {\n  \
+                     perform State.set(\"not an int\")\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 (State.set expects Int, got String); got {errs:?}"
+        );
+    }
+
     #[test]
     fn raise_int_return_in_string_returning_fn_fires_e0044_v1_gap_pin() {
         // Plan C Task 71 v1 gap pin per `[DEVIATION Task 71]`:
