@@ -6921,6 +6921,37 @@ fn std_raise_nested_catch_with_re_raise() {
     assert_eq!(stdout, "outer-rewrap\n", "stderr={stderr:?}");
 }
 
+/// `catch` over a body that conditionally raises (data-driven).
+/// Pin the discard-k semantics: when raise fires, catch returns
+/// `Err`; when it doesn't, catch returns `Ok` with the body's
+/// natural value.
+#[test]
+fn std_raise_catch_conditional_branch() {
+    let src = "import std.raise\n\
+               fn check_pos(n: Int) -> Int ![Raise] {\n  \
+                 match n {\n    \
+                   0 => raise(\"zero\"),\n    \
+                   _ => n + 100,\n  \
+                 }\n\
+               }\n\
+               fn check_three() -> Int ![Raise] { check_pos(3) }\n\
+               fn check_zero() -> Int ![Raise] { check_pos(0) }\n\
+               fn main() -> Int ![IO] {\n  \
+                 match catch(check_three) {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(_) => perform IO.println(\"err1\"),\n  \
+                 };\n  \
+                 match catch(check_zero) {\n    \
+                   Ok(_) => perform IO.println(\"ok2\"),\n    \
+                   Err(msg) => perform IO.println(msg),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_raise_catch_branch");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "103\nzero\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 72 — State + run_state =====
 
 /// Canonical run_state demo using direct `perform State.set/get`.
@@ -6961,35 +6992,51 @@ fn std_state_run_state_get_only_reflects_initial() {
     assert_eq!(stdout, "42\n", "stderr={stderr:?}");
 }
 
-/// `catch` over a body that conditionally raises (data-driven).
-/// Pin the discard-k semantics: when raise fires, catch returns
-/// `Err`; when it doesn't, catch returns `Ok` with the body's
-/// natural value.
+/// **Pin the v1 wrapper-fn-frame composition gap** documented as
+/// `[DEVIATION Task 72]` constraint #3. When user-side wrapper fns
+/// (`get_state` / `set_state`) introduce a function-call frame
+/// between the body's call site and the underlying `perform State.x`,
+/// the discharge-with-lambda continuation chain produces the wrong
+/// runtime result — `run_state(5, comp_via_wrappers)` returns the
+/// initial value `5` instead of the canonical threaded `11`.
+///
+/// The assertion below pins the **future-correct (v2)** value
+/// `"11\n"`. Pre-fix, actual stdout is `"5\n"` — the very failure
+/// shape that surfaced on PR #45's first CI run with commit
+/// `c71c1e4`.
+///
+/// **Resolution path:** v2 closure for the deferred Plan B' /
+/// Stage 6.8 wrapper-fn-frame composition fix (tracked in
+/// `PLAN_C_PROGRESS.md`'s "Plan B' Stage-6.8-followup architectural
+/// carryovers" section). When that lands, **un-ignore this test
+/// and confirm it passes**.
 #[test]
-fn std_raise_catch_conditional_branch() {
-    let src = "import std.raise\n\
-               fn check_pos(n: Int) -> Int ![Raise] {\n  \
-                 match n {\n    \
-                   0 => raise(\"zero\"),\n    \
-                   _ => n + 100,\n  \
-                 }\n\
+#[ignore = "FIXME [DEVIATION Task 72] constraint #3 — un-ignore when v2 closes wrapper-fn-frame composition"]
+fn std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix() {
+    let src = "import std.state\n\
+               fn get_state() -> Int ![State] { perform State.get() }\n\
+               fn set_state(s: Int) -> Int ![State] { perform State.set(s) }\n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = set_state(10);\n  \
+                 let v: Int = get_state();\n  \
+                 v + 1\n\
                }\n\
-               fn check_three() -> Int ![Raise] { check_pos(3) }\n\
-               fn check_zero() -> Int ![Raise] { check_pos(0) }\n\
                fn main() -> Int ![IO] {\n  \
-                 match catch(check_three) {\n    \
-                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
-                   Err(_) => perform IO.println(\"err1\"),\n  \
-                 };\n  \
-                 match catch(check_zero) {\n    \
-                   Ok(_) => perform IO.println(\"ok2\"),\n    \
-                   Err(msg) => perform IO.println(msg),\n  \
-                 };\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "std_raise_catch_branch");
+    let (stdout, stderr, code) = compile_and_run(src, "std_state_via_wrappers_pending");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "103\nzero\n", "stderr={stderr:?}");
+    // Future-correct (v2): wrappers thread state via discharge-with-
+    // lambda chain identically to the inline-perform shape; result is
+    // the canonical `11`.
+    assert_eq!(
+        stdout, "11\n",
+        "expected wrapper-fn-frame composition to thread state \
+         identically to inline-perform; pre-v2 actual is \"5\\n\" \
+         (initial value passes through). stderr={stderr:?}"
+    );
 }
 
 // ===== Plan C Task 64 — std/list run-and-check-output =====

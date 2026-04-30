@@ -485,7 +485,7 @@ The return-arm shape is cleaner in principle and matches `examples/state.sigil`'
 State[S] effect + run_state: (S, () -> A ![State[S] | e]) -> (A, S) !e
 ```
 
-Three v1 surface gaps prevent shipping the literal shape — the same trio Task 71's `[DEVIATION Task 71]` enumerated, plus a fourth tuple-return gap.
+Five v1 surface gaps prevent shipping the literal shape — the same trio Task 71's `[DEVIATION Task 71]` enumerated, plus a tuple-return gap and a wrapper-fn-frame composition gap (the latter discovered during PR #45's CI cycle).
 
 **v1 constraints, in priority order:**
 

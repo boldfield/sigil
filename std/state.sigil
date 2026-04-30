@@ -63,12 +63,33 @@
 //    when row-poly Fn parameters ship in v2.
 
 // `State` is the v1 mutable-state effect with `Int`-typed state.
-// `resumes: many` matches `examples/state.sigil`'s shape — though
-// `run_state` invokes `k` exactly once per arm activation in
-// practice, the `many` annotation keeps the option open for
-// future multi-shot patterns built on `State`.
+// `run_state` discharges single-shot (`k` is invoked exactly once
+// per arm activation); the `resumes: many` annotation matches
+// `examples/state.sigil` and keeps the surface open for future
+// multi-shot handlers (e.g., backtracking-with-state) to consume
+// the same effect declaration without a breaking change.
+//
+// **`State.set`'s return value contract.** Under `run_state`, the
+// `set` arm body is `fn (s) => k(arg)(arg)` — `k` is invoked with
+// `arg` (the new state) so the perform site evaluates to the *new*
+// value, not the previous value. This differs from imperative-
+// language setters (Rust's `mem::replace`, Java setters) which
+// typically return the old value. Users wanting the old value
+// before the write should `let prev = perform State.get()` first,
+// then perform set:
+//
+//   ```sigil
+//   let prev: Int = perform State.get();
+//   let _: Int = perform State.set(new_value);
+//   // `prev` holds the old state.
+//   ```
+//
+// (v2 may add a dedicated `swap: (Int) -> Int` op that returns
+// previous-state directly without the get-set sequence.)
 effect State resumes: many {
   get: () -> Int,
+  // `set(new): Int` evaluates to `new` at the perform site (NOT
+  // the previous state). See doc note above.
   set: (Int) -> Int,
 }
 

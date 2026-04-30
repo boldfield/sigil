@@ -123,6 +123,8 @@ PR #39 review's deferred items, queued for "first commit of Plan C" per the Stag
   - status: todo
 - **Sync shim emission gating.** Gate Sync shim emission on `top_level_fn_names_seen_as_value` from closure_convert. Bounded bloat (one ~100-byte shim per Cps fn); worth tightening if Cps-fn count grows in stdlib. **Carry-forward target: Stage 7 / Stage 10 if a touched module would benefit.**
   - status: todo
+- **Wrapper-fn-frame composition for discharge-with-lambda.** Plan B' Stage 6.8's run_state landing (PR #39) verified the discharge-with-lambda pattern only for *inline* `perform State.set/get` invocations. Inserting a function-call frame between the perform site and the body (e.g., `fn get_state() -> Int ![State] { perform State.get() }`) breaks state-threading: `run_state(5, comp_via_wrappers)` returns the initial 5 instead of the threaded result, because the discharge-k continuation captures the wrapper frame but doesn't re-thread state into the lambda chain when the wrapper returns. v1 ships with `[DEVIATION Task 72]` constraint #3 (no wrapper fns; users do `perform State.get()` / `perform State.set(s)` directly); the `#[ignore]`'d e2e test `std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix` pins future-correct behaviour. **Carry-forward target: Plan D / v2 effect-handler work — un-ignore the test and verify it returns 11 once the gap closes.**
+  - status: todo
 
 ## Plan C completion criteria
 
