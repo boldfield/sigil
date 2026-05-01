@@ -682,6 +682,28 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
 /// for the Phase 2 milestone because the e2e test program's body is
 /// a literal; widening the guard to follow call edges lands with
 /// Phase 3+ when the proper handler-frame setup ships.
+/// Plan D Task 117 (a) — format a `define_function` failure with full
+/// detail. Cranelift's `ModuleError::Display` for `Compilation(Verifier(_))`
+/// yields just `"Compilation error: Verifier errors"` — the per-instruction
+/// diagnostics that follow are dropped. Pretty-printed Debug
+/// (`{:#?}`) recursively formats `VerifierErrors`'s inner `Vec<VerifierError>`
+/// with file/loc/instruction context. The function's IR is appended so
+/// the rejected SSA shape is visible alongside the verifier complaint.
+///
+/// Used at every `module.define_function` call site to keep codegen
+/// failures debuggable end-to-end (Brian's "fix the swallow first;
+/// small diff, broad benefit" instruction, 2026-05-01).
+fn format_define_failure(
+    label: &str,
+    e: &cranelift_module::ModuleError,
+    ctx: &cranelift::codegen::Context,
+) -> String {
+    use std::fmt::Write;
+    let mut buf = format!("define {label}: {e:#?}");
+    let _ = write!(&mut buf, "\n--- IR ---\n{}", ctx.func.display());
+    buf
+}
+
 /// Plan D Task 117 — collect names of variant constructors registered
 /// in the program's type registry. Used by `expr_is_pure`'s ctor-aware
 /// branch to recognize constructor applications (`Some(x)`, `Ok(v)`,
@@ -6272,7 +6294,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         data.set_segment_section(".rodata", &name);
         module
             .define_data(id, &data)
-            .map_err(|e| format!("define {name}: {e}"))?;
+            .map_err(|e| format!("define {name}: {e:#?}"))?;
         lit_ids.push(id);
     }
 
@@ -6934,7 +6956,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 module
                     .define_function(entry.func_id, &mut ctx)
-                    .map_err(|e| format!("define {}: {e}", f.name))?;
+                    .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
                 module.clear_context(&mut ctx);
                 continue;
             }
@@ -7061,7 +7083,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         }
         module
             .define_function(entry.func_id, &mut ctx)
-            .map_err(|e| format!("define {}: {e}", f.name))?;
+            .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
         module.clear_context(&mut ctx);
     }
 
@@ -7272,7 +7294,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     }
     module
         .define_function(main, &mut ctx)
-        .map_err(|e| format!("define main: {e}"))?;
+        .map_err(|e| format_define_failure("main", &e, &ctx))?;
     module.clear_context(&mut ctx);
 
     // --- Plan B Task 55 (Phase 4c): synthetic handler-arm CPS fns ------
@@ -7985,7 +8007,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             }
             module
                 .define_function(synth.func_id, &mut ctx)
-                .map_err(|e| format!("define handler arm fn: {e}"))?;
+                .map_err(|e| format_define_failure("handler arm fn", &e, &ctx))?;
             module.clear_context(&mut ctx);
         }
     }
@@ -8281,7 +8303,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             }
             module
                 .define_function(synth.func_id, &mut ctx)
-                .map_err(|e| format!("define handler return-arm fn: {e}"))?;
+                .map_err(|e| format_define_failure("handler return-arm fn", &e, &ctx))?;
             module.clear_context(&mut ctx);
         }
     }
@@ -8484,7 +8506,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
             module
                 .define_function(post_arm_k.func_id, &mut ctx)
-                .map_err(|e| format!("define post-arm-k synth fn: {e}"))?;
+                .map_err(|e| format_define_failure("post-arm-k synth fn", &e, &ctx))?;
             module.clear_context(&mut ctx);
         }
     }
@@ -9667,7 +9689,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             }
             module
                 .define_function(synth.func_id, &mut ctx)
-                .map_err(|e| format!("define synth-cont for `{}`: {e}", synth.parent_fn_name))?;
+                .map_err(|e| {
+                    format_define_failure(
+                        &format!("synth-cont for `{}`", synth.parent_fn_name),
+                        &e,
+                        &ctx,
+                    )
+                })?;
             module.clear_context(&mut ctx);
         }
     }
@@ -9840,7 +9868,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         builder.finalize();
         module
             .define_function(shim_id, &mut ctx)
-            .map_err(|e| format!("define sync_shim for `{fn_name}`: {e}"))?;
+            .map_err(|e| format_define_failure(&format!("sync_shim for `{fn_name}`"), &e, &ctx))?;
         module.clear_context(&mut ctx);
     }
 
