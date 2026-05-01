@@ -5506,8 +5506,11 @@ impl Tc {
             // Snapshot the prior binding (if any) for each name the
             // pattern introduces so we can restore exact state after
             // the arm body is checked. Pattern::Var names are fresh
-            // per arm (resolve.rs does not track match-arm scopes),
-            // so there is no redefinition concern inside a single arm.
+            // per arm and may shadow outer names per the construct-
+            // introduced-binding rule (resolve.rs's audit-F-1 fix
+            // mirrors this with per-arm scope cloning); the env-side
+            // snapshot/restore here is what makes the shadow visible
+            // only inside the arm body.
             let saved: Vec<(String, Option<Ty>)> = bindings
                 .iter()
                 .map(|(name, _)| (name.clone(), self.env.get(name).cloned()))

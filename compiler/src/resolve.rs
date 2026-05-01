@@ -38,6 +38,19 @@ pub struct ResolvedProgram {
 
 pub fn resolve(program: Program) -> (ResolvedProgram, Vec<CompilerError>) {
     let mut errors = Vec::new();
+    // Collect every constructor name declared by `type ... = | C(...) | ...`
+    // items so the pattern walker can distinguish bare-ident ctor patterns
+    // from binding-introducing ones. The parser emits `Pattern::Var(name)`
+    // for any bare identifier in pattern position regardless of case
+    // (`parser.rs:1686-1723`); typechecker promotes `Pattern::Var` to
+    // nullary-ctor patterns at `check_pattern` time when the name resolves
+    // to a ctor of the scrutinee's type. resolve.rs runs before typecheck
+    // and has no scrutinee-type context, so the conservative reading is
+    // "any name that could be a ctor of any type is treated as a non-
+    // binding here." False negatives (a binding pattern whose name happens
+    // to collide with some other type's ctor) are caught by typecheck's
+    // `env_insert` assert in debug builds.
+    let ctor_names = collect_ctor_names(&program);
     for item in &program.items {
         if let Item::Fn(f) = item {
             // Fn-level scope: starts with the fn's params. Param self-
@@ -49,10 +62,22 @@ pub fn resolve(program: Program) -> (ResolvedProgram, Vec<CompilerError>) {
                     push_redef(&mut errors, p.span.clone(), &p.name);
                 }
             }
-            resolve_block(&f.body, &scope, &mut errors);
+            resolve_block(&f.body, &scope, &ctor_names, &mut errors);
         }
     }
     (ResolvedProgram { program }, errors)
+}
+
+fn collect_ctor_names(program: &Program) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for item in &program.items {
+        if let Item::Type(td) = item {
+            for variant in &td.variants {
+                names.insert(variant.name.clone());
+            }
+        }
+    }
+    names
 }
 
 fn push_redef(errors: &mut Vec<CompilerError>, span: Span, name: &str) {
@@ -68,7 +93,12 @@ fn push_redef(errors: &mut Vec<CompilerError>, span: Span, name: &str) {
 /// the outer scope so blocks are LIFO-fresh — a let inside an inner
 /// block doesn't survive past the block end). Within the block, lets
 /// check against the running scope for shadowing.
-fn resolve_block(b: &Block, outer_scope: &BTreeSet<String>, errors: &mut Vec<CompilerError>) {
+fn resolve_block(
+    b: &Block,
+    outer_scope: &BTreeSet<String>,
+    ctor_names: &BTreeSet<String>,
+    errors: &mut Vec<CompilerError>,
+) {
     let mut scope = outer_scope.clone();
     for s in &b.stmts {
         match s {
@@ -77,78 +107,87 @@ fn resolve_block(b: &Block, outer_scope: &BTreeSet<String>, errors: &mut Vec<Com
                 // a self-referential RHS (`let x: Int = x`) refers to
                 // the outer `x` if any, not to the binding being
                 // defined. Aligns with non-recursive let semantics.
-                resolve_expr(&l.value, &scope, errors);
+                resolve_expr(&l.value, &scope, ctor_names, errors);
                 if !scope.insert(l.name.clone()) {
                     push_redef(errors, l.span.clone(), &l.name);
                 }
             }
-            Stmt::Expr(e) => resolve_expr(e, &scope, errors),
+            Stmt::Expr(e) => resolve_expr(e, &scope, ctor_names, errors),
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    resolve_expr(a, &scope, errors);
+                    resolve_expr(a, &scope, ctor_names, errors);
                 }
             }
         }
     }
     if let Some(t) = &b.tail {
-        resolve_expr(t, &scope, errors);
+        resolve_expr(t, &scope, ctor_names, errors);
     }
 }
 
 /// Walk an expression. Compound expressions recurse into children;
 /// binder-introducing constructs (Lambda, Match, Handle) push a fresh
 /// scope before walking their bodies.
-fn resolve_expr(e: &Expr, scope: &BTreeSet<String>, errors: &mut Vec<CompilerError>) {
+fn resolve_expr(
+    e: &Expr,
+    scope: &BTreeSet<String>,
+    ctor_names: &BTreeSet<String>,
+    errors: &mut Vec<CompilerError>,
+) {
     match e {
+        // Leaves and post-closure-conversion shapes (resolve runs pre-CC,
+        // so the post-CC variants are unreachable in practice).
         Expr::IntLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
         | Expr::StringLit(_, _)
         | Expr::Ident(_, _)
+        | Expr::ClosureRecord { .. }
         | Expr::ClosureEnvLoad { .. } => {}
         Expr::Call { callee, args, .. } => {
-            resolve_expr(callee, scope, errors);
+            resolve_expr(callee, scope, ctor_names, errors);
             for a in args {
-                resolve_expr(a, scope, errors);
+                resolve_expr(a, scope, ctor_names, errors);
             }
         }
         Expr::Perform(p) => {
             for a in &p.args {
-                resolve_expr(a, scope, errors);
+                resolve_expr(a, scope, ctor_names, errors);
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            resolve_expr(lhs, scope, errors);
-            resolve_expr(rhs, scope, errors);
+            resolve_expr(lhs, scope, ctor_names, errors);
+            resolve_expr(rhs, scope, ctor_names, errors);
         }
-        Expr::Unary { operand, .. } => resolve_expr(operand, scope, errors),
+        Expr::Unary { operand, .. } => resolve_expr(operand, scope, ctor_names, errors),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
         } => {
-            resolve_expr(cond, scope, errors);
-            resolve_block(then_block, scope, errors);
-            resolve_block(else_block, scope, errors);
+            resolve_expr(cond, scope, ctor_names, errors);
+            resolve_block(then_block, scope, ctor_names, errors);
+            resolve_block(else_block, scope, ctor_names, errors);
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            resolve_expr(scrutinee, scope, errors);
+            resolve_expr(scrutinee, scope, ctor_names, errors);
             for arm in arms {
                 let mut inner = scope.clone();
                 let mut arm_pattern_seen: BTreeSet<String> = BTreeSet::new();
                 collect_pattern_bindings_with_dup_check(
                     &arm.pattern,
                     &mut arm_pattern_seen,
+                    ctor_names,
                     errors,
                 );
                 inner.extend(arm_pattern_seen);
-                resolve_expr(&arm.body, &inner, errors);
+                resolve_expr(&arm.body, &inner, ctor_names, errors);
             }
         }
-        Expr::Block(b) => resolve_block(b, scope, errors),
+        Expr::Block(b) => resolve_block(b, scope, ctor_names, errors),
         Expr::Lambda { params, body, .. } => {
             let mut inner = scope.clone();
             let mut lambda_param_seen: BTreeSet<String> = BTreeSet::new();
@@ -156,29 +195,22 @@ fn resolve_expr(e: &Expr, scope: &BTreeSet<String>, errors: &mut Vec<CompilerErr
                 if !lambda_param_seen.insert(p.name.clone()) {
                     push_redef(errors, p.span.clone(), &p.name);
                 }
-                // Inserting into `inner` even on duplicate so the second
-                // occurrence at least binds (typechecker's behavior is
-                // last-write-wins via direct insert; matching here keeps
-                // diagnostic surface the same).
+                // The set's `insert` is idempotent on the second
+                // occurrence (set membership has no value to overwrite);
+                // we add to `inner` once so the body walk sees the name
+                // in scope regardless of whether the dup-check fired.
                 inner.insert(p.name.clone());
             }
-            resolve_expr(body, &inner, errors);
-        }
-        Expr::ClosureRecord { env_exprs, .. } => {
-            // Post-closure-conversion shape; resolve.rs runs pre-CC so
-            // this arm is unreachable in practice. Defensive walk.
-            for ee in env_exprs {
-                resolve_expr(ee, scope, errors);
-            }
+            resolve_expr(body, &inner, ctor_names, errors);
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                resolve_expr(&f.value, scope, errors);
+                resolve_expr(&f.value, scope, ctor_names, errors);
             }
         }
         Expr::Tuple { elems, .. } => {
             for el in elems {
-                resolve_expr(el, scope, errors);
+                resolve_expr(el, scope, ctor_names, errors);
             }
         }
         Expr::Handle {
@@ -187,7 +219,7 @@ fn resolve_expr(e: &Expr, scope: &BTreeSet<String>, errors: &mut Vec<CompilerErr
             op_arms,
             ..
         } => {
-            resolve_expr(body, scope, errors);
+            resolve_expr(body, scope, ctor_names, errors);
             for arm in op_arms {
                 let mut inner = scope.clone();
                 let mut arm_param_seen: BTreeSet<String> = BTreeSet::new();
@@ -201,12 +233,12 @@ fn resolve_expr(e: &Expr, scope: &BTreeSet<String>, errors: &mut Vec<CompilerErr
                     push_redef(errors, arm.k_span.clone(), &arm.k_name);
                 }
                 inner.insert(arm.k_name.clone());
-                resolve_expr(&arm.body, &inner, errors);
+                resolve_expr(&arm.body, &inner, ctor_names, errors);
             }
             if let Some(ra) = return_arm {
                 let mut inner = scope.clone();
                 inner.insert(ra.binding.clone());
-                resolve_expr(&ra.body, &inner, errors);
+                resolve_expr(&ra.body, &inner, ctor_names, errors);
             }
         }
     }
@@ -218,9 +250,16 @@ fn resolve_expr(e: &Expr, scope: &BTreeSet<String>, errors: &mut Vec<CompilerErr
 ///
 /// Mirrors `typecheck::pattern_bindings` but also emits a diagnostic
 /// on duplicates rather than silently deduplicating into a `BTreeSet`.
+///
+/// `Pattern::Var(name)` whose name is in `ctor_names` is treated as a
+/// (presumed) nullary-constructor pattern with no binding — typechecker
+/// will perform the precise scrutinee-aware promotion at
+/// `check_pattern` time. Skipping ctor names here prevents false
+/// positives like `(None, None)` firing E0020 for "duplicate `None`."
 fn collect_pattern_bindings_with_dup_check(
     p: &Pattern,
     seen: &mut BTreeSet<String>,
+    ctor_names: &BTreeSet<String>,
     errors: &mut Vec<CompilerError>,
 ) {
     match p {
@@ -229,25 +268,36 @@ fn collect_pattern_bindings_with_dup_check(
         | Pattern::BoolLit(_, _)
         | Pattern::CharLit(_, _) => {}
         Pattern::Var(name, span) => {
+            // Conservative ctor-name check: any name that resolves to a
+            // declared constructor (across any user type) is treated as
+            // a non-binding here. The typechecker has scrutinee-type
+            // context and performs the precise promotion at
+            // `check_pattern`. A name that's a ctor for some other type
+            // but not the scrutinee's type stays a binding under
+            // typecheck — that gap is caught by `env_insert`'s no-shadow
+            // assert in debug builds.
+            if ctor_names.contains(name) {
+                return;
+            }
             if !seen.insert(name.clone()) {
                 push_redef(errors, span.clone(), name);
             }
         }
         Pattern::Tuple(pats, _) => {
             for sub in pats {
-                collect_pattern_bindings_with_dup_check(sub, seen, errors);
+                collect_pattern_bindings_with_dup_check(sub, seen, ctor_names, errors);
             }
         }
         Pattern::Ctor { fields, .. } => match fields {
             CtorPatternFields::Unit => {}
             CtorPatternFields::Positional(ps) => {
                 for sub in ps {
-                    collect_pattern_bindings_with_dup_check(sub, seen, errors);
+                    collect_pattern_bindings_with_dup_check(sub, seen, ctor_names, errors);
                 }
             }
             CtorPatternFields::Record(fs) => {
                 for f in fs {
-                    collect_pattern_bindings_with_dup_check(&f.pattern, seen, errors);
+                    collect_pattern_bindings_with_dup_check(&f.pattern, seen, ctor_names, errors);
                 }
             }
         },
@@ -519,6 +569,89 @@ mod tests {
         assert!(
             has_e0020(&errs),
             "deeply nested let shadow must fire E0020: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_pattern_with_duplicate_nullary_ctors_does_not_fire_e0020() {
+        // PR #65 review: the parser emits `Pattern::Var(name, _)` for
+        // any bare identifier in pattern position. Without ctor-aware
+        // pattern walking, `(None, None)` would falsely fire E0020 on
+        // the second `None` because `BTreeSet::insert` returns false.
+        // Typechecker promotes `Pattern::Var("None", _)` to a nullary-
+        // ctor pattern at check_pattern time; resolve.rs mirrors that
+        // by consulting `collect_ctor_names` before treating a bare
+        // ident as a binding.
+        let src = "type Opt = | None | Some(Int)\n\
+                   fn main() -> Int ![] { \
+                     match (None, None) { (None, None) => 0, _ => 1 } \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_e0020(&errs),
+            "tuple pattern with duplicate nullary ctors must NOT fire E0020 \
+             (parser emits Pattern::Var; resolve must skip ctor names): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn let_in_arm_body_shadowing_arm_pattern_ctor_name_does_not_fire_e0020() {
+        // PR #65 review (second-order): when a match-arm pattern is a
+        // nullary ctor, no binding is introduced — so a `let` inside
+        // the arm body whose name matches the ctor is a fresh binding,
+        // not a shadow. Pre-fix this falsely fired E0020 because
+        // resolve treated `Pattern::Var("A")` as a binding and added
+        // it to inner scope.
+        let src = "type B = | A | Other\n\
+                   fn main() -> Int ![] { \
+                     match A { A => { let A: Int = 99; A }, _ => 0 } \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_e0020(&errs),
+            "let inside arm body whose name matches an arm-pattern ctor must \
+             NOT fire E0020: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn return_arm_binding_can_shadow_outer_let() {
+        // PR #65 review #1 — completes the binder-shape coverage matrix.
+        // Return-arm binding `v` is a fresh-scope construct (typecheck
+        // uses direct `env.insert` at typecheck.rs:5255); it MAY shadow
+        // outer let `v`. resolve.rs's Handle return-arm path inserts
+        // `ra.binding` into the inner scope without dup-checking
+        // against outer; this test pins that intentional asymmetry.
+        let src = "effect Eff { op: () -> Int }\n\
+                   fn main() -> Int ![Eff] { \
+                     let v: Int = 1; \
+                     handle 0 with { \
+                       Eff.op(k) => 0, \
+                       return(v) => v + 1 \
+                     } \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_e0020(&errs),
+            "return-arm binding may shadow outer let (fresh-scope construct): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn let_can_shadow_top_level_fn_name() {
+        // PR #65 review #2 — typecheck.rs:3765 explicitly says
+        // "params/lets shadow top-level fns of the same name within
+        // their scope" (PR #6 review fix). resolve.rs mirrors this by
+        // NOT seeding the per-fn scope with top-level fn names —
+        // they're not in the structural shadow set. Pin the behavior
+        // so a future fn-name leak into the resolve scope would fail
+        // this test.
+        let src = "fn foo() -> Int ![] { 0 }\n\
+                   fn main() -> Int ![] { let foo: Int = 99; foo }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_e0020(&errs),
+            "let in fn body may shadow a top-level fn name: {errs:?}"
         );
     }
 
