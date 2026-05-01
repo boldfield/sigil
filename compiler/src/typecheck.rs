@@ -94,15 +94,21 @@ pub enum Ty {
     /// `lower_k_pair_call` trampoline emission instead of standard
     /// closure-convention dispatch.
     ///
-    /// **Why not user-surface**: there's no surface syntax that
-    /// produces a `Ty::Continuation`. The only way for a value to
-    /// have this type is via the typechecker's `check_handle` arm-
-    /// processing, which binds `k` with a fresh `Continuation`. User
-    /// code can `let f = k` to alias `k` (f inherits the
-    /// Continuation type) but cannot write a Continuation type
-    /// annotation. Consequently `ty_from_type_expr` has no
-    /// Continuation arm; user `(A) -> B ![]` annotations always
-    /// produce `Ty::Fn`.
+    /// **Why no value-position constructor**: there's no surface
+    /// syntax that *produces* a `Ty::Continuation` value at the
+    /// expression level. The only way for a value to have this
+    /// type is via the typechecker's `check_handle` arm-processing,
+    /// which binds `k` with a fresh `Continuation`. The follow-up
+    /// PR #62 added a *type-position* surface form
+    /// (`Continuation[op_ret, ret]` — see `ty_from_type_expr_with_-
+    /// rows`'s Apply arm) so users can name k's binding type:
+    /// `let f: Continuation[Int, Int] = k`. The value-position
+    /// non-user-constructible invariant is preserved — there's no
+    /// `Continuation { ... }` constructor or analogous expression
+    /// surface; `check_handle` remains the sole producer at the
+    /// value level. The `Continuation` type name is reserved
+    /// (rejected as a user type-decl name in the type-decl pre-pass
+    /// to avoid ambiguity with the surface form).
     ///
     /// **Why not Box-the-fields**: `Continuation` is rare (only at
     /// arm-binding sites and let-bindings of those). Boxing the
@@ -882,6 +888,29 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     }
     for item in &program.items {
         if let Item::Type(td) = item {
+            // Plan D Task 117 (continuation-surface, PR #62 followup):
+            // `Continuation` is reserved for the type-position
+            // continuation surface form. A user `type Continuation[A,
+            // B] { ... }` would silently lose under
+            // `ty_from_type_expr`'s special-case shunt at the Apply
+            // arm, and outside a handler arm body the user would get
+            // a misleading E0145 ("Continuation annotations are only
+            // valid inside a handler arm body") for what they think
+            // is *their* type. Reject at the type-decl pre-pass
+            // with a precise diagnostic.
+            if td.name == "Continuation" {
+                errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0113"),
+                    td.name_span.clone(),
+                    "`Continuation` is reserved for the type-position \
+                     continuation surface form (`Continuation[op_ret, ret]` \
+                     names a handler arm's `k` binding type); user type \
+                     declarations cannot use this name"
+                        .to_string(),
+                ));
+                continue;
+            }
             if types.contains_key(&td.name) {
                 errors.push(CompilerError::new(
                     Severity::Error,
@@ -1456,9 +1485,9 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     //
     // After typecheck verifies that `let f: Continuation[op_ret,
     // ret] = k` is well-typed inside an arm body (the arm-context-
-    // tracking E0145 + cross-handle E0145 pin the surface
-    // contract), rewrite the AST so downstream codegen sees the
-    // pre-existing supported shapes:
+    // tracking E0145 + cross-handle E0145 + bare-Ident-RHS check
+    // pin the surface contract), rewrite the AST so downstream
+    // codegen sees the pre-existing supported shapes:
     //
     //   `let f: Continuation[A, B] = k; ... f(arg) ...`
     //   →
@@ -1470,7 +1499,20 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // recognizer paths (k as direct callee in let-RHS or tail);
     // no codegen-side machinery for "let-bound k as 2-slot stack
     // local" is needed.
-    desugar_let_bound_continuations(&mut program);
+    //
+    // Gated on no typecheck errors (PR #62 followup): a partial-
+    // compilation consumer (IDE-style) that observes both the
+    // errors and the rewritten AST should not see desugar-
+    // produced rewrites for shapes typecheck didn't validate.
+    // The driver aborts on errors anyway; this guard makes the
+    // contract explicit.
+    let has_errors = tc
+        .errors
+        .iter()
+        .any(|e| matches!(e.severity, Severity::Error));
+    if !has_errors {
+        desugar_let_bound_continuations(&mut program);
+    }
 
     (
         CheckedProgram {
@@ -3862,6 +3904,40 @@ impl Tc {
                     // primitive). HM unification then checks the
                     // initializer against the declared type.
                     self.check_type_expr_known(&l.ty);
+                    // Plan D Task 117 (continuation-surface, PR #62
+                    // followup): when the let's declared type is
+                    // `Continuation[op_ret, ret]`, the v1 desugar
+                    // pre-pass only handles RHS shapes that are a
+                    // bare `Expr::Ident` (the alias case). Other
+                    // RHS shapes (`if cond { k } else { k }`,
+                    // `match m { ... }`, parenthesized blocks,
+                    // etc.) typecheck successfully (each branch is
+                    // Ty::Continuation) but the desugar can't
+                    // statically reduce them to the Slice B/C
+                    // shapes the codegen recognizer supports. Push
+                    // E0145 with a precise diagnostic at the
+                    // annotation site so the user knows what's
+                    // accepted; otherwise the compile fails later
+                    // with a confusing codegen-walker reject on the
+                    // surviving bare `k`.
+                    let is_continuation_annotation = matches!(
+                        &l.ty,
+                        TypeExpr::Apply { name, args, .. }
+                            if name == "Continuation" && args.len() == 2
+                    );
+                    if is_continuation_annotation && !matches!(&l.value, Expr::Ident(_, _)) {
+                        self.push_error(
+                            "E0145",
+                            l.span.clone(),
+                            "let-binding of type `Continuation[op_ret, ret]` requires \
+                             the initializer to be a bare identifier (the arm's `k` \
+                             or a previously-bound Continuation alias). Conditional/\
+                             matched/expression-form initializers aren't supported in \
+                             v1; pull the alias to a top-level `let` of the form \
+                             `let f: Continuation[..] = k;` and use `f` directly"
+                                .to_string(),
+                        );
+                    }
                     let got = self.check_expr(&l.value, row);
                     let declared = self.ty_from_type_expr_here(&l.ty);
                     if let (Some(got_ty), Some(decl_ty)) = (got.as_ref(), declared.as_ref()) {
@@ -6665,8 +6741,16 @@ pub(crate) fn pattern_bindings(p: &Pattern, out: &mut std::collections::BTreeSet
 
 fn desugar_let_bound_continuations(program: &mut Program) {
     for item in &mut program.items {
-        if let Item::Fn(f) = item {
-            desugar_block_handles(&mut f.body);
+        match item {
+            Item::Fn(f) => desugar_block_handles(&mut f.body),
+            // Plan D Task 117 (continuation-surface, PR #62
+            // followup): only `Item::Fn` carries an `Expr::Handle`
+            // today (handles only appear inside fn bodies). If a
+            // future top-level Item kind (e.g., a `const` carrying
+            // a computed handle expression) is added, this match
+            // needs to extend. Other current Items (Type, Effect,
+            // Import) carry no Expr at all.
+            Item::Type(_) | Item::Effect(_) | Item::Import(_) => {}
         }
     }
 }
@@ -6778,15 +6862,45 @@ fn desugar_expr_handles(e: &mut Expr) {
 /// (e.g. direct `Expr::Ident(k_name)` or `Expr::Call { callee:
 /// Ident(k_name), .. }`) don't carry let-bound k aliases and pass
 /// through unchanged.
+///
+/// Block-level scope tracking: the substitution accumulated within
+/// this block invalidates entries when subsequent lets shadow
+/// either the alias name (the substitution's key) or the original
+/// k_name (the substitution's value). See `apply_subst_to_block`
+/// for the per-stmt narrowing.
 fn desugar_arm_body(body: &mut Expr, k_name: &str) {
     let Expr::Block(block) = body else {
         return;
     };
+    // PR #62 followup case (d): if any top-level stmt of this block
+    // shadows the arm's `k_name` (e.g. `let k: Int = 99`), refuse all
+    // elision. Otherwise the substitution `f → k` would point at the
+    // shadowed binding for any uses of `f` past the shadow point —
+    // and dropping the subst at the shadow would leave `f`
+    // references undefined since the let-stmt that bound it was
+    // elided. The conservative "no elision in shadowed blocks"
+    // policy preserves the original AST; the codegen-walker reject
+    // surfaces the unsupported shape with the precise v1-restriction
+    // message. Users can rename the local.
+    let k_shadowed_at_top = block
+        .stmts
+        .iter()
+        .any(|s| matches!(s, Stmt::Let(l) if l.name == k_name));
+    if k_shadowed_at_top {
+        return;
+    }
     let mut subst: BTreeMap<String, String> = BTreeMap::new();
     let mut new_stmts: Vec<Stmt> = Vec::with_capacity(block.stmts.len());
     let raw_stmts = std::mem::take(&mut block.stmts);
     for s in raw_stmts {
         match s {
+            Stmt::Let(l) if is_let_bound_continuation(&l, k_name) && !subst.is_empty() => {
+                // Edge case: nested `let f: Continuation = k; let f:
+                // Continuation = k` — the second let collapses into
+                // the same alias. We just keep the latest entry
+                // (semantically equivalent; both alias k).
+                subst.insert(l.name, k_name.to_string());
+            }
             Stmt::Let(l) if is_let_bound_continuation(&l, k_name) => {
                 // Elide the let-stmt; record the substitution.
                 subst.insert(l.name, k_name.to_string());
@@ -6794,6 +6908,14 @@ fn desugar_arm_body(body: &mut Expr, k_name: &str) {
             mut s => {
                 if !subst.is_empty() {
                     apply_subst_to_stmt(&mut s, &subst);
+                }
+                // Per-stmt scope narrowing: if this stmt is a Let
+                // whose binding name shadows an alias (key) or the
+                // alias's target (value=k_name), drop the affected
+                // entries before processing subsequent stmts.
+                if let Stmt::Let(l) = &s {
+                    subst.remove(&l.name);
+                    subst.retain(|_, v| v != &l.name);
                 }
                 new_stmts.push(s);
             }
@@ -6828,6 +6950,26 @@ fn apply_subst_to_stmt(s: &mut Stmt, subst: &BTreeMap<String, String>) {
     }
 }
 
+/// Apply the substitution to an expression. Span on the rewritten
+/// `Expr::Ident` is intentionally preserved — downstream side-tables
+/// (handle_body_ty, capture_info, call_callee_tys, etc.) are
+/// span-keyed and must continue resolving to the original alias-
+/// reference's source location.
+///
+/// Scope discipline (PR #62 followup): every binder narrows the
+/// active substitution before recursing. Specifically:
+/// - `Expr::Lambda { params, body }` — drop subst entries whose
+///   key (alias name) OR value (target k_name) matches a lambda
+///   param. Without this, `let f = k; (fn (f: Int) => f + 1)(0)`
+///   would silently rewrite the lambda body's `f` to `k`.
+/// - `Expr::Match` — per arm, drop entries shadowed by the arm's
+///   pattern bindings. Without this, `let f = k; match m { Some(f)
+///   => f }` would rewrite the match-arm `f` to `k`.
+/// - `Expr::Handle` — per op-arm, drop entries shadowed by the
+///   arm's params or k_name (so an inner handle whose arm reuses
+///   the outer alias name as its own k_name is unaffected).
+/// - `Expr::Block` — let-stmt-by-let-stmt narrowing in
+///   `apply_subst_to_block` handles the in-block shadowing case.
 fn apply_subst_to_expr(e: &mut Expr, subst: &BTreeMap<String, String>) {
     match e {
         Expr::Ident(name, _) => {
@@ -6871,11 +7013,20 @@ fn apply_subst_to_expr(e: &mut Expr, subst: &BTreeMap<String, String>) {
         } => {
             apply_subst_to_expr(scrutinee, subst);
             for arm in arms {
-                apply_subst_to_expr(&mut arm.body, subst);
+                let mut bindings: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                pattern_bindings(&arm.pattern, &mut bindings);
+                let inner = filter_subst(subst, &bindings);
+                apply_subst_to_expr(&mut arm.body, &inner);
             }
         }
         Expr::Block(b) => apply_subst_to_block(b, subst),
-        Expr::Lambda { body, .. } => apply_subst_to_expr(body, subst),
+        Expr::Lambda { params, body, .. } => {
+            let shadowed: std::collections::BTreeSet<String> =
+                params.iter().map(|p| p.name.clone()).collect();
+            let inner = filter_subst(subst, &shadowed);
+            apply_subst_to_expr(body, &inner);
+        }
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
                 apply_subst_to_expr(ee, subst);
@@ -6899,21 +7050,52 @@ fn apply_subst_to_expr(e: &mut Expr, subst: &BTreeMap<String, String>) {
         } => {
             apply_subst_to_expr(body, subst);
             for arm in op_arms {
-                apply_subst_to_expr(&mut arm.body, subst);
+                let mut bindings: std::collections::BTreeSet<String> =
+                    arm.params.iter().map(|p| p.name.clone()).collect();
+                bindings.insert(arm.k_name.clone());
+                let inner = filter_subst(subst, &bindings);
+                apply_subst_to_expr(&mut arm.body, &inner);
             }
             if let Some(ra) = return_arm {
-                apply_subst_to_expr(&mut ra.body, subst);
+                let mut bindings: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                bindings.insert(ra.binding.clone());
+                let inner = filter_subst(subst, &bindings);
+                apply_subst_to_expr(&mut ra.body, &inner);
             }
         }
     }
 }
 
+/// Filter a substitution map: drop any entry whose key OR value is
+/// in the `shadowed` set. Used at every binder boundary in
+/// `apply_subst_to_expr`.
+fn filter_subst(
+    subst: &BTreeMap<String, String>,
+    shadowed: &std::collections::BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    subst
+        .iter()
+        .filter(|(k, v)| !shadowed.contains(k.as_str()) && !shadowed.contains(v.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 fn apply_subst_to_block(b: &mut Block, subst: &BTreeMap<String, String>) {
+    let mut active = subst.clone();
     for s in &mut b.stmts {
-        apply_subst_to_stmt(s, subst);
+        apply_subst_to_stmt(s, &active);
+        // Per-stmt scope narrowing: if this stmt is a Let whose
+        // binding name shadows an alias key (`f`) or the alias's
+        // target (`k`), drop affected entries before processing
+        // subsequent stmts.
+        if let Stmt::Let(l) = s {
+            active.remove(&l.name);
+            active.retain(|_, v| v != &l.name);
+        }
     }
     if let Some(t) = &mut b.tail {
-        apply_subst_to_expr(t, subst);
+        apply_subst_to_expr(t, &active);
     }
 }
 
@@ -11527,6 +11709,204 @@ mod tests {
              fire E0145 via cross-handle unify: {errs:?}"
         );
     }
+
+    // ----------------------------------------------------------------
+    // Plan D Task 117 (continuation-surface) — PR #62 followup
+    // hardening tests. These pin the shadowing-hygiene fix in
+    // `apply_subst_to_expr`/`apply_subst_to_block`, the type-decl
+    // pre-pass reservation of `Continuation`, the non-bare-Ident-RHS
+    // rejection at the let-stmt typecheck site, and the per-arity
+    // diagnostic for `Continuation[..]` surface form.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn continuation_user_type_decl_is_reserved_e0113() {
+        // Reserved name: `type Continuation[A, B] { ... }` would
+        // silently lose under `ty_from_type_expr`'s special-case
+        // shunt; reject at the type-decl pre-pass with E0113.
+        let src = "type Continuation = | Foo\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0113"),
+            "user `type Continuation = ...` must fire E0113 (reserved name): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_arity_one_fires_e0129() {
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let f: Continuation[Int] = k;\n\
+                         0\n\
+                       },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0129"),
+            "Continuation arity=1 must fire E0129: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_arity_three_fires_e0129() {
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let f: Continuation[Int, Int, Int] = k;\n\
+                         0\n\
+                       },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0129"),
+            "Continuation arity=3 must fire E0129: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_let_with_non_bare_ident_rhs_fires_e0145() {
+        // PR #62 review #4: typecheck-vs-codegen gap. `let f:
+        // Continuation = if cond { k } else { k }` typechecks (RHS
+        // is Ty::Continuation each branch) but the desugar can't
+        // statically reduce conditional/matched RHS shapes. Fire
+        // E0145 at the let-stmt with a precise diagnostic so the
+        // user knows what's accepted.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let f: Continuation[Int, Int] = if true { k } else { k };\n\
+                         f(0)\n\
+                       },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "let-binding of Continuation type with non-bare-Ident RHS must fire \
+             E0145 (only bare-Ident RHS is supported in v1): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn shadowing_hygiene_lambda_param_shadow_typechecks_cleanly() {
+        // PR #62 review case (a): a lambda inside an arm body whose
+        // param name shadows the let-bound continuation alias. Prior
+        // to the shadowing fix in `apply_subst_to_expr`'s Lambda
+        // arm, the desugar rewrote the lambda body's `f → k`,
+        // producing `fn (f: Int) -> Int => k + 1` — `k` is
+        // Continuation; `+1` against Continuation would fire E0044
+        // (or E0145 broad arm). Post-fix, the lambda param shadows
+        // the alias, the subst is filtered out, and the lambda body
+        // stays unchanged.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn run() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let f: Continuation[Int, Int] = k;\n\
+                         let l: (Int) -> Int ![] = fn (f: Int) -> Int ![] => f + 1;\n\
+                         l(0)\n\
+                       },\n\
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![] { run() }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0044") && !has_code(&errs, "E0145"),
+            "lambda param `f` shadowing the Continuation alias must NOT corrupt the \
+             lambda body via desugar substitution (no E0044 / E0145 from synthetic \
+             substitution sites): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn shadowing_hygiene_match_pattern_shadow_typechecks_cleanly() {
+        // PR #62 review case (b): a match arm pattern binding
+        // shadows the let-bound continuation alias. Prior to the
+        // shadowing fix in `apply_subst_to_expr`'s Match arm, the
+        // desugar rewrote `Some(f) => f` to `Some(f) => k`, breaking
+        // the pattern binding. Post-fix, the pattern bindings are
+        // filtered from the subst before recursing into arm bodies.
+        let src = "type Maybe = | None | Some(Int)\n\
+                   effect Raise { fail: () -> Int }\n\
+                   fn run() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let f: Continuation[Int, Int] = k;\n\
+                         match Some(7) {\n\
+                           Some(f) => f,\n\
+                           None => 0,\n\
+                         }\n\
+                       },\n\
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![] { run() }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0044") && !has_code(&errs, "E0145"),
+            "match arm pattern binding `f` shadowing the Continuation alias must NOT \
+             corrupt the arm body via desugar substitution (no E0044 / E0145 from \
+             synthetic substitution sites): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn shadowing_hygiene_inner_handle_k_name_reuse_typechecks_cleanly() {
+        // PR #62 review case (c): an inner handle's arm reuses the
+        // outer alias name as its own k_name. Prior to the
+        // shadowing fix in `apply_subst_to_expr`'s Handle arm, the
+        // outer subst `f → k_outer` was applied to the inner arm
+        // body's `f(0)` → `k_outer(0)`. The inner arm's k_name was
+        // `f`, so `k_outer` was a free reference at the inner arm,
+        // and the inner walker accepted it as a regular ident →
+        // miscompile. Post-fix, the inner arm's k_name is filtered
+        // from the subst before recursing.
+        let src = "effect Outer { op_o: () -> Int }\n\
+                   effect Inner { op_i: () -> Int }\n\
+                   fn run() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       Outer.op_o(k_outer) => {\n\
+                         let f: Continuation[Int, Int] = k_outer;\n\
+                         handle 0 with {\n\
+                           Inner.op_i(f) => f(0),\n\
+                         }\n\
+                       },\n\
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![] { run() }\n";
+        let errs = pipeline(src);
+        // Inner k_name `f` shadows the outer alias key `f`. The
+        // subst is filtered at the inner Handle's op-arm; inner
+        // arm body's `f(0)` stays as `f(0)`, resolving to inner k.
+        // Should typecheck cleanly (no E0044 / E0145 / E0046 from
+        // a corrupted reference).
+        assert!(
+            !has_code(&errs, "E0044") && !has_code(&errs, "E0145") && !has_code(&errs, "E0046"),
+            "inner handle reusing the outer alias name as its k_name must NOT \
+             corrupt the inner arm body via desugar substitution: {errs:?}"
+        );
+    }
+
+    // Note: PR #62 review case (d) — `let k: Int = 99` shadowing
+    // the arm's `k` inside the same arm body — is currently gated
+    // at `Tc::env_insert`'s debug_assert (resolve.rs has a gap and
+    // doesn't catch this shadow, so typecheck panics in debug
+    // builds when the let-stmt's `env_insert` finds an existing
+    // binding for `k`). The shadowing fix in `desugar_arm_body`'s
+    // pre-scan abort + `apply_subst_to_block`'s per-stmt subst
+    // narrowing are kept as defense-in-depth for the release-build
+    // case (where the assertion compiles out and the env's last
+    // insertion wins). No unit test exercises this path because it
+    // panics before reaching the desugar in debug builds; release-
+    // build behavior with the pre-scan abort: original AST
+    // preserved, codegen-walker catches the surviving let-
+    // Continuation shape with the v1-restriction diagnostic.
 
     #[test]
     fn ty_display_continuation_omits_scope_id() {
