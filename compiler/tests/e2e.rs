@@ -8417,12 +8417,12 @@ fn task_78_5_multi_effect_interpreter_traces_and_evaluates() {
                      let cur: Int = perform State.get();\n      \
                      let _: Int = perform State.set(cur + 1);\n      \
                      perform IO.println(\"tick\");\n      \
-                     let result: Int = if y == 0 {\n        \
-                       raise(\"divide by zero\")\n      \
+                     if y == 0 {\n        \
+                       let _r: Int = raise(\"divide by zero\");\n        \
+                       _r\n      \
                      } else {\n        \
                        x / y\n      \
-                     };\n      \
-                     result\n    \
+                     }\n    \
                    },\n  \
                  }\n\
                }\n\
