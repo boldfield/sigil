@@ -5271,63 +5271,68 @@ fn task_117_validation_multi_shot_through_let_bound_lambda() {
     );
 }
 
-/// Plan D Task 117 validation test 2 — frame escape past handle
-/// pop. **The validation question**: does the captured frame_ptr
-/// in `lower_k_pair_call`'s closure trailing-pair stay valid when
-/// the lambda is invoked AFTER `sigil_handle_pop` has run?
+/// Plan D Task 117 validation test 2 — multi-invocation frame
+/// escape past handle pop. **The validation question**: does the
+/// captured frame_ptr survive when the same arm-body lambda is
+/// invoked *twice* from outside the handle?
 ///
-/// Setup: arm body's tail expression IS the lambda (no let-bind);
-/// the lambda escapes the handle as the handle's overall value;
-/// caller invokes the returned lambda after the handle has popped.
-/// Per `lower_k_pair_call:11479-11484`, the lambda re-pushes the
-/// captured frame onto the handler stack before driving run_loop,
-/// then pops on exit. If the frame pointer references freed
-/// memory after pop, this segfaults; if it's GC-rooted via the
-/// closure record's bitmap, it works.
+/// Mirrors `std/state.sigil`'s `run_state` pattern (which proves
+/// single-invocation post-pop works) but calls the returned
+/// lambda twice in a row. Each invocation pushes the captured
+/// frame onto the handler stack, drives run_loop, pops. The bug
+/// surfaced by Test 1 (`sigil_handle_push: frame already linked
+/// (double-push?)`) was triggered by repeated `f(arg)` inside
+/// the same arm; here we trigger it from *outside* the handle to
+/// determine whether the failure is intrinsic to multi-invocation
+/// or specific to in-arm double-call.
 ///
-/// Per Plan B' Stage-6.8-followup Layer 3c, this scenario is
-/// documented as already-handled (run_state's canonical shape is
-/// exactly this — arm returns lambda, caller invokes lambda after
-/// handle pops). This test pins the behavior under Task 117's
-/// pre-validation evaluation.
+/// Setup: body returns a state-bearing lambda `(Int) -> Int ![]`.
+/// Handle's overall is also `(Int) -> Int ![]`. Arm captures k
+/// and returns a lambda using `run_state`-style `k(x)(x)`. main
+/// calls the returned lambda twice with different args.
 ///
-/// Test setup: `Foo.op` is a one-shot effect. Handle body performs
-/// `perform Foo.op()`. Arm captures k, returns a lambda
-/// `fn (x: Int) -> Int ![] => k(x)`. The handle's overall type is
-/// the lambda type. main calls the returned lambda with x=7. The
-/// lambda invokes k(7) — resumes the perform with value 7, which
-/// flows back into the handle body's `let _: Int = perform...; 99`.
-/// Body terminal value is 99; lambda returns that.
-///
-/// Expected: stdout = "99\n", exit 0. Segfault or wrong value
-/// indicates frame_ptr discipline doesn't hold for fresh
-/// continuation-escape patterns.
+/// Expected outcomes:
+/// - Pass (stdout = "34\n"): multi-invocation frame-escape works,
+///   contradicts Test 1 — eta-expansion design might be salvageable.
+///   Brian flagged this as the "stop and re-decide" case.
+/// - Panic (`sigil_handle_push: frame already linked`): same
+///   pathology as Test 1 — confirms dynamic-extent semantics for
+///   the conservative `Ty::Continuation` design.
+/// - Other (segfault, wrong value): also confirms dynamic-extent
+///   under different mechanism.
 #[test]
 fn task_117_validation_frame_escape_past_handle_pop() {
-    let src = "effect Foo { op: () -> Int }\n\
-               fn body_of_handle() -> Int ![Foo] {\n  \
-                 let _: Int = perform Foo.op();\n  \
-                 99\n\
+    let src = "effect Foo resumes: many { op: () -> Int }\n\
+               fn body_of_handle() -> (Int) -> Int ![Foo] {\n  \
+                 let v: Int = perform Foo.op();\n  \
+                 fn (x: Int) -> Int ![] => x + v\n\
                }\n\
                fn make_continuation() -> (Int) -> Int ![] ![] {\n  \
                  handle body_of_handle() with {\n    \
-                   Foo.op(k) => fn (x: Int) -> Int ![] => k(x),\n  \
+                   Foo.op(k) => fn (x: Int) -> Int ![] => k(x)(x),\n    \
+                   return(v) => v,\n  \
                  }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  let cont: (Int) -> Int ![] = make_continuation();\n  \
-                 let r: Int = cont(7);\n  \
-                 perform IO.println(int_to_string(r));\n  \
+                 let r1: Int = cont(7);\n  \
+                 let r2: Int = cont(10);\n  \
+                 perform IO.println(int_to_string(r1 + r2));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_117_validation_frame_escape");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // r1 = k(7)(7): k(7) re-runs body with v=7, body terminal =
+    //              `fn (x) => x + 7`, applied to 7 → 14.
+    // r2 = k(10)(10): if multi-invocation works, k(10) re-runs
+    //                 body with v=10, terminal applied to 10 → 20.
+    //                 Sum = 34.
     assert_eq!(
-        stdout, "99\n",
-        "Task 117 validation: lambda escaped from handle, invoked after \
-         pop. Expected 99 (handle body's terminal value after k(7) resumes \
-         the perform). Segfault or different value means frame_ptr \
-         discipline broke under continuation-escape. stderr={stderr:?}"
+        stdout, "34\n",
+        "Task 117 validation: multi-invocation post-pop frame escape. \
+         Pass means eta-expansion may be salvageable (stop and re-decide). \
+         Panic / wrong value confirms dynamic-extent semantics for the \
+         conservative Ty::Continuation design. stderr={stderr:?}"
     );
 }
 
