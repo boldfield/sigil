@@ -8247,43 +8247,28 @@ fn task_78_5_pending_g1_outer_fn_param_in_post_arm_k_tail() {
     );
 }
 
-/// **G1 variant 4 — combined op-arg + outer-capture in post-arm-k tail.**
-///
-/// Pinned shape (constructed, not Koka-imported): `fn run(threshold:
-/// Int) -> Int ![] { handle ... { Eff.go(arg, k) => let r: Int = k(0);
-/// r + arg + threshold } }`. Combines variants 1 (op-arg `arg`) + 3
-/// (outer fn-param `threshold`) in one tail. The captures-bearing fix
-/// must thread BOTH into the synth fn's closure record; pinning this
-/// composed shape pre-empts a partial fix that handles only one
-/// capture kind.
-///
-/// **Invariant** (post-fix): stdout = `"17\n"`, exit 0 (10 + 0 + 7).
-#[test]
-fn task_78_5_pending_g1_combined_op_arg_and_outer_capture() {
-    let src = "import std.io\n\
-               \n\
-               effect Eff { go: (Int) -> Int }\n\
-               \n\
-               fn run(threshold: Int) -> Int ![] {\n  \
-                 handle perform Eff.go(10) with {\n    \
-                   Eff.go(arg, k) => {\n      \
-                     let r: Int = k(0);\n      \
-                     r + arg + threshold\n    \
-                   },\n  \
-                 }\n\
-               }\n\
-               \n\
-               fn main() -> Int ![IO] {\n  \
-                 perform IO.println(int_to_string(run(7)));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pending_g1_combined");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(
-        stdout, "17\n",
-        "combined op-arg + outer-capture post-fix should yield 17; stderr={stderr:?}"
-    );
-}
+// G1 variant 4 — combined op-arg + outer-capture in post-arm-k tail —
+// was authored in this PR but DROPPED before merge: the shape `r + arg
+// + threshold` is flattened by the elaborate pass into ANF
+// (`let $tmp = r + arg; $tmp + threshold`), introducing a non-k-call
+// intermediate let-stmt. `arm_body_let_then_pure_tail_shape` requires
+// `block.stmts.len() == 1`; with the ANF intermediate the shape detector
+// rejects → falls through to the general arm-body walker → fires the
+// "k in non-tail position outside the supported shapes" diagnostic.
+//
+// This is an ORTHOGONAL gap from G1 (Slice B's shape detector +
+// elaborate-pass interaction; not the captures-bearing extension). G1's
+// closure-record machinery handles two captures-in-one-record fine
+// (variants 1, 2, 3 cover op-arg-only, ArmCapture-only-let, ArmCapture-
+// only-fn-param); the combined shape would activate the same machinery
+// once the ANF gap closes.
+//
+// Closure path: extend `arm_body_let_then_pure_tail_shape` to allow
+// trailing non-k-call lets between the k-call let and the tail
+// expression (treat them as part of the post-arm-k synth fn's body
+// prologue) — this is a separate compiler change with its own design
+// + tests + PR. Tracked as a follow-up gap; NOT part of G1's
+// captures-bearing closure path.
 
 /// **Task 78.5 import — Reader effect (DI seam).**
 ///

@@ -8509,28 +8509,68 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             .ins()
                             .store(MemFlags::trusted(), null_v, cp, 8);
                         // Each capture at offset 16 + 8*i, widened to I64.
+                        // Source-of-truth depends on capture kind:
+                        //   - OpArg: read from `lowerer.env` (op-args were
+                        //     unpacked from args_ptr at arm-fn entry).
+                        //   - ArmCapture { arm_idx }: NOT in env at this
+                        //     point — the arm-fn loads outer-scope captures
+                        //     on-demand via `Expr::ClosureEnvLoad`, which
+                        //     happens lazily during body lowering, not at
+                        //     fn entry. Eagerly load from arm-fn's
+                        //     `closure_ptr` at offset 16 + 8*arm_idx (the
+                        //     arm-fn's closure record layout: header, null
+                        //     code_ptr, captures starting at offset 16).
+                        //     The loaded I64 is already widened (the
+                        //     allocator that built arm-fn's closure record
+                        //     widened all values to I64 at store time).
                         for (i, capture) in captures.iter().enumerate() {
-                            let raw = match lowerer.env.get(&capture.name) {
-                                Some(v) => *v,
-                                None => unreachable!(
-                                    "Plan B Task 78.5 G1: post-arm-k capture `{}` \
-                                     not in arm-fn env at body-emit time. The pre-\
-                                     pass collected captures from arm.params \
-                                     (op-args, unpacked from args_ptr) and from \
-                                     arm-fn's ArmCapture list (loaded from \
-                                     closure_ptr at the arm-fn prologue) — both \
-                                     paths leave the value bound in env keyed by \
-                                     name.",
-                                    capture.name
-                                ),
+                            let raw = match capture.source {
+                                PostArmKCaptureSource::OpArg => {
+                                    match lowerer.env.get(&capture.name) {
+                                        Some(v) => *v,
+                                        None => unreachable!(
+                                            "Plan B Task 78.5 G1: OpArg capture `{}` \
+                                         not in arm-fn env at body-emit time. \
+                                         Op-args are unpacked at arm-fn entry; \
+                                         the pre-pass restricted OpArg captures \
+                                         to arm.params, which arm-fn entry \
+                                         binds.",
+                                            capture.name
+                                        ),
+                                    }
+                                }
+                                PostArmKCaptureSource::ArmCapture { arm_idx } => {
+                                    let offset: i32 = 16 + 8 * arm_idx as i32;
+                                    lowerer.builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        lowerer.closure_ptr,
+                                        offset,
+                                    )
+                                }
                             };
+                            // ArmCapture-sourced raw is already I64 (loaded
+                            // from arm-fn's closure record where values
+                            // were widened at store time). OpArg-sourced
+                            // raw is at the declared narrow Cranelift type
+                            // and needs widening per kind. Branch on
+                            // capture.source so the widening match below
+                            // doesn't double-widen ArmCapture I64 values
+                            // (which would invalid-IR Cranelift's
+                            // `uextend.i64 v_already_i64`).
+                            let needs_widen =
+                                matches!(capture.source, PostArmKCaptureSource::OpArg);
                             let slot_val = match capture.kind {
                                 crate::ast::EnvSlotKind::Int => raw,
                                 crate::ast::EnvSlotKind::Bool
                                 | crate::ast::EnvSlotKind::Byte
                                 | crate::ast::EnvSlotKind::Unit
                                 | crate::ast::EnvSlotKind::Char => {
-                                    lowerer.builder.ins().uextend(types::I64, raw)
+                                    if needs_widen {
+                                        lowerer.builder.ins().uextend(types::I64, raw)
+                                    } else {
+                                        raw
+                                    }
                                 }
                                 crate::ast::EnvSlotKind::String
                                 | crate::ast::EnvSlotKind::Closure
