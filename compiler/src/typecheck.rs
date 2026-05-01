@@ -1029,6 +1029,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         next_ty_var: 0,
         next_row_var: 0,
         next_scope_id: 0,
+        current_arm_scope_id: None,
         subst: Subst::new(),
         current_generic_subst: BTreeMap::new(),
         current_row_var_subst: BTreeMap::new(),
@@ -2132,6 +2133,17 @@ struct Tc {
     /// to tag the `Ty::Continuation` bound to each arm's `k` so
     /// continuations from different handles can't unify (E0145).
     next_scope_id: u32,
+    /// Plan D Task 117 (continuation-surface) — current handler arm
+    /// body's scope id, set during arm-body typecheck walks. When
+    /// `Some(N)`, user-written `Continuation[op_ret, ret]` type
+    /// annotations resolve to `Ty::Continuation { ..., scope_id:
+    /// Concrete(N) }` matching the enclosing handle. When `None`
+    /// (annotation appears outside any arm body), the Continuation
+    /// surface fires E0145 ("Continuation annotations are only
+    /// valid inside a handler arm body"). Stack-discipline: saved/
+    /// restored across nested arm bodies so each annotation gets
+    /// the innermost enclosing arm's scope id.
+    current_arm_scope_id: Option<u32>,
     /// Substitution accumulated by unification. Resolves type-vars
     /// via `Subst::apply_ty` and row-vars via `Subst::apply_row`.
     /// Updated in-place by `unify_ty` / `unify_row`; queried whenever
@@ -2261,6 +2273,7 @@ impl Tc {
             &self.types,
             &self.current_generic_subst,
             &self.current_row_var_subst,
+            self.current_arm_scope_id,
         )
     }
 
@@ -3120,6 +3133,43 @@ impl Tc {
                 // user sees every bad spot, not just the outermost.
                 for a in args {
                     self.check_type_expr_known(a);
+                }
+                // Plan D Task 117 (continuation-surface) —
+                // `Continuation[op_ret, ret]` is the surface form
+                // for k's binding type. Validate the arity and the
+                // arm-context location HERE so the diagnostic is
+                // precise; `ty_from_type_expr_with_rows` returns
+                // None silently in both failure modes (arity wrong
+                // or no arm context) and would otherwise surface
+                // as a generic E0112 "unknown type" miss.
+                if name == "Continuation" {
+                    if args.len() != 2 {
+                        self.push_error(
+                            "E0129",
+                            span.clone(),
+                            format!(
+                                "type `Continuation` expects 2 type arguments \
+                                 (op_ret, ret), got {}",
+                                args.len()
+                            ),
+                        );
+                        return;
+                    }
+                    if self.current_arm_scope_id.is_none() {
+                        self.push_error(
+                            "E0145",
+                            span.clone(),
+                            "Continuation annotations are only valid inside a handler arm \
+                             body — `Continuation[op_ret, ret]` names the type of the \
+                             handler's `k` binding, which exists only within that arm's \
+                             dynamic extent. Move the annotation inside an arm body, or \
+                             remove it (the type isn't user-constructible outside arm \
+                             contexts)"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                    return;
                 }
                 if matches!(
                     name.as_str(),
@@ -5217,9 +5267,20 @@ impl Tc {
                 scope_id: ScopeId::Concrete(handle_scope_id),
             }));
             self.env.insert(arm.k_name.clone(), k_ty);
+            // Plan D Task 117 (continuation-surface) — set the
+            // current arm's scope_id so user-written
+            // `Continuation[op_ret, ret]` annotations inside this
+            // arm body resolve to a Continuation tagged with the
+            // enclosing handle's scope. Saved/restored so nested
+            // arm bodies (e.g., a handle inside this arm body)
+            // inherit their own innermost scope_id and restore the
+            // outer scope on exit.
+            let saved_arm_scope_id = self.current_arm_scope_id;
+            self.current_arm_scope_id = Some(handle_scope_id);
             // Arm body runs at caller's row (the discharged effect is
             // *not* in scope here — we are servicing it).
             let arm_ty = self.check_expr(&arm.body, row);
+            self.current_arm_scope_id = saved_arm_scope_id;
             self.env = saved_env;
             // Unify arm body type with handler-overall only when the
             // op resolved cleanly; an arm whose registry lookup
@@ -6148,7 +6209,12 @@ pub(crate) fn ty_from_type_expr(
     generic_subst: &BTreeMap<String, Ty>,
 ) -> Option<Ty> {
     let empty_rows: BTreeMap<String, u32> = BTreeMap::new();
-    ty_from_type_expr_with_rows(t, types, generic_subst, &empty_rows)
+    // External callers (non-Tc walks like builtin scheme registration)
+    // never appear inside a handler arm body, so `arm_scope_id` is
+    // None — any user `Continuation[op_ret, ret]` annotation reached
+    // via these paths returns None, and `check_type_expr_known`
+    // surfaces E0145 separately at the use site.
+    ty_from_type_expr_with_rows(t, types, generic_subst, &empty_rows, None)
 }
 
 /// Plan D Task 116 — variant of `ty_from_type_expr` that threads a
@@ -6166,6 +6232,17 @@ pub(crate) fn ty_from_type_expr_with_rows(
     types: &BTreeMap<String, TypeDecl>,
     generic_subst: &BTreeMap<String, Ty>,
     row_var_subst: &BTreeMap<String, u32>,
+    // Plan D Task 117 (continuation-surface) — innermost enclosing
+    // handler arm body's scope_id, threaded from
+    // `Tc::ty_from_type_expr_here` via `Tc.current_arm_scope_id`.
+    // When `Some(N)`, user-written `Continuation[op_ret, ret]`
+    // annotations resolve to `Ty::Continuation { ..., scope_id:
+    // Concrete(N) }`. When `None`, returns `None` for the
+    // Continuation case — `check_type_expr_known` is the
+    // authoritative diagnostic site (pushes E0145 with the
+    // "Continuation annotations are only valid inside a handler
+    // arm body" message).
+    arm_scope_id: Option<u32>,
 ) -> Option<Ty> {
     match t {
         TypeExpr::Named(name, _) => match name.as_str() {
@@ -6193,6 +6270,42 @@ pub(crate) fn ty_from_type_expr_with_rows(
             }
         },
         TypeExpr::Apply { name, args, .. } => {
+            // Plan D Task 117 (continuation-surface) — `Continuation[
+            // op_ret, ret]` is the surface form for k's binding type.
+            // Type-position only (no value-position constructor —
+            // `check_handle` stays the sole producer of Ty::Continuation
+            // at the value level). scope_id is inferred from the
+            // innermost enclosing handler arm body via the threaded
+            // `arm_scope_id` param. When `arm_scope_id` is None
+            // (annotation appears outside any arm body), return None;
+            // `check_type_expr_known` is the diagnostic site for the
+            // E0145 ("Continuation annotations are only valid inside a
+            // handler arm body") message.
+            if name == "Continuation" {
+                if args.len() != 2 {
+                    return None;
+                }
+                let scope_id = arm_scope_id?;
+                let op_ret = ty_from_type_expr_with_rows(
+                    &args[0],
+                    types,
+                    generic_subst,
+                    row_var_subst,
+                    arm_scope_id,
+                )?;
+                let ret = ty_from_type_expr_with_rows(
+                    &args[1],
+                    types,
+                    generic_subst,
+                    row_var_subst,
+                    arm_scope_id,
+                )?;
+                return Some(Ty::Continuation(Box::new(ContinuationTy {
+                    op_ret,
+                    ret,
+                    scope_id: ScopeId::Concrete(scope_id),
+                })));
+            }
             // Primitives don't accept type arguments.
             if matches!(
                 name.as_str(),
@@ -6219,6 +6332,7 @@ pub(crate) fn ty_from_type_expr_with_rows(
                     types,
                     generic_subst,
                     row_var_subst,
+                    arm_scope_id,
                 )?);
             }
             Some(Ty::User(name.to_string(), resolved_args))
@@ -6246,9 +6360,16 @@ pub(crate) fn ty_from_type_expr_with_rows(
                     types,
                     generic_subst,
                     row_var_subst,
+                    arm_scope_id,
                 )?);
             }
-            let ret = ty_from_type_expr_with_rows(&fty.ret, types, generic_subst, row_var_subst)?;
+            let ret = ty_from_type_expr_with_rows(
+                &fty.ret,
+                types,
+                generic_subst,
+                row_var_subst,
+                arm_scope_id,
+            )?;
             // Plan D Task 116 — resolve the inner fn-type's
             // `effect_row_var` (if any) by name through the supplied
             // row-var subst. None when no row-var subst entry exists
@@ -6278,6 +6399,7 @@ pub(crate) fn ty_from_type_expr_with_rows(
                     types,
                     generic_subst,
                     row_var_subst,
+                    arm_scope_id,
                 )?);
             }
             Some(Ty::Tuple(elem_tys))
@@ -9449,6 +9571,7 @@ mod tests {
             next_ty_var: 0,
             next_row_var: 0,
             next_scope_id: 0,
+            current_arm_scope_id: None,
             subst: Subst::new(),
             current_generic_subst: BTreeMap::new(),
             current_row_var_subst: BTreeMap::new(),
@@ -11001,6 +11124,109 @@ mod tests {
             "passing `k` (or a let-aliased k) into a generic-typed param chain \
              must fire E0145 (the precision check sees the resolved arg type \
              post-deref): {errs:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Plan D Task 117 (continuation-surface) — Continuation type-
+    // position surface form. Pins the parser + typecheck-level
+    // behavior of `Continuation[op_ret, ret]` annotations: in-arm
+    // resolves to Ty::Continuation; outside-arm fires E0145; wrong
+    // arity fires E0129.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn continuation_annotation_inside_arm_body_typechecks() {
+        // `let f: Continuation[Int, Int] = k;` inside the arm body
+        // resolves the annotation to Ty::Continuation tagged with
+        // the enclosing handle's scope_id. The let-RHS is k (also
+        // Ty::Continuation with the same scope_id); unify_ty
+        // succeeds. Body returns 0 — handle returns 0.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let f: Continuation[Int, Int] = k;\n\
+                         0\n\
+                       },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0145") && !has_code(&errs, "E0044"),
+            "Continuation[Int, Int] annotation inside arm body must typecheck \
+             cleanly (resolves to the same Ty::Continuation k is bound at): \
+             {errs:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_annotation_outside_arm_body_fires_e0145() {
+        // Annotation outside any handler arm body — fires E0145
+        // ("Continuation annotations are only valid inside a
+        // handler arm body"). The diagnostic is precise: it points
+        // at the annotation's span, not at a generic "unknown
+        // type Continuation" miss.
+        let src = "fn main() -> Int ![] {\n\
+                     let f: Continuation[Int, Int] = 0;\n\
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "Continuation annotation outside arm body must fire E0145: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_annotation_wrong_arity_fires_e0129() {
+        // Continuation expects exactly 2 type args (op_ret, ret).
+        // Anything else fires E0129 ("type expects N type
+        // argument(s), got M") — same diagnostic shape as user
+        // generic types.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let f: Continuation[Int] = k;\n\
+                         0\n\
+                       },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0129"),
+            "Continuation with wrong arity must fire E0129: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_annotation_with_mismatched_scope_fires_e0145_via_unify() {
+        // Inner arm body has `let f: Continuation[Int, Int] = k_outer;`
+        // where k_outer comes from the surrounding outer handle's arm.
+        // The annotation resolves to Ty::Continuation tagged with the
+        // INNER scope_id; k_outer is tagged with the OUTER scope_id.
+        // unify_ty fires the cross-handle E0145 (the specific
+        // n != m message). This pins the interaction between the
+        // type-position surface and the existing cross-handle arm
+        // in unify_ty.
+        let src = "effect E1 { op1: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       E1.op1(k_outer) =>\n\
+                         handle 0 with {\n\
+                           E1.op1(k_inner) => {\n\
+                             let f: Continuation[Int, Int] = k_outer;\n\
+                             0\n\
+                           },\n\
+                         },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "Continuation annotation with mismatched enclosing scope vs RHS k must \
+             fire E0145 via cross-handle unify: {errs:?}"
         );
     }
 
