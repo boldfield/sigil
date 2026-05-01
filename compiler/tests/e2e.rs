@@ -5373,6 +5373,67 @@ fn task_117_let_bound_k_multi_shot_via_2_let_returns_3() {
 }
 
 #[test]
+fn task_117_let_bound_k_inside_if_branch_rejected_by_walker() {
+    // PR #62 followup: pin the v1-restriction diagnostic shape for
+    // a let-bound continuation inside a non-top-level position
+    // (here: inside an `if` branch). Typecheck accepts the surface
+    // (the let typechecks; arm-body walk doesn't see it as
+    // top-level so the desugar leaves it alone). Codegen-walker's
+    // `Expr::Ident(k_name)` reject fires with the post-Task-117
+    // message pointing at the v1 top-level-only restriction —
+    // confirms the walker reject's diagnostic shape didn't drift
+    // back to the pre-Task-117 "deferred to v2" wording.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn run() -> Int ![] {\n  \
+                 handle 0 with {\n    \
+                   Raise.fail(k) =>\n      \
+                     if true {\n        \
+                       let f: Continuation[Int, Int] = k;\n        \
+                       f(0)\n      \
+                     } else {\n        \
+                       0\n      \
+                     },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![] { run() }\n";
+
+    // compile_and_run panics on compile failure; drive sigil
+    // binary directly to capture stderr.
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_task_117_let_bound_k_in_if_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&src_path, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_task_117_let_bound_k_in_if_bin_{}",
+        std::process::id()
+    ));
+    let compile = std::process::Command::new(sigil_binary())
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(workspace_root())
+        .output()
+        .expect("failed to invoke sigil compiler");
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    let stderr = String::from_utf8_lossy(&compile.stderr).into_owned();
+
+    assert!(
+        !compile.status.success(),
+        "expected codegen-walker reject; compile succeeded with stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Task 117 type-position surface")
+            || stderr.contains("TOP LEVEL of a handler arm body"),
+        "walker reject must point at v1 top-level-only restriction \
+         (post-Task-117 message; the pre-Task-117 wording \"first-class \
+         continuations are deferred to v2\" would indicate diagnostic \
+         drift); got stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn handle_with_return_arm_inside_match_arm_compiles() {
     // Plan B Task 55 (Phase 4g) review-fix #2: regression test
     // for the `Lowerer::type_of_expr` `Expr::Handle` arm not

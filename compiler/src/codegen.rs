@@ -1635,27 +1635,31 @@ fn arm_body_walk(
         Expr::Ident(name, _) => {
             if name == k_name {
                 // Plan D Task 117 (continuation-surface) — `k` as a
-                // value still reaches this walker only as a defense-
-                // in-depth check. The typecheck-side escape barrier
-                // (E0145 broad arm in unify_ty + bind_ty_var
-                // precision check at check_call) is the
-                // authoritative gate; the let-bound k desugar
-                // pre-pass in typecheck rewrites
-                // `let f: Continuation = k; ... f ...` to `... k
-                // ...` so the supported user-surface shapes never
-                // reach this site with bare `k`. If a stray bare
-                // `k` reference does survive (e.g., a shape
-                // typecheck accepted but the desugar didn't
-                // simplify), reject with the documented message —
-                // E0145 already pinned the value-position
-                // restriction at typecheck.
+                // value reaches this walker only as defense-in-depth.
+                // Typecheck E0145 (broad arm in unify_ty + bind_ty_var
+                // precision check at check_call + let-RHS bare-Ident
+                // restriction) is the authoritative gate; the
+                // let-bound k desugar pre-pass in typecheck rewrites
+                // `let f: Continuation[..] = k; ... f ...` to
+                // `... k ...` so supported user-surface shapes never
+                // reach this site with bare `k`.
+                //
+                // The most likely path that survives to here is a v1
+                // restriction the desugar can't simplify: a let-stmt
+                // matching the alias shape but appearing INSIDE an
+                // if/match/lambda branch rather than at the top level
+                // of the arm body's `Expr::Block` (the desugar only
+                // walks top-level stmts of arm-body blocks). Direct
+                // user to the supported shape.
                 return Some(format!(
                     "references continuation `{name}` as a value (not as the \
-                     callee of a call) — Sigil v1's `Continuation[op_ret, ret]` \
-                     surface only supports the `let f: Continuation[op_ret, \
-                     ret] = k; ... f(arg) ...` form (rewritten to `k(arg)` at \
-                     typecheck); other value-position uses are dynamic-extent \
-                     escapes rejected at typecheck via E0145"
+                     callee of a call). The Task 117 type-position surface \
+                     `Continuation[op_ret, ret]` is supported only for let-\
+                     bindings at the TOP LEVEL of a handler arm body's block: \
+                     `Raise.fail(k) => {{ let f: Continuation[op_ret, ret] = k; \
+                     ... f(arg) ... }}`. Nested let-bound k inside if/match/\
+                     lambda branches is a v1 restriction (PR #62 followup may \
+                     extend the desugar to nested scopes)"
                 ));
             }
             if globals.contains(name) {
