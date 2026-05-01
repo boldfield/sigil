@@ -5506,8 +5506,11 @@ impl Tc {
             // Snapshot the prior binding (if any) for each name the
             // pattern introduces so we can restore exact state after
             // the arm body is checked. Pattern::Var names are fresh
-            // per arm (resolve.rs does not track match-arm scopes),
-            // so there is no redefinition concern inside a single arm.
+            // per arm and may shadow outer names per the construct-
+            // introduced-binding rule (resolve.rs's audit-F-1 fix
+            // mirrors this with per-arm scope cloning); the env-side
+            // snapshot/restore here is what makes the shadow visible
+            // only inside the arm body.
             let saved: Vec<(String, Option<Ty>)> = bindings
                 .iter()
                 .map(|(name, _)| (name.clone(), self.env.get(name).cloned()))
@@ -5644,10 +5647,12 @@ impl Tc {
     ///
     /// A catch-all arm (wildcard or bare-var binding that is not a
     /// nullary-ctor promotion) short-circuits to exhaustive. The
-    /// v1 algorithm only checks top-level coverage; nested non-
-    /// exhaustiveness inside a covered ctor's fields falls through to
-    /// the runtime trap and is documented as such in the E0120 catalog
-    /// long-form.
+    /// algorithm is full recursive Maranget (Plan B extension over
+    /// Plan A3's original top-level-only check): nested non-
+    /// exhaustiveness inside a covered ctor's fields produces a
+    /// witness with positional / record holes pasted in, e.g.
+    /// `Some(false)` or `Holds(Node(_, _, _))`. See the E0120 catalog
+    /// long-form for the witness format.
     fn user_type_witness(&self, type_name: &str, arms: &[MatchArm]) -> Option<String> {
         // For exhaustiveness purposes, the args carried on a generic
         // user type don't change the variant set — the generic params
