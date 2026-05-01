@@ -5251,7 +5251,7 @@ fn task_117_validation_multi_shot_through_let_bound_lambda() {
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle helper() with {\n    \
                    Choose.flip(k) => {\n      \
-                     let f: (Bool) -> Int ![] = fn (x: Bool) -> Int ![] => k(x);\n      \
+                     let f: (Bool) -> Int ![IO] = fn (x: Bool) -> Int ![IO] => k(x);\n      \
                      let r1: Int = f(true);\n      \
                      let r2: Int = f(false);\n      \
                      r1 + r2\n    \
@@ -5305,7 +5305,7 @@ fn task_117_validation_multi_shot_through_let_bound_lambda() {
 #[test]
 fn task_117_validation_frame_escape_past_handle_pop() {
     let src = "effect Foo { op: () -> Int }\n\
-               fn make_continuation() -> (Int) -> Int ![] {\n  \
+               fn make_continuation() -> (Int) -> Int ![] ![] {\n  \
                  handle (\n    \
                    let _: Int = perform Foo.op();\n    \
                    99\n  \
@@ -5380,7 +5380,7 @@ fn task_117_validation_arena_escape_let_bound_multi_shot() {
                    _ => {\n      \
                      let _: Int = handle outcome() with {\n        \
                        Choose.flip(k) => {\n          \
-                         let f: (Bool) -> Int ![] = fn (x: Bool) -> Int ![] => k(x);\n          \
+                         let f: (Bool) -> Int ![IO] = fn (x: Bool) -> Int ![IO] => k(x);\n          \
                          let r1: Int = f(true);\n          \
                          let r2: Int = f(false);\n          \
                          r1 + r2\n        \
