@@ -88,7 +88,7 @@
 //! HandlerFrame allocation and are scanned conservatively along with
 //! the rest of the block.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::ptr;
 
@@ -236,6 +236,32 @@ thread_local! {
     /// require either rooting this TLS or moving the value into a
     /// stack slot at consumption time.
     static LAST_TERMINAL_VALUE: Cell<u64> = const { Cell::new(0) };
+
+    /// Plan D Task 117 — push/pop relink discipline tracker.
+    ///
+    /// Each `sigil_handle_push` records whether it actually linked
+    /// the frame (pushed to true) or skipped (pushed to false; the
+    /// frame was already on top of the handler stack — the
+    /// "skip-if-on-top" case introduced by Task 117's let-bound k
+    /// dispatch path). The matching `sigil_handle_pop` reads the
+    /// most recent flag and, on `false`, no-ops the unlink.
+    ///
+    /// Why a per-thread stack: lower_k_pair_call's push/pop pair
+    /// is re-entrant — `run_loop` between push and pop drives
+    /// arbitrary handler-stack activity (nested handles in the
+    /// body's continuation), each of which push/pops RELINK_STACK
+    /// in their own scope. By the time lower_k_pair_call's pop
+    /// runs, intermediate entries have been balanced and the top
+    /// of the stack is the matching push's flag.
+    ///
+    /// Initial state: empty. Pop on empty defaults to `true`
+    /// (standard unlink) — preserves backwards-compatible behavior
+    /// for non-Task-117 callers (existing handle codegen pushes/
+    /// pops without going through the relink path; their pop on
+    /// an empty RELINK_STACK gets the standard semantics).
+    ///
+    /// **No GC root** — the Vec<bool> contains no heap pointers.
+    static RELINK_STACK: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Register the calling thread's `HANDLER_STACK` TLS cell as a Boehm
@@ -648,19 +674,35 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
         eprintln!("sigil_handle_push: null frame");
         std::process::abort();
     }
-    // Defensive against codegen bugs that double-push the same frame:
-    // a non-null `prev` at push time would silently overwrite the prior
-    // chain link. The check is debug-only because a release build on a
-    // verified codegen never trips it; if it ever does, the panic
-    // localises the bug to the push site rather than a later traversal.
-    debug_assert!(
-        (*frame).prev.is_null(),
-        "sigil_handle_push: frame already linked (double-push?)"
-    );
     HANDLER_STACK.with(|cell| {
         let head = cell.get();
+        // Plan D Task 117 — skip-if-on-top. When `lower_k_pair_call`
+        // dispatches a let-bound k from inside the originating handle's
+        // arm body, the captured `frame_ptr` IS the current head; the
+        // re-link push would trip the "frame already linked" panic
+        // (`frame.prev` is non-null because the outer handle linked
+        // it). Detect this and no-op the link, recording the
+        // skip-decision into RELINK_STACK so the matching pop is
+        // also a no-op.
+        if head == frame {
+            RELINK_STACK.with(|s| s.borrow_mut().push(false));
+            return;
+        }
+        // Defensive against codegen bugs that double-push the same
+        // frame from a NON-head position: a non-null `prev` at push
+        // time would silently overwrite the prior chain link. The
+        // check is debug-only because a release build on a verified
+        // codegen never trips it; if it ever does, the panic
+        // localises the bug to the push site rather than a later
+        // traversal. Skip-if-on-top above already handles the
+        // legitimate re-push-of-head case.
+        debug_assert!(
+            (*frame).prev.is_null(),
+            "sigil_handle_push: frame already linked but not at head (double-push from below?)"
+        );
         (*frame).prev = head;
         cell.set(frame);
+        RELINK_STACK.with(|s| s.borrow_mut().push(true));
     });
 }
 
@@ -684,19 +726,33 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
 /// chain — keeps it reachable).
 #[no_mangle]
 pub unsafe extern "C" fn sigil_handle_pop() -> *mut HandlerFrame {
+    // Plan D Task 117 — read the matching push's relink-decision
+    // off RELINK_STACK. If the push was a no-op (frame was already
+    // on top), the matching pop must also no-op. Default-true on
+    // empty: preserves backwards-compatible standard-unlink for
+    // any caller that bypasses RELINK_STACK (test infrastructure
+    // or future callers that don't go through `sigil_handle_push`).
+    let did_link = RELINK_STACK.with(|s| s.borrow_mut().pop().unwrap_or(true));
     HANDLER_STACK.with(|cell| {
         let head = cell.get();
         if head.is_null() {
             eprintln!("sigil_handle_pop: handler stack underflow");
             std::process::abort();
         }
+        if !did_link {
+            // Skip-if-on-top counterpart: matching push was a no-op,
+            // so pop is too. Return the current head unchanged
+            // (codegen may use the return value as a sentinel; the
+            // existing contract is "popped frame ptr").
+            return head;
+        }
         // SAFETY: head is non-null per the underflow check; reading
         // `prev` against the documented HandlerFrame layout is sound.
         let prev = (*head).prev;
         // Clear the popped frame's `prev` link so a subsequent push of
         // the same frame (legitimate use case: re-entering a `handle`
-        // in a loop) doesn't trip the no-double-push debug_assert at
-        // `sigil_handle_push`.
+        // in a loop) doesn't trip the not-at-head double-push assert
+        // at `sigil_handle_push`.
         (*head).prev = ptr::null_mut();
         cell.set(prev);
         head
