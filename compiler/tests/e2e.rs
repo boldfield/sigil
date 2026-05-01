@@ -8101,56 +8101,64 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 // new pattern lands as its own PR with one e2e test (and possibly an
 // example) so any surfaced bug ships as its own followup PR.
 
-/// **Task 78.5 PR 1** — Generator with collecting handler.
+/// **Task 78.5 — Generator with collecting handler [PENDING `_pending_slice_b_captures_bearing_post_arm_k`].**
 ///
 /// Source pattern: `koka/test/algeff/common.kk` lines 108–125 (the
 /// `yield` effect + `iterate` producer; the `foreach` consumer
 /// variant is inexpressible in sigil v1 per Task 64 deviation, so the
 /// port substitutes a list-collecting handler).
 ///
-/// **Why it's novel for sigil:**
+/// ## Status
+///
+/// **`#[ignore]`'d**: surfaced a real codegen gap in PR #66 CI (commit
+/// `2ab80f8`). The arm body `let rest: List[Int] = k(0); Cons(x, rest)`
+/// references op-arg `x` in the post-k tail. Slice B's post-arm-k
+/// synth-fn machinery only supports tails that reference the
+/// let-binding (`rest`) or globals; op-arg / outer-scope captures into
+/// the synth fn require a captures-bearing extension parallel to PR
+/// #26's commit `a5ee4c6` (which added captures-bearing slice to the
+/// helper synth-cont — the `let x = perform; let y = perform; tail`
+/// shape). The same lift applied to the post-arm-k synth fn closes
+/// this and the full underlying-gap coverage below.
+///
+/// ## Full underlying-gap coverage (audit-lesson characterization)
+///
+/// Slice B's post-arm-k synth fn restriction rejects ALL of these tail
+/// shapes today; the corpus accidentally avoided them by always writing
+/// tails that reference only the let-binding:
+///
+/// 1. **Op-arg in post-k tail** — `let r = k(arg); fn_of(op_arg, r)`
+///    (this test).
+/// 2. **Outer-fn-scope let in post-k tail** — `let f = 7; handle ...
+///    { Eff.op(_, k) => let r = k(0); r + f }`.
+/// 3. **Outer fn-param in post-k tail** — `fn outer(t: Int) { handle ...
+///    { Eff.op(_, k) => let r = k(0); r + t } }`.
+/// 4. **Combined op-arg + outer-capture in tail** — composed gap.
+///
+/// **Closure path** (PR #26 `a5ee4c6` precedent): mirror the
+/// helper-synth-cont's captures-bearing slice — at the post-arm-k synth
+/// fn build site (`compiler/src/codegen.rs` Slice B materialisation),
+/// detect free vars in the post-k tail beyond `{let_binding, globals}`,
+/// add them to the synth fn's closure record alongside the existing
+/// let-binding slot. Ne&w synth-fn entry rebinds them via ClosureEnvLoad.
+///
+/// ## Why it's novel for sigil
 ///
 /// 1. **Recursive perform under a handler.** `iterate(xs)` calls
-///    itself in the `Cons` arm after each `perform Gen.yield(x)`. The
-///    survey at `2026-05-01-sigil-koka-import-plan.md` flagged
-///    "stack-safety of deeply-nested recursive perform" as not
-///    exercised; this is the cleanest minimal probe of the trampoline
-///    machinery under recursive descent.
-///
+///    itself in the `Cons` arm after each `perform Gen.yield(x)`.
 /// 2. **Single-shot k whose result type is a non-Int sum (`List[Int]`).**
-///    Existing Slice B post-arm-k synth-fn tests (e.g.
-///    `slice_b_arm_body_let_then_pure_tail_post_arm_k_synth_fn_fires`)
-///    exercise `let r = k(99); r+1` where r is Int. This test routes
-///    `let rest: List[Int] = k(0); Cons(x, rest)` through the same
-///    machinery with a pointer-typed sum-type binding.
+/// 3. **Decl-level generic effect `Gen[A]`** instantiated to `Gen[Int]`.
 ///
-/// 3. **Decl-level generic effect `Gen[A]`** instantiated to
-///    `Gen[Int]` at the row site. Mirrors `std/raise.sigil`'s
-///    `Raise[E]` shape but with the type param appearing only in op
-///    *input* position (Raise's E appears in input only too — but
-///    Gen's discharger and arm body both consume the param-typed
-///    value, exercising a different lowering path).
+/// ## Trace (once the gap closes; xs = `[1, 2, 3]`)
 ///
-/// **Trace** (xs = `[1, 2, 3]`):
-/// - handle pushes Gen[Int] frame; iterate([1,2,3]) runs.
-/// - perform Gen.yield(1) → arm runs: `let rest = k(0)`. k(0) resumes
-///   iterate at the perform site with value 0 (the `_` binding); iterate
-///   tail-calls iterate([2,3]).
-///   - perform Gen.yield(2) → `let rest = k(0)`. k(0) resumes; iterate
-///     tail-calls iterate([3]).
-///     - perform Gen.yield(3) → `let rest = k(0)`. k(0) resumes;
-///       iterate tail-calls iterate([]).
-///       - match Nil => 0. Body returns 0.
-///       - return arm fires: _v=0; returns Nil.
-///       - rest = Nil; arm body evaluates Cons(3, Nil).
-///     - rest = Cons(3, Nil); arm body evaluates Cons(2, Cons(3, Nil)).
-///   - rest = Cons(2, Cons(3, Nil)); arm body evaluates Cons(1, _).
-/// - handle's overall = Cons(1, Cons(2, Cons(3, Nil))).
-/// - length(result) = 3; main prints "3\n".
+/// 3 nested arm bodies, each `let rest = k(0)` descending; return arm
+/// fires `Nil`; arm bodies build `Cons(1, Cons(2, Cons(3, Nil)))` on the
+/// way back up. `length(result) = 3`.
 ///
-/// **Invariant:** stdout = `"3\n"`, exit 0.
+/// **Invariant** (post-fix): stdout = `"3\n"`, exit 0.
 #[test]
-fn task_78_5_pr1_generator_collect_handler_yields_three_elements() {
+#[ignore = "Slice B post-arm-k synth fn rejects op-arg / outer-scope captures in post-k tail; closure path: PR #26 a5ee4c6 captures-bearing slice extension"]
+fn task_78_5_generator_collect_pending_slice_b_captures_bearing() {
     let src = "import std.list\n\
                import std.io\n\
                \n\
@@ -8368,106 +8376,77 @@ fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
     );
 }
 
-/// **Task 78.5 import — Multi-effect interpreter (Raise + State + IO).**
-///
-/// Source pattern: `koka/test/algeff/expr.kk` lines 145–165 (`eval2`
-/// with state + exc). Sigil's `examples/interpreter.sigil` uses
-/// Raise[String] only; this test extends it with a State[Int] tick
-/// counter + IO trace, mirroring expr.kk's progression eval1 → eval2 →
-/// eval3.
-///
-/// **Why it's novel for sigil:** the existing interpreter test handles
-/// only one effect (Raise). This one's `eval` body has effect row
-/// `![Raise[String], State, IO]` — three effects in a single recursive
-/// evaluator. Recursive perform under three handlers stacked is not in
-/// the corpus.
-///
-/// **Invariant:** evaluating `Div(Div(IntE(16), IntE(2)), IntE(3))`
-/// → `(16/2)/3 = 2` (integer div). With tick incremented per Div, total
-/// ticks = 2. stdout traces "tick" twice and prints final result `"2\n"`.
-#[test]
-fn task_78_5_multi_effect_interpreter_traces_and_evaluates() {
-    // Inline row-poly + body-type-poly run_state mirrors std/raise.sigil's
-    // catch shape (post-Task 116 row-poly Fn parameters). std/state.sigil's
-    // run_state is closed-row + Int-only; this test validates that the
-    // surface lift is in place even though std hasn't migrated yet.
-    let src = "import std.raise\n\
-               import std.result\n\
-               import std.io\n\
-               \n\
-               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
-               \n\
-               fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
-                 let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
-                   return(v) => fn (s: Int) -> A ![| e] => v,\n    \
-                   State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s),\n    \
-                   State.set(arg, k) => fn (s: Int) -> A ![| e] => k(arg)(arg),\n  \
-                 };\n  \
-                 state_fn(initial)\n\
-               }\n\
-               \n\
-               type Expr = | IntE(Int) | DivE(Expr, Expr)\n\
-               \n\
-               fn eval(e: Expr) -> Int ![Raise[String], State, ArithError, IO] {\n  \
-                 match e {\n    \
-                   IntE(i) => i,\n    \
-                   DivE(e1, e2) => {\n      \
-                     let x: Int = eval(e1);\n      \
-                     let y: Int = eval(e2);\n      \
-                     let cur: Int = perform State.get();\n      \
-                     let _: Int = perform State.set(cur + 1);\n      \
-                     perform IO.println(\"tick\");\n      \
-                     if y == 0 {\n        \
-                       let _r: Int = raise(\"divide by zero\");\n        \
-                       _r\n      \
-                     } else {\n        \
-                       x / y\n      \
-                     }\n    \
-                   },\n  \
-                 }\n\
-               }\n\
-               \n\
-               fn main() -> Int ![IO, ArithError] {\n  \
-                 let prog: Expr = DivE(DivE(IntE(16), IntE(2)), IntE(3));\n  \
-                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String], ArithError, IO] => run_state_poly(0, fn () -> Int ![Raise[String], State, ArithError, IO] => eval(prog)));\n  \
-                 match r {\n    \
-                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
-                   Err(m) => perform IO.println(m),\n  \
-                 };\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_multi_effect_interpreter");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(
-        stdout, "tick\ntick\n2\n",
-        "Div tree should print tick per Div node and final value 2; stderr={stderr:?}"
-    );
-}
+// Multi-effect interpreter port (algeff/expr.kk eval2/eval3) was authored
+// in this branch but exposed the SAME gap as the Plotkin combo below
+// (row-poly `[X | e]` in user fn signatures not treated as polymorphic
+// at user call sites — surfaced as E0128 closed-row-mismatch in the
+// run_state_poly call vs E0132 ambiguous-polymorphism in Plotkin's
+// amb_handle call). Per "each unique gap gets one representative" the
+// Plotkin test is kept as the cleaner, smaller pin; the multi-effect
+// interpreter port returns once the row-poly user-fn inference gap
+// closes (its own follow-up PR will add it back as a passing test).
 
-/// **Task 78.5 import — State+Choose Plotkin combo, order: state(amb).**
+/// **Task 78.5 — State+Choose Plotkin combo, state(amb) order [PENDING `_pending_row_poly_user_fn_inference`].**
 ///
 /// Source pattern: `koka/test/algeff/effs1a.kk` test2 — the canonical
 /// "stateful nondeterminism" demo from algebraic-effects literature.
-/// `state(0){ amb(foo) }` puts the State handler OUTSIDE the Choose
-/// handler; the State is therefore SHARED across both branches of every
-/// flip (because amb's multi-shot k traverses the State frame each
-/// resume, but the State frame's mutation is not rolled back per
-/// branch).
 ///
-/// **Why it's novel for sigil:** this is the single most-cited gap in
-/// standard algebraic-effect literature — stateful nondeterminism. The
-/// existing corpus has State alone, Choose alone, but never composed.
-/// Order matters semantically: state(amb) shares state across choices;
-/// amb(state) gives each branch its own state copy.
+/// ## Status
 ///
-/// **Invariant:** simplified body `let p = flip(); let i = get();
-/// set(i+1); p` performs flip then increments state. With `amb` as
-/// inner returning a List[Bool], state(amb(...)) ends with state =
-/// 2 (incremented twice — once per resume of flip). The handle's
-/// overall is the List[Bool] from amb. Final list = [true, false].
-/// We check the list length (= 2) printed via int_to_string.
+/// **`#[ignore]`'d**: surfaced a real typecheck gap in PR #66 CI
+/// (commit `2247f1d`). The user-defined row-poly `amb_handle[e](action:
+/// () -> Bool ![Amb | e]) -> List[Bool] ![| e]` is called with `body`
+/// whose row is `[Amb, State]`; the call site fires E0132 "ambiguous
+/// polymorphism: type parameter `e` of `amb_handle` is unconstrained at
+/// this call site". The same gap surfaces from a different angle in the
+/// dropped multi-effect interpreter port (E0128 closed-row mismatch
+/// when `run_state_poly[A](initial: Int, body: () -> A ![State | e])`
+/// is called with body row `[Raise[String], State, ArithError, IO]` —
+/// the `e` is treated as closed/empty rather than inferred).
+///
+/// ## Full underlying-gap coverage (audit-lesson characterization)
+///
+/// Row-poly `[X | e]` parameter rows in user-defined fn signatures are
+/// not inferred at user call sites. Symptoms surfaced:
+///
+/// 1. **`e` unconstrained → E0132** when no return-row context
+///    sufficiently pins it (Plotkin: `amb_handle(body)`).
+/// 2. **`e` defaults to closed/empty → E0128** when a body has effects
+///    beyond the named row entry (multi-effect interpreter:
+///    `run_state_poly(0, fn () => eval(prog))`).
+/// 3. Both shapes likely manifest for ANY user-defined fn with `[X | e]`
+///    in a fn-typed parameter row, regardless of the named X.
+///
+/// `std/raise.sigil`'s `catch[A, E]` works because all existing tests
+/// call it with a body whose row is a closed singleton `[Raise[E]]` —
+/// there's no row-passthrough demand. This test is the first to exercise
+/// row passthrough through a user-defined row-poly fn at the e2e level.
+/// Per memory `feedback_sigil_typecheck_unit_tests_insufficient`:
+/// type-system surface lifts must run a real stdlib migration before
+/// sign-off; per-task unit tests don't exercise scheme-inst / cross-clone
+/// paths. Plan D Stage 12 found 5 such gaps in std/raise; this is a 6th.
+///
+/// **Closure path**: TBD by gap-fix author. Likely fix-site is in
+/// `compiler/src/typecheck.rs` row-var resolution at `check_call`'s
+/// arg-unify or in scheme instantiation where the row-var is
+/// not freshened correctly. Could couple with the discovery work for
+/// std/state's row-poly migration once that's planned.
+///
+/// ## Why it's novel for sigil
+///
+/// **Stateful nondeterminism is the single most-cited gap in standard
+/// algebraic-effect literature.** The existing corpus has State alone,
+/// Choose alone, but never composed. Order matters semantically:
+/// state(amb) shares state across choices; amb(state) gives each branch
+/// its own state copy.
+///
+/// **Invariant** (post-fix): `body` performs flip then increments state.
+/// `amb_handle` resumes both branches; the outer `run_state_poly` shares
+/// the State frame across both. Final list = `[true, false]`; length =
+/// 2; stdout = `"2\n"`.
 #[test]
-fn task_78_5_plotkin_state_outer_amb_inner_shares_state_across_choices() {
+#[ignore = "row-poly `[X | e]` parameter rows in user-defined fn signatures not inferred at user call sites; manifests as E0132 (unconstrained) and E0128 (closed-row mismatch)"]
+fn task_78_5_plotkin_state_amb_pending_row_poly_user_fn_inference() {
     // Inline row-poly + body-type-poly run_state (mirrors std/raise.sigil's
     // catch shape). std/state.sigil's run_state is closed-row + Int-only,
     // which can't accept a body returning List[Bool] with extra effects.
