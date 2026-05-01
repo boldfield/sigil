@@ -815,15 +815,23 @@ pub(crate) fn slot_kind_for_ty(ty: &Ty) -> EnvSlotKind {
         // with one slot per element; the captured value is a pointer
         // into the GC heap. Use the same slot kind as user types.
         Ty::Tuple(_) => EnvSlotKind::User,
-        // Plan D Task 117 — `Ty::Continuation` should never be
-        // captured into a closure env: the typecheck escape barrier
-        // (E0145) rejects lambda capture of `k`. If a Continuation
-        // does reach this slot-kind classifier, an upstream
-        // invariant broke.
-        Ty::Continuation(_) => unreachable!(
-            "closure conversion: Ty::Continuation is impossible after E0145 escape barrier — \
-             lambda capture of `k` is rejected at typecheck"
-        ),
+        // Plan D Task 117 — `Ty::Continuation` reaches this slot-
+        // kind classifier today via the existing ArmKPairCapture
+        // discharge-with-lambda path (run_state-style handlers that
+        // wrap `k` inside a lambda passed back to the body). That
+        // path predates the escape barrier and remains supported;
+        // `k` is materialized into the lambda's closure record as a
+        // pointer-sized slot, mirroring the prior `Ty::Fn(...)`
+        // behavior (the actual 2-slot pair is laid out at the
+        // capture's storage site, not in this slot-kind classifier).
+        //
+        // Once Plan D Task 117 (b) wires the E0145 escape barrier
+        // and the lambda-captures-k inheritance lift (per-scope_id
+        // permitted-capture analysis), Continuation captures that
+        // would escape will fire E0145 at typecheck and never reach
+        // slot kind classification; `Closure` here covers the
+        // legitimate dischrage-with-lambda case until then.
+        Ty::Continuation(_) => EnvSlotKind::Closure,
         // Plan B task 48 — post-typecheck IR shouldn't have unbound
         // type variables in capture types: the codegen-entry walker
         // (`contains_apply_or_generic_ref`) rejects programs whose
