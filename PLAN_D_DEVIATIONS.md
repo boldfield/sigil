@@ -328,7 +328,27 @@ The original 1-2 sites estimate was based on a "discharge site only" closure pat
 
 **Implementing commit(s).** This entry + Tasks 71/72/73 closure-path updates in PLAN_C_DEVIATIONS.md + std/raise.sigil migration + handler-discharge/scheme-rename/subst-application fixes. PR `plan-d-stage-12-checkpoint`.
 
-## 2026-05-01 — [DEVIATION Task 117 split into 117a + 117b] Pre-authorized split surfaced before code-write
+## 2026-05-01 — [DEVIATION Task 117 design validation] Eta-expansion proposal needs validation; split withdrawn
+
+**Context.** Pre-execution recon (2026-05-01, sigil/main `0ff2c3a`) initially proposed splitting Task 117 into 117a (lifted-lambda generalization) + 117b (k-stored-in-record + k-as-fn-arg + smoke gate). User authorized the split. During the design pass, a cleaner mechanism surfaced: **eta-expansion at closure_convert** (rewrite `Expr::Ident(k_name)` in value position to `(fn x => k(x))`; the existing Plan B' Task 107 Phase B `ArmKPairCapture` substrate lifts the lambda; standard indirect-call dispatch reaches `lower_k_pair_call` via the lifted lambda's `arm_k_pair_self`). The eta-expansion proposal would subsume 117a *and* 117b in one mechanism with no codegen changes.
+
+**Why the split is withdrawn.** Brian (2026-05-01) pushed back: *"'no codegen changes needed' against a plan-estimated 6-PR architectural slice is a red flag, not a feature."* The 117a/117b split was scoped under the premise *"117a is mechanically simple, 117b verifies harder cases."* If 117b's harder cases (k-stored-in-record, k-as-fn-arg, multi-shot, frame escape) reveal that eta-expansion fails for them, 117a would have shipped under a design that can't generalize — a sealed sub-PR baking in a wrong choice. Single Task 117 PR after validation completes.
+
+**Three validation tests required before any production code lands.** Each test confirms-or-fails a load-bearing semantic of the eta-expansion design:
+
+1. **Multi-shot through let-bound k.** `let f = k; let r1 = f(true); let r2 = f(false); r1 + r2` inside a `resumes: many` arm. First confirm it fails today (walker rejects `Expr::Ident(k_name)` at `codegen.rs:1556-1571`). Then implement minimal eta-expansion and verify multi-shot produces chained-resume semantics, not N independent trampoline drives. If through-a-lambda forces each resume into its own `sigil_handle_push` + run-loop + pop cycle, eta-expansion is single-shot-only and the design is dead.
+
+2. **Frame escape past handle pop.** `let f = k; return f from inside the handle; invoke f after the handle's `sigil_handle_pop` has run.` The closure captures `frame_ptr` at perform time; that pointer references popped stack memory after the handle exits. `lower_k_pair_call:11479-11484` doesn't re-install popped frames. Verify behavior — works (frame discipline holds), segfaults, or returns garbage. Binary outcome.
+
+3. **Arena escape rate** (only if 1 and 2 pass). Eta-expansion adds an allocation per `let f = k` site; bare-k baseline is zero-alloc. Measure on a representative multi-shot-heavy input. >5% escape-rate jump trips Plan D's HARD perf gate.
+
+**Decision rule.** Pass all three → ship eta-expansion as the single-PR Task 117 implementation. Fail any → fall back to **conservative path**: distinct `Ty::Continuation` (code + closure + frame triple) propagated through typecheck and consumed directly by `lower_k_pair_call`. That's the architectural lift Plan D budgeted for; don't half-and-half a clever shortcut with a real ABI fix in the same PR.
+
+**Foundation commit `e2bc2fb` is superseded by this entry.** The split notation in `PLAN_D_PROGRESS.md` Stage 13 is reverted to "single Task 117, in-validation". Branch name `plan-d-task-117a` retained for git history continuity; PR #59 stays open as the single Task 117 PR's container; the title will be retitled once validation lands.
+
+**Implementing commit.** [HEAD] (this entry + PROGRESS revision).
+
+## 2026-05-01 — [DEVIATION Task 117 split into 117a + 117b] Pre-authorized split surfaced before code-write [SUPERSEDED 2026-05-01 — see Task 117 design validation entry above]
 
 **Context.** Plan D §74 pre-authorizes splitting Task 117 into 117a/117b/... if any of (a) diff exceeds Plan B' PR #38/#39 scope before smoke gate is reachable, (b) more than two distinct test-failure classes surface simultaneously, (c) the lifted-lambda closure-record discipline diverges from the existing N-chain `post_arm_k` substrate. **Stop and re-scope with the user** is reserved for cases where the split is unclear or the cluster requires an architectural lift not enumerated.
 
