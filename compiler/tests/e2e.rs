@@ -8083,49 +8083,60 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 // new pattern lands as its own PR with one e2e test (and possibly an
 // example) so any surfaced bug ships as its own followup PR.
 
-/// **G1 representative test — Generator with collecting handler.**
+/// **G4 representative test — Generator (recursive perform inside non-trivial fn body).**
 ///
-/// Pinned shape: **G1 variant 1 — op-arg in post-arm-k tail.**
+/// Originally pinned as G1 variant 1 (op-arg in post-arm-k tail) in
+/// PR #66; demoted to G4 during PR #67 G1 fix debug. The G1
+/// captures-bearing fix CLOSED the captures path, but Generator's
+/// `iterate(rest)` recursive shape surfaced a SEPARATE codegen
+/// limitation: synth-cont allocation only fires for fns whose body
+/// matches simple post-perform shapes. iterate's body is `match
+/// xs {...}`, so its perform site routes through identity k_fn.
+/// PR #67 iter 5's runtime-bypass works for inline-perform-in-handle
+/// shapes (outer_let / outer_fn_param) but is semantically wrong for
+/// Generator: bypassing identity skips iterate's recursive
+/// continuation, so the post-arm-k chain doesn't unwind.
+///
 /// Source pattern: `koka/test/algeff/common.kk` lines 108–125 (the
 /// `yield` effect + `iterate` producer; the `foreach` consumer
 /// variant is inexpressible in sigil v1 per Task 64 deviation, so the
 /// port substitutes a list-collecting handler).
 ///
-/// ## Status — gap representative for G1 variant 1 of 4
+/// ## Status — gap representative for G4 (separate gap from G1)
 ///
-/// **`#[ignore]`'d**: surfaced a real codegen gap in PR #66 CI (commit
-/// `2ab80f8`). The arm body `let rest: List[Int] = k(0); Cons(x, rest)`
-/// references op-arg `x` in the post-k tail. Slice B's post-arm-k
-/// synth-fn machinery only supports tails that reference the
-/// let-binding (`rest`) or globals.
+/// PR #67 G1 fix delivered captures-bearing for inline-perform-in-
+/// handle-body shapes (outer_let / outer_fn_param / inverted slice_b
+/// op-arg test). Generator surfaces a SEPARATE codegen gap (G4):
+/// codegen routes performs in non-trivial fn bodies (e.g., match-arm
+/// Blocks) through identity k_fn; the iter-5 runtime-bypass for
+/// identity is semantically wrong here because it skips iterate's
+/// recursive continuation.
 ///
-/// **G1 has 4 distinct tail-shape variants**, each pinned by its own
-/// `#[ignore]`'d representative in this section so the captures-bearing
-/// fix PR can un-ignore them as it lands each shape (per reviewer ask
-/// "while codegen context is fresh, pin all four"):
+/// ## Full G4 underlying-gap coverage
 ///
-/// 1. **Op-arg in post-k tail** — `task_78_5_pending_g1_op_arg_*` (this test)
-/// 2. **Outer-fn-scope let in post-k tail** — `task_78_5_pending_g1_outer_let_*`
-/// 3. **Outer fn-param in post-k tail** — `task_78_5_pending_g1_outer_fn_param_*`
-/// 4. **Combined op-arg + outer-capture in tail** — `task_78_5_pending_g1_combined_*`
+/// G4 fires for any user fn whose top-level body shape isn't a
+/// trivial `let-perform-then-tail` pattern AND that performs an
+/// effect somewhere in its body. The synth-cont allocation pass
+/// only matches simple shapes; performs nested in match-arms,
+/// if-branches, and other compound constructs aren't covered.
 ///
-/// ## Closure path (PR #26 `a5ee4c6` precedent)
+/// ## Closure path (G4 — separate fix from G1, substantial codegen lift)
 ///
-/// Mirror the helper-synth-cont's captures-bearing slice — at the
-/// post-arm-k synth fn build site (`compiler/src/codegen.rs` Slice B
-/// materialisation), detect free vars in the post-k tail beyond
-/// `{let_binding, globals}`, add them to the synth fn's closure record
-/// alongside the existing let-binding slot. New synth-fn entry rebinds
-/// them via ClosureEnvLoad.
+/// Extend the synth-cont allocation pass to synthesize a CPS
+/// continuation for performs nested in compound fn-body shapes
+/// (match-arm Blocks, if-branch Blocks, lambda bodies). The
+/// continuation must execute the surrounding fn's continuation (the
+/// rest of the arm-body / branch / fn body after the perform) before
+/// dispatching to post-arm-k via the trailing-pair convention.
+/// Wider than G1; tracked as its own follow-up PR.
 ///
 /// ## Why this test is novel for sigil
 ///
-/// 1. **Recursive perform under a handler.** `iterate(xs)` calls
-///    itself in the `Cons` arm after each `perform Gen.yield(x)`.
+/// 1. **Recursive perform under a handler in a non-trivial fn body.**
 /// 2. **Single-shot k whose result type is a non-Int sum (`List[Int]`).**
 /// 3. **Decl-level generic effect `Gen[A]`** instantiated to `Gen[Int]`.
 ///
-/// ## Trace (once the gap closes; xs = `[1, 2, 3]`)
+/// ## Trace (once G4 closes; xs = `[1, 2, 3]`)
 ///
 /// 3 nested arm bodies, each `let rest = k(0)` descending; return arm
 /// fires `Nil`; arm bodies build `Cons(1, Cons(2, Cons(3, Nil)))` on the
@@ -8133,7 +8144,8 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 ///
 /// **Invariant** (post-fix): stdout = `"3\n"`, exit 0.
 #[test]
-fn task_78_5_pending_g1_op_arg_in_post_arm_k_tail() {
+#[ignore = "G4: codegen routes performs inside non-trivial fn-body shapes (match-arm Blocks, etc.) through identity k_fn instead of synthesizing a real CPS continuation; post-arm-k chain doesn't unwind through recursive perform sites. Surfaced during G1 fix debug at PR #67 iter 5"]
+fn task_78_5_pending_g4_recursive_perform_in_match_arm_body() {
     let src = "import std.list\n\
                import std.io\n\
                \n\
