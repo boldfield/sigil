@@ -45,7 +45,11 @@ fn find_empty(grid: Array[Int], i: Int) -> Option[Int] ![] {
 
 // Returns true if placing digit `d` at `target_idx` would
 // conflict with an existing cell in the same row/col/box.
-fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![] {
+// Row carries `ArithError` because `/` (integer division) always
+// emits an ArithError row entry per Plan B Task 57; the runtime
+// main shim installs a top-level handler that aborts on actual
+// div-by-zero, but the typecheck row entry must be present.
+fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![ArithError] {
   match i {
     16 => false,
     _ => {
@@ -91,7 +95,7 @@ fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![]
   }
 }
 
-fn cell_valid(grid: Array[Int], idx: Int, d: Int) -> Bool ![] {
+fn cell_valid(grid: Array[Int], idx: Int, d: Int) -> Bool ![ArithError] {
   if check_conflict(grid, idx, 0, d) {
     false
   } else {
@@ -99,14 +103,14 @@ fn cell_valid(grid: Array[Int], idx: Int, d: Int) -> Bool ![] {
   }
 }
 
-fn solve(grid: Array[Int]) -> Option[Array[Int]] ![Branch] {
+fn solve(grid: Array[Int]) -> Option[Array[Int]] ![Branch, ArithError] {
   match find_empty(grid, 0) {
     None => Some(grid),
     Some(idx) => try_digits(grid, idx, 1),
   }
 }
 
-fn try_digits(grid: Array[Int], idx: Int, d: Int) -> Option[Array[Int]] ![Branch] {
+fn try_digits(grid: Array[Int], idx: Int, d: Int) -> Option[Array[Int]] ![Branch, ArithError] {
   match d {
     5 => None,
     _ => {
@@ -124,7 +128,7 @@ fn try_digits(grid: Array[Int], idx: Int, d: Int) -> Option[Array[Int]] ![Branch
   }
 }
 
-fn main() -> Int ![IO] {
+fn main() -> Int ![IO, ArithError] {
   // Initialize the 4×4 grid with cell 11 empty.
   let g00: Array[Int] = array_alloc(16, 0);
   let g01: Array[Int] = array_set(g00, 0, 1);
