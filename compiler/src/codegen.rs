@@ -4037,12 +4037,40 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                 extra_bindings,
             )
         }),
-        // Yield-able shapes: `expr_is_pure` already rejected these
+        // Plan D Task 117 — `expr_is_pure` is now ctor-aware:
+        // `Expr::Call { callee: Ident(Ctor), args }` is pure when
+        // args are pure (variant constructor application). Walk
+        // callee + args here using the same free-var restriction.
+        // The callee's Ident gets checked against `globals` (which
+        // includes all ctor names per `unsupported_handle_construct`),
+        // so well-formed ctor calls pass cleanly. Non-ctor Calls
+        // would have been rejected by `expr_is_pure` before reaching
+        // here; the recursive walk handles them defensively (the
+        // callee Ident check would surface "non-global identifier"
+        // for any non-ctor reference).
+        Expr::Call { callee, args, .. } => arm_body_post_arm_k_tail_free_vars_ok(
+            callee,
+            binding_name,
+            k_name,
+            globals,
+            extra_bindings,
+        )
+        .or_else(|| {
+            args.iter().find_map(|a| {
+                arm_body_post_arm_k_tail_free_vars_ok(
+                    a,
+                    binding_name,
+                    k_name,
+                    globals,
+                    extra_bindings,
+                )
+            })
+        }),
+        // Genuinely yield-able shapes: `expr_is_pure` rejected these
         // before this fn was called, so this is unreachable in
         // current callers. Defensive: surface the regression
         // immediately if a future caller drops the purity gate.
-        Expr::Call { .. }
-        | Expr::Perform(_)
+        Expr::Perform(_)
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => Some(format!(
