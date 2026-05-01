@@ -5423,13 +5423,14 @@ fn task_117_let_bound_k_inside_if_branch_rejected_by_walker() {
         !compile.status.success(),
         "expected codegen-walker reject; compile succeeded with stderr={stderr:?}"
     );
+    // Single canonical phrase pin (per PR #63 review #2 — two-clause
+    // OR'd assertion would let one clause drift without failing).
     assert!(
-        stderr.contains("Task 117 type-position surface")
-            || stderr.contains("TOP LEVEL of a handler arm body"),
+        stderr.contains("top level of a handler arm body"),
         "walker reject must point at v1 top-level-only restriction \
-         (post-Task-117 message; the pre-Task-117 wording \"first-class \
-         continuations are deferred to v2\" would indicate diagnostic \
-         drift); got stderr={stderr:?}"
+         (post-Task-117 canonical phrase: 'top level of a handler arm body'); \
+         the pre-Task-117 wording 'first-class continuations are deferred to v2' \
+         would indicate diagnostic drift; got stderr={stderr:?}"
     );
 }
 

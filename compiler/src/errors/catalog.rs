@@ -987,6 +987,31 @@ pub const CATALOG: &[ErrorEntry] = &[
                       }",
     },
     ErrorEntry {
+        code: "E0146",
+        short: "type name `Continuation` is reserved",
+        long: "Plan D Task 117 PR #62 followup: the `Continuation` \
+               name is reserved for the type-position continuation \
+               surface form (`Continuation[op_ret, ret]` names a \
+               handler arm's `k` binding type — see error E0145's \
+               long-form for the surrounding mechanism). User type \
+               declarations cannot use this name; `ty_from_type_-
+               expr_with_rows`'s Apply special case for \
+               `Continuation` would silently shunt every reference \
+               into the surface-form path, ignoring the user-\
+               declared type, and outside a handler arm body the \
+               user would see a misleading E0145 (\"Continuation \
+               annotations are only valid inside a handler arm \
+               body\") for what they think is *their* type.\n\n\
+               The fix is to rename the user type. The reserved \
+               name is one specific identifier (`Continuation`); \
+               variations like `Cont` / `Continuation2` / `MyCont` \
+               are unaffected.",
+        fix_example: "// Wrong (collides with the reserved name):\n\
+                      type Continuation = | Foo   // E0146 here\n\n\
+                      // Right (any other name works):\n\
+                      type Cont = | Foo",
+    },
+    ErrorEntry {
         code: "E0220",
         short: "one-shot continuation used more than once on a code path",
         long: "Plan B task 54: in a handler arm for a one-shot effect, \
