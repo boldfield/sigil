@@ -815,6 +815,15 @@ pub(crate) fn slot_kind_for_ty(ty: &Ty) -> EnvSlotKind {
         // with one slot per element; the captured value is a pointer
         // into the GC heap. Use the same slot kind as user types.
         Ty::Tuple(_) => EnvSlotKind::User,
+        // Plan D Task 117 — `Ty::Continuation` should never be
+        // captured into a closure env: the typecheck escape barrier
+        // (E0145) rejects lambda capture of `k`. If a Continuation
+        // does reach this slot-kind classifier, an upstream
+        // invariant broke.
+        Ty::Continuation(_) => unreachable!(
+            "closure conversion: Ty::Continuation is impossible after E0145 escape barrier — \
+             lambda capture of `k` is rejected at typecheck"
+        ),
         // Plan B task 48 — post-typecheck IR shouldn't have unbound
         // type variables in capture types: the codegen-entry walker
         // (`contains_apply_or_generic_ref`) rejects programs whose

@@ -345,6 +345,17 @@ fn cranelift_ty_of_ty(ty: &crate::typecheck::Ty, pointer_ty: Type) -> Type {
         Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
         Ty::Char => types::I32,
         Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => pointer_ty,
+        // Plan D Task 117 — `Ty::Continuation`'s runtime
+        // representation is a 2-slot value `(closure_ptr, fn_addr)`.
+        // At codegen sites that load a single-slot Cranelift type
+        // (e.g., a let-binding's bound value as a single Cranelift
+        // Value), we use `pointer_ty` as the surrogate — the actual
+        // 2-slot pair is materialized at the storage site (stack
+        // slot or stack-allocated record) rather than as a single
+        // Cranelift Value. This matches the existing `Ty::Fn`
+        // closure-record convention (a fn-typed local is a single
+        // pointer to a closure record on the heap).
+        Ty::Continuation(_) => pointer_ty,
         Ty::Var(id) => unreachable!(
             "codegen: Ty::Var({id}) reached cranelift_ty_of_ty — \
              typecheck must resolve every var through unification \
@@ -13643,6 +13654,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         }
                         Ty::Char => self.builder.ins().ireduce(types::I32, raw),
                         Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+                        // Plan D Task 117 — Continuation in a tuple
+                        // element would require storing k in a heap-
+                        // allocated tuple, which the E0145 escape
+                        // barrier rejects at typecheck.
+                        Ty::Continuation(_) => unreachable!(
+                            "codegen: Ty::Continuation in tuple element type — \
+                             E0145 escape barrier should have rejected"
+                        ),
                         Ty::Var(_) => unreachable!(
                             "codegen: Ty::Var in tuple element type — typecheck \
                              E0132 should have rejected"
@@ -13697,6 +13716,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Ty::Bool | Ty::Byte | Ty::Unit => self.builder.ins().ireduce(types::I8, raw),
             Ty::Char => self.builder.ins().ireduce(types::I32, raw),
             Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+            // Plan D Task 117 — Continuation in a user-type field
+            // would require storing k in a heap record, which the
+            // E0145 escape barrier rejects at typecheck.
+            Ty::Continuation(_) => unreachable!(
+                "codegen: Ty::Continuation in user-type field — \
+                 E0145 escape barrier should have rejected"
+            ),
             // Plan B task 48 invariant — codegen-entry walker
             // (`contains_apply_or_generic_ref`) rejects programs
             // whose AST has surface generic syntax, so a stray

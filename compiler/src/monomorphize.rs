@@ -338,6 +338,21 @@ pub fn canon_ty(ty: &Ty) -> String {
             }
             s
         }
+        Ty::Continuation(_) => {
+            // Plan D Task 117 — Continuation values cannot reach
+            // monomorphize: the E0145 escape barrier rejects them
+            // from any cross-fn position (return type, fn-arg,
+            // record field, lambda capture). Mono descends into
+            // fn signatures, type-decl variant fields, and generic
+            // arg lists — none of which can carry a Continuation
+            // post-typecheck. If a Continuation reaches canon_ty,
+            // the escape barrier missed a site.
+            unreachable!(
+                "monomorphize::canon_ty: Ty::Continuation reached the canon-mangler — \
+                 typecheck E0145 should have rejected the cross-fn / cross-storage \
+                 site that allowed a Continuation to escape"
+            )
+        }
     }
 }
 
@@ -1480,6 +1495,14 @@ impl Substitution {
                 // surface for first-class function values.
                 effect_row_var: sig.effect_row_var,
             })),
+            // Plan D Task 117 — Continuation values cannot reach
+            // mono-pass substitution: the E0145 escape barrier
+            // rejects them from any cross-fn site (return type,
+            // fn-arg, etc.) that mono would touch.
+            Ty::Continuation(_) => unreachable!(
+                "monomorphize::Substitution::apply_to_ty: Ty::Continuation reached mono \
+                 substitution — typecheck E0145 should have rejected the cross-fn site"
+            ),
         }
     }
 
@@ -1549,6 +1572,17 @@ pub(crate) fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
             elems: elems.iter().map(|e| ty_to_type_expr(e, span)).collect(),
             span: span.clone(),
         },
+        Ty::Continuation(_) => {
+            // Plan D Task 117 — Continuation has no surface TypeExpr.
+            // The E0145 escape barrier prevents any cross-fn /
+            // cross-storage site from carrying a Continuation, so
+            // rendering a Continuation back to TypeExpr should be
+            // unreachable. If reached, the escape barrier missed.
+            unreachable!(
+                "monomorphize::ty_to_type_expr: Ty::Continuation has no surface TypeExpr — \
+                 E0145 escape barrier should have rejected the cross-storage site"
+            )
+        }
     }
 }
 
