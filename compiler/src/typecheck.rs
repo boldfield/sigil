@@ -433,15 +433,29 @@ impl Subst {
                 let resolved = self.apply_row_to_sig(new_sig, seen);
                 Ty::Fn(Box::new(resolved))
             }
-            Ty::Continuation(c) => Ty::Continuation(Box::new(ContinuationTy {
-                op_ret: self.apply_ty_inner(&c.op_ret, seen),
-                ret: self.apply_ty_inner(&c.ret, seen),
-                // ScopeId substitution lands when scope-var
-                // unification is wired (mirrors `apply_row_to_sig`
-                // for row vars). For Task 117 (a) the scope_id is
-                // typically Concrete and untouched by Subst.
-                scope_id: c.scope_id.clone(),
-            })),
+            Ty::Continuation(c) => {
+                // Plan D Task 117 (a) — only Concrete scope ids
+                // exist today (`check_handle` is the sole producer
+                // and always allocates Concrete). Pass through
+                // unchanged. ScopeId substitution will land
+                // alongside scope-var unification (Task 117
+                // follow-up); assert here so the integration point
+                // surfaces loudly when Var producers are wired.
+                let scope_id = match &c.scope_id {
+                    ScopeId::Concrete(n) => ScopeId::Concrete(*n),
+                    ScopeId::Var(_) => unreachable!(
+                        "apply_ty_inner: ScopeId::Var reached substitution — Task 117 (a) \
+                         produces only Concrete scope ids; region-polymorphic schemes are \
+                         deferred to Task 117 follow-up which must wire Subst-of-ScopeId \
+                         before allocating Var"
+                    ),
+                };
+                Ty::Continuation(Box::new(ContinuationTy {
+                    op_ret: self.apply_ty_inner(&c.op_ret, seen),
+                    ret: self.apply_ty_inner(&c.ret, seen),
+                    scope_id,
+                }))
+            }
         }
     }
 
@@ -2435,14 +2449,29 @@ impl Tc {
                 };
                 Ty::Fn(Box::new(new_sig))
             }
-            Ty::Continuation(c) => Ty::Continuation(Box::new(ContinuationTy {
-                op_ret: Self::rename_ty(&c.op_ret, ty_map, row_map),
-                ret: Self::rename_ty(&c.ret, ty_map, row_map),
-                // ScopeId rename lands when scope-var-bearing
-                // schemes are wired (region polymorphism path).
-                // Region-monomorphic Concrete IDs pass through.
-                scope_id: c.scope_id.clone(),
-            })),
+            Ty::Continuation(c) => {
+                // Plan D Task 117 (a) — only Concrete scope ids
+                // exist today (`check_handle` allocates them; no
+                // scheme stores a Var ScopeId). Pass Concrete
+                // through unchanged. Var would require region-
+                // polymorphism wiring (Task 117 follow-up) — assert
+                // here so the integration point surfaces loudly
+                // when scheme-bearing Var ScopeIds are introduced.
+                let scope_id = match &c.scope_id {
+                    ScopeId::Concrete(n) => ScopeId::Concrete(*n),
+                    ScopeId::Var(_) => unreachable!(
+                        "rename_ty: ScopeId::Var reached scheme renaming — Task 117 (a) \
+                         produces only Concrete scope ids; region-polymorphic continuation \
+                         schemes are deferred to Task 117 follow-up which must wire ScopeId \
+                         renaming before allocating Var"
+                    ),
+                };
+                Ty::Continuation(Box::new(ContinuationTy {
+                    op_ret: Self::rename_ty(&c.op_ret, ty_map, row_map),
+                    ret: Self::rename_ty(&c.ret, ty_map, row_map),
+                    scope_id,
+                }))
+            }
         }
     }
 
@@ -2692,14 +2721,56 @@ impl Tc {
                             false
                         }
                     }
-                    // Var unification lands when region polymorphism
-                    // is wired (Plan D Task 117 follow-up). For
-                    // Task 117 (a) all scope_ids are Concrete.
-                    _ => true,
+                    // Plan D Task 117 (a) only produces Concrete
+                    // scope ids (`check_handle` calls
+                    // `Tc::fresh_scope_id()` which always returns
+                    // Concrete; no scheme-instantiation path or
+                    // surface syntax allocates Var). Reaching this
+                    // arm means a Var leaked into typecheck without
+                    // wiring the unification — assert to surface
+                    // the integration point loudly when region-
+                    // polymorphism work begins (Task 117 follow-up).
+                    (ScopeId::Var(_), _) | (_, ScopeId::Var(_)) => unreachable!(
+                        "ScopeId::Var reached unify_ty — Task 117 (a) produces only Concrete \
+                         scope ids; region-polymorphic continuation schemes are deferred to \
+                         Task 117 follow-up which must wire ScopeId unification before \
+                         allocating Var"
+                    ),
                 };
                 let op_ret_ok = self.unify_ty(&c_a.op_ret, &c_b.op_ret, span);
                 let ret_ok = self.unify_ty(&c_a.ret, &c_b.ret, span);
                 scope_ok && op_ret_ok && ret_ok
+            }
+            // Plan D Task 117 — escape barrier. A `Ty::Continuation`
+            // unified against any non-Continuation, non-Var type is
+            // an escape attempt: the continuation `k` would be
+            // stored in (record field / ctor field / fn param / fn
+            // return) something that isn't a continuation. Fire
+            // E0145 with a uniform fix message rather than the
+            // generic E0044 ("type mismatch"). Var-vs-Continuation
+            // is handled higher up by the (Var, other) arm via
+            // bind_ty_var — an unbound type var legitimately binds
+            // to Continuation (e.g. `let f = k` infers `f`'s var to
+            // Continuation); the escape only manifests when that
+            // bound var later unifies against a non-Continuation
+            // target, which re-enters this arm with both sides
+            // resolved.
+            (Ty::Continuation(_), _) | (_, Ty::Continuation(_)) => {
+                self.push_error(
+                    "E0145",
+                    span.clone(),
+                    format!(
+                        "continuation `k` cannot escape its handle's arm body — tried to \
+                         use a value of type `{}` where `{}` was expected. Keep `k` inside \
+                         the handle's arm body (do not store it in a record/ctor field, \
+                         pass it to a function expecting a non-continuation parameter, or \
+                         return it from a function whose declared return type is not a \
+                         continuation)",
+                        ty_display(&a),
+                        ty_display(&b)
+                    ),
+                );
+                false
             }
             _ => {
                 self.push_error(

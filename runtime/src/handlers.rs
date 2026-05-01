@@ -732,7 +732,22 @@ pub unsafe extern "C" fn sigil_handle_pop() -> *mut HandlerFrame {
     // empty: preserves backwards-compatible standard-unlink for
     // any caller that bypasses RELINK_STACK (test infrastructure
     // or future callers that don't go through `sigil_handle_push`).
-    let did_link = RELINK_STACK.with(|s| s.borrow_mut().pop().unwrap_or(true));
+    //
+    // Debug-mode assert catches the integration-bug case where a
+    // codegen path emits a pop without a matching push: silently
+    // returning `true` from the soft fallback masks the bug at
+    // runtime. Release builds keep the soft fallback so any
+    // legitimate caller that bypasses RELINK_STACK still works.
+    let did_link = RELINK_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        debug_assert!(
+            !stack.is_empty(),
+            "sigil_handle_pop: RELINK_STACK underflow — every pop must follow a matching \
+             push from sigil_handle_push. If a debug build trips this, a codegen path is \
+             emitting handle_pop without a paired handle_push (or vice versa)."
+        );
+        stack.pop().unwrap_or(true)
+    });
     HANDLER_STACK.with(|cell| {
         let head = cell.get();
         if head.is_null() {
