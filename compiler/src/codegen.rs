@@ -1634,18 +1634,28 @@ fn arm_body_walk(
         }
         Expr::Ident(name, _) => {
             if name == k_name {
-                // `k` as a value (not in callee position). Phase 4e
-                // captures+ shipped multi-shot `k` invocation via
-                // Slice C's chained post-arm-k synth fns (bool-Choose
-                // arms with two `k(arg)` calls), but `k`-as-a-value
-                // (passing `k` to another fn, storing it in a record,
-                // etc.) remains out-of-scope: that surface needs
-                // first-class continuations, which is a v2 feature.
+                // Plan D Task 117 (continuation-surface) — `k` as a
+                // value still reaches this walker only as a defense-
+                // in-depth check. The typecheck-side escape barrier
+                // (E0145 broad arm in unify_ty + bind_ty_var
+                // precision check at check_call) is the
+                // authoritative gate; the let-bound k desugar
+                // pre-pass in typecheck rewrites
+                // `let f: Continuation = k; ... f ...` to `... k
+                // ...` so the supported user-surface shapes never
+                // reach this site with bare `k`. If a stray bare
+                // `k` reference does survive (e.g., a shape
+                // typecheck accepted but the desugar didn't
+                // simplify), reject with the documented message —
+                // E0145 already pinned the value-position
+                // restriction at typecheck.
                 return Some(format!(
                     "references continuation `{name}` as a value (not as the \
-                     callee of a call) — Sigil v1 supports invoking `{name}` \
-                     as a callee but not passing it as a first-class value; \
-                     first-class continuations are deferred to v2"
+                     callee of a call) — Sigil v1's `Continuation[op_ret, ret]` \
+                     surface only supports the `let f: Continuation[op_ret, \
+                     ret] = k; ... f(arg) ...` form (rewritten to `k(arg)` at \
+                     typecheck); other value-position uses are dynamic-extent \
+                     escapes rejected at typecheck via E0145"
                 ));
             }
             if globals.contains(name) {

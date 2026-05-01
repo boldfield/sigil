@@ -861,7 +861,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
     out
 }
 
-pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
+pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // Pre-pass 1 (Plan A3 task 38): build the nominal-type symbol table.
     // Must precede the fn-env pre-pass so a `fn f(o: Option) -> ...`
     // declaration can resolve `Option` to `Ty::User("Option")` when
@@ -1450,6 +1450,27 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     for (span, ty) in raw_call_callee_tys {
         resolved_call_callee_tys.insert(span, tc.deref(&ty));
     }
+
+    // Plan D Task 117 (continuation-surface) — desugar the
+    // let-bound k pattern.
+    //
+    // After typecheck verifies that `let f: Continuation[op_ret,
+    // ret] = k` is well-typed inside an arm body (the arm-context-
+    // tracking E0145 + cross-handle E0145 pin the surface
+    // contract), rewrite the AST so downstream codegen sees the
+    // pre-existing supported shapes:
+    //
+    //   `let f: Continuation[A, B] = k; ... f(arg) ...`
+    //   →
+    //   `... k(arg) ...`
+    //
+    // The let-stmt is elided and every subsequent reference to
+    // `f` is renamed to the originating arm's `k_name`. After
+    // rewrite, the arm body matches the existing Slice C
+    // recognizer paths (k as direct callee in let-RHS or tail);
+    // no codegen-side machinery for "let-bound k as 2-slot stack
+    // local" is needed.
+    desugar_let_bound_continuations(&mut program);
 
     (
         CheckedProgram {
@@ -6616,6 +6637,283 @@ pub(crate) fn pattern_bindings(p: &Pattern, out: &mut std::collections::BTreeSet
                 }
             }
         },
+    }
+}
+
+// ----------------------------------------------------------------
+// Plan D Task 117 (continuation-surface) — let-bound k desugar.
+//
+// User-written `let f: Continuation[op_ret, ret] = k; ... f ...`
+// is rewritten to `... k ...` so downstream codegen sees the
+// existing supported "k as direct callee" arm-body shapes (Slice C
+// 2-let multi-shot or basic single-shot tail-k(arg)). The let-stmt
+// is elided; subsequent occurrences of `f` are renamed to `k_name`.
+//
+// Restrictions (v1):
+//   - The let-stmt must appear at the top level of the arm body's
+//     `Expr::Block`. Nested let-bound k (inside if/match/lambda
+//     branches) is not desugared — typecheck still accepts the
+//     shape (E0145 doesn't fire), but downstream codegen will
+//     reject the surviving `Expr::Ident(k_name)` via
+//     `arm_body_walk`.
+//   - Subsequent shadowing of the let-binding name is NOT tracked
+//     by the substitution (e.g., `let f: Cont = k; let f: Int = 0;
+//     f` would substitute `f → k` in the inner-let's RHS and tail
+//     incorrectly). For v1, this is documented as undefined and
+//     not exercised by tests.
+// ----------------------------------------------------------------
+
+fn desugar_let_bound_continuations(program: &mut Program) {
+    for item in &mut program.items {
+        if let Item::Fn(f) = item {
+            desugar_block_handles(&mut f.body);
+        }
+    }
+}
+
+/// Walk a `Block`, descending into every `Expr::Handle` to apply
+/// `desugar_arm_body` to each op-arm's body. Other Expr shapes
+/// (binop / call / match / etc.) are recursed into so nested
+/// handles deep inside an outer scope still get processed.
+fn desugar_block_handles(b: &mut Block) {
+    for s in &mut b.stmts {
+        match s {
+            Stmt::Let(l) => desugar_expr_handles(&mut l.value),
+            Stmt::Expr(e) => desugar_expr_handles(e),
+            Stmt::Perform(p) => {
+                for a in &mut p.args {
+                    desugar_expr_handles(a);
+                }
+            }
+        }
+    }
+    if let Some(t) = &mut b.tail {
+        desugar_expr_handles(t);
+    }
+}
+
+fn desugar_expr_handles(e: &mut Expr) {
+    match e {
+        Expr::IntLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::CharLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::Ident(_, _)
+        | Expr::ClosureEnvLoad { .. } => {}
+        Expr::Call { callee, args, .. } => {
+            desugar_expr_handles(callee);
+            for a in args {
+                desugar_expr_handles(a);
+            }
+        }
+        Expr::Perform(p) => {
+            for a in &mut p.args {
+                desugar_expr_handles(a);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            desugar_expr_handles(lhs);
+            desugar_expr_handles(rhs);
+        }
+        Expr::Unary { operand, .. } => desugar_expr_handles(operand),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            desugar_expr_handles(cond);
+            desugar_block_handles(then_block);
+            desugar_block_handles(else_block);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            desugar_expr_handles(scrutinee);
+            for arm in arms {
+                desugar_expr_handles(&mut arm.body);
+            }
+        }
+        Expr::Block(b) => desugar_block_handles(b),
+        Expr::Lambda { body, .. } => desugar_expr_handles(body),
+        Expr::ClosureRecord { env_exprs, .. } => {
+            for ee in env_exprs {
+                desugar_expr_handles(ee);
+            }
+        }
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                desugar_expr_handles(&mut f.value);
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                desugar_expr_handles(el);
+            }
+        }
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            ..
+        } => {
+            // Recurse into the handle's body first (nested
+            // handles in the body get their own desugaring at the
+            // appropriate scope).
+            desugar_expr_handles(body);
+            // Per-arm: apply the let-bound k desugar.
+            for arm in op_arms.iter_mut() {
+                desugar_arm_body(&mut arm.body, &arm.k_name);
+                desugar_expr_handles(&mut arm.body);
+            }
+            if let Some(ra) = return_arm {
+                desugar_expr_handles(&mut ra.body);
+            }
+        }
+    }
+}
+
+/// Apply the let-bound k desugar to a single arm body. Only the
+/// top-level `Expr::Block` shape is handled; other arm-body shapes
+/// (e.g. direct `Expr::Ident(k_name)` or `Expr::Call { callee:
+/// Ident(k_name), .. }`) don't carry let-bound k aliases and pass
+/// through unchanged.
+fn desugar_arm_body(body: &mut Expr, k_name: &str) {
+    let Expr::Block(block) = body else {
+        return;
+    };
+    let mut subst: BTreeMap<String, String> = BTreeMap::new();
+    let mut new_stmts: Vec<Stmt> = Vec::with_capacity(block.stmts.len());
+    let raw_stmts = std::mem::take(&mut block.stmts);
+    for s in raw_stmts {
+        match s {
+            Stmt::Let(l) if is_let_bound_continuation(&l, k_name) => {
+                // Elide the let-stmt; record the substitution.
+                subst.insert(l.name, k_name.to_string());
+            }
+            mut s => {
+                if !subst.is_empty() {
+                    apply_subst_to_stmt(&mut s, &subst);
+                }
+                new_stmts.push(s);
+            }
+        }
+    }
+    if !subst.is_empty() {
+        if let Some(t) = &mut block.tail {
+            apply_subst_to_expr(t, &subst);
+        }
+    }
+    block.stmts = new_stmts;
+}
+
+fn is_let_bound_continuation(l: &LetStmt, k_name: &str) -> bool {
+    let ty_is_continuation = matches!(
+        &l.ty,
+        TypeExpr::Apply { name, args, .. } if name == "Continuation" && args.len() == 2
+    );
+    let value_is_k = matches!(&l.value, Expr::Ident(n, _) if n == k_name);
+    ty_is_continuation && value_is_k
+}
+
+fn apply_subst_to_stmt(s: &mut Stmt, subst: &BTreeMap<String, String>) {
+    match s {
+        Stmt::Let(l) => apply_subst_to_expr(&mut l.value, subst),
+        Stmt::Expr(e) => apply_subst_to_expr(e, subst),
+        Stmt::Perform(p) => {
+            for a in &mut p.args {
+                apply_subst_to_expr(a, subst);
+            }
+        }
+    }
+}
+
+fn apply_subst_to_expr(e: &mut Expr, subst: &BTreeMap<String, String>) {
+    match e {
+        Expr::Ident(name, _) => {
+            if let Some(target) = subst.get(name) {
+                *name = target.clone();
+            }
+        }
+        Expr::IntLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::CharLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::ClosureEnvLoad { .. } => {}
+        Expr::Call { callee, args, .. } => {
+            apply_subst_to_expr(callee, subst);
+            for a in args {
+                apply_subst_to_expr(a, subst);
+            }
+        }
+        Expr::Perform(p) => {
+            for a in &mut p.args {
+                apply_subst_to_expr(a, subst);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            apply_subst_to_expr(lhs, subst);
+            apply_subst_to_expr(rhs, subst);
+        }
+        Expr::Unary { operand, .. } => apply_subst_to_expr(operand, subst),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            apply_subst_to_expr(cond, subst);
+            apply_subst_to_block(then_block, subst);
+            apply_subst_to_block(else_block, subst);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            apply_subst_to_expr(scrutinee, subst);
+            for arm in arms {
+                apply_subst_to_expr(&mut arm.body, subst);
+            }
+        }
+        Expr::Block(b) => apply_subst_to_block(b, subst),
+        Expr::Lambda { body, .. } => apply_subst_to_expr(body, subst),
+        Expr::ClosureRecord { env_exprs, .. } => {
+            for ee in env_exprs {
+                apply_subst_to_expr(ee, subst);
+            }
+        }
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                apply_subst_to_expr(&mut f.value, subst);
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                apply_subst_to_expr(el, subst);
+            }
+        }
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            ..
+        } => {
+            apply_subst_to_expr(body, subst);
+            for arm in op_arms {
+                apply_subst_to_expr(&mut arm.body, subst);
+            }
+            if let Some(ra) = return_arm {
+                apply_subst_to_expr(&mut ra.body, subst);
+            }
+        }
+    }
+}
+
+fn apply_subst_to_block(b: &mut Block, subst: &BTreeMap<String, String>) {
+    for s in &mut b.stmts {
+        apply_subst_to_stmt(s, subst);
+    }
+    if let Some(t) = &mut b.tail {
+        apply_subst_to_expr(t, subst);
     }
 }
 

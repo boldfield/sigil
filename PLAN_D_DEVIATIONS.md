@@ -507,9 +507,9 @@ The pattern is "Slice C had latent bugs the primitive corpus masked." Plan B Tas
 
 **Implementing commit(s).** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical patterns rather than workarounds. Recognizer fix at `e889e89`; downstream free-var-walker fix at `e10d8b3`; verifier-output unswallow at `d43a671`; layout-template-skip at `574c74d`; monomorphize-builtin-synthesis at `dcd2c11`. Squash-merged at `037c300`.
 
-## 2026-05-01 — [DEVIATION Task 117] Ty::Continuation + escape barrier — CLOSED on substrate; positive capability deferred against language-design constraint
+## 2026-05-01 — [DEVIATION Task 117] Ty::Continuation + escape barrier — CLOSED on substrate + positive capability via type-position surface for Continuation
 
-**Status**: **CLOSED** on substrate. PR #60 squash-merged at `4b3f0b4` shipped the load-bearing user-visible capability — the escape barrier (E0145) backed by the Ty::Continuation type, ScopeId tagging, RELINK_STACK runtime discipline, and the bind_ty_var precision fix. The let-bound k *positive capability* (`let f = k; f(arg)`) the original brief described turned out to be unreachable under Sigil's mandatory let-annotation policy and is deferred against that language-design constraint.
+**Status**: **CLOSED**. PR #60 (`4b3f0b4`) shipped the substrate (escape barrier E0145 + Ty::Continuation + ScopeId + RELINK_STACK + bind_ty_var precision fix); a follow-up PR ships the positive let-bound k capability via a type-position surface form for `Continuation[op_ret, ret]` plus a desugar pre-pass that rewrites the alias to direct k uses. **Reversal note**: PR #61 (`0dbd81c`) initially declared Task 117 substrate-only complete, deferring the positive capability against a "Sigil's mandatory let-annotation + non-user-constructible Continuation" language-design constraint. On reconsideration (Brian's 2026-05-01 reversal), that scoping was too strict — it conflated "users can't construct continuations as values" (correct design, kept) with "users can't name continuation types" (LLM-target drift, fixed). Type-position surface for Continuation closes the drift without contradicting the value-position non-user-constructible design rationale; the let-bound k positive capability lands as a deferred-then-restored part of Task 117.
 
 **Context.** Plan D Task 117 (first-class continuations) original intent was to "drop the k-as-value rejection; codegen treats `k` as a callable closure value" via lifted-lambda generalization (eta-expansion). Validation tests on PR #59 (`task_117_validation_*`, since removed) proved that approach dead — multi-shot through a let-bound lambda hits `sigil_handle_push: frame already linked` panic; multi-invocation post-pop segfaults; the existing `lower_k_pair_call` frame_ptr discipline is dynamic-extent under runtime constraints not observable from the type system.
 
@@ -532,17 +532,34 @@ Brian's 2026-05-01 decision: fall back to **Ty::Continuation conservative ABI pa
 
 5. **Tests** (5 typecheck unit tests + 2 bind_ty_var precision tests at HEAD `4b3f0b4`): `k_returned_from_fn_with_non_continuation_ret_fires_e0145`, `k_passed_as_fn_arg_of_non_continuation_param_fires_e0145`, `k_stored_in_user_type_field_fires_e0145`, `cross_handle_k_unification_fires_e0145_with_scope_mismatch`, `ty_display_continuation_omits_scope_id`, `k_passed_to_generic_fn_param_fires_e0145`, `k_let_aliased_then_passed_to_generic_fn_fires_e0145`. The implicit RELINK_STACK regression coverage runs through every `lower_k_pair_call` push/pop in the existing run_state-style discharge-with-lambda suite (`state_example_canonical_run_state_returns_11`, `integration_bug2_*`, etc.).
 
-### Deferred — positive capability (`let f = k; f(arg)`)
+### Shipped in follow-up PR — positive capability (`let f: Continuation[op_ret, ret] = k; f(arg)`)
 
-The original brief's items 5/6 (closure_convert let-bound k as 2-slot stack local + codegen `lower_call` dispatch via `lower_k_pair_call` analogue) and item 8-positive (positive `let f = k; f(arg)` tests single-shot + 2-let multi-shot) are **deferred indefinitely against a language-design constraint**:
+Per Brian's 2026-05-01 reversal of the substrate-only-close framing, the positive let-bound k capability ships via a type-position surface form for `Continuation` plus a typecheck-time desugar pre-pass — closing the LLM-target-drift exposure (an LLM reading source inside a handler arm body couldn't tell what `k` is without simulating the typechecker, since `Ty::Continuation` had no surface form) without contradicting the value-position non-user-constructible design rationale.
 
-- **Sigil's mandatory let annotations** are a deliberate design tenet for an LLM-targeted compiled language: explicit types make source readable without running the typechecker, which the project's rigor model depends on. The parser requires `let name : type = expr;` (see `compiler/src/parser.rs:918` `parse_let_stmt` + grammar at `compiler/src/parser.rs:13`).
-- **`Ty::Continuation` is non-user-constructible** by design (typecheck.rs:97-105 doc): "there's no surface syntax that produces a `Ty::Continuation`. The only way for a value to have this type is via the typechecker's `check_handle` arm-processing... User code can `let f = k` to alias `k` (f inherits the Continuation type) but cannot write a Continuation type annotation."
-- These two tenets together preclude `let f = k` at the user surface: any annotation other than Continuation fires E0145 (broad arm); no Continuation annotation exists; relaxing the let-annotation policy would invert the readability tenet; adding surface syntax for Continuation contradicts the non-user-constructible design.
+**Surface form**: `Continuation[op_ret, ret]` (square brackets; uses existing Sigil generic-application grammar — no parser change needed). Type position only — no value-position constructor; `check_handle` remains the sole producer of `Ty::Continuation` at the value level.
 
-**Resolution path**: requires a separate language-design decision relaxing one of the two tenets. None of the obvious fixes (Continuation surface syntax, let-without-annotation, special k-aliasing form) preserve the design rationale. Until such a decision is made, the positive capability remains permanently deferred.
+**scope_id inference**: from the innermost enclosing handler arm body. `Tc.current_arm_scope_id: Option<u32>` is pushed at the start of each op-arm body walk in `check_handle`, restored after. Nested handlers inherit innermost scope; return-arm bodies retain the OUTER scope (return arms don't introduce a continuation).
 
-The codegen-walker delta at `compiler/src/codegen.rs:1635-1650` (drop the `Expr::Ident(k_name)` reject in `arm_body_walk`) is also deferred — without let-bound k surface, the walker reject has no false-positive surface to remove (typecheck E0145 is now the authoritative barrier; the walker reject is currently unreachable on user code but harmless as redundant defense-in-depth).
+**Diagnostics**:
+- Continuation outside arm body → E0145 ("Continuation annotations are only valid inside a handler arm body") — `check_type_expr_known` fires the diagnostic at the annotation's span.
+- Continuation with wrong arity → E0129 (matches user-generic-type arity diagnostic).
+- Continuation annotation with mismatched scope vs RHS k (e.g., inner-arm annotation against outer-arm k) → E0145 via the existing cross-handle `(ScopeId::Concrete(n), ScopeId::Concrete(m))` arm in `unify_ty`.
+
+**Implementation**:
+- `Tc.current_arm_scope_id: Option<u32>` field; init in both ctors; push/pop around op-arm body walk in `check_handle`.
+- `ty_from_type_expr_with_rows` gains an `arm_scope_id: Option<u32>` param threaded from `ty_from_type_expr_here` via `self.current_arm_scope_id`. External callers (`ty_from_type_expr` 3-arg wrapper + monomorphize/layout) pass None — non-arm-body sites can't legitimately produce Continuation.
+- `ty_from_type_expr_with_rows`'s Apply arm gains a `Continuation` special case (arity != 2 returns None; `arm_scope_id` None returns None; else resolves args[0]/args[1] + returns `Ty::Continuation` tagged with `ScopeId::Concrete(scope_id)`).
+- `check_type_expr_known`'s Apply arm gains Continuation handling for the precise diagnostic (E0129 for arity / E0145 for arm-context).
+- **Typecheck-time desugar pre-pass**: after typecheck completes, `desugar_let_bound_continuations(&mut program)` walks all program items, descends to every `Expr::Handle`, and for each op-arm body's top-level `Expr::Block`, scans for `Stmt::Let { ty: TypeExpr::Apply { name: "Continuation", .. }, value: Expr::Ident(k_name, ..), .. }` matching the arm's k_name. Each match is elided + a substitution `f → k_name` is recorded; remaining stmts and the tail get the substitution applied via a recursive `apply_subst_to_expr` walker covering all Expr variants. Output AST has no let-bound k aliases — the body matches existing Slice B/C recognizer paths (single-shot tail-`k(arg)` or multi-shot 2-let chained k(arg) calls).
+- **No new codegen machinery**: with the desugar applied at typecheck, downstream paths see only the existing supported shapes. No closure_convert change, no `lower_call` extension, no new stack-slot management. The codegen-walker `Expr::Ident(k_name)` reject in `arm_body_walk` stays as defense-in-depth (its message updated to point at the surface form's narrow allowed shape).
+
+**Restrictions (v1)**:
+- The let-stmt must appear at the top level of the arm body's `Expr::Block`. Nested let-bound k (inside if/match/lambda branches) is not desugared — typecheck still accepts the shape (E0145 doesn't fire), but downstream codegen rejects the surviving `Expr::Ident(k_name)` via `arm_body_walk`.
+- Subsequent shadowing of the let-binding name is not tracked by the substitution. Documented as undefined; not exercised by tests.
+
+**Tests** (4 typecheck unit tests + 2 e2e positive capability tests):
+- Typecheck: `continuation_annotation_inside_arm_body_typechecks`, `continuation_annotation_outside_arm_body_fires_e0145`, `continuation_annotation_wrong_arity_fires_e0129`, `continuation_annotation_with_mismatched_scope_fires_e0145_via_unify`.
+- E2E: `task_117_let_bound_k_single_shot_resumes_with_arg` (let-bound k single-shot returns 42), `task_117_let_bound_k_multi_shot_via_2_let_returns_3` (multi-shot 2-let pattern via Choose effect returns 3).
 
 ### Out of scope
 
