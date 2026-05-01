@@ -2594,9 +2594,13 @@ impl Tc {
         //
         // Caveat: each effect-name is assumed to appear at most once
         // per row. Multi-instantiation rows like `![Raise[Int],
-        // Raise[String]]` are possible but unusual; if both rows
-        // carry multiple entries of the same name, only the first
-        // pair gets unified — rest fall through to only_a/only_b.
+        // Raise[String]]` are possible but unusual; the loop is
+        // first-occurrence-wins (matched_b marks each b entry the
+        // moment it pairs), so reversed b ordering would unify
+        // Int vs String first → E0044. Pinned by the
+        // `unify_row_multi_instantiation_*` regression tests in this
+        // module; revisit them if future work changes the matching
+        // strategy (e.g., exhaustive permutation).
         let mut only_a: Vec<EffectInst> = Vec::new();
         let mut matched_b: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         // Plan D Stage 12 R3 — thread unify_ty's bool through; a
@@ -2770,6 +2774,14 @@ impl Tc {
         // callee effect, find a caller effect with the same name; if
         // matched, unify args (E0044 fires on mismatch). Names not
         // in the caller's row go to `missing` (E0042).
+        //
+        // Same multi-instantiation caveat as `unify_row`: the loop is
+        // first-occurrence-wins (matched_caller marks each caller
+        // entry the moment it pairs), so reversed caller-side ordering
+        // would unify mismatched args first → E0044. Pinned by the
+        // `subsume_row_multi_instantiation_*` regression tests in this
+        // module; revisit them if future work changes the matching
+        // strategy (e.g., exhaustive permutation).
         let mut missing: Vec<EffectInst> = Vec::new();
         let mut matched_caller: std::collections::BTreeSet<usize> =
             std::collections::BTreeSet::new();
@@ -8305,6 +8317,184 @@ mod tests {
             has_code(&tc.errors, "E0042"),
             "expected E0042 (arg-arity mismatch); got {:?}",
             tc.errors
+        );
+    }
+
+    #[test]
+    fn subsume_row_multi_instantiation_same_order_subsumes() {
+        // Plan D Stage 12 R2 followup — mirror of the unify_row
+        // multi-instantiation pin, applied to subsume_row's
+        // analogous matched_caller set. Same-order callee/caller
+        // rows for `![Raise[Int], Raise[String]]` subsume cleanly:
+        // callee[0]=Raise[Int] matches caller[0]=Raise[Int] (idx 0
+        // marked), then callee[1]=Raise[String] matches caller[1]=
+        // Raise[String]. No diagnostics; missing is empty; closed
+        // callee returns args_ok=true.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("x.sigil");
+        let callee = Row::closed(vec![
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::Int],
+            },
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::String],
+            },
+        ]);
+        let caller = Row::closed(vec![
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::Int],
+            },
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::String],
+            },
+        ]);
+        let ok = tc.subsume_row(&callee, &caller, &span);
+        assert!(
+            ok,
+            "same-order multi-instantiation rows must subsume; errors: {:?}",
+            tc.errors
+        );
+        assert!(
+            tc.errors.is_empty(),
+            "no diagnostics expected; got {:?}",
+            tc.errors
+        );
+    }
+
+    #[test]
+    fn subsume_row_multi_instantiation_reversed_order_fires_e0044() {
+        // Plan D Stage 12 R2 followup — pair to
+        // `subsume_row_multi_instantiation_same_order_subsumes`. With
+        // caller reversed, callee[0]=Raise[Int] is matched against
+        // the first unclaimed caller entry by name (caller[0]=
+        // Raise[String]) — args unify Int vs String → E0044. Locks
+        // in subsume_row's order-dependent semantics symmetrically
+        // with the unify_row pins.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("x.sigil");
+        let callee = Row::closed(vec![
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::Int],
+            },
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::String],
+            },
+        ]);
+        let caller = Row::closed(vec![
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::String],
+            },
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::Int],
+            },
+        ]);
+        let ok = tc.subsume_row(&callee, &caller, &span);
+        assert!(
+            !ok,
+            "reversed multi-instantiation rows must fail (Int vs String at first match)"
+        );
+        assert!(
+            has_code(&tc.errors, "E0044"),
+            "expected E0044 from arg-unification at first by-name match; got {:?}",
+            tc.errors,
+        );
+    }
+
+    #[test]
+    fn unify_row_multi_instantiation_same_order_unifies() {
+        // Plan D Stage 12 R2 regression — pin the first-occurrence-
+        // wins behavior of unify_row's name-match loop for rows
+        // carrying the same effect-name twice with distinct args
+        // (`![Raise[Int], Raise[String]]`). Same-side ordering
+        // unifies cleanly: a[0]=Raise[Int] matches b[0]=Raise[Int]
+        // (idx 0 marked in matched_b), then a[1]=Raise[String]
+        // matches b[1]=Raise[String] (idx 1 in matched_b). The
+        // matched_b set is what makes the order matter — without
+        // it, a[1] could re-match b[0] and the args would diverge.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("x.sigil");
+        let row_a = Row::closed(vec![
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::Int],
+            },
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::String],
+            },
+        ]);
+        let row_b = Row::closed(vec![
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::Int],
+            },
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::String],
+            },
+        ]);
+        let ok = tc.unify_row(&row_a, &row_b, &span);
+        assert!(
+            ok,
+            "same-order multi-instantiation rows must unify; errors: {:?}",
+            tc.errors
+        );
+        assert!(
+            tc.errors.is_empty(),
+            "no diagnostics expected; got {:?}",
+            tc.errors
+        );
+    }
+
+    #[test]
+    fn unify_row_multi_instantiation_reversed_order_fires_e0044() {
+        // Plan D Stage 12 R2 regression — pair to
+        // `unify_row_multi_instantiation_same_order_unifies`. With
+        // b reversed, a[0]=Raise[Int] is matched against the first
+        // unclaimed b entry by name (b[0]=Raise[String]) — args
+        // unify Int vs String → E0044. This locks in the order-
+        // dependent semantics so a future "improvement" (e.g.,
+        // exhaustive permutation matching) can't silently change
+        // the diagnostic shape without un-ignoring this test.
+        let mut tc = fresh_tc();
+        let span = Span::synthetic("x.sigil");
+        let row_a = Row::closed(vec![
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::Int],
+            },
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::String],
+            },
+        ]);
+        let row_b = Row::closed(vec![
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::String],
+            },
+            EffectInst {
+                name: "Raise".to_string(),
+                args: vec![Ty::Int],
+            },
+        ]);
+        let ok = tc.unify_row(&row_a, &row_b, &span);
+        assert!(
+            !ok,
+            "reversed multi-instantiation rows must fail (Int vs String at first match)"
+        );
+        assert!(
+            has_code(&tc.errors, "E0044"),
+            "expected E0044 from arg-unification at first by-name match; got {:?}",
+            tc.errors,
         );
     }
 
