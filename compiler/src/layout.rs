@@ -122,6 +122,26 @@ pub fn build_layouts(
     let mut layouts: BTreeMap<String, TypeLayout> = BTreeMap::new();
     let mut next_tag: u8 = USER_TAG_START;
     for (name, td) in types {
+        // Plan D Task 117 (a) — skip unmonomorphized generic templates.
+        // Monomorphize creates specialized clones with mangled names
+        // and empty `generic_params`; the original templates remain in
+        // `types` but their variants reference generic params (e.g.
+        // `Some(A)` where A is a TypeExpr the resolver can't bind
+        // without an active subst). Including the templates pollutes
+        // `field_tys` with `Ty::Unit` fallbacks (the original behavior
+        // of `unwrap_or(Ty::Unit)` below), which then drives wrong
+        // slot-kind narrowing at codegen — a pointer-typed payload
+        // gets ireduced to i8.
+        //
+        // The original templates have no runtime representation: every
+        // value site targets a specialization. Skipping them keeps
+        // ctor_index honest and removes the silent pollution path.
+        // Surfaced by the Sudoku smoke gate (Plan D Task 117 (a) —
+        // `match solved { Some(grid) => array_get(grid, 11), ... }`
+        // where `Option[Array[Int]]`'s `Some` payload is pointer-typed).
+        if !td.generic_params.is_empty() {
+            continue;
+        }
         if next_tag == sigil_header_constants::TAG_EXTERNAL_DESCRIPTOR {
             return Err(LayoutError::TooManyTypes {
                 next_tag_attempted: next_tag,
@@ -131,22 +151,30 @@ pub fn build_layouts(
         next_tag = next_tag.saturating_add(1);
         let mut variants = Vec::new();
         for (idx, v) in td.variants.iter().enumerate() {
-            // Plan B task 48: layout runs after codegen-entry guard
-            // accepts only programs with no surface generic syntax,
-            // so empty generic-substitution is the right default
-            // here. Generic-type field types resolved into `Ty::Var`
-            // would have been rejected upstream.
+            // Plan B task 48 + Plan D Task 117 (a): layout runs after
+            // monomorphization, which substitutes every generic-param
+            // reference. Combined with the generic-template skip
+            // above, every TypeExpr reaching `ty_from_type_expr` here
+            // must resolve cleanly. A None return signals a real
+            // compiler bug — either monomorphize missed a TypeExpr
+            // rewrite, OR a generic template slipped past the skip.
             let empty_subst: BTreeMap<String, Ty> = BTreeMap::new();
+            let resolve = |t: &crate::ast::TypeExpr| {
+                ty_from_type_expr(t, types, &empty_subst).unwrap_or_else(|| {
+                    unreachable!(
+                        "build_layouts: unresolved field type in {}::{}: {:?} \
+                         (unmonomorphized generic template leaked past mono — \
+                         the skip-generic-templates branch is the gate, but a \
+                         specialization with a free generic-param TypeExpr \
+                         escaped it)",
+                        td.name, v.name, t
+                    )
+                })
+            };
             let field_tys: Vec<Ty> = match &v.fields {
                 VariantFields::Unit => Vec::new(),
-                VariantFields::Positional(ts) => ts
-                    .iter()
-                    .map(|t| ty_from_type_expr(t, types, &empty_subst).unwrap_or(Ty::Unit))
-                    .collect(),
-                VariantFields::Record(fs) => fs
-                    .iter()
-                    .map(|f| ty_from_type_expr(&f.ty, types, &empty_subst).unwrap_or(Ty::Unit))
-                    .collect(),
+                VariantFields::Positional(ts) => ts.iter().map(&resolve).collect(),
+                VariantFields::Record(fs) => fs.iter().map(|f| resolve(&f.ty)).collect(),
             };
             let field_names: Vec<String> = match &v.fields {
                 VariantFields::Unit | VariantFields::Positional(_) => Vec::new(),

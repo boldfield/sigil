@@ -380,7 +380,7 @@ User authorized the split per session 2026-05-01 ("sounds good" on the surfaced 
 
 **Implementing commit.** This entry + `PLAN_D_PROGRESS.md` Task 117 status update splitting into 117a/117b. No code changes in foundation commit.
 
-## 2026-05-01 — [DEVIATION Task 117] Slice C recognizer constructor-purity fix
+## 2026-05-01 — [DEVIATION Task 117] Slice C ctor-tail capability gap
 
 **Context.** Plan D Task 117's Sudoku smoke gate exercises a 4×4 backtracking solver whose handler arm body has the canonical Slice C 2-let shape with a constructor-bearing tail:
 
@@ -444,5 +444,40 @@ Two coupled invariants, one fix: `expr_is_pure` widens to accept ctors → `arm_
 
 **Failure mode.** None at the user surface. Pre-fix, programs using ctor-bearing tails in handler arm bodies would fall through to the regular walker and produce a confusing "k in non-tail position" diagnostic. Post-fix, those programs compile via Slice C as the recognizer was always intended to support.
 
-**Implementing commit(s).** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical `Some(s) => Some(s)` shape rather than a workaround. Recognizer fix at `e889e89`; downstream free-var-walker fix at `e10d8b3`.
+**Third coupled invariant: layout-template pollution.** Even after the recognizer + free-var-walker fixes, Sudoku produced a Cranelift verifier error (`define main: arg has type i8, expected i64`). The `format_define_failure` helper (commit `d43a671`) surfaced the verifier diagnostic + IR dump; the IR showed:
+
+```
+v68 = load.i64 notrap aligned v62+16   // load Some payload (Array[Int])
+v69 = ireduce.i8 v68                    // BUG: narrows ptr to i8
+v73 = call fn6(v69, v72)                // array_get expects i64, got i8 → reject
+```
+
+Root cause: `compiler/src/layout.rs:119+` `build_layouts` previously processed every TypeDecl in `types`, including unmonomorphized generic templates whose variants reference generic-param TypeExprs. `ty_from_type_expr(.., empty_subst)` returned None for those refs (e.g., `Some(A)`'s A); `.unwrap_or(Ty::Unit)` defaulted to `Ty::Unit`, polluting `field_tys`. Then `build_ctor_index` indexed the polluted variant. At codegen time, `emit_pattern_test` looked up `Some` in `ctor_index`, found the polluted layout with `field_tys[0] = Ty::Unit`, and `load_field_value` ireduced the loaded payload to i8.
+
+The original comment at `layout.rs:134-138` claimed *"layout runs after codegen-entry guard accepts only programs with no surface generic syntax"* — the assumption was correct in spirit (post-monomorphization), but the implementation didn't enforce it: the unmonomorphized templates *also* remained in `types` alongside the specializations.
+
+**Fix.** Skip generic-param-bearing TypeDecls in `build_layouts`:
+
+```rust
+if !td.generic_params.is_empty() {
+    continue;
+}
+```
+
+Plus replace `.unwrap_or(Ty::Unit)` with an explicit panic (`build_layouts: unresolved field type in T::V: <TypeExpr> (unmonomorphized generic template leaked past mono — the skip-generic-templates branch is the gate)`). Future regressions point at the exact location instead of silently producing wrong field_tys.
+
+**Why latent.** Reachable only when a program has BOTH multiple specializations of the same generic type (so `ctor_index` lookup hits the polluted unmonomorphized template, not a specialization) AND pattern-destructures one of those types' constructors with a pointer-typed payload. The existing test corpus had Option pattern-destructures with primitive (Int, Bool) payloads — `field_tys[0] = Ty::Unit` happens to work at i8 width for primitive payloads. Sudoku is the first program with `Option[Array[Int]]` pattern-destructure.
+
+**Regression test.** `task_117_layout_skip_generic_templates_pointer_payload_in_some` declares `find_empty() -> Option[Int]` and `make_arr() -> Option[Array[Int]]`; main pattern-matches `Some(arr)` and calls `array_get(arr, 0)`. Asserts stdout = "42\n". Pre-fix this hits the verifier; post-fix it compiles and runs cleanly.
+
+---
+
+**Three independent latent v1 bugs surfaced by the Sudoku smoke gate** (each addressed in this deviation):
+1. **Recognizer purity** — `expr_is_pure` blanket-rejected `Expr::Call`, including ctor applications.
+2. **Free-var walker** — `arm_body_post_arm_k_tail_free_vars_ok` defensively rejected `Expr::Call`, assuming `expr_is_pure` had already rejected them upstream.
+3. **Layout template pollution** — `build_layouts` processed unmonomorphized generic templates with `.unwrap_or(Ty::Unit)`, polluting `field_tys` and corrupting `ctor_index` for programs with multiple specializations.
+
+The pattern is "Slice C had latent bugs the primitive corpus masked." Plan B Task 78.5 (Koka subset import — deferred to Plan C completion) was specifically scoped to surface this convergence-class blind spot; that import's deferral is what allowed all three to survive to Task 117.
+
+**Implementing commit(s).** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical patterns rather than workarounds. Recognizer fix at `e889e89`; downstream free-var-walker fix at `e10d8b3`; verifier-output unswallow at `d43a671`; layout-template-skip at `[HEAD]`.
 

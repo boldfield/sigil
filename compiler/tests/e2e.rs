@@ -1186,6 +1186,63 @@ fn tree_example_prints_32767_under_500ms() {
     );
 }
 
+/// Plan D Task 117 (a) — pin the layout-template-leak failure mode
+/// surfaced by the Sudoku smoke gate. When a program has multiple
+/// specializations of the same generic type (`Option[Int]` and
+/// `Option[Array[Int]]`), the unmonomorphized `Option` template
+/// previously remained in the type registry and `build_layouts`
+/// processed it with `unwrap_or(Ty::Unit)` for unresolved
+/// generic-param fields, polluting `field_tys` to `Ty::Unit`. That
+/// pollution drove wrong slot-kind narrowing at codegen
+/// (`ireduce.i8` on a pointer-typed payload), tripping Cranelift's
+/// verifier with `arg has type i8, expected i64`.
+///
+/// Fix: skip generic-param-bearing TypeDecls in `build_layouts`
+/// (`compiler/src/layout.rs:124-145`). This test pins the multi-
+/// specialization + pointer-payload combo specifically — that's
+/// the exact failure mode.
+///
+/// Source: declare two Option specializations via `find_empty`
+/// returning `Option[Int]` and `make_arr` returning `Option[Array
+/// [Int]]`. main pattern-matches `Some(arr)` where arr is the
+/// pointer-typed Array[Int] payload, calls `array_get(arr, 0)`.
+/// Pre-fix, codegen ireduced the loaded payload to i8 and
+/// array_get's i64 arg failed verification. Post-fix, the
+/// generic-template skip + ctor_index honesty puts the right
+/// `Ty::User("Array", [Int])` field type in `variant.field_tys[0]`
+/// → no narrowing → verifier-clean.
+#[test]
+fn task_117_layout_skip_generic_templates_pointer_payload_in_some() {
+    let src = "import std.option\n\
+               fn find_empty() -> Option[Int] ![] {\n  \
+                 None\n\
+               }\n\
+               fn make_arr() -> Option[Array[Int]] ![] {\n  \
+                 let g0: Array[Int] = array_alloc(4, 0);\n  \
+                 let g1: Array[Int] = array_set(g0, 0, 42);\n  \
+                 Some(g1)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _: Option[Int] = find_empty();\n  \
+                 let opt_arr: Option[Array[Int]] = make_arr();\n  \
+                 let v: Int = match opt_arr {\n    \
+                   Some(arr) => array_get(arr, 0),\n    \
+                   None => -1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_117_layout_skip_generic_templates");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "Multi-Option-specialization + pointer-payload pattern destructure must \
+         load the Array pointer cleanly without ireduce.i8. Pre-fix this failed \
+         Cranelift verification with `arg has type i8, expected i64`. \
+         stderr={stderr:?}"
+    );
+}
+
 /// Plan D Task 117 smoke gate. 4×4 Sudoku via binary-choose +
 /// recursive backtracking (per Brian's 2026-05-01 restructure;
 /// runtime-N `all_choices` deferred to v3). Verifies the
