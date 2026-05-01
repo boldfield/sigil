@@ -1500,6 +1500,8 @@ fn arm_body_unsupported_construct(
                     &arm.k_name,
                     globals,
                     &extras,
+                    &op_args,
+                    None,
                 ) {
                     return Some(format!(
                         "Slice C: arg{i_1based} of multi-let arm body (the {i_1based}th \
@@ -1528,6 +1530,8 @@ fn arm_body_unsupported_construct(
                 &arm.k_name,
                 globals,
                 &extras,
+                &op_args,
+                None,
             ) {
                 return Some(diag);
             }
@@ -1555,19 +1559,35 @@ fn arm_body_unsupported_construct(
         } else if !expr_is_pure(shape.tail_expr, ctors) {
             // Same: let the regular walker surface the specific
             // yield-able sub-shape in `tail`.
-        } else if let Some(diag) = arm_body_post_arm_k_tail_free_vars_ok(
-            shape.tail_expr,
-            shape.binding_name,
-            &arm.k_name,
-            globals,
-            &BTreeSet::new(),
-        ) {
-            return Some(diag);
         } else {
+            // G1 captures-bearing extension: walker accepts post-k
+            // tails that reference the arm's op-args (resolved via
+            // `arm_params_set`) AND any closure_convert-rewritten
+            // outer-scope captures (`Expr::ClosureEnvLoad`). The
+            // codegen pre-pass alloc the post-arm-k synth fn's
+            // closure record carrying both kinds of captures; the
+            // synth fn loads them at fn entry. Pass `Some(&[])` for
+            // arm_captures as the acceptance signal — names aren't
+            // resolved in the walker context (the typecheck
+            // `handle_arm_captures` side-table isn't threaded down
+            // here). The pre-pass enforces the per-name match.
+            let arm_params_set: BTreeSet<String> =
+                arm.params.iter().map(|p| p.name.clone()).collect();
+            if let Some(diag) = arm_body_post_arm_k_tail_free_vars_ok(
+                shape.tail_expr,
+                shape.binding_name,
+                &arm.k_name,
+                globals,
+                &BTreeSet::new(),
+                &arm_params_set,
+                Some(&[]),
+            ) {
+                return Some(diag);
+            }
             // Slice B accepted shape: `arg` pure, `tail` pure,
-            // `tail` free vars ⊆ `{r} ∪ globals` (with Match-arm
-            // bodies extending that set with their pattern bindings).
-            // Allow.
+            // `tail` free vars ⊆ `{r} ∪ op-args ∪ outer captures ∪
+            // globals` (with Match-arm bodies extending that set
+            // with their pattern bindings). Allow.
             return None;
         }
     }
@@ -2336,10 +2356,94 @@ struct PostArmKSynth {
     /// emit's non-tail-`k` path. Must satisfy [`expr_is_pure`].
     arg_expr: crate::ast::Expr,
     /// The `pure_tail` expression that the post-arm-k synth fn
-    /// lowers. Must satisfy [`expr_is_pure`] and reference only
-    /// `binding_name` plus globals. The post-arm-k synth fn returns
-    /// `Done(widen(tail_value, I64))`.
+    /// lowers. Must satisfy [`expr_is_pure`] and reference
+    /// `binding_name`, any of `captures`, plus globals. The post-arm-
+    /// k synth fn returns `Done(widen(tail_value, I64))`.
+    ///
+    /// G1 captures-bearing extension: when [`Self::captures`] is non-
+    /// empty, the pre-pass has rewritten every `Expr::ClosureEnvLoad`
+    /// whose name is in `captures` back into an `Expr::Ident` so the
+    /// post-arm-k synth fn lowers the tail through the standard
+    /// Lowerer env path (env pre-populated at fn entry with the
+    /// captures loaded from `closure_ptr`).
     tail_expr: crate::ast::Expr,
+    /// G1 captures-bearing extension (mirrors PR #26 commit `a5ee4c6`'s
+    /// helper-side `SynthContCapture` slice for the synth-cont).
+    ///
+    /// Empty = current null-closure path: the arm-fn passes null
+    /// `post_arm_k_closure`; the synth fn's `closure_ptr` is null at
+    /// runtime; only `binding_name` is bound in env.
+    ///
+    /// Non-empty = closure-record path: the arm-fn allocates a
+    /// TAG_CLOSURE-tagged closure record holding each capture's
+    /// value and passes its pointer as `post_arm_k_closure`. The
+    /// synth fn loads each capture from `closure_ptr` at offset
+    /// `16 + 8*i` and binds it in env BEFORE lowering `tail_expr`.
+    ///
+    /// Captures come from two sources (per [`PostArmKCaptureSource`]):
+    ///   - Op-args (resolved against `arm.params`).
+    ///   - Outer-scope captures sourced via the arm-fn's typecheck
+    ///     `ArmCapture` list (originally rewritten by closure_convert
+    ///     into `Expr::ClosureEnvLoad` nodes inside the tail).
+    captures: Vec<PostArmKCapture>,
+}
+
+/// Plan B Task 78.5 G1 — one captured value the post-arm-k synth fn's
+/// closure record holds. Mirrors the helper-side
+/// [`SynthContCapture`] (a5ee4c6) but kept as a separate struct (per
+/// the same "intent at type level" rationale) because the post-arm-k
+/// synth fn captures come from TWO sources — the arm's user op-args
+/// AND outer-scope names rewritten by closure_convert — whereas the
+/// synth-cont captures come only from the helper's user params.
+#[derive(Clone, Debug)]
+struct PostArmKCapture {
+    /// Source-level name. For [`PostArmKCaptureSource::OpArg`] this
+    /// matches an entry in `arm.params`; for
+    /// [`PostArmKCaptureSource::ArmCapture`] this matches an entry
+    /// in the arm-fn's typecheck `ArmCapture` list (sourced via
+    /// `handle_arm_captures`). After the pre-pass's closure-env-load
+    /// unwrap rewrite, the tail expression references this name
+    /// uniformly via `Expr::Ident(name)`; the synth fn pre-populates
+    /// env with both kinds at fn entry.
+    name: String,
+    /// Slot kind for the closure-record encoding. Drives the bitmap
+    /// bit (pointer slots are GC-tracked) and the load/store
+    /// widening shape (mirroring `lower_closure_env_load`).
+    kind: crate::ast::EnvSlotKind,
+    /// Where the value is sourced from inside the arm-fn body at
+    /// closure-record allocation time. Both sources resolve through
+    /// the arm-fn's `Lowerer.env`: op-args are unpacked from
+    /// `args_ptr` at arm-fn entry; outer-scope captures are loaded
+    /// from the arm-fn's own `closure_ptr` at the prologue. By the
+    /// time the perform-site closure-record alloc runs, both kinds
+    /// are bound in env keyed by `name`.
+    #[allow(dead_code)]
+    source: PostArmKCaptureSource,
+}
+
+/// Plan B Task 78.5 G1 — discriminates [`PostArmKCapture`]'s source.
+/// Carried alongside the capture so the diagnostic / debug surface
+/// can distinguish the two paths; load/store machinery treats both
+/// identically (env keyed by `name`).
+#[derive(Clone, Debug)]
+enum PostArmKCaptureSource {
+    /// One of the arm's user-named op-args (resolved from `arm.params`
+    /// at the pre-pass). The arm-fn's body emit unpacked it from
+    /// `args_ptr` at fn entry under this name.
+    OpArg,
+    /// Outer-scope capture sourced via the arm-fn's `ArmCapture` list
+    /// (typecheck `handle_arm_captures` side-table). The pre-arm-fn-
+    /// emit rewrite (`rewrite_arm_body_with_captures`) turned tail
+    /// references into `Expr::ClosureEnvLoad{name, index, kind, ..}`;
+    /// `arm_idx` records the arm-fn-local slot for documentation /
+    /// debugging. The post-arm-k captures unwrap pass
+    /// (`unwrap_closure_env_loads_for_post_arm_k`) reverts those
+    /// nodes to `Expr::Ident(name)` so the synth fn's Lowerer env
+    /// pre-population covers them uniformly.
+    ArmCapture {
+        #[allow(dead_code)]
+        arm_idx: usize,
+    },
 }
 
 /// Plan B Task 55 (Phase 4d) — one captured outer-scope binding for a
@@ -2917,6 +3021,414 @@ fn walk_collect_arm_captures_block(
     }
 }
 
+/// Plan B Task 78.5 G1 — free-var analysis for the Slice B post-arm-k
+/// synth fn's captures-bearing slice. Collects, in source-encounter
+/// order with dedup-by-name, every name in `tail_expr` that the synth
+/// fn must capture.
+///
+/// Two capture sources, mirroring the helper-side `a5ee4c6` walker
+/// for synth-conts but generalised to cover both arm-fn op-args AND
+/// outer-scope captures:
+///
+///   - **Op-arg.** `Expr::Ident(name)` whose `name` matches an entry
+///     in `arm_params` AND isn't shadowed by `bound`. The capture's
+///     `kind` is derived from `arm_op_param_tes[idx]` post-mono
+///     (parallel to `arm_params`).
+///   - **Arm capture.** `Expr::ClosureEnvLoad{name, ..}` whose `name`
+///     matches an entry in the arm-fn's typecheck `arm_captures`
+///     list AND isn't shadowed by `bound`. The capture's `kind` is
+///     copied from the matching `ArmCapture`.
+///
+/// `bound`'s initial state is just the let-binding's name (mirrors the
+/// helper-side walker; in the post-arm-k context the let-binding is
+/// the result of `k(arg)` in the arm-fn body's `let r: Ty = k(arg);
+/// pure_tail` shape). Match-pattern walking extends `bound` with the
+/// arm-pattern-introduced names; block walking extends with each
+/// inner let-binding's name.
+fn collect_post_arm_k_captures(
+    tail_expr: &crate::ast::Expr,
+    let_binding_name: &str,
+    arm_params: &[crate::ast::HandleArmParam],
+    arm_op_param_tes: &[crate::ast::TypeExpr],
+    arm_captures: &[ArmCapture],
+) -> Vec<PostArmKCapture> {
+    let mut bound: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    bound.insert(let_binding_name.to_string());
+    let mut out: Vec<PostArmKCapture> = Vec::new();
+    walk_collect_post_arm_k_captures(
+        tail_expr,
+        &mut bound,
+        arm_params,
+        arm_op_param_tes,
+        arm_captures,
+        &mut out,
+    );
+    out
+}
+
+fn walk_collect_post_arm_k_captures(
+    e: &crate::ast::Expr,
+    bound: &mut std::collections::BTreeSet<String>,
+    arm_params: &[crate::ast::HandleArmParam],
+    arm_op_param_tes: &[crate::ast::TypeExpr],
+    arm_captures: &[ArmCapture],
+    out: &mut Vec<PostArmKCapture>,
+) {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => {}
+        Expr::Ident(name, _) => {
+            if !bound.contains(name) {
+                if let Some(idx) = arm_params.iter().position(|p| p.name == *name) {
+                    if !out.iter().any(|c| c.name == *name) {
+                        out.push(PostArmKCapture {
+                            name: name.clone(),
+                            kind: slot_kind_for_type_expr_post_mono(&arm_op_param_tes[idx]),
+                            source: PostArmKCaptureSource::OpArg,
+                        });
+                    }
+                }
+            }
+        }
+        Expr::ClosureEnvLoad { name, .. } => {
+            if !bound.contains(name) {
+                if let Some(idx) = arm_captures.iter().position(|c| c.name == *name) {
+                    if !out.iter().any(|c| c.name == *name) {
+                        out.push(PostArmKCapture {
+                            name: name.clone(),
+                            kind: arm_captures[idx].kind,
+                            source: PostArmKCaptureSource::ArmCapture { arm_idx: idx },
+                        });
+                    }
+                }
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_collect_post_arm_k_captures(
+                lhs,
+                bound,
+                arm_params,
+                arm_op_param_tes,
+                arm_captures,
+                out,
+            );
+            walk_collect_post_arm_k_captures(
+                rhs,
+                bound,
+                arm_params,
+                arm_op_param_tes,
+                arm_captures,
+                out,
+            );
+        }
+        Expr::Unary { operand, .. } => {
+            walk_collect_post_arm_k_captures(
+                operand,
+                bound,
+                arm_params,
+                arm_op_param_tes,
+                arm_captures,
+                out,
+            );
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            walk_collect_post_arm_k_captures(
+                cond,
+                bound,
+                arm_params,
+                arm_op_param_tes,
+                arm_captures,
+                out,
+            );
+            walk_collect_post_arm_k_captures_block(
+                then_block,
+                bound,
+                arm_params,
+                arm_op_param_tes,
+                arm_captures,
+                out,
+            );
+            walk_collect_post_arm_k_captures_block(
+                else_block,
+                bound,
+                arm_params,
+                arm_op_param_tes,
+                arm_captures,
+                out,
+            );
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            walk_collect_post_arm_k_captures(
+                scrutinee,
+                bound,
+                arm_params,
+                arm_op_param_tes,
+                arm_captures,
+                out,
+            );
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                collect_pattern_bindings(&arm.pattern, &mut arm_bound);
+                walk_collect_post_arm_k_captures(
+                    &arm.body,
+                    &mut arm_bound,
+                    arm_params,
+                    arm_op_param_tes,
+                    arm_captures,
+                    out,
+                );
+            }
+        }
+        Expr::Block(b) => walk_collect_post_arm_k_captures_block(
+            b,
+            bound,
+            arm_params,
+            arm_op_param_tes,
+            arm_captures,
+            out,
+        ),
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                walk_collect_post_arm_k_captures(
+                    &f.value,
+                    bound,
+                    arm_params,
+                    arm_op_param_tes,
+                    arm_captures,
+                    out,
+                );
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                walk_collect_post_arm_k_captures(
+                    el,
+                    bound,
+                    arm_params,
+                    arm_op_param_tes,
+                    arm_captures,
+                    out,
+                );
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            // Reachable via ctor-application Calls (purity gate
+            // upstream rejects user-fn Calls). Walk callee + args so
+            // captures inside `Cons(x, rest)` or similar surface.
+            walk_collect_post_arm_k_captures(
+                callee,
+                bound,
+                arm_params,
+                arm_op_param_tes,
+                arm_captures,
+                out,
+            );
+            for a in args {
+                walk_collect_post_arm_k_captures(
+                    a,
+                    bound,
+                    arm_params,
+                    arm_op_param_tes,
+                    arm_captures,
+                    out,
+                );
+            }
+        }
+        // Yield-able shapes — purity gate rejects, defensive skip.
+        Expr::Perform(_)
+        | Expr::Handle { .. }
+        | Expr::Lambda { .. }
+        | Expr::ClosureRecord { .. } => {}
+    }
+}
+
+fn walk_collect_post_arm_k_captures_block(
+    b: &crate::ast::Block,
+    bound: &mut std::collections::BTreeSet<String>,
+    arm_params: &[crate::ast::HandleArmParam],
+    arm_op_param_tes: &[crate::ast::TypeExpr],
+    arm_captures: &[ArmCapture],
+    out: &mut Vec<PostArmKCapture>,
+) {
+    use crate::ast::Stmt;
+    let saved = bound.clone();
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                walk_collect_post_arm_k_captures(
+                    &l.value,
+                    bound,
+                    arm_params,
+                    arm_op_param_tes,
+                    arm_captures,
+                    out,
+                );
+                bound.insert(l.name.clone());
+            }
+            Stmt::Expr(e) => walk_collect_post_arm_k_captures(
+                e,
+                bound,
+                arm_params,
+                arm_op_param_tes,
+                arm_captures,
+                out,
+            ),
+            Stmt::Perform(_) => {}
+        }
+    }
+    if let Some(t) = &b.tail {
+        walk_collect_post_arm_k_captures(t, bound, arm_params, arm_op_param_tes, arm_captures, out);
+    }
+    *bound = saved;
+}
+
+/// Plan B Task 78.5 G1 — rewrite a post-arm-k tail expression so every
+/// `Expr::ClosureEnvLoad{name, span, ..}` whose `name` appears in
+/// `captures` becomes `Expr::Ident(name, span)`. The synth fn's
+/// Lowerer pre-populates env at fn entry with both op-arg and outer-
+/// scope captures keyed uniformly by name; the rewrite means the tail-
+/// lowering walker resolves every reference via env without a
+/// closure-env-load codepath.
+///
+/// Mirrors the env-pre-population pattern from PR #26 commit
+/// `a5ee4c6`'s helper-side synth-cont: there too, captured names land
+/// in env by name and the synth-cont's tail lowers normally.
+fn unwrap_closure_env_loads_for_post_arm_k(
+    e: &crate::ast::Expr,
+    captures: &[PostArmKCapture],
+) -> crate::ast::Expr {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::Ident(..) => e.clone(),
+        Expr::ClosureEnvLoad { name, span, .. } => {
+            if captures.iter().any(|c| c.name == *name) {
+                Expr::Ident(name.clone(), span.clone())
+            } else {
+                e.clone()
+            }
+        }
+        Expr::Binary { op, lhs, rhs, span } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(unwrap_closure_env_loads_for_post_arm_k(lhs, captures)),
+            rhs: Box::new(unwrap_closure_env_loads_for_post_arm_k(rhs, captures)),
+            span: span.clone(),
+        },
+        Expr::Unary { op, operand, span } => Expr::Unary {
+            op: *op,
+            operand: Box::new(unwrap_closure_env_loads_for_post_arm_k(operand, captures)),
+            span: span.clone(),
+        },
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            span,
+        } => Expr::If {
+            cond: Box::new(unwrap_closure_env_loads_for_post_arm_k(cond, captures)),
+            then_block: Box::new(unwrap_closure_env_loads_for_post_arm_k_block(
+                then_block, captures,
+            )),
+            else_block: Box::new(unwrap_closure_env_loads_for_post_arm_k_block(
+                else_block, captures,
+            )),
+            span: span.clone(),
+        },
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => Expr::Match {
+            scrutinee: Box::new(unwrap_closure_env_loads_for_post_arm_k(scrutinee, captures)),
+            arms: arms
+                .iter()
+                .map(|a| crate::ast::MatchArm {
+                    pattern: a.pattern.clone(),
+                    body: unwrap_closure_env_loads_for_post_arm_k(&a.body, captures),
+                    span: a.span.clone(),
+                })
+                .collect(),
+            span: span.clone(),
+        },
+        Expr::Block(b) => Expr::Block(Box::new(unwrap_closure_env_loads_for_post_arm_k_block(
+            b, captures,
+        ))),
+        Expr::RecordLit { name, fields, span } => Expr::RecordLit {
+            name: name.clone(),
+            fields: fields
+                .iter()
+                .map(|f| crate::ast::RecordFieldLit {
+                    name: f.name.clone(),
+                    value: unwrap_closure_env_loads_for_post_arm_k(&f.value, captures),
+                    span: f.span.clone(),
+                })
+                .collect(),
+            span: span.clone(),
+        },
+        Expr::Tuple { elems, span } => Expr::Tuple {
+            elems: elems
+                .iter()
+                .map(|x| unwrap_closure_env_loads_for_post_arm_k(x, captures))
+                .collect(),
+            span: span.clone(),
+        },
+        Expr::Call { callee, args, span } => Expr::Call {
+            callee: Box::new(unwrap_closure_env_loads_for_post_arm_k(callee, captures)),
+            args: args
+                .iter()
+                .map(|a| unwrap_closure_env_loads_for_post_arm_k(a, captures))
+                .collect(),
+            span: span.clone(),
+        },
+        // Purity gate rejects yield-able shapes; rewrite by clone for
+        // defensive consistency (callers won't construct these).
+        Expr::Perform(..)
+        | Expr::Handle { .. }
+        | Expr::Lambda { .. }
+        | Expr::ClosureRecord { .. } => e.clone(),
+    }
+}
+
+fn unwrap_closure_env_loads_for_post_arm_k_block(
+    b: &crate::ast::Block,
+    captures: &[PostArmKCapture],
+) -> crate::ast::Block {
+    use crate::ast::Stmt;
+    let stmts: Vec<Stmt> = b
+        .stmts
+        .iter()
+        .map(|s| match s {
+            Stmt::Let(l) => Stmt::Let(crate::ast::LetStmt {
+                name: l.name.clone(),
+                ty: l.ty.clone(),
+                value: unwrap_closure_env_loads_for_post_arm_k(&l.value, captures),
+                span: l.span.clone(),
+            }),
+            Stmt::Expr(e) => Stmt::Expr(unwrap_closure_env_loads_for_post_arm_k(e, captures)),
+            Stmt::Perform(p) => Stmt::Perform(p.clone()),
+        })
+        .collect();
+    let tail = b
+        .tail
+        .as_ref()
+        .map(|t| unwrap_closure_env_loads_for_post_arm_k(t, captures));
+    crate::ast::Block {
+        stmts,
+        tail,
+        span: b.span.clone(),
+    }
+}
+
 /// Plan B Task 55, Phase 4e — collect names that a [`Pattern`] binds.
 ///
 /// Used by [`walk_collect_captures`] when descending into a match
@@ -3292,12 +3804,33 @@ fn collect_handle_arms_in_expr(
                         .declare_function(&post_arm_k_mangled, Linkage::Local, ctx.cps_arm_sig)
                         .map_err(|e| format!("declare {post_arm_k_mangled}: {e}"))?;
                     let binding_ty = cranelift_ty_for_type_expr(shape.binding_te, ctx.pointer_ty);
+                    // Plan B Task 78.5 G1 — captures-bearing slice of
+                    // the post-arm-k synth fn (mirrors PR #26 commit
+                    // `a5ee4c6` for helper synth-conts). Walk the tail
+                    // for free Idents matching arm op-args + free
+                    // ClosureEnvLoads matching outer-scope arm captures;
+                    // unwrap the ClosureEnvLoad nodes back to plain
+                    // Idents so the synth fn lowers tail through
+                    // standard env resolution. Empty captures =
+                    // null-closure path (current behaviour preserved).
+                    let post_arm_k_captures = collect_post_arm_k_captures(
+                        shape.tail_expr,
+                        shape.binding_name,
+                        &arm.params,
+                        &op_decl.params,
+                        &captures,
+                    );
+                    let unwrapped_tail = unwrap_closure_env_loads_for_post_arm_k(
+                        shape.tail_expr,
+                        &post_arm_k_captures,
+                    );
                     Some(PostArmKSynth {
                         func_id: post_arm_k_func_id,
                         binding_name: shape.binding_name.to_string(),
                         binding_ty,
                         arg_expr: shape.arg_expr.clone(),
-                        tail_expr: shape.tail_expr.clone(),
+                        tail_expr: unwrapped_tail,
+                        captures: post_arm_k_captures,
                         // tail_ty intentionally NOT pre-stored: the
                         // pre-pass can't know the actual lowered
                         // Cranelift type (it's whatever Lowerer
@@ -3957,12 +4490,18 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
     k_name: &str,
     globals: &std::collections::BTreeSet<String>,
     extra_bindings: &std::collections::BTreeSet<String>,
+    arm_params_set: &std::collections::BTreeSet<String>,
+    arm_captures: Option<&[ArmCapture]>,
 ) -> Option<String> {
     use crate::ast::Expr;
     match tail_expr {
         Expr::IntLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
         Expr::Ident(name, _) => {
-            if name == binding_name || globals.contains(name) || extra_bindings.contains(name) {
+            if name == binding_name
+                || globals.contains(name)
+                || extra_bindings.contains(name)
+                || arm_params_set.contains(name)
+            {
                 None
             } else if name == k_name {
                 Some(format!(
@@ -3980,22 +4519,42 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                 ))
             }
         }
-        Expr::ClosureEnvLoad { name, .. } => Some(format!(
-            "post-`k` tail of arm body reads `{name}` via a surrounding-lambda \
-             closure record (closure_convert rewrote it into a ClosureEnvLoad). \
-             Phase 4e captures+ Slice D shipped surrounding-lambda captures \
-             for ARM BODIES (e.g., a lambda-wrapped handle whose arm body \
-             references outer-scope `x`); the analogous support for the \
-             post-arm-k synth fn body's tail is deferred to a future captures-\
-             bearing extension that mirrors Slice D's pattern at the post-arm-k \
-             closure record's allocation site"
-        )),
+        Expr::ClosureEnvLoad { name, .. } => {
+            // G1 captures-bearing extension: when the caller (Slice B
+            // walker / pre-pass) supplies `Some(_)`, accept the
+            // ClosureEnvLoad — the post-arm-k synth fn will load the
+            // captured value from its own closure record at fn entry.
+            // The walker call site passes `Some(&[])` (acceptance
+            // signal — names not yet resolved in the walker context);
+            // the pre-pass call site passes `Some(&captures)` and we
+            // additionally enforce name-match for diagnostic precision.
+            // Slice C callers pass `None` to preserve their reject-on-
+            // ClosureEnvLoad behaviour (no captures threading through
+            // chain steps for ClosureEnvLoad-sourced names yet).
+            if let Some(caps) = arm_captures {
+                if caps.is_empty() || caps.iter().any(|c| c.name == *name) {
+                    return None;
+                }
+            }
+            Some(format!(
+                "post-`k` tail of arm body reads `{name}` via a surrounding-lambda \
+                 closure record (closure_convert rewrote it into a ClosureEnvLoad). \
+                 Phase 4e captures+ Slice D shipped surrounding-lambda captures \
+                 for ARM BODIES (e.g., a lambda-wrapped handle whose arm body \
+                 references outer-scope `x`); the analogous support for the \
+                 post-arm-k synth fn body's tail is deferred to a future captures-\
+                 bearing extension that mirrors Slice D's pattern at the post-arm-k \
+                 closure record's allocation site"
+            ))
+        }
         Expr::Binary { lhs, rhs, .. } => arm_body_post_arm_k_tail_free_vars_ok(
             lhs,
             binding_name,
             k_name,
             globals,
             extra_bindings,
+            arm_params_set,
+            arm_captures,
         )
         .or_else(|| {
             arm_body_post_arm_k_tail_free_vars_ok(
@@ -4004,6 +4563,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                 k_name,
                 globals,
                 extra_bindings,
+                arm_params_set,
+                arm_captures,
             )
         }),
         Expr::Unary { operand, .. } => arm_body_post_arm_k_tail_free_vars_ok(
@@ -4012,6 +4573,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
             k_name,
             globals,
             extra_bindings,
+            arm_params_set,
+            arm_captures,
         ),
         Expr::If {
             cond,
@@ -4024,6 +4587,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
             k_name,
             globals,
             extra_bindings,
+            arm_params_set,
+            arm_captures,
         )
         .or_else(|| {
             arm_body_post_arm_k_tail_free_vars_ok_block(
@@ -4032,6 +4597,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                 k_name,
                 globals,
                 extra_bindings,
+                arm_params_set,
+                arm_captures,
             )
         })
         .or_else(|| {
@@ -4041,6 +4608,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                 k_name,
                 globals,
                 extra_bindings,
+                arm_params_set,
+                arm_captures,
             )
         }),
         Expr::Match {
@@ -4051,6 +4620,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
             k_name,
             globals,
             extra_bindings,
+            arm_params_set,
+            arm_captures,
         )
         .or_else(|| {
             // Per-arm clone of `extra_bindings`, extended with the
@@ -4069,6 +4640,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                     k_name,
                     globals,
                     &arm_extra,
+                    arm_params_set,
+                    arm_captures,
                 )
             })
         }),
@@ -4078,6 +4651,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
             k_name,
             globals,
             extra_bindings,
+            arm_params_set,
+            arm_captures,
         ),
         Expr::RecordLit { fields, .. } => fields.iter().find_map(|f| {
             arm_body_post_arm_k_tail_free_vars_ok(
@@ -4086,6 +4661,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                 k_name,
                 globals,
                 extra_bindings,
+                arm_params_set,
+                arm_captures,
             )
         }),
         // Reachable only after `expr_is_pure` has accepted this
@@ -4108,6 +4685,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
             k_name,
             globals,
             extra_bindings,
+            arm_params_set,
+            arm_captures,
         )
         .or_else(|| {
             args.iter().find_map(|a| {
@@ -4117,6 +4696,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                     k_name,
                     globals,
                     extra_bindings,
+                    arm_params_set,
+                    arm_captures,
                 )
             })
         }),
@@ -4141,6 +4722,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                     k_name,
                     globals,
                     extra_bindings,
+                    arm_params_set,
+                    arm_captures,
                 ) {
                     return Some(msg);
                 }
@@ -4171,6 +4754,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
     k_name: &str,
     globals: &std::collections::BTreeSet<String>,
     extra_bindings: &std::collections::BTreeSet<String>,
+    arm_params_set: &std::collections::BTreeSet<String>,
+    arm_captures: Option<&[ArmCapture]>,
 ) -> Option<String> {
     use crate::ast::Stmt;
     let mut extras_extended: std::collections::BTreeSet<String> = extra_bindings.clone();
@@ -4185,6 +4770,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
                     k_name,
                     globals,
                     &extras_extended,
+                    arm_params_set,
+                    arm_captures,
                 ) {
                     return Some(d);
                 }
@@ -4199,6 +4786,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
                     k_name,
                     globals,
                     &extras_extended,
+                    arm_params_set,
+                    arm_captures,
                 ) {
                     return Some(d);
                 }
@@ -4219,6 +4808,8 @@ fn arm_body_post_arm_k_tail_free_vars_ok_block(
             k_name,
             globals,
             &extras_extended,
+            arm_params_set,
+            arm_captures,
         );
     }
     None
@@ -7854,10 +8445,90 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         argp_v,
                         POST_ARM_K_ARG_OFF,
                     );
-                    let null_post_arm_k_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
+                    // Plan B Task 78.5 G1 — captures-bearing slice.
+                    // Empty captures → null `post_arm_k_closure`
+                    // (current path, unchanged). Non-empty captures →
+                    // allocate a TAG_CLOSURE-tagged closure record at
+                    // this perform site holding each capture's value
+                    // sourced from arm-fn `Lowerer.env` (op-args were
+                    // unpacked at arm-fn entry; outer-scope captures
+                    // were loaded from arm-fn's `closure_ptr` at the
+                    // prologue). Layout mirrors PR #26 commit a5ee4c6:
+                    // header at +0, null code_ptr at +8, captures at
+                    // +16 + 8*i widened to I64.
+                    let post_arm_k_closure_v = if post_arm_k.captures.is_empty() {
+                        lowerer.builder.ins().iconst(pointer_ty, 0)
+                    } else {
+                        let captures = &post_arm_k.captures;
+                        assert!(
+                            captures.len() < MAX_CLOSURE_ENV_SLOTS,
+                            "Plan B Task 78.5 G1: post-arm-k closure env >= \
+                             {MAX_CLOSURE_ENV_SLOTS} slots exceeds bitmap layout"
+                        );
+                        let mut bitmap: u32 = 0;
+                        for (i, c) in captures.iter().enumerate() {
+                            if c.kind.is_pointer() {
+                                bitmap |= 1u32 << (i + 1);
+                            }
+                        }
+                        let count: u8 = 1 + captures.len() as u8;
+                        let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
+                        let payload_bytes: i64 = 8 + 8 * captures.len() as i64;
+                        let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
+                        let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                        let alloc_call = lowerer
+                            .builder
+                            .ins()
+                            .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
+                        lowerer
+                            .stackmap
+                            .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
+                        let cp = lowerer.builder.inst_results(alloc_call)[0];
+                        // Null code_ptr at offset 8.
+                        let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                        lowerer
+                            .builder
+                            .ins()
+                            .store(MemFlags::trusted(), null_v, cp, 8);
+                        // Each capture at offset 16 + 8*i, widened to I64.
+                        for (i, capture) in captures.iter().enumerate() {
+                            let raw = match lowerer.env.get(&capture.name) {
+                                Some(v) => *v,
+                                None => unreachable!(
+                                    "Plan B Task 78.5 G1: post-arm-k capture `{}` \
+                                     not in arm-fn env at body-emit time. The pre-\
+                                     pass collected captures from arm.params \
+                                     (op-args, unpacked from args_ptr) and from \
+                                     arm-fn's ArmCapture list (loaded from \
+                                     closure_ptr at the arm-fn prologue) — both \
+                                     paths leave the value bound in env keyed by \
+                                     name.",
+                                    capture.name
+                                ),
+                            };
+                            let slot_val = match capture.kind {
+                                crate::ast::EnvSlotKind::Int => raw,
+                                crate::ast::EnvSlotKind::Bool
+                                | crate::ast::EnvSlotKind::Byte
+                                | crate::ast::EnvSlotKind::Unit
+                                | crate::ast::EnvSlotKind::Char => {
+                                    lowerer.builder.ins().uextend(types::I64, raw)
+                                }
+                                crate::ast::EnvSlotKind::String
+                                | crate::ast::EnvSlotKind::Closure
+                                | crate::ast::EnvSlotKind::User => raw,
+                            };
+                            let offset: i32 = 16 + 8 * i as i32;
+                            lowerer
+                                .builder
+                                .ins()
+                                .store(MemFlags::trusted(), slot_val, cp, offset);
+                        }
+                        cp
+                    };
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
-                        null_post_arm_k_closure,
+                        post_arm_k_closure_v,
                         argp_v,
                         POST_ARM_K_CLOSURE_OFF,
                     );
@@ -8417,6 +9088,43 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
             let mut env: BTreeMap<String, Value> = BTreeMap::new();
             env.insert(post_arm_k.binding_name.clone(), r_value);
+
+            // Plan B Task 78.5 G1 — load each capture from the synth
+            // fn's `closure_ptr` (block_params[0]) at offset 16 + 8*i,
+            // narrow per kind, and bind in env BEFORE the Lowerer is
+            // constructed. Mirrors PR #26 commit `a5ee4c6`'s helper-
+            // synth-cont preamble. When `captures` is empty, this loop
+            // runs zero iterations and `closure_ptr` is null at runtime
+            // (current path, unchanged behaviour).
+            {
+                let synth_closure_ptr = block_params[0];
+                for (i, capture) in post_arm_k.captures.iter().enumerate() {
+                    let offset: i32 = 16 + 8 * i as i32;
+                    let raw = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        synth_closure_ptr,
+                        offset,
+                    );
+                    let val = match capture.kind {
+                        crate::ast::EnvSlotKind::Int => raw,
+                        crate::ast::EnvSlotKind::Bool
+                        | crate::ast::EnvSlotKind::Byte
+                        | crate::ast::EnvSlotKind::Unit => builder.ins().ireduce(types::I8, raw),
+                        crate::ast::EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
+                        crate::ast::EnvSlotKind::String
+                        | crate::ast::EnvSlotKind::Closure
+                        | crate::ast::EnvSlotKind::User => {
+                            if pointer_ty == types::I64 {
+                                raw
+                            } else {
+                                builder.ins().ireduce(pointer_ty, raw)
+                            }
+                        }
+                    };
+                    env.insert(capture.name.clone(), val);
+                }
+            }
 
             let PerFnRefs {
                 builtins,
@@ -17817,8 +18525,15 @@ mod tests {
         globals.insert("Some".to_string());
         globals.insert("None".to_string());
         let extras: BTreeSet<String> = BTreeSet::new();
-        let walk =
-            arm_body_post_arm_k_tail_free_vars_ok(&m.tail_expr, "r1", "k", &globals, &extras);
+        let walk = arm_body_post_arm_k_tail_free_vars_ok(
+            &m.tail_expr,
+            "r1",
+            "k",
+            &globals,
+            &extras,
+            &BTreeSet::new(),
+            None,
+        );
         assert!(
             walk.is_none(),
             "free-var walker must accept Some(r1) where r1 is the chain binding; \
@@ -17833,8 +18548,15 @@ mod tests {
             args: vec![Expr::Ident("r3".to_string(), span.clone())],
             span: span.clone(),
         };
-        let walk_bad =
-            arm_body_post_arm_k_tail_free_vars_ok(&bad_tail, "r1", "k", &globals, &extras);
+        let walk_bad = arm_body_post_arm_k_tail_free_vars_ok(
+            &bad_tail,
+            "r1",
+            "k",
+            &globals,
+            &extras,
+            &BTreeSet::new(),
+            None,
+        );
         assert!(
             walk_bad.is_some(),
             "free-var walker must reject Some(r3) where r3 is not bound"
@@ -17866,7 +18588,15 @@ mod tests {
             rhs: Box::new(Expr::Ident("r3".to_string(), span.clone())),
             span: span.clone(),
         };
-        let result = arm_body_post_arm_k_tail_free_vars_ok(&tail, "r1", "k", &globals, &extras);
+        let result = arm_body_post_arm_k_tail_free_vars_ok(
+            &tail,
+            "r1",
+            "k",
+            &globals,
+            &extras,
+            &BTreeSet::new(),
+            None,
+        );
         assert!(
             result.is_none(),
             "expected None (accept) for `r1 + r2 + r3` with r1 binding, \
@@ -17893,10 +18623,16 @@ mod tests {
             rhs: Box::new(Expr::Ident("int_to_string".to_string(), span.clone())),
             span: span.clone(),
         };
-        assert!(
-            arm_body_post_arm_k_tail_free_vars_ok(&tail, "r", "k", &globals, &BTreeSet::new(),)
-                .is_none()
-        );
+        assert!(arm_body_post_arm_k_tail_free_vars_ok(
+            &tail,
+            "r",
+            "k",
+            &globals,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+        )
+        .is_none());
     }
 
     #[test]
@@ -17919,6 +18655,8 @@ mod tests {
             "k",
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
         .expect("rejected");
         assert!(
@@ -17944,6 +18682,8 @@ mod tests {
             "k",
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
         .expect("rejected");
         assert!(
@@ -17970,6 +18710,8 @@ mod tests {
             "k",
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
         .expect("rejected");
         assert!(
@@ -18005,6 +18747,8 @@ mod tests {
             "k",
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
         .is_none());
     }
@@ -18039,6 +18783,8 @@ mod tests {
             "k",
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         );
         assert!(
             result.is_none(),
@@ -18508,5 +19254,156 @@ mod tests {
         };
         let result = find_closure_env_load_lambda_source(&body, "x");
         assert_eq!(result, Some((5, EnvSlotKind::Int)));
+    }
+
+    // ---------------- Plan B Task 78.5 G1 — captures-bearing slice
+    // for the post-arm-k synth fn (mirrors PR #26 commit `a5ee4c6`).
+    // Pre-pass walker pins: discovers op-arg references AND
+    // ClosureEnvLoad-rewritten outer-scope captures in the post-k
+    // tail; excludes the let-binding name (shadowed); combined
+    // op-arg + outer-capture is captured uniformly.
+
+    #[test]
+    fn collect_post_arm_k_captures_finds_op_arg() {
+        // Tail `r + arg` where `r` is the let-binding (post-k
+        // synth fn's `args_ptr[0]`-bound name) and `arg` is an arm
+        // op-arg. Returns `[arg]` with kind Int derived from the
+        // op_decl's `Int` param type.
+        use crate::ast::{BinOp, Expr, HandleArmParam, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("r".to_string(), span.clone())),
+            rhs: Box::new(Expr::Ident("arg".to_string(), span.clone())),
+            span: span.clone(),
+        };
+        let arm_params = vec![HandleArmParam {
+            name: "arg".to_string(),
+            span: span.clone(),
+        }];
+        let arm_op_param_tes = vec![TypeExpr::Named("Int".to_string(), span.clone())];
+        let arm_captures: Vec<ArmCapture> = Vec::new();
+        let captures =
+            collect_post_arm_k_captures(&tail, "r", &arm_params, &arm_op_param_tes, &arm_captures);
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].name, "arg");
+        assert_eq!(captures[0].kind, EnvSlotKind::Int);
+        assert!(matches!(captures[0].source, PostArmKCaptureSource::OpArg));
+    }
+
+    #[test]
+    fn collect_post_arm_k_captures_finds_arm_capture_via_closure_env_load() {
+        // Tail `r + threshold` where `threshold` appears as
+        // `Expr::ClosureEnvLoad` (closure_convert rewrote the outer
+        // fn-param into an env load against the arm-fn's
+        // `closure_ptr`). Pre-pass returns `[threshold]` sourced as
+        // ArmCapture, kind copied from the typecheck `ArmCapture` slot.
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("r".to_string(), span.clone())),
+            rhs: Box::new(Expr::ClosureEnvLoad {
+                name: "threshold".to_string(),
+                index: 0,
+                kind: EnvSlotKind::Int,
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let arm_params: Vec<crate::ast::HandleArmParam> = Vec::new();
+        let arm_op_param_tes: Vec<crate::ast::TypeExpr> = Vec::new();
+        let arm_captures = vec![ArmCapture {
+            name: "threshold".to_string(),
+            kind: EnvSlotKind::Int,
+            lambda_source: None,
+        }];
+        let captures =
+            collect_post_arm_k_captures(&tail, "r", &arm_params, &arm_op_param_tes, &arm_captures);
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].name, "threshold");
+        assert_eq!(captures[0].kind, EnvSlotKind::Int);
+        assert!(matches!(
+            captures[0].source,
+            PostArmKCaptureSource::ArmCapture { arm_idx: 0 }
+        ));
+    }
+
+    #[test]
+    fn collect_post_arm_k_captures_excludes_let_binding_name() {
+        // Tail `r + r` where `r` IS the let-binding name. The walker's
+        // initial `bound` set contains `r`; even if `r` happened to
+        // collide with an arm op-arg name, it is shadowed. Returns
+        // empty captures.
+        use crate::ast::{BinOp, Expr, HandleArmParam, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("r".to_string(), span.clone())),
+            rhs: Box::new(Expr::Ident("r".to_string(), span.clone())),
+            span: span.clone(),
+        };
+        // Pathological: `r` is also declared as an op-arg on the
+        // arm. Shadowing rule: the let-binding takes precedence.
+        let arm_params = vec![HandleArmParam {
+            name: "r".to_string(),
+            span: span.clone(),
+        }];
+        let arm_op_param_tes = vec![TypeExpr::Named("Int".to_string(), span.clone())];
+        let arm_captures: Vec<ArmCapture> = Vec::new();
+        let captures =
+            collect_post_arm_k_captures(&tail, "r", &arm_params, &arm_op_param_tes, &arm_captures);
+        assert_eq!(captures.len(), 0);
+    }
+
+    #[test]
+    fn collect_post_arm_k_captures_combines_op_arg_and_arm_capture() {
+        // Tail `r + arg + threshold`: `arg` is an op-arg, `threshold`
+        // is an outer-scope capture (ClosureEnvLoad). Both must be
+        // captured, in source-encounter order, with their respective
+        // sources distinguished.
+        use crate::ast::{BinOp, Expr, HandleArmParam, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // `(r + arg) + threshold`
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("r".to_string(), span.clone())),
+                rhs: Box::new(Expr::Ident("arg".to_string(), span.clone())),
+                span: span.clone(),
+            }),
+            rhs: Box::new(Expr::ClosureEnvLoad {
+                name: "threshold".to_string(),
+                index: 0,
+                kind: EnvSlotKind::Int,
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let arm_params = vec![HandleArmParam {
+            name: "arg".to_string(),
+            span: span.clone(),
+        }];
+        let arm_op_param_tes = vec![TypeExpr::Named("Int".to_string(), span.clone())];
+        let arm_captures = vec![ArmCapture {
+            name: "threshold".to_string(),
+            kind: EnvSlotKind::Int,
+            lambda_source: None,
+        }];
+        let captures =
+            collect_post_arm_k_captures(&tail, "r", &arm_params, &arm_op_param_tes, &arm_captures);
+        assert_eq!(captures.len(), 2);
+        assert_eq!(captures[0].name, "arg");
+        assert!(matches!(captures[0].source, PostArmKCaptureSource::OpArg));
+        assert_eq!(captures[1].name, "threshold");
+        assert!(matches!(
+            captures[1].source,
+            PostArmKCaptureSource::ArmCapture { arm_idx: 0 }
+        ));
     }
 }

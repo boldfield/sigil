@@ -8151,7 +8151,6 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 ///
 /// **Invariant** (post-fix): stdout = `"3\n"`, exit 0.
 #[test]
-#[ignore = "G1 variant 1: Slice B post-arm-k synth fn rejects op-arg in post-k tail; closure path PR #26 a5ee4c6 captures-bearing slice extension"]
 fn task_78_5_pending_g1_op_arg_in_post_arm_k_tail() {
     let src = "import std.list\n\
                import std.io\n\
@@ -8202,7 +8201,6 @@ fn task_78_5_pending_g1_op_arg_in_post_arm_k_tail() {
 ///
 /// **Invariant** (post-fix): stdout = `"7\n"`, exit 0.
 #[test]
-#[ignore = "G1 variant 2: Slice B post-arm-k synth fn rejects outer-fn-scope let in post-k tail; closure path PR #26 a5ee4c6"]
 fn task_78_5_pending_g1_outer_let_in_post_arm_k_tail() {
     let src = "import std.io\n\
                \n\
@@ -8241,7 +8239,6 @@ fn task_78_5_pending_g1_outer_let_in_post_arm_k_tail() {
 ///
 /// **Invariant** (post-fix): stdout = `"7\n"`, exit 0.
 #[test]
-#[ignore = "G1 variant 3: Slice B post-arm-k synth fn rejects outer fn-param in post-k tail; closure path PR #26 a5ee4c6"]
 fn task_78_5_pending_g1_outer_fn_param_in_post_arm_k_tail() {
     let src = "import std.io\n\
                \n\
@@ -8280,7 +8277,6 @@ fn task_78_5_pending_g1_outer_fn_param_in_post_arm_k_tail() {
 ///
 /// **Invariant** (post-fix): stdout = `"17\n"`, exit 0 (10 + 0 + 7).
 #[test]
-#[ignore = "G1 variant 4: Slice B post-arm-k synth fn rejects combined op-arg + outer-capture in post-k tail; closure path PR #26 a5ee4c6"]
 fn task_78_5_pending_g1_combined_op_arg_and_outer_capture() {
     let src = "import std.io\n\
                \n\
