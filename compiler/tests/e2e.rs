@@ -5329,18 +5329,28 @@ fn task_117_let_bound_k_single_shot_resumes_with_arg() {
 #[test]
 fn task_117_let_bound_k_multi_shot_via_2_let_returns_3() {
     // Plan D Task 117 (continuation-surface) — multi-shot variant.
-    // `let f: Continuation = k; let r1 = f(true); let r2 = f(false);
-    // r1 + r2`. After desugar, the arm body is the existing Slice C
-    // 2-let multi-shot pattern: `let r1 = k(true); let r2 = k(false);
-    // r1 + r2`. Choose effect declared `resumes: many` to bypass
-    // the one-shot linearity check.
+    // `let f: Continuation[Bool, Int] = k; let r1 = f(true); let r2
+    // = f(false); r1 + r2`. After desugar, the arm body is the
+    // existing Slice C 2-let multi-shot pattern. Choose declared
+    // `resumes: many` to bypass the one-shot linearity check.
     //
-    // f(true) resumes k with true → Int branch returns 1.
-    // f(false) resumes k with false → Int branch returns 2.
+    // Body shape mirrors existing
+    // `slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_args`:
+    // `let b: Bool = perform Choose.flip(); if b { 1 } else { 2 }`
+    // (the LetBindThenTail shape Slice C's recognizer supports).
+    // Inline `if perform ...` body shape doesn't drive multi-shot
+    // through the synth-cont pair correctly.
+    //
+    // f(true) → helper returns 1.
+    // f(false) → helper returns 2.
     // r1 + r2 = 3.
     let src = "effect Choose resumes: many { flip: () -> Bool }\n\
-               fn run() -> Int ![] {\n  \
-                 handle (if perform Choose.flip() { 1 } else { 2 }) with {\n    \
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 if b { 1 } else { 2 }\n\
+               }\n\
+               fn run() -> Int ![IO] {\n  \
+                 handle helper() with {\n    \
                    Choose.flip(k) => {\n      \
                      let f: Continuation[Bool, Int] = k;\n      \
                      let r1: Int = f(true);\n      \
@@ -5357,8 +5367,8 @@ fn task_117_let_bound_k_multi_shot_via_2_let_returns_3() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "3\n",
-        "let-bound k multi-shot via 2-let: f(true) → 1, f(false) → 2, \
-         r1 + r2 = 3. stderr={stderr:?}"
+        "let-bound k multi-shot via 2-let: f(true) → helper(true) → 1, \
+         f(false) → helper(false) → 2, r1 + r2 = 3. stderr={stderr:?}"
     );
 }
 
