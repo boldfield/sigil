@@ -6272,18 +6272,16 @@ fn ty_display(t: &Ty) -> String {
         }
         Ty::Var(id) => format!("?{id}"),
         // Plan D Task 117 — render `Continuation` for diagnostics.
-        // No user-source surface produces this type, but it shows
-        // up in E0145 escape-barrier diagnostics and unification
-        // failures (e.g., trying to unify k with a `Ty::Fn` value).
-        // The `<scope=N>` annotation distinguishes continuations
-        // from different handles in error messages.
+        // No user-source surface produces this type. The scope_id
+        // is intentionally NOT rendered here: users have no mental
+        // model for "scope N" and can't remediate by writing the
+        // type they should have written. E0145 messages where the
+        // scope_id is load-bearing (cross-handle escape) include
+        // the numbers explicitly. Other diagnostics surface this
+        // type as just `Continuation(op_ret) -> ret`.
         Ty::Continuation(c) => {
-            let scope_str = match &c.scope_id {
-                ScopeId::Concrete(n) => format!("scope={n}"),
-                ScopeId::Var(id) => format!("scope=?{id}"),
-            };
             format!(
-                "Continuation<{scope_str}>({}) -> {}",
+                "Continuation({}) -> {}",
                 ty_display(&c.op_ret),
                 ty_display(&c.ret)
             )

@@ -239,12 +239,22 @@ thread_local! {
 
     /// Plan D Task 117 — push/pop relink discipline tracker.
     ///
-    /// Each `sigil_handle_push` records whether it actually linked
-    /// the frame (pushed to true) or skipped (pushed to false; the
+    /// Each entry is `(frame_ptr, did_link)`: the frame whose
+    /// push/pop pair this entry tracks, plus whether the push
+    /// actually linked the frame (`true`) or skipped (`false`; the
     /// frame was already on top of the handler stack — the
     /// "skip-if-on-top" case introduced by Task 117's let-bound k
     /// dispatch path). The matching `sigil_handle_pop` reads the
-    /// most recent flag and, on `false`, no-ops the unlink.
+    /// most recent entry, debug-asserts `entry.0 == HANDLER_STACK
+    /// head` (defense-in-depth against codegen bugs that desync
+    /// push/pop pairs across frames), then no-ops the unlink when
+    /// `did_link == false`.
+    ///
+    /// Why frame-keyed (Plan D Task 117 review feedback): a bool-
+    /// only counter caught COUNT-balanced unbalanced pairs (push X
+    /// 2× / pop X 2× across two different frames) silently. Frame-
+    /// keyed entries fail the debug_assert at the actual desync
+    /// site rather than three handler levels later.
     ///
     /// Why a per-thread stack: lower_k_pair_call's push/pop pair
     /// is re-entrant — `run_loop` between push and pop drives
@@ -252,16 +262,26 @@ thread_local! {
     /// body's continuation), each of which push/pops RELINK_STACK
     /// in their own scope. By the time lower_k_pair_call's pop
     /// runs, intermediate entries have been balanced and the top
-    /// of the stack is the matching push's flag.
+    /// of the stack is the matching push's entry.
     ///
-    /// Initial state: empty. Pop on empty defaults to `true`
-    /// (standard unlink) — preserves backwards-compatible behavior
-    /// for non-Task-117 callers (existing handle codegen pushes/
-    /// pops without going through the relink path; their pop on
-    /// an empty RELINK_STACK gets the standard semantics).
+    /// Initial state: empty. Pop on empty hard-`panic!`s in both
+    /// debug and release builds — see the comment at
+    /// `sigil_handle_pop`'s `unwrap_or_else` callsite for why this
+    /// is the right tradeoff.
     ///
-    /// **No GC root** — the Vec<bool> contains no heap pointers.
-    static RELINK_STACK: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    /// **GC reasoning**: The Vec buffer holds raw `*mut
+    /// HandlerFrame` pointers. The buffer itself is on Rust's
+    /// global allocator (not Boehm's heap), so its contents are
+    /// NOT conservatively scanned — frames are kept alive only via
+    /// HANDLER_STACK's registered GC root (see
+    /// `register_handler_stack_root_for_calling_thread`). This is
+    /// sound by invariant: every frame in RELINK_STACK is also
+    /// reachable from HANDLER_STACK because push/pop pairs balance
+    /// in lockstep across both stacks. A balance violation would
+    /// trip the `unwrap_or_else` panic or the debug_assert at the
+    /// pop site before the GC could observe the desync.
+    static RELINK_STACK: RefCell<Vec<(*mut HandlerFrame, bool)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Register the calling thread's `HANDLER_STACK` TLS cell as a Boehm
@@ -685,7 +705,7 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
         // skip-decision into RELINK_STACK so the matching pop is
         // also a no-op.
         if head == frame {
-            RELINK_STACK.with(|s| s.borrow_mut().push(false));
+            RELINK_STACK.with(|s| s.borrow_mut().push((frame, false)));
             return;
         }
         // Defensive against codegen bugs that double-push the same
@@ -702,7 +722,7 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
         );
         (*frame).prev = head;
         cell.set(frame);
-        RELINK_STACK.with(|s| s.borrow_mut().push(true));
+        RELINK_STACK.with(|s| s.borrow_mut().push((frame, true)));
     });
 }
 
@@ -728,25 +748,31 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
 pub unsafe extern "C" fn sigil_handle_pop() -> *mut HandlerFrame {
     // Plan D Task 117 — read the matching push's relink-decision
     // off RELINK_STACK. If the push was a no-op (frame was already
-    // on top), the matching pop must also no-op. Default-true on
-    // empty: preserves backwards-compatible standard-unlink for
-    // any caller that bypasses RELINK_STACK (test infrastructure
-    // or future callers that don't go through `sigil_handle_push`).
-    //
-    // Debug-mode assert catches the integration-bug case where a
-    // codegen path emits a pop without a matching push: silently
-    // returning `true` from the soft fallback masks the bug at
-    // runtime. Release builds keep the soft fallback so any
-    // legitimate caller that bypasses RELINK_STACK still works.
-    let did_link = RELINK_STACK.with(|s| {
-        let mut stack = s.borrow_mut();
-        debug_assert!(
-            !stack.is_empty(),
-            "sigil_handle_pop: RELINK_STACK underflow — every pop must follow a matching \
-             push from sigil_handle_push. If a debug build trips this, a codegen path is \
-             emitting handle_pop without a paired handle_push (or vice versa)."
-        );
-        stack.pop().unwrap_or(true)
+    // on top), the matching pop must also no-op. There are no
+    // current bypass callers — every push/pop site goes through
+    // `sigil_handle_push` / `sigil_handle_pop` — so an empty stack
+    // at pop time means the stacks have desynced (codegen-emitted
+    // pop without a matching push, panic unwind across a push, or
+    // a future control-flow primitive intercepting pop). With
+    // HANDLER_STACK non-empty (the underflow check below passes)
+    // but RELINK_STACK empty, a default-`true` would silently
+    // unlink a real frame with no record of why — exactly the
+    // corruption the design wants to prevent. Hard-panic in both
+    // debug and release builds so a desync surfaces where it
+    // happens, not three handler levels later.
+    let (recorded_frame, did_link) = RELINK_STACK.with(|s| match s.borrow_mut().pop() {
+        Some(entry) => entry,
+        None => {
+            eprintln!(
+                "sigil_handle_pop: RELINK_STACK underflow — every pop must follow a \
+                 matching push from sigil_handle_push. A pop without a matching push \
+                 indicates a codegen-emitted unbalanced pair, an unwind across a push, \
+                 or a missing RELINK_STACK update from a control-flow primitive. \
+                 Default-passthrough would silently unlink a real frame; aborting \
+                 surfaces the desync at the actual unbalance."
+            );
+            std::process::abort();
+        }
     });
     HANDLER_STACK.with(|cell| {
         let head = cell.get();
@@ -754,6 +780,24 @@ pub unsafe extern "C" fn sigil_handle_pop() -> *mut HandlerFrame {
             eprintln!("sigil_handle_pop: handler stack underflow");
             std::process::abort();
         }
+        // Plan D Task 117 — frame-keyed RELINK_STACK pairing
+        // assert. Pop time HEAD must equal the push-time recorded
+        // frame: invariant for both did_link branches (link case
+        // pushed frame and set HEAD=frame; skip case left HEAD
+        // alone but recorded frame == HEAD). A mismatch means
+        // intermediate push/pop pairs targeted different frames
+        // (a desync on the order of "pop X is matching pop Y" —
+        // bool-only counter would silently let count-balanced
+        // desyncs through). Debug-only; the production-codegen
+        // contract is balanced pairs, so a release build on
+        // verified codegen never trips this.
+        debug_assert_eq!(
+            recorded_frame, head,
+            "sigil_handle_pop: RELINK_STACK frame mismatch — push-time frame {:p} != \
+             pop-time HANDLER_STACK head {:p}. Push/pop pair desync; check codegen for \
+             unbalanced pairs across nested handles.",
+            recorded_frame, head
+        );
         if !did_link {
             // Skip-if-on-top counterpart: matching push was a no-op,
             // so pop is too. Return the current head unchanged

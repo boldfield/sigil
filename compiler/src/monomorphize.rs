@@ -103,7 +103,7 @@ use crate::ast::{
 };
 use crate::elaborate::AnfProgram;
 use crate::errors::Span;
-use crate::typecheck::{GenericInstantiation, Scheme, Ty};
+use crate::typecheck::{GenericInstantiation, Scheme, ScopeId, Ty};
 
 /// Plan B' Stage 6.8 Phase C++ — per-clone resolved
 /// `lambda_captures`. See `MonoProgram::lambda_captures_resolved`.
@@ -338,19 +338,34 @@ pub fn canon_ty(ty: &Ty) -> String {
             }
             s
         }
-        Ty::Continuation(_) => {
-            // Plan D Task 117 — Continuation values cannot reach
-            // monomorphize: the E0145 escape barrier rejects them
-            // from any cross-fn position (return type, fn-arg,
-            // record field, lambda capture). Mono descends into
-            // fn signatures, type-decl variant fields, and generic
-            // arg lists — none of which can carry a Continuation
-            // post-typecheck. If a Continuation reaches canon_ty,
-            // the escape barrier missed a site.
-            unreachable!(
-                "monomorphize::canon_ty: Ty::Continuation reached the canon-mangler — \
-                 typecheck E0145 should have rejected the cross-fn / cross-storage \
-                 site that allowed a Continuation to escape"
+        Ty::Continuation(c) => {
+            // Plan D Task 117 — defensive mangling per PR #60
+            // review (review 2 issue #2). Continuation MAY reach
+            // canon_ty via the bind_ty_var path: `id(k)` for
+            // generic `id[A](x: A) -> A` binds A → Continuation
+            // through the (Var, other) bind_ty_var arm in
+            // unify_ty (which doesn't fire E0145 — A=Continuation
+            // is exactly the same arm `let f = k` uses to alias
+            // k locally). Mono then clones `id$$Cont...` and
+            // canon_ty mangles the Continuation type-arg.
+            //
+            // Render to a stable string mirroring the Ty::Fn
+            // mangling: `Cont` + scope-id discriminator + op_ret
+            // + ret. ScopeId::Var is unreachable in Task 117 (a)
+            // — caller-side walkers (`apply_ty_inner`,
+            // `rename_ty`, `unify_ty`) all `unreachable!()` on
+            // Var; if one slips through, the canon_ty mangling
+            // would still be unique against any Concrete-id
+            // mangling so codegen-side mismatches surface as
+            // "unknown symbol" rather than name collision.
+            let scope = match &c.scope_id {
+                ScopeId::Concrete(n) => format!("Concrete{n}"),
+                ScopeId::Var(id) => format!("Var{id}"),
+            };
+            format!(
+                "Cont${scope}${}$Ret${}",
+                canon_ty(&c.op_ret),
+                canon_ty(&c.ret)
             )
         }
     }
@@ -1495,14 +1510,25 @@ impl Substitution {
                 // surface for first-class function values.
                 effect_row_var: sig.effect_row_var,
             })),
-            // Plan D Task 117 — Continuation values cannot reach
-            // mono-pass substitution: the E0145 escape barrier
-            // rejects them from any cross-fn site (return type,
-            // fn-arg, etc.) that mono would touch.
-            Ty::Continuation(_) => unreachable!(
-                "monomorphize::Substitution::apply_to_ty: Ty::Continuation reached mono \
-                 substitution — typecheck E0145 should have rejected the cross-fn site"
-            ),
+            // Plan D Task 117 — defensive forwarding per PR #60
+            // review (review 2 issue #2). Continuation MAY reach
+            // mono substitution via the bind_ty_var path: `id(k)`
+            // for generic `id[A](x: A) -> A` binds A → Continuation
+            // through the (Var, other) bind_ty_var arm in
+            // unify_ty (which doesn't fire E0145 — A=Continuation
+            // is exactly the same arm `let f = k` uses to alias k
+            // locally). Cloning `id$$Cont...` then walks the body
+            // and applies subst to A-references, hitting this
+            // arm. Recurse into op_ret/ret and rebuild
+            // (mirrors the Ty::Fn arm above) so a panic on user
+            // code never trips at this layer; downstream codegen
+            // is the appropriate place to surface "Continuation
+            // doesn't lower this way" if it ever matters.
+            Ty::Continuation(c) => Ty::Continuation(Box::new(crate::typecheck::ContinuationTy {
+                op_ret: self.apply_to_ty(&c.op_ret),
+                ret: self.apply_to_ty(&c.ret),
+                scope_id: c.scope_id.clone(),
+            })),
         }
     }
 
@@ -1573,14 +1599,36 @@ pub(crate) fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
             span: span.clone(),
         },
         Ty::Continuation(_) => {
-            // Plan D Task 117 — Continuation has no surface TypeExpr.
-            // The E0145 escape barrier prevents any cross-fn /
-            // cross-storage site from carrying a Continuation, so
-            // rendering a Continuation back to TypeExpr should be
-            // unreachable. If reached, the escape barrier missed.
+            // Plan D Task 117 — Continuation has no surface
+            // TypeExpr. Per PR #60 review 2 issue #2 deferred:
+            // the bind_ty_var path (`id(k)` for generic `id[A]`)
+            // still binds A=Continuation today (E0145 doesn't fire
+            // there because the same arm legitimately handles
+            // `let f = k`). canon_ty + Substitution::apply_to_ty
+            // were defensive-forwarded above to survive that path.
+            // ty_to_type_expr is the one site where defensive
+            // forwarding has no clean target — Continuation has no
+            // syntactic representation, so synthesizing a TypeExpr
+            // would just shift the panic downstream (codegen would
+            // fail to resolve a synthetic Named entry). Pin
+            // `unreachable!()` here with explicit acknowledgment
+            // of the gap; resolution is one of:
+            //   (a) close the bind_ty_var bypass — fire E0145 on
+            //       generic-instantiation-with-Continuation at
+            //       check_call's arg-unify before bind_ty_var
+            //       binds the param-var. Restrictive but precise.
+            //   (b) thread Continuation through TypeExpr via a
+            //       synthetic named form, then teach codegen to
+            //       resolve it.
+            // Both are PR #60 (b) territory — surfaced for Brian's
+            // direction in the PR thread.
             unreachable!(
                 "monomorphize::ty_to_type_expr: Ty::Continuation has no surface TypeExpr — \
-                 E0145 escape barrier should have rejected the cross-storage site"
+                 the bind_ty_var-via-generic-instantiation path (e.g. `id(k)`) reaches mono \
+                 today; canon_ty + Substitution::apply_to_ty defensive-forward, but \
+                 ty_to_type_expr has no clean synthetic target. Closing requires either \
+                 E0145-on-bind for generic instantiation or a synthetic Continuation \
+                 TypeExpr — see Task 117 (b)"
             )
         }
     }
