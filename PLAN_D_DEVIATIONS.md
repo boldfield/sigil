@@ -507,50 +507,66 @@ The pattern is "Slice C had latent bugs the primitive corpus masked." Plan B Tas
 
 **Implementing commit(s).** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical patterns rather than workarounds. Recognizer fix at `e889e89`; downstream free-var-walker fix at `e10d8b3`; verifier-output unswallow at `d43a671`; layout-template-skip at `574c74d`; monomorphize-builtin-synthesis at `dcd2c11`. Squash-merged at `037c300`.
 
-## 2026-05-01 — [DEVIATION Task 117] Ty::Continuation + escape barrier
+## 2026-05-01 — [DEVIATION Task 117] Ty::Continuation + escape barrier — CLOSED on substrate; positive capability deferred against language-design constraint
+
+**Status**: **CLOSED** on substrate. PR #60 squash-merged at `4b3f0b4` shipped the load-bearing user-visible capability — the escape barrier (E0145) backed by the Ty::Continuation type, ScopeId tagging, RELINK_STACK runtime discipline, and the bind_ty_var precision fix. The let-bound k *positive capability* (`let f = k; f(arg)`) the original brief described turned out to be unreachable under Sigil's mandatory let-annotation policy and is deferred against that language-design constraint.
 
 **Context.** Plan D Task 117 (first-class continuations) original intent was to "drop the k-as-value rejection; codegen treats `k` as a callable closure value" via lifted-lambda generalization (eta-expansion). Validation tests on PR #59 (`task_117_validation_*`, since removed) proved that approach dead — multi-shot through a let-bound lambda hits `sigil_handle_push: frame already linked` panic; multi-invocation post-pop segfaults; the existing `lower_k_pair_call` frame_ptr discipline is dynamic-extent under runtime constraints not observable from the type system.
 
-Brian's 2026-05-01 decision: fall back to **Ty::Continuation conservative ABI path**. Make `k` a first-class value with a distinct type the typechecker enforces dynamic-extent on; codegen and runtime stay structurally close to today's `lower_k_pair_call` substrate. Substrate stabilization (PR #59) cleared four latent v1 bugs that would have masked Task 117's actual capability work. This PR ships the capability on that clean baseline.
+Brian's 2026-05-01 decision: fall back to **Ty::Continuation conservative ABI path**. Make `k` a first-class value with a distinct type the typechecker enforces dynamic-extent on; codegen and runtime stay structurally close to today's `lower_k_pair_call` substrate. Substrate stabilization (PR #59) cleared four latent v1 bugs that would have masked Task 117's actual capability work. PR #60 shipped the substrate on that baseline.
 
-**Scope** (per Brian's pre-approved brief, sign-off 2026-05-01):
+### Shipped in PR #60 (`4b3f0b4`)
 
 1. **`Ty::Continuation { op_ret, ret, scope_id }`** — distinct type, NOT a `Ty::Fn`. `op_ret` is the parameter type (op's return), `ret` is `k(arg)`'s evaluation result (handler-overall), `scope_id` identifies the originating handle.
 
-2. **ScopeId enum** with `Concrete(u32)` and `Var(u32)` variants. Allocated per-handle at typecheck via `Tc::next_scope_id` + `fn fresh_scope_id` (mirrors `next_ty_var` / `fresh_ty_var`). **Task 117 (a) is Concrete-only**: `check_handle` is the sole producer and always allocates `ScopeId::Concrete(N)`. The `Var(u32)` variant exists in the enum but is structurally dead in (a) — no `Scheme.scope_vars` field, no `Tc.current_scope_subst`, no `apply_scope_id` exists yet; walkers (`unify_ty`, `rename_ty`, `apply_ty_inner`) `unreachable!()` on Var so a stray Var leaks loudly when region-polymorphism work begins. The Plan B Stage 5 row-var-infrastructure parallel — `Scheme.scope_vars` parallel to `row_vars`, `Tc.current_scope_subst` parallel to `current_row_var_subst`, `apply_scope_id` parallel to `apply_row` — is **deferred to Task 117 (b)** along with the lambda-captures-k inheritance work; (a) ships only the Concrete-only mechanism.
+2. **ScopeId enum** with `Concrete(u32)` and `Var(u32)` variants. Allocated per-handle at typecheck via `Tc::next_scope_id` + `fn fresh_scope_id`. PR #60 ships **Concrete-only**: `check_handle` is the sole producer; the `Var(u32)` variant exists for forward-compat with region-polymorphic schemes (Task 117 follow-up territory) but is structurally dead today — walkers (`unify_ty`, `rename_ty`, `apply_ty_inner`) `unreachable!()` on Var. The Plan B Stage 5 row-var-infrastructure parallel (`Scheme.scope_vars`, `Tc.current_scope_subst`, `apply_scope_id`) is NOT shipped — deferred against the same language-design constraint that blocks the positive capability (no surface for region-polymorphic continuation schemes).
 
-3. **Walker delta** at `compiler/src/codegen.rs:1556-1571`: drop the unconditional `Expr::Ident(k_name)` reject. Walker stays as defense-in-depth; typechecker is the authoritative barrier.
+3. **Typecheck escape barrier** with error code **E0145** (single code; uniform fix message "keep `k` inside the handle's arm body"). Coverage at HEAD `4b3f0b4`:
+   - Returning a `Ty::Continuation` from a fn whose return type is non-Continuation → broad arm in `unify_ty` (`compiler/src/typecheck.rs:2758`).
+   - Storing in a record/ctor field whose declared type is Fn-typed (or any non-Continuation) → broad arm.
+   - Passing as a fn-decl parameter typed non-Continuation → broad arm.
+   - Cross-handle (k-from-outer leaks into inner-handler-arm context) → specific `(ScopeId::Concrete(n), ScopeId::Concrete(m))` `n != m` arm in `unify_ty`.
+   - Generic-instantiation bypass (`id(k)` for `fn id[A](x: A) -> A`) → precision check at `check_call`'s arg-unify (`compiler/src/typecheck.rs:4403-4445`); fires E0145 before bind_ty_var binds A → Continuation.
 
-4. **Typecheck escape barrier** with new error code **E0145** (single code per Q3 decision; fix message uniform: "keep `k` inside the handle's arm body"). Rules:
-   - Returning a `Ty::Continuation` from a fn whose return type isn't `Ty::Continuation` of matching scope_id → E0145.
-   - Storing in any heap-allocated structure (record field, lambda env, list element) → E0145.
-   - Passing as a fn-decl parameter not typed `Ty::Continuation` of matching scope_id → E0145.
-   - Lambda capture of `k` → E0145.
+4. **Runtime skip-if-on-top** in `sigil_handle_push` / `sigil_handle_pop`: when `frame_ptr == HEAD.get()`, no-op the push (and skip the matching pop). RELINK_STACK is frame-keyed `Vec<(*mut HandlerFrame, bool)>` with `debug_assert_eq!(recorded_frame, head)` at pop and `eprintln! + abort` on underflow. Preserves the existing `lower_k_pair_call` frame_ptr discipline + protects against the original `frame_already_linked` panic for not-at-head double-push.
 
-5. **closure_convert minimal touch** — let-bound `let f = k` allocates a 2-slot local on the stack frame holding `(k_closure, k_fn)`. **No lambda-captures-k inheritance** (deferred indefinitely with Brian's v1-surface rationale; existing `ArmKPairCapture` discharge-with-lambda machinery for run_state continues to work as today).
+5. **Tests** (5 typecheck unit tests + 2 bind_ty_var precision tests at HEAD `4b3f0b4`): `k_returned_from_fn_with_non_continuation_ret_fires_e0145`, `k_passed_as_fn_arg_of_non_continuation_param_fires_e0145`, `k_stored_in_user_type_field_fires_e0145`, `cross_handle_k_unification_fires_e0145_with_scope_mismatch`, `ty_display_continuation_omits_scope_id`, `k_passed_to_generic_fn_param_fires_e0145`, `k_let_aliased_then_passed_to_generic_fn_fires_e0145`. The implicit RELINK_STACK regression coverage runs through every `lower_k_pair_call` push/pop in the existing run_state-style discharge-with-lambda suite (`state_example_canonical_run_state_returns_11`, `integration_bug2_*`, etc.).
 
-6. **Codegen let-bound k dispatch** — when `Expr::Call { callee: Ident(name) }` resolves to a let-binding of `Ty::Continuation` type, route through `lower_k_pair_call`'s emission shape with `(k_closure, k_fn)` loaded from the let-binding's stack location instead of the synth fn's closure record. Single emission path; no ABI bifurcation.
+### Deferred — positive capability (`let f = k; f(arg)`)
 
-7. **Runtime skip-if-on-top** in `sigil_handle_push` / `sigil_handle_pop` (gap 1 option b per the design brief): when `frame_ptr == HEAD.get()`, no-op the push (and skip the matching pop). Prevents the "frame already linked" panic for in-arm-body let-bound k invocations where the frame is still on top at dispatch time. Companion debug-asserts to track push/pop pairing.
+The original brief's items 5/6 (closure_convert let-bound k as 2-slot stack local + codegen `lower_call` dispatch via `lower_k_pair_call` analogue) and item 8-positive (positive `let f = k; f(arg)` tests single-shot + 2-let multi-shot) are **deferred indefinitely against a language-design constraint**:
 
-8. **Tests**:
-   - **Positive**: `let f = k; f(arg)` single-shot; `let f = k; let r1 = f(true); let r2 = f(false); r1 + r2` multi-shot via 2-let; arena-escape gate stays at 0 on a let-bound multi-shot benchmark.
-   - **Negative** (E0145): k stored in record field, k passed as fn-arg, k returned from fn (without matching scope_id), lambda capture of k.
+- **Sigil's mandatory let annotations** are a deliberate design tenet for an LLM-targeted compiled language: explicit types make source readable without running the typechecker, which the project's rigor model depends on. The parser requires `let name : type = expr;` (see `compiler/src/parser.rs:918` `parse_let_stmt` + grammar at `compiler/src/parser.rs:13`).
+- **`Ty::Continuation` is non-user-constructible** by design (typecheck.rs:97-105 doc): "there's no surface syntax that produces a `Ty::Continuation`. The only way for a value to have this type is via the typechecker's `check_handle` arm-processing... User code can `let f = k` to alias `k` (f inherits the Continuation type) but cannot write a Continuation type annotation."
+- These two tenets together preclude `let f = k` at the user surface: any annotation other than Continuation fires E0145 (broad arm); no Continuation annotation exists; relaxing the let-annotation policy would invert the readability tenet; adding surface syntax for Continuation contradicts the non-user-constructible design.
 
-**Out of scope for this PR**:
-- **PR (b) — "complete the E0145 escape barrier"** (queued, single PR per Brian's 2026-05-01 direction). Two deferrals from this PR are bundled there as one family:
-  - **Lambda-captures-k inheritance.** Per-scope_id permitted-capture analysis in `closure_convert::Lambda` capture-collection: a captured `Ty::Continuation` whose scope_id matches an enclosing handle currently-on-stack passes through into the lambda's env via the `ArmKPairCapture` discharge-with-lambda machinery (existing run_state pattern); a captured `Ty::Continuation` whose scope_id is NOT in the enclosing-handle stack fires E0145. PR (b) prep runs `rg '=>\s*fn\s*\(' ...` discharge-with-lambda audit before opening.
-  - **bind_ty_var generic-instantiation bypass.** Per-call-site precision check: when `check_call`'s arg-unify resolves a generic-fn param's `Ty::Var(A_id)` against an arg of `Ty::Continuation`, fire E0145 BEFORE bind_ty_var binds A → Continuation. This is the bind-site precision fix Brian called out — closes the path where `id(k)` for generic `id[A](x: A) -> A` propagates Continuation through generics. Doesn't touch the let-RHS path (`let f = k` unifies against a fresh local var, not a generic-fn-instantiation var; same arm but different parent context).
+**Resolution path**: requires a separate language-design decision relaxing one of the two tenets. None of the obvious fixes (Continuation surface syntax, let-without-annotation, special k-aliasing form) preserve the design rationale. Until such a decision is made, the positive capability remains permanently deferred.
 
-  **Packaged dependency**: the bind_ty_var deferral is only safe BECAUSE PR (a) ships the cross-type unification E0145 arm (`(Ty::Continuation(_), _) | (_, Ty::Continuation(_)) => E0145` in `unify_ty`, see `compiler/src/typecheck.rs:2758`). Without it, Continuation values produced by the bypass would surface as generic E0044 ("type mismatch") at downstream-use sites, with no escape-barrier framing. **If the cross-type arm slips for any reason (revert, refactor, future cleanup), pull bind_ty_var forward into PR (a) — they're a packaged dependency.**
+The codegen-walker delta at `compiler/src/codegen.rs:1635-1650` (drop the `Expr::Ident(k_name)` reject in `arm_body_walk`) is also deferred — without let-bound k surface, the walker reject has no false-positive surface to remove (typecheck E0145 is now the authoritative barrier; the walker reject is currently unreachable on user code but harmless as redundant defense-in-depth).
 
+### Out of scope
+
+- **PR (b) — lambda-captures-k inheritance + std/state migration breakage**: queued independently of this scoping decision. Lambda-captures-k inheritance via per-scope_id permitted-capture analysis in `closure_convert::Lambda` capture-collection. std/state migration to first-class `effect State[S]` was carried over from Plan B' Stage 6.8 / Plan C completion work.
 - `all_choices` / `first_choice` runtime-N dischargers (deferred to v3 indefinite-extent per Q1 decision).
 - Conditional/branched k-call (Plan D Task 118).
-- Plan B' Stage-6.8-followup carryover #1 (TLS multi-return) — Task 117 follow-up territory.
+- Plan B' Stage-6.8-followup carryover #1 (TLS multi-return).
 
-**Iteration budget** (per Brian's reset post-PR-#59): same as PR #59 — 2-3 surgical fixes for coupled invariants, hard stop at 5th-equivalent. Substrate is more stable now but expect 0-2 new gaps as the capability extends the chain.
+### Implementing commits (PR #60)
 
-**Branch**: `plan-d-task-117-continuation` (no `(a)` suffix; PR (b) is queued, not indefinitely deferred). Rebases off `main` at `037c300`.
+11 commits squash-merged at `4b3f0b4`:
+1. `5b5b902` — Foundation entry + PROGRESS update.
+2. `a4f2eef` — Runtime skip-if-on-top + initial RELINK_STACK.
+3. `a3de60f` — `Ty::Continuation` + `ScopeId` enum + walker boilerplate (237 LOC).
+4. `b442217` — `check_handle` binds k as Continuation; `check_call` Continuation dispatch.
+5. `3ae703f` — `slot_kind_for_ty(Ty::Continuation) = Closure` (CI iteration).
+6. `1219790` — `closure_convert` ArmKPairCapture detector accepts Continuation (CI iteration).
+7. `503308d` — Review #1 fold: E0145 broad arm + ScopeId::Var unreachable!() in 3 walkers.
+8. `6c6fb41` — Review #2 fold: ty_display scope omission + RELINK_STACK frame-keyed + abort underflow + mono defensive forwarding.
+9. `b5b6a5b` — DEVIATIONS reframe.
+10. `decb6d8` — Substrate tests + E0145 catalog entry.
+11. `2e487c9` — Review #3 fold: bind_ty_var bypass closed at check_call + revert mono defensive forwarding to unreachable!() (consistency restored) + dead Ty::Fn arm dropped in closure_convert + ScopeId derives + check_call comment + fresh_scope_id overflow assert.
 
-**Implementing commit(s).** [HEAD] foundation entry + PROGRESS update. Subsequent commits address each scope item in implementation order: runtime skip-if-on-top → Ty::Continuation type + ScopeId machinery → walker delta → escape barrier → closure_convert minimal touch → codegen let-bound k dispatch → tests → regression verification.
+**Iteration budget consumed** across PR #60: 3 surgical fixes for coupled invariants — within Brian's 2-3 budget per landing × 1 landing post-bypass-closure. Three review responses (`503308d`, `6c6fb41`, `2e487c9`'s polish folds) were quality work, not budget items.
+
+Three review rounds (boldfield as reviewer): substrate-quality issues, ty_to_type_expr panic surface (closed), and bind_ty_var bypass blocker (closed via check_call precision fix).
 
