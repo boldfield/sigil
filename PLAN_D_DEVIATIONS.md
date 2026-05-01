@@ -328,3 +328,35 @@ The original 1-2 sites estimate was based on a "discharge site only" closure pat
 
 **Implementing commit(s).** This entry + Tasks 71/72/73 closure-path updates in PLAN_C_DEVIATIONS.md + std/raise.sigil migration + handler-discharge/scheme-rename/subst-application fixes. PR `plan-d-stage-12-checkpoint`.
 
+## 2026-05-01 — [DEVIATION Task 117 split into 117a + 117b] Pre-authorized split surfaced before code-write
+
+**Context.** Plan D §74 pre-authorizes splitting Task 117 into 117a/117b/... if any of (a) diff exceeds Plan B' PR #38/#39 scope before smoke gate is reachable, (b) more than two distinct test-failure classes surface simultaneously, (c) the lifted-lambda closure-record discipline diverges from the existing N-chain `post_arm_k` substrate. **Stop and re-scope with the user** is reserved for cases where the split is unclear or the cluster requires an architectural lift not enumerated.
+
+A pre-execution recon (sigil/main `0ff2c3a`, branch `plan-d-task-117a`) identified that criterion (a) is structurally certain to fire if Task 117 is attempted as a single PR. The recon partitioned the smoke-gate work (`std/choose.sigil` `all_choices` discharger) into three structurally distinct mechanisms, each with independent ABI / closure-record discipline / test surface:
+
+1. **Lifted-lambda generalization** — drop the `Expr::Ident(k_name)` reject at `compiler/src/codegen.rs:1556-1571`; allow `k` to flow as a value through let-bindings inside the arm body, materialized as a closure-record-shaped value carrying `(k_closure, k_fn)` per the existing `ArmKPairCapture` (`compiler/src/closure_convert.rs:104-149`) + `lower_k_pair_call` substrate. The existing machinery (Plan B' Task 107 Phase B) handles this for syntactically-nested lambdas whose body calls `k(arg)`; this generalization extends to `let f = k; f(arg)` shape (k bound to a fn-typed local, then invoked indirectly).
+2. **k-stored-in-record** — k as a slot in a TAG_RECORD value (different layout / bitmap discipline from TAG_CLOSURE).
+3. **k-passed-as-fn-arg** — k flows through a regular fn-decl parameter slot. Mutates *callee signatures*, not just closure records.
+
+PR #38 (Task 97/98 N-chain post_arm_k) shipped a single mechanism with extensive deviations; PR #39 (Stage 6.8 followup) bundled six layered bugs and was the largest single PR in the project. Three structurally distinct mechanisms in one PR puts the diff comfortably past PR #39 scope.
+
+**Split scope:**
+
+- **Task 117a — lifted-lambda generalization** (this branch). Walker delta + closure_convert generalization (≈80% of substrate already in place via `ArmKPairCapture`) + minimal `lower_call` change. Acceptance: arena-escape gate (`arena_escape_count_is_zero_below_one_percent_ceiling` at `compiler/tests/e2e.rs:584-728`) stays at 0; existing tests pass; one new positive test (`k captured into fn-typed local then invoked indirectly`).
+- **Task 117b — k-stored-in-record + k-passed-as-fn-arg + smoke gate.** Builds on 117a's now-validated lifted-lambda generalization. New ABI for fn params taking k-pairs; new TAG_RECORD slot encoding for k-stored. Smoke gate: `all_choices` discharger compiles and runs against `std/choose.sigil`. Targeted tests: k-stored-in-record positive, k-as-fn-arg positive, arena-reset across N-resume chain.
+
+**Rationale for surfacing pre-execution rather than mid-PR.** The plan body's "stop and re-scope" trigger is reserved for cases where the split itself is unclear. The split above is clear (orthogonal mechanisms by k-shape; existing substrate disambiguates 117a vs 117b cleanly). Per `feedback_sigil_per_task_pr_cadence.md` ("default is one task per PR; bundling requires explicit per-session user authorization"), the split is the natural per-task cadence; bundling 117 as a single PR would require explicit user authorization, not the other way around.
+
+User authorized the split per session 2026-05-01 ("sounds good" on the surfaced split recommendation).
+
+**Closure paths:**
+
+- **Task 117a closure point**: `compiler/src/codegen.rs:1556-1571` (the `Expr::Ident(k_name)` reject in `arm_body_walk`); `compiler/src/closure_convert.rs:104-149` (`ArmKPairCapture` substrate).
+- **Task 117b closure point**: same `arm_body_walk` walker for the fn-arg / record-slot rejections; new closure-convert pass for fn-arg k-pair representation; new codegen path for record-slot dispatch.
+
+**Performance acceptance gate.** Plan D Task 117 acceptance gate (post-117 arena escape rate ≤ Plan B Task 60 baseline of 0% on single-shot, ≤ multi-shot driver's existing ceiling) applies to **117a's PR** in addition to 117b's. The split does not relax the perf gate; it just ships it twice (once per sub-PR).
+
+**Failure mode.** None at sigil/main today. The split lands as a PROGRESS / DEVIATIONS bookkeeping change.
+
+**Implementing commit.** This entry + `PLAN_D_PROGRESS.md` Task 117 status update splitting into 117a/117b. No code changes in foundation commit.
+

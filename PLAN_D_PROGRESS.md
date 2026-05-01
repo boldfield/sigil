@@ -77,8 +77,11 @@ Internal ordering: 114 must precede 115; 113 and 116 are independent.
 
 ## Stage 13 — Continuation lifts
 
-- Task 117 — First-class continuations (k-as-value). Highest-risk Plan D step; pre-authorized to split into 117a/117b/... per the plan's split-authority criteria.
-  - status: todo
+- Task 117 — First-class continuations (k-as-value). Pre-execution recon (2026-05-01) surfaced that the `all_choices` smoke gate requires three structurally distinct k-as-value mechanisms (lifted-lambda generalization, k-stored-in-record, k-as-fn-arg), each with independent ABI / closure-record / test surface. Split into 117a + 117b per Plan D §74 split-authority. User-authorized 2026-05-01. See `PLAN_D_DEVIATIONS.md` `[DEVIATION Task 117 split]`.
+  - **Task 117a** — Lifted-lambda generalization. Drop `Expr::Ident(k_name)` walker reject at `compiler/src/codegen.rs:1556-1571`; extend `ArmKPairCapture` substrate (Plan B' Task 107 Phase B) to handle `let f = k; f(arg)` shape (k bound to a fn-typed local, invoked indirectly). Acceptance: arena-escape gate (`arena_escape_count_is_zero_below_one_percent_ceiling` at `compiler/tests/e2e.rs:584-728`) stays at 0 + one new positive test.
+    - status: in-progress
+  - **Task 117b** — k-stored-in-record + k-passed-as-fn-arg + `all_choices` smoke gate. New ABI for fn params taking k-pairs; new TAG_RECORD slot encoding for k-stored. Builds on 117a's lifted-lambda substrate.
+    - status: todo (gated on 117a)
 - Task 118 — Conditional/branched k-call.
   - status: todo
 
