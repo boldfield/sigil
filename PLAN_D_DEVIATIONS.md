@@ -538,7 +538,12 @@ Brian's 2026-05-01 decision: fall back to **Ty::Continuation conservative ABI pa
    - **Negative** (E0145): k stored in record field, k passed as fn-arg, k returned from fn (without matching scope_id), lambda capture of k.
 
 **Out of scope for this PR**:
-- Lambda-captures-k inheritance (PR (b), queued — runs `rg '=>\s*fn\s*\(' ...` discharge-with-lambda audit at PR (b) prep).
+- **PR (b) — "complete the E0145 escape barrier"** (queued, single PR per Brian's 2026-05-01 direction). Two deferrals from this PR are bundled there as one family:
+  - **Lambda-captures-k inheritance.** Per-scope_id permitted-capture analysis in `closure_convert::Lambda` capture-collection: a captured `Ty::Continuation` whose scope_id matches an enclosing handle currently-on-stack passes through into the lambda's env via the `ArmKPairCapture` discharge-with-lambda machinery (existing run_state pattern); a captured `Ty::Continuation` whose scope_id is NOT in the enclosing-handle stack fires E0145. PR (b) prep runs `rg '=>\s*fn\s*\(' ...` discharge-with-lambda audit before opening.
+  - **bind_ty_var generic-instantiation bypass.** Per-call-site precision check: when `check_call`'s arg-unify resolves a generic-fn param's `Ty::Var(A_id)` against an arg of `Ty::Continuation`, fire E0145 BEFORE bind_ty_var binds A → Continuation. This is the bind-site precision fix Brian called out — closes the path where `id(k)` for generic `id[A](x: A) -> A` propagates Continuation through generics. Doesn't touch the let-RHS path (`let f = k` unifies against a fresh local var, not a generic-fn-instantiation var; same arm but different parent context).
+
+  **Packaged dependency**: the bind_ty_var deferral is only safe BECAUSE PR (a) ships the cross-type unification E0145 arm (`(Ty::Continuation(_), _) | (_, Ty::Continuation(_)) => E0145` in `unify_ty`, see `compiler/src/typecheck.rs:2758`). Without it, Continuation values produced by the bypass would surface as generic E0044 ("type mismatch") at downstream-use sites, with no escape-barrier framing. **If the cross-type arm slips for any reason (revert, refactor, future cleanup), pull bind_ty_var forward into PR (a) — they're a packaged dependency.**
+
 - `all_choices` / `first_choice` runtime-N dischargers (deferred to v3 indefinite-extent per Q1 decision).
 - Conditional/branched k-call (Plan D Task 118).
 - Plan B' Stage-6.8-followup carryover #1 (TLS multi-return) — Task 117 follow-up territory.
