@@ -8569,6 +8569,95 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         }
                         cp
                     };
+                    // Plan B Task 78.5 G1 iter 5 — bypass identity at
+                    // runtime when k_fn is identity (perform was made in
+                    // tail position of handle body via
+                    // `lower_perform_to_value` which sets k_fn=identity,
+                    // k_closure=null). identity ignores the trailing
+                    // pair and returns Done(args_ptr[0]) — so the
+                    // post-arm-k synth fn would never fire and the arm
+                    // body's `let r = k(arg); pure_tail` would never
+                    // produce its tail value.
+                    //
+                    // Discriminator: compare loaded k_fn_v against
+                    // identity's address. We can't statically know
+                    // which perform site supplied this arm-fn (the
+                    // arm-fn is dispatched via NextStep::Call from any
+                    // surrounding helper / inline-perform), so the
+                    // check is at runtime.
+                    //
+                    // - Identity branch: dispatch directly to the
+                    //   post-arm-k synth fn with arg_count=1, args
+                    //   = [widened_arg]. The post-arm-k synth fn binds
+                    //   r=widened_arg and runs pure_tail; no helper
+                    //   synth-cont in the chain to honor the trailing
+                    //   pair anyway, so bypass is sound.
+                    //
+                    // - Non-identity branch: the standard trailing-pair
+                    //   dispatch — Call(k_closure, k_fn, [arg, post_arm
+                    //   _k_closure, post_arm_k_fn]) with arg_count=3.
+                    //   The helper synth-cont reads the trailing pair
+                    //   and dispatches its result through it.
+                    //
+                    // The empty-captures path keeps working in both
+                    // branches: post_arm_k_closure_v is null, and the
+                    // post-arm-k synth fn's preamble loads zero
+                    // captures from a null closure_ptr (no loads
+                    // emitted when captures.is_empty()).
+                    let identity_addr_v = lowerer
+                        .builder
+                        .ins()
+                        .func_addr(pointer_ty, lowerer.continuation_identity_ref);
+                    let is_identity_v =
+                        lowerer
+                            .builder
+                            .ins()
+                            .icmp(IntCC::Equal, k_fn_v, identity_addr_v);
+                    let identity_block = lowerer.builder.create_block();
+                    let normal_block = lowerer.builder.create_block();
+                    let merge_block = lowerer.builder.create_block();
+                    lowerer.builder.append_block_param(merge_block, pointer_ty);
+                    lowerer.builder.ins().brif(
+                        is_identity_v,
+                        identity_block,
+                        &[],
+                        normal_block,
+                        &[],
+                    );
+
+                    // Identity branch: bypass identity, dispatch
+                    // directly to post_arm_k with arg_count=1.
+                    lowerer.builder.switch_to_block(identity_block);
+                    lowerer.builder.seal_block(identity_block);
+                    let one_v = lowerer.builder.ins().iconst(types::I32, 1);
+                    let call_ns_id = lowerer.builder.ins().call(
+                        next_step_call_ref,
+                        &[post_arm_k_closure_v, post_arm_k_fn_addr, one_v],
+                    );
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns_id));
+                    let ns_ptr_id = lowerer.builder.inst_results(call_ns_id)[0];
+                    let argp_call_id = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_args_ptr_ref, &[ns_ptr_id]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call_id));
+                    let argp_v_id = lowerer.builder.inst_results(argp_call_id)[0];
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        widened_arg,
+                        argp_v_id,
+                        POST_ARM_K_ARG_OFF,
+                    );
+                    lowerer.builder.ins().jump(merge_block, &[ns_ptr_id.into()]);
+
+                    // Non-identity branch: standard trailing-pair
+                    // dispatch with arg_count=3.
+                    lowerer.builder.switch_to_block(normal_block);
+                    lowerer.builder.seal_block(normal_block);
                     let three_v = lowerer.builder.ins().iconst(types::I32, 3);
                     let call_ns = lowerer
                         .builder
@@ -8604,7 +8693,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         argp_v,
                         POST_ARM_K_FN_OFF,
                     );
-                    ns_ptr
+                    lowerer.builder.ins().jump(merge_block, &[ns_ptr.into()]);
+
+                    // Merge block: the dispatched ns_ptr (either branch).
+                    lowerer.builder.switch_to_block(merge_block);
+                    lowerer.builder.seal_block(merge_block);
+                    let merged_ns_ptr = lowerer.builder.block_params(merge_block)[0];
+                    merged_ns_ptr
                 } else if let Some(arg_expr) = arm_body_tail_is_k_call(&synth.body, &synth.k_name) {
                     // --- Tail-`k(arg)` path ---
                     //
