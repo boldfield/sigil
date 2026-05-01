@@ -505,5 +505,47 @@ Plus: **verifier-output unswallow** (`d43a671`) — `format_define_failure` help
 
 The pattern is "Slice C had latent bugs the primitive corpus masked." Plan B Task 78.5 (Koka subset import — deferred to Plan C completion) was specifically scoped to surface this convergence-class blind spot; that import's deferral is what allowed all four to survive to Task 117.
 
-**Implementing commit(s).** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical patterns rather than workarounds. Recognizer fix at `e889e89`; downstream free-var-walker fix at `e10d8b3`; verifier-output unswallow at `d43a671`; layout-template-skip at `574c74d`; monomorphize-builtin-synthesis at `[HEAD]`.
+**Implementing commit(s).** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical patterns rather than workarounds. Recognizer fix at `e889e89`; downstream free-var-walker fix at `e10d8b3`; verifier-output unswallow at `d43a671`; layout-template-skip at `574c74d`; monomorphize-builtin-synthesis at `dcd2c11`. Squash-merged at `037c300`.
+
+## 2026-05-01 — [DEVIATION Task 117] Ty::Continuation + escape barrier
+
+**Context.** Plan D Task 117 (first-class continuations) original intent was to "drop the k-as-value rejection; codegen treats `k` as a callable closure value" via lifted-lambda generalization (eta-expansion). Validation tests on PR #59 (`task_117_validation_*`, since removed) proved that approach dead — multi-shot through a let-bound lambda hits `sigil_handle_push: frame already linked` panic; multi-invocation post-pop segfaults; the existing `lower_k_pair_call` frame_ptr discipline is dynamic-extent under runtime constraints not observable from the type system.
+
+Brian's 2026-05-01 decision: fall back to **Ty::Continuation conservative ABI path**. Make `k` a first-class value with a distinct type the typechecker enforces dynamic-extent on; codegen and runtime stay structurally close to today's `lower_k_pair_call` substrate. Substrate stabilization (PR #59) cleared four latent v1 bugs that would have masked Task 117's actual capability work. This PR ships the capability on that clean baseline.
+
+**Scope** (per Brian's pre-approved brief, sign-off 2026-05-01):
+
+1. **`Ty::Continuation { op_ret, ret, scope_id }`** — distinct type, NOT a `Ty::Fn`. `op_ret` is the parameter type (op's return), `ret` is `k(arg)`'s evaluation result (handler-overall), `scope_id` identifies the originating handle.
+
+2. **ScopeId enum** with `Concrete(u32)` and `Var(u32)` variants. Allocated per-handle at typecheck. **Reuses Plan B Stage 5 row-var infrastructure**: `Scheme.scope_vars: Vec<u32>` parallel to `row_vars`; `Tc.current_scope_subst` parallel to `current_row_var_subst`; `apply_scope_id` parallel to `apply_row`. Region-polymorphic functions work; region-monomorphic functions are unaffected.
+
+3. **Walker delta** at `compiler/src/codegen.rs:1556-1571`: drop the unconditional `Expr::Ident(k_name)` reject. Walker stays as defense-in-depth; typechecker is the authoritative barrier.
+
+4. **Typecheck escape barrier** with new error code **E0145** (single code per Q3 decision; fix message uniform: "keep `k` inside the handle's arm body"). Rules:
+   - Returning a `Ty::Continuation` from a fn whose return type isn't `Ty::Continuation` of matching scope_id → E0145.
+   - Storing in any heap-allocated structure (record field, lambda env, list element) → E0145.
+   - Passing as a fn-decl parameter not typed `Ty::Continuation` of matching scope_id → E0145.
+   - Lambda capture of `k` → E0145.
+
+5. **closure_convert minimal touch** — let-bound `let f = k` allocates a 2-slot local on the stack frame holding `(k_closure, k_fn)`. **No lambda-captures-k inheritance** (deferred indefinitely with Brian's v1-surface rationale; existing `ArmKPairCapture` discharge-with-lambda machinery for run_state continues to work as today).
+
+6. **Codegen let-bound k dispatch** — when `Expr::Call { callee: Ident(name) }` resolves to a let-binding of `Ty::Continuation` type, route through `lower_k_pair_call`'s emission shape with `(k_closure, k_fn)` loaded from the let-binding's stack location instead of the synth fn's closure record. Single emission path; no ABI bifurcation.
+
+7. **Runtime skip-if-on-top** in `sigil_handle_push` / `sigil_handle_pop` (gap 1 option b per the design brief): when `frame_ptr == HEAD.get()`, no-op the push (and skip the matching pop). Prevents the "frame already linked" panic for in-arm-body let-bound k invocations where the frame is still on top at dispatch time. Companion debug-asserts to track push/pop pairing.
+
+8. **Tests**:
+   - **Positive**: `let f = k; f(arg)` single-shot; `let f = k; let r1 = f(true); let r2 = f(false); r1 + r2` multi-shot via 2-let; arena-escape gate stays at 0 on a let-bound multi-shot benchmark.
+   - **Negative** (E0145): k stored in record field, k passed as fn-arg, k returned from fn (without matching scope_id), lambda capture of k.
+
+**Out of scope for this PR**:
+- Lambda-captures-k inheritance (PR (b), queued — runs `rg '=>\s*fn\s*\(' ...` discharge-with-lambda audit at PR (b) prep).
+- `all_choices` / `first_choice` runtime-N dischargers (deferred to v3 indefinite-extent per Q1 decision).
+- Conditional/branched k-call (Plan D Task 118).
+- Plan B' Stage-6.8-followup carryover #1 (TLS multi-return) — Task 117 follow-up territory.
+
+**Iteration budget** (per Brian's reset post-PR-#59): same as PR #59 — 2-3 surgical fixes for coupled invariants, hard stop at 5th-equivalent. Substrate is more stable now but expect 0-2 new gaps as the capability extends the chain.
+
+**Branch**: `plan-d-task-117-continuation` (no `(a)` suffix; PR (b) is queued, not indefinitely deferred). Rebases off `main` at `037c300`.
+
+**Implementing commit(s).** [HEAD] foundation entry + PROGRESS update. Subsequent commits address each scope item in implementation order: runtime skip-if-on-top → Ty::Continuation type + ScopeId machinery → walker delta → escape barrier → closure_convert minimal touch → codegen let-bound k dispatch → tests → regression verification.
 

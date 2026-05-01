@@ -77,8 +77,8 @@ Internal ordering: 114 must precede 115; 113 and 116 are independent.
 
 ## Stage 13 — Continuation lifts
 
-- Task 117 — First-class continuations (k-as-value). Single PR scope after design validation. Pre-execution recon raised an eta-expansion design (rewrite bare-k uses as `(fn x => k(x))` lifted lambdas, reuse Plan B' Task 107 Phase B substrate). Brian (2026-05-01) flagged the design as needing validation against three load-bearing scenarios — multi-shot through let-bound k, frame escape past handle pop, arena escape rate — before committing to it. The earlier 117a/117b split (recorded in this file's prior revision and in `PLAN_D_DEVIATIONS.md`) is **withdrawn**: the split's premise was "117a is mechanically simple, 117b verifies harder cases", which is dead now that 117b's harder cases may require codegen work the 117a design doesn't predict. See `PLAN_D_DEVIATIONS.md` `[DEVIATION Task 117 design validation]`.
-  - status: in-validation (no production code; three validation tests in flight)
+- Task 117 — First-class continuations (k-as-value). Eta-expansion design proven dead by validation (PR #59 prelude work, validation tests since removed). Falling back to **Ty::Continuation conservative ABI path** — distinct type the typechecker enforces dynamic-extent on; reuses Plan B Stage 5 row-var infrastructure for ScopeId machinery. Substrate stabilization landed in PR #59 (5 latent v1 bugs fixed + Sudoku smoke gate); capability work begins on a clean baseline. Branch: `plan-d-task-117-continuation` off `037c300`. See `PLAN_D_DEVIATIONS.md` `[DEVIATION Task 117] Ty::Continuation + escape barrier`.
+  - status: in-progress (foundation commit; capability implementation in flight)
 - Task 118 — Conditional/branched k-call.
   - status: todo
 
