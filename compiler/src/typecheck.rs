@@ -7037,6 +7037,25 @@ fn desugar_arm_body(body: &mut Expr, k_name: &str) {
     // PR #62 followup case (d) — top-level `let k: Int = ...`
     // shadow — is now subsumed by the recursive scan (top-level
     // Stmt::Let counts as a binder hit).
+    //
+    // PR #64 review #1 (acknowledged conservatism): the recursive
+    // scan refuses elision on ANY shadow in the arm body, even
+    // shadows in dead/parallel branches that don't reference the
+    // alias. E.g.,
+    //   let f: Cont = k;
+    //   if cond { let k: Int = 99; 0 } else { f(0) }
+    // refuses elision globally because the then-branch shadows
+    // `k`, even though the alias `f` is only used in the else-
+    // branch (where elision would be safe). Acceptable for v1
+    // (correctness-via-conservatism); the precise refinement
+    // (only refuse if the alias is *referenced* inside a shadowed
+    // sub-scope) requires per-scope use analysis.
+    //
+    // The pre-scan also walks the arm body in addition to the
+    // rewrite walk in `apply_subst_to_block` / `apply_subst_to_-
+    // expr` — two passes per arm body. Negligible at v1 program
+    // sizes; combine into a single pass if it shows up in
+    // profiles.
     if arm_body_shadows_k_name(body, k_name) {
         return;
     }
@@ -7049,15 +7068,12 @@ fn desugar_arm_body(body: &mut Expr, k_name: &str) {
     let raw_stmts = std::mem::take(&mut block.stmts);
     for s in raw_stmts {
         match s {
-            Stmt::Let(l) if is_let_bound_continuation(&l, k_name) && !subst.is_empty() => {
-                // Edge case: nested `let f: Continuation = k; let f:
-                // Continuation = k` — the second let collapses into
-                // the same alias. We just keep the latest entry
-                // (semantically equivalent; both alias k).
-                subst.insert(l.name, k_name.to_string());
-            }
+            // Elide `let <alias>: Continuation[..] = k`; record the
+            // alias name in subst. Re-`let`-of-an-alias-name is
+            // handled by `subst.insert` overwriting the prior
+            // binding (both aliases point at the same k_name —
+            // semantically equivalent).
             Stmt::Let(l) if is_let_bound_continuation(&l, k_name) => {
-                // Elide the let-stmt; record the substitution.
                 subst.insert(l.name, k_name.to_string());
             }
             mut s => {
@@ -7137,6 +7153,15 @@ fn apply_subst_to_stmt(s: &mut Stmt, subst: &BTreeMap<String, String>) {
 /// - `Expr::Block` — let-stmt-by-let-stmt narrowing in
 ///   `apply_subst_to_block` handles the in-block shadowing case.
 fn apply_subst_to_expr(e: &mut Expr, subst: &BTreeMap<String, String>) {
+    // PR #64 review #2 R6 (empty-subst short-circuit asymmetry):
+    // mirror the short-circuit in `apply_subst_to_block` so each
+    // recursive descent into a sub-Expr also exits early on empty
+    // subst. Avoids `filter_subst`'s `BTreeMap` clone at every
+    // Lambda/Match/Handle binder boundary when there's nothing to
+    // substitute.
+    if subst.is_empty() {
+        return;
+    }
     match e {
         Expr::Ident(name, _) => {
             if let Some(target) = subst.get(name) {
@@ -12068,79 +12093,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shadowing_hygiene_lambda_param_shadows_k_name_does_not_dangle_f_reference() {
-        // PR #63 review #1 (HIGH): a lambda param shadowing the
-        // arm's `k_name` (not the alias `f`) caused `filter_subst`
-        // to drop the `f → k` entry inside the lambda body, but
-        // the elision of `let f = k` already committed at the top
-        // of `desugar_arm_body`. Result: `f` reference inside the
-        // lambda body became a dangling free-var (the let-stmt was
-        // gone; substitution didn't fire). Post-fix: recursive
-        // pre-scan detects the lambda-param-shadows-k_name pattern
-        // and refuses all elision; original AST reaches codegen;
-        // codegen-walker rejects with the v1-restriction message.
-        //
-        // Test asserts typecheck does NOT corrupt the AST. A
-        // closure_convert / unbound-capture panic would indicate
-        // the elision committed without the substitution following
-        // through.
-        let src = "effect Raise { fail: () -> Int }\n\
-                   fn run() -> Int ![] {\n\
-                     handle 0 with {\n\
-                       Raise.fail(k) => {\n\
-                         let f: Continuation[Int, Int] = k;\n\
-                         (fn (k: Int) -> Int ![] => f + 1)(0)\n\
-                       },\n\
-                     }\n\
-                   }\n\
-                   fn main() -> Int ![] { run() }\n";
-        let errs = pipeline(src);
-        // Pre-fix: lambda-body `f` was a dangling free-var post-
-        // desugar; closure_convert would either panic or surface
-        // an unbound-capture error. Post-fix: recursive pre-scan
-        // refuses elision; typecheck clean (lambda body's `f` is
-        // still bound to the let-stmt's Continuation).
-        // No E0046 ("unknown identifier") expected for `f` —
-        // would indicate the let-stmt was elided despite the
-        // sub-scope shadow.
-        assert!(
-            !has_code(&errs, "E0046"),
-            "lambda param shadowing k_name must NOT cause the let-bound \
-             continuation alias to dangle (no E0046 for the alias name): {errs:?}"
-        );
-    }
-
-    #[test]
-    fn shadowing_hygiene_chained_aliases_typecheck_cleanly() {
-        // PR #63 review #2 (Medium): chained aliases `let f: Cont
-        // = k; let g: Cont = f` weren't recognized by the desugar
-        // (the second let's RHS check was against the original
-        // `Expr::Ident("f")`, not the post-substitution
-        // `Expr::Ident("k")`). The substitute-then-recheck fix
-        // recognizes the chain and elides both lets, ending with
-        // the existing Slice B/C-supported shape.
-        let src = "effect Raise { fail: () -> Int }\n\
-                   fn run() -> Int ![] {\n\
-                     handle 0 with {\n\
-                       Raise.fail(k) => {\n\
-                         let f: Continuation[Int, Int] = k;\n\
-                         let g: Continuation[Int, Int] = f;\n\
-                         g(42)\n\
-                       },\n\
-                     }\n\
-                   }\n\
-                   fn main() -> Int ![] { run() }\n";
-        let errs = pipeline(src);
-        // Both lets should desugar cleanly. No E0145 / E0044 from
-        // a botched substitution; no E0046 from a missed elision.
-        assert!(
-            !has_code(&errs, "E0145") && !has_code(&errs, "E0044") && !has_code(&errs, "E0046"),
-            "chained Continuation aliases (let g: Cont = f for prior `let f: \
-             Cont = k`) must typecheck cleanly: {errs:?}"
-        );
-    }
-
+    // Note: PR #63 review #1 (dangling-reference) and review #2's
+    // chained-aliases case land as e2e tests in
+    // `compiler/tests/e2e.rs` rather than typecheck-pipeline tests
+    // here. PR #64 review #1 correctly flagged that pipeline-level
+    // assertions can't pin these regressions: the pre-fix bugs
+    // manifest in closure_convert / codegen-walker, which
+    // `pipeline()` doesn't run. e2e drives the binary so the
+    // codegen-walker rejection (or successful run) is observable.
+    // See `task_117_let_bound_k_alias_then_match_pattern_shadows_k_*`
+    // and `task_117_let_bound_k_chained_aliases_*` in tests/e2e.rs.
+    //
     // Note: PR #62 review case (d) — `let k: Int = 99` shadowing
     // the arm's `k` inside the same arm body — is currently gated
     // at `Tc::env_insert`'s debug_assert (resolve.rs has a gap and

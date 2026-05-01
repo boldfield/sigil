@@ -994,9 +994,8 @@ pub const CATALOG: &[ErrorEntry] = &[
                surface form (`Continuation[op_ret, ret]` names a \
                handler arm's `k` binding type — see error E0145's \
                long-form for the surrounding mechanism). User type \
-               declarations cannot use this name; `ty_from_type_-
-               expr_with_rows`'s Apply special case for \
-               `Continuation` would silently shunt every reference \
+               declarations cannot use this name; the typecheck \
+               surface-form path would silently shunt every reference \
                into the surface-form path, ignoring the user-\
                declared type, and outside a handler arm body the \
                user would see a misleading E0145 (\"Continuation \

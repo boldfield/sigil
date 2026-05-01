@@ -5435,6 +5435,118 @@ fn task_117_let_bound_k_inside_if_branch_rejected_by_walker() {
 }
 
 #[test]
+fn task_117_let_bound_k_chained_aliases_runs_cleanly() {
+    // PR #64 review #2 — real regression test for chained aliases
+    // (PR #63's substitute-then-recheck fix). `let f: Cont = k;
+    // let g: Cont = f; g(42)` post-desugar collapses to the basic
+    // tail-`k(arg)` shape via two elisions. Pre-fix, the second
+    // let-stmt's RHS check fired against the original `Ident("f")`
+    // — desugar substituted RHS to `Ident("k")` but didn't
+    // re-detect the alias shape. Post-desugar AST stayed `let g:
+    // Cont = k; g(42)`, codegen-walker rejected bare `k` in
+    // let-RHS. Test asserts the program compiles + runs + returns
+    // 42 — only possible with the substitute-then-recheck.
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn run() -> Int ![] {\n  \
+                 handle perform Raise.fail() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let f: Continuation[Int, Int] = k;\n      \
+                     let g: Continuation[Int, Int] = f;\n      \
+                     g(42)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_117_chained_aliases");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "chained aliases `let f = k; let g = f; g(42)` must compile + run + \
+         return 42 (proves both elisions happened via substitute-then-recheck): \
+         stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn task_117_let_bound_k_alias_then_match_pattern_shadows_k_rejected_at_walker() {
+    // PR #64 review #1 — real regression test for the dangling-
+    // reference fix (PR #63's recursive pre-scan). Source has a
+    // match arm pattern `Some(k)` shadowing the arm's k_name.
+    // Typecheck is clean (the alias `f` is in scope and used
+    // inside the match arm body).
+    //
+    // Pre-fix (PR #63 final): top-level pre-scan only checked
+    // top-level stmts; the inner Some-arm pattern shadow was not
+    // detected. Desugar elided `let f = k`, then `apply_subst_to_-
+    // expr`'s Match arm narrowed the subst (drops `f → k` because
+    // pattern bindings include `k`), so `f(0)` in the match arm
+    // body STAYED as `f(0)`. Post-desugar AST: `match Some(7) {
+    // Some(k) => f(0), None => 0 }` — `f` references the elided
+    // let-binding (now undefined). codegen would panic on
+    // `unknown ident f`.
+    //
+    // Post-fix (PR #64 recursive pre-scan): walker finds the
+    // Some-arm pattern shadow of k_name, refuses all elision.
+    // Original AST preserved; codegen-walker catches the
+    // surviving let-Continuation shape with the v1-restriction
+    // message. Test asserts the compile fails with that specific
+    // message (NOT a codegen panic).
+    let src = "type Maybe = | None | Some(Int)\n\
+               effect Raise { fail: () -> Int }\n\
+               fn run() -> Int ![] {\n  \
+                 handle perform Raise.fail() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let f: Continuation[Int, Int] = k;\n      \
+                     match Some(7) {\n        \
+                       Some(k) => f(0),\n        \
+                       None => 0,\n      \
+                     }\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![] { run() }\n";
+
+    // Drive sigil binary directly (compile_and_run panics on
+    // compile failure).
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_task_117_alias_match_shadow_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&src_path, src).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_task_117_alias_match_shadow_bin_{}",
+        std::process::id()
+    ));
+    let compile = std::process::Command::new(sigil_binary())
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(workspace_root())
+        .output()
+        .expect("failed to invoke sigil compiler");
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    let stderr = String::from_utf8_lossy(&compile.stderr).into_owned();
+
+    assert!(
+        !compile.status.success(),
+        "match-arm pattern shadowing k_name with let-bound alias must NOT \
+         silently miscompile (pre-fix: codegen panic on undefined `f`); \
+         compile succeeded with stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("top level of a handler arm body"),
+        "rejection must come from the codegen-walker's v1-restriction message \
+         (post-fix: recursive pre-scan refuses elision; original AST reaches \
+         walker). A panic-style stderr would indicate the pre-fix dangling-ref \
+         bug; got stderr={stderr:?}"
+    );
+}
+
+#[test]
 fn handle_with_return_arm_inside_match_arm_compiles() {
     // Plan B Task 55 (Phase 4g) review-fix #2: regression test
     // for the `Lowerer::type_of_expr` `Expr::Handle` arm not
