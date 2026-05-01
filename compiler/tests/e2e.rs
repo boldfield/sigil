@@ -8101,48 +8101,42 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 // new pattern lands as its own PR with one e2e test (and possibly an
 // example) so any surfaced bug ships as its own followup PR.
 
-/// **Task 78.5 — Generator with collecting handler [PENDING `_pending_slice_b_captures_bearing_post_arm_k`].**
+/// **G1 representative test — Generator with collecting handler.**
 ///
+/// Pinned shape: **G1 variant 1 — op-arg in post-arm-k tail.**
 /// Source pattern: `koka/test/algeff/common.kk` lines 108–125 (the
 /// `yield` effect + `iterate` producer; the `foreach` consumer
 /// variant is inexpressible in sigil v1 per Task 64 deviation, so the
 /// port substitutes a list-collecting handler).
 ///
-/// ## Status
+/// ## Status — gap representative for G1 variant 1 of 4
 ///
 /// **`#[ignore]`'d**: surfaced a real codegen gap in PR #66 CI (commit
 /// `2ab80f8`). The arm body `let rest: List[Int] = k(0); Cons(x, rest)`
 /// references op-arg `x` in the post-k tail. Slice B's post-arm-k
 /// synth-fn machinery only supports tails that reference the
-/// let-binding (`rest`) or globals; op-arg / outer-scope captures into
-/// the synth fn require a captures-bearing extension parallel to PR
-/// #26's commit `a5ee4c6` (which added captures-bearing slice to the
-/// helper synth-cont — the `let x = perform; let y = perform; tail`
-/// shape). The same lift applied to the post-arm-k synth fn closes
-/// this and the full underlying-gap coverage below.
+/// let-binding (`rest`) or globals.
 ///
-/// ## Full underlying-gap coverage (audit-lesson characterization)
+/// **G1 has 4 distinct tail-shape variants**, each pinned by its own
+/// `#[ignore]`'d representative in this section so the captures-bearing
+/// fix PR can un-ignore them as it lands each shape (per reviewer ask
+/// "while codegen context is fresh, pin all four"):
 ///
-/// Slice B's post-arm-k synth fn restriction rejects ALL of these tail
-/// shapes today; the corpus accidentally avoided them by always writing
-/// tails that reference only the let-binding:
+/// 1. **Op-arg in post-k tail** — `task_78_5_pending_g1_op_arg_*` (this test)
+/// 2. **Outer-fn-scope let in post-k tail** — `task_78_5_pending_g1_outer_let_*`
+/// 3. **Outer fn-param in post-k tail** — `task_78_5_pending_g1_outer_fn_param_*`
+/// 4. **Combined op-arg + outer-capture in tail** — `task_78_5_pending_g1_combined_*`
 ///
-/// 1. **Op-arg in post-k tail** — `let r = k(arg); fn_of(op_arg, r)`
-///    (this test).
-/// 2. **Outer-fn-scope let in post-k tail** — `let f = 7; handle ...
-///    { Eff.op(_, k) => let r = k(0); r + f }`.
-/// 3. **Outer fn-param in post-k tail** — `fn outer(t: Int) { handle ...
-///    { Eff.op(_, k) => let r = k(0); r + t } }`.
-/// 4. **Combined op-arg + outer-capture in tail** — composed gap.
+/// ## Closure path (PR #26 `a5ee4c6` precedent)
 ///
-/// **Closure path** (PR #26 `a5ee4c6` precedent): mirror the
-/// helper-synth-cont's captures-bearing slice — at the post-arm-k synth
-/// fn build site (`compiler/src/codegen.rs` Slice B materialisation),
-/// detect free vars in the post-k tail beyond `{let_binding, globals}`,
-/// add them to the synth fn's closure record alongside the existing
-/// let-binding slot. Ne&w synth-fn entry rebinds them via ClosureEnvLoad.
+/// Mirror the helper-synth-cont's captures-bearing slice — at the
+/// post-arm-k synth fn build site (`compiler/src/codegen.rs` Slice B
+/// materialisation), detect free vars in the post-k tail beyond
+/// `{let_binding, globals}`, add them to the synth fn's closure record
+/// alongside the existing let-binding slot. New synth-fn entry rebinds
+/// them via ClosureEnvLoad.
 ///
-/// ## Why it's novel for sigil
+/// ## Why this test is novel for sigil
 ///
 /// 1. **Recursive perform under a handler.** `iterate(xs)` calls
 ///    itself in the `Cons` arm after each `perform Gen.yield(x)`.
@@ -8157,8 +8151,8 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 ///
 /// **Invariant** (post-fix): stdout = `"3\n"`, exit 0.
 #[test]
-#[ignore = "Slice B post-arm-k synth fn rejects op-arg / outer-scope captures in post-k tail; closure path: PR #26 a5ee4c6 captures-bearing slice extension"]
-fn task_78_5_generator_collect_pending_slice_b_captures_bearing() {
+#[ignore = "G1 variant 1: Slice B post-arm-k synth fn rejects op-arg in post-k tail; closure path PR #26 a5ee4c6 captures-bearing slice extension"]
+fn task_78_5_pending_g1_op_arg_in_post_arm_k_tail() {
     let src = "import std.list\n\
                import std.io\n\
                \n\
@@ -8194,6 +8188,122 @@ fn task_78_5_generator_collect_pending_slice_b_captures_bearing() {
         stdout, "3\n",
         "generator should yield 3 elements collected into List[Int]; \
          stderr={stderr:?}"
+    );
+}
+
+/// **G1 variant 2 — outer-fn-scope let in post-arm-k tail.**
+///
+/// Pinned shape (constructed, not Koka-imported): `let factor: Int = 7;
+/// handle ... { Eff.fail(k) => let r: Int = k(0); r + factor }`. The
+/// post-k tail references `factor`, an outer-fn-scope let binding that
+/// is neither the let-binding (`r`) nor a global. Same root cause as G1
+/// variant 1; codegen rejects with the same Slice B captures-bearing
+/// diagnostic.
+///
+/// **Invariant** (post-fix): stdout = `"7\n"`, exit 0.
+#[test]
+#[ignore = "G1 variant 2: Slice B post-arm-k synth fn rejects outer-fn-scope let in post-k tail; closure path PR #26 a5ee4c6"]
+fn task_78_5_pending_g1_outer_let_in_post_arm_k_tail() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { fail: () -> Int }\n\
+               \n\
+               fn run() -> Int ![] {\n  \
+                 let factor: Int = 7;\n  \
+                 handle perform Eff.fail() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r + factor\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pending_g1_outer_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "outer-let in tail post-fix should yield 7; stderr={stderr:?}"
+    );
+}
+
+/// **G1 variant 3 — outer fn-param in post-arm-k tail.**
+///
+/// Pinned shape (constructed, not Koka-imported): `fn run(threshold:
+/// Int) -> Int ![] { handle ... { Eff.fail(k) => let r: Int = k(0); r +
+/// threshold } }`. The post-k tail references `threshold`, an outer
+/// fn-param that is neither the let-binding (`r`) nor a global. Same
+/// root cause as G1 variants 1 + 2; codegen rejects with the same
+/// Slice B captures-bearing diagnostic.
+///
+/// **Invariant** (post-fix): stdout = `"7\n"`, exit 0.
+#[test]
+#[ignore = "G1 variant 3: Slice B post-arm-k synth fn rejects outer fn-param in post-k tail; closure path PR #26 a5ee4c6"]
+fn task_78_5_pending_g1_outer_fn_param_in_post_arm_k_tail() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { fail: () -> Int }\n\
+               \n\
+               fn run(threshold: Int) -> Int ![] {\n  \
+                 handle perform Eff.fail() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r + threshold\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run(7)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pending_g1_outer_fn_param");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "outer fn-param in tail post-fix should yield 7; stderr={stderr:?}"
+    );
+}
+
+/// **G1 variant 4 — combined op-arg + outer-capture in post-arm-k tail.**
+///
+/// Pinned shape (constructed, not Koka-imported): `fn run(threshold:
+/// Int) -> Int ![] { handle ... { Eff.go(arg, k) => let r: Int = k(0);
+/// r + arg + threshold } }`. Combines variants 1 (op-arg `arg`) + 3
+/// (outer fn-param `threshold`) in one tail. The captures-bearing fix
+/// must thread BOTH into the synth fn's closure record; pinning this
+/// composed shape pre-empts a partial fix that handles only one
+/// capture kind.
+///
+/// **Invariant** (post-fix): stdout = `"17\n"`, exit 0 (10 + 0 + 7).
+#[test]
+#[ignore = "G1 variant 4: Slice B post-arm-k synth fn rejects combined op-arg + outer-capture in post-k tail; closure path PR #26 a5ee4c6"]
+fn task_78_5_pending_g1_combined_op_arg_and_outer_capture() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { go: (Int) -> Int }\n\
+               \n\
+               fn run(threshold: Int) -> Int ![] {\n  \
+                 handle perform Eff.go(10) with {\n    \
+                   Eff.go(arg, k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r + arg + threshold\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run(7)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pending_g1_combined");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "17\n",
+        "combined op-arg + outer-capture post-fix should yield 17; stderr={stderr:?}"
     );
 }
 
@@ -8409,23 +8519,40 @@ fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
 /// effects)`, `unify_row(closed [State], closed [Raise,State,
 /// ArithError,IO])` fires E0128 at 2942/2970.
 ///
-/// ## Closure path
+/// ## Closure path — recommended option (1)
 ///
-/// Two-pronged fix at typecheck.rs:
-/// 1. Lambda construction should inherit the enclosing fn's row
-///    variable: resolve `effect_row_var` name through
-///    `current_row_var_subst` at lambda construction (mirroring the
-///    inner-fn-type resolution at line 6493).
-/// 2. AND/OR let-annotation→RHS should use asymmetric `subsume_row`-
+/// Two-pronged fix at typecheck.rs. Reviewer preference: (1) first.
+///
+/// 1. **Lambda construction inherits the enclosing fn's row variable:
+///    resolve `effect_row_var` name through `current_row_var_subst` at
+///    lambda construction (mirroring the inner-fn-type resolution at
+///    line 6493).** Smaller blast radius — single-site change at
+///    typecheck.rs:4328+4743 plus one lookup. **Recommended; land
+///    first.**
+/// 2. AND/OR let-annotation→RHS uses asymmetric `subsume_row`-
 ///    direction logic so the annotation's open row absorbs the
 ///    closed RHS's effects without binding the row var to closed.
+///    Broader — touches `unify_row` direction semantics across all
+///    let-annot→RHS sites, not just lambda-shaped RHS. Revisit
+///    only if some V-variant requires it after (1) lands.
+///
+/// ## Note on the typed-let raise() workaround
+///
+/// The `if y == 0 { let _r: Int = raise(...); _r } else { x / y }`
+/// shape sidesteps a SEPARATE smaller gap (G3) where per-op fresh A
+/// from `raise[A, E]` doesn't propagate through nested if-branch
+/// unification at expression position. See
+/// `task_78_5_pending_g3_raise_in_if_branch_expr_position_polymorphism`
+/// for the isolated G3 pin. The workaround is acceptable here because
+/// G2.b is the test's primary purpose; once G3 closes the workaround
+/// can be removed.
 ///
 /// **Invariant** (post-fix): `Div(Div(IntE(16), IntE(2)), IntE(3))`
 /// → `(16/2)/3 = 2`. tick prints once per Div node; final value 2.
 /// stdout = `"tick\ntick\n2\n"`, exit 0.
 #[test]
-#[ignore = "G2.b: lambda typing drops parsed effect_row_var (typecheck.rs:4328/4743); symmetric let-annot unify_row collapses outer row var to closed empty"]
-fn task_78_5_multi_effect_interpreter_pending_row_poly_lambda_drops_effect_row_var() {
+#[ignore = "G2.b: lambda typing drops parsed effect_row_var (typecheck.rs:4328/4743); symmetric let-annot unify_row collapses outer row var to closed empty. Recommended fix: option (1) — lambda inherits enclosing row var via current_row_var_subst lookup"]
+fn task_78_5_pending_g2b_lambda_drops_effect_row_var() {
     let src = "import std.raise\n\
                import std.result\n\
                import std.io\n\
@@ -8479,6 +8606,83 @@ fn task_78_5_multi_effect_interpreter_pending_row_poly_lambda_drops_effect_row_v
     );
 }
 
+/// **G3 representative test — expression-position polymorphism in if-branch.**
+///
+/// Pinned shape (constructed, not Koka-imported): `if b { raise("nope")
+/// } else { 42 }` where `raise[A, E](e: E) -> A ![Raise[E]]`. The
+/// per-op fresh A from `raise` should infer to `Int` from the else
+/// branch's `42` literal, but typecheck fires **E0063 "if branches
+/// have incompatible types: then is `?N` but else is `Int`"** before
+/// the cross-branch unification can pin A.
+///
+/// ## Status — gap representative for G3 (own gap, surfaced by Task 78.5)
+///
+/// **`#[ignore]`'d**: surfaced from the multi-effect interpreter port
+/// (G2.b test above) when a `raise` call appears in expression position
+/// inside an if-branch. The workaround `let _r: Int = raise(...); _r`
+/// converts the expression to a let-binding and pins A via ascription.
+/// The workaround is acceptable in practice but G3 is a real
+/// **expression-position polymorphism inference gap** distinct from
+/// G2.a / G2.b — it lives in the if-branch unification path, not the
+/// row-poly call-site path.
+///
+/// ## G3 root site
+///
+/// `compiler/src/typecheck.rs` if-branch unification — likely
+/// `check_if` or the `match`-arm cross-branch unify entry. Fires
+/// E0063 before the per-op A from `raise[A, E]` is bound. The
+/// expected behavior: cross-branch unify at the if's join point
+/// should drive A := Int from the else branch's literal type. The
+/// observed behavior: typecheck checks the then-branch in isolation,
+/// observes the unbound A, and emits E0063 against the else's Int.
+///
+/// ## Closure path
+///
+/// TBD by fix author. Likely site: the if-expression typecheck arm in
+/// `check_expr` — needs to defer the cross-branch unify until both
+/// branches have been checked, then unify the per-op fresh vars
+/// against each other before emitting E0063.
+///
+/// **NOT** in the same family as G2.a / G2.b (those are row-poly
+/// inference; G3 is type-poly inference at expression position). Per
+/// reviewer ask: "don't bury this in a doc-comment as 'not a gap'" —
+/// pinned as its own ignored test.
+///
+/// **Invariant** (post-fix): `safe_or_default(true)` returns nothing
+/// (raises); `safe_or_default(false)` returns 42. With the surrounding
+/// catch wrapping, returns `Err("nope")` for true, `Ok(42)` for false.
+/// stdout for `safe_or_default(false)` = `"42\n"`, exit 0.
+#[test]
+#[ignore = "G3: per-op fresh A from raise[A,E] not propagated through if-branch cross-branch unification at expression position; E0063 fires before A is pinned. Workaround: typed-let ascription"]
+fn task_78_5_pending_g3_raise_in_if_branch_expr_position_polymorphism() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               import std.io\n\
+               \n\
+               fn safe_or_default(b: Bool) -> Int ![Raise[String]] {\n  \
+                 if b {\n    \
+                   raise(\"nope\")\n  \
+                 } else {\n    \
+                   42\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String]] => safe_or_default(false));\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(m) => perform IO.println(m),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pending_g3_raise_in_if_branch");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "post-fix safe_or_default(false) should yield Ok(42); stderr={stderr:?}"
+    );
+}
+
 /// **Task 78.5 — State+Choose Plotkin combo, state(amb) order [PENDING `_pending_row_poly_bracketed_alias_unconstrained`].**
 ///
 /// Source pattern: `koka/test/algeff/effs1a.kk` test2 — the canonical
@@ -8511,15 +8715,20 @@ fn task_78_5_multi_effect_interpreter_pending_row_poly_lambda_drops_effect_row_v
 /// E0132. The "type parameter `e`" wording is exact —
 /// `fn_param_names[amb_handle][0] = "e"`.
 ///
-/// ## Closure path
+/// ## Closure path — recommended option (b)
 ///
-/// Two options at parser/AST + typecheck:
-/// 1. Add a row-vs-type kind to `GenericParam` so `[e]` can declare a
-///    row var explicitly (cleaner long-term surface; aligns with
-///    Koka's `<e>` syntactic distinction).
-/// 2. Detect the alias `gp.name == effect_row_var.name` at scheme
-///    registration and skip allocating a separate type var (smaller
-///    surface delta; Plan-D-Task-116-style follow-up).
+/// Two options at parser/AST + typecheck. Reviewer preference: (b).
+///
+/// 1. (a) Add a row-vs-type kind to `GenericParam` so `[e]` can declare
+///    a row var explicitly. Cleaner long-term surface (aligns with
+///    Koka's `<e>` syntactic distinction) but propagates through every
+///    consumer of `GenericParam` — broad blast radius.
+/// 2. **(b) Detect the alias `gp.name == effect_row_var.name` at scheme
+///    registration (typecheck.rs near :1114, `fresh_generic_subst`)
+///    and skip allocating a separate type var.** Single-site change
+///    in typecheck; ~5 LOC. **Recommended.** Land (b) first; revisit
+///    (a) only if some V-variant requires the explicit row-var
+///    declaration surface.
 ///
 /// ## Variants the same root cause touches (audit-lesson coverage)
 ///
@@ -8542,8 +8751,8 @@ fn task_78_5_multi_effect_interpreter_pending_row_poly_lambda_drops_effect_row_v
 /// the State frame across both. Final list = `[true, false]`; length =
 /// 2; stdout = `"2\n"`.
 #[test]
-#[ignore = "G2.a: bracketed `[e]` generic param aliases the row var name (parser.rs splits into GenericParam{e} + RowVar{e}); type var unconstrained → E0132"]
-fn task_78_5_plotkin_state_amb_pending_row_poly_bracketed_alias_unconstrained() {
+#[ignore = "G2.a: bracketed `[e]` generic param aliases the row var name (parser.rs splits into GenericParam{e} + RowVar{e}); type var unconstrained → E0132. Recommended fix: option (b) — alias detection at scheme registration (~5 LOC)"]
+fn task_78_5_pending_g2a_bracketed_e_alias_unconstrained() {
     // Inline row-poly + body-type-poly run_state (mirrors std/raise.sigil's
     // catch shape). std/state.sigil's run_state is closed-row + Int-only,
     // which can't accept a body returning List[Bool] with extra effects.
