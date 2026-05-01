@@ -151,12 +151,19 @@ fn main() -> Int ![IO, ArithError] {
   // Handler discharges Branch via binary-choose 2-let arm body
   // (Slice C shape). r1 explores "commit this digit"; r2 explores
   // "try next digit". match-on-r1 returns the first non-None.
+  // Handler discharges Branch via binary-choose 2-let arm body
+  // (Slice C shape). Tail expression must be PURE per
+  // `arm_body_n_let_then_pure_tail_shape` — Some(s) is a Call
+  // (constructor application) which expr_is_pure rejects, so the
+  // arm's `Some` branch returns r1 directly (already an Option) to
+  // keep the match arm bodies as pure Idents. r1 is the "commit
+  // this digit" branch; r2 is "try next digit".
   let solved: Option[Array[Int]] = handle solve(initial) with {
     Branch.branch(k) => {
       let r1: Option[Array[Int]] = k(true);
       let r2: Option[Array[Int]] = k(false);
       match r1 {
-        Some(s) => Some(s),
+        Some(_) => r1,
         None => r2,
       }
     },
