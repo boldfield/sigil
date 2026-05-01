@@ -8440,40 +8440,25 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         .builder
                         .ins()
                         .func_addr(pointer_ty, post_arm_k_fn_ref);
-                    let three_v = lowerer.builder.ins().iconst(types::I32, 3);
-                    let call_ns = lowerer
-                        .builder
-                        .ins()
-                        .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
-                    let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
-                    let argp_call = lowerer
-                        .builder
-                        .ins()
-                        .call(next_step_args_ptr_ref, &[ns_ptr]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
-                    let argp_v = lowerer.builder.inst_results(argp_call)[0];
-                    lowerer.builder.ins().store(
-                        MemFlags::trusted(),
-                        widened_arg,
-                        argp_v,
-                        POST_ARM_K_ARG_OFF,
-                    );
-                    // Plan B Task 78.5 G1 — captures-bearing slice.
-                    // Empty captures → null `post_arm_k_closure`
-                    // (current path, unchanged). Non-empty captures →
-                    // allocate a TAG_CLOSURE-tagged closure record at
-                    // this perform site holding each capture's value
-                    // sourced from arm-fn `Lowerer.env` (op-args were
-                    // unpacked at arm-fn entry; outer-scope captures
-                    // were loaded from arm-fn's `closure_ptr` at the
-                    // prologue). Layout mirrors PR #26 commit a5ee4c6:
-                    // header at +0, null code_ptr at +8, captures at
-                    // +16 + 8*i widened to I64.
+                    // Plan B Task 78.5 G1 iter 4 — alloc-then-call-then-
+                    // store ordering. Allocate the captures-bearing
+                    // closure record (or materialize the empty-captures
+                    // null) BEFORE `sigil_next_step_call`, then issue
+                    // the call, then store all three trailing-pair
+                    // slots into `argp_v`. Mirrors the chain Slice C
+                    // arm-fn perform-site (codegen.rs:8200+) and the
+                    // helper synth-cont Middle-step (codegen.rs:9683+),
+                    // both of which alloc-first-then-call. The previous
+                    // ordering (call → store arg → alloc → store
+                    // closure/fn) was the only G1-arm path that
+                    // interleaved a heap allocation between argp_v
+                    // stores; it produced runtime "0\n" output for
+                    // captures-bearing arms (post-arm-k synth fn never
+                    // fired — dispatch landed in identity), even though
+                    // empty-captures arms passed. Reordering aligns G1
+                    // with the structural precedent so any future
+                    // reasoning about argp_v liveness through alloc
+                    // applies uniformly.
                     let post_arm_k_closure_v = if post_arm_k.captures.is_empty() {
                         lowerer.builder.ins().iconst(pointer_ty, 0)
                     } else {
@@ -8584,6 +8569,29 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         }
                         cp
                     };
+                    let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                    let call_ns = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                    let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                    let argp_call = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_args_ptr_ref, &[ns_ptr]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
+                    let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        widened_arg,
+                        argp_v,
+                        POST_ARM_K_ARG_OFF,
+                    );
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
                         post_arm_k_closure_v,
