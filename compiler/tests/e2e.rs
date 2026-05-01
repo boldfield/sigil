@@ -8090,3 +8090,715 @@ fn generic_tuple_scrutinee_via_call_resolves() {
     assert_eq!(code, 42, "exit code expected 42; stderr={stderr:?}");
     assert_eq!(stdout, "", "no stdout expected; stderr={stderr:?}");
 }
+
+// ===== Plan C Task 78.5 — Koka subset import ===============================
+//
+// Each test in this section is a port of a pattern from
+// koka-lang/koka's BSD-2-licensed effect-handler test suite
+// (`koka/test/algeff/` and surrounding) — pinning composition shapes
+// the existing sigil corpus doesn't exercise. Per the import plan at
+// `boldfield/designs:docs/2026-05-01-sigil-koka-import-plan.md`, each
+// new pattern lands as its own PR with one e2e test (and possibly an
+// example) so any surfaced bug ships as its own followup PR.
+
+/// **G1 representative test — Generator with collecting handler.**
+///
+/// Pinned shape: **G1 variant 1 — op-arg in post-arm-k tail.**
+/// Source pattern: `koka/test/algeff/common.kk` lines 108–125 (the
+/// `yield` effect + `iterate` producer; the `foreach` consumer
+/// variant is inexpressible in sigil v1 per Task 64 deviation, so the
+/// port substitutes a list-collecting handler).
+///
+/// ## Status — gap representative for G1 variant 1 of 4
+///
+/// **`#[ignore]`'d**: surfaced a real codegen gap in PR #66 CI (commit
+/// `2ab80f8`). The arm body `let rest: List[Int] = k(0); Cons(x, rest)`
+/// references op-arg `x` in the post-k tail. Slice B's post-arm-k
+/// synth-fn machinery only supports tails that reference the
+/// let-binding (`rest`) or globals.
+///
+/// **G1 has 4 distinct tail-shape variants**, each pinned by its own
+/// `#[ignore]`'d representative in this section so the captures-bearing
+/// fix PR can un-ignore them as it lands each shape (per reviewer ask
+/// "while codegen context is fresh, pin all four"):
+///
+/// 1. **Op-arg in post-k tail** — `task_78_5_pending_g1_op_arg_*` (this test)
+/// 2. **Outer-fn-scope let in post-k tail** — `task_78_5_pending_g1_outer_let_*`
+/// 3. **Outer fn-param in post-k tail** — `task_78_5_pending_g1_outer_fn_param_*`
+/// 4. **Combined op-arg + outer-capture in tail** — `task_78_5_pending_g1_combined_*`
+///
+/// ## Closure path (PR #26 `a5ee4c6` precedent)
+///
+/// Mirror the helper-synth-cont's captures-bearing slice — at the
+/// post-arm-k synth fn build site (`compiler/src/codegen.rs` Slice B
+/// materialisation), detect free vars in the post-k tail beyond
+/// `{let_binding, globals}`, add them to the synth fn's closure record
+/// alongside the existing let-binding slot. New synth-fn entry rebinds
+/// them via ClosureEnvLoad.
+///
+/// ## Why this test is novel for sigil
+///
+/// 1. **Recursive perform under a handler.** `iterate(xs)` calls
+///    itself in the `Cons` arm after each `perform Gen.yield(x)`.
+/// 2. **Single-shot k whose result type is a non-Int sum (`List[Int]`).**
+/// 3. **Decl-level generic effect `Gen[A]`** instantiated to `Gen[Int]`.
+///
+/// ## Trace (once the gap closes; xs = `[1, 2, 3]`)
+///
+/// 3 nested arm bodies, each `let rest = k(0)` descending; return arm
+/// fires `Nil`; arm bodies build `Cons(1, Cons(2, Cons(3, Nil)))` on the
+/// way back up. `length(result) = 3`.
+///
+/// **Invariant** (post-fix): stdout = `"3\n"`, exit 0.
+#[test]
+#[ignore = "G1 variant 1: Slice B post-arm-k synth fn rejects op-arg in post-k tail; closure path PR #26 a5ee4c6 captures-bearing slice extension"]
+fn task_78_5_pending_g1_op_arg_in_post_arm_k_tail() {
+    let src = "import std.list\n\
+               import std.io\n\
+               \n\
+               effect Gen[A] {\n  \
+                 yield: (A) -> Int,\n\
+               }\n\
+               \n\
+               fn iterate(xs: List[Int]) -> Int ![Gen[Int]] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(x, rest) => {\n      \
+                     let _: Int = perform Gen.yield(x);\n      \
+                     iterate(rest)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = Cons(1, Cons(2, Cons(3, Nil)));\n  \
+                 let result: List[Int] = handle iterate(xs) with {\n    \
+                   Gen.yield(x, k) => {\n      \
+                     let rest: List[Int] = k(0);\n      \
+                     Cons(x, rest)\n    \
+                   },\n    \
+                   return(_v) => Nil,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(length(result)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pr1_generator_collect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3\n",
+        "generator should yield 3 elements collected into List[Int]; \
+         stderr={stderr:?}"
+    );
+}
+
+/// **G1 variant 2 — outer-fn-scope let in post-arm-k tail.**
+///
+/// Pinned shape (constructed, not Koka-imported): `let factor: Int = 7;
+/// handle ... { Eff.fail(k) => let r: Int = k(0); r + factor }`. The
+/// post-k tail references `factor`, an outer-fn-scope let binding that
+/// is neither the let-binding (`r`) nor a global. Same root cause as G1
+/// variant 1; codegen rejects with the same Slice B captures-bearing
+/// diagnostic.
+///
+/// **Invariant** (post-fix): stdout = `"7\n"`, exit 0.
+#[test]
+#[ignore = "G1 variant 2: Slice B post-arm-k synth fn rejects outer-fn-scope let in post-k tail; closure path PR #26 a5ee4c6"]
+fn task_78_5_pending_g1_outer_let_in_post_arm_k_tail() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { fail: () -> Int }\n\
+               \n\
+               fn run() -> Int ![] {\n  \
+                 let factor: Int = 7;\n  \
+                 handle perform Eff.fail() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r + factor\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pending_g1_outer_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "outer-let in tail post-fix should yield 7; stderr={stderr:?}"
+    );
+}
+
+/// **G1 variant 3 — outer fn-param in post-arm-k tail.**
+///
+/// Pinned shape (constructed, not Koka-imported): `fn run(threshold:
+/// Int) -> Int ![] { handle ... { Eff.fail(k) => let r: Int = k(0); r +
+/// threshold } }`. The post-k tail references `threshold`, an outer
+/// fn-param that is neither the let-binding (`r`) nor a global. Same
+/// root cause as G1 variants 1 + 2; codegen rejects with the same
+/// Slice B captures-bearing diagnostic.
+///
+/// **Invariant** (post-fix): stdout = `"7\n"`, exit 0.
+#[test]
+#[ignore = "G1 variant 3: Slice B post-arm-k synth fn rejects outer fn-param in post-k tail; closure path PR #26 a5ee4c6"]
+fn task_78_5_pending_g1_outer_fn_param_in_post_arm_k_tail() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { fail: () -> Int }\n\
+               \n\
+               fn run(threshold: Int) -> Int ![] {\n  \
+                 handle perform Eff.fail() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r + threshold\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run(7)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pending_g1_outer_fn_param");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "outer fn-param in tail post-fix should yield 7; stderr={stderr:?}"
+    );
+}
+
+/// **G1 variant 4 — combined op-arg + outer-capture in post-arm-k tail.**
+///
+/// Pinned shape (constructed, not Koka-imported): `fn run(threshold:
+/// Int) -> Int ![] { handle ... { Eff.go(arg, k) => let r: Int = k(0);
+/// r + arg + threshold } }`. Combines variants 1 (op-arg `arg`) + 3
+/// (outer fn-param `threshold`) in one tail. The captures-bearing fix
+/// must thread BOTH into the synth fn's closure record; pinning this
+/// composed shape pre-empts a partial fix that handles only one
+/// capture kind.
+///
+/// **Invariant** (post-fix): stdout = `"17\n"`, exit 0 (10 + 0 + 7).
+#[test]
+#[ignore = "G1 variant 4: Slice B post-arm-k synth fn rejects combined op-arg + outer-capture in post-k tail; closure path PR #26 a5ee4c6"]
+fn task_78_5_pending_g1_combined_op_arg_and_outer_capture() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { go: (Int) -> Int }\n\
+               \n\
+               fn run(threshold: Int) -> Int ![] {\n  \
+                 handle perform Eff.go(10) with {\n    \
+                   Eff.go(arg, k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r + arg + threshold\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run(7)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pending_g1_combined");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "17\n",
+        "combined op-arg + outer-capture post-fix should yield 17; stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 import — Reader effect (DI seam).**
+///
+/// Source pattern: synthesized from Koka's reader-style `effect val width`
+/// pattern (`algeff/implicits.kk`) and the `getstr` shape in
+/// `algeff/common.kk` lines 45–60, stripped of Koka's `effect val` /
+/// implicit-binding sugar (which sigil v1 doesn't have). The plain
+/// `effect Reader[A] { ask: () -> A }` form is the canonical
+/// dependency-injection seam in any algebraic-effect language.
+///
+/// **Why it's novel for sigil:** the existing corpus has no Reader-style
+/// effect test. State threads mutable values; Raise short-circuits;
+/// Reader provides read-only ambient values via single-shot k(config).
+/// This is the smallest possible test of "handler resumes once with a
+/// value supplied by the discharger" — the pattern that makes effects a
+/// DI seam (per README's "Testability is a consequence" section).
+///
+/// **Invariant:** `with_config(32, helper)` where `helper = ask() + 10`
+/// → 42. stdout = `"42\n"`, exit 0.
+#[test]
+fn task_78_5_reader_effect_returns_config_plus_ten() {
+    let src = "import std.io\n\
+               \n\
+               effect Reader[A] {\n  \
+                 ask: () -> A,\n\
+               }\n\
+               \n\
+               fn helper() -> Int ![Reader[Int]] {\n  \
+                 let v: Int = perform Reader.ask();\n  \
+                 v + 10\n\
+               }\n\
+               \n\
+               fn with_config(config: Int, action: () -> Int ![Reader[Int]]) -> Int ![] {\n  \
+                 handle action() with {\n    \
+                   Reader.ask(k) => k(config),\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = with_config(32, helper);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_reader_effect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "Reader.ask single-shot k(config) should return 42; stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 import — Custom-ADT error in Raise[E].**
+///
+/// Source pattern: synthesized from the survey gap "Exception with
+/// structured error type — Raise[String] everywhere; Raise[ParseError]-
+/// style with custom ADT not tested." Plan D Stage 12's row-arg
+/// propagation through `catch[A, E]` was unit-tested but never exercised
+/// at the e2e level with a non-String E.
+///
+/// **Why it's novel for sigil:** every existing `std_raise_*` and
+/// `Raise.fail` e2e test uses E = String. This is the first e2e where
+/// E is a sum type. Tests:
+///   1. `raise(Lex(42))` instantiates Raise[ParseError] at the perform
+///      site — row-arg ParseError must propagate from the row entry to
+///      the op's E parameter.
+///   2. `catch(...)` discharges and returns `Result[Int, ParseError]`;
+///      the row arg flows through catch's row-poly signature into the
+///      result type.
+///   3. The Err arm's pattern `Err(e)` binds `e: ParseError`, then a
+///      match on `e` selects the right diagnostic.
+///
+/// **Invariant:** stdout = `"lex error at line 42\n"`, exit 0.
+#[test]
+fn task_78_5_raise_custom_adt_error_routes_through_catch() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               import std.io\n\
+               \n\
+               type ParseError = | Lex(Int) | EOF | Bad(String)\n\
+               \n\
+               fn show_err(e: ParseError) -> String ![] {\n  \
+                 match e {\n    \
+                   Lex(line) => string_concat(\"lex error at line \", int_to_string(line)),\n    \
+                   EOF => \"unexpected EOF\",\n    \
+                   Bad(s) => string_concat(\"bad: \", s),\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn parse_thing(input: Int) -> Int ![Raise[ParseError]] {\n  \
+                 match input {\n    \
+                   0 => raise(EOF),\n    \
+                   1 => raise(Lex(42)),\n    \
+                   _ => input,\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, ParseError] = catch(fn () -> Int ![Raise[ParseError]] => parse_thing(1));\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(e) => perform IO.println(show_err(e)),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_raise_custom_adt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "lex error at line 42\n",
+        "custom ParseError should route through catch + show_err; \
+         stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 import — Mini Nim with mutual recursion through effect ops.**
+///
+/// Source pattern: `koka/test/algeff/nim1a.kk` perfect-strategy variant
+/// (the full `nim.kk` file uses `choose` + `cut` which require multi-shot
+/// dischargers sigil doesn't have; the perfect-strategy variant is
+/// single-shot k throughout).
+///
+/// **Why it's novel for sigil:** mutual recursion `alice_turn` ↔
+/// `bob_turn` where both fns perform `Nim.move(player, n)`. The existing
+/// corpus has recursion through perform (e.g. fib_cps_perf, sudoku) but
+/// no MUTUAL recursion through perform — the forward-reference path
+/// between two effect-using fns at the same scope is a separate
+/// resolve.rs / typecheck path.
+///
+/// **Invariant:** `game(7)` with perfect strategy returns `Alice`
+/// (printed as `"alice\n"`); exit 0.
+#[test]
+fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
+    let src = "import std.io\n\
+               \n\
+               type Player = | Bob | Alice\n\
+               \n\
+               effect Nim {\n  \
+                 move: (Int, Int) -> Int,\n\
+               }\n\
+               \n\
+               fn alice_turn(n: Int) -> Player ![Nim] {\n  \
+                 if n <= 0 {\n    \
+                   Bob\n  \
+                 } else {\n    \
+                   let taken: Int = perform Nim.move(0, n);\n    \
+                   bob_turn(n - taken)\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn bob_turn(n: Int) -> Player ![Nim] {\n  \
+                 if n <= 0 {\n    \
+                   Alice\n  \
+                 } else {\n    \
+                   let taken: Int = perform Nim.move(1, n);\n    \
+                   alice_turn(n - taken)\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn pick(n: Int) -> Int ![ArithError] {\n  \
+                 let m: Int = n % 4;\n  \
+                 if m < 1 { 1 } else { m }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO, ArithError] {\n  \
+                 let winner: Player = handle alice_turn(7) with {\n    \
+                   Nim.move(_p, n, k) => k(pick(n)),\n  \
+                 };\n  \
+                 match winner {\n    \
+                   Alice => perform IO.println(\"alice\"),\n    \
+                   Bob => perform IO.println(\"bob\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_nim_mini_perfect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "alice\n",
+        "perfect-strategy Nim from 7 sticks should yield Alice; stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 — Multi-effect interpreter (Raise+State+IO) [PENDING `_pending_row_poly_lambda_drops_effect_row_var`].**
+///
+/// Source pattern: `koka/test/algeff/expr.kk` lines 145–165 (`eval2`
+/// with state + exc) extended with IO trace per eval3 (lines 179–195).
+/// First sigil e2e exercising 3-effect recursive evaluation under
+/// stacked dischargers.
+///
+/// ## Status — gap representative for G2.b
+///
+/// **`#[ignore]`'d**: surfaced E0128 "effect row mismatch: closed row
+/// `![State]` cannot unify with closed row `![ArithError, IO,
+/// Raise[String], State]`" at the run_state_poly call site. Originally
+/// authored alongside Plotkin (G2.a); typecheck trace confirmed
+/// **different root sites** so kept as the dedicated G2.b pin.
+///
+/// ## G2.b root site
+///
+/// `compiler/src/typecheck.rs:4328` (the `let _ = effect_row_var;`)
+/// and `:4743` (hardcoded `effect_row_var: None` on the lambda's
+/// `FnSig`). Lambda typing **drops the parsed `effect_row_var`**, so a
+/// lambda with declared row `![State | e]` (e.g. inside the body of a
+/// row-poly user fn) is typed as **closed**. Then the surrounding
+/// `let state_fn: (Int) -> A ![| e] = handle body() with { ... }`
+/// runs `unify_ty(decl, got)` symmetrically (typecheck.rs:3957→2780),
+/// `unify_row` takes the `(Some(a_tail), None)` branch (typecheck.rs:
+/// 3007), and `bind_row_var(id, Row{[], None})` (3021–3028) **binds
+/// run_state_poly's outer row var to closed empty**. The corrupted
+/// scheme stored at line 3873 is what's instantiated at every call
+/// site — the body param's `![State | e]` collapses to closed
+/// `![State]`. At main's call `run_state_poly(0, lambda_with_extra_-
+/// effects)`, `unify_row(closed [State], closed [Raise,State,
+/// ArithError,IO])` fires E0128 at 2942/2970.
+///
+/// ## Closure path — recommended option (1)
+///
+/// Two-pronged fix at typecheck.rs. Reviewer preference: (1) first.
+///
+/// 1. **Lambda construction inherits the enclosing fn's row variable:
+///    resolve `effect_row_var` name through `current_row_var_subst` at
+///    lambda construction (mirroring the inner-fn-type resolution at
+///    line 6493).** Smaller blast radius — single-site change at
+///    typecheck.rs:4328+4743 plus one lookup. **Recommended; land
+///    first.**
+/// 2. AND/OR let-annotation→RHS uses asymmetric `subsume_row`-
+///    direction logic so the annotation's open row absorbs the
+///    closed RHS's effects without binding the row var to closed.
+///    Broader — touches `unify_row` direction semantics across all
+///    let-annot→RHS sites, not just lambda-shaped RHS. Revisit
+///    only if some V-variant requires it after (1) lands.
+///
+/// ## Note on the typed-let raise() workaround
+///
+/// The `if y == 0 { let _r: Int = raise(...); _r } else { x / y }`
+/// shape sidesteps a SEPARATE smaller gap (G3) where per-op fresh A
+/// from `raise[A, E]` doesn't propagate through nested if-branch
+/// unification at expression position. See
+/// `task_78_5_pending_g3_raise_in_if_branch_expr_position_polymorphism`
+/// for the isolated G3 pin. The workaround is acceptable here because
+/// G2.b is the test's primary purpose; once G3 closes the workaround
+/// can be removed.
+///
+/// **Invariant** (post-fix): `Div(Div(IntE(16), IntE(2)), IntE(3))`
+/// → `(16/2)/3 = 2`. tick prints once per Div node; final value 2.
+/// stdout = `"tick\ntick\n2\n"`, exit 0.
+#[test]
+#[ignore = "G2.b: lambda typing drops parsed effect_row_var (typecheck.rs:4328/4743); symmetric let-annot unify_row collapses outer row var to closed empty. Recommended fix: option (1) — lambda inherits enclosing row var via current_row_var_subst lookup"]
+fn task_78_5_pending_g2b_lambda_drops_effect_row_var() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               import std.io\n\
+               \n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               \n\
+               fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
+                 let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> A ![| e] => v,\n    \
+                   State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s),\n    \
+                   State.set(arg, k) => fn (s: Int) -> A ![| e] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               type Expr = | IntE(Int) | DivE(Expr, Expr)\n\
+               \n\
+               fn eval(e: Expr) -> Int ![Raise[String], State, ArithError, IO] {\n  \
+                 match e {\n    \
+                   IntE(i) => i,\n    \
+                   DivE(e1, e2) => {\n      \
+                     let x: Int = eval(e1);\n      \
+                     let y: Int = eval(e2);\n      \
+                     let cur: Int = perform State.get();\n      \
+                     let _: Int = perform State.set(cur + 1);\n      \
+                     perform IO.println(\"tick\");\n      \
+                     if y == 0 {\n        \
+                       let _r: Int = raise(\"divide by zero\");\n        \
+                       _r\n      \
+                     } else {\n        \
+                       x / y\n      \
+                     }\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO, ArithError] {\n  \
+                 let prog: Expr = DivE(DivE(IntE(16), IntE(2)), IntE(3));\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String], ArithError, IO] => run_state_poly(0, fn () -> Int ![Raise[String], State, ArithError, IO] => eval(prog)));\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(m) => perform IO.println(m),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_multi_effect_interpreter");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "tick\ntick\n2\n",
+        "Div tree should print tick per Div node and final value 2; stderr={stderr:?}"
+    );
+}
+
+/// **G3 representative test — expression-position polymorphism in if-branch.**
+///
+/// Pinned shape (constructed, not Koka-imported): `if b { raise("nope")
+/// } else { 42 }` where `raise[A, E](e: E) -> A ![Raise[E]]`. The
+/// per-op fresh A from `raise` should infer to `Int` from the else
+/// branch's `42` literal, but typecheck fires **E0063 "if branches
+/// have incompatible types: then is `?N` but else is `Int`"** before
+/// the cross-branch unification can pin A.
+///
+/// ## Status — gap representative for G3 (own gap, surfaced by Task 78.5)
+///
+/// **`#[ignore]`'d**: surfaced from the multi-effect interpreter port
+/// (G2.b test above) when a `raise` call appears in expression position
+/// inside an if-branch. The workaround `let _r: Int = raise(...); _r`
+/// converts the expression to a let-binding and pins A via ascription.
+/// The workaround is acceptable in practice but G3 is a real
+/// **expression-position polymorphism inference gap** distinct from
+/// G2.a / G2.b — it lives in the if-branch unification path, not the
+/// row-poly call-site path.
+///
+/// ## G3 root site
+///
+/// `compiler/src/typecheck.rs` if-branch unification — likely
+/// `check_if` or the `match`-arm cross-branch unify entry. Fires
+/// E0063 before the per-op A from `raise[A, E]` is bound. The
+/// expected behavior: cross-branch unify at the if's join point
+/// should drive A := Int from the else branch's literal type. The
+/// observed behavior: typecheck checks the then-branch in isolation,
+/// observes the unbound A, and emits E0063 against the else's Int.
+///
+/// ## Closure path
+///
+/// TBD by fix author. Likely site: the if-expression typecheck arm in
+/// `check_expr` — needs to defer the cross-branch unify until both
+/// branches have been checked, then unify the per-op fresh vars
+/// against each other before emitting E0063.
+///
+/// **NOT** in the same family as G2.a / G2.b (those are row-poly
+/// inference; G3 is type-poly inference at expression position). Per
+/// reviewer ask: "don't bury this in a doc-comment as 'not a gap'" —
+/// pinned as its own ignored test.
+///
+/// **Invariant** (post-fix): `safe_or_default(true)` returns nothing
+/// (raises); `safe_or_default(false)` returns 42. With the surrounding
+/// catch wrapping, returns `Err("nope")` for true, `Ok(42)` for false.
+/// stdout for `safe_or_default(false)` = `"42\n"`, exit 0.
+#[test]
+#[ignore = "G3: per-op fresh A from raise[A,E] not propagated through if-branch cross-branch unification at expression position; E0063 fires before A is pinned. Workaround: typed-let ascription"]
+fn task_78_5_pending_g3_raise_in_if_branch_expr_position_polymorphism() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               import std.io\n\
+               \n\
+               fn safe_or_default(b: Bool) -> Int ![Raise[String]] {\n  \
+                 if b {\n    \
+                   raise(\"nope\")\n  \
+                 } else {\n    \
+                   42\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String]] => safe_or_default(false));\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(m) => perform IO.println(m),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pending_g3_raise_in_if_branch");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "post-fix safe_or_default(false) should yield Ok(42); stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 — State+Choose Plotkin combo, state(amb) order [PENDING `_pending_row_poly_bracketed_alias_unconstrained`].**
+///
+/// Source pattern: `koka/test/algeff/effs1a.kk` test2 — the canonical
+/// "stateful nondeterminism" demo from algebraic-effects literature.
+///
+/// ## Status — gap representative for G2.a
+///
+/// **`#[ignore]`'d**: surfaced E0132 "ambiguous polymorphism: type
+/// parameter `e` of `amb_handle` is unconstrained at this call site".
+/// Originally suspected to share a root with the multi-effect
+/// interpreter port (E0128); typecheck trace confirmed **different
+/// root sites** so each gets a dedicated pin.
+///
+/// ## G2.a root site
+///
+/// `compiler/src/typecheck.rs:1346-1370` (the post-typecheck E0132
+/// sweep over `pending_call_instantiations`). Upstream root: the AST
+/// parser (parser.rs:391-405 + 418-422) splits "bracketed generic
+/// params" (`f.generic_params`, parsed as TYPE GenericParam) from
+/// "row variable" (`f.effect_row_var`, set only by `| e` syntax).
+/// When the user writes `fn amb_handle[e](action: () -> Bool ![Amb |
+/// e]) -> List[Bool] ![| e]` intending `e` as a row variable, the
+/// parser produces BOTH `f.generic_params = [GP{e}]` (type kind) AND
+/// `f.effect_row_var = Some(RowVar{e})` (row kind) — **two different
+/// variables sharing a name**. The type variable is allocated at
+/// scheme-registration (typecheck.rs:1114, `fresh_generic_subst`) and
+/// at check_fn entry (:3785), but no surface reference ever pins it
+/// (nothing in the body uses `e` in TypeExpr position), so the
+/// post-typecheck sweep at 1346-1370 finds it unbound and fires
+/// E0132. The "type parameter `e`" wording is exact —
+/// `fn_param_names[amb_handle][0] = "e"`.
+///
+/// ## Closure path — recommended option (b)
+///
+/// Two options at parser/AST + typecheck. Reviewer preference: (b).
+///
+/// 1. (a) Add a row-vs-type kind to `GenericParam` so `[e]` can declare
+///    a row var explicitly. Cleaner long-term surface (aligns with
+///    Koka's `<e>` syntactic distinction) but propagates through every
+///    consumer of `GenericParam` — broad blast radius.
+/// 2. **(b) Detect the alias `gp.name == effect_row_var.name` at scheme
+///    registration (typecheck.rs near :1114, `fresh_generic_subst`)
+///    and skip allocating a separate type var.** Single-site change
+///    in typecheck; ~5 LOC. **Recommended.** Land (b) first; revisit
+///    (a) only if some V-variant requires the explicit row-var
+///    declaration surface.
+///
+/// ## Variants the same root cause touches (audit-lesson coverage)
+///
+/// G2.a fires for any user-defined fn that puts `[e]` in the
+/// bracketed generic-param list intending it as a row variable.
+/// Workaround: omit `[e]` and rely on the implicit row var from
+/// `| e` in the row position (mirrors `std/raise.sigil`'s `catch`,
+/// which has `[A, E]` only — no `[e]`).
+///
+/// ## Why it's novel for sigil
+///
+/// **Stateful nondeterminism is the single most-cited gap in standard
+/// algebraic-effect literature.** The existing corpus has State alone,
+/// Choose alone, but never composed. Order matters semantically:
+/// state(amb) shares state across choices; amb(state) gives each branch
+/// its own state copy.
+///
+/// **Invariant** (post-fix): `body` performs flip then increments state.
+/// `amb_handle` resumes both branches; the outer `run_state_poly` shares
+/// the State frame across both. Final list = `[true, false]`; length =
+/// 2; stdout = `"2\n"`.
+#[test]
+#[ignore = "G2.a: bracketed `[e]` generic param aliases the row var name (parser.rs splits into GenericParam{e} + RowVar{e}); type var unconstrained → E0132. Recommended fix: option (b) — alias detection at scheme registration (~5 LOC)"]
+fn task_78_5_pending_g2a_bracketed_e_alias_unconstrained() {
+    // Inline row-poly + body-type-poly run_state (mirrors std/raise.sigil's
+    // catch shape). std/state.sigil's run_state is closed-row + Int-only,
+    // which can't accept a body returning List[Bool] with extra effects.
+    let src = "import std.list\n\
+               import std.io\n\
+               \n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               effect Amb resumes: many { flip: () -> Bool }\n\
+               \n\
+               fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
+                 let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> A ![| e] => v,\n    \
+                   State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s),\n    \
+                   State.set(arg, k) => fn (s: Int) -> A ![| e] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               fn body() -> Bool ![Amb, State] {\n  \
+                 let p: Bool = perform Amb.flip();\n  \
+                 let i: Int = perform State.get();\n  \
+                 let _: Int = perform State.set(i + 1);\n  \
+                 p\n\
+               }\n\
+               \n\
+               fn amb_handle[e](action: () -> Bool ![Amb | e]) -> List[Bool] ![| e] {\n  \
+                 handle action() with {\n    \
+                   Amb.flip(k) => {\n      \
+                     let r1: List[Bool] = k(true);\n      \
+                     let r2: List[Bool] = k(false);\n      \
+                     append(r1, r2)\n    \
+                   },\n    \
+                   return(v) => Cons(v, Nil),\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: List[Bool] = run_state_poly(0, fn () -> List[Bool] ![State] => amb_handle(body));\n  \
+                 perform IO.println(int_to_string(length(result)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_plotkin_state_amb");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "2\n",
+        "Plotkin state(amb): list of both flip outcomes has length 2; \
+         stderr={stderr:?}"
+    );
+}
