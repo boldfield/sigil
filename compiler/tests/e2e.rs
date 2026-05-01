@@ -5305,11 +5305,12 @@ fn task_117_validation_multi_shot_through_let_bound_lambda() {
 #[test]
 fn task_117_validation_frame_escape_past_handle_pop() {
     let src = "effect Foo { op: () -> Int }\n\
+               fn body_of_handle() -> Int ![Foo] {\n  \
+                 let _: Int = perform Foo.op();\n  \
+                 99\n\
+               }\n\
                fn make_continuation() -> (Int) -> Int ![] ![] {\n  \
-                 handle (\n    \
-                   let _: Int = perform Foo.op();\n    \
-                   99\n  \
-                 ) with {\n    \
+                 handle body_of_handle() with {\n    \
                    Foo.op(k) => fn (x: Int) -> Int ![] => k(x),\n  \
                  }\n\
                }\n\
