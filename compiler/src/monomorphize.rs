@@ -159,7 +159,7 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
         };
     }
 
-    let (new_items, lambda_captures_resolved, match_scrut_tys_resolved) = {
+    let (new_items, lambda_captures_resolved, match_scrut_tys_resolved, builtin_specializations) = {
         let mono = Monomorphizer::new(&anf.checked);
         mono.run_with_lambda_captures()
     };
@@ -173,6 +173,31 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
         if let Item::Type(td) = item {
             new_types.insert(td.name.clone(), (**td).clone());
         }
+    }
+    // Plan D Task 117 (a) — inject synthetic TypeDecls for builtin
+    // generic specializations encountered during rewriting. These
+    // entries (e.g. `Array$$Int`) carry empty `generic_params` and
+    // empty `variants`; they're never instantiated as user types,
+    // but their presence in `tc.types` lets `ty_from_type_expr`
+    // resolve mangled `Named("Array$$Int")` references that
+    // monomorphize emits for Apply-form builtin generic uses.
+    // Empty variants ensure `build_ctor_index` registers no spurious
+    // ctors and `build_layouts`'s inner variant loop produces an
+    // empty layout entry. Synthetic TypeDecls are NOT pushed into
+    // `program.items` — that would re-trigger `clone_type` and
+    // double-mangle on subsequent passes; injecting directly into
+    // the rebuilt types map keeps them registry-only.
+    let synth_span = crate::errors::Span::synthetic("monomorphize.synthetic");
+    for mangled in &builtin_specializations {
+        new_types
+            .entry(mangled.clone())
+            .or_insert_with(|| TypeDecl {
+                name: mangled.clone(),
+                name_span: synth_span.clone(),
+                generic_params: Vec::new(),
+                variants: Vec::new(),
+                span: synth_span.clone(),
+            });
     }
     anf.checked.types = new_types;
     MonoProgram {
@@ -436,6 +461,20 @@ struct Monomorphizer<'a> {
     /// concrete (post-substitution) scrutinee types regardless of
     /// scrutinee expression shape.
     match_scrut_tys_resolved: MatchScrutTysResolved,
+    /// Plan D Task 117 (a) — mangled names of builtin generic
+    /// specializations encountered during `rewrite_type_expr`'s
+    /// `Apply` rewrite. Builtin generic types (`Array`, `MutArray`)
+    /// have synthetic TypeDecls in `tc.types` (`builtin_types()`)
+    /// but no clone target — `enqueue_type` skips them. The Apply
+    /// rewrite still produces a mangled `Named("Array$$Int")` for
+    /// downstream IR consistency. Without a corresponding TypeDecl
+    /// in `tc.types`, sites like `build_layouts` /
+    /// `ty_from_type_expr` can't resolve the mangled name. The set
+    /// here is consumed at the top-level `monomorphize()` to
+    /// inject synthetic empty-variants TypeDecls into the rebuilt
+    /// `tc.types`. Surfaced by Sudoku's `Option[Array[Int]]`
+    /// pattern destructure.
+    builtin_specializations: BTreeSet<String>,
 }
 
 impl<'a> Monomorphizer<'a> {
@@ -482,6 +521,7 @@ impl<'a> Monomorphizer<'a> {
             lambda_captures_resolved: BTreeMap::new(),
             current_clone_fn_name: None,
             match_scrut_tys_resolved: BTreeMap::new(),
+            builtin_specializations: BTreeSet::new(),
         }
     }
 
@@ -492,13 +532,19 @@ impl<'a> Monomorphizer<'a> {
     /// for each clone's lambdas.
     fn run_with_lambda_captures(
         self,
-    ) -> (Vec<Item>, LambdaCapturesResolved, MatchScrutTysResolved) {
+    ) -> (
+        Vec<Item>,
+        LambdaCapturesResolved,
+        MatchScrutTysResolved,
+        BTreeSet<String>,
+    ) {
         let mut this = self;
         let items = this.run_inner_borrowed();
         (
             items,
             this.lambda_captures_resolved,
             this.match_scrut_tys_resolved,
+            this.builtin_specializations,
         )
     }
 
@@ -748,6 +794,18 @@ impl<'a> Monomorphizer<'a> {
                     self.enqueue_type(name.clone(), resolved_args.clone());
                 }
                 let mangled = mangle_type(name, &resolved_args);
+                // Plan D Task 117 (a) — record builtin generic
+                // specializations for synthetic-TypeDecl injection at
+                // top-level `monomorphize()`. User generic types get
+                // clones via `enqueue_type` above; builtins
+                // (Array/MutArray) have no user TypeDecl to clone, so
+                // their mangled `Named("Array$$Int")` would have no
+                // resolution target in `tc.types` post-mono. Tracking
+                // here lets the wrapper inject a synthetic empty-
+                // variants TypeDecl post-rebuild.
+                if !self.type_decls.contains_key(name) {
+                    self.builtin_specializations.insert(mangled.clone());
+                }
                 TypeExpr::Named(mangled, span.clone())
             }
             // Plan B' Stage 6.8 Task 102 — rewrite a fn-type by

@@ -328,3 +328,182 @@ The original 1-2 sites estimate was based on a "discharge site only" closure pat
 
 **Implementing commit(s).** This entry + Tasks 71/72/73 closure-path updates in PLAN_C_DEVIATIONS.md + std/raise.sigil migration + handler-discharge/scheme-rename/subst-application fixes. PR `plan-d-stage-12-checkpoint`.
 
+## 2026-05-01 — [DEVIATION Task 117 design validation] Eta-expansion proposal needs validation; split withdrawn
+
+**Context.** Pre-execution recon (2026-05-01, sigil/main `0ff2c3a`) initially proposed splitting Task 117 into 117a (lifted-lambda generalization) + 117b (k-stored-in-record + k-as-fn-arg + smoke gate). User authorized the split. During the design pass, a cleaner mechanism surfaced: **eta-expansion at closure_convert** (rewrite `Expr::Ident(k_name)` in value position to `(fn x => k(x))`; the existing Plan B' Task 107 Phase B `ArmKPairCapture` substrate lifts the lambda; standard indirect-call dispatch reaches `lower_k_pair_call` via the lifted lambda's `arm_k_pair_self`). The eta-expansion proposal would subsume 117a *and* 117b in one mechanism with no codegen changes.
+
+**Why the split is withdrawn.** Brian (2026-05-01) pushed back: *"'no codegen changes needed' against a plan-estimated 6-PR architectural slice is a red flag, not a feature."* The 117a/117b split was scoped under the premise *"117a is mechanically simple, 117b verifies harder cases."* If 117b's harder cases (k-stored-in-record, k-as-fn-arg, multi-shot, frame escape) reveal that eta-expansion fails for them, 117a would have shipped under a design that can't generalize — a sealed sub-PR baking in a wrong choice. Single Task 117 PR after validation completes.
+
+**Three validation tests required before any production code lands.** Each test confirms-or-fails a load-bearing semantic of the eta-expansion design:
+
+1. **Multi-shot through let-bound k.** `let f = k; let r1 = f(true); let r2 = f(false); r1 + r2` inside a `resumes: many` arm. First confirm it fails today (walker rejects `Expr::Ident(k_name)` at `codegen.rs:1556-1571`). Then implement minimal eta-expansion and verify multi-shot produces chained-resume semantics, not N independent trampoline drives. If through-a-lambda forces each resume into its own `sigil_handle_push` + run-loop + pop cycle, eta-expansion is single-shot-only and the design is dead.
+
+2. **Frame escape past handle pop.** `let f = k; return f from inside the handle; invoke f after the handle's `sigil_handle_pop` has run.` The closure captures `frame_ptr` at perform time; that pointer references popped stack memory after the handle exits. `lower_k_pair_call:11479-11484` doesn't re-install popped frames. Verify behavior — works (frame discipline holds), segfaults, or returns garbage. Binary outcome.
+
+3. **Arena escape rate** (only if 1 and 2 pass). Eta-expansion adds an allocation per `let f = k` site; bare-k baseline is zero-alloc. Measure on a representative multi-shot-heavy input. >5% escape-rate jump trips Plan D's HARD perf gate.
+
+**Decision rule.** Pass all three → ship eta-expansion as the single-PR Task 117 implementation. Fail any → fall back to **conservative path**: distinct `Ty::Continuation` (code + closure + frame triple) propagated through typecheck and consumed directly by `lower_k_pair_call`. That's the architectural lift Plan D budgeted for; don't half-and-half a clever shortcut with a real ABI fix in the same PR.
+
+**Foundation commit `e2bc2fb` is superseded by this entry.** The split notation in `PLAN_D_PROGRESS.md` Stage 13 is reverted to "single Task 117, in-validation". Branch name `plan-d-task-117a` retained for git history continuity; PR #59 stays open as the single Task 117 PR's container; the title will be retitled once validation lands.
+
+**Implementing commit.** [HEAD] (this entry + PROGRESS revision).
+
+## 2026-05-01 — [DEVIATION Task 117 split into 117a + 117b] Pre-authorized split surfaced before code-write [SUPERSEDED 2026-05-01 — see Task 117 design validation entry above]
+
+**Context.** Plan D §74 pre-authorizes splitting Task 117 into 117a/117b/... if any of (a) diff exceeds Plan B' PR #38/#39 scope before smoke gate is reachable, (b) more than two distinct test-failure classes surface simultaneously, (c) the lifted-lambda closure-record discipline diverges from the existing N-chain `post_arm_k` substrate. **Stop and re-scope with the user** is reserved for cases where the split is unclear or the cluster requires an architectural lift not enumerated.
+
+A pre-execution recon (sigil/main `0ff2c3a`, branch `plan-d-task-117a`) identified that criterion (a) is structurally certain to fire if Task 117 is attempted as a single PR. The recon partitioned the smoke-gate work (`std/choose.sigil` `all_choices` discharger) into three structurally distinct mechanisms, each with independent ABI / closure-record discipline / test surface:
+
+1. **Lifted-lambda generalization** — drop the `Expr::Ident(k_name)` reject at `compiler/src/codegen.rs:1556-1571`; allow `k` to flow as a value through let-bindings inside the arm body, materialized as a closure-record-shaped value carrying `(k_closure, k_fn)` per the existing `ArmKPairCapture` (`compiler/src/closure_convert.rs:104-149`) + `lower_k_pair_call` substrate. The existing machinery (Plan B' Task 107 Phase B) handles this for syntactically-nested lambdas whose body calls `k(arg)`; this generalization extends to `let f = k; f(arg)` shape (k bound to a fn-typed local, then invoked indirectly).
+2. **k-stored-in-record** — k as a slot in a TAG_RECORD value (different layout / bitmap discipline from TAG_CLOSURE).
+3. **k-passed-as-fn-arg** — k flows through a regular fn-decl parameter slot. Mutates *callee signatures*, not just closure records.
+
+PR #38 (Task 97/98 N-chain post_arm_k) shipped a single mechanism with extensive deviations; PR #39 (Stage 6.8 followup) bundled six layered bugs and was the largest single PR in the project. Three structurally distinct mechanisms in one PR puts the diff comfortably past PR #39 scope.
+
+**Split scope:**
+
+- **Task 117a — lifted-lambda generalization** (this branch). Walker delta + closure_convert generalization (≈80% of substrate already in place via `ArmKPairCapture`) + minimal `lower_call` change. Acceptance: arena-escape gate (`arena_escape_count_is_zero_below_one_percent_ceiling` at `compiler/tests/e2e.rs:584-728`) stays at 0; existing tests pass; one new positive test (`k captured into fn-typed local then invoked indirectly`).
+- **Task 117b — k-stored-in-record + k-passed-as-fn-arg + smoke gate.** Builds on 117a's now-validated lifted-lambda generalization. New ABI for fn params taking k-pairs; new TAG_RECORD slot encoding for k-stored. Smoke gate: `all_choices` discharger compiles and runs against `std/choose.sigil`. Targeted tests: k-stored-in-record positive, k-as-fn-arg positive, arena-reset across N-resume chain.
+
+**Rationale for surfacing pre-execution rather than mid-PR.** The plan body's "stop and re-scope" trigger is reserved for cases where the split itself is unclear. The split above is clear (orthogonal mechanisms by k-shape; existing substrate disambiguates 117a vs 117b cleanly). Per `feedback_sigil_per_task_pr_cadence.md` ("default is one task per PR; bundling requires explicit per-session user authorization"), the split is the natural per-task cadence; bundling 117 as a single PR would require explicit user authorization, not the other way around.
+
+User authorized the split per session 2026-05-01 ("sounds good" on the surfaced split recommendation).
+
+**Closure paths:**
+
+- **Task 117a closure point**: `compiler/src/codegen.rs:1556-1571` (the `Expr::Ident(k_name)` reject in `arm_body_walk`); `compiler/src/closure_convert.rs:104-149` (`ArmKPairCapture` substrate).
+- **Task 117b closure point**: same `arm_body_walk` walker for the fn-arg / record-slot rejections; new closure-convert pass for fn-arg k-pair representation; new codegen path for record-slot dispatch.
+
+**Performance acceptance gate.** Plan D Task 117 acceptance gate (post-117 arena escape rate ≤ Plan B Task 60 baseline of 0% on single-shot, ≤ multi-shot driver's existing ceiling) applies to **117a's PR** in addition to 117b's. The split does not relax the perf gate; it just ships it twice (once per sub-PR).
+
+**Failure mode.** None at sigil/main today. The split lands as a PROGRESS / DEVIATIONS bookkeeping change.
+
+**Implementing commit.** This entry + `PLAN_D_PROGRESS.md` Task 117 status update splitting into 117a/117b. No code changes in foundation commit.
+
+## 2026-05-01 — [DEVIATION Task 117] Slice C ctor-tail capability gap
+
+**Context.** Plan D Task 117's Sudoku smoke gate exercises a 4×4 backtracking solver whose handler arm body has the canonical Slice C 2-let shape with a constructor-bearing tail:
+
+```sigil
+Branch.branch(k) => {
+  let r1: Option[Array[Int]] = k(true);
+  let r2: Option[Array[Int]] = k(false);
+  match r1 {
+    Some(s) => Some(s),
+    None => r2,
+  }
+}
+```
+
+The first attempt at compiling this shape on `plan-d-task-117a` (commit `82740c5`, Sudoku ArithError-row fix) produced an unexpected codegen rejection:
+
+> `handle` expression at … has arm `Branch.branch` body that uses continuation `k` in non-tail position outside the supported shapes.
+
+This was surprising — the shape matches `arm_body_n_let_then_pure_tail_shape`'s recognized 2-let pattern (Plan B' Stage 6.7 N-chain Slice C). Investigation revealed a latent over-conservative check in `expr_is_pure` (`compiler/src/codegen.rs:15009`):
+
+```rust
+Expr::Call { .. } => false,  // unconditional rejection
+```
+
+Constructor applications (`Some(s)`, `Ok(v)`, `Cons(h, t)`, …) are parsed as `Expr::Call { callee: Expr::Ident("Some"), args: [...] }` — structurally a Call. The pre-Task-117 classifier rejected them uniformly, miscategorizing pure value constructions as "yield-able" and falling through to the regular walker, which then rejected the surrounding `let r1 = k(arg)` as "k in non-tail position".
+
+**Why latent.** The existing test corpus skews toward primitive returns (Int, Bool) — none of the existing Slice C handler arm bodies re-wrap an Option / Result / List in their tail. The Plan B Task 78.5 Koka-subset import was specifically scoped to surface exactly this kind of convergence-class blind spot (per `feedback_sigil_review_structural_weakness.md`); since that import was deferred to Plan C completion, the gap survived to Task 117.
+
+**Fix.** Added a constructor-aware branch to `expr_is_pure`:
+
+```rust
+Expr::Call { callee, args, .. } => {
+    if let Expr::Ident(name, _) = callee.as_ref() {
+        if ctors.contains(name) {
+            return args.iter().all(|a| expr_is_pure(a, ctors));
+        }
+    }
+    false
+}
+```
+
+`ctors: &BTreeSet<String>` is the set of variant constructor names registered in the program's type registry. Computed once at codegen entry (`emit_object` and `unsupported_handle_construct`) via the new `collect_ctor_names(&program)` helper, then threaded through:
+
+- `expr_is_pure` / `block_is_pure` — direct consumers.
+- `is_simple_tail_perform_with_pure_args_body` / `is_simple_yield_then_constant_tail_body` / `is_simple_chained_let_yield_then_pure_tail_body` — CPS-color body classifiers.
+- `arm_body_unsupported_construct` / `expr_unsupported_handle` / `block_unsupported_handle` — handle-walker chain.
+
+**Why this scope addition is justified.** The fix is single-purpose and contained: one new helper (`collect_ctor_names`), one new branch in `expr_is_pure`, mechanical threading through ~10 sites. The classifier name "pure" continues to mean "non-yield-able" (per the existing doc) — ctor calls satisfy non-yield-ability because constructors lower synchronously to header + per-field stores (no trampoline yields). Non-ctor calls (user fns, builtins like `int_to_string`) remain rejected; the false-negative class is unchanged for that path.
+
+This is **not** a broader recognizer rework: the recognizer's structural shape (`{ let _ = k(arg); ...; pure_tail }`) is unchanged, only the purity classifier is extended. Future widenings (e.g., color-aware purity for Native-color user-fn calls) would be additional sub-fixes, not a generalization of this branch.
+
+**Second-order coupled invariant: post-arm-k free-var walker.** `arm_body_post_arm_k_tail_free_vars_ok` (`compiler/src/codegen.rs:3903`) was relying on `expr_is_pure` rejecting all `Expr::Call` shapes — its `Expr::Call` arm explicitly panicked with "caller bypassed `expr_is_pure`" as a defensive invariant. With ctor calls now passing the purity gate, they reach this fn and trip the panic. Fix: extend the `Expr::Call` arm to walk callee + args recursively (same shape as `Binary`/`Unary`), with a doc comment noting the upstream invariant ("Reachable only after `expr_is_pure` has accepted this Call as a constructor application; user-fn calls are rejected upstream"). The callee Ident gets checked against `globals` (which includes all ctor names per `unsupported_handle_construct`) so well-formed ctor calls pass cleanly; the recursive walk on args correctly identifies free-var references inside the ctor (e.g., `Some(r1)` with `r1` as the chain binding name accepts; `Some(r3)` with `r3` unbound rejects).
+
+Two coupled invariants, one fix: `expr_is_pure` widens to accept ctors → `arm_body_post_arm_k_tail_free_vars_ok` widens to walk through them. Reverting either change without the other breaks the chain.
+
+**Regression tests.** Three unit tests in `compiler/src/codegen.rs` `tests` module:
+
+- `expr_is_pure_accepts_ctor_application_of_pure_args` — pins direct ctor purity (`Some(r1)` and `None` accepted; `int_to_string(r1)` rejected).
+- `expr_is_pure_accepts_match_arm_body_with_ctor_tail` — pins the canonical Sudoku match-tail shape (`match r1 { Some(s) => Some(s), None => r2 }`) as pure under ctor-aware classifier.
+- `slice_c_recognizer_accepts_arm_body_with_ctor_wrapping_chain_binding` — full chain regression: arm body `{ let r1 = k(true); let r2 = k(false); Some(r1) }`. Pins both invariants in one test: (1) Slice C recognizer + ctor-aware `expr_is_pure` accept the shape; (2) post-arm-k free-var walker accepts `Some(r1)` (correctly identifies r1 as the chain binding) and rejects `Some(r3)` (r3 unbound). Without either change the chain breaks; the test asserts both surfaces hold simultaneously.
+
+**Failure mode.** None at the user surface. Pre-fix, programs using ctor-bearing tails in handler arm bodies would fall through to the regular walker and produce a confusing "k in non-tail position" diagnostic. Post-fix, those programs compile via Slice C as the recognizer was always intended to support.
+
+**Third coupled invariant: layout-template pollution.** Even after the recognizer + free-var-walker fixes, Sudoku produced a Cranelift verifier error (`define main: arg has type i8, expected i64`). The `format_define_failure` helper (commit `d43a671`) surfaced the verifier diagnostic + IR dump; the IR showed:
+
+```
+v68 = load.i64 notrap aligned v62+16   // load Some payload (Array[Int])
+v69 = ireduce.i8 v68                    // BUG: narrows ptr to i8
+v73 = call fn6(v69, v72)                // array_get expects i64, got i8 → reject
+```
+
+Root cause: `compiler/src/layout.rs:119+` `build_layouts` previously processed every TypeDecl in `types`, including unmonomorphized generic templates whose variants reference generic-param TypeExprs. `ty_from_type_expr(.., empty_subst)` returned None for those refs (e.g., `Some(A)`'s A); `.unwrap_or(Ty::Unit)` defaulted to `Ty::Unit`, polluting `field_tys`. Then `build_ctor_index` indexed the polluted variant. At codegen time, `emit_pattern_test` looked up `Some` in `ctor_index`, found the polluted layout with `field_tys[0] = Ty::Unit`, and `load_field_value` ireduced the loaded payload to i8.
+
+The original comment at `layout.rs:134-138` claimed *"layout runs after codegen-entry guard accepts only programs with no surface generic syntax"* — the assumption was correct in spirit (post-monomorphization), but the implementation didn't enforce it: the unmonomorphized templates *also* remained in `types` alongside the specializations.
+
+**Fix.** Skip generic-param-bearing TypeDecls in `build_layouts`:
+
+```rust
+if !td.generic_params.is_empty() {
+    continue;
+}
+```
+
+Plus replace `.unwrap_or(Ty::Unit)` with an explicit panic (`build_layouts: unresolved field type in T::V: <TypeExpr> (unmonomorphized generic template leaked past mono — the skip-generic-templates branch is the gate)`). Future regressions point at the exact location instead of silently producing wrong field_tys.
+
+**Why latent.** Reachable only when a program has BOTH multiple specializations of the same generic type (so `ctor_index` lookup hits the polluted unmonomorphized template, not a specialization) AND pattern-destructures one of those types' constructors with a pointer-typed payload. The existing test corpus had Option pattern-destructures with primitive (Int, Bool) payloads — `field_tys[0] = Ty::Unit` happens to work at i8 width for primitive payloads. Sudoku is the first program with `Option[Array[Int]]` pattern-destructure.
+
+**Regression test.** `task_117_layout_skip_generic_templates_pointer_payload_in_some` declares `find_empty() -> Option[Int]` and `make_arr() -> Option[Array[Int]]`; main pattern-matches `Some(arr)` and calls `array_get(arr, 0)`. Asserts stdout = "42\n". Pre-fix this hits the verifier; post-fix it compiles and runs cleanly.
+
+---
+
+**Fourth coupled invariant: monomorphize mangles builtin generic Apply with no resolution target.** With the layout-template-skip fix, the `unreachable!()` panic surfaced its full surface context:
+
+```
+build_layouts: unresolved field type in
+  Option$$Array$$Int::Some$$Array$$Int:
+  Named("Array$$Int", Span { ... line: 15 ... })
+```
+
+The TypeDecl `Option$$Array$$Int` (a user-generic specialization with mangled name) had its `Some$$Array$$Int` variant's field rewritten to `Named("Array$$Int")` — but `Array$$Int` had no TypeDecl in `tc.types` to resolve. Monomorphize's `rewrite_type_expr` Apply arm uniformly mangled `Apply { Array, [Int] }` → `Named("Array$$Int")` regardless of whether the name was a user TypeDecl (cloneable) or a builtin (not cloneable). Builtin generics like `Array[A]` and `MutArray[A]` are registered as synthetic TypeDecls in `tc.types` (per Plan C Task 65 — `typecheck::builtin_types()`) with `generic_params: [A]` and empty variants; they have no monomorphization clone target because the runtime is opaque (values come from FFI primitives `array_alloc` / `array_get`, not user-defined ctors). The rewrite produced a mangled name with nowhere to land.
+
+**First-attempt fix reverted.** The intuitive fix — preserve `Apply` form for builtin generics in monomorphize's rewrite — was tried (commit `7af8f08`) and reverted (commit `4d5c83f`) because it broke the Plan B Task 48 codegen-entry invariant (`contains_apply_or_generic_ref`): all 10+ existing Array/MutArray e2e tests started failing as their post-mono IR retained Apply forms, which the entry guard explicitly rejects.
+
+**Architectural fix: synthesize TypeDecls for builtin specializations in monomorphize.** New `Monomorphizer.builtin_specializations: BTreeSet<String>` field tracks each mangled name produced by Apply-rewrites where the type is NOT in `self.type_decls` (i.e., a builtin generic). After the post-mono `tc.types` rebuild, the wrapper injects empty-variants empty-generic_params synthetic TypeDecls for each tracked mangled name. Now `Named("Array$$Int")` resolves via `ty_from_type_expr_with_rows`'s `Named` branch (returns `Ty::User("Array$$Int", [])`); `build_layouts` produces an empty layout (the existing `ByteArray` / `Int64` / `StringBuilder` precedent — non-generic empty-variants builtins already round-trip cleanly); `build_ctor_index` registers no ctors (empty variants). Maintains the Plan B Task 48 invariant (no Apply post-mono) and unblocks the layout-side mangled-name resolution.
+
+**Audit-driven choices** (per Brian's 2026-05-01 followup):
+- **Insertion point**: post-rebuild in `monomorphize()` wrapper (line 162-200), NOT into `program.items` — the latter would round-trip through `clone_type`'s mangle, double-mangling already-mangled names.
+- **`build_ctor_index` interaction**: empty variants → no entries → no spurious ctors.
+- **Template-skip branch interaction**: synthetic specializations have empty `generic_params` so they pass the `574c74d` skip and get processed; empty variants make the inner loop a no-op; layout entry is empty → harmless.
+- **Other registry consumers** (typecheck.rs match-witness, ctor-resolution paths) are gated by `self.ctors` lookups; synthetics register no ctors → unreachable.
+- **Lexer rejection of `$`** confirmed: user source can't reference synthetic mangled names.
+
+---
+
+**Four independent latent v1 bugs + one diagnostic improvement, surfaced by the Sudoku smoke gate** (each addressed in this deviation):
+1. **Recognizer purity** — `expr_is_pure` blanket-rejected `Expr::Call`, including ctor applications.
+2. **Free-var walker** — `arm_body_post_arm_k_tail_free_vars_ok` defensively rejected `Expr::Call`, assuming `expr_is_pure` had already rejected them upstream.
+3. **Layout template pollution** — `build_layouts` processed unmonomorphized generic templates with `.unwrap_or(Ty::Unit)`, polluting `field_tys` and corrupting `ctor_index` for programs with multiple specializations.
+4. **Monomorphize builtin Apply mangling without TypeDecl synthesis** — Apply-rewrites for builtin generics produced mangled `Named("Array$$Int")` with no resolution target in `tc.types`; fixed by tracking specializations during rewrite and injecting synthetic empty-variants TypeDecls post-rebuild.
+
+Plus: **verifier-output unswallow** (`d43a671`) — `format_define_failure` helper at every `module.define_function` call site uses pretty-print Debug + IR dump so future codegen failures show full per-instruction diagnostics rather than `Compilation error: Verifier errors`. This was load-bearing for diagnosing #4 and remains valuable for any future codegen issue.
+
+The pattern is "Slice C had latent bugs the primitive corpus masked." Plan B Task 78.5 (Koka subset import — deferred to Plan C completion) was specifically scoped to surface this convergence-class blind spot; that import's deferral is what allowed all four to survive to Task 117.
+
+**Implementing commit(s).** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical patterns rather than workarounds. Recognizer fix at `e889e89`; downstream free-var-walker fix at `e10d8b3`; verifier-output unswallow at `d43a671`; layout-template-skip at `574c74d`; monomorphize-builtin-synthesis at `[HEAD]`.
+

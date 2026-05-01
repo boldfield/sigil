@@ -238,8 +238,9 @@ fn compute_user_fn_abi(
     if !colored.needs_cps_transform(name) {
         return UserFnAbi::Sync;
     }
-    if is_simple_tail_perform_with_pure_args_body(body)
-        || is_simple_yield_then_constant_tail_body(body)
+    let ctors = collect_ctor_names(&colored.mono.anf.checked.program);
+    if is_simple_tail_perform_with_pure_args_body(body, &ctors)
+        || is_simple_yield_then_constant_tail_body(body, &ctors)
     {
         return UserFnAbi::Cps;
     }
@@ -261,7 +262,7 @@ fn compute_user_fn_abi(
     // helper the pre-pass uses, so the ABI selection sees the real
     // K + N combination instead of the conservative `N >=
     // MAX_CLOSURE_ENV_SLOTS` that the classifier alone enforces.
-    if let Some(chain_length) = is_simple_chained_let_yield_then_pure_tail_body(body) {
+    if let Some(chain_length) = is_simple_chained_let_yield_then_pure_tail_body(body, &ctors) {
         let mut performs: Vec<crate::ast::PerformExpr> = Vec::with_capacity(chain_length);
         let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
         for stmt in &body.stmts {
@@ -681,6 +682,50 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
 /// for the Phase 2 milestone because the e2e test program's body is
 /// a literal; widening the guard to follow call edges lands with
 /// Phase 3+ when the proper handler-frame setup ships.
+/// Plan D Task 117 (a) — format a `define_function` failure with full
+/// detail. Cranelift's `ModuleError::Display` for `Compilation(Verifier(_))`
+/// yields just `"Compilation error: Verifier errors"` — the per-instruction
+/// diagnostics that follow are dropped. Pretty-printed Debug
+/// (`{:#?}`) recursively formats `VerifierErrors`'s inner `Vec<VerifierError>`
+/// with file/loc/instruction context. The function's IR is appended so
+/// the rejected SSA shape is visible alongside the verifier complaint.
+///
+/// Used at every `module.define_function` call site to keep codegen
+/// failures debuggable end-to-end (Brian's "fix the swallow first;
+/// small diff, broad benefit" instruction, 2026-05-01).
+fn format_define_failure(
+    label: &str,
+    e: &cranelift_module::ModuleError,
+    ctx: &cranelift::codegen::Context,
+) -> String {
+    use std::fmt::Write;
+    let mut buf = format!("define {label}: {e:#?}");
+    let _ = write!(&mut buf, "\n--- IR ---\n{}", ctx.func.display());
+    buf
+}
+
+/// Plan D Task 117 — collect names of variant constructors registered
+/// in the program's type registry. Used by `expr_is_pure`'s ctor-aware
+/// branch to recognize constructor applications (`Some(x)`, `Ok(v)`,
+/// `Cons(h, t)`, …) as pure value constructions, parallel to
+/// `RecordLit` / `Tuple`. Pre-Task-117 the classifier blanket-rejected
+/// `Expr::Call`, miscategorizing constructor applications and blocking
+/// Slice C arm-body recognition for handler arms whose tail re-wraps
+/// an `Option` / `Result` / `List`.
+pub(crate) fn collect_ctor_names(
+    program: &crate::ast::Program,
+) -> std::collections::BTreeSet<String> {
+    let mut ctors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for item in &program.items {
+        if let crate::ast::Item::Type(t) = item {
+            for v in &t.variants {
+                ctors.insert(v.name.clone());
+            }
+        }
+    }
+    ctors
+}
+
 pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Option<String> {
     use std::collections::{BTreeMap, BTreeSet};
     // Globals reachable as bare `Expr::Ident` from anywhere — used by
@@ -778,9 +823,12 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("random_pseudo_int".to_string());
     // Plan C Task 76 — Clock builtin.
     globals.insert("clock_os_now".to_string());
+    let ctors: BTreeSet<String> = collect_ctor_names(program);
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
-            if let Some(msg) = block_unsupported_handle(&f.body, &globals, &effects_resumes_many) {
+            if let Some(msg) =
+                block_unsupported_handle(&f.body, &globals, &ctors, &effects_resumes_many)
+            {
                 return Some(format!("in fn `{}`: {}", f.name, msg));
             }
         }
@@ -1009,25 +1057,30 @@ fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
 fn block_unsupported_handle(
     b: &crate::ast::Block,
     globals: &std::collections::BTreeSet<String>,
+    ctors: &std::collections::BTreeSet<String>,
     effects_resumes_many: &std::collections::BTreeMap<String, bool>,
 ) -> Option<String> {
     use crate::ast::Stmt;
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                if let Some(msg) = expr_unsupported_handle(&l.value, globals, effects_resumes_many)
+                if let Some(msg) =
+                    expr_unsupported_handle(&l.value, globals, ctors, effects_resumes_many)
                 {
                     return Some(msg);
                 }
             }
             Stmt::Expr(e) => {
-                if let Some(msg) = expr_unsupported_handle(e, globals, effects_resumes_many) {
+                if let Some(msg) = expr_unsupported_handle(e, globals, ctors, effects_resumes_many)
+                {
                     return Some(msg);
                 }
             }
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    if let Some(msg) = expr_unsupported_handle(a, globals, effects_resumes_many) {
+                    if let Some(msg) =
+                        expr_unsupported_handle(a, globals, ctors, effects_resumes_many)
+                    {
                         return Some(msg);
                     }
                 }
@@ -1035,7 +1088,7 @@ fn block_unsupported_handle(
         }
     }
     if let Some(tail) = &b.tail {
-        if let Some(msg) = expr_unsupported_handle(tail, globals, effects_resumes_many) {
+        if let Some(msg) = expr_unsupported_handle(tail, globals, ctors, effects_resumes_many) {
             return Some(msg);
         }
     }
@@ -1045,6 +1098,7 @@ fn block_unsupported_handle(
 fn expr_unsupported_handle(
     e: &crate::ast::Expr,
     globals: &std::collections::BTreeSet<String>,
+    ctors: &std::collections::BTreeSet<String>,
     effects_resumes_many: &std::collections::BTreeMap<String, bool>,
 ) -> Option<String> {
     use crate::ast::Expr;
@@ -1056,50 +1110,59 @@ fn expr_unsupported_handle(
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => None,
         Expr::Binary { lhs, rhs, .. } => {
-            expr_unsupported_handle(lhs, globals, effects_resumes_many)
-                .or_else(|| expr_unsupported_handle(rhs, globals, effects_resumes_many))
+            expr_unsupported_handle(lhs, globals, ctors, effects_resumes_many)
+                .or_else(|| expr_unsupported_handle(rhs, globals, ctors, effects_resumes_many))
         }
         Expr::Unary { operand, .. } => {
-            expr_unsupported_handle(operand, globals, effects_resumes_many)
+            expr_unsupported_handle(operand, globals, ctors, effects_resumes_many)
         }
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => expr_unsupported_handle(cond, globals, effects_resumes_many)
-            .or_else(|| block_unsupported_handle(then_block, globals, effects_resumes_many))
-            .or_else(|| block_unsupported_handle(else_block, globals, effects_resumes_many)),
-        Expr::Block(b) => block_unsupported_handle(b, globals, effects_resumes_many),
+        } => expr_unsupported_handle(cond, globals, ctors, effects_resumes_many)
+            .or_else(|| block_unsupported_handle(then_block, globals, ctors, effects_resumes_many))
+            .or_else(|| block_unsupported_handle(else_block, globals, ctors, effects_resumes_many)),
+        Expr::Block(b) => block_unsupported_handle(b, globals, ctors, effects_resumes_many),
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            if let Some(msg) = expr_unsupported_handle(scrutinee, globals, effects_resumes_many) {
+            if let Some(msg) =
+                expr_unsupported_handle(scrutinee, globals, ctors, effects_resumes_many)
+            {
                 return Some(msg);
             }
             for a in arms {
-                if let Some(msg) = expr_unsupported_handle(&a.body, globals, effects_resumes_many) {
+                if let Some(msg) =
+                    expr_unsupported_handle(&a.body, globals, ctors, effects_resumes_many)
+                {
                     return Some(msg);
                 }
             }
             None
         }
         Expr::Call { callee, args, .. } => {
-            if let Some(msg) = expr_unsupported_handle(callee, globals, effects_resumes_many) {
+            if let Some(msg) = expr_unsupported_handle(callee, globals, ctors, effects_resumes_many)
+            {
                 return Some(msg);
             }
             for a in args {
-                if let Some(msg) = expr_unsupported_handle(a, globals, effects_resumes_many) {
+                if let Some(msg) = expr_unsupported_handle(a, globals, ctors, effects_resumes_many)
+                {
                     return Some(msg);
                 }
             }
             None
         }
         Expr::Perform(_) => None,
-        Expr::Lambda { body, .. } => expr_unsupported_handle(body, globals, effects_resumes_many),
+        Expr::Lambda { body, .. } => {
+            expr_unsupported_handle(body, globals, ctors, effects_resumes_many)
+        }
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
-                if let Some(msg) = expr_unsupported_handle(ee, globals, effects_resumes_many) {
+                if let Some(msg) = expr_unsupported_handle(ee, globals, ctors, effects_resumes_many)
+                {
                     return Some(msg);
                 }
             }
@@ -1107,7 +1170,8 @@ fn expr_unsupported_handle(
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                if let Some(msg) = expr_unsupported_handle(&f.value, globals, effects_resumes_many)
+                if let Some(msg) =
+                    expr_unsupported_handle(&f.value, globals, ctors, effects_resumes_many)
                 {
                     return Some(msg);
                 }
@@ -1231,7 +1295,7 @@ fn expr_unsupported_handle(
             // to use any expression over its op-args + globals.
             for arm in op_arms.iter() {
                 if let Some(msg) =
-                    arm_body_unsupported_construct(arm, globals, effects_resumes_many)
+                    arm_body_unsupported_construct(arm, globals, ctors, effects_resumes_many)
                 {
                     return Some(format!(
                         "`handle` expression at {:?} has arm `{}.{}` body that {} \
@@ -1275,13 +1339,14 @@ fn expr_unsupported_handle(
             // are never enforced — at runtime that can register arms
             // under the wrong effect_id and crash inside `sigil_perform`'s
             // handler-stack walk.
-            if let Some(msg) = expr_unsupported_handle(body, globals, effects_resumes_many) {
+            if let Some(msg) = expr_unsupported_handle(body, globals, ctors, effects_resumes_many) {
                 return Some(msg);
             }
             // Recurse into arm bodies so nested handles deeper in
             // the AST surface their own diagnostics.
             for arm in op_arms {
-                if let Some(msg) = expr_unsupported_handle(&arm.body, globals, effects_resumes_many)
+                if let Some(msg) =
+                    expr_unsupported_handle(&arm.body, globals, ctors, effects_resumes_many)
                 {
                     return Some(msg);
                 }
@@ -1291,7 +1356,8 @@ fn expr_unsupported_handle(
             // their own diagnostics (parallel to op-arm body
             // recursion above).
             if let Some(ra) = return_arm {
-                if let Some(msg) = expr_unsupported_handle(&ra.body, globals, effects_resumes_many)
+                if let Some(msg) =
+                    expr_unsupported_handle(&ra.body, globals, ctors, effects_resumes_many)
                 {
                     return Some(msg);
                 }
@@ -1300,7 +1366,8 @@ fn expr_unsupported_handle(
         }
         Expr::Tuple { elems, .. } => {
             for e in elems {
-                if let Some(msg) = expr_unsupported_handle(e, globals, effects_resumes_many) {
+                if let Some(msg) = expr_unsupported_handle(e, globals, ctors, effects_resumes_many)
+                {
                     return Some(msg);
                 }
             }
@@ -1333,6 +1400,7 @@ fn expr_unsupported_handle(
 fn arm_body_unsupported_construct(
     arm: &crate::ast::HandleOpArm,
     globals: &std::collections::BTreeSet<String>,
+    ctors: &std::collections::BTreeSet<String>,
     effects_resumes_many: &std::collections::BTreeMap<String, bool>,
 ) -> Option<String> {
     use std::collections::BTreeSet;
@@ -1383,7 +1451,7 @@ fn arm_body_unsupported_construct(
         // Per-arg purity check.
         let mut any_impure = false;
         for arg in &shape.arg_exprs {
-            if !expr_is_pure(arg) {
+            if !expr_is_pure(arg, ctors) {
                 any_impure = true;
                 break;
             }
@@ -1391,7 +1459,7 @@ fn arm_body_unsupported_construct(
         if any_impure {
             // Fall through; regular walker surfaces the specific
             // yield-able sub-shape in the failing arg.
-        } else if !expr_is_pure(&shape.tail_expr) {
+        } else if !expr_is_pure(&shape.tail_expr, ctors) {
             // Fall through; regular walker surfaces the specific
             // yield-able sub-shape in tail.
         } else {
@@ -1469,11 +1537,11 @@ fn arm_body_unsupported_construct(
     // emitting `Call(k_closure, k_fn, [arg, null,
     // post_arm_k_fn_addr])`.
     if let Some(shape) = arm_body_let_then_pure_tail_shape(&arm.body, &arm.k_name) {
-        if !expr_is_pure(shape.arg_expr) {
+        if !expr_is_pure(shape.arg_expr, ctors) {
             // Fall through to the regular walker so the diagnostic
             // it emits points at the specific yield-able sub-shape
             // in `arg`. Not an early return.
-        } else if !expr_is_pure(shape.tail_expr) {
+        } else if !expr_is_pure(shape.tail_expr, ctors) {
             // Same: let the regular walker surface the specific
             // yield-able sub-shape in `tail`.
         } else if let Some(diag) = arm_body_post_arm_k_tail_free_vars_ok(
@@ -3991,12 +4059,43 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                 extra_bindings,
             )
         }),
-        // Yield-able shapes: `expr_is_pure` already rejected these
+        // Reachable only after `expr_is_pure` has accepted this
+        // Call as a constructor application; user-fn calls are
+        // rejected upstream. Plan D Task 117 — `expr_is_pure` is
+        // now ctor-aware: `Expr::Call { callee: Ident(Ctor), args }`
+        // is pure when args are pure (variant constructor
+        // application). Walk callee + args here using the same
+        // free-var restriction. The callee's Ident gets checked
+        // against `globals` (which includes all ctor names per
+        // `unsupported_handle_construct`), so well-formed ctor
+        // calls pass cleanly. Non-ctor Calls would have been
+        // rejected by `expr_is_pure` before reaching here; the
+        // recursive walk handles them defensively (the callee
+        // Ident check would surface "non-global identifier" for
+        // any non-ctor reference).
+        Expr::Call { callee, args, .. } => arm_body_post_arm_k_tail_free_vars_ok(
+            callee,
+            binding_name,
+            k_name,
+            globals,
+            extra_bindings,
+        )
+        .or_else(|| {
+            args.iter().find_map(|a| {
+                arm_body_post_arm_k_tail_free_vars_ok(
+                    a,
+                    binding_name,
+                    k_name,
+                    globals,
+                    extra_bindings,
+                )
+            })
+        }),
+        // Genuinely yield-able shapes: `expr_is_pure` rejected these
         // before this fn was called, so this is unreachable in
         // current callers. Defensive: surface the regression
         // immediately if a future caller drops the purity gate.
-        Expr::Call { .. }
-        | Expr::Perform(_)
+        Expr::Perform(_)
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => Some(format!(
@@ -4633,6 +4732,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // Plan A1 Stage 1 stops at the hello-world shape. Validate that shape
     // up front so codegen can assume it.
     let checked: &CheckedProgram = &cc.colored.mono.anf.checked;
+
+    // Plan D Task 117 — variant constructor names for `expr_is_pure`'s
+    // ctor-aware branch. Computed once at codegen entry and threaded
+    // to the CPS-body classifiers + arm-body recognizer purity checks.
+    let ctors: std::collections::BTreeSet<String> = collect_ctor_names(&checked.program);
 
     // Plan B task 48 — codegen-entry guard. The verification-debt
     // entry "Codegen path for un-monomorphized generic params" in
@@ -5979,7 +6083,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // two passes (declare all N FuncIds first, then build N
             // entries with cross-references populated).
             if abi == UserFnAbi::Cps {
-                if is_simple_yield_then_constant_tail_body(&f.body) {
+                if is_simple_yield_then_constant_tail_body(&f.body, &ctors) {
                     let constant_value = match &f.body.tail {
                         Some(crate::ast::Expr::IntLit(n, _)) => *n,
                         _ => unreachable!(
@@ -6001,7 +6105,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     });
                     cps_continuation_synth_indices.insert(f.name.clone(), synth_cont_idx);
                 } else if let Some(chain_length) =
-                    is_simple_chained_let_yield_then_pure_tail_body(&f.body)
+                    is_simple_chained_let_yield_then_pure_tail_body(&f.body, &ctors)
                 {
                     // Extract per-step let-binding info (name +
                     // declared type + slot kind) and the perform.
@@ -6190,7 +6294,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         data.set_segment_section(".rodata", &name);
         module
             .define_data(id, &data)
-            .map_err(|e| format!("define {name}: {e}"))?;
+            .map_err(|e| format!("define {name}: {e:#?}"))?;
         lit_ids.push(id);
     }
 
@@ -6852,7 +6956,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 module
                     .define_function(entry.func_id, &mut ctx)
-                    .map_err(|e| format!("define {}: {e}", f.name))?;
+                    .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
                 module.clear_context(&mut ctx);
                 continue;
             }
@@ -6979,7 +7083,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         }
         module
             .define_function(entry.func_id, &mut ctx)
-            .map_err(|e| format!("define {}: {e}", f.name))?;
+            .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
         module.clear_context(&mut ctx);
     }
 
@@ -7190,7 +7294,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     }
     module
         .define_function(main, &mut ctx)
-        .map_err(|e| format!("define main: {e}"))?;
+        .map_err(|e| format_define_failure("main", &e, &ctx))?;
     module.clear_context(&mut ctx);
 
     // --- Plan B Task 55 (Phase 4c): synthetic handler-arm CPS fns ------
@@ -7903,7 +8007,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             }
             module
                 .define_function(synth.func_id, &mut ctx)
-                .map_err(|e| format!("define handler arm fn: {e}"))?;
+                .map_err(|e| format_define_failure("handler arm fn", &e, &ctx))?;
             module.clear_context(&mut ctx);
         }
     }
@@ -8199,7 +8303,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             }
             module
                 .define_function(synth.func_id, &mut ctx)
-                .map_err(|e| format!("define handler return-arm fn: {e}"))?;
+                .map_err(|e| format_define_failure("handler return-arm fn", &e, &ctx))?;
             module.clear_context(&mut ctx);
         }
     }
@@ -8402,7 +8506,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
             module
                 .define_function(post_arm_k.func_id, &mut ctx)
-                .map_err(|e| format!("define post-arm-k synth fn: {e}"))?;
+                .map_err(|e| format_define_failure("post-arm-k synth fn", &e, &ctx))?;
             module.clear_context(&mut ctx);
         }
     }
@@ -9585,7 +9689,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             }
             module
                 .define_function(synth.func_id, &mut ctx)
-                .map_err(|e| format!("define synth-cont for `{}`: {e}", synth.parent_fn_name))?;
+                .map_err(|e| {
+                    format_define_failure(
+                        &format!("synth-cont for `{}`", synth.parent_fn_name),
+                        &e,
+                        &ctx,
+                    )
+                })?;
             module.clear_context(&mut ctx);
         }
     }
@@ -9758,7 +9868,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         builder.finalize();
         module
             .define_function(shim_id, &mut ctx)
-            .map_err(|e| format!("define sync_shim for `{fn_name}`: {e}"))?;
+            .map_err(|e| format_define_failure(&format!("sync_shim for `{fn_name}`"), &e, &ctx))?;
         module.clear_context(&mut ctx);
     }
 
@@ -14946,7 +15056,10 @@ fn prepare_per_fn_refs(
 /// [`cps_signature`] CPS ABI or with the existing native ABI. The
 /// transitional `#[allow(dead_code)]` from `76c17ae` is removed
 /// at this commit — the function is now consumed.
-fn is_simple_tail_perform_with_pure_args_body(body: &crate::ast::Block) -> bool {
+fn is_simple_tail_perform_with_pure_args_body(
+    body: &crate::ast::Block,
+    ctors: &std::collections::BTreeSet<String>,
+) -> bool {
     if !body.stmts.is_empty() {
         return false;
     }
@@ -14960,7 +15073,7 @@ fn is_simple_tail_perform_with_pure_args_body(body: &crate::ast::Block) -> bool 
             // `[DEVIATION Task 57] IO color filter retention`).
             // Post-lift, IO performs flow through the trampoline
             // like any other effect; the discard-`k` gap closes.
-            p.args.iter().all(expr_is_pure)
+            p.args.iter().all(|a| expr_is_pure(a, ctors))
         }
         _ => false,
     }
@@ -14991,15 +15104,22 @@ fn is_simple_tail_perform_with_pure_args_body(body: &crate::ast::Block) -> bool 
 /// fn values that may need their own CPS treatment downstream) are
 /// not.
 ///
-/// Conservative: `Expr::Call` is rejected unconditionally even
-/// though calls to Native-color callees are technically safe. The
-/// alternative (color-aware purity) requires the colored program
-/// at the analysis site, which the classifier doesn't have access
-/// to. False negatives are acceptable; rejecting `int_to_string`
-/// in a perform's args means the surrounding fn falls through to
-/// the native-ABI path, which lowers correctly via the existing
+/// Plan D Task 117 — extended to be ctor-aware: variant
+/// constructors registered in the type registry (`type Foo = |
+/// Ctor(...) | ...`) ARE accepted as pure when their args are
+/// pure. Pre-Task-117 the Call rejection was unconditional which
+/// blocked Slice C recognition for arm bodies returning
+/// re-wrapped Option / Result / etc.
+///
+/// Non-ctor calls remain rejected. This is still conservative:
+/// calls to Native-color user fns are technically safe but
+/// determining color requires the colored program at the analysis
+/// site, which the classifier doesn't have access to. False
+/// negatives are acceptable; rejecting `int_to_string` in a
+/// perform's args means the surrounding fn falls through to the
+/// native-ABI path, which lowers correctly via the existing
 /// synchronous shape.
-fn expr_is_pure(e: &crate::ast::Expr) -> bool {
+fn expr_is_pure(e: &crate::ast::Expr, ctors: &std::collections::BTreeSet<String>) -> bool {
     use crate::ast::Expr;
     match e {
         Expr::IntLit(..)
@@ -15008,25 +15128,52 @@ fn expr_is_pure(e: &crate::ast::Expr) -> bool {
         | Expr::CharLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => true,
-        Expr::Binary { lhs, rhs, .. } => expr_is_pure(lhs) && expr_is_pure(rhs),
-        Expr::Unary { operand, .. } => expr_is_pure(operand),
+        Expr::Binary { lhs, rhs, .. } => expr_is_pure(lhs, ctors) && expr_is_pure(rhs, ctors),
+        Expr::Unary { operand, .. } => expr_is_pure(operand, ctors),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => expr_is_pure(cond) && block_is_pure(then_block) && block_is_pure(else_block),
+        } => {
+            expr_is_pure(cond, ctors)
+                && block_is_pure(then_block, ctors)
+                && block_is_pure(else_block, ctors)
+        }
         Expr::Match {
             scrutinee, arms, ..
-        } => expr_is_pure(scrutinee) && arms.iter().all(|a| expr_is_pure(&a.body)),
-        Expr::Block(b) => block_is_pure(b),
-        Expr::RecordLit { fields, .. } => fields.iter().all(|f| expr_is_pure(&f.value)),
-        // Reject any yield-able shape and any first-class-fn-value
-        // construction (lambdas / closure records). Conservative; a
-        // future commit could allow lambdas if it's clear they don't
-        // need CPS treatment downstream.
-        Expr::Call { .. }
-        | Expr::Perform(_)
+        } => expr_is_pure(scrutinee, ctors) && arms.iter().all(|a| expr_is_pure(&a.body, ctors)),
+        Expr::Block(b) => block_is_pure(b, ctors),
+        Expr::RecordLit { fields, .. } => fields.iter().all(|f| expr_is_pure(&f.value, ctors)),
+        // Plan D Task 117 — constructor-aware purity. Variant
+        // constructors (registered in the type registry as
+        // `type Foo = | Ctor(...) | ...`) are pure value
+        // constructions: they allocate but have no side effects
+        // beyond allocation, identical to RecordLit / Tuple. The
+        // pre-Task-117 blanket Call rejection misclassified
+        // `Some(s) => Some(s)` arm bodies as impure, blocking
+        // Slice C recognition for handler arms whose tail
+        // re-wraps an Option / Result / List / etc. The existing
+        // test corpus skews toward primitive (Int, Bool) returns;
+        // the Sudoku smoke gate (Plan D Task 117) was the first
+        // arm body to surface this gap.
+        //
+        // Non-ctor calls (user fns, builtins like `int_to_string`)
+        // remain rejected — those may be Cps-color and would
+        // require trampoline yields. The classifier name "pure"
+        // continues to mean "non-yield-able" (per the doc above),
+        // not "side-effect-free in the usual sense"; ctor calls
+        // satisfy non-yield-ability because constructors lower
+        // synchronously to header + per-field stores.
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident(name, _) = callee.as_ref() {
+                if ctors.contains(name) {
+                    return args.iter().all(|a| expr_is_pure(a, ctors));
+                }
+            }
+            false
+        }
+        Expr::Perform(_)
         | Expr::Handle { .. }
         | Expr::Lambda { .. }
         | Expr::ClosureRecord { .. } => false,
@@ -15039,7 +15186,7 @@ fn expr_is_pure(e: &crate::ast::Expr) -> bool {
         // Task 113 R1 finding 4 — flipped from `false` to mirror the
         // RecordLit shape so generic helpers using tuple ctor
         // values aren't rejected by the perform-side classifier.
-        Expr::Tuple { elems, .. } => elems.iter().all(expr_is_pure),
+        Expr::Tuple { elems, .. } => elems.iter().all(|e| expr_is_pure(e, ctors)),
     }
 }
 
@@ -15047,17 +15194,17 @@ fn expr_is_pure(e: &crate::ast::Expr) -> bool {
 /// every stmt and the tail are pure. `Stmt::Perform` is always
 /// rejected (yield by definition). Used recursively to cover the
 /// `Expr::If` / `Expr::Match` / `Expr::Block` arms of `expr_is_pure`.
-fn block_is_pure(b: &crate::ast::Block) -> bool {
+fn block_is_pure(b: &crate::ast::Block, ctors: &std::collections::BTreeSet<String>) -> bool {
     use crate::ast::Stmt;
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                if !expr_is_pure(&l.value) {
+                if !expr_is_pure(&l.value, ctors) {
                     return false;
                 }
             }
             Stmt::Expr(e) => {
-                if !expr_is_pure(e) {
+                if !expr_is_pure(e, ctors) {
                     return false;
                 }
             }
@@ -15065,7 +15212,7 @@ fn block_is_pure(b: &crate::ast::Block) -> bool {
         }
     }
     match &b.tail {
-        Some(t) => expr_is_pure(t),
+        Some(t) => expr_is_pure(t, ctors),
         None => true,
     }
 }
@@ -15129,7 +15276,10 @@ fn block_is_pure(b: &crate::ast::Block) -> bool {
 ///    synth-cont chaining.
 /// 3. `Stmt::Let(name, perform)` — synth-cont takes the perform's
 ///    result as `name` in its env.
-fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
+fn is_simple_yield_then_constant_tail_body(
+    body: &crate::ast::Block,
+    ctors: &std::collections::BTreeSet<String>,
+) -> bool {
     use crate::ast::{Expr, Stmt};
     if body.stmts.len() != 1 {
         return false;
@@ -15140,7 +15290,7 @@ fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
         Stmt::Perform(p) => p,
         _ => return false,
     };
-    if !yield_perform.args.iter().all(expr_is_pure) {
+    if !yield_perform.args.iter().all(|a| expr_is_pure(a, ctors)) {
         return false;
     }
     matches!(&body.tail, Some(Expr::IntLit(_, _)))
@@ -15182,7 +15332,10 @@ fn is_simple_yield_then_constant_tail_body(body: &crate::ast::Block) -> bool {
 /// chains beyond ~10 steps are rare); a future revision could
 /// lift captures collection into the classifier or refactor
 /// `compute_user_fn_abi` to run after captures are known.
-fn is_simple_chained_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> Option<usize> {
+fn is_simple_chained_let_yield_then_pure_tail_body(
+    body: &crate::ast::Block,
+    ctors: &std::collections::BTreeSet<String>,
+) -> Option<usize> {
     use crate::ast::{Expr, Stmt};
     if body.stmts.is_empty() {
         return None;
@@ -15199,12 +15352,12 @@ fn is_simple_chained_let_yield_then_pure_tail_body(body: &crate::ast::Block) -> 
             Expr::Perform(p) => p,
             _ => return None,
         };
-        if !yield_perform.args.iter().all(expr_is_pure) {
+        if !yield_perform.args.iter().all(|a| expr_is_pure(a, ctors)) {
             return None;
         }
     }
     match &body.tail {
-        Some(t) if expr_is_pure(t) => Some(body.stmts.len()),
+        Some(t) if expr_is_pure(t, ctors) => Some(body.stmts.len()),
         _ => None,
     }
 }
@@ -15695,7 +15848,10 @@ mod tests {
             })),
             span,
         };
-        assert!(is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(is_simple_tail_perform_with_pure_args_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -15717,7 +15873,10 @@ mod tests {
             })),
             span,
         };
-        assert!(is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(is_simple_tail_perform_with_pure_args_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -15742,7 +15901,10 @@ mod tests {
             })),
             span,
         };
-        assert!(is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(is_simple_tail_perform_with_pure_args_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -15771,7 +15933,10 @@ mod tests {
             })),
             span,
         };
-        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(!is_simple_tail_perform_with_pure_args_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -15784,7 +15949,10 @@ mod tests {
             tail: Some(Expr::IntLit(42, span.clone())),
             span,
         };
-        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(!is_simple_tail_perform_with_pure_args_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     // ---------------- Plan B Task 55, Phase 4e — yield-then-
@@ -15805,7 +15973,10 @@ mod tests {
             tail: Some(Expr::IntLit(42, span.clone())),
             span,
         };
-        assert!(is_simple_yield_then_constant_tail_body(&body));
+        assert!(is_simple_yield_then_constant_tail_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -15827,7 +15998,10 @@ mod tests {
             tail: Some(Expr::IntLit(42, span.clone())),
             span,
         };
-        assert!(is_simple_yield_then_constant_tail_body(&body));
+        assert!(is_simple_yield_then_constant_tail_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -15848,7 +16022,10 @@ mod tests {
             tail: Some(Expr::Ident("x".to_string(), span.clone())),
             span,
         };
-        assert!(!is_simple_yield_then_constant_tail_body(&body));
+        assert!(!is_simple_yield_then_constant_tail_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -15868,7 +16045,10 @@ mod tests {
             tail: Some(Expr::IntLit(42, span.clone())),
             span,
         };
-        assert!(is_simple_yield_then_constant_tail_body(&body));
+        assert!(is_simple_yield_then_constant_tail_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     // ---------------- Plan B' Stage 6.7 Task 93 (B.2 Phase A) —
@@ -15913,7 +16093,10 @@ mod tests {
             span,
         };
         assert_eq!(
-            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new()
+            ),
             Some(1)
         );
     }
@@ -15940,7 +16123,10 @@ mod tests {
             span,
         };
         assert_eq!(
-            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new()
+            ),
             Some(2)
         );
     }
@@ -15961,7 +16147,10 @@ mod tests {
             span,
         };
         assert_eq!(
-            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new()
+            ),
             Some(3)
         );
     }
@@ -15978,7 +16167,13 @@ mod tests {
             tail: None,
             span,
         };
-        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -16008,7 +16203,13 @@ mod tests {
             tail: Some(Expr::Ident("x".to_string(), span.clone())),
             span,
         };
-        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -16028,7 +16229,13 @@ mod tests {
             tail: Some(Expr::Ident("x".to_string(), span.clone())),
             span,
         };
-        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -16059,7 +16266,13 @@ mod tests {
             tail: Some(Expr::Ident("x".to_string(), span.clone())),
             span,
         };
-        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -16087,7 +16300,13 @@ mod tests {
             }),
             span,
         };
-        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -16114,7 +16333,13 @@ mod tests {
             tail: None,
             span,
         };
-        assert_eq!(is_simple_chained_let_yield_then_pure_tail_body(&body), None);
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -16151,7 +16376,10 @@ mod tests {
             span: span.clone(),
         };
         assert_eq!(
-            is_simple_chained_let_yield_then_pure_tail_body(&body_at_cap),
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body_at_cap,
+                &std::collections::BTreeSet::new()
+            ),
             None,
             "chain at MAX_CLOSURE_ENV_SLOTS rejected"
         );
@@ -16169,7 +16397,10 @@ mod tests {
             span,
         };
         assert_eq!(
-            is_simple_chained_let_yield_then_pure_tail_body(&body_under_cap),
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body_under_cap,
+                &std::collections::BTreeSet::new()
+            ),
             Some(MAX_CLOSURE_ENV_SLOTS - 1),
             "chain just below MAX_CLOSURE_ENV_SLOTS accepted"
         );
@@ -16219,7 +16450,10 @@ mod tests {
             span,
         };
         assert_eq!(
-            is_simple_chained_let_yield_then_pure_tail_body(&body),
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new()
+            ),
             Some(1)
         );
     }
@@ -16250,7 +16484,10 @@ mod tests {
             tail: Some(Expr::IntLit(42, span.clone())),
             span,
         };
-        assert!(!is_simple_yield_then_constant_tail_body(&body));
+        assert!(!is_simple_yield_then_constant_tail_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -16263,7 +16500,10 @@ mod tests {
             tail: None,
             span,
         };
-        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(!is_simple_tail_perform_with_pure_args_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -16292,7 +16532,10 @@ mod tests {
             })),
             span,
         };
-        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(!is_simple_tail_perform_with_pure_args_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -16318,7 +16561,10 @@ mod tests {
             })),
             span,
         };
-        assert!(!is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(!is_simple_tail_perform_with_pure_args_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -16354,7 +16600,10 @@ mod tests {
             })),
             span,
         };
-        assert!(is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(is_simple_tail_perform_with_pure_args_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
     }
 
     // ---------------- Plan B Task 55, Phase 4e — ABI selection
@@ -16648,7 +16897,10 @@ mod tests {
         };
         // Sanity: the body IS simple-tail-perform; if not for the
         // forced-Native classification, the fn would be Cps.
-        assert!(is_simple_tail_perform_with_pure_args_body(&body));
+        assert!(is_simple_tail_perform_with_pure_args_body(
+            &body,
+            &std::collections::BTreeSet::new()
+        ));
         // The actual assertion: Sync, because color short-circuits.
         assert_eq!(
             compute_user_fn_abi("f", &body, &[], &colored),
@@ -16693,7 +16945,10 @@ mod tests {
         let helper_params = params_of(&prog, "helper");
         // Sanity: classifier accepts the body shape (perform's
         // arg `x` is pure Ident); color taints CPS via row.
-        assert!(is_simple_tail_perform_with_pure_args_body(&helper_body));
+        assert!(is_simple_tail_perform_with_pure_args_body(
+            &helper_body,
+            &std::collections::BTreeSet::new()
+        ));
         assert!(colored.needs_cps_transform("helper"));
         assert_eq!(helper_params.len(), 1);
         // Inverted from prior commit's Sync expectation — the
@@ -16728,7 +16983,10 @@ mod tests {
         let (prog, colored) = colored_from_src(src);
         let helper_body = body_of(&prog, "helper");
         let helper_params = params_of(&prog, "helper");
-        assert!(is_simple_tail_perform_with_pure_args_body(&helper_body));
+        assert!(is_simple_tail_perform_with_pure_args_body(
+            &helper_body,
+            &std::collections::BTreeSet::new()
+        ));
         assert!(colored.needs_cps_transform("helper"));
         assert!(helper_params.is_empty());
         assert_eq!(
@@ -16779,7 +17037,10 @@ mod tests {
         // Sanity: classifier accepts the body shape; color taints
         // CPS via row.
         assert_eq!(
-            is_simple_chained_let_yield_then_pure_tail_body(&helper_body),
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &helper_body,
+                &std::collections::BTreeSet::new()
+            ),
             Some(1),
             "1-stmt let-yield body matches chained classifier with N=1"
         );
@@ -17432,11 +17693,107 @@ mod tests {
         let globals: BTreeSet<String> = BTreeSet::new();
         let mut effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
         effects_resumes_many.insert("Choose".to_string(), true);
-        let result = arm_body_unsupported_construct(&arm, &globals, &effects_resumes_many);
+        let ctors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many);
         assert!(
             result.is_none(),
             "expected None (accept) for 3-let arm body of resumes:many effect; \
              got {result:?}"
+        );
+    }
+
+    /// Plan D Task 117 — full chain regression: arm body with
+    /// `Some(captured_var)` in tail where captured_var is the chain
+    /// binding. Two coupled invariants pinned in one test:
+    /// Slice C recognizer + ctor-aware `expr_is_pure` accept the
+    /// canonical 2-let arm body whose tail re-wraps a chain binding
+    /// in a constructor; AND the post-arm-k tail free-var walker
+    /// (`arm_body_post_arm_k_tail_free_vars_ok`) accepts ctor Calls
+    /// by walking callee + args, correctly identifying `r1` as a
+    /// free var.
+    ///
+    /// Without either change the chain breaks: pre-fix, `expr_is_pure`
+    /// rejects `Some(r1)` on the tail-purity check → recognizer
+    /// falls through → walker rejects `let r1 = k(true)` as "k
+    /// non-tail". With ctor-aware purity but missing free-var-walker
+    /// branch, the post-arm-k checker panics with "caller bypassed
+    /// expr_is_pure". This test pins both surfaces.
+    #[test]
+    fn slice_c_recognizer_accepts_arm_body_with_ctor_wrapping_chain_binding() {
+        use crate::ast::{Block, Expr, Stmt};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("x.sigil");
+        let mut ctors: BTreeSet<String> = BTreeSet::new();
+        ctors.insert("Some".to_string());
+        ctors.insert("None".to_string());
+
+        // Body: { let r1: Int = k(true); let r2: Int = k(false); Some(r1) }
+        let make_let = |name: &str, arg_int: i64| -> Stmt {
+            Stmt::Let(crate::ast::LetStmt {
+                name: name.to_string(),
+                ty: crate::ast::TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::IntLit(arg_int, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![make_let("r1", 1), make_let("r2", 0)],
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("Some".to_string(), span.clone())),
+                args: vec![Expr::Ident("r1".to_string(), span.clone())],
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        }));
+
+        // Invariant 1: Slice C recognizer accepts the 2-let shape.
+        let m = arm_body_n_let_then_pure_tail_shape(&body, "k").expect(
+            "Slice C recognizer must accept canonical 2-let-then-ctor-wrap-chain-binding shape",
+        );
+        assert_eq!(m.binding_names, vec!["r1", "r2"]);
+
+        // Invariant 1b: `expr_is_pure` accepts the tail under ctor-
+        // aware classifier.
+        assert!(
+            expr_is_pure(&m.tail_expr, &ctors),
+            "ctor-aware expr_is_pure must accept Some(r1) tail"
+        );
+
+        // Invariant 2: post-arm-k free-var walker accepts the ctor
+        // Call when r1 is the binding name. With `binding_name=r1`
+        // and empty extras, the walker descends: callee Ident("Some")
+        // is in globals (assumed, mirroring runtime registration);
+        // arg Ident("r1") matches binding_name → accepted.
+        let mut globals: BTreeSet<String> = BTreeSet::new();
+        globals.insert("Some".to_string());
+        globals.insert("None".to_string());
+        let extras: BTreeSet<String> = BTreeSet::new();
+        let walk =
+            arm_body_post_arm_k_tail_free_vars_ok(&m.tail_expr, "r1", "k", &globals, &extras);
+        assert!(
+            walk.is_none(),
+            "free-var walker must accept Some(r1) where r1 is the chain binding; \
+             got {walk:?}"
+        );
+
+        // Sanity: walker REJECTS Some(r3) when r3 is neither binding
+        // nor in globals/extras (this is the actual free-var check
+        // working through the ctor recursion).
+        let bad_tail = Expr::Call {
+            callee: Box::new(Expr::Ident("Some".to_string(), span.clone())),
+            args: vec![Expr::Ident("r3".to_string(), span.clone())],
+            span: span.clone(),
+        };
+        let walk_bad =
+            arm_body_post_arm_k_tail_free_vars_ok(&bad_tail, "r1", "k", &globals, &extras);
+        assert!(
+            walk_bad.is_some(),
+            "free-var walker must reject Some(r3) where r3 is not bound"
         );
     }
 
@@ -17676,6 +18033,115 @@ mod tests {
             tail: Some(Expr::Ident("r1".to_string(), span.clone())),
             span: span.clone(),
         }))
+    }
+
+    /// Plan D Task 117 — regression for the Slice C recognizer's
+    /// constructor-purity fix. Pre-Task-117 `expr_is_pure` rejected
+    /// every `Expr::Call`, including variant constructor
+    /// applications like `Some(s)`. This blocked Slice C recognition
+    /// for handler arms whose tail re-wraps an Option / Result /
+    /// List, surfaced as a regression in the Plan D Task 117 Sudoku
+    /// smoke gate (the `match r1 { Some(s) => Some(s), None => r2 }`
+    /// arm body produced "k in non-tail position" because the tail
+    /// expr_is_pure check failed on the `Some(s)` constructor call).
+    /// The fix adds a ctor-aware branch to `expr_is_pure`: callee
+    /// `Ident(name)` where `name ∈ ctors` AND args all pure → pure.
+    /// Pin both the ctor-call directly and the canonical Slice C
+    /// arm-body shape.
+    #[test]
+    fn expr_is_pure_accepts_ctor_application_of_pure_args() {
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let mut ctors = std::collections::BTreeSet::new();
+        ctors.insert("Some".to_string());
+        ctors.insert("None".to_string());
+        let span = Span::synthetic("x.sigil");
+        // Some(r1) — ctor call with Ident arg.
+        let some_r1 = Expr::Call {
+            callee: Box::new(Expr::Ident("Some".to_string(), span.clone())),
+            args: vec![Expr::Ident("r1".to_string(), span.clone())],
+            span: span.clone(),
+        };
+        assert!(
+            expr_is_pure(&some_r1, &ctors),
+            "Some(r1) with `Some` registered as ctor must be pure"
+        );
+        // None — ctor call with no args.
+        let none = Expr::Call {
+            callee: Box::new(Expr::Ident("None".to_string(), span.clone())),
+            args: vec![],
+            span: span.clone(),
+        };
+        assert!(
+            expr_is_pure(&none, &ctors),
+            "None with `None` registered as ctor must be pure"
+        );
+        // Non-ctor call — int_to_string(r1) — stays rejected.
+        let non_ctor = Expr::Call {
+            callee: Box::new(Expr::Ident("int_to_string".to_string(), span.clone())),
+            args: vec![Expr::Ident("r1".to_string(), span.clone())],
+            span: span.clone(),
+        };
+        assert!(
+            !expr_is_pure(&non_ctor, &ctors),
+            "non-ctor call must remain rejected"
+        );
+    }
+
+    /// Plan D Task 117 — pin that the canonical Slice C arm body
+    /// `Choose.choose(k) => { let r1 = k(true); let r2 = k(false);
+    /// match r1 { Some(s) => Some(s), None => r2 } }` recognizes as
+    /// a 2-let-then-pure-tail shape WITH a constructor-bearing
+    /// tail. The recognizer's tail-purity check uses `expr_is_pure`,
+    /// which is now ctor-aware. Without the fix, the
+    /// `Some(s) => Some(s)` arm body fails purity (Call rejected)
+    /// and the recognizer falls through to the regular walker,
+    /// which then rejects the `let r1 = k(true)` line as "k in
+    /// non-tail position".
+    #[test]
+    fn expr_is_pure_accepts_match_arm_body_with_ctor_tail() {
+        use crate::ast::{CtorPatternFields, Expr, MatchArm, Pattern};
+        use crate::errors::Span;
+        let mut ctors = std::collections::BTreeSet::new();
+        ctors.insert("Some".to_string());
+        ctors.insert("None".to_string());
+        let span = Span::synthetic("x.sigil");
+        // match r1 { Some(s) => Some(s), None => r2 }
+        let match_expr = Expr::Match {
+            scrutinee: Box::new(Expr::Ident("r1".to_string(), span.clone())),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Ctor {
+                        name: "Some".to_string(),
+                        fields: CtorPatternFields::Positional(vec![Pattern::Var(
+                            "s".to_string(),
+                            span.clone(),
+                        )]),
+                        span: span.clone(),
+                    },
+                    body: Expr::Call {
+                        callee: Box::new(Expr::Ident("Some".to_string(), span.clone())),
+                        args: vec![Expr::Ident("s".to_string(), span.clone())],
+                        span: span.clone(),
+                    },
+                    span: span.clone(),
+                },
+                MatchArm {
+                    pattern: Pattern::Ctor {
+                        name: "None".to_string(),
+                        fields: CtorPatternFields::Unit,
+                        span: span.clone(),
+                    },
+                    body: Expr::Ident("r2".to_string(), span.clone()),
+                    span: span.clone(),
+                },
+            ],
+            span: span.clone(),
+        };
+        assert!(
+            expr_is_pure(&match_expr, &ctors),
+            "canonical Sudoku match-tail with ctor-bearing arm body must be pure under ctor-aware classifier"
+        );
     }
 
     #[test]

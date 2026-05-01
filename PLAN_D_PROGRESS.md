@@ -77,8 +77,8 @@ Internal ordering: 114 must precede 115; 113 and 116 are independent.
 
 ## Stage 13 — Continuation lifts
 
-- Task 117 — First-class continuations (k-as-value). Highest-risk Plan D step; pre-authorized to split into 117a/117b/... per the plan's split-authority criteria.
-  - status: todo
+- Task 117 — First-class continuations (k-as-value). Single PR scope after design validation. Pre-execution recon raised an eta-expansion design (rewrite bare-k uses as `(fn x => k(x))` lifted lambdas, reuse Plan B' Task 107 Phase B substrate). Brian (2026-05-01) flagged the design as needing validation against three load-bearing scenarios — multi-shot through let-bound k, frame escape past handle pop, arena escape rate — before committing to it. The earlier 117a/117b split (recorded in this file's prior revision and in `PLAN_D_DEVIATIONS.md`) is **withdrawn**: the split's premise was "117a is mechanically simple, 117b verifies harder cases", which is dead now that 117b's harder cases may require codegen work the 117a design doesn't predict. See `PLAN_D_DEVIATIONS.md` `[DEVIATION Task 117 design validation]`.
+  - status: in-validation (no production code; three validation tests in flight)
 - Task 118 — Conditional/branched k-call.
   - status: todo
 
