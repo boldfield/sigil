@@ -4037,17 +4037,20 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                 extra_bindings,
             )
         }),
-        // Plan D Task 117 — `expr_is_pure` is now ctor-aware:
-        // `Expr::Call { callee: Ident(Ctor), args }` is pure when
-        // args are pure (variant constructor application). Walk
-        // callee + args here using the same free-var restriction.
-        // The callee's Ident gets checked against `globals` (which
-        // includes all ctor names per `unsupported_handle_construct`),
-        // so well-formed ctor calls pass cleanly. Non-ctor Calls
-        // would have been rejected by `expr_is_pure` before reaching
-        // here; the recursive walk handles them defensively (the
-        // callee Ident check would surface "non-global identifier"
-        // for any non-ctor reference).
+        // Reachable only after `expr_is_pure` has accepted this
+        // Call as a constructor application; user-fn calls are
+        // rejected upstream. Plan D Task 117 — `expr_is_pure` is
+        // now ctor-aware: `Expr::Call { callee: Ident(Ctor), args }`
+        // is pure when args are pure (variant constructor
+        // application). Walk callee + args here using the same
+        // free-var restriction. The callee's Ident gets checked
+        // against `globals` (which includes all ctor names per
+        // `unsupported_handle_construct`), so well-formed ctor
+        // calls pass cleanly. Non-ctor Calls would have been
+        // rejected by `expr_is_pure` before reaching here; the
+        // recursive walk handles them defensively (the callee
+        // Ident check would surface "non-global identifier" for
+        // any non-ctor reference).
         Expr::Call { callee, args, .. } => arm_body_post_arm_k_tail_free_vars_ok(
             callee,
             binding_name,
@@ -17668,6 +17671,101 @@ mod tests {
             result.is_none(),
             "expected None (accept) for 3-let arm body of resumes:many effect; \
              got {result:?}"
+        );
+    }
+
+    /// Plan D Task 117 — full chain regression: arm body with
+    /// `Some(captured_var)` in tail where captured_var is the chain
+    /// binding. Two coupled invariants pinned in one test:
+    /// Slice C recognizer + ctor-aware `expr_is_pure` accept the
+    /// canonical 2-let arm body whose tail re-wraps a chain binding
+    /// in a constructor; AND the post-arm-k tail free-var walker
+    /// (`arm_body_post_arm_k_tail_free_vars_ok`) accepts ctor Calls
+    /// by walking callee + args, correctly identifying `r1` as a
+    /// free var.
+    ///
+    /// Without either change the chain breaks: pre-fix, `expr_is_pure`
+    /// rejects `Some(r1)` on the tail-purity check → recognizer
+    /// falls through → walker rejects `let r1 = k(true)` as "k
+    /// non-tail". With ctor-aware purity but missing free-var-walker
+    /// branch, the post-arm-k checker panics with "caller bypassed
+    /// expr_is_pure". This test pins both surfaces.
+    #[test]
+    fn slice_c_recognizer_accepts_arm_body_with_ctor_wrapping_chain_binding() {
+        use crate::ast::{Block, Expr, Stmt};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("x.sigil");
+        let mut ctors: BTreeSet<String> = BTreeSet::new();
+        ctors.insert("Some".to_string());
+        ctors.insert("None".to_string());
+
+        // Body: { let r1: Int = k(true); let r2: Int = k(false); Some(r1) }
+        let make_let = |name: &str, arg_int: i64| -> Stmt {
+            Stmt::Let(crate::ast::LetStmt {
+                name: name.to_string(),
+                ty: crate::ast::TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Call {
+                    callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+                    args: vec![Expr::IntLit(arg_int, span.clone())],
+                    span: span.clone(),
+                },
+                span: span.clone(),
+            })
+        };
+        let body = Expr::Block(Box::new(Block {
+            stmts: vec![make_let("r1", 1), make_let("r2", 0)],
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("Some".to_string(), span.clone())),
+                args: vec![Expr::Ident("r1".to_string(), span.clone())],
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        }));
+
+        // Invariant 1: Slice C recognizer accepts the 2-let shape.
+        let m = arm_body_n_let_then_pure_tail_shape(&body, "k").expect(
+            "Slice C recognizer must accept canonical 2-let-then-ctor-wrap-chain-binding shape",
+        );
+        assert_eq!(m.binding_names, vec!["r1", "r2"]);
+
+        // Invariant 1b: `expr_is_pure` accepts the tail under ctor-
+        // aware classifier.
+        assert!(
+            expr_is_pure(&m.tail_expr, &ctors),
+            "ctor-aware expr_is_pure must accept Some(r1) tail"
+        );
+
+        // Invariant 2: post-arm-k free-var walker accepts the ctor
+        // Call when r1 is the binding name. With `binding_name=r1`
+        // and empty extras, the walker descends: callee Ident("Some")
+        // is in globals (assumed, mirroring runtime registration);
+        // arg Ident("r1") matches binding_name → accepted.
+        let mut globals: BTreeSet<String> = BTreeSet::new();
+        globals.insert("Some".to_string());
+        globals.insert("None".to_string());
+        let extras: BTreeSet<String> = BTreeSet::new();
+        let walk =
+            arm_body_post_arm_k_tail_free_vars_ok(&m.tail_expr, "r1", "k", &globals, &extras);
+        assert!(
+            walk.is_none(),
+            "free-var walker must accept Some(r1) where r1 is the chain binding; \
+             got {walk:?}"
+        );
+
+        // Sanity: walker REJECTS Some(r3) when r3 is neither binding
+        // nor in globals/extras (this is the actual free-var check
+        // working through the ctor recursion).
+        let bad_tail = Expr::Call {
+            callee: Box::new(Expr::Ident("Some".to_string(), span.clone())),
+            args: vec![Expr::Ident("r3".to_string(), span.clone())],
+            span: span.clone(),
+        };
+        let walk_bad =
+            arm_body_post_arm_k_tail_free_vars_ok(&bad_tail, "r1", "k", &globals, &extras);
+        assert!(
+            walk_bad.is_some(),
+            "free-var walker must reject Some(r3) where r3 is not bound"
         );
     }
 

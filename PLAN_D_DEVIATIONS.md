@@ -432,12 +432,17 @@ Expr::Call { callee, args, .. } => {
 
 This is **not** a broader recognizer rework: the recognizer's structural shape (`{ let _ = k(arg); ...; pure_tail }`) is unchanged, only the purity classifier is extended. Future widenings (e.g., color-aware purity for Native-color user-fn calls) would be additional sub-fixes, not a generalization of this branch.
 
-**Regression tests.** Two unit tests in `compiler/src/codegen.rs` `tests` module:
+**Second-order coupled invariant: post-arm-k free-var walker.** `arm_body_post_arm_k_tail_free_vars_ok` (`compiler/src/codegen.rs:3903`) was relying on `expr_is_pure` rejecting all `Expr::Call` shapes — its `Expr::Call` arm explicitly panicked with "caller bypassed `expr_is_pure`" as a defensive invariant. With ctor calls now passing the purity gate, they reach this fn and trip the panic. Fix: extend the `Expr::Call` arm to walk callee + args recursively (same shape as `Binary`/`Unary`), with a doc comment noting the upstream invariant ("Reachable only after `expr_is_pure` has accepted this Call as a constructor application; user-fn calls are rejected upstream"). The callee Ident gets checked against `globals` (which includes all ctor names per `unsupported_handle_construct`) so well-formed ctor calls pass cleanly; the recursive walk on args correctly identifies free-var references inside the ctor (e.g., `Some(r1)` with `r1` as the chain binding name accepts; `Some(r3)` with `r3` unbound rejects).
+
+Two coupled invariants, one fix: `expr_is_pure` widens to accept ctors → `arm_body_post_arm_k_tail_free_vars_ok` widens to walk through them. Reverting either change without the other breaks the chain.
+
+**Regression tests.** Three unit tests in `compiler/src/codegen.rs` `tests` module:
 
 - `expr_is_pure_accepts_ctor_application_of_pure_args` — pins direct ctor purity (`Some(r1)` and `None` accepted; `int_to_string(r1)` rejected).
 - `expr_is_pure_accepts_match_arm_body_with_ctor_tail` — pins the canonical Sudoku match-tail shape (`match r1 { Some(s) => Some(s), None => r2 }`) as pure under ctor-aware classifier.
+- `slice_c_recognizer_accepts_arm_body_with_ctor_wrapping_chain_binding` — full chain regression: arm body `{ let r1 = k(true); let r2 = k(false); Some(r1) }`. Pins both invariants in one test: (1) Slice C recognizer + ctor-aware `expr_is_pure` accept the shape; (2) post-arm-k free-var walker accepts `Some(r1)` (correctly identifies r1 as the chain binding) and rejects `Some(r3)` (r3 unbound). Without either change the chain breaks; the test asserts both surfaces hold simultaneously.
 
 **Failure mode.** None at the user surface. Pre-fix, programs using ctor-bearing tails in handler arm bodies would fall through to the regular walker and produce a confusing "k in non-tail position" diagnostic. Post-fix, those programs compile via Slice C as the recognizer was always intended to support.
 
-**Implementing commit.** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical `Some(s) => Some(s)` shape rather than a workaround.
+**Implementing commit(s).** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical `Some(s) => Some(s)` shape rather than a workaround. Recognizer fix at `e889e89`; downstream free-var-walker fix at `e10d8b3`.
 
