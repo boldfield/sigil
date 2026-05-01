@@ -8345,12 +8345,12 @@ fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
                  }\n\
                }\n\
                \n\
-               fn pick(n: Int) -> Int ![] {\n  \
+               fn pick(n: Int) -> Int ![ArithError] {\n  \
                  let m: Int = n % 4;\n  \
                  if m < 1 { 1 } else { m }\n\
                }\n\
                \n\
-               fn main() -> Int ![IO] {\n  \
+               fn main() -> Int ![IO, ArithError] {\n  \
                  let winner: Player = handle alice_turn(7) with {\n    \
                    Nim.move(_p, n, k) => k(pick(n)),\n  \
                  };\n  \
@@ -8387,14 +8387,28 @@ fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
 /// ticks = 2. stdout traces "tick" twice and prints final result `"2\n"`.
 #[test]
 fn task_78_5_multi_effect_interpreter_traces_and_evaluates() {
+    // Inline row-poly + body-type-poly run_state mirrors std/raise.sigil's
+    // catch shape (post-Task 116 row-poly Fn parameters). std/state.sigil's
+    // run_state is closed-row + Int-only; this test validates that the
+    // surface lift is in place even though std hasn't migrated yet.
     let src = "import std.raise\n\
                import std.result\n\
-               import std.state\n\
                import std.io\n\
+               \n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               \n\
+               fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
+                 let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> A ![| e] => v,\n    \
+                   State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s),\n    \
+                   State.set(arg, k) => fn (s: Int) -> A ![| e] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
                \n\
                type Expr = | IntE(Int) | DivE(Expr, Expr)\n\
                \n\
-               fn eval(e: Expr) -> Int ![Raise[String], State, IO] {\n  \
+               fn eval(e: Expr) -> Int ![Raise[String], State, ArithError, IO] {\n  \
                  match e {\n    \
                    IntE(i) => i,\n    \
                    DivE(e1, e2) => {\n      \
@@ -8412,9 +8426,9 @@ fn task_78_5_multi_effect_interpreter_traces_and_evaluates() {
                  }\n\
                }\n\
                \n\
-               fn main() -> Int ![IO] {\n  \
+               fn main() -> Int ![IO, ArithError] {\n  \
                  let prog: Expr = DivE(DivE(IntE(16), IntE(2)), IntE(3));\n  \
-                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String], State, IO] => run_state(0, fn () -> Int ![Raise[String], State, IO] => eval(prog)));\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![ArithError, IO] => run_state_poly(0, fn () -> Int ![Raise[String], State, ArithError, IO] => eval(prog)));\n  \
                  match r {\n    \
                    Ok(v) => perform IO.println(int_to_string(v)),\n    \
                    Err(m) => perform IO.println(m),\n  \
@@ -8453,22 +8467,34 @@ fn task_78_5_multi_effect_interpreter_traces_and_evaluates() {
 /// We check the list length (= 2) printed via int_to_string.
 #[test]
 fn task_78_5_plotkin_state_outer_amb_inner_shares_state_across_choices() {
+    // Inline row-poly + body-type-poly run_state (mirrors std/raise.sigil's
+    // catch shape). std/state.sigil's run_state is closed-row + Int-only,
+    // which can't accept a body returning List[Bool] with extra effects.
     let src = "import std.list\n\
-               import std.state\n\
                import std.io\n\
                \n\
-               effect Choose resumes: many { flip: () -> Bool }\n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               effect Amb resumes: many { flip: () -> Bool }\n\
                \n\
-               fn body() -> Bool ![Choose, State] {\n  \
-                 let p: Bool = perform Choose.flip();\n  \
+               fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
+                 let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> A ![| e] => v,\n    \
+                   State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s),\n    \
+                   State.set(arg, k) => fn (s: Int) -> A ![| e] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               fn body() -> Bool ![Amb, State] {\n  \
+                 let p: Bool = perform Amb.flip();\n  \
                  let i: Int = perform State.get();\n  \
                  let _: Int = perform State.set(i + 1);\n  \
                  p\n\
                }\n\
                \n\
-               fn amb_handle(action: () -> Bool ![Choose, State]) -> List[Bool] ![State] {\n  \
+               fn amb_handle[e](action: () -> Bool ![Amb | e]) -> List[Bool] ![| e] {\n  \
                  handle action() with {\n    \
-                   Choose.flip(k) => {\n      \
+                   Amb.flip(k) => {\n      \
                      let r1: List[Bool] = k(true);\n      \
                      let r2: List[Bool] = k(false);\n      \
                      append(r1, r2)\n    \
@@ -8478,7 +8504,7 @@ fn task_78_5_plotkin_state_outer_amb_inner_shares_state_across_choices() {
                }\n\
                \n\
                fn main() -> Int ![IO] {\n  \
-                 let result: List[Bool] = run_state(0, fn () -> List[Bool] ![State] => amb_handle(body));\n  \
+                 let result: List[Bool] = run_state_poly(0, fn () -> List[Bool] ![State] => amb_handle(body));\n  \
                  perform IO.println(int_to_string(length(result)));\n  \
                  0\n\
                }\n";
