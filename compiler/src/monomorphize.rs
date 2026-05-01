@@ -736,19 +736,39 @@ impl<'a> Monomorphizer<'a> {
                 TypeExpr::Named(n.clone(), span.clone())
             }
             TypeExpr::Apply { name, args, span } => {
-                let resolved_args: Vec<Ty> = args
-                    .iter()
-                    .map(|a| {
-                        let te = self.rewrite_type_expr(a, subst);
-                        type_expr_to_ty(&te)
-                    })
-                    .collect();
-                // The application is over a generic type — clone it.
                 if self.type_decls.contains_key(name) {
+                    // User generic type — clone + mangle (existing
+                    // behavior). The clone gets enqueued and emitted
+                    // as a specialized TypeDecl; downstream consumers
+                    // resolve `Named(mangled)` via `types.get(mangled)`.
+                    let resolved_args: Vec<Ty> = args
+                        .iter()
+                        .map(|a| {
+                            let te = self.rewrite_type_expr(a, subst);
+                            type_expr_to_ty(&te)
+                        })
+                        .collect();
                     self.enqueue_type(name.clone(), resolved_args.clone());
+                    let mangled = mangle_type(name, &resolved_args);
+                    TypeExpr::Named(mangled, span.clone())
+                } else {
+                    // Plan D Task 117 (a) — builtin generic types
+                    // (Array/MutArray) have synthetic TypeDecls in
+                    // `tc.types` but no clone. Preserve `Apply` form
+                    // so downstream `ty_from_type_expr` resolves via
+                    // the synthetic TypeDecl. Mangling here would
+                    // emit `Named("Array$$Int")` with no resolution
+                    // target, surfaced by Sudoku's
+                    // `Option[Array[Int]]` Some-payload destructure.
+                    TypeExpr::Apply {
+                        name: name.clone(),
+                        args: args
+                            .iter()
+                            .map(|a| self.rewrite_type_expr(a, subst))
+                            .collect(),
+                        span: span.clone(),
+                    }
                 }
-                let mangled = mangle_type(name, &resolved_args);
-                TypeExpr::Named(mangled, span.clone())
             }
             // Plan B' Stage 6.8 Task 102 — rewrite a fn-type by
             // recursively substituting its params + ret. Effects
@@ -1454,8 +1474,28 @@ pub(crate) fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
         Ty::Byte => TypeExpr::Named("Byte".to_string(), span.clone()),
         Ty::Unit => TypeExpr::Named("Unit".to_string(), span.clone()),
         Ty::User(name, args) => {
-            let mangled = mangle_type(name, args);
-            TypeExpr::Named(mangled, span.clone())
+            // Plan D Task 117 (a) — builtin generic types (`Array`,
+            // `MutArray`) have synthetic TypeDecls in `tc.types`
+            // (registered by `typecheck::builtin_types()`) but no
+            // monomorphized clones — they're handled at the codegen
+            // layer via builtin FFI primitives. Mangling them to
+            // `Named("Array$$Int")` produces a name with no
+            // resolvable TypeDecl, breaking `ty_from_type_expr` at
+            // downstream sites (e.g., `build_layouts` for an
+            // `Option[Array[Int]]` specialization's `Some` payload).
+            // Round-trip via `Apply` preserves the typecheck-side
+            // resolution path (`Ty::User("Array", [Int])` ←→
+            // `Apply { Array, [Int] }`).
+            if !args.is_empty() && matches!(name.as_str(), "Array" | "MutArray") {
+                TypeExpr::Apply {
+                    name: name.clone(),
+                    args: args.iter().map(|a| ty_to_type_expr(a, span)).collect(),
+                    span: span.clone(),
+                }
+            } else {
+                let mangled = mangle_type(name, args);
+                TypeExpr::Named(mangled, span.clone())
+            }
         }
         Ty::Var(id) => {
             // Symmetric with `canon_ty`'s `Ty::Var` arm — if a
