@@ -8417,18 +8417,19 @@ fn task_78_5_multi_effect_interpreter_traces_and_evaluates() {
                      let cur: Int = perform State.get();\n      \
                      let _: Int = perform State.set(cur + 1);\n      \
                      perform IO.println(\"tick\");\n      \
-                     if y == 0 {\n        \
+                     let result: Int = if y == 0 {\n        \
                        raise(\"divide by zero\")\n      \
                      } else {\n        \
                        x / y\n      \
-                     }\n    \
+                     };\n      \
+                     result\n    \
                    },\n  \
                  }\n\
                }\n\
                \n\
                fn main() -> Int ![IO, ArithError] {\n  \
                  let prog: Expr = DivE(DivE(IntE(16), IntE(2)), IntE(3));\n  \
-                 let r: Result[Int, String] = catch(fn () -> Int ![ArithError, IO] => run_state_poly(0, fn () -> Int ![Raise[String], State, ArithError, IO] => eval(prog)));\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String], ArithError, IO] => run_state_poly(0, fn () -> Int ![Raise[String], State, ArithError, IO] => eval(prog)));\n  \
                  match r {\n    \
                    Ok(v) => perform IO.println(int_to_string(v)),\n    \
                    Err(m) => perform IO.println(m),\n  \
