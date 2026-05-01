@@ -47,7 +47,7 @@ use crate::ast::{
 };
 use crate::color::ColoredProgram;
 use crate::errors::Span;
-use crate::typecheck::Ty;
+use crate::typecheck::{ContinuationTy, Ty};
 
 #[derive(Clone, Debug)]
 pub struct ClosureConvertedProgram {
@@ -334,7 +334,7 @@ struct Converter {
 /// pushed during op-arm body traversal in `rewrite_expr`'s
 /// `Expr::Handle` arm. See `Converter::arm_k_context_stack`.
 ///
-/// We only track `k_name` here; the captured-k's `Ty::Fn(sig)` or
+/// We only track `k_name` here; the captured-k's
 /// `Ty::Continuation { op_ret, ret, scope_id }` (Plan D Task 117)
 /// is pulled from the Lambda's per-span entry in `all_captures`
 /// when the k-capture is actually detected (avoids needing
@@ -593,8 +593,9 @@ impl Converter {
 
                 // Plan B' Stage 6.8 Task 107 Phase B — detect a
                 // capture whose name matches the topmost arm's
-                // continuation `k_name` and whose Ty is `Ty::Fn(_)`
-                // or `Ty::Continuation(_)` (Plan D Task 117).
+                // continuation `k_name` and whose Ty is
+                // `Ty::Continuation(_)` (Plan D Task 117 — k's
+                // binding is always Continuation post-PR-#60).
                 // Such captures get the trailing-pair convention
                 // (parallel to the arm fn args_ptr layout): the
                 // capture is removed from the regular `caps` list,
@@ -625,31 +626,28 @@ impl Converter {
                     // then arg as call args). Free-var collection
                     // order is body-traversal order, not declaration
                     // order, so the previous form was order-fragile.
-                    // Plan D Task 117 — k's binding is now `Ty::
-                    // Continuation { op_ret, ret, scope_id }` rather
-                    // than `Ty::Fn(...)`. Match either variant when
-                    // detecting the captured-k for ArmKPairCapture
-                    // dispatch; the discharge-with-lambda lift logic
-                    // below extracts op_ret_ty / handler_overall_ty
-                    // from whichever variant we matched.
-                    let mut k_ty_opt: Option<Ty> = None;
+                    // Plan D Task 117 — k's binding is `Ty::
+                    // Continuation { op_ret, ret, scope_id }`
+                    // (check_handle is the sole producer; always
+                    // allocates Continuation per
+                    // `compiler/src/typecheck.rs:5159-5163`). The
+                    // pre-Task-117 `Ty::Fn(...)` shape is no longer
+                    // produced; matching it here would be dead
+                    // code per PR #60 review #3.
+                    let mut k_ty_opt: Option<ContinuationTy> = None;
                     let mut filtered: Vec<(String, Ty)> = Vec::with_capacity(raw_caps.len());
                     for (cname, cty) in &raw_caps {
-                        if cname == arm_k && matches!(cty, Ty::Fn(_) | Ty::Continuation(_)) {
-                            k_ty_opt = Some(cty.clone());
-                            continue;
+                        if cname == arm_k {
+                            if let Ty::Continuation(c) = cty {
+                                k_ty_opt = Some(*c.clone());
+                                continue;
+                            }
                         }
                         filtered.push((cname.clone(), cty.clone()));
                     }
-                    let k_pair_tys: Option<(Ty, Ty)> = match k_ty_opt {
-                        Some(Ty::Fn(sig)) => Some((
-                            sig.params.first().cloned().unwrap_or(Ty::Unit),
-                            sig.ret.clone(),
-                        )),
-                        Some(Ty::Continuation(c)) => Some((c.op_ret.clone(), c.ret.clone())),
-                        _ => None,
-                    };
-                    if let Some((op_ret_ty, handler_overall_ty)) = k_pair_tys {
+                    if let Some(c) = k_ty_opt {
+                        let op_ret_ty = c.op_ret.clone();
+                        let handler_overall_ty = c.ret.clone();
                         let handle_span = active_arm_k
                             .as_ref()
                             .map(|(_, s)| s.clone())

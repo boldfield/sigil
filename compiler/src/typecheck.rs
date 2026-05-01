@@ -139,7 +139,7 @@ pub struct ContinuationTy {
 /// is the resolved-pin form (one per handle expression), `Var` is
 /// the unification-variable form (used in region-polymorphic fn
 /// schemes; bound to a concrete at instantiation time).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScopeId {
     /// Concrete handle scope. The `u32` is allocated per-handle by
     /// `Tc::fresh_scope_id`; each `handle` expression's pre-pass
@@ -2109,7 +2109,7 @@ struct Tc {
     /// Plan B task 48 — Hindley-Milner unification machinery.
     ///
     /// Schemes for top-level functions: a generic fn declaration
-    /// (`fn id[A](x: A) -> A { x }`) registers `(["A"], [], (Var(N))
+    /// (`fn id[A](x: A) -> A ![] { x }`) registers `(["A"], [], (Var(N))
     /// -> Var(N))` so every call site can instantiate fresh vars.
     /// Builtins and non-generic user fns store schemes with empty
     /// `type_vars` and `row_vars`. Lookup at call sites: `fn_schemes`
@@ -2277,6 +2277,16 @@ impl Tc {
     /// bindings, so unification of continuations from different
     /// handles fires E0145.
     fn fresh_scope_id(&mut self) -> u32 {
+        // Mirrors the implicit overflow-discipline of
+        // `fresh_ty_var` / `fresh_row_var`: u32 wraparound at
+        // 4 billion handles is not a realistic v1 limit, but trip
+        // the assert if it ever happens in test rather than
+        // silently re-using ids.
+        debug_assert!(
+            self.next_scope_id != u32::MAX,
+            "Tc::fresh_scope_id: u32 overflow — 4 billion handles allocated in one \
+             typecheck pass is implausible; check for a leaked allocator loop"
+        );
         let id = self.next_scope_id;
         self.next_scope_id += 1;
         id
@@ -4359,11 +4369,17 @@ impl Tc {
             // (i.e. an arm-bound `k` or a let-bound alias of one).
             // Synthesize a single-param FnSig from the continuation's
             // `op_ret` / `ret` so the rest of `check_call` (arity,
-            // arg-type unify, ret deref) runs unchanged. Effect row
-            // is the caller's row by construction: a continuation
-            // resumes the surrounding fn's computation in place, so
-            // it sees that fn's effects literally — `subsume_row`
-            // against an identical caller_row is trivially OK.
+            // arg-type unify, ret deref) runs unchanged.
+            //
+            // Dynamic-extent enforcement is via E0145 only (broad
+            // arm in unify_ty + bind_ty_var bypass closure below);
+            // the synthetic `effects` / `effect_row_var` fields
+            // exist solely for FnSig shape compatibility with
+            // `subsume_row`. By constructing them with the call-
+            // site row, the row check is structurally trivial — a
+            // future reader removing the row fields wouldn't break
+            // any safety contract, only the FnSig shape requirement
+            // for `subsume_row`'s argument.
             Some(Ty::Continuation(c)) => Box::new(FnSig {
                 params: vec![c.op_ret.clone()],
                 ret: c.ret.clone(),
@@ -4400,11 +4416,49 @@ impl Tc {
         // (3) arg types — Plan B task 48 routes through HM
         // unification so generic-fn instantiations resolve their
         // freshly-allocated vars against concrete arg types.
+        //
+        // Plan D Task 117 — bind_ty_var bypass closure (review #3 at
+        // HEAD `decb6d8`). Before unify_ty would silently bind a
+        // freshly-instantiated generic var to `Ty::Continuation`, fire
+        // E0145 explicitly. Without this gate, `id(k)` for generic
+        // `fn id[A](x: A) -> A` propagates Continuation through the
+        // (Var, other) bind_ty_var arm (the same arm `let f = k` uses
+        // legitimately for local aliasing). Downstream USES are caught
+        // by the broad arm in unify_ty, but the COMPILE PATH —
+        // monomorphize cloning `id$$Continuation` and walking its body
+        // via `rewrite_type_expr` → `ty_to_type_expr(Continuation)` —
+        // panics with `unreachable!()` because Continuation has no
+        // surface TypeExpr representation. Catching at the bind site
+        // closes the panic surface AND surfaces a precise diagnostic.
+        //
+        // Discriminator vs `let f = k`: this gate fires only at the
+        // call-site arg-unify against an instantiated generic param's
+        // Var. The let-RHS path goes through the let-binding's own
+        // unify (against a fresh let-var allocated outside check_call),
+        // not through this loop, so let-aliasing stays untouched.
         for (i, (arg_ty, param_ty)) in arg_tys.iter().zip(sig.params.iter()).enumerate() {
             if let Some(at) = arg_ty {
                 let arg_span = args.get(i).map(Expr::span).unwrap_or_else(|| span.clone());
+                let resolved_at = self.deref(at);
+                let resolved_param = self.deref(param_ty);
+                if matches!(resolved_at, Ty::Continuation(_))
+                    && matches!(resolved_param, Ty::Var(_))
+                {
+                    self.push_error(
+                        "E0145",
+                        arg_span.clone(),
+                        "continuation `k` cannot escape its handle's arm body — \
+                         passing `k` to a generic-typed parameter would propagate \
+                         Continuation through the generic instantiation, escaping \
+                         the arm body's dynamic extent. Keep `k` inside the \
+                         handle's arm body (do not pass it to a function whose \
+                         parameter type is a generic type variable)"
+                            .to_string(),
+                    );
+                    continue;
+                }
                 if !self.unify_ty(param_ty, at, &arg_span) {
-                    // unify_ty pushed the precise E0044; nothing
+                    // unify_ty pushed the precise E0044 / E0145; nothing
                     // more to add here.
                 }
             }
@@ -8260,7 +8314,7 @@ mod tests {
 
     #[test]
     fn generic_id_function_typechecks() {
-        // `fn id[A](x: A) -> A { x }` is the simplest Algorithm-W
+        // `fn id[A](x: A) -> A ![] { x }` is the simplest Algorithm-W
         // exercise: A is a fresh type-variable, body returns A, so
         // the inferred sig is (A) -> A and no unification fails.
         let src = "fn id[A](x: A) -> A ![] { x }\n\
@@ -10873,6 +10927,80 @@ mod tests {
             has_code(&errs, "E0145"),
             "cross-handle k unification with mismatched scope_ids must fire E0145: \
              {errs:?}"
+        );
+    }
+
+    #[test]
+    fn k_passed_to_generic_fn_param_fires_e0145() {
+        // PR #60 review #3 (HEAD `decb6d8`) high-severity blocker:
+        // close the bind_ty_var bypass. `id(k)` for generic
+        // `fn id[A](x: A) -> A` instantiates A := fresh Var; arg-
+        // unify would normally bind A → Continuation through the
+        // (Var, other) bind_ty_var arm — the same arm `let f = k`
+        // legitimately uses for local aliasing. Without the
+        // precision check at check_call, A binds, `id(k)` returns
+        // Continuation, and monomorphize later panics in
+        // `ty_to_type_expr(Continuation)` because Continuation has
+        // no surface TypeExpr. The check_call precision gate
+        // catches this BEFORE the bind, firing E0145 and skipping
+        // unify_ty so A stays unbound.
+        //
+        // Test shape uses `discard[A](x: A) -> Int` so the result
+        // type is structurally Int, NOT Continuation — without the
+        // precision check, typecheck would silently pass (broad
+        // unify_ty arm doesn't fire on Int return), and mono would
+        // crash with `unreachable!()` on Continuation in
+        // ty_to_type_expr. With the precision check, E0145 fires
+        // at the call site and the cascade is short-circuited.
+        // Tight regression: removing the precision check makes this
+        // test fail (E0145 stops appearing in pipeline errors).
+        let src = "fn id[A](x: A) -> A ![] { x }\n\
+                   fn discard[A](x: A) -> Int ![] { 0 }\n\
+                   effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => discard(id(k)),\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "passing `k` to a generic-typed param must fire E0145 at the bind \
+             site — closes the bind_ty_var bypass that would otherwise propagate \
+             Continuation through generics and panic in mono::ty_to_type_expr. \
+             This shape (discard returns Int, not the generic) doesn't trigger \
+             the broad unify arm; only the precision check at check_call fires \
+             E0145: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn k_let_aliased_then_passed_to_generic_fn_fires_e0145() {
+        // Regression: ensure the precision check fires even when k
+        // flows through an intermediate let-binding (the let-RHS
+        // path is intentionally untouched by the precision check —
+        // `let f = k` is the legitimate aliasing case — but `f`
+        // then passed to a generic param re-enters check_call's
+        // gate). Same `discard[A] -> Int` discriminator as above:
+        // removing the precision check would silently typecheck-pass
+        // and panic in mono.
+        let src = "fn id[A](x: A) -> A ![] { x }\n\
+                   fn discard[A](x: A) -> Int ![] { 0 }\n\
+                   effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let f: Int = discard(id(k));\n\
+                         f\n\
+                       },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "passing `k` (or a let-aliased k) into a generic-typed param chain \
+             must fire E0145 (the precision check sees the resolved arg type \
+             post-deref): {errs:?}"
         );
     }
 
