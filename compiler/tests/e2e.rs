@@ -4010,17 +4010,22 @@ fn slice_b_arm_body_let_then_pure_tail_with_global_in_tail() {
 }
 
 #[test]
-fn slice_b_arm_body_post_arm_k_tail_referencing_op_arg_is_rejected_at_codegen() {
-    // Slice B negative coverage (PR #27 mid-flight at e5991a9
-    // review item 6): tail references an op-arg, which is outside
-    // `{r} ∪ globals`. Walker rejects with the captures-bearing-
-    // extension-pointing diagnostic.
+fn slice_b_arm_body_post_arm_k_tail_with_op_arg_now_compiles_via_g1_captures_bearing() {
+    // PRE-G1: Slice B negative coverage — tail references an op-arg,
+    // which is outside `{r} ∪ globals`; walker rejected with the
+    // captures-bearing-extension-pointing diagnostic.
     //
-    // Op `Raise.fail(n: Int)` takes one arg `n`; arm body
-    // `Raise.fail(n, k) => { let r: Int = k(99); r + n }` references
-    // `n` (op-arg) in the post-arm-k tail. Future captures-bearing
-    // extension would alloc a closure record at the arm-fn body
-    // emit and read it in the post-arm-k synth fn.
+    // POST-G1 (Task 78.5 follow-up PR — `task-78-5-g1-captures-bearing-
+    // post-arm-k`): the captures-bearing extension shipped. Op-arg `arg`
+    // referenced in the post-arm-k tail is now packed into the
+    // post-arm-k synth fn's closure record at the arm-fn perform site
+    // and loaded from `closure_ptr` at the synth fn entry. Test
+    // inverted from "must reject" to "must compile + run + return
+    // arm body's value." `helper()` performs `Raise.fail(7)`. Arm body
+    // invokes `k(99)` → resumes `helper` with 99 → helper returns 99
+    // → handle's overall body value = 99 → no return arm declared, so
+    // `k(99)` returns 99 directly. Arm body computes `r + arg = 99 + 7
+    // = 106`. Prints "106\n".
     let src = "effect Raise { fail: (Int) -> Int }\n\
                fn helper() -> Int ![Raise, IO] {\n  \
                  let x: Int = perform Raise.fail(7);\n  \
@@ -4033,35 +4038,12 @@ fn slice_b_arm_body_post_arm_k_tail_referencing_op_arg_is_rejected_at_codegen() 
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "slice_b_reject_op_arg_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path =
-        std::env::temp_dir().join(format!("slice_b_reject_op_arg_{}", std::process::id()));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail: post-arm-k tail references op-arg `arg`. \
-         stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("captures-bearing extension") || stderr.contains("`arg`"),
-        "diagnostic should point at the captures-bearing extension or name `arg`; \
-         got stderr={stderr:?}"
+    let (stdout, stderr, code) = compile_and_run(src, "slice_b_g1_captures_bearing_op_arg");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "106\n",
+        "post-G1 captures-bearing path: arm body `r + arg` should be \
+         99 + 7 = 106; stderr={stderr:?}"
     );
 }
 

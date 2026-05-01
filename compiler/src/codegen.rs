@@ -4497,18 +4497,36 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
     match tail_expr {
         Expr::IntLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
         Expr::Ident(name, _) => {
+            if name == k_name {
+                return Some(format!(
+                    "Slice B: post-`k` tail of arm body references continuation \
+                     `{k_name}` — multi-shot / further-non-tail uses require Slice C \
+                     (heap-reified continuation)"
+                ));
+            }
+            // Accept names known at the walker site (binding, extras,
+            // arm op-args, globals). Other Idents may resolve to outer-
+            // scope captures that closure_convert / `rewrite_arm_body
+            // _with_captures` will rewrite to `Expr::ClosureEnvLoad` in
+            // the codegen pre-pass (which runs AFTER this walker); the
+            // walker can't see them as ClosureEnvLoad yet, but
+            // `collect_post_arm_k_captures` at the pre-pass enforces
+            // strict per-name match against the typecheck `handle_arm
+            // _captures` side-table. When `arm_captures` is `Some(_)`
+            // (Slice B caller), permissively accept any non-`k_name`
+            // Ident — typecheck has already verified the name resolves;
+            // the pre-pass catches captures it can't classify. When
+            // `arm_captures` is `None` (Slice C caller), keep the
+            // historical strict reject for unknown names — Slice C
+            // doesn't yet thread outer-scope captures through chain
+            // steps.
             if name == binding_name
                 || globals.contains(name)
                 || extra_bindings.contains(name)
                 || arm_params_set.contains(name)
+                || arm_captures.is_some()
             {
                 None
-            } else if name == k_name {
-                Some(format!(
-                    "Slice B: post-`k` tail of arm body references continuation \
-                     `{k_name}` — multi-shot / further-non-tail uses require Slice C \
-                     (heap-reified continuation)"
-                ))
             } else {
                 Some(format!(
                     "Slice B: post-`k` tail of arm body references `{name}`, which is \
