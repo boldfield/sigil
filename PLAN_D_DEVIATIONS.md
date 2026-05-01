@@ -380,3 +380,64 @@ User authorized the split per session 2026-05-01 ("sounds good" on the surfaced 
 
 **Implementing commit.** This entry + `PLAN_D_PROGRESS.md` Task 117 status update splitting into 117a/117b. No code changes in foundation commit.
 
+## 2026-05-01 — [DEVIATION Task 117] Slice C recognizer constructor-purity fix
+
+**Context.** Plan D Task 117's Sudoku smoke gate exercises a 4×4 backtracking solver whose handler arm body has the canonical Slice C 2-let shape with a constructor-bearing tail:
+
+```sigil
+Branch.branch(k) => {
+  let r1: Option[Array[Int]] = k(true);
+  let r2: Option[Array[Int]] = k(false);
+  match r1 {
+    Some(s) => Some(s),
+    None => r2,
+  }
+}
+```
+
+The first attempt at compiling this shape on `plan-d-task-117a` (commit `82740c5`, Sudoku ArithError-row fix) produced an unexpected codegen rejection:
+
+> `handle` expression at … has arm `Branch.branch` body that uses continuation `k` in non-tail position outside the supported shapes.
+
+This was surprising — the shape matches `arm_body_n_let_then_pure_tail_shape`'s recognized 2-let pattern (Plan B' Stage 6.7 N-chain Slice C). Investigation revealed a latent over-conservative check in `expr_is_pure` (`compiler/src/codegen.rs:15009`):
+
+```rust
+Expr::Call { .. } => false,  // unconditional rejection
+```
+
+Constructor applications (`Some(s)`, `Ok(v)`, `Cons(h, t)`, …) are parsed as `Expr::Call { callee: Expr::Ident("Some"), args: [...] }` — structurally a Call. The pre-Task-117 classifier rejected them uniformly, miscategorizing pure value constructions as "yield-able" and falling through to the regular walker, which then rejected the surrounding `let r1 = k(arg)` as "k in non-tail position".
+
+**Why latent.** The existing test corpus skews toward primitive returns (Int, Bool) — none of the existing Slice C handler arm bodies re-wrap an Option / Result / List in their tail. The Plan B Task 78.5 Koka-subset import was specifically scoped to surface exactly this kind of convergence-class blind spot (per `feedback_sigil_review_structural_weakness.md`); since that import was deferred to Plan C completion, the gap survived to Task 117.
+
+**Fix.** Added a constructor-aware branch to `expr_is_pure`:
+
+```rust
+Expr::Call { callee, args, .. } => {
+    if let Expr::Ident(name, _) = callee.as_ref() {
+        if ctors.contains(name) {
+            return args.iter().all(|a| expr_is_pure(a, ctors));
+        }
+    }
+    false
+}
+```
+
+`ctors: &BTreeSet<String>` is the set of variant constructor names registered in the program's type registry. Computed once at codegen entry (`emit_object` and `unsupported_handle_construct`) via the new `collect_ctor_names(&program)` helper, then threaded through:
+
+- `expr_is_pure` / `block_is_pure` — direct consumers.
+- `is_simple_tail_perform_with_pure_args_body` / `is_simple_yield_then_constant_tail_body` / `is_simple_chained_let_yield_then_pure_tail_body` — CPS-color body classifiers.
+- `arm_body_unsupported_construct` / `expr_unsupported_handle` / `block_unsupported_handle` — handle-walker chain.
+
+**Why this scope addition is justified.** The fix is single-purpose and contained: one new helper (`collect_ctor_names`), one new branch in `expr_is_pure`, mechanical threading through ~10 sites. The classifier name "pure" continues to mean "non-yield-able" (per the existing doc) — ctor calls satisfy non-yield-ability because constructors lower synchronously to header + per-field stores (no trampoline yields). Non-ctor calls (user fns, builtins like `int_to_string`) remain rejected; the false-negative class is unchanged for that path.
+
+This is **not** a broader recognizer rework: the recognizer's structural shape (`{ let _ = k(arg); ...; pure_tail }`) is unchanged, only the purity classifier is extended. Future widenings (e.g., color-aware purity for Native-color user-fn calls) would be additional sub-fixes, not a generalization of this branch.
+
+**Regression tests.** Two unit tests in `compiler/src/codegen.rs` `tests` module:
+
+- `expr_is_pure_accepts_ctor_application_of_pure_args` — pins direct ctor purity (`Some(r1)` and `None` accepted; `int_to_string(r1)` rejected).
+- `expr_is_pure_accepts_match_arm_body_with_ctor_tail` — pins the canonical Sudoku match-tail shape (`match r1 { Some(s) => Some(s), None => r2 }`) as pure under ctor-aware classifier.
+
+**Failure mode.** None at the user surface. Pre-fix, programs using ctor-bearing tails in handler arm bodies would fall through to the regular walker and produce a confusing "k in non-tail position" diagnostic. Post-fix, those programs compile via Slice C as the recognizer was always intended to support.
+
+**Implementing commit.** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical `Some(s) => Some(s)` shape rather than a workaround.
+
