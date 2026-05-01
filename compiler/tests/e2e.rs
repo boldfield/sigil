@@ -8188,3 +8188,305 @@ fn task_78_5_pr1_generator_collect_handler_yields_three_elements() {
          stderr={stderr:?}"
     );
 }
+
+/// **Task 78.5 import — Reader effect (DI seam).**
+///
+/// Source pattern: synthesized from Koka's reader-style `effect val width`
+/// pattern (`algeff/implicits.kk`) and the `getstr` shape in
+/// `algeff/common.kk` lines 45–60, stripped of Koka's `effect val` /
+/// implicit-binding sugar (which sigil v1 doesn't have). The plain
+/// `effect Reader[A] { ask: () -> A }` form is the canonical
+/// dependency-injection seam in any algebraic-effect language.
+///
+/// **Why it's novel for sigil:** the existing corpus has no Reader-style
+/// effect test. State threads mutable values; Raise short-circuits;
+/// Reader provides read-only ambient values via single-shot k(config).
+/// This is the smallest possible test of "handler resumes once with a
+/// value supplied by the discharger" — the pattern that makes effects a
+/// DI seam (per README's "Testability is a consequence" section).
+///
+/// **Invariant:** `with_config(32, helper)` where `helper = ask() + 10`
+/// → 42. stdout = `"42\n"`, exit 0.
+#[test]
+fn task_78_5_reader_effect_returns_config_plus_ten() {
+    let src = "import std.io\n\
+               \n\
+               effect Reader[A] {\n  \
+                 ask: () -> A,\n\
+               }\n\
+               \n\
+               fn helper() -> Int ![Reader[Int]] {\n  \
+                 let v: Int = perform Reader.ask();\n  \
+                 v + 10\n\
+               }\n\
+               \n\
+               fn with_config(config: Int, action: () -> Int ![Reader[Int]]) -> Int ![] {\n  \
+                 handle action() with {\n    \
+                   Reader.ask(k) => k(config),\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = with_config(32, helper);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_reader_effect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "Reader.ask single-shot k(config) should return 42; stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 import — Custom-ADT error in Raise[E].**
+///
+/// Source pattern: synthesized from the survey gap "Exception with
+/// structured error type — Raise[String] everywhere; Raise[ParseError]-
+/// style with custom ADT not tested." Plan D Stage 12's row-arg
+/// propagation through `catch[A, E]` was unit-tested but never exercised
+/// at the e2e level with a non-String E.
+///
+/// **Why it's novel for sigil:** every existing `std_raise_*` and
+/// `Raise.fail` e2e test uses E = String. This is the first e2e where
+/// E is a sum type. Tests:
+///   1. `raise(Lex(42))` instantiates Raise[ParseError] at the perform
+///      site — row-arg ParseError must propagate from the row entry to
+///      the op's E parameter.
+///   2. `catch(...)` discharges and returns `Result[Int, ParseError]`;
+///      the row arg flows through catch's row-poly signature into the
+///      result type.
+///   3. The Err arm's pattern `Err(e)` binds `e: ParseError`, then a
+///      match on `e` selects the right diagnostic.
+///
+/// **Invariant:** stdout = `"lex error at line 42\n"`, exit 0.
+#[test]
+fn task_78_5_raise_custom_adt_error_routes_through_catch() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               import std.io\n\
+               \n\
+               type ParseError = | Lex(Int) | EOF | Bad(String)\n\
+               \n\
+               fn show_err(e: ParseError) -> String ![] {\n  \
+                 match e {\n    \
+                   Lex(line) => string_concat(\"lex error at line \", int_to_string(line)),\n    \
+                   EOF => \"unexpected EOF\",\n    \
+                   Bad(s) => string_concat(\"bad: \", s),\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn parse_thing(input: Int) -> Int ![Raise[ParseError]] {\n  \
+                 match input {\n    \
+                   0 => raise(EOF),\n    \
+                   1 => raise(Lex(42)),\n    \
+                   _ => input,\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, ParseError] = catch(fn () -> Int ![Raise[ParseError]] => parse_thing(1));\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(e) => perform IO.println(show_err(e)),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_raise_custom_adt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "lex error at line 42\n",
+        "custom ParseError should route through catch + show_err; \
+         stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 import — Mini Nim with mutual recursion through effect ops.**
+///
+/// Source pattern: `koka/test/algeff/nim1a.kk` perfect-strategy variant
+/// (the full `nim.kk` file uses `choose` + `cut` which require multi-shot
+/// dischargers sigil doesn't have; the perfect-strategy variant is
+/// single-shot k throughout).
+///
+/// **Why it's novel for sigil:** mutual recursion `alice_turn` ↔
+/// `bob_turn` where both fns perform `Nim.move(player, n)`. The existing
+/// corpus has recursion through perform (e.g. fib_cps_perf, sudoku) but
+/// no MUTUAL recursion through perform — the forward-reference path
+/// between two effect-using fns at the same scope is a separate
+/// resolve.rs / typecheck path.
+///
+/// **Invariant:** `game(7)` with perfect strategy returns `Alice`
+/// (printed as `"alice\n"`); exit 0.
+#[test]
+fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
+    let src = "import std.io\n\
+               \n\
+               type Player = | Bob | Alice\n\
+               \n\
+               effect Nim {\n  \
+                 move: (Int, Int) -> Int,\n\
+               }\n\
+               \n\
+               fn alice_turn(n: Int) -> Player ![Nim] {\n  \
+                 if n <= 0 {\n    \
+                   Bob\n  \
+                 } else {\n    \
+                   let taken: Int = perform Nim.move(0, n);\n    \
+                   bob_turn(n - taken)\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn bob_turn(n: Int) -> Player ![Nim] {\n  \
+                 if n <= 0 {\n    \
+                   Alice\n  \
+                 } else {\n    \
+                   let taken: Int = perform Nim.move(1, n);\n    \
+                   alice_turn(n - taken)\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn pick(n: Int) -> Int ![] {\n  \
+                 let m: Int = n % 4;\n  \
+                 if m < 1 { 1 } else { m }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let winner: Player = handle alice_turn(7) with {\n    \
+                   Nim.move(_p, n, k) => k(pick(n)),\n  \
+                 };\n  \
+                 match winner {\n    \
+                   Alice => perform IO.println(\"alice\"),\n    \
+                   Bob => perform IO.println(\"bob\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_nim_mini_perfect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "alice\n",
+        "perfect-strategy Nim from 7 sticks should yield Alice; stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 import — Multi-effect interpreter (Raise + State + IO).**
+///
+/// Source pattern: `koka/test/algeff/expr.kk` lines 145–165 (`eval2`
+/// with state + exc). Sigil's `examples/interpreter.sigil` uses
+/// Raise[String] only; this test extends it with a State[Int] tick
+/// counter + IO trace, mirroring expr.kk's progression eval1 → eval2 →
+/// eval3.
+///
+/// **Why it's novel for sigil:** the existing interpreter test handles
+/// only one effect (Raise). This one's `eval` body has effect row
+/// `![Raise[String], State, IO]` — three effects in a single recursive
+/// evaluator. Recursive perform under three handlers stacked is not in
+/// the corpus.
+///
+/// **Invariant:** evaluating `Div(Div(IntE(16), IntE(2)), IntE(3))`
+/// → `(16/2)/3 = 2` (integer div). With tick incremented per Div, total
+/// ticks = 2. stdout traces "tick" twice and prints final result `"2\n"`.
+#[test]
+fn task_78_5_multi_effect_interpreter_traces_and_evaluates() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               import std.state\n\
+               import std.io\n\
+               \n\
+               type Expr = | IntE(Int) | DivE(Expr, Expr)\n\
+               \n\
+               fn eval(e: Expr) -> Int ![Raise[String], State, IO] {\n  \
+                 match e {\n    \
+                   IntE(i) => i,\n    \
+                   DivE(e1, e2) => {\n      \
+                     let x: Int = eval(e1);\n      \
+                     let y: Int = eval(e2);\n      \
+                     let cur: Int = perform State.get();\n      \
+                     let _: Int = perform State.set(cur + 1);\n      \
+                     perform IO.println(\"tick\");\n      \
+                     if y == 0 {\n        \
+                       raise(\"divide by zero\")\n      \
+                     } else {\n        \
+                       x / y\n      \
+                     }\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let prog: Expr = DivE(DivE(IntE(16), IntE(2)), IntE(3));\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String], State, IO] => run_state(0, fn () -> Int ![Raise[String], State, IO] => eval(prog)));\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(m) => perform IO.println(m),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_multi_effect_interpreter");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "tick\ntick\n2\n",
+        "Div tree should print tick per Div node and final value 2; stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 import — State+Choose Plotkin combo, order: state(amb).**
+///
+/// Source pattern: `koka/test/algeff/effs1a.kk` test2 — the canonical
+/// "stateful nondeterminism" demo from algebraic-effects literature.
+/// `state(0){ amb(foo) }` puts the State handler OUTSIDE the Choose
+/// handler; the State is therefore SHARED across both branches of every
+/// flip (because amb's multi-shot k traverses the State frame each
+/// resume, but the State frame's mutation is not rolled back per
+/// branch).
+///
+/// **Why it's novel for sigil:** this is the single most-cited gap in
+/// standard algebraic-effect literature — stateful nondeterminism. The
+/// existing corpus has State alone, Choose alone, but never composed.
+/// Order matters semantically: state(amb) shares state across choices;
+/// amb(state) gives each branch its own state copy.
+///
+/// **Invariant:** simplified body `let p = flip(); let i = get();
+/// set(i+1); p` performs flip then increments state. With `amb` as
+/// inner returning a List[Bool], state(amb(...)) ends with state =
+/// 2 (incremented twice — once per resume of flip). The handle's
+/// overall is the List[Bool] from amb. Final list = [true, false].
+/// We check the list length (= 2) printed via int_to_string.
+#[test]
+fn task_78_5_plotkin_state_outer_amb_inner_shares_state_across_choices() {
+    let src = "import std.list\n\
+               import std.state\n\
+               import std.io\n\
+               \n\
+               effect Choose resumes: many { flip: () -> Bool }\n\
+               \n\
+               fn body() -> Bool ![Choose, State] {\n  \
+                 let p: Bool = perform Choose.flip();\n  \
+                 let i: Int = perform State.get();\n  \
+                 let _: Int = perform State.set(i + 1);\n  \
+                 p\n\
+               }\n\
+               \n\
+               fn amb_handle(action: () -> Bool ![Choose, State]) -> List[Bool] ![State] {\n  \
+                 handle action() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: List[Bool] = k(true);\n      \
+                     let r2: List[Bool] = k(false);\n      \
+                     append(r1, r2)\n    \
+                   },\n    \
+                   return(v) => Cons(v, Nil),\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: List[Bool] = run_state(0, fn () -> List[Bool] ![State] => amb_handle(body));\n  \
+                 perform IO.println(int_to_string(length(result)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_plotkin_state_amb");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "2\n",
+        "Plotkin state(amb): list of both flip outcomes has length 2; \
+         stderr={stderr:?}"
+    );
+}
