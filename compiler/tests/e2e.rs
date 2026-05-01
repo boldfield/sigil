@@ -8376,61 +8376,158 @@ fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
     );
 }
 
-// Multi-effect interpreter port (algeff/expr.kk eval2/eval3) was authored
-// in this branch but exposed the SAME gap as the Plotkin combo below
-// (row-poly `[X | e]` in user fn signatures not treated as polymorphic
-// at user call sites — surfaced as E0128 closed-row-mismatch in the
-// run_state_poly call vs E0132 ambiguous-polymorphism in Plotkin's
-// amb_handle call). Per "each unique gap gets one representative" the
-// Plotkin test is kept as the cleaner, smaller pin; the multi-effect
-// interpreter port returns once the row-poly user-fn inference gap
-// closes (its own follow-up PR will add it back as a passing test).
+/// **Task 78.5 — Multi-effect interpreter (Raise+State+IO) [PENDING `_pending_row_poly_lambda_drops_effect_row_var`].**
+///
+/// Source pattern: `koka/test/algeff/expr.kk` lines 145–165 (`eval2`
+/// with state + exc) extended with IO trace per eval3 (lines 179–195).
+/// First sigil e2e exercising 3-effect recursive evaluation under
+/// stacked dischargers.
+///
+/// ## Status — gap representative for G2.b
+///
+/// **`#[ignore]`'d**: surfaced E0128 "effect row mismatch: closed row
+/// `![State]` cannot unify with closed row `![ArithError, IO,
+/// Raise[String], State]`" at the run_state_poly call site. Originally
+/// authored alongside Plotkin (G2.a); typecheck trace confirmed
+/// **different root sites** so kept as the dedicated G2.b pin.
+///
+/// ## G2.b root site
+///
+/// `compiler/src/typecheck.rs:4328` (the `let _ = effect_row_var;`)
+/// and `:4743` (hardcoded `effect_row_var: None` on the lambda's
+/// `FnSig`). Lambda typing **drops the parsed `effect_row_var`**, so a
+/// lambda with declared row `![State | e]` (e.g. inside the body of a
+/// row-poly user fn) is typed as **closed**. Then the surrounding
+/// `let state_fn: (Int) -> A ![| e] = handle body() with { ... }`
+/// runs `unify_ty(decl, got)` symmetrically (typecheck.rs:3957→2780),
+/// `unify_row` takes the `(Some(a_tail), None)` branch (typecheck.rs:
+/// 3007), and `bind_row_var(id, Row{[], None})` (3021–3028) **binds
+/// run_state_poly's outer row var to closed empty**. The corrupted
+/// scheme stored at line 3873 is what's instantiated at every call
+/// site — the body param's `![State | e]` collapses to closed
+/// `![State]`. At main's call `run_state_poly(0, lambda_with_extra_-
+/// effects)`, `unify_row(closed [State], closed [Raise,State,
+/// ArithError,IO])` fires E0128 at 2942/2970.
+///
+/// ## Closure path
+///
+/// Two-pronged fix at typecheck.rs:
+/// 1. Lambda construction should inherit the enclosing fn's row
+///    variable: resolve `effect_row_var` name through
+///    `current_row_var_subst` at lambda construction (mirroring the
+///    inner-fn-type resolution at line 6493).
+/// 2. AND/OR let-annotation→RHS should use asymmetric `subsume_row`-
+///    direction logic so the annotation's open row absorbs the
+///    closed RHS's effects without binding the row var to closed.
+///
+/// **Invariant** (post-fix): `Div(Div(IntE(16), IntE(2)), IntE(3))`
+/// → `(16/2)/3 = 2`. tick prints once per Div node; final value 2.
+/// stdout = `"tick\ntick\n2\n"`, exit 0.
+#[test]
+#[ignore = "G2.b: lambda typing drops parsed effect_row_var (typecheck.rs:4328/4743); symmetric let-annot unify_row collapses outer row var to closed empty"]
+fn task_78_5_multi_effect_interpreter_pending_row_poly_lambda_drops_effect_row_var() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               import std.io\n\
+               \n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               \n\
+               fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
+                 let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> A ![| e] => v,\n    \
+                   State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s),\n    \
+                   State.set(arg, k) => fn (s: Int) -> A ![| e] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               type Expr = | IntE(Int) | DivE(Expr, Expr)\n\
+               \n\
+               fn eval(e: Expr) -> Int ![Raise[String], State, ArithError, IO] {\n  \
+                 match e {\n    \
+                   IntE(i) => i,\n    \
+                   DivE(e1, e2) => {\n      \
+                     let x: Int = eval(e1);\n      \
+                     let y: Int = eval(e2);\n      \
+                     let cur: Int = perform State.get();\n      \
+                     let _: Int = perform State.set(cur + 1);\n      \
+                     perform IO.println(\"tick\");\n      \
+                     if y == 0 {\n        \
+                       let _r: Int = raise(\"divide by zero\");\n        \
+                       _r\n      \
+                     } else {\n        \
+                       x / y\n      \
+                     }\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO, ArithError] {\n  \
+                 let prog: Expr = DivE(DivE(IntE(16), IntE(2)), IntE(3));\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String], ArithError, IO] => run_state_poly(0, fn () -> Int ![Raise[String], State, ArithError, IO] => eval(prog)));\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(m) => perform IO.println(m),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_multi_effect_interpreter");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "tick\ntick\n2\n",
+        "Div tree should print tick per Div node and final value 2; stderr={stderr:?}"
+    );
+}
 
-/// **Task 78.5 — State+Choose Plotkin combo, state(amb) order [PENDING `_pending_row_poly_user_fn_inference`].**
+/// **Task 78.5 — State+Choose Plotkin combo, state(amb) order [PENDING `_pending_row_poly_bracketed_alias_unconstrained`].**
 ///
 /// Source pattern: `koka/test/algeff/effs1a.kk` test2 — the canonical
 /// "stateful nondeterminism" demo from algebraic-effects literature.
 ///
-/// ## Status
+/// ## Status — gap representative for G2.a
 ///
-/// **`#[ignore]`'d**: surfaced a real typecheck gap in PR #66 CI
-/// (commit `2247f1d`). The user-defined row-poly `amb_handle[e](action:
-/// () -> Bool ![Amb | e]) -> List[Bool] ![| e]` is called with `body`
-/// whose row is `[Amb, State]`; the call site fires E0132 "ambiguous
-/// polymorphism: type parameter `e` of `amb_handle` is unconstrained at
-/// this call site". The same gap surfaces from a different angle in the
-/// dropped multi-effect interpreter port (E0128 closed-row mismatch
-/// when `run_state_poly[A](initial: Int, body: () -> A ![State | e])`
-/// is called with body row `[Raise[String], State, ArithError, IO]` —
-/// the `e` is treated as closed/empty rather than inferred).
+/// **`#[ignore]`'d**: surfaced E0132 "ambiguous polymorphism: type
+/// parameter `e` of `amb_handle` is unconstrained at this call site".
+/// Originally suspected to share a root with the multi-effect
+/// interpreter port (E0128); typecheck trace confirmed **different
+/// root sites** so each gets a dedicated pin.
 ///
-/// ## Full underlying-gap coverage (audit-lesson characterization)
+/// ## G2.a root site
 ///
-/// Row-poly `[X | e]` parameter rows in user-defined fn signatures are
-/// not inferred at user call sites. Symptoms surfaced:
+/// `compiler/src/typecheck.rs:1346-1370` (the post-typecheck E0132
+/// sweep over `pending_call_instantiations`). Upstream root: the AST
+/// parser (parser.rs:391-405 + 418-422) splits "bracketed generic
+/// params" (`f.generic_params`, parsed as TYPE GenericParam) from
+/// "row variable" (`f.effect_row_var`, set only by `| e` syntax).
+/// When the user writes `fn amb_handle[e](action: () -> Bool ![Amb |
+/// e]) -> List[Bool] ![| e]` intending `e` as a row variable, the
+/// parser produces BOTH `f.generic_params = [GP{e}]` (type kind) AND
+/// `f.effect_row_var = Some(RowVar{e})` (row kind) — **two different
+/// variables sharing a name**. The type variable is allocated at
+/// scheme-registration (typecheck.rs:1114, `fresh_generic_subst`) and
+/// at check_fn entry (:3785), but no surface reference ever pins it
+/// (nothing in the body uses `e` in TypeExpr position), so the
+/// post-typecheck sweep at 1346-1370 finds it unbound and fires
+/// E0132. The "type parameter `e`" wording is exact —
+/// `fn_param_names[amb_handle][0] = "e"`.
 ///
-/// 1. **`e` unconstrained → E0132** when no return-row context
-///    sufficiently pins it (Plotkin: `amb_handle(body)`).
-/// 2. **`e` defaults to closed/empty → E0128** when a body has effects
-///    beyond the named row entry (multi-effect interpreter:
-///    `run_state_poly(0, fn () => eval(prog))`).
-/// 3. Both shapes likely manifest for ANY user-defined fn with `[X | e]`
-///    in a fn-typed parameter row, regardless of the named X.
+/// ## Closure path
 ///
-/// `std/raise.sigil`'s `catch[A, E]` works because all existing tests
-/// call it with a body whose row is a closed singleton `[Raise[E]]` —
-/// there's no row-passthrough demand. This test is the first to exercise
-/// row passthrough through a user-defined row-poly fn at the e2e level.
-/// Per memory `feedback_sigil_typecheck_unit_tests_insufficient`:
-/// type-system surface lifts must run a real stdlib migration before
-/// sign-off; per-task unit tests don't exercise scheme-inst / cross-clone
-/// paths. Plan D Stage 12 found 5 such gaps in std/raise; this is a 6th.
+/// Two options at parser/AST + typecheck:
+/// 1. Add a row-vs-type kind to `GenericParam` so `[e]` can declare a
+///    row var explicitly (cleaner long-term surface; aligns with
+///    Koka's `<e>` syntactic distinction).
+/// 2. Detect the alias `gp.name == effect_row_var.name` at scheme
+///    registration and skip allocating a separate type var (smaller
+///    surface delta; Plan-D-Task-116-style follow-up).
 ///
-/// **Closure path**: TBD by gap-fix author. Likely fix-site is in
-/// `compiler/src/typecheck.rs` row-var resolution at `check_call`'s
-/// arg-unify or in scheme instantiation where the row-var is
-/// not freshened correctly. Could couple with the discovery work for
-/// std/state's row-poly migration once that's planned.
+/// ## Variants the same root cause touches (audit-lesson coverage)
+///
+/// G2.a fires for any user-defined fn that puts `[e]` in the
+/// bracketed generic-param list intending it as a row variable.
+/// Workaround: omit `[e]` and rely on the implicit row var from
+/// `| e` in the row position (mirrors `std/raise.sigil`'s `catch`,
+/// which has `[A, E]` only — no `[e]`).
 ///
 /// ## Why it's novel for sigil
 ///
@@ -8445,8 +8542,8 @@ fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
 /// the State frame across both. Final list = `[true, false]`; length =
 /// 2; stdout = `"2\n"`.
 #[test]
-#[ignore = "row-poly `[X | e]` parameter rows in user-defined fn signatures not inferred at user call sites; manifests as E0132 (unconstrained) and E0128 (closed-row mismatch)"]
-fn task_78_5_plotkin_state_amb_pending_row_poly_user_fn_inference() {
+#[ignore = "G2.a: bracketed `[e]` generic param aliases the row var name (parser.rs splits into GenericParam{e} + RowVar{e}); type var unconstrained → E0132"]
+fn task_78_5_plotkin_state_amb_pending_row_poly_bracketed_alias_unconstrained() {
     // Inline row-poly + body-type-poly run_state (mirrors std/raise.sigil's
     // catch shape). std/state.sigil's run_state is closed-row + Int-only,
     // which can't accept a body returning List[Bool] with extra effects.
