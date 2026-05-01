@@ -1014,6 +1014,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         fn_schemes: BTreeMap::new(),
         next_ty_var: 0,
         next_row_var: 0,
+        next_scope_id: 0,
         subst: Subst::new(),
         current_generic_subst: BTreeMap::new(),
         current_row_var_subst: BTreeMap::new(),
@@ -2112,6 +2113,11 @@ struct Tc {
     /// for explicit `![ ... | e]` row variables and for fresh-row
     /// holes opened during HM inference.
     next_row_var: u32,
+    /// Plan D Task 117 — handle-scope id supply. One fresh
+    /// `ScopeId::Concrete(N)` per `Expr::Handle` at typecheck. Used
+    /// to tag the `Ty::Continuation` bound to each arm's `k` so
+    /// continuations from different handles can't unify (E0145).
+    next_scope_id: u32,
     /// Substitution accumulated by unification. Resolves type-vars
     /// via `Subst::apply_ty` and row-vars via `Subst::apply_row`.
     /// Updated in-place by `unify_ty` / `unify_row`; queried whenever
@@ -2247,6 +2253,18 @@ impl Tc {
     fn fresh_row_var(&mut self) -> u32 {
         let id = self.next_row_var;
         self.next_row_var += 1;
+        id
+    }
+
+    /// Plan D Task 117 — allocate a fresh handle-scope id. Each
+    /// `Expr::Handle` calls this once at the top of `check_handle`;
+    /// the resulting `ScopeId::Concrete(N)` tags every
+    /// `Ty::Continuation` produced for that handle's arm `k`
+    /// bindings, so unification of continuations from different
+    /// handles fires E0145.
+    fn fresh_scope_id(&mut self) -> u32 {
+        let id = self.next_scope_id;
+        self.next_scope_id += 1;
         id
     }
 
@@ -4266,6 +4284,21 @@ impl Tc {
 
         let sig = match callee_ty {
             Some(Ty::Fn(sig)) => sig,
+            // Plan D Task 117 — calling a `Ty::Continuation` value
+            // (i.e. an arm-bound `k` or a let-bound alias of one).
+            // Synthesize a single-param FnSig from the continuation's
+            // `op_ret` / `ret` so the rest of `check_call` (arity,
+            // arg-type unify, ret deref) runs unchanged. Effect row
+            // is the caller's row by construction: a continuation
+            // resumes the surrounding fn's computation in place, so
+            // it sees that fn's effects literally — `subsume_row`
+            // against an identical caller_row is trivially OK.
+            Some(Ty::Continuation(c)) => Box::new(FnSig {
+                params: vec![c.op_ret.clone()],
+                ret: c.ret.clone(),
+                effects: row.to_vec(),
+                effect_row_var: self.lookup_active_row_var(),
+            }),
             Some(other) => {
                 self.push_error(
                     "E0068",
@@ -4559,6 +4592,13 @@ impl Tc {
         // `handle_arm_captures` side-table populated below.
         handle_span: &Span,
     ) -> Option<Ty> {
+        // Plan D Task 117 — allocate the handle's scope id once at
+        // entry. Tags every `Ty::Continuation` bound for this
+        // handle's arm `k` names, so unifying a `k` from this handle
+        // with a `k` from a different handle fires E0145 (escape
+        // barrier).
+        let handle_scope_id = self.fresh_scope_id();
+
         // ---------- Phase 1: dispatch table ----------
         // Per-arm collected info that the arm walk consumes. Done
         // outside the arm loop so we see the full picture before
@@ -5029,20 +5069,27 @@ impl Tc {
                     .unwrap_or(Ty::Unit);
                 self.env.insert(p.name.clone(), pty);
             }
-            // Continuation `k`: typed as `Fn(op_ret_ty) ->
-            // handler_overall ![caller_row]`. Effect row is the
-            // caller's row literally — `k` runs the remainder of the
-            // surrounding fn's computation, so it sees that fn's
-            // effects. When op_ret_ty couldn't be resolved (E0138 /
-            // E0139 path), default to Ty::Unit; the binding still
-            // lets references to `k` inside the arm body resolve
-            // without firing spurious E0046.
+            // Continuation `k`: Plan D Task 117 — typed as
+            // `Ty::Continuation { op_ret, ret: handler_overall,
+            // scope_id }` rather than `Ty::Fn(...)`. The
+            // Continuation type carries no effect row: `k` resumes
+            // the surrounding fn's computation in place, so its
+            // effects are exactly the caller's row by construction;
+            // call sites that read `k`'s type fabricate the row at
+            // use time. The fresh `handle_scope_id` (allocated at
+            // the top of `check_handle`) tags the binding so
+            // unifying a `k` from this handle with a `k` from a
+            // different handle fires E0145.
+            //
+            // When op_ret_ty couldn't be resolved (E0138 / E0139
+            // path), default to Ty::Unit; the binding still lets
+            // references to `k` inside the arm body resolve without
+            // firing spurious E0046.
             let k_param_ty = typing.op_ret_ty.clone().unwrap_or(Ty::Unit);
-            let k_ty = Ty::Fn(Box::new(FnSig {
-                params: vec![k_param_ty],
+            let k_ty = Ty::Continuation(Box::new(ContinuationTy {
+                op_ret: k_param_ty,
                 ret: handler_overall.clone(),
-                effects: row.to_vec(),
-                effect_row_var: self.lookup_active_row_var(),
+                scope_id: ScopeId::Concrete(handle_scope_id),
             }));
             self.env.insert(arm.k_name.clone(), k_ty);
             // Arm body runs at caller's row (the discharged effect is
@@ -9278,6 +9325,7 @@ mod tests {
             fn_schemes: BTreeMap::new(),
             next_ty_var: 0,
             next_row_var: 0,
+            next_scope_id: 0,
             subst: Subst::new(),
             current_generic_subst: BTreeMap::new(),
             current_row_var_subst: BTreeMap::new(),
