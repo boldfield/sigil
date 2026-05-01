@@ -1651,15 +1651,19 @@ fn arm_body_walk(
                 // of the arm body's `Expr::Block` (the desugar only
                 // walks top-level stmts of arm-body blocks). Direct
                 // user to the supported shape.
+                // Single canonical phrase; tests pin against
+                // `"top level of a handler arm body"` to detect
+                // wording drift if the message is split across
+                // alternates.
                 return Some(format!(
                     "references continuation `{name}` as a value (not as the \
                      callee of a call). The Task 117 type-position surface \
                      `Continuation[op_ret, ret]` is supported only for let-\
-                     bindings at the TOP LEVEL of a handler arm body's block: \
+                     bindings at the top level of a handler arm body's block: \
                      `Raise.fail(k) => {{ let f: Continuation[op_ret, ret] = k; \
                      ... f(arg) ... }}`. Nested let-bound k inside if/match/\
-                     lambda branches is a v1 restriction (PR #62 followup may \
-                     extend the desugar to nested scopes)"
+                     lambda branches is a v1 restriction (a future follow-up \
+                     may extend the desugar to nested scopes)"
                 ));
             }
             if globals.contains(name) {
