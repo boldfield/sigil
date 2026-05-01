@@ -8090,3 +8090,101 @@ fn generic_tuple_scrutinee_via_call_resolves() {
     assert_eq!(code, 42, "exit code expected 42; stderr={stderr:?}");
     assert_eq!(stdout, "", "no stdout expected; stderr={stderr:?}");
 }
+
+// ===== Plan C Task 78.5 — Koka subset import ===============================
+//
+// Each test in this section is a port of a pattern from
+// koka-lang/koka's BSD-2-licensed effect-handler test suite
+// (`koka/test/algeff/` and surrounding) — pinning composition shapes
+// the existing sigil corpus doesn't exercise. Per the import plan at
+// `boldfield/designs:docs/2026-05-01-sigil-koka-import-plan.md`, each
+// new pattern lands as its own PR with one e2e test (and possibly an
+// example) so any surfaced bug ships as its own followup PR.
+
+/// **Task 78.5 PR 1** — Generator with collecting handler.
+///
+/// Source pattern: `koka/test/algeff/common.kk` lines 108–125 (the
+/// `yield` effect + `iterate` producer; the `foreach` consumer
+/// variant is inexpressible in sigil v1 per Task 64 deviation, so the
+/// port substitutes a list-collecting handler).
+///
+/// **Why it's novel for sigil:**
+///
+/// 1. **Recursive perform under a handler.** `iterate(xs)` calls
+///    itself in the `Cons` arm after each `perform Gen.yield(x)`. The
+///    survey at `2026-05-01-sigil-koka-import-plan.md` flagged
+///    "stack-safety of deeply-nested recursive perform" as not
+///    exercised; this is the cleanest minimal probe of the trampoline
+///    machinery under recursive descent.
+///
+/// 2. **Single-shot k whose result type is a non-Int sum (`List[Int]`).**
+///    Existing Slice B post-arm-k synth-fn tests (e.g.
+///    `slice_b_arm_body_let_then_pure_tail_post_arm_k_synth_fn_fires`)
+///    exercise `let r = k(99); r+1` where r is Int. This test routes
+///    `let rest: List[Int] = k(0); Cons(x, rest)` through the same
+///    machinery with a pointer-typed sum-type binding.
+///
+/// 3. **Decl-level generic effect `Gen[A]`** instantiated to
+///    `Gen[Int]` at the row site. Mirrors `std/raise.sigil`'s
+///    `Raise[E]` shape but with the type param appearing only in op
+///    *input* position (Raise's E appears in input only too — but
+///    Gen's discharger and arm body both consume the param-typed
+///    value, exercising a different lowering path).
+///
+/// **Trace** (xs = `[1, 2, 3]`):
+/// - handle pushes Gen[Int] frame; iterate([1,2,3]) runs.
+/// - perform Gen.yield(1) → arm runs: `let rest = k(0)`. k(0) resumes
+///   iterate at the perform site with value 0 (the `_` binding); iterate
+///   tail-calls iterate([2,3]).
+///   - perform Gen.yield(2) → `let rest = k(0)`. k(0) resumes; iterate
+///     tail-calls iterate([3]).
+///     - perform Gen.yield(3) → `let rest = k(0)`. k(0) resumes;
+///       iterate tail-calls iterate([]).
+///       - match Nil => 0. Body returns 0.
+///       - return arm fires: _v=0; returns Nil.
+///       - rest = Nil; arm body evaluates Cons(3, Nil).
+///     - rest = Cons(3, Nil); arm body evaluates Cons(2, Cons(3, Nil)).
+///   - rest = Cons(2, Cons(3, Nil)); arm body evaluates Cons(1, _).
+/// - handle's overall = Cons(1, Cons(2, Cons(3, Nil))).
+/// - length(result) = 3; main prints "3\n".
+///
+/// **Invariant:** stdout = `"3\n"`, exit 0.
+#[test]
+fn task_78_5_pr1_generator_collect_handler_yields_three_elements() {
+    let src = "import std.list\n\
+               import std.io\n\
+               \n\
+               effect Gen[A] {\n  \
+                 yield: (A) -> Int,\n\
+               }\n\
+               \n\
+               fn iterate(xs: List[Int]) -> Int ![Gen[Int]] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(x, rest) => {\n      \
+                     let _: Int = perform Gen.yield(x);\n      \
+                     iterate(rest)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = Cons(1, Cons(2, Cons(3, Nil)));\n  \
+                 let result: List[Int] = handle iterate(xs) with {\n    \
+                   Gen.yield(x, k) => {\n      \
+                     let rest: List[Int] = k(0);\n      \
+                     Cons(x, rest)\n    \
+                   },\n    \
+                   return(_v) => Nil,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(length(result)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pr1_generator_collect");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3\n",
+        "generator should yield 3 elements collected into List[Int]; \
+         stderr={stderr:?}"
+    );
+}
