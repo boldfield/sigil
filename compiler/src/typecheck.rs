@@ -10726,11 +10726,14 @@ mod tests {
 
     #[test]
     fn handle_arm_k_call_with_wrong_arg_is_e0044() {
-        // `k`'s type is `Fn(op_ret_ty) -> handler_overall ![caller_row]`.
-        // For `Raise.fail: (String) -> Int`, op_ret_ty is Int. Calling
-        // k with a String argument fires E0044 via the call-site arg
-        // check, locking down the binding-type contract at the arm's
-        // env-extension site.
+        // `k`'s type is `Continuation(op_ret_ty) -> handler_overall`
+        // post-Task-117. For `Raise.fail: (String) -> Int`, op_ret is
+        // Int (the op's return). Calling k with a String fires E0044
+        // via check_call's Continuation arm (synthesizes a single-param
+        // FnSig from op_ret/ret and unifies arg against op_ret). Both
+        // sides of the failing unify are non-Continuation primitives,
+        // so the E0145 broad arm doesn't kick in — generic E0044
+        // ("type mismatch") is the right diagnostic.
         let src = "effect Raise { fail: (String) -> Int }\n\
                    fn main() -> Int ![] {\n\
                      handle 0 with {\n\
@@ -10740,8 +10743,158 @@ mod tests {
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
-            "k call with wrong arg type must E0044 (k has Fn(op_ret_ty) -> handler_overall): {errs:?}"
+            "k call with wrong arg type must E0044 (Continuation's op_ret unifies arg \
+             against the op's return type, both non-Continuation): {errs:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Plan D Task 117 — E0145 escape barrier (PR #60 substrate tests)
+    // ----------------------------------------------------------------
+    //
+    // These tests pin the E0145 broad-arm in `unify_ty` (added in
+    // PR #60 fix `503308d`), the cross-handle scope_id mismatch arm
+    // (added in `a3de60f`), and the `ty_display` scope-omission fix
+    // (added in `6c6fb41`).
+    //
+    // Positive shapes (`let f = k; f(arg)` single-shot + multi-shot)
+    // are out of scope here — they need the codegen-walker delta +
+    // closure_convert + codegen let-bound k dispatch, which ship in
+    // a follow-up PR. Lambda-capture-of-k → E0145 is also out of
+    // scope; today the linearity check fires E0220 for one-shot and
+    // multi-shot bypasses linearity (the existing
+    // `linearity_lambda_capturing_k_is_e0220` test pins one-shot
+    // E0220; lambda-capture-k inheritance with E0145 ships in PR (b)
+    // per `[DEVIATION Task 117]`).
+
+    #[test]
+    fn k_returned_from_fn_with_non_continuation_ret_fires_e0145() {
+        // `fn ret_k() -> Int` whose body's value is `k`. Arm body's
+        // type is `Continuation(op_ret) -> handler_overall`.
+        // handler_overall var binds to Continuation via the arm-body
+        // unify. The handle's overall type is Continuation. The fn
+        // body's type is Continuation. `check_fn` unifies the fn's
+        // declared return type (Int) against the body type:
+        // `unify_ty(Int, Continuation)` → E0145 broad arm fires
+        // ("continuation `k` cannot escape its handle's arm body").
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn ret_k() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => k,\n\
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![Raise] { ret_k() }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "returning `k` from a fn whose declared ret type is non-Continuation must \
+             fire E0145 (escape barrier): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn k_passed_as_fn_arg_of_non_continuation_param_fires_e0145() {
+        // `fn take_fn(f: (Int) -> Int ![]) -> Int ![]`. Calling
+        // `take_fn(k)` from inside a handler arm: check_call's
+        // arg-unify pass walks `unify_ty(Fn(Int) -> Int, Continuation)`
+        // → E0145 broad arm fires. The Fn-vs-Continuation unify fails
+        // structurally (different type ctors), but the broad arm
+        // catches it before the generic E0044 catchall.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn take_fn(f: (Int) -> Int ![]) -> Int ![] { f(0) }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => take_fn(k),\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "passing `k` as a fn-arg of non-Continuation declared type must fire E0145 \
+             (escape barrier): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn k_stored_in_user_type_field_fires_e0145() {
+        // ctor-construction site for a non-generic user type whose
+        // field has a Fn-typed declared TypeExpr. Storing `k` at that
+        // field unifies `Fn(Int) -> Int` against `Continuation(Int) ->
+        // handler_overall` → E0145 broad arm. Distinct from the
+        // generic-instantiation case (`Wrap[A]` with `Wrap(k)`): a
+        // generic field would resolve A → Continuation via the
+        // (Var, other) bind_ty_var arm and bypass E0145 here; that
+        // bypass is the bind_ty_var precision fix deferred to PR (b)
+        // ("complete the E0145 escape barrier") per the DEVIATIONS
+        // entry.
+        let src = "type WrapFn = | WrapFn((Int) -> Int ![])\n\
+                   effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let _: WrapFn = WrapFn(k);\n\
+                         0\n\
+                       },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "storing `k` in a user-type field whose declared type is Fn (not generic) \
+             must fire E0145: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn cross_handle_k_unification_fires_e0145_with_scope_mismatch() {
+        // Two nested `handle` expressions, both discharging `E1`.
+        // Inner handle has two arms; arm 1's body returns the OUTER
+        // handle's `k1` (a Continuation tagged with the outer
+        // handle's scope_id), arm 2's body returns the INNER handle's
+        // `ki2` (tagged with the inner handle's scope_id). Cross-arm
+        // unification of the two arm bodies' types into the inner
+        // handle's `handler_overall` var produces a
+        // `(Ty::Continuation, Ty::Continuation)` unify with mismatched
+        // Concrete scope_ids — fires the specific cross-handle E0145
+        // arm (`scope {n} cannot unify with scope {m}`).
+        let src = "effect E1 { op1: () -> Int, op2: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       E1.op1(k1) =>\n\
+                         handle 0 with {\n\
+                           E1.op1(ki1) => k1,\n\
+                           E1.op2(ki2) => ki2,\n\
+                         },\n\
+                       E1.op2(k2) => 0,\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "cross-handle k unification with mismatched scope_ids must fire E0145: \
+             {errs:?}"
+        );
+    }
+
+    #[test]
+    fn ty_display_continuation_omits_scope_id() {
+        // PR #60 review 2 issue #5 regression: `ty_display` MUST NOT
+        // render `<scope=N>` in user-facing diagnostics — users have
+        // no mental model for "scope N" and can't remediate by
+        // writing the type they should have written. Scope numbers
+        // are reserved for E0145 cross-handle messages where they
+        // explain the violation.
+        let ct = Ty::Continuation(Box::new(ContinuationTy {
+            op_ret: Ty::Int,
+            ret: Ty::Bool,
+            scope_id: ScopeId::Concrete(42),
+        }));
+        let rendered = ty_display(&ct);
+        assert!(
+            !rendered.contains("scope"),
+            "ty_display must not leak scope_id to user diagnostics; got: {rendered}"
+        );
+        assert_eq!(rendered, "Continuation(Int) -> Bool");
     }
 
     // ----------------------------------------------------------------
