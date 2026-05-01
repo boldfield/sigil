@@ -1186,6 +1186,31 @@ fn tree_example_prints_32767_under_500ms() {
     );
 }
 
+/// Plan D Task 117 smoke gate. 4×4 Sudoku via binary-choose +
+/// recursive backtracking (per Brian's 2026-05-01 restructure;
+/// runtime-N `all_choices` deferred to v3). Verifies the
+/// binary-choose 2-let arm-body shape compiles end-to-end through
+/// existing Slice C machinery WITHOUT requiring Task 117's k-as-
+/// value capability — proves the smoke gate is reachable under
+/// today's Slice C, so the typecheck infrastructure PR (a) ships
+/// is gated on a real working demo, not a speculative one.
+///
+/// Grid: cell 11 is the only empty cell; valid digit is 3 (every
+/// other digit conflicts with row, col, or box). Output is
+/// `array_get(solved, 11)` = "3\n".
+#[test]
+fn task_117_smoke_gate_sudoku_solves_4x4() {
+    let root = workspace_root();
+    let source = root.join("examples/sudoku.sigil");
+    let (stdout, stderr, code) = compile_file_and_run(&source, "sudoku_example");
+    assert_eq!(code, 0, "sudoku.sigil exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3\n",
+        "sudoku.sigil must produce \"3\\n\" — the unique valid digit at cell 11. \
+         stderr={stderr:?}"
+    );
+}
+
 // ===== Plan A3 Task 45 — E0120 non-exhaustive-match regression ==============
 
 /// Compile a deliberately non-exhaustive `match` on `Option` with
@@ -5210,268 +5235,6 @@ fn task_108_arm_body_lambda_captures_k_runs() {
          body=0 → arm never fires → handle returns 0. stderr={stderr:?}"
     );
 }
-
-/// Plan D Task 117 validation test 1 — multi-shot through a let-
-/// bound lambda capturing k. **The validation question**: does
-/// invoking k indirectly via a let-bound lambda preserve the
-/// multi-shot semantics of the canonical positional shape
-/// `{ let r1 = k(true); let r2 = k(false); r1 + r2 }` (which
-/// today produces "1\n" via Slice C's chained synth-cont machinery)?
-///
-/// Test source mirrors `slice_c_choose_multi_shot_arm_invokes_k_-
-/// twice_with_different_args` (e2e.rs:4107) with one substitution:
-/// `let f: (Bool) -> Int ![] = fn (x: Bool) -> Int ![] => k(x);`
-/// then `f(true)` and `f(false)` instead of `k(true)` and
-/// `k(false)`.
-///
-/// Phase B (Plan B' Task 107) already lifts the lambda with k
-/// captured via the trailing-pair convention. Each `f(arg)`
-/// dispatches through standard indirect-call ABI into the lifted
-/// lambda; inside, `k(x)` triggers `lower_k_pair_call` which
-/// drives `sigil_run_loop` after pushing the captured frame.
-///
-/// The mechanism differs from the positional shape: each `f(arg)`
-/// is its own trampoline cycle (push frame, run_loop, pop frame),
-/// not a chained post_arm_k step. **For pure `resumes: many` the
-/// numerical result should be identical** (each k-call produces
-/// an independent resume), but if cross-resume state leaks across
-/// the two trampoline cycles the value will diverge from "1\n".
-///
-/// Expected: stdout = "1\n", exit 0 (same as the canonical Slice C
-/// positional test). If stdout differs, multi-shot via let-bound
-/// lambda has different semantics than the positional case — and
-/// eta-expansion as a Task 117 design is dead.
-#[test]
-fn task_117_validation_multi_shot_through_let_bound_lambda() {
-    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
-               fn helper() -> Int ![Choose, IO] {\n  \
-                 let b: Bool = perform Choose.flip();\n  \
-                 if b { 1 } else { 0 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle helper() with {\n    \
-                   Choose.flip(k) => {\n      \
-                     let f: (Bool) -> Int ![IO] = fn (x: Bool) -> Int ![IO] => k(x);\n      \
-                     let r1: Int = f(true);\n      \
-                     let r2: Int = f(false);\n      \
-                     r1 + r2\n    \
-                   },\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(n));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "task_117_validation_multi_shot");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(
-        stdout, "1\n",
-        "Task 117 validation: multi-shot via let-bound lambda must produce \
-         same result as positional Slice C shape (1+0=1). Different stdout \
-         means cross-resume independence is broken under indirect dispatch \
-         — eta-expansion design is dead. stderr={stderr:?}"
-    );
-}
-
-/// Plan D Task 117 validation test 2 — multi-invocation frame
-/// escape past handle pop. **The validation question**: does the
-/// captured frame_ptr survive when the same arm-body lambda is
-/// invoked *twice* from outside the handle?
-///
-/// Mirrors `std/state.sigil`'s `run_state` pattern (which proves
-/// single-invocation post-pop works) but calls the returned
-/// lambda twice in a row. Each invocation pushes the captured
-/// frame onto the handler stack, drives run_loop, pops. The bug
-/// surfaced by Test 1 (`sigil_handle_push: frame already linked
-/// (double-push?)`) was triggered by repeated `f(arg)` inside
-/// the same arm; here we trigger it from *outside* the handle to
-/// determine whether the failure is intrinsic to multi-invocation
-/// or specific to in-arm double-call.
-///
-/// Setup: body returns a state-bearing lambda `(Int) -> Int ![]`.
-/// Handle's overall is also `(Int) -> Int ![]`. Arm captures k
-/// and returns a lambda using `run_state`-style `k(x)(x)`. main
-/// calls the returned lambda twice with different args.
-///
-/// Expected outcomes:
-/// - Pass (stdout = "34\n"): multi-invocation frame-escape works,
-///   contradicts Test 1 — eta-expansion design might be salvageable.
-///   Brian flagged this as the "stop and re-decide" case.
-/// - Panic (`sigil_handle_push: frame already linked`): same
-///   pathology as Test 1 — confirms dynamic-extent semantics for
-///   the conservative `Ty::Continuation` design.
-/// - Other (segfault, wrong value): also confirms dynamic-extent
-///   under different mechanism.
-#[test]
-fn task_117_validation_frame_escape_past_handle_pop() {
-    let src = "effect Foo resumes: many { op: () -> Int }\n\
-               fn body_of_handle() -> (Int) -> Int ![] ![Foo] {\n  \
-                 let v: Int = perform Foo.op();\n  \
-                 fn (x: Int) -> Int ![] => x + v\n\
-               }\n\
-               fn make_continuation() -> (Int) -> Int ![] ![] {\n  \
-                 handle body_of_handle() with {\n    \
-                   Foo.op(k) => fn (x: Int) -> Int ![] => k(x)(x),\n    \
-                   return(v) => v,\n  \
-                 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let cont: (Int) -> Int ![] = make_continuation();\n  \
-                 let r1: Int = cont(7);\n  \
-                 let r2: Int = cont(10);\n  \
-                 perform IO.println(int_to_string(r1 + r2));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "task_117_validation_frame_escape");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    // r1 = k(7)(7): k(7) re-runs body with v=7, body terminal =
-    //              `fn (x) => x + 7`, applied to 7 → 14.
-    // r2 = k(10)(10): if multi-invocation works, k(10) re-runs
-    //                 body with v=10, terminal applied to 10 → 20.
-    //                 Sum = 34.
-    assert_eq!(
-        stdout, "34\n",
-        "Task 117 validation: multi-invocation post-pop frame escape. \
-         Pass means eta-expansion may be salvageable (stop and re-decide). \
-         Panic / wrong value confirms dynamic-extent semantics for the \
-         conservative Ty::Continuation design. stderr={stderr:?}"
-    );
-}
-
-/// Plan D Task 117 validation test 3 — arena escape rate under
-/// let-bound multi-shot. **The validation question**: does the
-/// indirect-dispatch mechanism (each f(arg) drives its own
-/// trampoline) inflate the arena escape rate beyond the Plan B
-/// Task 60 baseline of 0%?
-///
-/// This test compiles a let-bound-lambda variant of
-/// `examples/multishot_perf.sigil`, runs it with
-/// SIGIL_PRINT_STATS=1, parses the counter dump, and asserts
-/// `escape == 0`. Each `f(arg)` allocates one closure record at
-/// invocation; the existing `arena_escape_count_is_zero_below_-
-/// one_percent_ceiling` baseline measures the positional-k
-/// case's escape rate. Plan D's HARD perf gate (single-shot 0%,
-/// multi-shot ≤ existing ceiling) requires this variant's escape
-/// rate stays at 0 too.
-///
-/// If the indirect-dispatch path forces N closure-record promotions
-/// to Boehm heap, the escape count rises above 0 and eta-expansion
-/// trips Plan D's HARD perf gate.
-///
-/// Iteration count = 50 (lower than baseline's 300 to keep CI fast;
-/// escape rate is a per-allocation property, so 50 iters is enough
-/// signal for the gate).
-#[test]
-fn task_117_validation_arena_escape_let_bound_multi_shot() {
-    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
-               fn outcome() -> Int ![Choose, IO] {\n  \
-                 let b1: Bool = perform Choose.flip();\n  \
-                 let b2: Bool = perform Choose.flip();\n  \
-                 let b3: Bool = perform Choose.flip();\n  \
-                 if b1 {\n    \
-                   if b2 {\n      \
-                     if b3 { 1 } else { 2 }\n    \
-                   } else {\n      \
-                     if b3 { 3 } else { 4 }\n    \
-                   }\n  \
-                 } else {\n    \
-                   if b2 {\n      \
-                     if b3 { 5 } else { 6 }\n    \
-                   } else {\n      \
-                     if b3 { 7 } else { 8 }\n    \
-                   }\n  \
-                 }\n\
-               }\n\
-               fn run(n: Int) -> Int ![IO] {\n  \
-                 match n {\n    \
-                   0 => 0,\n    \
-                   _ => {\n      \
-                     let _: Int = handle outcome() with {\n        \
-                       Choose.flip(k) => {\n          \
-                         let f: (Bool) -> Int ![IO] = fn (x: Bool) -> Int ![IO] => k(x);\n          \
-                         let r1: Int = f(true);\n          \
-                         let r2: Int = f(false);\n          \
-                         r1 + r2\n        \
-                       },\n      \
-                     };\n      \
-                     run(n - 1)\n    \
-                   },\n  \
-                 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let _: Int = run(50);\n  \
-                 perform IO.println(int_to_string(0));\n  \
-                 0\n\
-               }\n";
-    let src_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_task_117_validation_arena_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&src_path, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_task_117_validation_arena_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let compile_out = Command::new(&sigil_bin)
-        .arg(&src_path)
-        .arg("-o")
-        .arg(&bin_path)
-        .output()
-        .expect("invoke sigil compiler");
-    let _ = std::fs::remove_file(&src_path);
-    assert!(
-        compile_out.status.success(),
-        "compile must succeed; stderr={:?}",
-        String::from_utf8_lossy(&compile_out.stderr)
-    );
-
-    let run_out = Command::new(&bin_path)
-        .env("SIGIL_PRINT_STATS", "1")
-        .output()
-        .expect("invoke compiled binary");
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        run_out.status.success(),
-        "run must succeed; stderr={:?}",
-        String::from_utf8_lossy(&run_out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&run_out.stdout);
-    let stderr = String::from_utf8_lossy(&run_out.stderr);
-    assert_eq!(stdout.as_ref(), "0\n", "sentinel stdout: stderr={stderr:?}");
-
-    // Parse SIGIL_COUNTER_ARENA_ESCAPE_COUNT from stderr.
-    let escape_line = stderr
-        .lines()
-        .find(|l| l.starts_with("SIGIL_COUNTER_ARENA_ESCAPE_COUNT="))
-        .unwrap_or_else(|| panic!("ARENA_ESCAPE_COUNT counter missing from stderr={stderr:?}"));
-    let escape_val: u64 = escape_line
-        .strip_prefix("SIGIL_COUNTER_ARENA_ESCAPE_COUNT=")
-        .unwrap()
-        .parse()
-        .expect("parse escape count");
-    let alloc_line = stderr
-        .lines()
-        .find(|l| l.starts_with("SIGIL_COUNTER_ARENA_ALLOC_COUNT="))
-        .unwrap_or_else(|| panic!("ARENA_ALLOC_COUNT counter missing from stderr={stderr:?}"));
-    let alloc_val: u64 = alloc_line
-        .strip_prefix("SIGIL_COUNTER_ARENA_ALLOC_COUNT=")
-        .unwrap()
-        .parse()
-        .expect("parse alloc count");
-
-    assert!(
-        alloc_val > 0,
-        "ARENA_ALLOC_COUNT must be > 0 (multi-shot drives arena allocation); \
-         got alloc={alloc_val}, escape={escape_val}, stderr={stderr:?}"
-    );
-    assert_eq!(
-        escape_val, 0,
-        "Task 117 validation: let-bound multi-shot must keep arena escape \
-         rate at Plan B Task 60 baseline (escape == 0). Got alloc={alloc_val}, \
-         escape={escape_val}. Non-zero escape trips Plan D HARD perf gate; \
-         eta-expansion design is dead. stderr={stderr:?}"
-    );
-}
-
 #[test]
 fn handle_with_return_arm_inside_match_arm_compiles() {
     // Plan B Task 55 (Phase 4g) review-fix #2: regression test

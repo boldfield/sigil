@@ -1,0 +1,171 @@
+// examples/sudoku.sigil
+//
+// Plan D Task 117 smoke gate. 4×4 Sudoku via binary-choose +
+// recursive backtracking. Originally Plan D specified runtime-N
+// `Choose.choose(n)` + `all_choices` discharger; that requires
+// indefinite-extent continuations (deferred to v3). Brian
+// (2026-05-01) restructured the smoke gate to binary-choose
+// (resumes: many with `branch: () -> Bool`) + recursive
+// `try_digits` helper — N=2 per choice point, statically-
+// detectable as a 2-let chain by today's Slice C arm-body
+// recognizer.
+//
+// 4×4 grid layout (digits 1..4, 2×2 subgrids):
+//
+//   1 2 | 3 4
+//   3 4 | 1 2
+//   ----+----
+//   2 1 | 4 ?
+//   4 3 | 2 1
+//
+// Cell 11 (row 2, col 3) is empty (0). The unique valid digit
+// for cell 11 is 3 (every other digit conflicts with row, col,
+// or box). The solver brute-forces digits 1..4, using binary-
+// choose to "commit this digit" (true) or "try next" (false).
+// Output is the value at cell 11 in the solved grid: "3\n".
+
+import std.option
+
+effect Branch resumes: many {
+  branch: () -> Bool,
+}
+
+fn find_empty(grid: Array[Int], i: Int) -> Option[Int] ![] {
+  match i {
+    16 => None,
+    _ => {
+      if array_get(grid, i) == 0 {
+        Some(i)
+      } else {
+        find_empty(grid, i + 1)
+      }
+    },
+  }
+}
+
+// Returns true if placing digit `d` at `target_idx` would
+// conflict with an existing cell in the same row/col/box.
+fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![] {
+  match i {
+    16 => false,
+    _ => {
+      if i == target_idx {
+        check_conflict(grid, target_idx, i + 1, d)
+      } else {
+        let row_i: Int = i / 4;
+        let row_t: Int = target_idx / 4;
+        let col_i: Int = i - row_i * 4;
+        let col_t: Int = target_idx - row_t * 4;
+        let box_i: Int = row_i / 2 * 2 + col_i / 2;
+        let box_t: Int = row_t / 2 * 2 + col_t / 2;
+        let same_row: Bool = row_i == row_t;
+        let same_col: Bool = col_i == col_t;
+        let same_box: Bool = box_i == box_t;
+        if same_row {
+          if array_get(grid, i) == d {
+            true
+          } else {
+            check_conflict(grid, target_idx, i + 1, d)
+          }
+        } else {
+          if same_col {
+            if array_get(grid, i) == d {
+              true
+            } else {
+              check_conflict(grid, target_idx, i + 1, d)
+            }
+          } else {
+            if same_box {
+              if array_get(grid, i) == d {
+                true
+              } else {
+                check_conflict(grid, target_idx, i + 1, d)
+              }
+            } else {
+              check_conflict(grid, target_idx, i + 1, d)
+            }
+          }
+        }
+      }
+    },
+  }
+}
+
+fn cell_valid(grid: Array[Int], idx: Int, d: Int) -> Bool ![] {
+  if check_conflict(grid, idx, 0, d) {
+    false
+  } else {
+    true
+  }
+}
+
+fn solve(grid: Array[Int]) -> Option[Array[Int]] ![Branch] {
+  match find_empty(grid, 0) {
+    None => Some(grid),
+    Some(idx) => try_digits(grid, idx, 1),
+  }
+}
+
+fn try_digits(grid: Array[Int], idx: Int, d: Int) -> Option[Array[Int]] ![Branch] {
+  match d {
+    5 => None,
+    _ => {
+      if cell_valid(grid, idx, d) {
+        let take: Bool = perform Branch.branch();
+        if take {
+          solve(array_set(grid, idx, d))
+        } else {
+          try_digits(grid, idx, d + 1)
+        }
+      } else {
+        try_digits(grid, idx, d + 1)
+      }
+    },
+  }
+}
+
+fn main() -> Int ![IO] {
+  // Initialize the 4×4 grid with cell 11 empty.
+  let g00: Array[Int] = array_alloc(16, 0);
+  let g01: Array[Int] = array_set(g00, 0, 1);
+  let g02: Array[Int] = array_set(g01, 1, 2);
+  let g03: Array[Int] = array_set(g02, 2, 3);
+  let g04: Array[Int] = array_set(g03, 3, 4);
+  let g05: Array[Int] = array_set(g04, 4, 3);
+  let g06: Array[Int] = array_set(g05, 5, 4);
+  let g07: Array[Int] = array_set(g06, 6, 1);
+  let g08: Array[Int] = array_set(g07, 7, 2);
+  let g09: Array[Int] = array_set(g08, 8, 2);
+  let g10: Array[Int] = array_set(g09, 9, 1);
+  let g11: Array[Int] = array_set(g10, 10, 4);
+  // cell 11 stays 0 (empty)
+  let g12: Array[Int] = array_set(g11, 12, 4);
+  let g13: Array[Int] = array_set(g12, 13, 3);
+  let g14: Array[Int] = array_set(g13, 14, 2);
+  let initial: Array[Int] = array_set(g14, 15, 1);
+
+  // Handler discharges Branch via binary-choose 2-let arm body
+  // (Slice C shape). r1 explores "commit this digit"; r2 explores
+  // "try next digit". match-on-r1 returns the first non-None.
+  let solved: Option[Array[Int]] = handle solve(initial) with {
+    Branch.branch(k) => {
+      let r1: Option[Array[Int]] = k(true);
+      let r2: Option[Array[Int]] = k(false);
+      match r1 {
+        Some(s) => Some(s),
+        None => r2,
+      }
+    },
+  };
+
+  match solved {
+    Some(grid) => {
+      perform IO.println(int_to_string(array_get(grid, 11)));
+      0
+    },
+    None => {
+      perform IO.println("no solution");
+      1
+    },
+  }
+}
