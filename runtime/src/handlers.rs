@@ -88,7 +88,7 @@
 //! HandlerFrame allocation and are scanned conservatively along with
 //! the rest of the block.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::ptr;
 
@@ -236,6 +236,52 @@ thread_local! {
     /// require either rooting this TLS or moving the value into a
     /// stack slot at consumption time.
     static LAST_TERMINAL_VALUE: Cell<u64> = const { Cell::new(0) };
+
+    /// Plan D Task 117 — push/pop relink discipline tracker.
+    ///
+    /// Each entry is `(frame_ptr, did_link)`: the frame whose
+    /// push/pop pair this entry tracks, plus whether the push
+    /// actually linked the frame (`true`) or skipped (`false`; the
+    /// frame was already on top of the handler stack — the
+    /// "skip-if-on-top" case introduced by Task 117's let-bound k
+    /// dispatch path). The matching `sigil_handle_pop` reads the
+    /// most recent entry, debug-asserts `entry.0 == HANDLER_STACK
+    /// head` (defense-in-depth against codegen bugs that desync
+    /// push/pop pairs across frames), then no-ops the unlink when
+    /// `did_link == false`.
+    ///
+    /// Why frame-keyed (Plan D Task 117 review feedback): a bool-
+    /// only counter caught COUNT-balanced unbalanced pairs (push X
+    /// 2× / pop X 2× across two different frames) silently. Frame-
+    /// keyed entries fail the debug_assert at the actual desync
+    /// site rather than three handler levels later.
+    ///
+    /// Why a per-thread stack: lower_k_pair_call's push/pop pair
+    /// is re-entrant — `run_loop` between push and pop drives
+    /// arbitrary handler-stack activity (nested handles in the
+    /// body's continuation), each of which push/pops RELINK_STACK
+    /// in their own scope. By the time lower_k_pair_call's pop
+    /// runs, intermediate entries have been balanced and the top
+    /// of the stack is the matching push's entry.
+    ///
+    /// Initial state: empty. Pop on empty hard-`panic!`s in both
+    /// debug and release builds — see the comment at
+    /// `sigil_handle_pop`'s `unwrap_or_else` callsite for why this
+    /// is the right tradeoff.
+    ///
+    /// **GC reasoning**: The Vec buffer holds raw `*mut
+    /// HandlerFrame` pointers. The buffer itself is on Rust's
+    /// global allocator (not Boehm's heap), so its contents are
+    /// NOT conservatively scanned — frames are kept alive only via
+    /// HANDLER_STACK's registered GC root (see
+    /// `register_handler_stack_root_for_calling_thread`). This is
+    /// sound by invariant: every frame in RELINK_STACK is also
+    /// reachable from HANDLER_STACK because push/pop pairs balance
+    /// in lockstep across both stacks. A balance violation would
+    /// trip the `unwrap_or_else` panic or the debug_assert at the
+    /// pop site before the GC could observe the desync.
+    static RELINK_STACK: RefCell<Vec<(*mut HandlerFrame, bool)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Register the calling thread's `HANDLER_STACK` TLS cell as a Boehm
@@ -648,19 +694,35 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
         eprintln!("sigil_handle_push: null frame");
         std::process::abort();
     }
-    // Defensive against codegen bugs that double-push the same frame:
-    // a non-null `prev` at push time would silently overwrite the prior
-    // chain link. The check is debug-only because a release build on a
-    // verified codegen never trips it; if it ever does, the panic
-    // localises the bug to the push site rather than a later traversal.
-    debug_assert!(
-        (*frame).prev.is_null(),
-        "sigil_handle_push: frame already linked (double-push?)"
-    );
     HANDLER_STACK.with(|cell| {
         let head = cell.get();
+        // Plan D Task 117 — skip-if-on-top. When `lower_k_pair_call`
+        // dispatches a let-bound k from inside the originating handle's
+        // arm body, the captured `frame_ptr` IS the current head; the
+        // re-link push would trip the "frame already linked" panic
+        // (`frame.prev` is non-null because the outer handle linked
+        // it). Detect this and no-op the link, recording the
+        // skip-decision into RELINK_STACK so the matching pop is
+        // also a no-op.
+        if head == frame {
+            RELINK_STACK.with(|s| s.borrow_mut().push((frame, false)));
+            return;
+        }
+        // Defensive against codegen bugs that double-push the same
+        // frame from a NON-head position: a non-null `prev` at push
+        // time would silently overwrite the prior chain link. The
+        // check is debug-only because a release build on a verified
+        // codegen never trips it; if it ever does, the panic
+        // localises the bug to the push site rather than a later
+        // traversal. Skip-if-on-top above already handles the
+        // legitimate re-push-of-head case.
+        debug_assert!(
+            (*frame).prev.is_null(),
+            "sigil_handle_push: frame already linked but not at head (double-push from below?)"
+        );
         (*frame).prev = head;
         cell.set(frame);
+        RELINK_STACK.with(|s| s.borrow_mut().push((frame, true)));
     });
 }
 
@@ -684,19 +746,72 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
 /// chain — keeps it reachable).
 #[no_mangle]
 pub unsafe extern "C" fn sigil_handle_pop() -> *mut HandlerFrame {
+    // Plan D Task 117 — read the matching push's relink-decision
+    // off RELINK_STACK. If the push was a no-op (frame was already
+    // on top), the matching pop must also no-op. There are no
+    // current bypass callers — every push/pop site goes through
+    // `sigil_handle_push` / `sigil_handle_pop` — so an empty stack
+    // at pop time means the stacks have desynced (codegen-emitted
+    // pop without a matching push, panic unwind across a push, or
+    // a future control-flow primitive intercepting pop). With
+    // HANDLER_STACK non-empty (the underflow check below passes)
+    // but RELINK_STACK empty, a default-`true` would silently
+    // unlink a real frame with no record of why — exactly the
+    // corruption the design wants to prevent. Hard-panic in both
+    // debug and release builds so a desync surfaces where it
+    // happens, not three handler levels later.
+    let (recorded_frame, did_link) = RELINK_STACK.with(|s| match s.borrow_mut().pop() {
+        Some(entry) => entry,
+        None => {
+            eprintln!(
+                "sigil_handle_pop: RELINK_STACK underflow — every pop must follow a \
+                 matching push from sigil_handle_push. A pop without a matching push \
+                 indicates a codegen-emitted unbalanced pair, an unwind across a push, \
+                 or a missing RELINK_STACK update from a control-flow primitive. \
+                 Default-passthrough would silently unlink a real frame; aborting \
+                 surfaces the desync at the actual unbalance."
+            );
+            std::process::abort();
+        }
+    });
     HANDLER_STACK.with(|cell| {
         let head = cell.get();
         if head.is_null() {
             eprintln!("sigil_handle_pop: handler stack underflow");
             std::process::abort();
         }
+        // Plan D Task 117 — frame-keyed RELINK_STACK pairing
+        // assert. Pop time HEAD must equal the push-time recorded
+        // frame: invariant for both did_link branches (link case
+        // pushed frame and set HEAD=frame; skip case left HEAD
+        // alone but recorded frame == HEAD). A mismatch means
+        // intermediate push/pop pairs targeted different frames
+        // (a desync on the order of "pop X is matching pop Y" —
+        // bool-only counter would silently let count-balanced
+        // desyncs through). Debug-only; the production-codegen
+        // contract is balanced pairs, so a release build on
+        // verified codegen never trips this.
+        debug_assert_eq!(
+            recorded_frame, head,
+            "sigil_handle_pop: RELINK_STACK frame mismatch — push-time frame {:p} != \
+             pop-time HANDLER_STACK head {:p}. Push/pop pair desync; check codegen for \
+             unbalanced pairs across nested handles.",
+            recorded_frame, head
+        );
+        if !did_link {
+            // Skip-if-on-top counterpart: matching push was a no-op,
+            // so pop is too. Return the current head unchanged
+            // (codegen may use the return value as a sentinel; the
+            // existing contract is "popped frame ptr").
+            return head;
+        }
         // SAFETY: head is non-null per the underflow check; reading
         // `prev` against the documented HandlerFrame layout is sound.
         let prev = (*head).prev;
         // Clear the popped frame's `prev` link so a subsequent push of
         // the same frame (legitimate use case: re-entering a `handle`
-        // in a loop) doesn't trip the no-double-push debug_assert at
-        // `sigil_handle_push`.
+        // in a loop) doesn't trip the not-at-head double-push assert
+        // at `sigil_handle_push`.
         (*head).prev = ptr::null_mut();
         cell.set(prev);
         head

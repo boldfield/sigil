@@ -77,6 +77,82 @@ pub enum Ty {
     /// at `16 + 8*i` after the discriminant). The GC pointer bitmap
     /// reflects per-slot pointer-ness.
     Tuple(Vec<Ty>),
+    /// Plan D Task 117 — first-class continuation type. Allocated
+    /// per-handle at typecheck (one fresh `ScopeId::Concrete(N)` per
+    /// `handle ... with` expression's pre-pass entry). The arm's
+    /// continuation binding `k` gets type
+    /// `Continuation { op_ret, ret, scope_id }` where `op_ret` is
+    /// the op's return type (the value `k` accepts) and `ret` is
+    /// the handler's overall result type (the value `k(arg)`
+    /// evaluates to).
+    ///
+    /// **Distinct from `Ty::Fn`** even though `k(arg)` reduces to a
+    /// fn-call shape at the surface — the typechecker enforces a
+    /// dynamic-extent escape barrier (E0145) on `Continuation`-typed
+    /// values that doesn't apply to `Fn`-typed values, and the
+    /// codegen routes `Continuation` calls through the
+    /// `lower_k_pair_call` trampoline emission instead of standard
+    /// closure-convention dispatch.
+    ///
+    /// **Why not user-surface**: there's no surface syntax that
+    /// produces a `Ty::Continuation`. The only way for a value to
+    /// have this type is via the typechecker's `check_handle` arm-
+    /// processing, which binds `k` with a fresh `Continuation`. User
+    /// code can `let f = k` to alias `k` (f inherits the
+    /// Continuation type) but cannot write a Continuation type
+    /// annotation. Consequently `ty_from_type_expr` has no
+    /// Continuation arm; user `(A) -> B ![]` annotations always
+    /// produce `Ty::Fn`.
+    ///
+    /// **Why not Box-the-fields**: `Continuation` is rare (only at
+    /// arm-binding sites and let-bindings of those). Boxing the
+    /// payload to keep `Ty` register-sized is the standard idiom
+    /// here (mirrors `Ty::Fn`).
+    Continuation(Box<ContinuationTy>),
+}
+
+/// Plan D Task 117 — payload of `Ty::Continuation`. Boxed inside
+/// `Ty::Continuation` to keep the parent `Ty` discriminant + payload
+/// register-sized (mirrors `Ty::Fn(Box<FnSig>)` precedent).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContinuationTy {
+    /// The op's return type. `k(arg)` requires `arg`'s type to unify
+    /// with this.
+    pub op_ret: Ty,
+    /// The handler's overall result type. `k(arg)` evaluates to this.
+    pub ret: Ty,
+    /// Identifier of the originating handle. Allocated per-handle at
+    /// typecheck. Concrete IDs are assigned by the handle pre-pass;
+    /// region-polymorphic fns introduce `Var` IDs that unify against
+    /// surrounding handle IDs at call sites (mirroring row-var
+    /// substitution from Plan B Stage 5).
+    pub scope_id: ScopeId,
+}
+
+/// Plan D Task 117 — handle scope identifier. Acts as a region tag
+/// distinguishing different `handle` expressions' continuation types
+/// at the type level. Two `Ty::Continuation` values unify only if
+/// their `scope_id`s unify (concrete IDs must be equal; vars bind
+/// to concretes or each other).
+///
+/// Reuses Plan B Stage 5 row-var infrastructure idiom: `Concrete`
+/// is the resolved-pin form (one per handle expression), `Var` is
+/// the unification-variable form (used in region-polymorphic fn
+/// schemes; bound to a concrete at instantiation time).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScopeId {
+    /// Concrete handle scope. The `u32` is allocated per-handle by
+    /// `Tc::fresh_scope_id`; each `handle` expression's pre-pass
+    /// gets a fresh ID. Equal-vs-equal unifies; not-equal-vs-not-
+    /// equal fires E0145 ("continuations from different handles
+    /// cannot unify").
+    Concrete(u32),
+    /// Region-polymorphic scope variable. Allocated per-fn at
+    /// scheme-instantiation time. Unifies via
+    /// `Subst::bind_scope_var` (parallel to `bind_row_var` from
+    /// Plan B Stage 5). Every reachable `Var` must be resolved by
+    /// inference end (codegen-entry guard rejects survivors).
+    Var(u32),
 }
 
 /// Structural function signature. Used in `Ty::Fn` and built for
@@ -356,6 +432,29 @@ impl Subst {
                 };
                 let resolved = self.apply_row_to_sig(new_sig, seen);
                 Ty::Fn(Box::new(resolved))
+            }
+            Ty::Continuation(c) => {
+                // Plan D Task 117 (a) — only Concrete scope ids
+                // exist today (`check_handle` is the sole producer
+                // and always allocates Concrete). Pass through
+                // unchanged. ScopeId substitution will land
+                // alongside scope-var unification (Task 117
+                // follow-up); assert here so the integration point
+                // surfaces loudly when Var producers are wired.
+                let scope_id = match &c.scope_id {
+                    ScopeId::Concrete(n) => ScopeId::Concrete(*n),
+                    ScopeId::Var(_) => unreachable!(
+                        "apply_ty_inner: ScopeId::Var reached substitution — Task 117 (a) \
+                         produces only Concrete scope ids; region-polymorphic schemes are \
+                         deferred to Task 117 follow-up which must wire Subst-of-ScopeId \
+                         before allocating Var"
+                    ),
+                };
+                Ty::Continuation(Box::new(ContinuationTy {
+                    op_ret: self.apply_ty_inner(&c.op_ret, seen),
+                    ret: self.apply_ty_inner(&c.ret, seen),
+                    scope_id,
+                }))
             }
         }
     }
@@ -929,6 +1028,7 @@ pub fn typecheck(program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         fn_schemes: BTreeMap::new(),
         next_ty_var: 0,
         next_row_var: 0,
+        next_scope_id: 0,
         subst: Subst::new(),
         current_generic_subst: BTreeMap::new(),
         current_row_var_subst: BTreeMap::new(),
@@ -2009,7 +2109,7 @@ struct Tc {
     /// Plan B task 48 — Hindley-Milner unification machinery.
     ///
     /// Schemes for top-level functions: a generic fn declaration
-    /// (`fn id[A](x: A) -> A { x }`) registers `(["A"], [], (Var(N))
+    /// (`fn id[A](x: A) -> A ![] { x }`) registers `(["A"], [], (Var(N))
     /// -> Var(N))` so every call site can instantiate fresh vars.
     /// Builtins and non-generic user fns store schemes with empty
     /// `type_vars` and `row_vars`. Lookup at call sites: `fn_schemes`
@@ -2027,6 +2127,11 @@ struct Tc {
     /// for explicit `![ ... | e]` row variables and for fresh-row
     /// holes opened during HM inference.
     next_row_var: u32,
+    /// Plan D Task 117 — handle-scope id supply. One fresh
+    /// `ScopeId::Concrete(N)` per `Expr::Handle` at typecheck. Used
+    /// to tag the `Ty::Continuation` bound to each arm's `k` so
+    /// continuations from different handles can't unify (E0145).
+    next_scope_id: u32,
     /// Substitution accumulated by unification. Resolves type-vars
     /// via `Subst::apply_ty` and row-vars via `Subst::apply_row`.
     /// Updated in-place by `unify_ty` / `unify_row`; queried whenever
@@ -2162,6 +2267,28 @@ impl Tc {
     fn fresh_row_var(&mut self) -> u32 {
         let id = self.next_row_var;
         self.next_row_var += 1;
+        id
+    }
+
+    /// Plan D Task 117 — allocate a fresh handle-scope id. Each
+    /// `Expr::Handle` calls this once at the top of `check_handle`;
+    /// the resulting `ScopeId::Concrete(N)` tags every
+    /// `Ty::Continuation` produced for that handle's arm `k`
+    /// bindings, so unification of continuations from different
+    /// handles fires E0145.
+    fn fresh_scope_id(&mut self) -> u32 {
+        // Mirrors the implicit overflow-discipline of
+        // `fresh_ty_var` / `fresh_row_var`: u32 wraparound at
+        // 4 billion handles is not a realistic v1 limit, but trip
+        // the assert if it ever happens in test rather than
+        // silently re-using ids.
+        debug_assert!(
+            self.next_scope_id != u32::MAX,
+            "Tc::fresh_scope_id: u32 overflow — 4 billion handles allocated in one \
+             typecheck pass is implausible; check for a leaked allocator loop"
+        );
+        let id = self.next_scope_id;
+        self.next_scope_id += 1;
         id
     }
 
@@ -2332,6 +2459,29 @@ impl Tc {
                 };
                 Ty::Fn(Box::new(new_sig))
             }
+            Ty::Continuation(c) => {
+                // Plan D Task 117 (a) — only Concrete scope ids
+                // exist today (`check_handle` allocates them; no
+                // scheme stores a Var ScopeId). Pass Concrete
+                // through unchanged. Var would require region-
+                // polymorphism wiring (Task 117 follow-up) — assert
+                // here so the integration point surfaces loudly
+                // when scheme-bearing Var ScopeIds are introduced.
+                let scope_id = match &c.scope_id {
+                    ScopeId::Concrete(n) => ScopeId::Concrete(*n),
+                    ScopeId::Var(_) => unreachable!(
+                        "rename_ty: ScopeId::Var reached scheme renaming — Task 117 (a) \
+                         produces only Concrete scope ids; region-polymorphic continuation \
+                         schemes are deferred to Task 117 follow-up which must wire ScopeId \
+                         renaming before allocating Var"
+                    ),
+                };
+                Ty::Continuation(Box::new(ContinuationTy {
+                    op_ret: Self::rename_ty(&c.op_ret, ty_map, row_map),
+                    ret: Self::rename_ty(&c.ret, ty_map, row_map),
+                    scope_id,
+                }))
+            }
         }
     }
 
@@ -2348,6 +2498,9 @@ impl Tc {
             Ty::Fn(sig) => {
                 sig.params.iter().any(|p| self.occurs_in_ty(id, p))
                     || self.occurs_in_ty(id, &sig.ret)
+            }
+            Ty::Continuation(c) => {
+                self.occurs_in_ty(id, &c.op_ret) || self.occurs_in_ty(id, &c.ret)
             }
         }
     }
@@ -2550,6 +2703,84 @@ impl Tc {
                     ok = false;
                 }
                 ok
+            }
+            // Plan D Task 117 — continuation unification. Two
+            // `Ty::Continuation` values unify only if their scope_ids
+            // match (concrete-vs-concrete must be equal; vars bind to
+            // concretes or each other) AND their op_ret + ret
+            // structurally unify. Different concrete scope_ids fire
+            // E0145 ("continuations from different handles cannot
+            // unify") rather than the generic E0044 — the user
+            // doesn't think of these as type mismatches but as
+            // escape-barrier violations.
+            (Ty::Continuation(c_a), Ty::Continuation(c_b)) => {
+                let scope_ok = match (&c_a.scope_id, &c_b.scope_id) {
+                    (ScopeId::Concrete(n), ScopeId::Concrete(m)) => {
+                        if n == m {
+                            true
+                        } else {
+                            self.push_error(
+                                "E0145",
+                                span.clone(),
+                                format!(
+                                    "continuation from handle scope {n} cannot unify with \
+                                     continuation from handle scope {m} — `k` cannot escape \
+                                     its originating handle's arm body"
+                                ),
+                            );
+                            false
+                        }
+                    }
+                    // Plan D Task 117 (a) only produces Concrete
+                    // scope ids (`check_handle` calls
+                    // `Tc::fresh_scope_id()` which always returns
+                    // Concrete; no scheme-instantiation path or
+                    // surface syntax allocates Var). Reaching this
+                    // arm means a Var leaked into typecheck without
+                    // wiring the unification — assert to surface
+                    // the integration point loudly when region-
+                    // polymorphism work begins (Task 117 follow-up).
+                    (ScopeId::Var(_), _) | (_, ScopeId::Var(_)) => unreachable!(
+                        "ScopeId::Var reached unify_ty — Task 117 (a) produces only Concrete \
+                         scope ids; region-polymorphic continuation schemes are deferred to \
+                         Task 117 follow-up which must wire ScopeId unification before \
+                         allocating Var"
+                    ),
+                };
+                let op_ret_ok = self.unify_ty(&c_a.op_ret, &c_b.op_ret, span);
+                let ret_ok = self.unify_ty(&c_a.ret, &c_b.ret, span);
+                scope_ok && op_ret_ok && ret_ok
+            }
+            // Plan D Task 117 — escape barrier. A `Ty::Continuation`
+            // unified against any non-Continuation, non-Var type is
+            // an escape attempt: the continuation `k` would be
+            // stored in (record field / ctor field / fn param / fn
+            // return) something that isn't a continuation. Fire
+            // E0145 with a uniform fix message rather than the
+            // generic E0044 ("type mismatch"). Var-vs-Continuation
+            // is handled higher up by the (Var, other) arm via
+            // bind_ty_var — an unbound type var legitimately binds
+            // to Continuation (e.g. `let f = k` infers `f`'s var to
+            // Continuation); the escape only manifests when that
+            // bound var later unifies against a non-Continuation
+            // target, which re-enters this arm with both sides
+            // resolved.
+            (Ty::Continuation(_), _) | (_, Ty::Continuation(_)) => {
+                self.push_error(
+                    "E0145",
+                    span.clone(),
+                    format!(
+                        "continuation `k` cannot escape its handle's arm body — tried to \
+                         use a value of type `{}` where `{}` was expected. Keep `k` inside \
+                         the handle's arm body (do not store it in a record/ctor field, \
+                         pass it to a function expecting a non-continuation parameter, or \
+                         return it from a function whose declared return type is not a \
+                         continuation)",
+                        ty_display(&a),
+                        ty_display(&b)
+                    ),
+                );
+                false
             }
             _ => {
                 self.push_error(
@@ -4134,6 +4365,27 @@ impl Tc {
 
         let sig = match callee_ty {
             Some(Ty::Fn(sig)) => sig,
+            // Plan D Task 117 — calling a `Ty::Continuation` value
+            // (i.e. an arm-bound `k` or a let-bound alias of one).
+            // Synthesize a single-param FnSig from the continuation's
+            // `op_ret` / `ret` so the rest of `check_call` (arity,
+            // arg-type unify, ret deref) runs unchanged.
+            //
+            // Dynamic-extent enforcement is via E0145 only (broad
+            // arm in unify_ty + bind_ty_var bypass closure below);
+            // the synthetic `effects` / `effect_row_var` fields
+            // exist solely for FnSig shape compatibility with
+            // `subsume_row`. By constructing them with the call-
+            // site row, the row check is structurally trivial — a
+            // future reader removing the row fields wouldn't break
+            // any safety contract, only the FnSig shape requirement
+            // for `subsume_row`'s argument.
+            Some(Ty::Continuation(c)) => Box::new(FnSig {
+                params: vec![c.op_ret.clone()],
+                ret: c.ret.clone(),
+                effects: row.to_vec(),
+                effect_row_var: self.lookup_active_row_var(),
+            }),
             Some(other) => {
                 self.push_error(
                     "E0068",
@@ -4164,11 +4416,49 @@ impl Tc {
         // (3) arg types — Plan B task 48 routes through HM
         // unification so generic-fn instantiations resolve their
         // freshly-allocated vars against concrete arg types.
+        //
+        // Plan D Task 117 — bind_ty_var bypass closure (review #3 at
+        // HEAD `decb6d8`). Before unify_ty would silently bind a
+        // freshly-instantiated generic var to `Ty::Continuation`, fire
+        // E0145 explicitly. Without this gate, `id(k)` for generic
+        // `fn id[A](x: A) -> A` propagates Continuation through the
+        // (Var, other) bind_ty_var arm (the same arm `let f = k` uses
+        // legitimately for local aliasing). Downstream USES are caught
+        // by the broad arm in unify_ty, but the COMPILE PATH —
+        // monomorphize cloning `id$$Continuation` and walking its body
+        // via `rewrite_type_expr` → `ty_to_type_expr(Continuation)` —
+        // panics with `unreachable!()` because Continuation has no
+        // surface TypeExpr representation. Catching at the bind site
+        // closes the panic surface AND surfaces a precise diagnostic.
+        //
+        // Discriminator vs `let f = k`: this gate fires only at the
+        // call-site arg-unify against an instantiated generic param's
+        // Var. The let-RHS path goes through the let-binding's own
+        // unify (against a fresh let-var allocated outside check_call),
+        // not through this loop, so let-aliasing stays untouched.
         for (i, (arg_ty, param_ty)) in arg_tys.iter().zip(sig.params.iter()).enumerate() {
             if let Some(at) = arg_ty {
                 let arg_span = args.get(i).map(Expr::span).unwrap_or_else(|| span.clone());
+                let resolved_at = self.deref(at);
+                let resolved_param = self.deref(param_ty);
+                if matches!(resolved_at, Ty::Continuation(_))
+                    && matches!(resolved_param, Ty::Var(_))
+                {
+                    self.push_error(
+                        "E0145",
+                        arg_span.clone(),
+                        "continuation `k` cannot escape its handle's arm body — \
+                         passing `k` to a generic-typed parameter would propagate \
+                         Continuation through the generic instantiation, escaping \
+                         the arm body's dynamic extent. Keep `k` inside the \
+                         handle's arm body (do not pass it to a function whose \
+                         parameter type is a generic type variable)"
+                            .to_string(),
+                    );
+                    continue;
+                }
                 if !self.unify_ty(param_ty, at, &arg_span) {
-                    // unify_ty pushed the precise E0044; nothing
+                    // unify_ty pushed the precise E0044 / E0145; nothing
                     // more to add here.
                 }
             }
@@ -4427,6 +4717,13 @@ impl Tc {
         // `handle_arm_captures` side-table populated below.
         handle_span: &Span,
     ) -> Option<Ty> {
+        // Plan D Task 117 — allocate the handle's scope id once at
+        // entry. Tags every `Ty::Continuation` bound for this
+        // handle's arm `k` names, so unifying a `k` from this handle
+        // with a `k` from a different handle fires E0145 (escape
+        // barrier).
+        let handle_scope_id = self.fresh_scope_id();
+
         // ---------- Phase 1: dispatch table ----------
         // Per-arm collected info that the arm walk consumes. Done
         // outside the arm loop so we see the full picture before
@@ -4897,20 +5194,27 @@ impl Tc {
                     .unwrap_or(Ty::Unit);
                 self.env.insert(p.name.clone(), pty);
             }
-            // Continuation `k`: typed as `Fn(op_ret_ty) ->
-            // handler_overall ![caller_row]`. Effect row is the
-            // caller's row literally — `k` runs the remainder of the
-            // surrounding fn's computation, so it sees that fn's
-            // effects. When op_ret_ty couldn't be resolved (E0138 /
-            // E0139 path), default to Ty::Unit; the binding still
-            // lets references to `k` inside the arm body resolve
-            // without firing spurious E0046.
+            // Continuation `k`: Plan D Task 117 — typed as
+            // `Ty::Continuation { op_ret, ret: handler_overall,
+            // scope_id }` rather than `Ty::Fn(...)`. The
+            // Continuation type carries no effect row: `k` resumes
+            // the surrounding fn's computation in place, so its
+            // effects are exactly the caller's row by construction;
+            // call sites that read `k`'s type fabricate the row at
+            // use time. The fresh `handle_scope_id` (allocated at
+            // the top of `check_handle`) tags the binding so
+            // unifying a `k` from this handle with a `k` from a
+            // different handle fires E0145.
+            //
+            // When op_ret_ty couldn't be resolved (E0138 / E0139
+            // path), default to Ty::Unit; the binding still lets
+            // references to `k` inside the arm body resolve without
+            // firing spurious E0046.
             let k_param_ty = typing.op_ret_ty.clone().unwrap_or(Ty::Unit);
-            let k_ty = Ty::Fn(Box::new(FnSig {
-                params: vec![k_param_ty],
+            let k_ty = Ty::Continuation(Box::new(ContinuationTy {
+                op_ret: k_param_ty,
                 ret: handler_overall.clone(),
-                effects: row.to_vec(),
-                effect_row_var: self.lookup_active_row_var(),
+                scope_id: ScopeId::Concrete(handle_scope_id),
             }));
             self.env.insert(arm.k_name.clone(), k_ty);
             // Arm body runs at caller's row (the discharged effect is
@@ -5341,6 +5645,18 @@ impl Tc {
                 }
                 None
             }
+            // Plan D Task 117 — Continuation scrutinees have no
+            // user-constructible value form (no surface syntax
+            // produces a Continuation literal); user code can only
+            // bind `k` and pass it through let-aliases. A `match k`
+            // expression has no destructuring rules and the only
+            // pattern shape that would typecheck is `Pattern::Var`
+            // (catchall, handled at the top of this fn). Any
+            // structured pattern would have failed typecheck E0066
+            // upstream. Return None (treat as exhaustive once a
+            // catchall is present; otherwise the caller surfaces
+            // the empty-witness case).
+            Ty::Continuation(_) => None,
         }
     }
 
@@ -6009,6 +6325,21 @@ fn ty_display(t: &Ty) -> String {
             format!("({})", parts.join(", "))
         }
         Ty::Var(id) => format!("?{id}"),
+        // Plan D Task 117 — render `Continuation` for diagnostics.
+        // No user-source surface produces this type. The scope_id
+        // is intentionally NOT rendered here: users have no mental
+        // model for "scope N" and can't remediate by writing the
+        // type they should have written. E0145 messages where the
+        // scope_id is load-bearing (cross-handle escape) include
+        // the numbers explicitly. Other diagnostics surface this
+        // type as just `Continuation(op_ret) -> ret`.
+        Ty::Continuation(c) => {
+            format!(
+                "Continuation({}) -> {}",
+                ty_display(&c.op_ret),
+                ty_display(&c.ret)
+            )
+        }
     }
 }
 
@@ -6442,6 +6773,13 @@ fn is_exhaustive(scrut: &Ty, arms: &[MatchArm]) -> bool {
         // here returns false; Maranget's algorithm in
         // `match_witness` does the actual coverage analysis.
         Ty::Tuple(_) => false,
+        // Plan D Task 117 — Continuation scrutinees can't reach
+        // shape-based exhaustiveness either. The user can't
+        // construct a Continuation value in user surface, but the
+        // typechecker may still produce one as a let-binding's
+        // inferred type; if that's matched-on, only a wildcard
+        // saturates.
+        Ty::Continuation(_) => false,
         // Plan B task 48: still-polymorphic scrutinees can't reach
         // shape-based exhaustiveness; defer the diagnostic to the
         // upstream unification site that left the variable free.
@@ -7976,7 +8314,7 @@ mod tests {
 
     #[test]
     fn generic_id_function_typechecks() {
-        // `fn id[A](x: A) -> A { x }` is the simplest Algorithm-W
+        // `fn id[A](x: A) -> A ![] { x }` is the simplest Algorithm-W
         // exercise: A is a fresh type-variable, body returns A, so
         // the inferred sig is (A) -> A and no unification fails.
         let src = "fn id[A](x: A) -> A ![] { x }\n\
@@ -9110,6 +9448,7 @@ mod tests {
             fn_schemes: BTreeMap::new(),
             next_ty_var: 0,
             next_row_var: 0,
+            next_scope_id: 0,
             subst: Subst::new(),
             current_generic_subst: BTreeMap::new(),
             current_row_var_subst: BTreeMap::new(),
@@ -10441,11 +10780,14 @@ mod tests {
 
     #[test]
     fn handle_arm_k_call_with_wrong_arg_is_e0044() {
-        // `k`'s type is `Fn(op_ret_ty) -> handler_overall ![caller_row]`.
-        // For `Raise.fail: (String) -> Int`, op_ret_ty is Int. Calling
-        // k with a String argument fires E0044 via the call-site arg
-        // check, locking down the binding-type contract at the arm's
-        // env-extension site.
+        // `k`'s type is `Continuation(op_ret_ty) -> handler_overall`
+        // post-Task-117. For `Raise.fail: (String) -> Int`, op_ret is
+        // Int (the op's return). Calling k with a String fires E0044
+        // via check_call's Continuation arm (synthesizes a single-param
+        // FnSig from op_ret/ret and unifies arg against op_ret). Both
+        // sides of the failing unify are non-Continuation primitives,
+        // so the E0145 broad arm doesn't kick in — generic E0044
+        // ("type mismatch") is the right diagnostic.
         let src = "effect Raise { fail: (String) -> Int }\n\
                    fn main() -> Int ![] {\n\
                      handle 0 with {\n\
@@ -10455,8 +10797,232 @@ mod tests {
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
-            "k call with wrong arg type must E0044 (k has Fn(op_ret_ty) -> handler_overall): {errs:?}"
+            "k call with wrong arg type must E0044 (Continuation's op_ret unifies arg \
+             against the op's return type, both non-Continuation): {errs:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Plan D Task 117 — E0145 escape barrier (PR #60 substrate tests)
+    // ----------------------------------------------------------------
+    //
+    // These tests pin the E0145 broad-arm in `unify_ty` (added in
+    // PR #60 fix `503308d`), the cross-handle scope_id mismatch arm
+    // (added in `a3de60f`), and the `ty_display` scope-omission fix
+    // (added in `6c6fb41`).
+    //
+    // Positive shapes (`let f = k; f(arg)` single-shot + multi-shot)
+    // are out of scope here — they need the codegen-walker delta +
+    // closure_convert + codegen let-bound k dispatch, which ship in
+    // a follow-up PR. Lambda-capture-of-k → E0145 is also out of
+    // scope; today the linearity check fires E0220 for one-shot and
+    // multi-shot bypasses linearity (the existing
+    // `linearity_lambda_capturing_k_is_e0220` test pins one-shot
+    // E0220; lambda-capture-k inheritance with E0145 ships in PR (b)
+    // per `[DEVIATION Task 117]`).
+
+    #[test]
+    fn k_returned_from_fn_with_non_continuation_ret_fires_e0145() {
+        // `fn ret_k() -> Int` whose body's value is `k`. Arm body's
+        // type is `Continuation(op_ret) -> handler_overall`.
+        // handler_overall var binds to Continuation via the arm-body
+        // unify. The handle's overall type is Continuation. The fn
+        // body's type is Continuation. `check_fn` unifies the fn's
+        // declared return type (Int) against the body type:
+        // `unify_ty(Int, Continuation)` → E0145 broad arm fires
+        // ("continuation `k` cannot escape its handle's arm body").
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn ret_k() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => k,\n\
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![Raise] { ret_k() }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "returning `k` from a fn whose declared ret type is non-Continuation must \
+             fire E0145 (escape barrier): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn k_passed_as_fn_arg_of_non_continuation_param_fires_e0145() {
+        // `fn take_fn(f: (Int) -> Int ![]) -> Int ![]`. Calling
+        // `take_fn(k)` from inside a handler arm: check_call's
+        // arg-unify pass walks `unify_ty(Fn(Int) -> Int, Continuation)`
+        // → E0145 broad arm fires. The Fn-vs-Continuation unify fails
+        // structurally (different type ctors), but the broad arm
+        // catches it before the generic E0044 catchall.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn take_fn(f: (Int) -> Int ![]) -> Int ![] { f(0) }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => take_fn(k),\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "passing `k` as a fn-arg of non-Continuation declared type must fire E0145 \
+             (escape barrier): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn k_stored_in_user_type_field_fires_e0145() {
+        // ctor-construction site for a non-generic user type whose
+        // field has a Fn-typed declared TypeExpr. Storing `k` at that
+        // field unifies `Fn(Int) -> Int` against `Continuation(Int) ->
+        // handler_overall` → E0145 broad arm. Distinct from the
+        // generic-instantiation case (`Wrap[A]` with `Wrap(k)`): a
+        // generic field would resolve A → Continuation via the
+        // (Var, other) bind_ty_var arm and bypass E0145 here; that
+        // bypass is the bind_ty_var precision fix deferred to PR (b)
+        // ("complete the E0145 escape barrier") per the DEVIATIONS
+        // entry.
+        let src = "type WrapFn = | WrapFn((Int) -> Int ![])\n\
+                   effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let _: WrapFn = WrapFn(k);\n\
+                         0\n\
+                       },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "storing `k` in a user-type field whose declared type is Fn (not generic) \
+             must fire E0145: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn cross_handle_k_unification_fires_e0145_with_scope_mismatch() {
+        // Two nested `handle` expressions, both discharging `E1`.
+        // Inner handle has two arms; arm 1's body returns the OUTER
+        // handle's `k1` (a Continuation tagged with the outer
+        // handle's scope_id), arm 2's body returns the INNER handle's
+        // `ki2` (tagged with the inner handle's scope_id). Cross-arm
+        // unification of the two arm bodies' types into the inner
+        // handle's `handler_overall` var produces a
+        // `(Ty::Continuation, Ty::Continuation)` unify with mismatched
+        // Concrete scope_ids — fires the specific cross-handle E0145
+        // arm (`scope {n} cannot unify with scope {m}`).
+        let src = "effect E1 { op1: () -> Int, op2: () -> Int }\n\
+                   fn main() -> Int ![] {\n\
+                     handle 0 with {\n\
+                       E1.op1(k1) =>\n\
+                         handle 0 with {\n\
+                           E1.op1(ki1) => k1,\n\
+                           E1.op2(ki2) => ki2,\n\
+                         },\n\
+                       E1.op2(k2) => 0,\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "cross-handle k unification with mismatched scope_ids must fire E0145: \
+             {errs:?}"
+        );
+    }
+
+    #[test]
+    fn k_passed_to_generic_fn_param_fires_e0145() {
+        // PR #60 review #3 (HEAD `decb6d8`) high-severity blocker:
+        // close the bind_ty_var bypass. `id(k)` for generic
+        // `fn id[A](x: A) -> A` instantiates A := fresh Var; arg-
+        // unify would normally bind A → Continuation through the
+        // (Var, other) bind_ty_var arm — the same arm `let f = k`
+        // legitimately uses for local aliasing. Without the
+        // precision check at check_call, A binds, `id(k)` returns
+        // Continuation, and monomorphize later panics in
+        // `ty_to_type_expr(Continuation)` because Continuation has
+        // no surface TypeExpr. The check_call precision gate
+        // catches this BEFORE the bind, firing E0145 and skipping
+        // unify_ty so A stays unbound.
+        //
+        // Test shape uses `discard[A](x: A) -> Int` so the result
+        // type is structurally Int, NOT Continuation — without the
+        // precision check, typecheck would silently pass (broad
+        // unify_ty arm doesn't fire on Int return), and mono would
+        // crash with `unreachable!()` on Continuation in
+        // ty_to_type_expr. With the precision check, E0145 fires
+        // at the call site and the cascade is short-circuited.
+        // Tight regression: removing the precision check makes this
+        // test fail (E0145 stops appearing in pipeline errors).
+        let src = "fn id[A](x: A) -> A ![] { x }\n\
+                   fn discard[A](x: A) -> Int ![] { 0 }\n\
+                   effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => discard(id(k)),\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "passing `k` to a generic-typed param must fire E0145 at the bind \
+             site — closes the bind_ty_var bypass that would otherwise propagate \
+             Continuation through generics and panic in mono::ty_to_type_expr. \
+             This shape (discard returns Int, not the generic) doesn't trigger \
+             the broad unify arm; only the precision check at check_call fires \
+             E0145: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn k_let_aliased_then_passed_to_generic_fn_fires_e0145() {
+        // Regression: ensure the precision check fires even when k
+        // flows through an intermediate let-binding (the let-RHS
+        // path is intentionally untouched by the precision check —
+        // `let f = k` is the legitimate aliasing case — but `f`
+        // then passed to a generic param re-enters check_call's
+        // gate). Same `discard[A] -> Int` discriminator as above:
+        // removing the precision check would silently typecheck-pass
+        // and panic in mono.
+        let src = "fn id[A](x: A) -> A ![] { x }\n\
+                   fn discard[A](x: A) -> Int ![] { 0 }\n\
+                   effect Raise { fail: () -> Int }\n\
+                   fn main() -> Int ![Raise] {\n\
+                     handle 0 with {\n\
+                       Raise.fail(k) => {\n\
+                         let f: Int = discard(id(k));\n\
+                         f\n\
+                       },\n\
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "passing `k` (or a let-aliased k) into a generic-typed param chain \
+             must fire E0145 (the precision check sees the resolved arg type \
+             post-deref): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn ty_display_continuation_omits_scope_id() {
+        // PR #60 review 2 issue #5 regression: `ty_display` MUST NOT
+        // render `<scope=N>` in user-facing diagnostics — users have
+        // no mental model for "scope N" and can't remediate by
+        // writing the type they should have written. Scope numbers
+        // are reserved for E0145 cross-handle messages where they
+        // explain the violation.
+        let ct = Ty::Continuation(Box::new(ContinuationTy {
+            op_ret: Ty::Int,
+            ret: Ty::Bool,
+            scope_id: ScopeId::Concrete(42),
+        }));
+        let rendered = ty_display(&ct);
+        assert!(
+            !rendered.contains("scope"),
+            "ty_display must not leak scope_id to user diagnostics; got: {rendered}"
+        );
+        assert_eq!(rendered, "Continuation(Int) -> Bool");
     }
 
     // ----------------------------------------------------------------

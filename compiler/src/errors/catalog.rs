@@ -927,6 +927,66 @@ pub const CATALOG: &[ErrorEntry] = &[
                       effect Raise[E] { fail[A]: (E) -> A }",
     },
     ErrorEntry {
+        code: "E0145",
+        short: "continuation `k` cannot escape its handle's arm body",
+        long: "Plan D Task 117: a `Ty::Continuation` value (the `k` \
+               binding inside a handler arm body, or any let-binding \
+               that aliases one) is dynamic-extent: it remains valid \
+               only inside the arm body that introduced it. Storing \
+               `k` in any cross-storage / cross-fn position lets it \
+               escape to a context where its originating handle's \
+               frame may have been popped, producing undefined \
+               behavior at runtime.\n\n\
+               Four escape shapes fire E0145:\n\n\
+               1. Returning `k` (or a let-binding aliased to `k`) \
+                  from a fn whose declared return type is not a \
+                  matching `Continuation`.\n\
+               2. Storing `k` in a record/ctor field whose declared \
+                  type is not a matching `Continuation`.\n\
+               3. Passing `k` to a fn parameter whose declared type \
+                  is not a matching `Continuation`.\n\
+               4. Cross-handle: unifying a `Continuation` with \
+                  another `Continuation` whose `scope_id` originates \
+                  from a different `handle` expression. This catches \
+                  `k`-from-outer-handle leaking into inner-handler-\
+                  -arm contexts where the inner handle's frame would \
+                  pop the outer's `k` out of dynamic extent.\n\n\
+               The fix in all cases is to keep `k` inside the handle's \
+               arm body. Multi-shot resumption (`effect E resumes: \
+               many`) lifts the linearity rule (E0220) but does NOT \
+               lift the escape barrier — `k` may be invoked multiple \
+               times within the arm, but cannot be smuggled out.\n\n\
+               Lambda capture of `k` is rejected today via E0220 \
+               (one-shot effects) or via the `ArmKPairCapture` \
+               discharge-with-lambda machinery (multi-shot effects \
+               that lift the lambda back into the same arm body). \
+               Lambda-capture-k-with-E0145 inheritance and the \
+               generic-instantiation bypass (`id(k)` for generic \
+               `id[A]`) are deferred to a follow-up PR titled \
+               \"complete the E0145 escape barrier.\"",
+        fix_example: "// Wrong (returning k from fn whose ret is non-Continuation):\n\
+                      effect Raise { fail: () -> Int }\n\
+                      fn ret_k() -> Int ![Raise] {\n\
+                        handle 0 with {\n\
+                          Raise.fail(k) => k,   // E0145 here\n\
+                        }\n\
+                      }\n\n\
+                      // Right (invoke k inside the arm; return its result):\n\
+                      fn ret_k() -> Int ![Raise] {\n\
+                        handle 0 with {\n\
+                          Raise.fail(k) => k(42),\n\
+                        }\n\
+                      }\n\n\
+                      // Wrong (k stored in a record field):\n\
+                      type WrapFn = | WrapFn((Int) -> Int ![])\n\
+                      handle 0 with {\n\
+                        Raise.fail(k) => {\n\
+                          let _: WrapFn = WrapFn(k);   // E0145 here\n\
+                          0\n\
+                        },\n\
+                      }",
+    },
+    ErrorEntry {
         code: "E0220",
         short: "one-shot continuation used more than once on a code path",
         long: "Plan B task 54: in a handler arm for a one-shot effect, \

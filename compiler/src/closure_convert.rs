@@ -47,7 +47,7 @@ use crate::ast::{
 };
 use crate::color::ColoredProgram;
 use crate::errors::Span;
-use crate::typecheck::Ty;
+use crate::typecheck::{ContinuationTy, Ty};
 
 #[derive(Clone, Debug)]
 pub struct ClosureConvertedProgram {
@@ -334,10 +334,12 @@ struct Converter {
 /// pushed during op-arm body traversal in `rewrite_expr`'s
 /// `Expr::Handle` arm. See `Converter::arm_k_context_stack`.
 ///
-/// We only track `k_name` here; the captured-k's `Ty::Fn(sig)` is
-/// pulled from the Lambda's per-span entry in `all_captures` when
-/// the k-capture is actually detected (avoids needing typecheck
-/// side-tables for op_ret_ty / handler_overall_ty at this layer).
+/// We only track `k_name` here; the captured-k's
+/// `Ty::Continuation { op_ret, ret, scope_id }` (Plan D Task 117)
+/// is pulled from the Lambda's per-span entry in `all_captures`
+/// when the k-capture is actually detected (avoids needing
+/// typecheck side-tables for op_ret_ty / handler_overall_ty at
+/// this layer).
 ///
 /// Stage-6.8-followup Layer 2 fix: also track `handle_span` (the
 /// originating `Expr::Handle`'s span) so codegen's `lower_k_pair_call`
@@ -591,7 +593,9 @@ impl Converter {
 
                 // Plan B' Stage 6.8 Task 107 Phase B — detect a
                 // capture whose name matches the topmost arm's
-                // continuation `k_name` and whose Ty is `Ty::Fn(_)`.
+                // continuation `k_name` and whose Ty is
+                // `Ty::Continuation(_)` (Plan D Task 117 — k's
+                // binding is always Continuation post-PR-#60).
                 // Such captures get the trailing-pair convention
                 // (parallel to the arm fn args_ptr layout): the
                 // capture is removed from the regular `caps` list,
@@ -622,18 +626,28 @@ impl Converter {
                     // then arg as call args). Free-var collection
                     // order is body-traversal order, not declaration
                     // order, so the previous form was order-fragile.
-                    let mut k_ty_opt: Option<Ty> = None;
+                    // Plan D Task 117 — k's binding is `Ty::
+                    // Continuation { op_ret, ret, scope_id }`
+                    // (check_handle is the sole producer; always
+                    // allocates Continuation per
+                    // `compiler/src/typecheck.rs:5159-5163`). The
+                    // pre-Task-117 `Ty::Fn(...)` shape is no longer
+                    // produced; matching it here would be dead
+                    // code per PR #60 review #3.
+                    let mut k_ty_opt: Option<ContinuationTy> = None;
                     let mut filtered: Vec<(String, Ty)> = Vec::with_capacity(raw_caps.len());
                     for (cname, cty) in &raw_caps {
-                        if cname == arm_k && matches!(cty, Ty::Fn(_)) {
-                            k_ty_opt = Some(cty.clone());
-                            continue;
+                        if cname == arm_k {
+                            if let Ty::Continuation(c) = cty {
+                                k_ty_opt = Some(*c.clone());
+                                continue;
+                            }
                         }
                         filtered.push((cname.clone(), cty.clone()));
                     }
-                    if let Some(Ty::Fn(sig)) = k_ty_opt {
-                        let op_ret_ty = sig.params.first().cloned().unwrap_or(Ty::Unit);
-                        let handler_overall_ty = sig.ret.clone();
+                    if let Some(c) = k_ty_opt {
+                        let op_ret_ty = c.op_ret.clone();
+                        let handler_overall_ty = c.ret.clone();
                         let handle_span = active_arm_k
                             .as_ref()
                             .map(|(_, s)| s.clone())
@@ -815,6 +829,23 @@ pub(crate) fn slot_kind_for_ty(ty: &Ty) -> EnvSlotKind {
         // with one slot per element; the captured value is a pointer
         // into the GC heap. Use the same slot kind as user types.
         Ty::Tuple(_) => EnvSlotKind::User,
+        // Plan D Task 117 — `Ty::Continuation` reaches this slot-
+        // kind classifier today via the existing ArmKPairCapture
+        // discharge-with-lambda path (run_state-style handlers that
+        // wrap `k` inside a lambda passed back to the body). That
+        // path predates the escape barrier and remains supported;
+        // `k` is materialized into the lambda's closure record as a
+        // pointer-sized slot, mirroring the prior `Ty::Fn(...)`
+        // behavior (the actual 2-slot pair is laid out at the
+        // capture's storage site, not in this slot-kind classifier).
+        //
+        // Once Plan D Task 117 (b) wires the E0145 escape barrier
+        // and the lambda-captures-k inheritance lift (per-scope_id
+        // permitted-capture analysis), Continuation captures that
+        // would escape will fire E0145 at typecheck and never reach
+        // slot kind classification; `Closure` here covers the
+        // legitimate dischrage-with-lambda case until then.
+        Ty::Continuation(_) => EnvSlotKind::Closure,
         // Plan B task 48 — post-typecheck IR shouldn't have unbound
         // type variables in capture types: the codegen-entry walker
         // (`contains_apply_or_generic_ref`) rejects programs whose

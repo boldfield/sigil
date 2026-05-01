@@ -338,6 +338,31 @@ pub fn canon_ty(ty: &Ty) -> String {
             }
             s
         }
+        Ty::Continuation(_) => {
+            // Plan D Task 117 — Continuation values cannot reach
+            // mono. The escape barrier rejects them from any
+            // cross-fn position (return / heap-store / fn-arg via
+            // unify_ty's broad arm; generic-instantiation via
+            // check_call's bind_ty_var bypass closure with
+            // E0145 — see typecheck.rs:4403-4445 for the
+            // precision check). Mono runs only on programs whose
+            // typecheck succeeded, so a Continuation reaching
+            // canon_ty means an escape path slipped through the
+            // typecheck barrier.
+            //
+            // Restored to `unreachable!()` after PR #60 review #3
+            // closed the bind_ty_var bypass; defensive mangling
+            // was the temporary cover for that bypass. Walker
+            // consistency: matches the Var unreachable!()s in
+            // typecheck.rs (`apply_ty_inner`, `rename_ty`,
+            // `unify_ty`) and `Substitution::apply_to_ty` /
+            // `ty_to_type_expr` below.
+            unreachable!(
+                "monomorphize::canon_ty: Ty::Continuation reached the canon-mangler — \
+                 typecheck E0145 should have rejected the cross-fn / cross-storage \
+                 site that allowed a Continuation to escape"
+            )
+        }
     }
 }
 
@@ -1480,6 +1505,19 @@ impl Substitution {
                 // surface for first-class function values.
                 effect_row_var: sig.effect_row_var,
             })),
+            // Plan D Task 117 — Continuation values cannot reach
+            // mono substitution (escape barrier rejects all paths
+            // upstream). Restored to `unreachable!()` after PR #60
+            // review #3 closed the bind_ty_var bypass via
+            // check_call's precision check at typecheck.rs:4403-
+            // 4445; defensive forwarding here was the temporary
+            // cover for that bypass. Walker consistency: matches
+            // canon_ty above and ty_to_type_expr below.
+            Ty::Continuation(_) => unreachable!(
+                "monomorphize::Substitution::apply_to_ty: Ty::Continuation reached mono \
+                 substitution — typecheck E0145 should have rejected the cross-fn / \
+                 generic-instantiation site"
+            ),
         }
     }
 
@@ -1549,6 +1587,25 @@ pub(crate) fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
             elems: elems.iter().map(|e| ty_to_type_expr(e, span)).collect(),
             span: span.clone(),
         },
+        Ty::Continuation(_) => {
+            // Plan D Task 117 — Continuation has no surface
+            // TypeExpr. PR #60 review #3 closed the bind_ty_var
+            // bypass at check_call (typecheck.rs:4403-4445) via
+            // a precision check that fires E0145 when an arg of
+            // type Ty::Continuation would unify against an
+            // unresolved generic-param Var. With that gate in
+            // place, mono never sees Continuation, so this
+            // unreachable!() is now actually unreachable on user
+            // code. Walker consistency: matches canon_ty +
+            // apply_to_ty above and the Var unreachable!()s in
+            // typecheck.rs walkers.
+            unreachable!(
+                "monomorphize::ty_to_type_expr: Ty::Continuation has no surface TypeExpr — \
+                 typecheck E0145 (escape barrier broad arm + check_call generic-\
+                 instantiation precision check) should have rejected the cross-fn / \
+                 cross-storage / generic-instantiation site upstream"
+            )
+        }
     }
 }
 
