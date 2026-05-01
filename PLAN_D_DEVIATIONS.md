@@ -472,12 +472,38 @@ Plus replace `.unwrap_or(Ty::Unit)` with an explicit panic (`build_layouts: unre
 
 ---
 
-**Three independent latent v1 bugs surfaced by the Sudoku smoke gate** (each addressed in this deviation):
+**Fourth coupled invariant: monomorphize mangles builtin generic Apply with no resolution target.** With the layout-template-skip fix, the `unreachable!()` panic surfaced its full surface context:
+
+```
+build_layouts: unresolved field type in
+  Option$$Array$$Int::Some$$Array$$Int:
+  Named("Array$$Int", Span { ... line: 15 ... })
+```
+
+The TypeDecl `Option$$Array$$Int` (a user-generic specialization with mangled name) had its `Some$$Array$$Int` variant's field rewritten to `Named("Array$$Int")` — but `Array$$Int` had no TypeDecl in `tc.types` to resolve. Monomorphize's `rewrite_type_expr` Apply arm uniformly mangled `Apply { Array, [Int] }` → `Named("Array$$Int")` regardless of whether the name was a user TypeDecl (cloneable) or a builtin (not cloneable). Builtin generics like `Array[A]` and `MutArray[A]` are registered as synthetic TypeDecls in `tc.types` (per Plan C Task 65 — `typecheck::builtin_types()`) with `generic_params: [A]` and empty variants; they have no monomorphization clone target because the runtime is opaque (values come from FFI primitives `array_alloc` / `array_get`, not user-defined ctors). The rewrite produced a mangled name with nowhere to land.
+
+**First-attempt fix reverted.** The intuitive fix — preserve `Apply` form for builtin generics in monomorphize's rewrite — was tried (commit `7af8f08`) and reverted (commit `4d5c83f`) because it broke the Plan B Task 48 codegen-entry invariant (`contains_apply_or_generic_ref`): all 10+ existing Array/MutArray e2e tests started failing as their post-mono IR retained Apply forms, which the entry guard explicitly rejects.
+
+**Architectural fix: synthesize TypeDecls for builtin specializations in monomorphize.** New `Monomorphizer.builtin_specializations: BTreeSet<String>` field tracks each mangled name produced by Apply-rewrites where the type is NOT in `self.type_decls` (i.e., a builtin generic). After the post-mono `tc.types` rebuild, the wrapper injects empty-variants empty-generic_params synthetic TypeDecls for each tracked mangled name. Now `Named("Array$$Int")` resolves via `ty_from_type_expr_with_rows`'s `Named` branch (returns `Ty::User("Array$$Int", [])`); `build_layouts` produces an empty layout (the existing `ByteArray` / `Int64` / `StringBuilder` precedent — non-generic empty-variants builtins already round-trip cleanly); `build_ctor_index` registers no ctors (empty variants). Maintains the Plan B Task 48 invariant (no Apply post-mono) and unblocks the layout-side mangled-name resolution.
+
+**Audit-driven choices** (per Brian's 2026-05-01 followup):
+- **Insertion point**: post-rebuild in `monomorphize()` wrapper (line 162-200), NOT into `program.items` — the latter would round-trip through `clone_type`'s mangle, double-mangling already-mangled names.
+- **`build_ctor_index` interaction**: empty variants → no entries → no spurious ctors.
+- **Template-skip branch interaction**: synthetic specializations have empty `generic_params` so they pass the `574c74d` skip and get processed; empty variants make the inner loop a no-op; layout entry is empty → harmless.
+- **Other registry consumers** (typecheck.rs match-witness, ctor-resolution paths) are gated by `self.ctors` lookups; synthetics register no ctors → unreachable.
+- **Lexer rejection of `$`** confirmed: user source can't reference synthetic mangled names.
+
+---
+
+**Four independent latent v1 bugs + one diagnostic improvement, surfaced by the Sudoku smoke gate** (each addressed in this deviation):
 1. **Recognizer purity** — `expr_is_pure` blanket-rejected `Expr::Call`, including ctor applications.
 2. **Free-var walker** — `arm_body_post_arm_k_tail_free_vars_ok` defensively rejected `Expr::Call`, assuming `expr_is_pure` had already rejected them upstream.
 3. **Layout template pollution** — `build_layouts` processed unmonomorphized generic templates with `.unwrap_or(Ty::Unit)`, polluting `field_tys` and corrupting `ctor_index` for programs with multiple specializations.
+4. **Monomorphize builtin Apply mangling without TypeDecl synthesis** — Apply-rewrites for builtin generics produced mangled `Named("Array$$Int")` with no resolution target in `tc.types`; fixed by tracking specializations during rewrite and injecting synthetic empty-variants TypeDecls post-rebuild.
 
-The pattern is "Slice C had latent bugs the primitive corpus masked." Plan B Task 78.5 (Koka subset import — deferred to Plan C completion) was specifically scoped to surface this convergence-class blind spot; that import's deferral is what allowed all three to survive to Task 117.
+Plus: **verifier-output unswallow** (`d43a671`) — `format_define_failure` helper at every `module.define_function` call site uses pretty-print Debug + IR dump so future codegen failures show full per-instruction diagnostics rather than `Compilation error: Verifier errors`. This was load-bearing for diagnosing #4 and remains valuable for any future codegen issue.
 
-**Implementing commit(s).** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical patterns rather than workarounds. Recognizer fix at `e889e89`; downstream free-var-walker fix at `e10d8b3`; verifier-output unswallow at `d43a671`; layout-template-skip at `[HEAD]`.
+The pattern is "Slice C had latent bugs the primitive corpus masked." Plan B Task 78.5 (Koka subset import — deferred to Plan C completion) was specifically scoped to surface this convergence-class blind spot; that import's deferral is what allowed all four to survive to Task 117.
+
+**Implementing commit(s).** PR #59 (Plan D Task 117 (a)) — bundled with the Sudoku smoke gate so the smoke gate's source can use the canonical patterns rather than workarounds. Recognizer fix at `e889e89`; downstream free-var-walker fix at `e10d8b3`; verifier-output unswallow at `d43a671`; layout-template-skip at `574c74d`; monomorphize-builtin-synthesis at `[HEAD]`.
 
