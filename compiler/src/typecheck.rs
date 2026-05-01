@@ -5644,10 +5644,12 @@ impl Tc {
     ///
     /// A catch-all arm (wildcard or bare-var binding that is not a
     /// nullary-ctor promotion) short-circuits to exhaustive. The
-    /// v1 algorithm only checks top-level coverage; nested non-
-    /// exhaustiveness inside a covered ctor's fields falls through to
-    /// the runtime trap and is documented as such in the E0120 catalog
-    /// long-form.
+    /// algorithm is full recursive Maranget (Plan B extension over
+    /// Plan A3's original top-level-only check): nested non-
+    /// exhaustiveness inside a covered ctor's fields produces a
+    /// witness with positional / record holes pasted in, e.g.
+    /// `Some(false)` or `Holds(Node(_, _, _))`. See the E0120 catalog
+    /// long-form for the witness format.
     fn user_type_witness(&self, type_name: &str, arms: &[MatchArm]) -> Option<String> {
         // For exhaustiveness purposes, the args carried on a generic
         // user type don't change the variant set — the generic params
