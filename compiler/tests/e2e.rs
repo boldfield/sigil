@@ -8086,49 +8086,40 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 /// **G4 representative test — Generator (recursive perform inside non-trivial fn body).**
 ///
 /// Originally pinned as G1 variant 1 (op-arg in post-arm-k tail) in
-/// PR #66; demoted to G4 during PR #67 G1 fix debug. The G1
-/// captures-bearing fix CLOSED the captures path, but Generator's
+/// PR #66; demoted to G4 during PR #67 G1 fix debug. G1's
+/// captures-bearing fix closed the captures path, but Generator's
 /// `iterate(rest)` recursive shape surfaced a SEPARATE codegen
-/// limitation: synth-cont allocation only fires for fns whose body
-/// matches simple post-perform shapes. iterate's body is `match
-/// xs {...}`, so its perform site routes through identity k_fn.
+/// limitation: synth-cont allocation only fired for fns whose body
+/// matched simple post-perform shapes. iterate's body is `match
+/// xs {...}`, so pre-G4 its perform site routed through identity k_fn.
 /// PR #67 iter 5's runtime-bypass works for inline-perform-in-handle
-/// shapes (outer_let / outer_fn_param) but is semantically wrong for
-/// Generator: bypassing identity skips iterate's recursive
-/// continuation, so the post-arm-k chain doesn't unwind.
+/// shapes (outer_let / outer_fn_param) but was semantically wrong for
+/// Generator: bypassing identity skipped iterate's recursive
+/// continuation, so the post-arm-k chain didn't unwind.
 ///
 /// Source pattern: `koka/test/algeff/common.kk` lines 108–125 (the
 /// `yield` effect + `iterate` producer; the `foreach` consumer
 /// variant is inexpressible in sigil v1 per Task 64 deviation, so the
 /// port substitutes a list-collecting handler).
 ///
-/// ## Status — gap representative for G4 (separate gap from G1)
+/// ## Status — CLOSED at G4 closeout PR
 ///
-/// PR #67 G1 fix delivered captures-bearing for inline-perform-in-
-/// handle-body shapes (outer_let / outer_fn_param / inverted slice_b
-/// op-arg test). Generator surfaces a SEPARATE codegen gap (G4):
-/// codegen routes performs in non-trivial fn bodies (e.g., match-arm
-/// Blocks) through identity k_fn; the iter-5 runtime-bypass for
-/// identity is semantically wrong here because it skips iterate's
-/// recursive continuation.
+/// G4 closed across four Phase B sub-PRs landed before this closeout:
+///   - **B.1** (PR #74) — wire compound-match-with-arm-perform shape
+///     into CPS ABI selection + body emit (Lowerer-dispatched).
+///   - **B.2** (PR #76) — synth-cont with arm-pattern captures
+///     (`x`, `rest` from `Cons(x, rest)` round-trip through closure
+///     record).
+///   - **B.3** (PR #77) — CPS→CPS direct dispatch from synth-cont
+///     tail (recursive `iterate(rest)` dispatches via outer
+///     trampoline; no nested `sigil_run_loop`, per
+///     `feedback_sigil_trampoline_charter`).
+///   - **B.4** (PR #75) — deep-handler return-arm pair installed as
+///     trailing pair on Cps body call; deepest iterate exit routes
+///     through return-arm first, then the post-arm-k chain unwinds.
 ///
-/// ## Full G4 underlying-gap coverage
-///
-/// G4 fires for any user fn whose top-level body shape isn't a
-/// trivial `let-perform-then-tail` pattern AND that performs an
-/// effect somewhere in its body. The synth-cont allocation pass
-/// only matches simple shapes; performs nested in match-arms,
-/// if-branches, and other compound constructs aren't covered.
-///
-/// ## Closure path (G4 — separate fix from G1, substantial codegen lift)
-///
-/// Extend the synth-cont allocation pass to synthesize a CPS
-/// continuation for performs nested in compound fn-body shapes
-/// (match-arm Blocks, if-branch Blocks, lambda bodies). The
-/// continuation must execute the surrounding fn's continuation (the
-/// rest of the arm-body / branch / fn body after the perform) before
-/// dispatching to post-arm-k via the trailing-pair convention.
-/// Wider than G1; tracked as its own follow-up PR.
+/// This test was un-ignored at G4 closeout (this PR) and is the
+/// load-bearing CI signal for the four sub-PRs composing cleanly.
 ///
 /// ## Why this test is novel for sigil
 ///
@@ -8136,16 +8127,15 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 /// 2. **Single-shot k whose result type is a non-Int sum (`List[Int]`).**
 /// 3. **Decl-level generic effect `Gen[A]`** instantiated to `Gen[Int]`.
 ///
-/// ## Trace (once G4 closes; xs = `[1, 2, 3]`)
+/// ## Trace (xs = `[1, 2, 3]`)
 ///
 /// 3 nested arm bodies, each `let rest = k(0)` descending; return arm
 /// fires `Nil`; arm bodies build `Cons(1, Cons(2, Cons(3, Nil)))` on the
 /// way back up. `length(result) = 3`.
 ///
-/// **Invariant** (post-fix): stdout = `"3\n"`, exit 0.
+/// **Invariant**: stdout = `"3\n"`, exit 0.
 #[test]
-#[ignore = "G4: codegen routes performs inside non-trivial fn-body shapes (match-arm Blocks, etc.) through identity k_fn instead of synthesizing a real CPS continuation; post-arm-k chain doesn't unwind through recursive perform sites. Surfaced during G1 fix debug at PR #67 iter 5"]
-fn task_78_5_pending_g4_recursive_perform_in_match_arm_body() {
+fn task_78_5_g4_generator_recursive_perform_in_match_arm_body() {
     let src = "import std.list\n\
                import std.io\n\
                \n\
@@ -8192,7 +8182,7 @@ fn task_78_5_pending_g4_recursive_perform_in_match_arm_body() {
 /// wrapping). Independent of B.2/B.3/B.4 — the perform-bearing arm has no
 /// recursive tail call, so the iter-5 identity-bypass behavior in
 /// `lower_perform_to_value` is sufficient. Sister test
-/// `task_78_5_pending_g4_recursive_perform_in_match_arm_body` exercises
+/// `task_78_5_g4_generator_recursive_perform_in_match_arm_body` exercises
 /// the recursive shape that B.3 closes; this test pins the simpler
 /// non-recursive path that B.1 alone is responsible for.
 ///
@@ -9404,7 +9394,7 @@ fn b4_discharged_bypass_skips_return_arm_trailing_pair() {
 /// classified Cps). The non-recursive shape pins B.3's dispatch
 /// mechanics independent of the recursive Generator shape (which the
 /// closeout PR exercises via
-/// `task_78_5_pending_g4_recursive_perform_in_match_arm_body`).
+/// `task_78_5_g4_generator_recursive_perform_in_match_arm_body`).
 ///
 /// **Trace (unwinding the trampoline hops):**
 ///   1. main: `handle caller(Cons(7, Nil)) with { Gen.yield(_, k) => k(0) }`.

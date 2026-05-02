@@ -20547,9 +20547,11 @@ mod tests {
     /// **What B.1 does NOT change** (B.2/B.3/B.4 close): the perform-
     /// bearing arm's perform site still uses identity-k_fn (via the
     /// Lowerer's `lower_perform_to_value`), so recursive-perform
-    /// behavior remains the iter-5 identity-bypass shape — the
-    /// `task_78_5_pending_g4_recursive_perform_in_match_arm_body`
-    /// e2e test STAYS `#[ignore]`'d.
+    /// behavior remains the iter-5 identity-bypass shape. The
+    /// recursive Generator e2e test
+    /// (`task_78_5_g4_generator_recursive_perform_in_match_arm_body`)
+    /// stays `#[ignore]`'d at B.1; un-ignored at the G4 closeout PR
+    /// after B.2/B.3/B.4 land.
     #[test]
     fn compute_user_fn_abi_cps_for_compound_match_with_arm_perform_g4_b1() {
         // Inline a Gen-style effect (no generic params) + custom
