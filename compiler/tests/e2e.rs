@@ -8143,9 +8143,25 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 /// way back up. `length(result) = 3`.
 ///
 /// **Invariant** (post-fix): stdout = `"3\n"`, exit 0.
+///
+/// Task 78.5 G4 Approach 6 deep-redo — un-ignored. The body-fn natural-
+/// exit emit at codegen.rs:8534 (B.2 ConstantDone arm — iterate's Nil
+/// arm) calls `sigil_done_or_dispatch_return_arm` which dispatches the
+/// return arm at the deepest k(0) terminus (deep-handler semantic);
+/// post_arm_k chain unwinds with Nil → Cons(3, Nil) → Cons(2, Cons(3,
+/// Nil)) → Cons(1, ...) → length 3. Phase 4g suppression check at
+/// codegen.rs:14289 reads `BODY_RETURN_ARM_FIRED` and skips the second
+/// nested run_loop that would double-wrap.
 #[test]
-#[ignore = "G4: codegen routes performs inside non-trivial fn-body shapes (match-arm Blocks, etc.) through identity k_fn instead of synthesizing a real CPS continuation; post-arm-k chain doesn't unwind through recursive perform sites. Surfaced during G1 fix debug at PR #67 iter 5"]
-fn task_78_5_pending_g4_recursive_perform_in_match_arm_body() {
+fn task_78_5_g4_recursive_perform_in_match_arm_body() {
+    // PR #80 review iter 3 §"New issue: Generator test discriminator
+    // is too weak" — earlier asserted only `length(result) == 3`,
+    // which would silently pass under wrong unwind order
+    // (Cons(3, Cons(2, Cons(1, Nil)))) or wrong intermediate values
+    // (Cons(0, Cons(0, Cons(0, Nil)))). Approach 6's whole point is
+    // the post-arm-k chain unwinding in the right order with the
+    // right intermediates — print each element so `"1\n2\n3\n"`
+    // pins both content and order.
     let src = "import std.list\n\
                import std.io\n\
                \n\
@@ -8163,6 +8179,16 @@ fn task_78_5_pending_g4_recursive_perform_in_match_arm_body() {
                  }\n\
                }\n\
                \n\
+               fn print_list(xs: List[Int]) -> Int ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => {\n      \
+                     perform IO.println(int_to_string(h));\n      \
+                     print_list(t)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
                fn main() -> Int ![IO] {\n  \
                  let xs: List[Int] = Cons(1, Cons(2, Cons(3, Nil)));\n  \
                  let result: List[Int] = handle iterate(xs) with {\n    \
@@ -8172,15 +8198,335 @@ fn task_78_5_pending_g4_recursive_perform_in_match_arm_body() {
                    },\n    \
                    return(_v) => Nil,\n  \
                  };\n  \
-                 perform IO.println(int_to_string(length(result)));\n  \
-                 0\n\
+                 print_list(result)\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pr1_generator_collect");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "3\n",
-        "generator should yield 3 elements collected into List[Int]; \
+        stdout, "1\n2\n3\n",
+        "Generator should yield 3 elements collected into List[Int] in \
+         source-order: 1, 2, 3. Wrong outputs surface unwind-order or \
+         intermediate-value regressions that the prior length-only \
+         assertion would have masked. stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Approach 6 deep-redo — Risk 3 regression: Cps
+/// sub-call inside body fn must NOT trigger outer return-arm wrap.**
+///
+/// Body fn calls a Cps sub-fn (sub_cps_fn) before its own perform.
+/// sub_cps_fn's natural-exit Done(99) flows back to body_fn directly;
+/// the helper at sub_cps_fn's natural-exit emit site must read TLS as
+/// CLEAR (not the outer body's return-arm pair) and fall through to
+/// plain `Done(99)`.
+///
+/// **Mechanism**: lower_call's `UserFnAbi::Cps` branch
+/// (codegen.rs:14971 area) wraps its nested run_loop with
+/// SAVE+CLEAR+RESTORE around BODY_RETURN_ARM TLS. During the sub-call's
+/// nested run_loop, BODY_RETURN_ARM is null → helper at
+/// sub_cps_fn natural exit emits Done(99) without wrap. After the
+/// sub-call returns, RESTORE re-installs the outer body's return-arm
+/// pair so body_fn's own natural-exit dispatches correctly.
+///
+/// **Trace**:
+///   - sub_cps_fn() → 99 (no wrap)
+///   - body_fn: n=99, perform Eff.op() → 0, tail = n+1 = 100
+///   - body_fn natural exit Done(100) → helper wraps → return arm v+1000 = 1100
+///
+/// **Invariant**: stdout = `"1100\n"`, exit 0. If wrong (e.g.,
+/// `"2100\n"`), Risk 3 surfaced (sub-call inherited outer's return arm).
+#[test]
+fn task_78_5_g4_approach6_risk3_cps_sub_call_does_not_trigger_outer_return_arm() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { op: () -> Int }\n\
+               effect Log { write: (String) -> Int }\n\
+               \n\
+               fn sub_cps_fn() -> Int ![Log] {\n  \
+                 let _: Int = perform Log.write(\"hi\");\n  \
+                 99\n\
+               }\n\
+               \n\
+               fn body_fn() -> Int ![Eff, Log] {\n  \
+                 let n: Int = sub_cps_fn();\n  \
+                 let _: Int = perform Eff.op();\n  \
+                 n + 1\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle body_fn() with {\n    \
+                   Log.write(_, k) => k(0),\n    \
+                   Eff.op(k) => k(0),\n    \
+                   return(v) => v + 1000,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_risk3_cps_sub_call_does_not_trigger_outer_return_arm",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1100\n",
+        "Risk 3: sub_cps_fn's Done(99) MUST NOT wrap via outer return arm; \
+         only body_fn's natural exit (n+1=100) should wrap to 1100. \
+         Wrong output (e.g. 2100) means the sub-call inherited the outer \
+         body's BODY_RETURN_ARM pair. stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Approach 6 deep-redo — nested handles: each handle's
+/// return-arm fires for its own body's natural exit only.**
+///
+/// Outer handle wraps outer_body via `v + 100`; inner handle inside
+/// outer_body wraps inner_body via `v + 1`. Verifies that the SAVE +
+/// SET + RESTORE pattern in the custom handle body-call wrapper
+/// preserves the outer's TLS triplet across the inner handle's
+/// run_loop, so inner_body's natural exit wraps via INNER's return arm
+/// and outer_body's natural exit wraps via OUTER's return arm.
+///
+/// **Trace**:
+///   - inner_body's natural exit Done(7) → inner helper wraps → 8
+///   - outer_body sees inner = 8; tail inner * 10 = 80
+///   - outer_body natural exit Done(80) → outer helper wraps → 180
+///
+/// **Invariant**: stdout = `"180\n"`, exit 0. Wrong outputs:
+/// `"108\n"` (outer wrap fires on inner's natural exit), `"800\n"`
+/// (no wrap), or other.
+#[test]
+fn task_78_5_g4_approach6_nested_handles_each_return_arm_fires_for_its_own_body() {
+    let src = "import std.io\n\
+               \n\
+               effect E1 { op1: () -> Int }\n\
+               effect E2 { op2: () -> Int }\n\
+               \n\
+               fn inner_body() -> Int ![E2] {\n  \
+                 let _: Int = perform E2.op2();\n  \
+                 7\n\
+               }\n\
+               \n\
+               fn outer_body() -> Int ![E1, E2] {\n  \
+                 let _: Int = perform E1.op1();\n  \
+                 let inner: Int = handle inner_body() with {\n    \
+                   E2.op2(k) => k(0),\n    \
+                   return(v) => v + 1,\n  \
+                 };\n  \
+                 inner * 10\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let outer: Int = handle outer_body() with {\n    \
+                   E1.op1(k) => k(0),\n    \
+                   E2.op2(k) => k(0),\n    \
+                   return(v) => v + 100,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(outer));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_nested_handles_each_return_arm_fires_for_its_own_body",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "180\n",
+        "Nested handles: inner return arm wraps inner's natural exit \
+         (7→8), outer return arm wraps outer's natural exit (80→180). \
          stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Approach 6 deep-redo (PR #80 review §4) — B != R
+/// regression: body type B is narrower than handler-overall R.**
+///
+/// The custom handle body-call wrapper drives the body's run_loop which
+/// (when the body's natural exit fires the helper) returns the return
+/// arm's R-typed value as the trampoline's u64. An earlier iteration of
+/// this PR narrowed the wrapper's `raw_u64` to B (the callee's declared
+/// return type) before handing it to Phase 4g — Phase 4g's suppression
+/// branch then re-widened to I64 with `uextend` (zero-extend), which
+/// CLIPS bits whenever R is wider than B in Cranelift width. For
+/// String / pointer-typed R (I64) and Char-typed B (I32) the upper
+/// 32 bits of the return-arm pointer are lost; downstream
+/// `IO.println(result)` then dereferences a corrupt pointer and either
+/// segfaults or prints garbage.
+///
+/// **Setup**: body is `body_returning_char()` — a Cps fn returning
+/// `Char` (I32) that performs `E.op` and tails on a Char literal. The
+/// handle declares `result: String` and `return(_c) => "ok"` — so R =
+/// String (pointer_ty = I64). The arm `E.op(k) => k(0)` keeps the body
+/// running so its tail Char `'a'` becomes the helper's argument, then
+/// the helper invokes return_arm which yields the String "ok".
+///
+/// The wrapper now returns `(body_val, raw_u64, fired_v)`: `body_val`
+/// stays narrowed to B for Phase 4g's non-suppression paths, but the
+/// suppression branch consumes `raw_u64` directly (full 64 bits) and
+/// narrows once to handler_overall_ty.
+///
+/// **Invariant**: stdout = `"ok\n"`, exit 0. Pre-fix output is
+/// non-deterministic (segfault, garbage bytes, or panic) depending on
+/// the host's pointer layout — any non-`"ok\n"` outcome surfaces the
+/// regression.
+#[test]
+fn task_78_5_g4_approach6_b_neq_r_pointer_return_arm_through_char_body() {
+    let src = "import std.io\n\
+               \n\
+               effect E { op: () -> Int }\n\
+               \n\
+               fn body_returning_char() -> Char ![E] {\n  \
+                 let _: Int = perform E.op();\n  \
+                 'a'\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: String = handle body_returning_char() with {\n    \
+                   E.op(k) => k(0),\n    \
+                   return(_c) => \"ok\",\n  \
+                 };\n  \
+                 perform IO.println(result);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_b_neq_r_pointer_return_arm_through_char_body",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "ok\n",
+        "B != R: body returns Char (I32, narrower), handler returns \
+         String (pointer_ty = I64, wider). Pre-fix wrapper narrowed \
+         raw_u64 to Char and the suppression branch's re-widen via \
+         uextend lost the upper 32 bits of the \"ok\" String pointer. \
+         Wrong stdout (or segfault) surfaces the regression. \
+         stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Approach 6 deep-redo (PR #80 review §6) —
+/// DISCHARGED-bypass through the wrapper path.**
+///
+/// `handle_with_op_arm_discharge_skips_return_arm` already covers the
+/// general Phase 4g discharge case, but its body is a bare `perform`
+/// expression — not a direct Cps user fn call. That shape skips the
+/// custom wrapper entirely (no PUSH/POP, no `wrapper_state`); Phase 4g
+/// reaches the discharge_block via the existing `lower_expr` path.
+///
+/// This test exercises the *wrapper-engaged* discharge path: body is
+/// `body_fn()` (a direct Cps user fn call → wrapper engages → PUSH a
+/// real return-arm pair → run_loop), and body_fn performs an op whose
+/// arm discharges `k`. The trampoline records LAST_TERMINAL_TAG =
+/// DISCHARGED, returns the discharged value (99 here) as the
+/// trampoline's u64. The wrapper POPs (fired = false because helper
+/// never reached a body-fn natural-exit emit site — body discharged
+/// before that), and Phase 4g's three-way branch:
+///
+///   - fired_v == 0 → not the suppression branch
+///   - tag == DISCHARGED → discharge_block (NOT normal_block)
+///   - discharge_block: body_val IS handle's overall → 99
+///
+/// Pre-fix or stack-discipline regression symptoms:
+///   - "9900\n": return arm wrapped 99 → 9900 (DISCHARGED bypass broke).
+///   - segfault / panic: stack underflow if PUSH/POP imbalanced under
+///     the discharge path.
+#[test]
+fn task_78_5_g4_approach6_discharged_bypass_through_wrapper_path() {
+    let src = "import std.io\n\
+               \n\
+               effect Raise { fail: () -> Int }\n\
+               \n\
+               fn body_fn() -> Int ![Raise] {\n  \
+                 let _: Int = perform Raise.fail();\n  \
+                 0\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle body_fn() with {\n    \
+                   Raise.fail(k) => 99,\n    \
+                   return(v) => v * 100,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_discharged_bypass_through_wrapper_path",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n",
+        "Approach 6 wrapper + DISCHARGED bypass: body_fn performs Raise.fail; \
+         arm discharges k → 99 IS handle's overall; return arm MUST NOT fire. \
+         \"9900\\n\" means return arm wrapped (DISCHARGED bypass broke). \
+         stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Approach 6 deep-redo (PR #80 review §5) — Risk 3,
+/// shape 3: triply-nested handle + Cps sub-call inside an inner
+/// handle's body fn.**
+///
+/// Three handle expressions stack up; the middle one's body is a Cps
+/// user fn that itself calls a Cps sub-fn. The sub-fn must not see any
+/// of the three return arms — its natural exit emits plain Done.
+///
+/// outer wraps middle's overall via `v + 1000`.
+/// middle wraps middle_body's natural exit via `v + 100`.
+/// inner has no return arm but discharges via op arm.
+///
+/// middle_body() → 5: calls deep_cps(7) — must return 7+1=8 plainly,
+/// then middle_body returns 5 → middle return wraps → 105 → outer
+/// return wraps → 1105.
+#[test]
+fn task_78_5_g4_approach6_risk3_triply_nested_with_sub_cps_call() {
+    let src = "import std.io\n\
+               \n\
+               effect E1 { op1: () -> Int }\n\
+               effect E2 { op2: () -> Int }\n\
+               effect E3 { op3: () -> Int }\n\
+               \n\
+               fn deep_cps(n: Int) -> Int ![E3] {\n  \
+                 let _: Int = perform E3.op3();\n  \
+                 n + 1\n\
+               }\n\
+               \n\
+               fn middle_body() -> Int ![E2, E3] {\n  \
+                 let _x: Int = perform E2.op2();\n  \
+                 let _y: Int = deep_cps(7);\n  \
+                 5\n\
+               }\n\
+               \n\
+               fn outer_body() -> Int ![E1, E2, E3] {\n  \
+                 let _: Int = perform E1.op1();\n  \
+                 let m: Int = handle middle_body() with {\n    \
+                   E2.op2(k) => k(0),\n    \
+                   E3.op3(k) => k(0),\n    \
+                   return(v) => v + 100,\n  \
+                 };\n  \
+                 m\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle outer_body() with {\n    \
+                   E1.op1(k) => k(0),\n    \
+                   E2.op2(k) => k(0),\n    \
+                   E3.op3(k) => k(0),\n    \
+                   return(v) => v + 1000,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_risk3_triply_nested_with_sub_cps_call",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1105\n",
+        "Triply-nested + sub-Cps-call: deep_cps's natural exit is plain Done(8), \
+         middle_body returns 5 → middle return wraps → 105 → outer return wraps \
+         → 1105. Wrong outputs surface stack-discipline breaks across nested \
+         wrapper invocations. stderr={stderr:?}"
     );
 }
 

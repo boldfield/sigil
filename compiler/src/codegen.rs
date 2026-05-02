@@ -6861,13 +6861,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_outer_post_arm_k_push: {e}"))?;
 
-    // sigil_next_step_done(value: u64) -> *mut NextStep
-    let mut next_step_done_sig = Signature::new(isa_call_conv(&module));
-    next_step_done_sig.params.push(AbiParam::new(types::I64));
-    next_step_done_sig.returns.push(AbiParam::new(pointer_ty));
-    let next_step_done = module
-        .declare_function("sigil_next_step_done", Linkage::Import, &next_step_done_sig)
-        .map_err(|e| format!("declare sigil_next_step_done: {e}"))?;
+    // PR #80 review §3 — `sigil_next_step_done` is no longer declared
+    // here. The compiler-emitted callers at the 4 body-fn natural-exit
+    // emit sites all dispatch through `sigil_done_or_dispatch_return_arm`
+    // which CALLs `sigil_next_step_done` itself within the runtime
+    // crate; the linker pulls in the symbol via that path without a
+    // compiler-side declaration.
 
     // sigil_next_step_discharged(value: u64) -> *mut NextStep
     //
@@ -6892,6 +6891,59 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             &next_step_discharged_sig,
         )
         .map_err(|e| format!("declare sigil_next_step_discharged: {e}"))?;
+
+    // ===== Task 78.5 G4 Approach 6 deep-redo — body-return-arm stack helpers =====
+    //
+    // PR #80 review §1 — replaces the iter-2 single-cell-triplet TLS
+    // (set/get/clear/get_fired/set_fired) with a 3-helper stack
+    // discipline (push/pop/done_or_dispatch). See
+    // `runtime/src/handlers.rs::BODY_RETURN_ARM_STACK` for the stack
+    // and the helpers' docstrings for push/pop/dispatch contracts.
+
+    // sigil_body_return_arm_push(closure_ptr: *mut u8, fn_ptr: *mut u8)
+    let mut body_return_arm_push_sig = Signature::new(isa_call_conv(&module));
+    body_return_arm_push_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    body_return_arm_push_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    let body_return_arm_push = module
+        .declare_function(
+            "sigil_body_return_arm_push",
+            Linkage::Import,
+            &body_return_arm_push_sig,
+        )
+        .map_err(|e| format!("declare sigil_body_return_arm_push: {e}"))?;
+
+    // sigil_body_return_arm_pop() -> u8 (popped entry's fired flag)
+    let mut body_return_arm_pop_sig = Signature::new(isa_call_conv(&module));
+    body_return_arm_pop_sig
+        .returns
+        .push(AbiParam::new(types::I8));
+    let body_return_arm_pop = module
+        .declare_function(
+            "sigil_body_return_arm_pop",
+            Linkage::Import,
+            &body_return_arm_pop_sig,
+        )
+        .map_err(|e| format!("declare sigil_body_return_arm_pop: {e}"))?;
+
+    // sigil_done_or_dispatch_return_arm(v: u64) -> *mut NextStep
+    let mut done_or_dispatch_return_arm_sig = Signature::new(isa_call_conv(&module));
+    done_or_dispatch_return_arm_sig
+        .params
+        .push(AbiParam::new(types::I64));
+    done_or_dispatch_return_arm_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
+    let done_or_dispatch_return_arm = module
+        .declare_function(
+            "sigil_done_or_dispatch_return_arm",
+            Linkage::Import,
+            &done_or_dispatch_return_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_done_or_dispatch_return_arm: {e}"))?;
 
     // sigil_last_terminal_tag() -> u32
     //
@@ -7589,7 +7641,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         perform_func,
         outer_post_arm_k_push,
         run_loop,
-        next_step_done,
         next_step_discharged,
         last_terminal_tag,
         reset_last_terminal_tag,
@@ -7598,6 +7649,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         next_step_call,
         next_step_args_ptr,
         continuation_identity,
+        body_return_arm_push,
+        body_return_arm_pop,
+        done_or_dispatch_return_arm,
         handler_arm_indices: &handler_arm_indices,
         handler_arm_synth: &handler_arm_synth,
         handler_return_arm_synth: &handler_return_arm_synth,
@@ -7628,12 +7682,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
             // Plan B Task 55, Phase 4e — per-fn FuncRefs + DataRefs +
             // side-table reflections. See `prepare_per_fn_refs` for
-            // the layout. Some refs (`next_step_done_ref`,
-            // `next_step_call_ref`, `next_step_args_ptr_ref`) aren't
-            // used directly by the user-fn body lowering (only
-            // synth-arm-fn body emit needs them); unreferenced FuncRefs
-            // sit in `dfg.ext_funcs` without producing relocations, so
-            // the emitted object code is unaffected.
+            // the layout. Some refs (`next_step_call_ref`,
+            // `next_step_args_ptr_ref`) aren't used directly by the
+            // user-fn body lowering (only synth-arm-fn body emit needs
+            // them); unreferenced FuncRefs sit in `dfg.ext_funcs`
+            // without producing relocations, so the emitted object
+            // code is unaffected.
             let PerFnRefs {
                 builtins,
                 handler_frame_new_ref,
@@ -7644,11 +7698,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 perform_ref,
                 outer_post_arm_k_push_ref: _,
                 run_loop_ref,
-                // Plan B Task 78.5 G4 Phase B.1 — bound (was `_`) so
-                // the new compound-match-body branch can call
-                // `sigil_next_step_done` to wrap the Lowerer-produced
-                // tail value as `NextStep::Done(value)`.
-                next_step_done_ref,
                 next_step_discharged_ref: _,
                 last_terminal_tag_ref,
                 reset_last_terminal_tag_ref,
@@ -7657,6 +7706,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
+                body_return_arm_push_ref,
+                body_return_arm_pop_ref,
+                done_or_dispatch_return_arm_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
@@ -7926,6 +7978,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_return_arm_synth: &handler_return_arm_synth,
                         handler_return_arm_indices: &handler_return_arm_indices,
                         continuation_identity_ref,
+                        body_return_arm_push_ref,
+                        body_return_arm_pop_ref,
                         effect_ids: &checked.effect_ids,
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
@@ -8411,8 +8465,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 ),
                             };
                             let const_v = lowerer.builder.ins().iconst(types::I64, constant_value);
-                            let done_call =
-                                lowerer.builder.ins().call(next_step_done_ref, &[const_v]);
+                            // Task 78.5 G4 Approach 6 deep-redo —
+                            // body-fn natural-exit emit (compound-match
+                            // ConstantDone arm). Helper reads
+                            // BODY_RETURN_ARM TLS triplet: if a return
+                            // arm is set + not yet fired, dispatches via
+                            // Call(return_arm, [const_v, null, identity])
+                            // for deep-handler semantic; else emits
+                            // Done(const_v) (matches pre-Approach-6
+                            // behavior). Sets BODY_RETURN_ARM_FIRED so
+                            // (a) subsequent helper invocations during
+                            // outer_post_arm_k_stack chain unwind skip
+                            // re-wrap, (b) the handle expression's
+                            // Phase 4g check skips the second nested
+                            // run_loop.
+                            let done_call = lowerer
+                                .builder
+                                .ins()
+                                .call(done_or_dispatch_return_arm_ref, &[const_v]);
                             lowerer.stackmap.push_placeholder(function_code_offset(
                                 &lowerer.builder,
                                 done_call,
@@ -8810,6 +8880,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_synth: &handler_return_arm_synth,
                     handler_return_arm_indices: &handler_return_arm_indices,
                     continuation_identity_ref,
+                    body_return_arm_push_ref,
+                    body_return_arm_pop_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
@@ -8953,6 +9025,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_return_arm_synth: &handler_return_arm_synth,
                 handler_return_arm_indices: &handler_return_arm_indices,
                 continuation_identity_ref,
+                body_return_arm_push_ref,
+                body_return_arm_pop_ref,
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
@@ -9307,7 +9381,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     perform_ref,
                     outer_post_arm_k_push_ref: _,
                     run_loop_ref,
-                    next_step_done_ref: _,
                     next_step_discharged_ref,
                     last_terminal_tag_ref,
                     reset_last_terminal_tag_ref,
@@ -9316,6 +9389,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
+                    body_return_arm_push_ref,
+                    body_return_arm_pop_ref,
+                    done_or_dispatch_return_arm_ref: _,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
@@ -9453,6 +9529,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_synth: &handler_return_arm_synth,
                     handler_return_arm_indices: &handler_return_arm_indices,
                     continuation_identity_ref,
+                    body_return_arm_push_ref,
+                    body_return_arm_pop_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
@@ -10247,7 +10325,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     perform_ref,
                     outer_post_arm_k_push_ref: _,
                     run_loop_ref,
-                    next_step_done_ref: _,
                     next_step_discharged_ref: _,
                     last_terminal_tag_ref,
                     reset_last_terminal_tag_ref,
@@ -10256,6 +10333,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
+                    body_return_arm_push_ref,
+                    body_return_arm_pop_ref,
+                    done_or_dispatch_return_arm_ref: _,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
@@ -10381,6 +10461,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_synth: &handler_return_arm_synth,
                     handler_return_arm_indices: &handler_return_arm_indices,
                     continuation_identity_ref,
+                    body_return_arm_push_ref,
+                    body_return_arm_pop_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
@@ -10613,7 +10695,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 perform_ref,
                 outer_post_arm_k_push_ref: _,
                 run_loop_ref,
-                next_step_done_ref,
                 next_step_discharged_ref: _,
                 last_terminal_tag_ref,
                 reset_last_terminal_tag_ref,
@@ -10622,6 +10703,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
+                body_return_arm_push_ref,
+                body_return_arm_pop_ref,
+                done_or_dispatch_return_arm_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
@@ -10658,6 +10742,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_return_arm_synth: &handler_return_arm_synth,
                 handler_return_arm_indices: &handler_return_arm_indices,
                 continuation_identity_ref,
+                body_return_arm_push_ref,
+                body_return_arm_pop_ref,
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
@@ -10707,10 +10793,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 );
                 tail_value
             };
+            // Task 78.5 G4 Approach 6 deep-redo — post-arm-k synth fn
+            // body Done emit (Slice B). Helper checks the top
+            // BODY_RETURN_ARM_STACK entry's `fired` flag — if set (the
+            // body's deepest natural-exit already wrapped via the same
+            // helper at the B.2 ConstantDone arm site), helper falls
+            // through to Done(widened_tail). post-arm-k synth fns run
+            // DURING outer_post_arm_k_stack chain unwind with
+            // already-wrapped `r` bindings; their Done emits must NOT
+            // re-wrap. If `fired` is false (the body hasn't wrapped yet
+            // — possible for body shapes that don't use compound-match),
+            // helper wraps via the active return arm.
             let done_call = lowerer
                 .builder
                 .ins()
-                .call(next_step_done_ref, &[widened_tail]);
+                .call(done_or_dispatch_return_arm_ref, &[widened_tail]);
             lowerer
                 .stackmap
                 .push_placeholder(function_code_offset(&lowerer.builder, done_call));
@@ -10892,7 +10989,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         perform_ref,
                         outer_post_arm_k_push_ref: _,
                         run_loop_ref,
-                        next_step_done_ref,
                         next_step_discharged_ref: _,
                         last_terminal_tag_ref,
                         reset_last_terminal_tag_ref,
@@ -10901,6 +10997,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         next_step_call_ref,
                         next_step_args_ptr_ref,
                         continuation_identity_ref,
+                        body_return_arm_push_ref,
+                        body_return_arm_pop_ref,
+                        done_or_dispatch_return_arm_ref,
                         handler_arm_refs_per_handle,
                         handler_return_arm_refs_per_handle,
                         user_fn_refs,
@@ -10936,6 +11035,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_return_arm_synth: &handler_return_arm_synth,
                         handler_return_arm_indices: &handler_return_arm_indices,
                         continuation_identity_ref,
+                        body_return_arm_push_ref,
+                        body_return_arm_pop_ref,
                         effect_ids: &checked.effect_ids,
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
@@ -10977,10 +11078,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 );
                                 tail_value
                             };
+                            // Task 78.5 G4 Approach 6 deep-redo —
+                            // Slice C N-let chain Final step Done emit.
+                            // Final step is the body fn's natural-exit
+                            // for chained-let-yield-pure-tail body
+                            // shape. Helper wraps via active return arm
+                            // (deep semantic) or falls through to
+                            // Done(widened_tail) when no return arm /
+                            // already fired.
                             let done_call = lowerer
                                 .builder
                                 .ins()
-                                .call(next_step_done_ref, &[widened_tail]);
+                                .call(done_or_dispatch_return_arm_ref, &[widened_tail]);
                             lowerer.stackmap.push_placeholder(function_code_offset(
                                 &lowerer.builder,
                                 done_call,
@@ -11307,6 +11416,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let next_step_call_ref = module.declare_func_in_func(next_step_call, builder.func);
                 let next_step_args_ptr_ref =
                     module.declare_func_in_func(next_step_args_ptr, builder.func);
+                // Task 78.5 G4 Approach 6 deep-redo — synth-cont body
+                // emit declares the helper FuncRef directly (this
+                // emit pass uses bespoke FuncRef declarations rather
+                // than `prepare_per_fn_refs`).
+                let done_or_dispatch_return_arm_ref =
+                    module.declare_func_in_func(done_or_dispatch_return_arm, builder.func);
 
                 // Slice A: load post-arm-k pair from args_ptr at the
                 // trailing-pair offsets defined by the convention
@@ -11396,12 +11511,30 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     CpsContinuationKind::ConstantDone { constant_value } => {
                         // ConstantDone shape: synth-cont's body is
                         // just the parent helper's constant tail
-                        // expression. Slice A: dispatch the constant
-                        // through post-arm-k instead of returning
-                        // `Done` directly.
+                        // expression. Pre-Approach-6: dispatch the
+                        // constant through post-arm-k chain via
+                        // emit_dispatch_to_post_arm_k.
+                        //
+                        // Task 78.5 G4 Approach 6 deep-redo: this is
+                        // the simple-yield-then-constant-tail body
+                        // shape's natural-exit emit. Helper wraps via
+                        // active return arm (deep semantic) when set;
+                        // when not set OR already fired, helper falls
+                        // through to Done(constant_v). The trampoline's
+                        // Done branch then pops `outer_post_arm_k_stack`
+                        // (TLS) and routes to the post-arm-k chain
+                        // unwind (equivalent net behavior to the
+                        // pre-Approach-6 dispatch_to_post_arm_k path
+                        // for the BODY_RETURN_ARM-null case, since the
+                        // perform site that allocated this synth-cont
+                        // also pushed its post_arm_k pair onto the TLS
+                        // stack).
                         let constant_v = builder.ins().iconst(types::I64, *constant_value);
-                        let next_step =
-                            emit_dispatch_to_post_arm_k(&mut builder, &mut stackmap, constant_v);
+                        let done_call = builder
+                            .ins()
+                            .call(done_or_dispatch_return_arm_ref, &[constant_v]);
+                        stackmap.push_placeholder(function_code_offset(&builder, done_call));
+                        let next_step = builder.inst_results(done_call)[0];
                         builder.ins().return_(&[next_step]);
                         builder.finalize();
                     }
@@ -11531,7 +11664,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             perform_ref,
                             outer_post_arm_k_push_ref,
                             run_loop_ref,
-                            next_step_done_ref: _,
                             next_step_discharged_ref: _,
                             last_terminal_tag_ref,
                             reset_last_terminal_tag_ref,
@@ -11540,6 +11672,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             continuation_identity_ref,
+                            body_return_arm_push_ref,
+                            body_return_arm_pop_ref,
+                            done_or_dispatch_return_arm_ref: _,
                             handler_arm_refs_per_handle,
                             handler_return_arm_refs_per_handle,
                             user_fn_refs,
@@ -11576,6 +11711,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_return_arm_synth: &handler_return_arm_synth,
                             handler_return_arm_indices: &handler_return_arm_indices,
                             continuation_identity_ref,
+                            body_return_arm_push_ref,
+                            body_return_arm_pop_ref,
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
@@ -12036,9 +12173,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_arm_ref,
                             handler_frame_set_return_ref,
                             perform_ref,
-                            outer_post_arm_k_push_ref: _,
+                            outer_post_arm_k_push_ref,
                             run_loop_ref,
-                            next_step_done_ref: _,
                             next_step_discharged_ref: _,
                             last_terminal_tag_ref,
                             reset_last_terminal_tag_ref,
@@ -12047,6 +12183,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             continuation_identity_ref,
+                            body_return_arm_push_ref,
+                            body_return_arm_pop_ref,
+                            done_or_dispatch_return_arm_ref: _,
                             handler_arm_refs_per_handle,
                             handler_return_arm_refs_per_handle,
                             user_fn_refs,
@@ -12083,6 +12222,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_return_arm_synth: &handler_return_arm_synth,
                             handler_return_arm_indices: &handler_return_arm_indices,
                             continuation_identity_ref,
+                            body_return_arm_push_ref,
+                            body_return_arm_pop_ref,
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
@@ -12215,6 +12356,67 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             let target_fn_addr =
                                 lowerer.builder.ins().func_addr(pointer_ty, target_fn_ref);
 
+                            // Task 78.5 G4 Approach 6 deep-redo +
+                            // Option (α) — push the synth-cont's
+                            // incoming post-arm-k pair onto
+                            // outer_post_arm_k_stack BEFORE the B.3
+                            // dispatch, then use (null, identity) as
+                            // the recursive callee's trailing pair.
+                            //
+                            // Pre-Option-(α): B.3 forwarded the
+                            // synth-cont's incoming post-arm-k pair
+                            // verbatim as the recursive callee's
+                            // trailing pair. That preserved only the
+                            // LATEST pair across recursion (each B.3
+                            // hop overwrites with the new arm body's
+                            // post-arm-k from the synth-cont's args
+                            // buffer, which itself comes from the
+                            // arm body's k(arg) trailing slots).
+                            // Generator's chain `Cons(1, k(0))`,
+                            // `Cons(2, k(0))`, `Cons(3, k(0))` lost
+                            // post_arm_k_1 and post_arm_k_2 by the
+                            // time iterate(Nil) ran.
+                            //
+                            // Push-onto-stack mirrors Slice C helper
+                            // Middle's pattern (codegen.rs:12119-
+                            // 12138). Each push lives within
+                            // sigil_run_loop's depth window and gets
+                            // popped by the trampoline's Done branch
+                            // when the deepest natural exit
+                            // (iterate(Nil)'s Approach 6 helper)
+                            // unwinds. With LIFO discipline and
+                            // pushes in source order x1, x2, x3, the
+                            // pops fire in order x3, x2, x1 — exactly
+                            // the inside-out order the Cons-builder
+                            // chain needs to construct
+                            // `Cons(1, Cons(2, Cons(3, wrapped)))`.
+                            //
+                            // The recursive callee's trailing pair
+                            // becomes (null, identity) — a no-op
+                            // continuation. The callee's compound-
+                            // match body (also B.1/B.2/B.3) doesn't
+                            // consume its args_ptr trailing pair
+                            // directly (perform sites use codegen-
+                            // time-determined synth-cont k_pairs);
+                            // only the callee's synth-cont reads the
+                            // trailing pair, which it then pushes
+                            // onto the stack itself at its own B.3
+                            // dispatch. So the (null, identity) we
+                            // write here is consumed only if the
+                            // callee's synth-cont fires B.3 again —
+                            // in which case the (null, identity)
+                            // gets pushed (a no-op pop later) and
+                            // overwritten with the callee's own
+                            // trailing pair from its k(arg) slots.
+                            let push_call = lowerer.builder.ins().call(
+                                outer_post_arm_k_push_ref,
+                                &[post_arm_k_closure, post_arm_k_fn],
+                            );
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                push_call,
+                            ));
+
                             // arg_count = N + 2 so the trampoline
                             // allocates an arena args buffer with room
                             // for the trailing pair.
@@ -12252,19 +12454,27 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     (i * 8) as i32,
                                 );
                             }
-                            // Forward the synth-cont's incoming post-
-                            // arm-k pair as the callee's trailing pair.
-                            // Offsets match the Cps callee's body emit
-                            // reading convention.
+                            // Trailing pair = (null, identity). The
+                            // post-arm-k pair has been pushed onto
+                            // outer_post_arm_k_stack above; the
+                            // callee's synth-cont (if any) sees this
+                            // trailing pair as its post-arm-k pair
+                            // and (per the B.3 stack-push pattern)
+                            // pushes (null, identity) onto the stack
+                            // — a degenerate no-op pop at unwind.
+                            let identity_fn_addr_v = lowerer
+                                .builder
+                                .ins()
+                                .func_addr(pointer_ty, continuation_identity_ref);
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
-                                post_arm_k_closure,
+                                null_closure_v,
                                 argp_v,
                                 k_closure_offset(user_arg_count),
                             );
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
-                                post_arm_k_fn,
+                                identity_fn_addr_v,
                                 argp_v,
                                 k_fn_offset(user_arg_count),
                             );
@@ -12461,10 +12671,29 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             .call(cps_fn_ref, &[closure_ptr_v, args_ptr, args_len_v]);
         let next_step = builder.inst_results(cps_call)[0];
 
+        // Task 78.5 G4 Approach 6 deep-redo (PR #80 review §1) —
+        // PUSH (null, null) onto BODY_RETURN_ARM_STACK around the
+        // nested run_loop. This Sync shim is the fn-as-value
+        // materialization path's equivalent of lower_call's
+        // direct-call Cps branch (Risk 3 discipline): the sub-Cps-fn
+        // call invoked through the materialized fn value must NOT
+        // inherit the surrounding body's return arm — so we mask
+        // with a null pair, run the trampoline, then pop. Pop's
+        // return value (the fired flag of the popped entry) is
+        // ignored — this site never has a return arm to dispatch.
+        let push_ref = module.declare_func_in_func(body_return_arm_push, builder.func);
+        let pop_ref = module.declare_func_in_func(body_return_arm_pop, builder.func);
+        let null_closure = builder.ins().iconst(pointer_ty, 0);
+        let null_fn = builder.ins().iconst(pointer_ty, 0);
+        builder.ins().call(push_ref, &[null_closure, null_fn]);
+
         // Drive the trampoline.
         let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
         let run_loop_call = builder.ins().call(run_loop_ref, &[next_step]);
         let raw_u64 = builder.inst_results(run_loop_call)[0];
+
+        // POP after run_loop — symmetric to push above.
+        builder.ins().call(pop_ref, &[]);
 
         // Narrow to ret_ty.
         let ret_v = if ret_ty == types::I64 {
@@ -12684,6 +12913,17 @@ struct Lowerer<'a, 'b> {
     /// arm body's `sigil_next_step_call` dispatches into the
     /// identity continuation, producing a terminal `Done(arg)`.
     continuation_identity_ref: FuncRef,
+    /// Task 78.5 G4 Approach 6 deep-redo (PR #80 review §1) —
+    /// body-return-arm stack helpers. Used by:
+    /// - **Custom handle body-call wrapper** for direct-Cps-call
+    ///   bodies: PUSH (return_arm_closure, return_arm_fn) before
+    ///   driving body's run_loop; POP after — pop returns the
+    ///   popped entry's `fired` flag for Phase 4g suppression.
+    /// - **`lower_call`'s `UserFnAbi::Cps` branch + Sync shim**:
+    ///   PUSH (null, null) to mask, POP after the nested run_loop
+    ///   (Risk 3 discipline).
+    body_return_arm_push_ref: FuncRef,
+    body_return_arm_pop_ref: FuncRef,
     /// Plan B Task 55 (Phase 3a) — effect-name → effect_id (u32) map
     /// from typecheck. `Expr::Handle` codegen looks up the handle's
     /// declared effect (the unique effect name in its arms; Phase 3a
@@ -12835,6 +13075,32 @@ struct Lowerer<'a, 'b> {
     arm_k_pair_captures: &'b BTreeMap<String, crate::closure_convert::ArmKPairCapture>,
 }
 
+/// Task 78.5 G4 Approach 6 deep-redo (PR #80 review §7) — free-fn
+/// kernel of `Lowerer::body_as_direct_cps_call`. Detects whether the
+/// handle expression's body is a direct call to a Cps-ABI top-level
+/// user fn. Returns `Some((name, args))` for the eligible shape,
+/// `None` otherwise.
+///
+/// `lookup_abi(name)` returns the ABI of `name` if it's a top-level
+/// user fn, otherwise `None`. The Lowerer wrapper passes
+/// `|n| self.user_fns.get(n).map(|e| e.abi)`; unit tests pass ad-hoc
+/// closures so the detector's structural rules can be pinned without
+/// constructing a full Lowerer.
+fn body_as_direct_cps_call_with_lookup(
+    body: &crate::ast::Expr,
+    lookup_abi: impl Fn(&str) -> Option<UserFnAbi>,
+) -> Option<(&str, &[crate::ast::Expr])> {
+    use crate::ast::Expr;
+    if let Expr::Call { callee, args, .. } = body {
+        if let Expr::Ident(name, _) = callee.as_ref() {
+            if matches!(lookup_abi(name), Some(UserFnAbi::Cps)) {
+                return Some((name.as_str(), args.as_slice()));
+            }
+        }
+    }
+    None
+}
+
 impl<'a, 'b> Lowerer<'a, 'b> {
     /// Lower a `Block`. Returns the tail expression's value if any,
     /// `None` when the block has no tail (statement-only block, value
@@ -12853,6 +13119,197 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// arg explicitly afterward and emits `sigil_next_step_call`.
     /// Mirrors `arm_body_tail_is_k_call`'s recursion shape so the two
     /// stay in lockstep.
+    /// Task 78.5 G4 Approach 6 deep-redo — detects whether the handle
+    /// expression's body is a direct call to a Cps-ABI top-level user
+    /// fn. Returns `Some((name, args))` for the eligible shape, `None`
+    /// otherwise.
+    ///
+    /// Thin Lowerer-method wrapper around the free helper
+    /// [`body_as_direct_cps_call_with_lookup`] — Lowerer instances
+    /// pass `self.user_fns` as the ABI lookup; unit tests bypass the
+    /// Lowerer and construct ad-hoc lookup closures (see the
+    /// `body_as_direct_cps_call_*` tests in this module).
+    ///
+    /// Used by `Expr::Handle`'s lower_expr arm to gate routing into
+    /// `lower_handle_body_direct_cps_call` (the custom Sync→Cps interop
+    /// wrapper that PUSHes the active handle's return-arm pair onto
+    /// BODY_RETURN_ARM_STACK, per Approach 6's deep-handler semantic
+    /// for the body fn).
+    fn body_as_direct_cps_call<'expr>(
+        &self,
+        body: &'expr crate::ast::Expr,
+    ) -> Option<(&'expr str, &'expr [crate::ast::Expr])> {
+        body_as_direct_cps_call_with_lookup(body, |name| {
+            self.user_fns.get(name).map(|entry| entry.abi)
+        })
+    }
+
+    /// Task 78.5 G4 Approach 6 deep-redo — custom Sync→Cps interop
+    /// wrapper for handle expression's body when the body is a direct
+    /// Cps user fn call AND the handle has a return arm.
+    ///
+    /// Mirrors `lower_call`'s `UserFnAbi::Cps` branch — packs user args +
+    /// (null, identity) trailing pair, calls the cps_fn, drives
+    /// `sigil_run_loop`, returns the trampoline's raw u64. Differences:
+    ///
+    /// - PUSH (ret_closure_ptr, ret_fn_ptr_v) onto BODY_RETURN_ARM_STACK
+    ///   before driving the body's nested `run_loop`; POP after. The
+    ///   helper at body-fn natural-exit emit sites reads the top entry
+    ///   and dispatches through this return arm for deep-handler
+    ///   semantic (PR #80 review §1: stack discipline replaces the
+    ///   prior single-cell TLS triplet).
+    /// - Returns a triple `(body_val, raw_u64, fired_v)`:
+    ///   - `body_val` is the trampoline's u64 narrowed to the callee's
+    ///     declared return type (B). Used by Phase 4g's non-suppression
+    ///     paths (discharge_block / normal_block) which expect
+    ///     body_val typed as B (so `type_of_expr`'s preview correctly
+    ///     resolves return-arm-binding references).
+    ///   - `raw_u64` is the trampoline's terminal u64, unchanged. Used
+    ///     by Phase 4g's suppression branch — when the helper fires,
+    ///     the bits hold the handle's overall (R, handler_overall_ty),
+    ///     not the body's B. Pre-narrowing to B would clip bits when
+    ///     R is wider than B (Item 4 / B!=R regression — covered by
+    ///     `task_78_5_g4_approach6_b_neq_r_*` tests).
+    ///   - `fired_v` is the popped entry's fired flag. Phase 4g's
+    ///     three-way branch reads it directly — no fresh TLS read,
+    ///     no action-at-a-distance Lowerer field (PR #80 review §2).
+    ///
+    /// Sub-Cps-fn calls inside the body fn route through `lower_call`'s
+    /// Cps branch which PUSHes (null, null) for its own nested
+    /// run_loop; the helper at the sub-call's natural-exit reads null
+    /// and emits Done(value) instead of dispatching the outer handle's
+    /// return arm (Risk 3 discipline).
+    ///
+    /// **Order of operations.** PUSH must happen BEFORE the cps_fn's
+    /// args are computed if those args could perform — but they can't,
+    /// because args are pure user expressions (the wrapper is gated on
+    /// `body_as_direct_cps_call` which only matches direct calls; arg
+    /// expressions are lowered by `lower_expr` and reach the heap or
+    /// runtime only through value-producing ops, none of which look at
+    /// `BODY_RETURN_ARM_STACK`). PUSH happens AFTER the cps_call
+    /// (which constructs `next_step` but doesn't enter the trampoline)
+    /// and BEFORE `run_loop`, mirroring the lower_call Cps branch's
+    /// push site. POP must happen AFTER `run_loop` returns and BEFORE
+    /// any outer code (the surrounding handle's pop-frames sequence)
+    /// reads the stack.
+    fn lower_handle_body_direct_cps_call(
+        &mut self,
+        name: &str,
+        args: &[crate::ast::Expr],
+        ret_closure_ptr: Value,
+        ret_fn_ptr_v: Value,
+    ) -> (Value, Value, Value) {
+        let callee_entry = self.user_fns.get(name).unwrap_or_else(|| {
+            unreachable!(
+                "lower_handle_body_direct_cps_call: caller must gate on \
+                 body_as_direct_cps_call which requires user_fns entry; got missing \
+                 entry for `{name}`"
+            )
+        });
+        let ret_ty = callee_entry.ret_ty;
+
+        // Pack user args + (null, identity) trailing pair into a stack
+        // slot of `(N + 2) * 8` bytes. Layout matches `lower_call`'s
+        // Cps branch.
+        let user_arg_count = args.len();
+        let slot_bytes = ((user_arg_count + 2) * 8) as u32;
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            slot_bytes,
+            3,
+        ));
+
+        for (i, arg_expr) in args.iter().enumerate() {
+            let arg_v = self.lower_expr(arg_expr);
+            let arg_ty = self.builder.func.dfg.value_type(arg_v);
+            let widened = if arg_ty == types::I64 {
+                arg_v
+            } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                self.builder.ins().uextend(types::I64, arg_v)
+            } else {
+                assert_eq!(
+                    arg_ty, self.pointer_ty,
+                    "codegen Approach 6 deep-redo: unexpected user-arg \
+                     Cranelift type {arg_ty:?} for handle body call to `{name}`"
+                );
+                arg_v
+            };
+            self.builder
+                .ins()
+                .stack_store(widened, slot, (i * 8) as i32);
+        }
+
+        let null_k_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+        let identity_k_fn = self
+            .builder
+            .ins()
+            .func_addr(self.pointer_ty, self.continuation_identity_ref);
+        self.builder
+            .ins()
+            .stack_store(null_k_closure, slot, k_closure_offset(user_arg_count));
+        self.builder
+            .ins()
+            .stack_store(identity_k_fn, slot, k_fn_offset(user_arg_count));
+
+        let args_ptr = self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
+        let args_len = self.builder.ins().iconst(types::I32, user_arg_count as i64);
+
+        let func_ref = self.user_fn_refs[name];
+        let null_closure_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
+        let cps_call = self
+            .builder
+            .ins()
+            .call(func_ref, &[null_closure_ptr, args_ptr, args_len]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, cps_call));
+        let next_step = self.builder.inst_results(cps_call)[0];
+
+        // PUSH the active handle's return-arm pair onto
+        // BODY_RETURN_ARM_STACK before driving the body's nested
+        // run_loop. The helper at body-fn natural-exit emit sites
+        // reads the top entry and dispatches through this return arm
+        // for deep-handler semantic.
+        self.builder.ins().call(
+            self.body_return_arm_push_ref,
+            &[ret_closure_ptr, ret_fn_ptr_v],
+        );
+
+        // Drive the trampoline. Returns u64.
+        let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[next_step]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
+        let raw_u64 = self.builder.inst_results(run_loop_call)[0];
+
+        // POP — symmetric with the PUSH above. The runtime returns the
+        // popped entry's `fired` flag (u8); we hand it back to Phase 4g
+        // alongside `raw_u64` so the suppression branch can decide
+        // without a fresh TLS read.
+        let pop_call = self.builder.ins().call(self.body_return_arm_pop_ref, &[]);
+        let fired_v = self.builder.inst_results(pop_call)[0];
+
+        // Narrow `raw_u64` to the callee's declared return type (B) for
+        // body_val. Phase 4g's discharge_block / normal_block paths
+        // expect body_val typed as B (so `type_of_expr`'s preview
+        // correctly resolves return-arm-binding references). The
+        // suppression branch sees `raw_u64` directly — bits there hold
+        // R (handler_overall_ty), not B. See the function doc-comment's
+        // B != R note.
+        let body_val = if ret_ty == types::I64 {
+            raw_u64
+        } else if ret_ty.is_int() && ret_ty.bits() < 64 {
+            self.builder.ins().ireduce(ret_ty, raw_u64)
+        } else {
+            debug_assert_eq!(
+                ret_ty, self.pointer_ty,
+                "codegen Approach 6 deep-redo: CPS callee `{name}` has \
+                 unexpected ret_ty {ret_ty:?}; expected I64 or pointer_ty"
+            );
+            raw_u64
+        };
+
+        (body_val, raw_u64, fired_v)
+    }
+
     fn lower_arm_body_pre_tail_k_stmts(&mut self, body: &crate::ast::Expr) {
         use crate::ast::Expr;
         if let Expr::Block(b) = body {
@@ -13380,6 +13837,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // through the body via Cranelift SSA / register
                 // allocator; no explicit stack slot needed.)
                 let mut frame_1_ptr_snapshot: Option<Value> = None;
+                // Task 78.5 G4 Approach 6 deep-redo — captured at the
+                // is_first_frame set_return site; consumed below in the
+                // custom direct-Cps-call body wrapper.
+                let mut pending_return_arm_pair: Option<(Value, Value)> = None;
                 for (groups_iter_index, (effect_name, arms_in_effect)) in groups.iter().enumerate()
                 {
                     let is_first_frame = groups_iter_index == 0;
@@ -13538,6 +13999,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                 &self.builder,
                                 set_return_call,
                             ));
+                            // Task 78.5 G4 Approach 6 deep-redo —
+                            // stash for the custom direct-Cps-call body
+                            // wrapper below.
+                            pending_return_arm_pair = Some((ret_closure_ptr, ret_fn_ptr_v));
                         }
                     }
 
@@ -13579,7 +14044,50 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, reset_v_call));
 
-                let body_val = self.lower_expr(body);
+                // Task 78.5 G4 Approach 6 deep-redo — if the body is a
+                // direct Cps user fn call AND the handle has a return
+                // arm, use a custom Sync→Cps interop wrapper instead of
+                // routing through `lower_call`'s standard Cps branch.
+                // The standard branch PUSHes (null, null) onto
+                // BODY_RETURN_ARM_STACK around the sub-call's nested
+                // run_loop (Risk 3 discipline) — but for the body itself
+                // we need a real (return_arm_closure, return_arm_fn)
+                // pair on top of the stack so the helper at the body-fn
+                // natural-exit emit sites (every call site of
+                // `done_or_dispatch_return_arm_ref` in this file) can
+                // dispatch through the active handle's return arm for
+                // deep-handler semantic.
+                //
+                // Detection: body is `Expr::Call { callee:
+                // Expr::Ident(name), args }` where `name` is a Cps-ABI
+                // top-level user fn AND `pending_return_arm_pair` was
+                // populated by the set_return site above.
+                //
+                // PR #80 review §2 — the wrapper returns
+                // `(body_val, raw_u64, fired_v)` so Phase 4g can consume
+                // `fired_v` directly (no action-at-a-distance via a
+                // Lowerer field). When the wrapper isn't taken,
+                // `wrapper_state` is `None` and Phase 4g's suppression
+                // branch is dead at runtime (no helper fires without
+                // a PUSH). `body_val` is always typed as the body's
+                // declared return type (B); `raw_u64` (the wrapper's
+                // pre-narrow trampoline u64) is held separately so the
+                // suppression branch can narrow I64 → R correctly when
+                // B and R differ in width (Item 4 / B!=R).
+                let (body_val, wrapper_state) =
+                    if let (Some((ret_closure_ptr, ret_fn_ptr_v)), Some((cps_name, cps_args))) =
+                        (pending_return_arm_pair, self.body_as_direct_cps_call(body))
+                    {
+                        let (b_val, raw_u64, fired_v) = self.lower_handle_body_direct_cps_call(
+                            cps_name,
+                            cps_args,
+                            ret_closure_ptr,
+                            ret_fn_ptr_v,
+                        );
+                        (b_val, Some((raw_u64, fired_v)))
+                    } else {
+                        (self.lower_expr(body), None)
+                    };
 
                 // Step 3: pop N frames in reverse push order. Capture
                 // the last pop's return value for the concern #1
@@ -13666,6 +14174,30 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         )
                     });
 
+                    // Task 78.5 G4 Approach 6 deep-redo — Phase 4g
+                    // suppression. If the helper at body-fn natural-
+                    // exit emit sites already wrapped via the return
+                    // arm (BODY_RETURN_ARM_FIRED set), `body_val`
+                    // already contains the chain-unwound, return-arm-
+                    // wrapped value (deep-handler semantic). Skip the
+                    // second nested `run_loop` that would otherwise
+                    // double-wrap. We compute handler_overall_ty up
+                    // front and three-way branch on
+                    // (fired, discharged, normal). The ABSENT-fired
+                    // path falls through to the existing
+                    // (discharge_block, normal_block) Phase 4g
+                    // dispatch.
+                    //
+                    // For the FIRED branch: widen body_val back to I64
+                    // (it was narrowed to ret_ty by the custom
+                    // body-call wrapper / lower_call's Cps branch but
+                    // the bits ARE handler_overall_ty bits because
+                    // the helper's NextStep::Call(return_arm, ...)
+                    // produced a handler_overall_ty value through the
+                    // body's run_loop), then narrow to
+                    // handler_overall_ty. Mirrors the discharge_block
+                    // u64→handler_overall_ty narrow.
+
                     // Widen body_val to I64 for the trailing-pair
                     // arg slot — mirrors `lower_perform_to_value`'s
                     // perform-side widening at codegen.rs:6504-6543.
@@ -13719,6 +14251,83 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     let merge_block = self.builder.create_block();
                     self.builder
                         .append_block_param(merge_block, handler_overall_ty);
+
+                    // Task 78.5 G4 Approach 6 deep-redo — three-way
+                    // branch (fired, discharged, normal). When the
+                    // custom body-call wrapper ran, `wrapper_state`
+                    // carries the popped fired flag from
+                    // BODY_RETURN_ARM_STACK. When the wrapper didn't
+                    // run (body wasn't a direct Cps call), no PUSH/POP
+                    // happened and FIRED is structurally false for this
+                    // body — encode that as a constant 0 so the
+                    // suppression branch is statically dead at runtime
+                    // (PR #80 review §2: explicit tuple return removes
+                    // the need for action-at-a-distance Lowerer state).
+                    let fired_v = if let Some((_, captured_fired)) = wrapper_state {
+                        captured_fired
+                    } else {
+                        self.builder.ins().iconst(types::I8, 0)
+                    };
+                    let zero_i8 = self.builder.ins().iconst(types::I8, 0);
+                    let is_fired = self.builder.ins().icmp(IntCC::NotEqual, fired_v, zero_i8);
+                    let suppression_block = self.builder.create_block();
+                    let post_suppression_block = self.builder.create_block();
+                    self.builder.ins().brif(
+                        is_fired,
+                        suppression_block,
+                        &[],
+                        post_suppression_block,
+                        &[],
+                    );
+
+                    // Suppression block: helper already wrapped via
+                    // return arm during body's run_loop. The right
+                    // source of bits is the wrapper's pre-narrow
+                    // `raw_u64` (the trampoline's terminal u64) — bits
+                    // hold handler_overall_ty (R) because the body's
+                    // run_loop drove return_arm → Done(R-typed value).
+                    // Re-widening `body_val` (B-typed, narrowed) would
+                    // zero-extend and clip when R is wider than B
+                    // (Item 4 / B != R). For the non-wrapper case
+                    // there is no `raw_u64`; the suppression branch is
+                    // dead at runtime (no helper fires without a PUSH)
+                    // but Cranelift requires valid IR — synthesize a
+                    // widen-from-body_val placeholder.
+                    self.builder.switch_to_block(suppression_block);
+                    self.builder.seal_block(suppression_block);
+                    let suppression_widened = if let Some((raw_u64, _)) = wrapper_state {
+                        raw_u64
+                    } else if body_ty == types::I64 {
+                        body_val
+                    } else if body_ty.is_int() && body_ty.bits() < 64 {
+                        self.builder.ins().uextend(types::I64, body_val)
+                    } else {
+                        // pointer_ty — bit-identical to I64.
+                        body_val
+                    };
+                    let suppression_val = if handler_overall_ty == types::I64 {
+                        suppression_widened
+                    } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
+                        self.builder
+                            .ins()
+                            .ireduce(handler_overall_ty, suppression_widened)
+                    } else {
+                        // pointer_ty — bit-identical to I64.
+                        debug_assert_eq!(
+                            handler_overall_ty, self.pointer_ty,
+                            "codegen Approach 6 deep-redo suppression: unexpected \
+                             handler_overall_ty {handler_overall_ty:?}"
+                        );
+                        suppression_widened
+                    };
+                    self.builder
+                        .ins()
+                        .jump(merge_block, &[suppression_val.into()]);
+
+                    // post_suppression_block: existing (discharge,
+                    // normal) branching unchanged.
+                    self.builder.switch_to_block(post_suppression_block);
+                    self.builder.seal_block(post_suppression_block);
                     self.builder
                         .ins()
                         .brif(is_discharged, discharge_block, &[], normal_block, &[]);
@@ -14652,12 +15261,32 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             .push_placeholder(function_code_offset(&self.builder, cps_call));
                         let next_step = self.builder.inst_results(cps_call)[0];
 
+                        // Task 78.5 G4 Approach 6 deep-redo (PR #80
+                        // review §1): PUSH (null, null) onto
+                        // BODY_RETURN_ARM_STACK before the nested
+                        // run_loop, POP after. The null pair masks the
+                        // outer body's return arm — the helper at the
+                        // sub-call's natural-exit reads the top entry,
+                        // sees null, and emits Done(value) instead of
+                        // dispatching the outer handle's return arm
+                        // (Risk 3 discipline). Pop's return value
+                        // (popped fired flag) is ignored — sub-calls
+                        // never have their own return arm.
+                        let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+                        let null_fn = self.builder.ins().iconst(self.pointer_ty, 0);
+                        self.builder
+                            .ins()
+                            .call(self.body_return_arm_push_ref, &[null_closure, null_fn]);
+
                         // Drive the trampoline. Returns u64.
                         let run_loop_call =
                             self.builder.ins().call(self.run_loop_ref, &[next_step]);
                         self.stackmap
                             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
                         let raw_u64 = self.builder.inst_results(run_loop_call)[0];
+
+                        // POP — symmetric with the PUSH above.
+                        self.builder.ins().call(self.body_return_arm_pop_ref, &[]);
 
                         // Narrow `raw_u64` back to the callee's
                         // declared return type. Mirrors the
@@ -17334,7 +17963,6 @@ struct PerFnRefsCtx<'a> {
     /// Middle's emit before sigil_perform.
     outer_post_arm_k_push: cranelift_module::FuncId,
     run_loop: cranelift_module::FuncId,
-    next_step_done: cranelift_module::FuncId,
     /// Stage-6.8-followup Bug 2 fix — `sigil_next_step_discharged`
     /// FuncId. Op arm fn body's discard-`k` tail emit replaces
     /// `next_step_done` with this so the trampoline's
@@ -17365,6 +17993,12 @@ struct PerFnRefsCtx<'a> {
     next_step_call: cranelift_module::FuncId,
     next_step_args_ptr: cranelift_module::FuncId,
     continuation_identity: cranelift_module::FuncId,
+    /// Task 78.5 G4 Approach 6 deep-redo (PR #80 review §1) —
+    /// body-return-arm stack helpers. See
+    /// `runtime/src/handlers.rs::BODY_RETURN_ARM_STACK`.
+    body_return_arm_push: cranelift_module::FuncId,
+    body_return_arm_pop: cranelift_module::FuncId,
+    done_or_dispatch_return_arm: cranelift_module::FuncId,
     handler_arm_indices: &'a BTreeMap<Span, Vec<usize>>,
     handler_arm_synth: &'a [HandlerArmSynth],
     /// Plan B Task 55 (Phase 4g) — per-handle return-arm `FuncId` if
@@ -17417,7 +18051,6 @@ struct PerFnRefs {
     /// `sigil_outer_post_arm_k_push` FuncRef, used by B.2 helper Middle's emit.
     outer_post_arm_k_push_ref: FuncRef,
     run_loop_ref: FuncRef,
-    next_step_done_ref: FuncRef,
     /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::next_step_discharged`.
     next_step_discharged_ref: FuncRef,
     /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::last_terminal_tag`.
@@ -17431,6 +18064,11 @@ struct PerFnRefs {
     next_step_call_ref: FuncRef,
     next_step_args_ptr_ref: FuncRef,
     continuation_identity_ref: FuncRef,
+    /// Task 78.5 G4 Approach 6 deep-redo (PR #80 review §1) —
+    /// body-return-arm stack helpers.
+    body_return_arm_push_ref: FuncRef,
+    body_return_arm_pop_ref: FuncRef,
+    done_or_dispatch_return_arm_ref: FuncRef,
     handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>>,
     /// Plan B Task 55 (Phase 4g) — per-handle return-arm `FuncRef` if
     /// the handle has a return arm; absent otherwise. Keyed by handle
@@ -17452,13 +18090,13 @@ struct PerFnRefs {
 /// side-table reflections needed to lower a fn body.
 ///
 /// Replaces ~70 LOC of duplicated FFI-ref + lit_gv + handler_arm_refs +
-/// user_fn_refs setup at three sites in `emit_object`. The three sites
+/// user_fn_refs setup at multiple sites in `emit_object`. The sites
 /// have slightly different needs — the user-fn site doesn't use the
-/// `next_step_done_ref` / `next_step_call_ref` / `next_step_args_ptr_ref`
-/// trio, and the synth-cont site doesn't use the tail-`k` refs — but
-/// over-declaring here is cheap: unreferenced FuncRefs sit in the
-/// function's `dfg.ext_funcs` table without producing relocations, so
-/// the emitted object code is unaffected.
+/// `next_step_call_ref` / `next_step_args_ptr_ref` pair, and the
+/// synth-cont site doesn't use the tail-`k` refs — but over-declaring
+/// here is cheap: unreferenced FuncRefs sit in the function's
+/// `dfg.ext_funcs` table without producing relocations, so the emitted
+/// object code is unaffected.
 fn prepare_builtin_func_refs(
     module: &mut ObjectModule,
     builder: &mut FunctionBuilder<'_>,
@@ -17548,7 +18186,6 @@ fn prepare_per_fn_refs(
     let outer_post_arm_k_push_ref =
         module.declare_func_in_func(ctx.outer_post_arm_k_push, builder.func);
     let run_loop_ref = module.declare_func_in_func(ctx.run_loop, builder.func);
-    let next_step_done_ref = module.declare_func_in_func(ctx.next_step_done, builder.func);
     let next_step_discharged_ref =
         module.declare_func_in_func(ctx.next_step_discharged, builder.func);
     let last_terminal_tag_ref = module.declare_func_in_func(ctx.last_terminal_tag, builder.func);
@@ -17562,6 +18199,12 @@ fn prepare_per_fn_refs(
     let next_step_args_ptr_ref = module.declare_func_in_func(ctx.next_step_args_ptr, builder.func);
     let continuation_identity_ref =
         module.declare_func_in_func(ctx.continuation_identity, builder.func);
+    let body_return_arm_push_ref =
+        module.declare_func_in_func(ctx.body_return_arm_push, builder.func);
+    let body_return_arm_pop_ref =
+        module.declare_func_in_func(ctx.body_return_arm_pop, builder.func);
+    let done_or_dispatch_return_arm_ref =
+        module.declare_func_in_func(ctx.done_or_dispatch_return_arm, builder.func);
 
     // Per-handle synth-arm-fn FuncRefs, keyed by handle span. Built
     // from the `handler_arm_indices` side-table (one entry per
@@ -17643,7 +18286,6 @@ fn prepare_per_fn_refs(
         perform_ref,
         outer_post_arm_k_push_ref,
         run_loop_ref,
-        next_step_done_ref,
         next_step_discharged_ref,
         last_terminal_tag_ref,
         reset_last_terminal_tag_ref,
@@ -17652,6 +18294,9 @@ fn prepare_per_fn_refs(
         next_step_call_ref,
         next_step_args_ptr_ref,
         continuation_identity_ref,
+        body_return_arm_push_ref,
+        body_return_arm_pop_ref,
+        done_or_dispatch_return_arm_ref,
         handler_arm_refs_per_handle,
         handler_return_arm_refs_per_handle,
         user_fn_refs,
@@ -22328,5 +22973,189 @@ mod tests {
             "B.3 detector should reject ctor-shaped calls (Cons isn't \
              a user fn; lookup returns None)"
         );
+    }
+
+    // ======================================================================
+    // Task 78.5 G4 Approach 6 deep-redo (PR #80 review §7) — Lowerer's
+    // `body_as_direct_cps_call` shape detector tests.
+    //
+    // The detector at `body_as_direct_cps_call_with_lookup` (free
+    // helper; the Lowerer method is a thin wrapper) returns
+    // `Some((name, args))` iff the handle body is a direct call to a
+    // Cps-ABI top-level user fn. The handle expression's `lower_expr`
+    // arm uses this signal to gate routing into
+    // `lower_handle_body_direct_cps_call`, which PUSHes the active
+    // handle's return-arm pair onto BODY_RETURN_ARM_STACK around the
+    // body's nested run_loop (so the helper at body-fn natural-exit
+    // emit sites can dispatch through the active handle's return arm
+    // for deep-handler semantic).
+    //
+    // These tests pin the structural acceptance/rejection invariants;
+    // the IR-level emission path is exercised end-to-end by the e2e
+    // tests in `compiler/tests/e2e.rs` (Generator, B!=R, Risk 3 matrix,
+    // DISCHARGED-bypass, nested handles).
+    //
+    // Ported from the now-removed PR #75 `b4_handle_body_is_cps_user_-
+    // fn_call` test suite to keep coverage of the detector contract.
+    // ======================================================================
+
+    /// Build a minimal `Expr::Call { callee: Ident(name), args: [] }`.
+    fn body_as_direct_cps_call_make_call_expr(name: &str) -> crate::ast::Expr {
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        Expr::Call {
+            callee: Box::new(Expr::Ident(name.to_string(), span.clone())),
+            args: vec![],
+            span,
+        }
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_accepts_direct_call_to_cps_user_fn() {
+        // Body shape: `iterate()` where `iterate` is a top-level user
+        // fn with Cps ABI. The detector returns Some so the handle
+        // expression routes into `lower_handle_body_direct_cps_call`.
+        let body = body_as_direct_cps_call_make_call_expr("iterate");
+        let result = body_as_direct_cps_call_with_lookup(&body, |name| {
+            (name == "iterate").then_some(UserFnAbi::Cps)
+        });
+        assert_eq!(
+            result.map(|(n, args)| (n, args.len())),
+            Some(("iterate", 0)),
+            "Approach 6 detector should accept direct call to Cps user fn"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_rejects_call_to_sync_user_fn() {
+        // Body shape: `comp()` where `comp` is a top-level user fn but
+        // with Sync ABI. The standard sync body lowering handles Sync
+        // callees correctly; Approach 6's wrapper only applies to Cps
+        // callees (where the body's nested run_loop hosts the helper
+        // dispatch).
+        let body = body_as_direct_cps_call_make_call_expr("comp");
+        let result = body_as_direct_cps_call_with_lookup(&body, |name| {
+            (name == "comp").then_some(UserFnAbi::Sync)
+        });
+        assert!(
+            result.is_none(),
+            "Approach 6 detector should reject Sync-ABI callees \
+             (standard sync body lowering handles them)"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_rejects_unknown_callee() {
+        // Body shape: `mystery()` where `mystery` is NOT a top-level
+        // user fn (could be a constructor, a local fn-typed binding,
+        // or simply unresolved). The detector returns None; the
+        // handle expression falls through to standard `lower_expr`,
+        // which then dispatches according to the standard rules.
+        let body = body_as_direct_cps_call_make_call_expr("mystery");
+        let result = body_as_direct_cps_call_with_lookup(&body, |_| None);
+        assert!(
+            result.is_none(),
+            "Approach 6 detector should reject unknown callees (not in user_fns)"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_rejects_non_call_body() {
+        // Body shape: an integer literal. Not a call at all; the
+        // standard `lower_expr` produces an inline `iconst` value. No
+        // trampoline body call to wrap, so Approach 6 doesn't apply.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let body = Expr::IntLit(42, Span::synthetic("x.sigil"));
+        let result = body_as_direct_cps_call_with_lookup(&body, |_| Some(UserFnAbi::Cps));
+        assert!(
+            result.is_none(),
+            "Approach 6 detector should reject non-Call body shapes"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_rejects_indirect_call_callee_shape() {
+        // Body shape: `(get_fn())()` — the callee is itself a call,
+        // not an Ident. This is the indirect-call shape (e.g., `body()`
+        // in run_state where `body` is a fn parameter). The detector
+        // returns None; standard lowering takes the indirect-call path
+        // via `local_fn_types` / `call_callee_tys`. Critically, this
+        // means run_state's `body()` body shape is unaffected by
+        // Approach 6 — the existing run_state ships unchanged.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let inner_call = Expr::Call {
+            callee: Box::new(Expr::Ident("get_fn".to_string(), span.clone())),
+            args: vec![],
+            span: span.clone(),
+        };
+        let body = Expr::Call {
+            callee: Box::new(inner_call),
+            args: vec![],
+            span,
+        };
+        let result = body_as_direct_cps_call_with_lookup(&body, |_| Some(UserFnAbi::Cps));
+        assert!(
+            result.is_none(),
+            "Approach 6 detector should reject indirect-call shapes \
+             (callee is not an Ident); preserves run_state's body() lowering"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_rejects_call_with_args_when_callee_unknown() {
+        // Edge: the call has args but the callee isn't in user_fns.
+        // Detector returns None regardless of args. (Documents that
+        // arg shape doesn't influence detection — only callee-name
+        // resolution + ABI check do.)
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Call {
+            callee: Box::new(Expr::Ident("Cons".to_string(), span.clone())),
+            args: vec![
+                Expr::IntLit(1, span.clone()),
+                Expr::Ident("rest".to_string(), span.clone()),
+            ],
+            span,
+        };
+        // Cons is a constructor; not in user_fns (so lookup returns None).
+        let result = body_as_direct_cps_call_with_lookup(&body, |_| None);
+        assert!(
+            result.is_none(),
+            "Approach 6 detector should reject ctor-shaped calls (Cons isn't \
+             a user fn; lookup returns None)"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_threads_args_through_to_caller() {
+        // Approach 6 / Item 7 specific: confirm the args slice is
+        // propagated correctly. The wrapper needs to lower each arg
+        // expression for its Cps-call's stack-slot pack — the detector
+        // returning the args slice (not just the name) saves the
+        // caller from re-walking the AST.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Call {
+            callee: Box::new(Expr::Ident("iterate".to_string(), span.clone())),
+            args: vec![
+                Expr::IntLit(1, span.clone()),
+                Expr::Ident("xs".to_string(), span.clone()),
+            ],
+            span,
+        };
+        let result = body_as_direct_cps_call_with_lookup(&body, |name| {
+            (name == "iterate").then_some(UserFnAbi::Cps)
+        });
+        let (name, args) = result.expect("should accept Cps user fn call with args");
+        assert_eq!(name, "iterate");
+        assert_eq!(args.len(), 2, "args slice should preserve length");
+        assert!(matches!(args[0], Expr::IntLit(1, _)));
+        assert!(matches!(args[1], Expr::Ident(ref n, _) if n == "xs"));
     }
 }
