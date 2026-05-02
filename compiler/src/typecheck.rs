@@ -2384,6 +2384,26 @@ impl Tc {
         ));
     }
 
+    /// Task 78.5 G6 — shared E0137 emission for unbound row-variable
+    /// names. Used by both the `TypeExpr::Fn` walk in
+    /// `check_type_expr_known` (annotation position) and the
+    /// `Expr::Lambda` arm in `check_expr` (expression position).
+    /// Wording is generalised to "fn-type or lambda rows" so the same
+    /// string covers both call sites.
+    fn e0137_unbound_row_var(&mut self, name: &str, span: Span) {
+        self.push_error(
+            "E0137",
+            span,
+            format!(
+                "row variable `{}` is not bound by the enclosing function — \
+                 declare it on the fn's row (e.g. `fn f(...) -> R ![| {}]` or \
+                 `![<effects> | {}]`) so the row variable can be referenced in \
+                 fn-type or lambda rows",
+                name, name, name,
+            ),
+        );
+    }
+
     // ---------- Plan B task 48 — HM unification helpers ----------
 
     fn fresh_ty_var(&mut self) -> u32 {
@@ -3378,17 +3398,7 @@ impl Tc {
                 // pointing to the missing declaration.
                 if let Some(rv) = &fty.effect_row_var {
                     if !self.current_row_var_subst.contains_key(&rv.name) {
-                        self.push_error(
-                            "E0137",
-                            rv.span.clone(),
-                            format!(
-                                "row variable `{}` is not bound by the enclosing function — \
-                                 declare it on the fn's row (e.g. `fn f(...) -> R ![| {}]` or \
-                                 `![<effects> | {}]`) so the row variable can be referenced in \
-                                 inner fn-type rows",
-                                rv.name, rv.name, rv.name,
-                            ),
-                        );
+                        self.e0137_unbound_row_var(&rv.name, rv.span.clone());
                     }
                 }
             }
@@ -4475,22 +4485,39 @@ impl Tc {
                 // enclosing binder exists, and G6 now treats a non-
                 // empty subst with no matching name as "user named a
                 // row var that isn't in scope" — a precision E0137.
+                //
+                // Asymmetry with `TypeExpr::Fn`'s E0137 path (intentional,
+                // long-term design — rank-1 ML preservation):
+                //
+                // * `TypeExpr::Fn` (annotation position, check_type_-
+                //   expr_known above) fires E0137 **unconditionally**
+                //   when the named row var isn't in `current_row_var_-
+                //   subst`. Annotations carry stronger user intent —
+                //   they're declarative type expressions and a stray
+                //   name there is always a typo / scope error.
+                //
+                // * `Expr::Lambda` (here, expression position) fires
+                //   E0137 only when the subst is **non-empty** and the
+                //   name doesn't match. Empty subst = "no enclosing
+                //   row var at all" → silent degradation to a closed
+                //   surface row, which preserves rank-1 ML (lambdas
+                //   never introduce a fresh generalised row var of
+                //   their own). Non-empty subst with no matching name
+                //   = "row var available but user named a different
+                //   one" → the precision E0137 added by G6.
+                //
+                // Both paths converge in spirit: when an enclosing
+                // row-var context exists, both reject unbound names.
+                // They diverge only in the "no enclosing row var"
+                // case, where annotation strictness > expression
+                // permissiveness — a deliberate trade-off, not a bug
+                // to harmonise.
                 let lambda_row_var_id: Option<u32> = effect_row_var
                     .as_ref()
                     .and_then(|rv| self.current_row_var_subst.get(&rv.name).copied());
                 if let Some(rv) = effect_row_var.as_ref() {
                     if lambda_row_var_id.is_none() && !self.current_row_var_subst.is_empty() {
-                        self.push_error(
-                            "E0137",
-                            rv.span.clone(),
-                            format!(
-                                "row variable `{}` is not bound by the enclosing function — \
-                                 declare it on the fn's row (e.g. `fn f(...) -> R ![| {}]` or \
-                                 `![<effects> | {}]`) so the row variable can be referenced in \
-                                 inner fn-type rows",
-                                rv.name, rv.name, rv.name,
-                            ),
-                        );
+                        self.e0137_unbound_row_var(&rv.name, rv.span.clone());
                     }
                 }
                 // Plan D Task 114 — lambda's row carries args (same
