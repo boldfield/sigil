@@ -16352,23 +16352,28 @@ fn is_compound_match_with_arm_perform_body(
 ///
 /// - `PerformThenTail`: the arm body is `Block { stmts: [Stmt::Let(_,
 ///   Expr::Perform(_)) | Stmt::Perform(_)], tail: Some(_) }` with all
-///   perform args pure.
-/// - `ConstantDone`: the arm body is a constant literal (IntLit /
-///   BoolLit / CharLit) that lowers cleanly to `NextStep::Done(const)`.
+///   perform args pure. Tail-shape validation is intentionally
+///   permissive here (any non-`None` tail is accepted) — Phase B's
+///   synth-cont lowering pass has the context to reject tails it can't
+///   emit (non-pure / non-tail-call), so the classifier focuses on the
+///   surrounding structural shape only.
+/// - `ConstantDone`: the arm body is an `IntLit` at the arm's tail
+///   position. MVP is `IntLit`-only because the iterate-Generator
+///   driver only needs `Int` discriminants (`Nil => 0`). Widening to
+///   `BoolLit` / `CharLit` is queued for Phase B+ (will need a small
+///   `NextStep::Done` constant-kind extension on the lowering side).
 /// - `Unsupported`: anything else (forces the parent classifier to
 ///   return None — falls through to the existing Sync ABI path).
-///
-/// Phase A scope: only IntLit constant arms are accepted (matches the
-/// iterate test's `Nil => 0` and the parser-style `match Cons | Nil`
-/// shape). Future widenings add BoolLit / pure compound tails.
 #[allow(dead_code)]
 fn arm_body_perform_then_tail_shape(
     arm_body: &crate::ast::Expr,
     ctors: &std::collections::BTreeSet<String>,
 ) -> ArmBodyShape {
     use crate::ast::{Expr, Stmt};
-    // Constant-tail shape: literal at the arm's tail position, no
+    // Constant-tail shape: IntLit at the arm's tail position, no
     // wrapping block. Lowers to NextStep::Done(constant) directly.
+    // MVP: IntLit only — see the function docstring for the BoolLit /
+    // CharLit widening note.
     if matches!(arm_body, Expr::IntLit(..)) {
         return ArmBodyShape::ConstantDone;
     }
@@ -16390,6 +16395,12 @@ fn arm_body_perform_then_tail_shape(
     if !perform.args.iter().all(|a| expr_is_pure(a, ctors)) {
         return ArmBodyShape::Unsupported;
     }
+    // NOTE: tail validation is intentionally deferred to Phase B's
+    // lowering pass. The classifier accepts any non-`None` tail — Phase
+    // B has the context (effect rows, types, fn-table membership) to
+    // reject tails the synth-cont can't emit. Keeping it permissive
+    // here avoids duplicating that logic and lets the classifier focus
+    // on the structural `let perform; tail` shape.
     if block.tail.is_none() {
         return ArmBodyShape::Unsupported;
     }
@@ -18918,6 +18929,47 @@ mod tests {
         let m = is_compound_match_with_arm_perform_body(&body, &ctors)
             .expect("Stmt::Perform shape should match G4 classifier");
         assert_eq!(m, vec![1]);
+    }
+
+    #[test]
+    fn g4_shape_detector_accepts_named_binding_in_perform_arm() {
+        // Cons arm body shape:
+        //   { let v: Int = perform Gen.yield(x); iterate(rest_appending(v)) }
+        // — same `let-perform-then-tail` structure as the iterate test, but
+        // the let-binding has a real name (`v`) and the tail uses it.
+        // The classifier ignores `let_stmt.name` (only inspects the
+        // structural shape: single Stmt::Let with Expr::Perform value, then
+        // a tail), so this MUST classify as PerformThenTail today.
+        //
+        // NOTE: Phase B's synth-cont lowering may distinguish captured
+        // (`v` used in tail) vs discarded (`_`) bindings — that is a
+        // lowering concern. This test asserts the *current* classifier
+        // contract: binding name does not gate Phase A acceptance.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let cons_arm = g4_block_let_perform_then_tail(
+            "v",
+            "Gen",
+            "yield",
+            vec![Expr::Ident("x".to_string(), span.clone())],
+            Expr::Call {
+                callee: Box::new(Expr::Ident("rest_appending".to_string(), span.clone())),
+                args: vec![Expr::Ident("v".to_string(), span.clone())],
+                span: span.clone(),
+            },
+        );
+        let body = g4_match_xs_nil_then_cons(cons_arm);
+        let ctors: std::collections::BTreeSet<String> = ["Nil".to_string(), "Cons".to_string()]
+            .into_iter()
+            .collect();
+        let m = is_compound_match_with_arm_perform_body(&body, &ctors)
+            .expect("named-binding perform-then-tail shape should match G4 classifier");
+        assert_eq!(
+            m,
+            vec![1],
+            "Cons arm with named binding `v` is the perform-bearing arm"
+        );
     }
 
     #[test]
