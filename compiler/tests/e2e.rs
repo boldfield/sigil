@@ -8240,10 +8240,134 @@ fn task_78_5_g4_b1_non_recursive_compound_match_with_perform_arm_emits_and_runs(
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "99\n",
-        "B.1 emit branch should drive the perform-bearing arm through the \
-         Lowerer's identity-k_fn path; arm tail `99` should reach \
-         `NextStep::Done` and unwind to main's `result` binding; \
-         stderr={stderr:?}"
+        "Post-B.2 the perform-bearing arm should now route through a \
+         synth-cont (CompoundMatchArmPostPerform) rather than identity-k_fn; \
+         arm tail `99` lowers to `NextStep::Done(99)` from the synth-cont \
+         and unwinds to main's `result` binding (no arm-pattern captures \
+         since `99` is a literal — exercises the empty-captures synth-cont \
+         path). stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Phase B.2 — synth-cont captures arm-pattern binding
+/// into env.**
+///
+/// Pins B.2's arm-pattern capture machinery: the perform-arm's tail
+/// references an arm-pattern binding (`x` from `Cons(x, _)`), so the
+/// synth-cont's closure record must hold `x` and the synth-cont body
+/// must load it into env before lowering the tail. Independent of B.3
+/// (no recursive Cps→Cps tail call) — the tail is a pure `x + 1`.
+///
+/// Pre-B.2: identity-k_fn path runs the perform synchronously inside
+/// the parent fn's stack frame, then the arm body's tail `x + 1` is
+/// lowered with `x` already in env (no captures needed at that path).
+/// Output `"8\n"` from `7 + 1`.
+///
+/// Post-B.2: parent fn returns NextStep::Call from sigil_perform; arm
+/// body's `k(0)` lands in our synth-cont; synth-cont loads `x` from
+/// closure record (offset 16), env binds `x`, lowers `x + 1` → 8 via
+/// the standard Lowerer; widens to I64; dispatches Done(8) through
+/// the args_ptr trailing pair (`(null, identity)` for tail-`k` arm).
+/// Same observable output `"8\n"`. The change is in the codegen
+/// pipeline — the test asserts behavioral equivalence under the new
+/// emit path AND that the `x` capture round-trips correctly through
+/// the closure record.
+///
+/// **Invariant**: stdout = `"8\n"`, exit 0.
+#[test]
+fn task_78_5_g4_b2_synth_cont_captures_arm_pattern_binding_in_tail() {
+    let src = "import std.io\n\
+               \n\
+               effect Gen { yield: (Int) -> Int }\n\
+               \n\
+               type IntList = | Nil | Cons(Int, IntList)\n\
+               \n\
+               fn yield_x_plus_one(xs: IntList) -> Int ![Gen] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(x, _) => {\n      \
+                     let _: Int = perform Gen.yield(x);\n      \
+                     x + 1\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: IntList = Cons(7, Nil);\n  \
+                 let result: Int = handle yield_x_plus_one(xs) with {\n    \
+                   Gen.yield(_x, k) => k(0),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_b2_synth_cont_captures_arm_pattern_binding",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "8\n",
+        "B.2's synth-cont should capture `x` (arm-pattern binding from \
+         `Cons(x, _)`) into the closure record, load it into env at \
+         synth-cont entry, then lower `x + 1` to 8. stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Phase B.2 — synth-cont captures multiple arm-pattern
+/// bindings (x AND rest) into env.**
+///
+/// Pins B.2's multi-capture machinery: the perform-arm's tail
+/// references TWO arm-pattern bindings (`x` and a function of `rest`'s
+/// shape via match destructure). Closure record must hold both at the
+/// correct offsets; synth-cont loads both into env before lowering the
+/// tail.
+///
+/// Pin shape: tail `match rest { Cons(_, _) => x + 100, Nil => x }` —
+/// no recursive Cps→Cps call (tail uses only locals + arm-pattern
+/// bindings). Result: `xs = Cons(7, Nil)`, so the inner match dispatches
+/// `Nil` → returns `x` = 7.
+///
+/// **Invariant**: stdout = `"7\n"`, exit 0.
+#[test]
+fn task_78_5_g4_b2_synth_cont_captures_two_arm_pattern_bindings() {
+    let src = "import std.io\n\
+               \n\
+               effect Gen { yield: (Int) -> Int }\n\
+               \n\
+               type IntList = | Nil | Cons(Int, IntList)\n\
+               \n\
+               fn classify(xs: IntList) -> Int ![Gen] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(x, rest) => {\n      \
+                     let _: Int = perform Gen.yield(x);\n      \
+                     match rest {\n        \
+                       Cons(_, _) => x + 100,\n        \
+                       Nil => x,\n      \
+                     }\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: IntList = Cons(7, Nil);\n  \
+                 let result: Int = handle classify(xs) with {\n    \
+                   Gen.yield(_x, k) => k(0),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_b2_synth_cont_captures_two_arm_pattern_bindings",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "B.2's synth-cont should capture BOTH `x` and `rest` into the \
+         closure record; synth-cont loads both, lowers `match rest {{ \
+         ... }}` with `x` and `rest` bound. xs = Cons(7, Nil) → rest = \
+         Nil → returns `x` = 7. stderr={stderr:?}"
     );
 }
 
