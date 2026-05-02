@@ -8658,20 +8658,85 @@ fn task_78_5_pending_g3_raise_in_if_branch_expr_position_polymorphism() {
     );
 }
 
-/// **Task 78.5 — State+Choose Plotkin combo, state(amb) order [PENDING `_pending_row_poly_bracketed_alias_unconstrained`].**
+/// **Task 78.5 G2.a — minimal regression pin: bracketed `[e]` aliases
+/// row var, no lambda involvement.**
+///
+/// Constructed (not Koka-imported). Isolates G2.a alone — single
+/// row-poly fn `ask_then_double[e]` with bracketed `[e]` aliasing the
+/// `| e` row variable, plus a single-arm handle that doesn't introduce
+/// any lambda with a row-bearing surface row. Sister test
+/// `task_78_5_pending_g2a_bracketed_e_alias_unconstrained` (still
+/// `#[ignore]`'d below, blocked on G2.b) is the third-party-grounded
+/// Plotkin port that exercises G2.a + G2.b together.
+///
+/// ## Pre-fix failure
+///
+/// E0132 "ambiguous polymorphism: type parameter `e` of
+/// `ask_then_double` is unconstrained at this call site" at
+/// `ask_then_double(doer)`. Pre-fix, the parser produces both
+/// `f.generic_params = [GenericParam{e}]` (TYPE kind, from the
+/// bracketed `[e]`) and `f.effect_row_var = Some(RowVar{e})` (ROW
+/// kind, from `| e`). The type-kind alias is allocated at scheme
+/// registration but never pinned by any body reference (the body uses
+/// `e` only in row positions), so the post-typecheck E0132 sweep at
+/// typecheck.rs:1346-1370 reports it unconstrained at every call.
+///
+/// ## Post-fix invariant
+///
+/// `effective_fn_generic_params` strips the alias at scheme
+/// registration / `check_fn` entry; the type-var slot is never
+/// allocated and the sweep sees no unbound var. The handler resumes
+/// `Eff.ask` with `21`; `doer` returns `21 + 21 = 42`. stdout =
+/// `"42\n"`, exit 0.
+#[test]
+fn task_78_5_g2a_minimal_bracketed_e_alias_typechecks() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { ask: () -> Int }\n\
+               \n\
+               fn ask_then_double[e](action: () -> Int ![Eff | e]) -> Int ![| e] {\n  \
+                 handle action() with {\n    \
+                   Eff.ask(k) => k(21),\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn doer() -> Int ![Eff] {\n  \
+                 let v: Int = perform Eff.ask();\n  \
+                 v + v\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = ask_then_double(doer);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_g2a_minimal_bracketed_e_alias");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "ask_then_double resumes Eff.ask with 21; doer returns 21+21=42; \
+         stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 — State+Choose Plotkin combo, state(amb) order [STILL PENDING — G2.b blocking].**
 ///
 /// Source pattern: `koka/test/algeff/effs1a.kk` test2 — the canonical
 /// "stateful nondeterminism" demo from algebraic-effects literature.
 ///
-/// ## Status — gap representative for G2.a
+/// ## Status — gap representative for G2.a + G2.b combined
 ///
-/// **`#[ignore]`'d**: surfaced E0132 "ambiguous polymorphism: type
-/// parameter `e` of `amb_handle` is unconstrained at this call site".
-/// Originally suspected to share a root with the multi-effect
-/// interpreter port (E0128); typecheck trace confirmed **different
-/// root sites** so each gets a dedicated pin.
+/// **`#[ignore]`'d post-G2.a-fix**: G2.a is closed (the bracketed
+/// `[e]` alias on `amb_handle` no longer fires E0132), but this test
+/// still fails because `run_state_poly`'s body uses lambdas with
+/// `![| e]` surface rows (`fn (s: Int) -> A ![| e] => ...`) that
+/// drop the row variable, surfacing G2.b (E0128 "effect row mismatch:
+/// closed row `![]` cannot unify with open row `![| e]`"). The
+/// minimal G2.a-only regression is
+/// `task_78_5_g2a_minimal_bracketed_e_alias_typechecks` above; this
+/// larger test will un-ignore once G2.b lands.
 ///
-/// ## G2.a root site
+/// ## G2.a root site (now closed)
 ///
 /// `compiler/src/typecheck.rs:1346-1370` (the post-typecheck E0132
 /// sweep over `pending_call_instantiations`). Upstream root: the AST
@@ -8680,38 +8745,26 @@ fn task_78_5_pending_g3_raise_in_if_branch_expr_position_polymorphism() {
 /// "row variable" (`f.effect_row_var`, set only by `| e` syntax).
 /// When the user writes `fn amb_handle[e](action: () -> Bool ![Amb |
 /// e]) -> List[Bool] ![| e]` intending `e` as a row variable, the
-/// parser produces BOTH `f.generic_params = [GP{e}]` (type kind) AND
+/// parser produced BOTH `f.generic_params = [GP{e}]` (type kind) AND
 /// `f.effect_row_var = Some(RowVar{e})` (row kind) — **two different
-/// variables sharing a name**. The type variable is allocated at
+/// variables sharing a name**. The type variable was allocated at
 /// scheme-registration (typecheck.rs:1114, `fresh_generic_subst`) and
-/// at check_fn entry (:3785), but no surface reference ever pins it
+/// at check_fn entry (:3785), but no surface reference ever pinned it
 /// (nothing in the body uses `e` in TypeExpr position), so the
-/// post-typecheck sweep at 1346-1370 finds it unbound and fires
-/// E0132. The "type parameter `e`" wording is exact —
-/// `fn_param_names[amb_handle][0] = "e"`.
+/// post-typecheck sweep at 1346-1370 found it unbound and fired
+/// E0132. **G2.a fix landed: `effective_fn_generic_params` strips the
+/// alias at the four FnDecl-consuming sites; the type-var slot is no
+/// longer allocated.**
 ///
-/// ## Closure path — recommended option (b)
+/// ## Why this test is still ignored — G2.b blocking
 ///
-/// Two options at parser/AST + typecheck. Reviewer preference: (b).
-///
-/// 1. (a) Add a row-vs-type kind to `GenericParam` so `[e]` can declare
-///    a row var explicitly. Cleaner long-term surface (aligns with
-///    Koka's `<e>` syntactic distinction) but propagates through every
-///    consumer of `GenericParam` — broad blast radius.
-/// 2. **(b) Detect the alias `gp.name == effect_row_var.name` at scheme
-///    registration (typecheck.rs near :1114, `fresh_generic_subst`)
-///    and skip allocating a separate type var.** Single-site change
-///    in typecheck; ~5 LOC. **Recommended.** Land (b) first; revisit
-///    (a) only if some V-variant requires the explicit row-var
-///    declaration surface.
-///
-/// ## Variants the same root cause touches (audit-lesson coverage)
-///
-/// G2.a fires for any user-defined fn that puts `[e]` in the
-/// bracketed generic-param list intending it as a row variable.
-/// Workaround: omit `[e]` and rely on the implicit row var from
-/// `| e` in the row position (mirrors `std/raise.sigil`'s `catch`,
-/// which has `[A, E]` only — no `[e]`).
+/// `run_state_poly`'s body uses lambdas with `![| e]` row surfaces
+/// (`fn (s: Int) -> A ![| e] => v`). G2.b (lambda drops the parsed
+/// row variable at typecheck.rs:4328 / :4743) collapses the lambda's
+/// row to closed; the surrounding `let state_fn: (Int) -> A ![| e]
+/// = ...` symmetric unify_row binds `run_state_poly`'s outer row var
+/// to closed empty, surfacing E0128 at the call-site row-mismatch.
+/// Will un-ignore once G2.b lands.
 ///
 /// ## Why it's novel for sigil
 ///
@@ -8721,12 +8774,12 @@ fn task_78_5_pending_g3_raise_in_if_branch_expr_position_polymorphism() {
 /// state(amb) shares state across choices; amb(state) gives each branch
 /// its own state copy.
 ///
-/// **Invariant** (post-fix): `body` performs flip then increments state.
-/// `amb_handle` resumes both branches; the outer `run_state_poly` shares
-/// the State frame across both. Final list = `[true, false]`; length =
-/// 2; stdout = `"2\n"`.
+/// **Invariant** (post-G2.b-fix): `body` performs flip then increments
+/// state. `amb_handle` resumes both branches; the outer
+/// `run_state_poly` shares the State frame across both. Final list =
+/// `[true, false]`; length = 2; stdout = `"2\n"`.
 #[test]
-#[ignore = "G2.a: bracketed `[e]` generic param aliases the row var name (parser.rs splits into GenericParam{e} + RowVar{e}); type var unconstrained → E0132. Recommended fix: option (b) — alias detection at scheme registration (~5 LOC)"]
+#[ignore = "G2.a closed (Task 78.5 g2a-bracketed-alias-detection); now blocked on G2.b — lambdas with `![| e]` rows in run_state_poly's arms drop the row var → E0128. Un-ignore once G2.b lands."]
 fn task_78_5_pending_g2a_bracketed_e_alias_unconstrained() {
     // Inline row-poly + body-type-poly run_state (mirrors std/raise.sigil's
     // catch shape). std/state.sigil's run_state is closed-row + Int-only,

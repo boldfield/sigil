@@ -23,6 +23,34 @@ use crate::ast::*;
 use crate::errors::{self, CompilerError, Severity, Span};
 use std::collections::BTreeMap;
 
+/// Task 78.5 G2.a — strip `[e]` bracketed generic-param entries that
+/// alias the fn's row-variable name (`![... | e]`). The parser does
+/// not distinguish row-kind from type-kind in the bracketed `[...]`
+/// header (parser.rs:418-422); a row-poly fn declared as
+/// `fn amb_handle[e](action: () -> Bool ![Amb | e]) -> List[Bool] ![| e]`
+/// produces both `f.generic_params = [GenericParam{e}]` (TYPE kind)
+/// and `f.effect_row_var = Some(RowVar{e})` (ROW kind). The user's
+/// intent is a single row variable; the bracketed `[e]` is redundant
+/// surface noise. Without filtering, the type-kind alias is allocated
+/// at scheme registration / `check_fn` entry and is never pinned by
+/// any body reference (the body only uses `e` in row position),
+/// causing the post-typecheck E0132 sweep at typecheck.rs:1346-1370
+/// to report "type parameter `e` is unconstrained at this call site"
+/// at every call to a row-poly fn. Filtering at the FnDecl-consuming
+/// sites keeps `Scheme.type_vars` / `pending_call_instantiations` /
+/// `fn_param_names` index-aligned and avoids the false-positive
+/// E0132. The row variable alone carries the polymorphism.
+/// Reviewer-recommended option (b) per the test doc-comment at
+/// `compiler/tests/e2e.rs::task_78_5_pending_g2a_*`.
+fn effective_fn_generic_params(f: &FnDecl) -> Vec<GenericParam> {
+    let row_alias: Option<&str> = f.effect_row_var.as_ref().map(|rv| rv.name.as_str());
+    f.generic_params
+        .iter()
+        .filter(|gp| row_alias != Some(gp.name.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// The checker's type lattice. Expanded in plan A2 task 30 to include
 /// `Fn` for user function/lambda values; expanded again in plan B
 /// task 48 to carry HM type variables and generic-applied user types.
@@ -1111,7 +1139,11 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // declared generic to a specific type).
     for item in &program.items {
         if let Item::Fn(f) = item {
-            let (gs, ty_var_ids) = tc.fresh_generic_subst(&f.generic_params);
+            // Task 78.5 G2.a — strip bracketed `[e]` GP entries that
+            // alias the row var name (`![... | e]`); see
+            // `effective_fn_generic_params` doc-comment for rationale.
+            let gps = effective_fn_generic_params(f);
+            let (gs, ty_var_ids) = tc.fresh_generic_subst(&gps);
             let row_var_id = f.effect_row_var.as_ref().map(|_| tc.fresh_row_var());
             let saved = std::mem::take(&mut tc.current_generic_subst);
             let saved_row_subst = std::mem::take(&mut tc.current_row_var_subst);
@@ -1176,7 +1208,9 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         if let Item::Fn(f) = item {
             let saved_generic_subst = std::mem::take(&mut tc.current_generic_subst);
             let saved_row_var_subst = std::mem::take(&mut tc.current_row_var_subst);
-            let (gs, _) = tc.fresh_generic_subst(&f.generic_params);
+            // Task 78.5 G2.a — see `effective_fn_generic_params`.
+            let gps = effective_fn_generic_params(f);
+            let (gs, _) = tc.fresh_generic_subst(&gps);
             tc.current_generic_subst = gs;
             // Plan D Task 116 — seed the row-var subst with the
             // fn's own row variable (if any). This lets the
@@ -1324,9 +1358,16 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     for item in &program.items {
         match item {
             Item::Fn(f) => {
+                // Task 78.5 G2.a — keep this name list aligned with
+                // `Scheme.type_vars` / `pending_call_instantiations`,
+                // both of which now skip row-var-aliased GP entries.
+                // See `effective_fn_generic_params` doc-comment.
                 fn_param_names.insert(
                     f.name.clone(),
-                    f.generic_params.iter().map(|gp| gp.name.clone()).collect(),
+                    effective_fn_generic_params(f)
+                        .iter()
+                        .map(|gp| gp.name.clone())
+                        .collect(),
                 );
             }
             Item::Type(td) => {
@@ -3782,7 +3823,9 @@ impl Tc {
         // and store it in `fn_schemes` for call-site instantiation.
         let saved_generic_subst = std::mem::take(&mut self.current_generic_subst);
         let saved_row_var_subst = std::mem::take(&mut self.current_row_var_subst);
-        let (generic_subst, ty_var_ids) = self.fresh_generic_subst(&f.generic_params);
+        // Task 78.5 G2.a — see `effective_fn_generic_params`.
+        let gps = effective_fn_generic_params(f);
+        let (generic_subst, ty_var_ids) = self.fresh_generic_subst(&gps);
         self.current_generic_subst = generic_subst;
         let mut row_var_id: Option<u32> = None;
         if let Some(rv) = &f.effect_row_var {
@@ -12286,11 +12329,13 @@ mod tests {
         // row vars unifies cleanly.
         //
         // Note: `e` is bound by the outer fn's `![| e]`, NOT by
-        // generic_params. Including `e` in `generic_params`
-        // would allocate it as a Ty::Var (unconstrained, fires
-        // E0132 at call sites). The R1 reviewer flagged this
-        // ergonomics — v1's row-var binder is the outer fn's
-        // `effect_row_var`, not generic_params.
+        // generic_params. Pre-Task-78.5-G2.a, including `e` in
+        // generic_params would allocate it as a Ty::Var
+        // (unconstrained, firing E0132 at call sites). The R1
+        // reviewer flagged that ergonomics; G2.a's
+        // `effective_fn_generic_params` filter now strips the
+        // alias and the `[e]`-included form typechecks cleanly
+        // — see `bracketed_e_alias_does_not_fire_e0132` below.
         let src = "effect Raise[E] { fail: (E) -> Int }\n\
                    fn passthrough[A](body: () -> A ![Raise[String] | e]) -> A ![Raise[String] | e] {\n  \
                      body()\n\
@@ -12301,6 +12346,150 @@ mod tests {
             errs.is_empty(),
             "row-polymorphic passthrough signature should typecheck; got {errs:?}"
         );
+    }
+
+    // ===== Task 78.5 G2.a — bracketed `[e]` alias detection =====
+
+    #[test]
+    fn bracketed_e_alias_does_not_fire_e0132() {
+        // Task 78.5 G2.a regression pin. Pre-fix, the parser
+        // produces both `f.generic_params = [GenericParam{e}]`
+        // (TYPE kind, from the bracketed `[e]`) and
+        // `f.effect_row_var = Some(RowVar{e})` (ROW kind, from
+        // `| e` in the row position). The type-kind alias is
+        // never pinned by any body reference (the body uses `e`
+        // only in row positions), so the post-typecheck E0132
+        // sweep at typecheck.rs:1346-1370 fires "type parameter
+        // `e` of `passthrough` is unconstrained at this call
+        // site" at every call.
+        //
+        // Post-fix, `effective_fn_generic_params` strips the
+        // alias at scheme registration / `check_fn` entry, so
+        // the type-var slot is never allocated and the sweep
+        // sees no unbound var. Pair with the e2e regression at
+        // `compiler/tests/e2e.rs::task_78_5_g2a_*`.
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn passthrough[e](body: () -> Int ![Raise[String] | e]) -> Int ![Raise[String] | e] {\n  \
+                     body()\n\
+                   }\n\
+                   fn caller() -> Int ![Raise[String]] {\n  \
+                     passthrough(my_body)\n\
+                   }\n\
+                   fn my_body() -> Int ![Raise[String]] { 0 }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0132"),
+            "bracketed `[e]` aliasing the row-var name must not fire E0132 \
+             post-Task-78.5-G2.a; got {errs:?}"
+        );
+        assert!(
+            errs.is_empty(),
+            "bracketed `[e]` row-var-alias form should typecheck cleanly; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn bracketed_genuine_type_param_plus_separate_row_var_still_works() {
+        // Task 78.5 G2.a invariant pin — the alias filter must
+        // ONLY drop GP entries whose name matches the row-var
+        // name. A genuine type parameter `A` plus an unrelated
+        // row variable `e` (different names) must continue to
+        // allocate both: `A` as a type var (resolved by body
+        // reference / call-site arg unification) and `e` as a
+        // row var. This test would FAIL if the filter were
+        // overly broad (e.g., always strips the last GP, or
+        // strips any GP when a row var is present).
+        let src = "effect Raise[E] { fail: (E) -> Int }\n\
+                   fn passthrough[A](body: () -> A ![Raise[String] | e]) -> A ![Raise[String] | e] {\n  \
+                     body()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "genuine `[A]` type param with separate `| e` row var must keep \
+             allocating both; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn effective_fn_generic_params_strips_only_row_alias() {
+        // Direct unit test on the `effective_fn_generic_params`
+        // helper. Constructs FnDecls with various GP /
+        // effect_row_var combinations and asserts the filter's
+        // output. Using the AST factory directly side-steps the
+        // parser/lexer entirely so the test pins the helper's
+        // contract (not the surface syntax that produces the
+        // alias). Pair with the pipeline-level test above for
+        // end-to-end coverage.
+        use crate::ast::{Block, FnDecl, GenericParam, RowVar, TypeExpr};
+
+        let span = Span::synthetic("test.sigil");
+        let mk_decl = |gps: Vec<&str>, row_var: Option<&str>| FnDecl {
+            name: "f".to_string(),
+            name_span: span.clone(),
+            generic_params: gps
+                .into_iter()
+                .map(|n| GenericParam {
+                    name: n.to_string(),
+                    span: span.clone(),
+                })
+                .collect(),
+            params: Vec::new(),
+            return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: row_var.map(|n| RowVar {
+                name: n.to_string(),
+                span: span.clone(),
+            }),
+            body: Block {
+                stmts: Vec::new(),
+                tail: None,
+                span: span.clone(),
+            },
+            span: span.clone(),
+        };
+
+        // No row var → all GPs preserved.
+        let f = mk_decl(vec!["A", "B"], None);
+        let kept: Vec<String> = effective_fn_generic_params(&f)
+            .into_iter()
+            .map(|gp| gp.name)
+            .collect();
+        assert_eq!(kept, vec!["A".to_string(), "B".to_string()]);
+
+        // Row var with no name collision → all GPs preserved.
+        let f = mk_decl(vec!["A", "B"], Some("e"));
+        let kept: Vec<String> = effective_fn_generic_params(&f)
+            .into_iter()
+            .map(|gp| gp.name)
+            .collect();
+        assert_eq!(kept, vec!["A".to_string(), "B".to_string()]);
+
+        // Row var aliasing one GP → only that GP is stripped.
+        let f = mk_decl(vec!["A", "e"], Some("e"));
+        let kept: Vec<String> = effective_fn_generic_params(&f)
+            .into_iter()
+            .map(|gp| gp.name)
+            .collect();
+        assert_eq!(kept, vec!["A".to_string()]);
+
+        // Row var aliasing the only GP → empty result.
+        let f = mk_decl(vec!["e"], Some("e"));
+        let kept: Vec<String> = effective_fn_generic_params(&f)
+            .into_iter()
+            .map(|gp| gp.name)
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "alias-only GP should yield empty; got {kept:?}"
+        );
+
+        // Empty GP list → empty result regardless of row var.
+        let f = mk_decl(Vec::new(), Some("e"));
+        let kept = effective_fn_generic_params(&f);
+        assert!(kept.is_empty());
     }
 
     #[test]
