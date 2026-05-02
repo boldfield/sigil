@@ -8628,7 +8628,6 @@ fn task_78_5_pending_g2b_lambda_drops_effect_row_var() {
 /// catch wrapping, returns `Err("nope")` for true, `Ok(42)` for false.
 /// stdout for `safe_or_default(false)` = `"42\n"`, exit 0.
 #[test]
-#[ignore = "G3: per-op fresh A from raise[A,E] not propagated through if-branch cross-branch unification at expression position; E0063 fires before A is pinned. Workaround: typed-let ascription"]
 fn task_78_5_pending_g3_raise_in_if_branch_expr_position_polymorphism() {
     let src = "import std.raise\n\
                import std.result\n\
