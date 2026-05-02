@@ -14490,7 +14490,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         }
     }
 
-
     fn lower_call(
         &mut self,
         callee: &crate::ast::Expr,
@@ -18177,7 +18176,6 @@ enum ArmBodyShape {
     /// classifier to return `None`.
     Unsupported,
 }
-
 
 /// Task 78.5 G4 Phase B.3 — does this `CompoundMatchArmPostPerform`
 /// synth-cont's `tail_expr` match the B.3-eligible shape (direct call
@@ -21876,7 +21874,6 @@ mod tests {
             PostArmKCaptureSource::ArmCapture { arm_idx: 0 }
         ));
     }
-
 
     // ===== Plan B Task 78.5 G4 Phase B.2 — synth-cont arm-pattern
     // captures =====

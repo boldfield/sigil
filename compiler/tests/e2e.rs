@@ -9211,7 +9211,6 @@ fn task_78_5_pending_g2a_bracketed_e_alias_unconstrained() {
     );
 }
 
-
 /// **Task 78.5 G4 Phase B.3 — CPS→CPS direct dispatch from synth-cont
 /// tail (non-recursive helper).**
 ///
