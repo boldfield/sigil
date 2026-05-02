@@ -8966,3 +8966,96 @@ fn task_78_5_pending_g2a_bracketed_e_alias_unconstrained() {
          stderr={stderr:?}"
     );
 }
+
+/// **Task 78.5 G4 Phase B.4 — handle-with-Cps-body-call routes the
+/// body's natural terminal value through the return-arm pair installed
+/// as the trailing pair on the body call's args buffer.**
+///
+/// **Shape:** `handle helper() with { E.op(k) => k(7), return(v) => v
+/// + 100 }` where `helper` is a Cps-color tail-perform user fn
+/// (`fn helper() -> Int ![E] { perform E.op() }`).
+///
+/// **Pre-B.4 behaviour:** the standard sync body lowering routes
+/// `helper()` through the Sync wrapper (or `lower_call`'s Cps branch
+/// in the inline path), packing `(null, identity)` as the trailing
+/// pair. The Cps body's tail-perform invokes the matching arm; arm
+/// calls `k(7)` → identity → Done(7) → run_loop returns 7. The
+/// post-body return-arm dispatch then fires AFTER the run_loop
+/// completes, computing `7 + 100 = 107` via a separate
+/// `sigil_run_loop` invocation. Result: 107. **The pre-B.4 path
+/// produces the correct value via the post-body dispatch path —
+/// not via the trailing-pair routing.**
+///
+/// **Post-B.4 behaviour:** the B.4 detector fires at the handle
+/// expression's body-lowering site (body is `Expr::Call { callee:
+/// Ident("helper") }` and `helper`'s ABI is Cps). The custom
+/// `lower_b4_cps_body_call` path packs `(return_arm_closure,
+/// return_arm_fn)` as the trailing pair. The Cps body's tail-perform
+/// invokes the arm; arm calls `k(7)` → identity → Done(7) → run_loop
+/// sees the trailing pair is the return-arm pair (NOT identity), so
+/// it re-dispatches as `Call(return_closure, return_fn, [7, null,
+/// identity])`. The return-arm synth fn lowers `v + 100` with v=7,
+/// emits Call back through `(null, identity)` → Done(107) → run_loop
+/// returns 107. **The post-B.4 path produces the correct value via
+/// the trailing-pair routing — the post-body dispatch is skipped.**
+///
+/// **Both pre-B.4 and post-B.4 produce the same observable value
+/// (107).** The test pins the observable value; the routing mechanism
+/// difference is internal. The e2e test's role is to confirm the
+/// post-B.4 path doesn't regress the value (i.e., the B.4 wiring is
+/// correct end-to-end). The structural difference (which dispatch
+/// mechanism fires) is covered by the lib tests on
+/// `b4_handle_body_is_cps_user_fn_call`.
+///
+/// **Why "non-recursive deep-handler shape":** the brief
+/// (`task-78-5-g4-b4-handle-return-arm-trailing-pair`) calls for a
+/// non-recursive shape that demonstrates the trailing-pair routing.
+/// Recursive performs (e.g., the iterate-Generator port) require
+/// B.1's compound-match Cps body emission to land first — those are
+/// covered by the G4 Generator test (still ignored, un-ignored at
+/// the closeout PR after all four B.* slices merge). This test
+/// covers the simpler shape that's already lowerable at HEAD: a
+/// single tail-perform + arm that resumes via `k(arg)`.
+///
+/// **DISCHARGED-bypass coverage in existing tests:** the
+/// `handle_returning_fn_typed_value_with_op_arm_discharge_runs` test
+/// (e2e.rs:4649) exercises a B.4-eligible shape (`handle comp() with
+/// { return(v) => fn ..., Trigger.fire(k) => fn ... }` where comp is
+/// Cps) but where the arm DISCHARGES (returns a lambda directly).
+/// The trampoline's DISCHARGED branch bypasses outer_post_arm_k
+/// routing AND trailing-pair routing, returning the discharge value
+/// as `v` directly. The B.4 path mirrors this: `run_loop`'s u64 on
+/// DISCHARGED is the discharge value (skipping return-arm); the
+/// existing test's expected output (`107`) stays correct under B.4.
+/// This test is the COMPLEMENT — exercises the DONE path through
+/// the trailing-pair-routed return-arm.
+///
+/// **Invariant:** stdout = `"107\n"`, exit 0.
+#[test]
+fn b4_handle_with_cps_body_call_and_return_arm_routes_via_trailing_pair() {
+    // helper's body shape `perform E.op()` is the tail-perform shape
+    // recognised by `is_simple_tail_perform_with_pure_args_body`, so
+    // `compute_user_fn_abi` classifies it as Cps. The handle body is
+    // a direct call to helper, so B.4's detector fires.
+    let src = "effect E { op: () -> Int }\n\
+               fn helper() -> Int ![E] {\n  \
+                 perform E.op()\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   E.op(k) => k(7),\n    \
+                   return(v) => v + 100,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "b4_handle_with_cps_body_call_return_arm_trailing_pair");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "107\n",
+        "B.4 trailing-pair routing: arm `=> k(7)` → trampoline → \
+         return-arm pair (installed as trailing pair on body call) \
+         → `v + 100` with v=7 → 107. stderr={stderr:?}"
+    );
+}

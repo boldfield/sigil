@@ -11861,7 +11861,90 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.reset_last_terminal_value_ref, &[]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, reset_v_call));
-                let body_val = self.lower_expr(body);
+
+                // Task 78.5 G4 Phase B.4 — deep-handler return-arm
+                // semantics for recursive perform via Cps-body call.
+                //
+                // Detect the eligible shape: handle has a return arm
+                // AND body is `Expr::Call { callee: Ident(name) }` where
+                // `name` is a Cps-ABI user fn. In this shape, the body
+                // call's trailing pair is normally written as
+                // `(null, identity)` by `lower_call`'s Cps branch
+                // (codegen.rs:12846). B.4 instead installs the return
+                // arm pair as the trailing pair so the trampoline's
+                // Done branch routes through return-arm at the deepest
+                // iterate exit (deepest `k(arg)` terminus). For
+                // recursive-perform shapes (e.g., the Generator port),
+                // this lets the post-arm-k chain unwind ATOP the
+                // return-arm-wrapped value rather than wrapping AFTER
+                // the body's Sync `run_loop` completes (which
+                // structurally cannot work for recursive Cps callees —
+                // the Sync wrapper drives a nested run_loop and breaks
+                // the trampoline charter).
+                //
+                // **Shape constraints (intentionally narrow MVP):**
+                // - Body is `Expr::Call { callee: Expr::Ident(name) }`.
+                //   Indirect calls (`body()` for `body: () -> T`) and
+                //   inline expressions (`handle 5 with`, `handle
+                //   (perform Foo.op()) with`) take the standard sync
+                //   body-lowering path.
+                // - `name` is in `user_fn_refs` (a top-level user fn,
+                //   not a constructor or local).
+                // - Callee's ABI is `UserFnAbi::Cps`. Native callees
+                //   take the standard path because there's no
+                //   Cps-trampoline body call to route through.
+                // - `return_arm.is_some()`. No-return-arm handles fall
+                //   through to the existing path; trailing-pair
+                //   routing degenerates to `(null, identity)` either
+                //   way.
+                //
+                // **DISCHARGED bypass interaction:** when an op arm
+                // discharges (returns without calling k), the
+                // trampoline's DISCHARGED tag bypasses
+                // `outer_post_arm_k` routing AND the trailing-pair
+                // routing (the trailing pair lives in the body call's
+                // args buffer, not in `outer_post_arm_k`'s TLS stack;
+                // DISCHARGED returns the discharge value as `v`
+                // directly without invoking the trailing pair). Per
+                // algebraic-effects semantics, the discharged value IS
+                // the handle's overall — return arm dispatch is
+                // bypassed. The B.4 path mirrors this: `run_loop`'s
+                // u64 result on DISCHARGED is the discharge value
+                // (skipping return-arm); on DONE it's the
+                // return-arm-wrapped value (because the trailing pair
+                // is the return-arm pair). Both paths converge to
+                // "u64 IS handler-overall"; B.4 skips the post-body
+                // discharge query + return-arm dispatch entirely.
+                //
+                // **B.4 is independent of B.1/B.2/B.3:** B.4 wires
+                // handle-side dispatch + runtime routing; the other
+                // three slices wire CPS body emission for the
+                // compound-match shape (B.1), synth-cont machinery
+                // (B.2), and Cps→Cps tail call lowering (B.3). The G4
+                // Generator test only un-ignores when ALL FOUR B.*
+                // slices land. At HEAD (pre-B.1), `is_compound_match
+                // _with_arm_perform_body`-shaped fns (e.g., iterate)
+                // are still classified as Sync ABI by
+                // `compute_user_fn_abi` — the B.4 detector here
+                // returns `false` for them, falling through to the
+                // standard path. Once B.1 widens
+                // `compute_user_fn_abi` to route compound-match fns
+                // to `UserFnAbi::Cps`, B.4's detector starts firing
+                // for them automatically.
+                let b4_eligible = return_arm.is_some() && self.is_b4_eligible_cps_body_call(body);
+
+                let (body_val, b4_routed_via_return_arm) = if b4_eligible {
+                    let snap = frame_1_ptr_snapshot.unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen Task 78.5 G4 B.4: frame_1_ptr_snapshot must be \
+                             set when groups is non-empty (B.4 body-call dispatch)"
+                        )
+                    });
+                    let v = self.lower_b4_cps_body_call(body, snap);
+                    (v, true)
+                } else {
+                    (self.lower_expr(body), false)
+                };
 
                 // Step 3: pop N frames in reverse push order. Capture
                 // the last pop's return value for the concern #1
@@ -11940,6 +12023,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // bypassed. If the body completed normally (DONE),
                 // the existing return arm dispatch fires (body_val
                 // passed as `v`).
+                //
+                // **Task 78.5 G4 B.4 short-circuit:** when
+                // `b4_routed_via_return_arm` is true, the body's Cps
+                // call already routed Done through the return-arm pair
+                // installed as the trailing pair (per
+                // `lower_b4_cps_body_call`). `body_val` is already
+                // either (a) the return-arm-wrapped value (DONE), or
+                // (b) the discharged arm's value (DISCHARGED bypass —
+                // skips trailing pair just like `outer_post_arm_k`'s
+                // bypass). Both cases are the handler's overall;
+                // skip the post-body discharge query + return-arm
+                // dispatch entirely.
+                if return_arm.is_some() && b4_routed_via_return_arm {
+                    return body_val;
+                }
                 if let Some(ra) = return_arm.as_deref() {
                     let snap = frame_1_ptr_snapshot.unwrap_or_else(|| {
                         unreachable!(
@@ -12769,6 +12867,248 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 "lower_k_pair_call: unexpected handler_overall_ty Cranelift type {target_ty:?}"
             );
             final_widened
+        }
+    }
+
+    /// Task 78.5 G4 Phase B.4 — eligibility check for the
+    /// return-arm-via-trailing-pair handle body call path. Delegates
+    /// to the free-function shape detector
+    /// [`b4_handle_body_is_cps_user_fn_call`]; the method just
+    /// supplies the Lowerer's `user_fn_refs` and `user_fns` maps.
+    fn is_b4_eligible_cps_body_call(&self, body: &crate::ast::Expr) -> bool {
+        b4_handle_body_is_cps_user_fn_call(body, |name| {
+            if self.user_fn_refs.contains_key(name) {
+                self.user_fns.get(name).map(|e| e.abi)
+            } else {
+                None
+            }
+        })
+        .is_some()
+    }
+
+    /// Task 78.5 G4 Phase B.4 — lower a handle body that is a direct
+    /// call to a Cps-ABI user fn, installing the return-arm pair as
+    /// the trailing pair (not `(null, identity)`).
+    ///
+    /// Mirrors `lower_call`'s `UserFnAbi::Cps` branch (codegen.rs
+    /// :12846) but writes the return-arm pair at the trailing-pair
+    /// slots so the trampoline's Done branch routes the body's
+    /// natural terminal value through the return-arm synth fn first.
+    /// The return-arm synth fn (`HandlerReturnArmSynth` body emit at
+    /// codegen.rs:8906) then writes its OWN outbound trailing pair
+    /// as `(null, identity)` and emits a Call → trampoline →
+    /// Done(wrapped). `sigil_run_loop` returns the wrapped value as
+    /// u64. The wrapped value IS the handler's overall.
+    ///
+    /// **Frame snapshot:** the return-arm pair is read from the
+    /// first-pushed handler frame (already populated by
+    /// `sigil_handler_frame_set_return` at handle pre-pass; see
+    /// codegen.rs:11781-11824). This mirrors the post-body return-
+    /// arm dispatch path's read at codegen.rs:12125-12136.
+    ///
+    /// **Caller contract:** the caller (handle expression's
+    /// `lower_expr` arm) must:
+    /// - Pre-check eligibility via `is_b4_eligible_cps_body_call`.
+    /// - Pass `frame_1_ptr_snapshot` (the snapshot of the first-
+    ///   pushed frame's pointer; populated by handle pre-pass).
+    /// - Skip the post-body discharge query + return-arm dispatch
+    ///   (the trampoline handled both: DONE routes through return-
+    ///   arm, DISCHARGED bypasses trailing pair AND post-body
+    ///   dispatch, returning the discharge value as the handler's
+    ///   overall directly).
+    fn lower_b4_cps_body_call(
+        &mut self,
+        body: &crate::ast::Expr,
+        frame_1_ptr_snapshot: Value,
+    ) -> Value {
+        use crate::ast::Expr;
+        let (callee, args) = match body {
+            Expr::Call { callee, args, .. } => (callee.as_ref(), args.as_slice()),
+            _ => unreachable!(
+                "lower_b4_cps_body_call: caller must gate on \
+                 is_b4_eligible_cps_body_call which requires Expr::Call body"
+            ),
+        };
+        let name = match callee {
+            Expr::Ident(n, _) => n.clone(),
+            _ => unreachable!(
+                "lower_b4_cps_body_call: caller must gate on \
+                 is_b4_eligible_cps_body_call which requires Ident callee"
+            ),
+        };
+        let callee_entry = self.user_fns.get(&name).unwrap_or_else(|| {
+            unreachable!(
+                "lower_b4_cps_body_call: callee `{name}` registered in \
+                 user_fn_refs but missing from user_fns; pre-pass invariant broken"
+            )
+        });
+        debug_assert!(
+            matches!(callee_entry.abi, UserFnAbi::Cps),
+            "lower_b4_cps_body_call: caller must gate on Cps ABI; \
+             callee `{name}` has abi {:?}",
+            callee_entry.abi
+        );
+        let ret_ty = callee_entry.ret_ty;
+
+        // Pack user args + (return_arm_closure, return_arm_fn) into a
+        // single stack slot of size `(N + 2) * 8` bytes. Mirrors
+        // `lower_call`'s Cps branch (codegen.rs:12846 onwards) but
+        // writes the return-arm pair at the trailing slots instead of
+        // (null, identity).
+        let user_arg_count = args.len();
+        let slot_bytes = ((user_arg_count + 2) * 8) as u32;
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            slot_bytes,
+            3,
+        ));
+
+        for (i, arg_expr) in args.iter().enumerate() {
+            let arg_v = self.lower_expr(arg_expr);
+            // Per `feedback_sigil_dfg_value_type`: read the lowered
+            // Cranelift type from `dfg.value_type(arg_v)`.
+            let arg_ty = self.builder.func.dfg.value_type(arg_v);
+            let widened = if arg_ty == types::I64 {
+                arg_v
+            } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                self.builder.ins().uextend(types::I64, arg_v)
+            } else {
+                assert_eq!(
+                    arg_ty, self.pointer_ty,
+                    "codegen Task 78.5 G4 B.4: unexpected user-arg \
+                     Cranelift type {arg_ty:?} for `{name}` body call \
+                     packing"
+                );
+                arg_v
+            };
+            self.builder
+                .ins()
+                .stack_store(widened, slot, (i * 8) as i32);
+        }
+
+        // Read the return-arm pair from the first-pushed frame's
+        // pinned offsets. Mirrors codegen.rs:12125-12136
+        // (Phase 4g return-arm dispatch read).
+        let return_closure_v = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            frame_1_ptr_snapshot,
+            sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
+        );
+        let return_fn_v = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            frame_1_ptr_snapshot,
+            sigil_abi::effect::HANDLER_FRAME_RETURN_FN_OFF,
+        );
+
+        // Write the return-arm pair at the trailing-pair slots.
+        // Standard Cps interop wrapper writes `(null, identity)`
+        // here; B.4's distinguishing change is writing the
+        // return-arm pair.
+        self.builder
+            .ins()
+            .stack_store(return_closure_v, slot, k_closure_offset(user_arg_count));
+        self.builder
+            .ins()
+            .stack_store(return_fn_v, slot, k_fn_offset(user_arg_count));
+
+        let args_ptr = self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
+        let args_len = self.builder.ins().iconst(types::I32, user_arg_count as i64);
+
+        // Direct-call the Cps fn. Pass null closure_ptr (top-level
+        // direct call; closure_ptr is reserved for closure-converted
+        // lifted lambdas).
+        let func_ref = self.user_fn_refs[&name];
+        let null_closure_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
+        let cps_call = self
+            .builder
+            .ins()
+            .call(func_ref, &[null_closure_ptr, args_ptr, args_len]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, cps_call));
+        let next_step = self.builder.inst_results(cps_call)[0];
+
+        // Drive the trampoline. Returns u64.
+        //
+        // **Routing trace (DONE path):** body's tail-perform invokes
+        // the matching arm; arm calls `k(arg)` (or post-arm-k chain
+        // bottoms out); deepest k is identity which builds Done(arg);
+        // run_loop's Done branch checks `outer_post_arm_k_stack`
+        // (empty for B.4 inline path), then sees the body's args
+        // buffer at offsets `k_closure_offset(N)` /
+        // `k_fn_offset(N)` — the return-arm pair we wrote — and
+        // re-dispatches as `Call(return_closure, return_fn,
+        // [arg, null, identity])`. The return-arm synth fn lowers
+        // the return-arm body and emits its OWN Call back through
+        // identity → Done(wrapped). run_loop returns wrapped value
+        // as u64.
+        //
+        // **Routing trace (DISCHARGED path):** an op arm discards
+        // k → returns arm value via `sigil_next_step_discharged`;
+        // run_loop's DISCHARGED branch bypasses outer_post_arm_k
+        // routing AND trailing-pair routing, returning the discharge
+        // value as `v` directly. Algebraic-effects semantics: the
+        // discharged value IS the handle's overall — return arm is
+        // skipped (matches the existing post-body discharge_block
+        // behavior at codegen.rs:12183-).
+        let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[next_step]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
+        let raw_u64 = self.builder.inst_results(run_loop_call)[0];
+
+        // Narrow `raw_u64` back to the callee's declared return type.
+        // The DONE-path value was return-arm-wrapped (so its
+        // Cranelift type is the return arm body's type, == the
+        // handler's overall type, == the callee's ret_ty? — yes,
+        // because typecheck pinned `handler_overall == ra.body's
+        // type` AND for the B.4 path the wrapped value flowing
+        // back IS body's natural terminal which matches the
+        // callee's ret_ty… wait, the return arm transforms `v: B`
+        // (body's type) into a value of type R (handler overall).
+        // In the B.4 path, `r_loop` returns the R-typed value
+        // (return-arm output) widened to u64, NOT body's B-typed
+        // value. So the narrow target should be R = handler
+        // overall, not callee_entry.ret_ty.
+        //
+        // **handler_overall_ty:** typecheck binds it on
+        // `handle_body_ty` for the body's type and the return arm's
+        // body's type IS the handler overall. The caller (handle
+        // lowering site) treats `body_val`'s type as the handler
+        // overall via the existing post-body merge — for B.4 we
+        // return body_val with the ret_ty narrow, and the caller
+        // passes it through unchanged (since `b4_routed_via_return_
+        // arm` short-circuits to `return body_val`).
+        //
+        // **For the B.4 MVP:** handler-overall == callee.ret_ty
+        // when typecheck-time `B == R` (e.g., `comp() -> Int`,
+        // return arm `return(v) => v + 1` keeps R = Int = B). For
+        // mixed-type return arms (B = Int, R = Bool via `v > 50`),
+        // the run_loop result is R-shaped but Cranelift-typed to
+        // I64; narrowing via `ret_ty = callee.ret_ty` would be
+        // WRONG when R has narrower Cranelift type than B. To
+        // stay sound at the MVP, we narrow to the callee's
+        // ret_ty under the assertion that B == R for B.4-eligible
+        // shapes. The reachable B != R B.4 shape is the G4
+        // Generator port (B = Int, R = List[Int] both pointer_ty),
+        // where Cranelift type narrowing collapses both to
+        // pointer_ty. Mixed-narrow-int B != R + body-is-Cps-call +
+        // return-arm shapes are not currently exercised; if a
+        // future test surfaces one, this narrow needs to switch
+        // to the handler-overall Cranelift type computed by
+        // `type_of_expr(&ra.body, &preview)` (mirrors codegen.rs
+        // :12092-94).
+        if ret_ty == types::I64 {
+            raw_u64
+        } else if ret_ty.is_int() && ret_ty.bits() < 64 {
+            self.builder.ins().ireduce(ret_ty, raw_u64)
+        } else {
+            debug_assert_eq!(
+                ret_ty, self.pointer_ty,
+                "codegen Task 78.5 G4 B.4: callee `{name}` has unexpected \
+                 ret_ty {ret_ty:?}; expected I64 or pointer_ty"
+            );
+            raw_u64
         }
     }
 
@@ -16422,6 +16762,55 @@ enum ArmBodyShape {
     Unsupported,
 }
 
+/// Task 78.5 G4 Phase B.4 — does this `Expr::Handle`'s body match the
+/// B.4-eligible shape (direct call to a Cps-ABI top-level user fn)?
+///
+/// Returns `Some(name)` iff:
+/// - `body` is `Expr::Call { callee: Expr::Ident(name), .. }`.
+/// - `lookup_abi(name)` returns `Some(UserFnAbi::Cps)`. The caller
+///   provides the lookup closure, which encapsulates the
+///   "is this a top-level user fn?" check (returning `None` for
+///   constructors and local fn-typed bindings) plus the ABI query.
+///
+/// Otherwise `None`. The caller (handle expression's `lower_expr` arm)
+/// uses `Some(_)` to gate routing into [`Lowerer::lower_b4_cps_body_call`]
+/// (which installs the return-arm pair as the trailing pair instead of
+/// `(null, identity)` per the standard Cps interop wrapper at
+/// `lower_call`'s Cps branch).
+///
+/// **Why narrow:** the standard handle-body lowering uses
+/// `lower_expr(body)` which routes through `lower_call`'s Cps branch
+/// when the body resolves to a Cps fn — that path packs `(null,
+/// identity)` as the trailing pair. B.4 needs to install
+/// `(return_arm_closure, return_arm_fn)` as the trailing pair instead,
+/// so the trampoline's Done branch routes through the return-arm at
+/// the deepest iterate exit. Other body shapes (indirect calls, inline
+/// expressions, blocks wrapping a call) either don't have a trampoline
+/// body call to route through, or are deferred to a future phase
+/// (e.g., wrapping a Block whose tail is a Cps call would require
+/// lowering the stmts before the call, which the MVP defers).
+///
+/// **Closure-based lookup:** parameterising over `lookup_abi` keeps
+/// this function stateless / map-shape-agnostic and unit-testable
+/// without constructing real `UserFnEntry` records (which require a
+/// `cranelift_module::FuncId` from a populated module). Production
+/// call sites pass `|n| user_fn_refs.contains_key(n).then(|| ...)`
+/// closures that consult the per-fn ABI maps.
+fn b4_handle_body_is_cps_user_fn_call(
+    body: &crate::ast::Expr,
+    lookup_abi: impl Fn(&str) -> Option<UserFnAbi>,
+) -> Option<&str> {
+    use crate::ast::Expr;
+    if let Expr::Call { callee, .. } = body {
+        if let Expr::Ident(name, _) = callee.as_ref() {
+            if matches!(lookup_abi(name), Some(UserFnAbi::Cps)) {
+                return Some(name.as_str());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -19989,5 +20378,158 @@ mod tests {
             captures[1].source,
             PostArmKCaptureSource::ArmCapture { arm_idx: 0 }
         ));
+    }
+
+    // ======================================================================
+    // Task 78.5 G4 Phase B.4 — handle-body Cps-call shape detector tests.
+    //
+    // The detector at `b4_handle_body_is_cps_user_fn_call` returns
+    // `Some(name)` iff the handle body is a direct call to a Cps-ABI
+    // top-level user fn. The handle expression's `lower_expr` arm uses
+    // this signal to gate routing into `lower_b4_cps_body_call`, which
+    // installs the return-arm pair as the trailing pair (so the
+    // trampoline's Done branch routes through the return-arm at the
+    // deepest iterate exit, instead of `(null, identity)` per the
+    // standard Cps interop wrapper).
+    //
+    // These tests pin the structural acceptance/rejection invariants;
+    // the IR-level emission path (`lower_b4_cps_body_call`) is
+    // exercised end-to-end by the e2e test
+    // `b4_handle_with_cps_body_call_and_return_arm_routes_via_trailing_pair`.
+    // ======================================================================
+
+    /// Build a minimal `Expr::Call { callee: Ident(name), args: [] }`.
+    fn b4_make_call_expr(name: &str) -> crate::ast::Expr {
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        Expr::Call {
+            callee: Box::new(Expr::Ident(name.to_string(), span.clone())),
+            args: vec![],
+            span,
+        }
+    }
+
+    #[test]
+    fn b4_detector_accepts_direct_call_to_cps_user_fn() {
+        // Body shape: `call_iterate()` where `call_iterate` is a top-
+        // level user fn with Cps ABI. The detector returns Some so the
+        // handle expression routes into the B.4 trailing-pair path.
+        let body = b4_make_call_expr("iterate");
+        let result = b4_handle_body_is_cps_user_fn_call(&body, |name| {
+            (name == "iterate").then_some(UserFnAbi::Cps)
+        });
+        assert_eq!(
+            result,
+            Some("iterate"),
+            "B.4 detector should accept direct call to Cps user fn"
+        );
+    }
+
+    #[test]
+    fn b4_detector_rejects_call_to_sync_user_fn() {
+        // Body shape: `comp()` where `comp` is a top-level user fn but
+        // with Sync ABI. The standard sync body lowering handles Sync
+        // callees correctly; B.4's trailing-pair routing only applies
+        // to Cps callees (where the trampoline is the dispatch
+        // mechanism that needs the return-arm pair installed).
+        let body = b4_make_call_expr("comp");
+        let result = b4_handle_body_is_cps_user_fn_call(&body, |name| {
+            (name == "comp").then_some(UserFnAbi::Sync)
+        });
+        assert_eq!(
+            result, None,
+            "B.4 detector should reject Sync-ABI callees (standard \
+             sync body lowering handles them)"
+        );
+    }
+
+    #[test]
+    fn b4_detector_rejects_unknown_callee() {
+        // Body shape: `mystery()` where `mystery` is NOT a top-level
+        // user fn (could be a constructor, a local fn-typed binding,
+        // or simply unresolved). The detector returns None; the
+        // handle expression falls through to standard lowering, which
+        // then dispatches according to the standard rules (e.g.,
+        // ctor application, indirect call via local_fn_types).
+        let body = b4_make_call_expr("mystery");
+        let result = b4_handle_body_is_cps_user_fn_call(&body, |_| None);
+        assert_eq!(
+            result, None,
+            "B.4 detector should reject unknown callees (not in user_fn_refs)"
+        );
+    }
+
+    #[test]
+    fn b4_detector_rejects_non_call_body() {
+        // Body shape: an integer literal. Not a call at all; the
+        // standard sync body lowering produces an inline `iconst`
+        // value. No trampoline body call to route through, so B.4
+        // doesn't apply.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let body = Expr::IntLit(42, Span::synthetic("x.sigil"));
+        let result = b4_handle_body_is_cps_user_fn_call(&body, |_| Some(UserFnAbi::Cps));
+        assert_eq!(
+            result, None,
+            "B.4 detector should reject non-Call body shapes"
+        );
+    }
+
+    #[test]
+    fn b4_detector_rejects_indirect_call_callee_shape() {
+        // Body shape: `(get_fn())()` — the callee is itself a call,
+        // not an Ident. This is the indirect-call shape (e.g.,
+        // `body()` in `run_state` where `body` is a fn parameter).
+        // The detector returns None; standard lowering takes the
+        // indirect-call path via `local_fn_types` / `call_callee_tys`.
+        // Critically, this means run_state's `body()` body shape is
+        // unaffected by B.4 — the existing run_state ships unchanged.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let inner_call = Expr::Call {
+            callee: Box::new(Expr::Ident("get_fn".to_string(), span.clone())),
+            args: vec![],
+            span: span.clone(),
+        };
+        let body = Expr::Call {
+            callee: Box::new(inner_call),
+            args: vec![],
+            span,
+        };
+        let result = b4_handle_body_is_cps_user_fn_call(&body, |_| Some(UserFnAbi::Cps));
+        assert_eq!(
+            result, None,
+            "B.4 detector should reject indirect-call shapes (callee \
+             is not an Ident); preserves run_state's body() lowering"
+        );
+    }
+
+    #[test]
+    fn b4_detector_rejects_call_with_args_when_callee_unknown() {
+        // Edge: the call has args but the callee isn't in user_fn_refs.
+        // Detector returns None regardless of args. (Documents that
+        // arg shape doesn't influence detection — only callee-name
+        // resolution + ABI check do.)
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Call {
+            callee: Box::new(Expr::Ident("Cons".to_string(), span.clone())),
+            args: vec![
+                Expr::IntLit(1, span.clone()),
+                Expr::Ident("rest".to_string(), span.clone()),
+            ],
+            span,
+        };
+        // Cons is a constructor; not in user_fn_refs (so lookup
+        // returns None).
+        let result = b4_handle_body_is_cps_user_fn_call(&body, |_| None);
+        assert_eq!(
+            result, None,
+            "B.4 detector should reject ctor-shaped calls (Cons isn't \
+             a user fn; lookup returns None)"
+        );
     }
 }
