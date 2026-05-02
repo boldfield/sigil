@@ -1098,6 +1098,14 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     }
 
     let fn_env: BTreeMap<String, Ty> = builtin_fn_env();
+    // Task 78.5 G5 (review-2 widening) — pre-compute whether the
+    // program contains ANY generics (user-declared generic fn / type,
+    // or any `TypeExpr::Apply` use site). Mirrors mono's gate so the
+    // typecheck-level lambda-captures-k barrier (`check_lambda`) fires
+    // E0145 in any program where mono will run, surfacing the v1
+    // limitation as a clean diagnostic instead of a runtime panic at
+    // `monomorphize.rs:1516`. See `Tc.program_has_generics` doc.
+    let program_has_generics = crate::monomorphize::program_has_generics(&program);
     let mut tc = Tc {
         errors,
         string_literals: Vec::new(),
@@ -1123,6 +1131,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         handle_arm_captures: BTreeMap::new(),
         handle_return_arm_captures: BTreeMap::new(),
         handle_body_ty: BTreeMap::new(),
+        program_has_generics,
     };
     // Plan C Task 65 — builtin generic schemes for `array_alloc` /
     // `array_empty` / `array_length` / `array_get` / `array_set`.
@@ -2360,6 +2369,35 @@ struct Tc {
     /// Cranelift type correctly. See
     /// `CheckedProgram::handle_body_ty`.
     handle_body_ty: BTreeMap<Span, Ty>,
+    /// Task 78.5 G5 (review-2 widening) — pre-computed flag indicating
+    /// whether the program contains ANY generics (user-declared
+    /// generic fn / type, or any `TypeExpr::Apply` use site such as
+    /// `Array[Int]`). Mirrors `monomorphize::program_has_generics`'s
+    /// logic so the typecheck-level gate predicts exactly when mono
+    /// will walk a fn body and trip the `Ty::Continuation` mono panic.
+    ///
+    /// Why this is wider than `current_generic_subst.is_empty() == false`:
+    ///
+    /// The previous narrowing ("enclosing fn is generic") missed the
+    /// case where a NON-generic fn (e.g., `std/state.sigil`'s
+    /// `run_state`) lives in a program that ALSO contains generics
+    /// elsewhere. Mono walks every reachable fn (including non-generic
+    /// ones) when `program_has_generics` is true (`monomorphize.rs:153`),
+    /// and the lambda-captures rewrite at `monomorphize.rs:1052-1054`
+    /// calls `subst.apply_to_ty(t)` unconditionally on every capture's
+    /// `Ty` — `apply_to_ty(Ty::Continuation(_))` panics regardless of
+    /// whether the substitution is empty. The widened gate fires E0145
+    /// in any program where mono will run, surfacing the v1 limitation
+    /// as a clean diagnostic instead of a runtime panic.
+    ///
+    /// Honest about the constraint: any program that triggers mono
+    /// (i.e., contains any user-declared generic fn/type or any builtin
+    /// generic Apply like `Array[Int]`) cannot contain a lambda-
+    /// captures-`k` shape anywhere. This regresses
+    /// `std/state.sigil`'s `run_state` for users who ALSO use generics
+    /// — but it surfaces the real limitation as a clean E0145
+    /// diagnostic instead of a runtime panic in mono.
+    program_has_generics: bool,
 }
 
 /// Plan B task 54 — one handler's effect-instantiation cache.
@@ -4947,45 +4985,60 @@ impl Tc {
             .collect();
         // Task 78.5 G5 — E0145 escape barrier extension: a lambda
         // that captures a `Ty::Continuation` value (the arm `k`, or a
-        // let-bound alias of it) inside a **generic** enclosing fn is
-        // an escape attempt that monomorphize cannot lower. When the
-        // surrounding fn is monomorphized, `Substitution::apply_to_ty`
-        // walks the lambda's captures (`monomorphize.rs:1054`) and
-        // hits the `Ty::Continuation` arm which panics with
-        // `unreachable!()` at `monomorphize.rs:1516` ("typecheck E0145
-        // should have rejected the cross-fn / generic-instantiation
-        // site"). G5 closes the typecheck-level gap so that panic is
-        // unreachable in well-formed programs.
+        // let-bound alias of it) inside a program containing any
+        // generics is an escape attempt that monomorphize cannot
+        // lower. When mono runs (any program-level generic triggers
+        // it), `Substitution::apply_to_ty` walks every reachable fn's
+        // body, including non-generic ones, and the lambda capture
+        // rewrite at `monomorphize.rs:1052-1054` calls
+        // `subst.apply_to_ty(t)` unconditionally on every capture's
+        // `Ty`. `apply_to_ty(Ty::Continuation(_))` hits the
+        // `unreachable!()` arm at `monomorphize.rs:1516` regardless
+        // of whether the substitution is empty — so the panic fires
+        // even for a non-generic fn embedded in a program that ALSO
+        // contains a generic fn elsewhere. G5 closes the typecheck-
+        // level gap so that panic is unreachable in well-formed
+        // programs.
         //
-        // Why the narrowing to "generic enclosing fn":
+        // Why the gate is `self.program_has_generics` (review-2
+        // widening), not `current_generic_subst.is_empty() == false`:
         //
-        // The `std/state.sigil`'s `run_state` shape (handler arms
-        // returning `(Int) -> Int ![]` lambdas that capture `k`) is
-        // SUPPORTED today for non-generic fns: codegen + runtime lower
-        // multi-shot continuation values into closures whose captures
-        // include the live continuation, and there is no monomorphize
-        // walk to surface the panic. Forbidding all lambda-capture-of-k
-        // would regress this shipped pattern. The escape only manifests
-        // at mono time, and mono only walks lambda captures when there
-        // is a generic clone in flight (`current_clone_fn_name` is
-        // `Some`). Mirroring that gate at typecheck — `current_generic_-
-        // subst` non-empty means the enclosing fn declared generics —
-        // narrows the diagnostic to exactly the shapes mono cannot
-        // lower, leaving the non-generic shipped pattern untouched.
+        // The original narrowing ("enclosing fn is generic") missed
+        // the case where a NON-generic fn (e.g., `std/state.sigil`'s
+        // `run_state`) lives in a program that ALSO contains generics
+        // elsewhere. Reviewer constructed a reproducer (a non-generic
+        // `run_state` + a generic `id[A]` + a `comp` that uses both)
+        // that typechecked under the narrow gate but panicked at mono
+        // because mono walks every reachable fn — not just generic
+        // ones — when `program_has_generics` returns true. The
+        // widened gate predicts mono's behaviour exactly: fire E0145
+        // anywhere a lambda captures `Ty::Continuation` in a program
+        // that will trigger mono.
         //
-        // Other typecheck barriers don't cover this path: (1) the broad
-        // `unify_ty` arm fires on `Ty::Continuation` vs non-Continuation
-        // unifications, but a lambda built from `fn (...) -> A => k(s)`
-        // has type `Fn(...) -> A` (the lambda itself, not k), so no
-        // unify against Continuation occurs at the value level; and
-        // (2) the one-shot linearity check (`count_continuation_uses`)
-        // saturates at 2 for lambdas-capturing-k and fires E0220 — but
-        // only for effects WITHOUT `resumes: many`. Multi-shot effects
-        // (e.g. `effect State resumes: many`) skip the linearity check
-        // entirely (typecheck.rs:5571 `if !typing.resumes_many`), and
-        // the row-poly handler-arm-returns-lambda shape used by the
-        // multi-effect interpreter port (`task_78_5_g5_*` test) hits
-        // exactly this gap.
+        // Honest about the constraint: any program that triggers
+        // mono cannot contain a lambda-captures-`k` shape anywhere.
+        // This regresses `std/state.sigil`'s `run_state` for users
+        // who ALSO use generics — but it surfaces the real v1
+        // limitation as a clean E0145 diagnostic instead of a
+        // runtime panic. The pure non-generic `run_state` use stays
+        // supported (see `std_state_run_state_set_get_returns_11`
+        // and `task_78_5_g5_run_state_lambda_capture_in_no_generics_-
+        // program_compiles_cleanly` for negative-coverage pins).
+        //
+        // Other typecheck barriers don't cover this path: (1) the
+        // broad `unify_ty` arm fires on `Ty::Continuation` vs
+        // non-Continuation unifications, but a lambda built from
+        // `fn (...) -> A => k(s)` has type `Fn(...) -> A` (the
+        // lambda itself, not k), so no unify against Continuation
+        // occurs at the value level; and (2) the one-shot linearity
+        // check (`count_continuation_uses`) saturates at 2 for
+        // lambdas-capturing-k and fires E0220 — but only for effects
+        // WITHOUT `resumes: many`. Multi-shot effects (e.g.
+        // `effect State resumes: many`) skip the linearity check
+        // entirely (typecheck.rs:5571 `if !typing.resumes_many`),
+        // and the row-poly handler-arm-returns-lambda shape used by
+        // the multi-effect interpreter port (`task_78_5_g5_*` test)
+        // hits exactly this gap.
         //
         // Diagnostic site: the lambda-construction span (the surface
         // `fn (...) -> ... => ...`). Iterates `captures` to find the
@@ -4995,25 +5048,32 @@ impl Tc {
         // downstream typecheck walks see consistent state; the
         // pipeline's error count gates codegen so the panic at mono
         // is short-circuited regardless.
-        if !self.current_generic_subst.is_empty() {
+        if self.program_has_generics {
             for (cap_name, cap_ty) in &captures {
                 if matches!(cap_ty, Ty::Continuation(_)) {
                     self.push_error(
                         "E0145",
                         span.clone(),
                         format!(
-                            "continuation `{cap_name}` cannot escape its handle's arm body \
-                             via lambda capture inside a generic function — this lambda \
-                             closes over a continuation value, and the surrounding generic \
-                             function's monomorphization would carry the continuation \
-                             through the type-substitution pass which cannot lower \
-                             continuation values across generic instantiations. Either \
-                             rewrite the arm body to call `{cap_name}(arg)` directly \
-                             without intermediate lambda capture, or move the handler \
-                             out of the generic function (a non-generic wrapper around \
-                             the generic body)"
+                            "continuation `{cap_name}` cannot be captured by a lambda \
+                             in a program containing generic functions (v1 limitation: \
+                             continuation values cannot cross generic-instantiation \
+                             boundaries, and monomorphization walks every reachable \
+                             function — including non-generic ones — once any generic \
+                             exists in the program). Either rewrite the arm body to \
+                             call `{cap_name}(arg)` directly without intermediate \
+                             lambda capture, or move the handler into a non-generic \
+                             wrapper around the generic body."
                         ),
                     );
+                    // v1 single-error-per-lambda: only the first
+                    // `Ty::Continuation` capture is reported. The
+                    // user fixes one capture, recompiles, and any
+                    // remaining captures surface on the next pass.
+                    // Acceptable for v1: each fix is local (rewrite
+                    // the arm body / hoist out of generic scope) so
+                    // an iterative fix loop matches user intent
+                    // better than a flood of duplicates here.
                     break;
                 }
             }
@@ -10503,6 +10563,12 @@ mod tests {
             handle_arm_captures: BTreeMap::new(),
             handle_return_arm_captures: BTreeMap::new(),
             handle_body_ty: BTreeMap::new(),
+            // Unit-test default: no enclosing program, so the
+            // program-level G5 widening gate is off. Tests that need
+            // the gate on go through `pipeline()` (full top-level
+            // `typecheck()` entry, which computes the flag from the
+            // parsed program).
+            program_has_generics: false,
         }
     }
 
@@ -12102,16 +12168,26 @@ mod tests {
     }
 
     #[test]
-    fn task_78_5_g5_lambda_capturing_k_in_non_generic_fn_does_not_fire_e0145() {
-        // Negative coverage / regression guard for the narrowing:
-        // the SAME shape inside a non-generic fn must NOT fire E0145.
+    fn task_78_5_g5_lambda_capturing_k_in_non_generic_fn_in_no_generics_program_does_not_fire_e0145(
+    ) {
+        // Negative coverage / regression guard for the widened gate
+        // (review-2): the SAME shape inside a non-generic fn in a
+        // program with NO generics anywhere must NOT fire E0145.
         // This mirrors `std/state.sigil`'s `run_state` exactly. The
         // shipped multi-shot state-threading pattern depends on
         // lambda-captures-k working at codegen + runtime (closure
         // record holds the live continuation); rejecting it at
         // typecheck would regress `std/state.sigil` and any user
-        // code using the same shape. The G5 fix narrows on
-        // `current_generic_subst.is_empty()` to preserve this.
+        // code using the same shape so long as that user code
+        // doesn't ALSO declare any generic fn / type / Apply use
+        // anywhere in the same program. The G5 fix gates on
+        // `program_has_generics` to preserve this no-generics path.
+        //
+        // For the corresponding negative-coverage of the widening
+        // ("non-generic fn embedded in a program WITH generics
+        // elsewhere — must fire E0145"), see
+        // `task_78_5_g5_run_state_non_generic_fn_with_any_program_-
+        // generic_fires_e0145` below.
         //
         // Linearity is also bypassed (State is `resumes: many`), so
         // there's no E0220 either. The test additionally guards
@@ -12127,14 +12203,60 @@ mod tests {
         let errs = pipeline(src);
         assert!(
             !has_code(&errs, "E0145"),
-            "lambda capturing arm `k` inside NON-generic `run_state` must NOT fire \
-             E0145 (regression guard for the narrowing — `std/state.sigil` ships \
-             this exact shape): {errs:?}"
+            "lambda capturing arm `k` inside NON-generic `run_state` in a program \
+             with NO generics must NOT fire E0145 (regression guard for the widened \
+             gate — `std/state.sigil` ships this exact shape and stays supported \
+             so long as no generics live elsewhere in the user's program): {errs:?}"
         );
         assert!(
             !has_code(&errs, "E0220"),
             "multi-shot State must skip linearity check (sanity check that the \
              negative test isn't relying on a different barrier): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn task_78_5_g5_run_state_non_generic_fn_with_any_program_generic_fires_e0145() {
+        // Reviewer's reproducer (review 2 BLOCKER): non-generic
+        // `run_state` (the shipped `std/state.sigil` shape) used
+        // alongside ANY generic fn in the same program must fire
+        // E0145 at the lambda-capture-of-k site. Pre-widening this
+        // typechecked clean (the narrow gate "enclosing fn is
+        // generic" returned false for `run_state`'s lambda) and
+        // panicked at `monomorphize.rs:1516` because mono walks
+        // every reachable fn — including non-generic ones — when
+        // `program_has_generics` is true. The widened gate
+        // (`self.program_has_generics`) predicts mono's behaviour
+        // exactly: fire E0145 at the lambda construction site,
+        // surfacing the v1 limitation as a clean diagnostic.
+        let src = "effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+                   fn id[A](x: A) -> A ![] { x }\n\
+                   fn run_state(initial: Int, body: () -> Int ![State]) -> Int ![] {\n  \
+                     let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                       return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                       State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                       State.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                     };\n  \
+                     state_fn(initial)\n\
+                   }\n\
+                   fn comp() -> Int ![State] {\n  \
+                     let _: Int = perform State.set(10);\n  \
+                     let v: Int = perform State.get();\n  \
+                     v + 1\n\
+                   }\n\
+                   fn main() -> Int ![] {\n  \
+                     let result: Int = run_state(5, comp);\n  \
+                     let _: Int = id(result);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "lambda capturing `k` inside NON-generic `run_state` must fire E0145 \
+             when the enclosing program contains ANY generic fn (here `id[A]`) — \
+             mono walks every reachable fn body when `program_has_generics` is \
+             true and would panic at `monomorphize.rs:1516` on the captured \
+             `Ty::Continuation`. Widened gate must surface this: {errs:?}"
         );
     }
 
@@ -12165,6 +12287,16 @@ mod tests {
             "lambda capturing a let-aliased `Continuation` inside generic fn must \
              fire E0145 (the alias is Ty::Continuation, captured by the lambda; \
              scan visits it and triggers the barrier): {errs:?}"
+        );
+        // Precision claim: E0145 must fire against `f` (the alias name
+        // visible in the lambda's capture set), not `k` — confirms the
+        // capture-scan iterates derefed captures by name and reports
+        // the captured binding rather than the original arm parameter.
+        assert!(
+            errs.iter()
+                .any(|e| e.code.as_str() == "E0145" && e.message.contains("`f`")),
+            "E0145 must name the lambda-captured alias `f`, not the underlying \
+             arm `k`: {errs:?}"
         );
     }
 

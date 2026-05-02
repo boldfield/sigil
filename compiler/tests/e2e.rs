@@ -8622,8 +8622,99 @@ fn task_78_5_g5_continuation_in_handler_lambda_through_mono_fires_e0145() {
     assert_compile_fails_with_code(
         src,
         "E0145",
-        &["cannot escape its handle's arm body via lambda capture"],
+        &["cannot be captured by a lambda"],
         "task_78_5_g5_multi_effect_interpreter",
+    );
+}
+
+/// **Task 78.5 G5 (review-2 BLOCKER reproducer) — non-generic
+/// `run_state` shape combined with ANY generic fn elsewhere fires
+/// E0145 at the lambda-capture-of-k site.**
+///
+/// Reviewer-constructed reproducer for the gate-narrowing blocker on
+/// PR #72. Pre-widening (`current_generic_subst.is_empty() == false`)
+/// this typechecked clean and panicked at `monomorphize.rs:1516`
+/// because mono walks every reachable fn — including non-generic
+/// ones — when `program_has_generics` is true. Post-widening
+/// (`self.program_has_generics`) the gate fires E0145 at the lambda
+/// construction site, surfacing the v1 limitation as a clean
+/// diagnostic instead of a runtime panic.
+///
+/// This e2e pin complements the in-typecheck unit-level reproducer
+/// `task_78_5_g5_run_state_non_generic_fn_with_any_program_generic_-
+/// fires_e0145` by running through the full compiler driver — pinning
+/// that the diagnostic surfaces in `stderr` exactly as users will see
+/// it.
+#[test]
+fn task_78_5_g5_lambda_captures_k_with_any_generic_in_program_fires_e0145() {
+    let src = "import std.state\n\
+               import std.io\n\
+               \n\
+               fn id[A](x: A) -> A ![] { x }\n\
+               \n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
+                 v + 1\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 let _: Int = id(result);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    assert_compile_fails_with_code(
+        src,
+        "E0145",
+        &["cannot be captured by a lambda"],
+        "task_78_5_g5_lambda_captures_k_with_any_generic_in_program",
+    );
+}
+
+/// **Task 78.5 G5 (review-2 widening) — `std/state.sigil`'s
+/// `run_state` shape in a no-generics program compiles + runs
+/// cleanly.**
+///
+/// Negative-coverage regression guard for the widened
+/// `program_has_generics` gate. Mirrors
+/// `std_state_run_state_set_get_returns_11` — so long as a user's
+/// program contains NO generics anywhere (no user generic fn / type
+/// declarations, no `Array[Int]`-style Apply use), `run_state`'s
+/// shipped lambda-captures-k shape stays supported. Pins the gate
+/// boundary: the widening only fires when mono will run, never on
+/// pure non-generic programs.
+///
+/// Distinct from the unit-level
+/// `task_78_5_g5_lambda_capturing_k_in_non_generic_fn_in_no_generics_-
+/// program_does_not_fire_e0145` test (typecheck-only) by running
+/// through the full driver and asserting the program both compiles
+/// AND produces the canonical `"11\n"` runtime output — pins that
+/// the widening doesn't accidentally regress codegen / runtime
+/// behaviour for the supported shape.
+#[test]
+fn task_78_5_g5_run_state_lambda_capture_in_no_generics_program_compiles_cleanly() {
+    let src = "import std.state\n\
+               import std.io\n\
+               \n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
+                 v + 1\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "task_78_5_g5_run_state_no_generics_negative_coverage");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "11\n",
+        "run_state(5, comp) must still return 11 in a no-generics program \
+         (regression guard for the widened gate); stderr={stderr:?}"
     );
 }
 
