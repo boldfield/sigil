@@ -8516,54 +8516,53 @@ fn task_78_5_g2b_minimal_lambda_row_var_inheritance() {
     );
 }
 
-/// **Task 78.5 — Multi-effect interpreter (Raise+State+IO) [PENDING G5: Ty::Continuation reaches monomorphize].**
+/// **Task 78.5 G5 — generic handler arm returns a lambda capturing
+/// `k`: must fire E0145 at typecheck (negative pin).**
 ///
 /// Source pattern: `koka/test/algeff/expr.kk` lines 145–165 (`eval2`
 /// with state + exc) extended with IO trace per eval3 (lines 179–195).
-/// First sigil e2e exercising 3-effect recursive evaluation under
-/// stacked dischargers.
+/// Originally a positive end-to-end test of 3-effect recursive
+/// evaluation under stacked dischargers; restructured into a negative
+/// E0145 pin as part of the G5 closure (the surface shape is not
+/// monomorphizable; the diagnostic now redirects users to the
+/// non-generic pattern).
 ///
-/// ## Status — G2.b closed (typecheck), G5 surfaced (monomorphize)
+/// ## Status — G5 closed (typecheck-level rejection)
 ///
-/// Originally `#[ignore]`'d as the G2.b representative: pre-fix
-/// surfaced E0128 "effect row mismatch: closed row `![State]` cannot
-/// unify with closed row `![ArithError, IO, Raise[String], State]`"
-/// at the `run_state_poly` call site. The G2.b fix (typecheck.rs
-/// Lambda arm — resolve the parsed `effect_row_var` name through
-/// `current_row_var_subst` at lambda construction, mirroring the
-/// inner-fn-type resolution at typecheck.rs:6532-6535 — the
-/// `TypeExpr::Fn` arm of `ty_from_type_expr_with_rows`) **closes the
-/// typecheck-level gap**: the test progresses past typecheck into
-/// monomorphize. Sister test `task_78_5_g2b_minimal_lambda_row_var_-
-/// inheritance` is the clean G2.b regression pin and passes
-/// post-fix.
+/// Pre-G5: G2.b's lambda-row-var inheritance fix made this test
+/// progress past typecheck and panic at monomorphize.rs:1516
+/// (`Ty::Continuation reached mono substitution`). The arm body
+/// `State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s)` returns a
+/// lambda capturing `k` (`Ty::Continuation`). Inside the **generic**
+/// `run_state_poly[A]`, monomorphize's `Substitution::apply_to_ty`
+/// walked the lambda's captures (`monomorphize.rs:1054`) and hit
+/// `Ty::Continuation` in `apply_to_ty`'s arm at line 1516.
 ///
-/// **G5 (NEW gap surfaced post-G2.b)**: monomorphize panics at
-/// `compiler/src/monomorphize.rs:1516`:
-/// `internal error: entered unreachable code: monomorphize::-
-/// Substitution::apply_to_ty: Ty::Continuation reached mono
-/// substitution — typecheck E0145 should have rejected the cross-fn /
-/// generic-instantiation site`. The handler arms of `run_state_poly`
-/// return lambdas (`fn (s: Int) -> A ![| e] => ...`) that close over
-/// the arm continuation `k`. When `run_state_poly[A]` is monomorphized
-/// at `A := Int`, the substitution walks into the lambda body and
-/// encounters `Ty::Continuation` (the type of `k` captured from the
-/// arm). Monomorphize asserts `Ty::Continuation` shouldn't survive
-/// typecheck cross-fn boundaries (per Plan D Task 117 escape barrier),
-/// but the row-poly handler-returns-lambda shape produces exactly
-/// such a survivor. G5 is its own gap — the lambda inheritance fix
-/// in this PR only closes the typecheck-level row-var collapse;
-/// downstream codegen / monomorphize support for handler-arm-derived
-/// lambdas in row-poly fns is separate work.
+/// Post-G5: typecheck rejects the surface shape with E0145 at the
+/// lambda construction site. The fix narrows the new escape-barrier
+/// arm in `check_lambda` to fire only when the **enclosing fn is
+/// generic** (`current_generic_subst` non-empty) — the non-generic
+/// `run_state` shape in `std/state.sigil` is unaffected and continues
+/// to compile and run.
 ///
-/// ## G2.b root site (pre-fix, now closed)
+/// ## G5 root site
 ///
-/// `compiler/src/typecheck.rs:4328` (the `let _ = effect_row_var;`)
-/// and `:4769` (hardcoded `effect_row_var: None` on the lambda's
-/// `FnSig`). Lambda typing **dropped the parsed `effect_row_var`**.
-/// The G2.b fix lookups the row-var name through
-/// `self.current_row_var_subst` and threads the resolved `Option<u32>`
-/// into `check_lambda` to populate `FnSig::effect_row_var`.
+/// `compiler/src/typecheck.rs` `check_lambda` — after captures are
+/// gathered with their derefed `Ty`s, scan for `Ty::Continuation`
+/// entries when `self.current_generic_subst.is_empty() == false`.
+/// Push E0145 with a precise diagnostic naming the captured `k`.
+///
+/// ## Recommended user fix
+///
+/// Either rewrite the handler arms to call `k(arg)` directly (without
+/// intermediate lambda capture — the trade-off is that the State
+/// state-threading pattern requires lambdas), or move the handler
+/// out of the generic function (a non-generic wrapper `run_state`
+/// like `std/state.sigil` ships, then call that wrapper from the
+/// generic body via inversion of control). See
+/// `task_78_5_g5_run_state_non_generic_handler_arm_lambda_capture_-
+/// is_supported` (in typecheck unit tests) for the supported
+/// non-generic pattern.
 ///
 /// ## Note on the typed-let raise() workaround
 ///
@@ -8573,13 +8572,8 @@ fn task_78_5_g2b_minimal_lambda_row_var_inheritance() {
 /// unification at expression position. See
 /// `task_78_5_pending_g3_raise_in_if_branch_expr_position_polymorphism`
 /// for the isolated G3 pin.
-///
-/// **Invariant** (post-G2.b + post-G5 fix): `Div(Div(IntE(16),
-/// IntE(2)), IntE(3))` → `(16/2)/3 = 2`. tick prints once per Div
-/// node; final value 2. stdout = `"tick\ntick\n2\n"`, exit 0.
 #[test]
-#[ignore = "G5 (post-G2.b): handler arm returns lambda capturing arm k; monomorphize panics at Ty::Continuation. G2.b (lambda effect_row_var inheritance) is closed by this PR — see task_78_5_g2b_minimal_lambda_row_var_inheritance. G5 is its own follow-up: extend monomorphize / Ty::Continuation propagation through row-poly handler-returns-lambda shapes."]
-fn task_78_5_pending_g5_continuation_in_handler_lambda_through_mono() {
+fn task_78_5_g5_continuation_in_handler_lambda_through_mono_fires_e0145() {
     let src = "import std.raise\n\
                import std.result\n\
                import std.io\n\
@@ -8625,11 +8619,102 @@ fn task_78_5_pending_g5_continuation_in_handler_lambda_through_mono() {
                  };\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_multi_effect_interpreter");
+    assert_compile_fails_with_code(
+        src,
+        "E0145",
+        &["cannot be captured by a lambda"],
+        "task_78_5_g5_multi_effect_interpreter",
+    );
+}
+
+/// **Task 78.5 G5 (review-2 BLOCKER reproducer) — non-generic
+/// `run_state` shape combined with ANY generic fn elsewhere fires
+/// E0145 at the lambda-capture-of-k site.**
+///
+/// Reviewer-constructed reproducer for the gate-narrowing blocker on
+/// PR #72. Pre-widening (`current_generic_subst.is_empty() == false`)
+/// this typechecked clean and panicked at `monomorphize.rs:1516`
+/// because mono walks every reachable fn — including non-generic
+/// ones — when `program_has_generics` is true. Post-widening
+/// (`self.program_has_generics`) the gate fires E0145 at the lambda
+/// construction site, surfacing the v1 limitation as a clean
+/// diagnostic instead of a runtime panic.
+///
+/// This e2e pin complements the in-typecheck unit-level reproducer
+/// `task_78_5_g5_run_state_non_generic_fn_with_any_program_generic_-
+/// fires_e0145` by running through the full compiler driver — pinning
+/// that the diagnostic surfaces in `stderr` exactly as users will see
+/// it.
+#[test]
+fn task_78_5_g5_lambda_captures_k_with_any_generic_in_program_fires_e0145() {
+    let src = "import std.state\n\
+               import std.io\n\
+               \n\
+               fn id[A](x: A) -> A ![] { x }\n\
+               \n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
+                 v + 1\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 let _: Int = id(result);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    assert_compile_fails_with_code(
+        src,
+        "E0145",
+        &["cannot be captured by a lambda"],
+        "task_78_5_g5_lambda_captures_k_with_any_generic_in_program",
+    );
+}
+
+/// **Task 78.5 G5 (review-2 widening) — `std/state.sigil`'s
+/// `run_state` shape in a no-generics program compiles + runs
+/// cleanly.**
+///
+/// Negative-coverage regression guard for the widened
+/// `program_has_generics` gate. Mirrors
+/// `std_state_run_state_set_get_returns_11` — so long as a user's
+/// program contains NO generics anywhere (no user generic fn / type
+/// declarations, no `Array[Int]`-style Apply use), `run_state`'s
+/// shipped lambda-captures-k shape stays supported. Pins the gate
+/// boundary: the widening only fires when mono will run, never on
+/// pure non-generic programs.
+///
+/// Distinct from the unit-level
+/// `task_78_5_g5_lambda_capturing_k_in_non_generic_fn_in_no_generics_-
+/// program_does_not_fire_e0145` test (typecheck-only) by running
+/// through the full driver and asserting the program both compiles
+/// AND produces the canonical `"11\n"` runtime output — pins that
+/// the widening doesn't accidentally regress codegen / runtime
+/// behaviour for the supported shape.
+#[test]
+fn task_78_5_g5_run_state_lambda_capture_in_no_generics_program_compiles_cleanly() {
+    let src = "import std.state\n\
+               import std.io\n\
+               \n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
+                 v + 1\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "task_78_5_g5_run_state_no_generics_negative_coverage");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "tick\ntick\n2\n",
-        "Div tree should print tick per Div node and final value 2; stderr={stderr:?}"
+        stdout, "11\n",
+        "run_state(5, comp) must still return 11 in a no-generics program \
+         (regression guard for the widened gate); stderr={stderr:?}"
     );
 }
 

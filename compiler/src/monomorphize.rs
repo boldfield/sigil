@@ -219,7 +219,7 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
 /// without user-declared generic decls; those Apply nodes must be
 /// rewritten to mangled `Named` so the codegen-entry assertion
 /// doesn't trip.
-fn program_has_generics(program: &Program) -> bool {
+pub(crate) fn program_has_generics(program: &Program) -> bool {
     if crate::codegen::contains_apply_or_generic_ref(program) {
         return true;
     }
