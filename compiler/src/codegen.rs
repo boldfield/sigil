@@ -8067,6 +8067,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_k_fn_v: None,
                         arm_frame_ptr_v: None,
                         arm_k_pair_self: None,
+                        pending_handle_helper_fired_v: None,
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
                     };
 
@@ -8974,6 +8975,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_k_fn_v: None,
                     arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
+                    pending_handle_helper_fired_v: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
 
@@ -9152,6 +9154,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_k_fn_v: None,
                 arm_frame_ptr_v: None,
                 arm_k_pair_self: cc.arm_k_pair_captures.get(&f.name).cloned(),
+                pending_handle_helper_fired_v: None,
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
             };
 
@@ -9644,6 +9647,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_k_fn_v: Some(k_fn_v),
                     arm_frame_ptr_v: frame_ptr_v,
                     arm_k_pair_self: None,
+                    pending_handle_helper_fired_v: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
 
@@ -10580,6 +10584,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_k_fn_v: None,
                     arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
+                    pending_handle_helper_fired_v: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
                 };
 
@@ -10871,6 +10876,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_k_fn_v: None,
                 arm_frame_ptr_v: None,
                 arm_k_pair_self: None,
+                pending_handle_helper_fired_v: None,
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
             };
 
@@ -11174,6 +11180,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_k_fn_v: None,
                         arm_frame_ptr_v: None,
                         arm_k_pair_self: None,
+                        pending_handle_helper_fired_v: None,
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
                     };
 
@@ -11860,6 +11867,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             arm_k_fn_v: None,
                             arm_frame_ptr_v: None,
                             arm_k_pair_self: None,
+                            pending_handle_helper_fired_v: None,
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
                         };
 
@@ -12381,6 +12389,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             arm_k_fn_v: None,
                             arm_frame_ptr_v: None,
                             arm_k_pair_self: None,
+                            pending_handle_helper_fired_v: None,
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
                         };
 
@@ -13225,6 +13234,16 @@ struct Lowerer<'a, 'b> {
     /// at synth-fn Lowerer construction.
     arm_k_pair_self: Option<crate::closure_convert::ArmKPairCapture>,
 
+    /// Task 78.5 G4 Approach 6 deep-redo iter 2 — captured
+    /// `BODY_RETURN_ARM_FIRED` Cranelift Value from the most recent
+    /// `lower_handle_body_direct_cps_call` invocation, sampled BEFORE
+    /// the wrapper's TLS RESTORE (which clears FIRED to the prior
+    /// outer state). Phase 4g's suppression check reads this Value
+    /// instead of issuing a fresh TLS load — the fresh load would see
+    /// the restored (false) state and miss the helper-fired signal.
+    /// Cleared after Phase 4g consumes it.
+    pending_handle_helper_fired_v: Option<Value>,
+
     /// Plan B' Stage 6.8 Task 107 Phase B — global side-table from
     /// closure_convert flagging which lifted lambda fns are k-pair-
     /// bearing. Read by `lower_closure_record` when the code_fn_name
@@ -13406,6 +13425,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let raw_u64 = self.builder.inst_results(run_loop_call)[0];
+
+        // Task 78.5 G4 Approach 6 deep-redo iter 2 — capture the
+        // post-run_loop FIRED state BEFORE restoring TLS. Phase 4g's
+        // suppression check needs to know whether the helper fired
+        // during the body's run_loop; once we restore, the TLS slot
+        // reflects the OUTER's prior FIRED state (typically false
+        // for the outermost handle), losing the helper-fired signal.
+        // Phase 4g's brif-on-FIRED check reads `self.pending_handle_
+        // helper_fired_v` instead of issuing a fresh TLS load.
+        let post_run_loop_fired_call = self
+            .builder
+            .ins()
+            .call(self.get_body_return_arm_fired_ref, &[]);
+        let post_run_loop_fired_v = self.builder.inst_results(post_run_loop_fired_call)[0];
+        self.pending_handle_helper_fired_v = Some(post_run_loop_fired_v);
 
         // Approach 6 RESTORE — put the saved TLS triplet back. This
         // is the correctness load-bearing point for nested handles:
@@ -14364,15 +14398,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         .append_block_param(merge_block, handler_overall_ty);
 
                     // Task 78.5 G4 Approach 6 deep-redo — three-way
-                    // branch (fired, discharged, normal). Read FIRED
-                    // first; if set, jump to suppression block (uses
-                    // body_val directly — already wrapped). Else
-                    // existing (discharged, normal) branching.
-                    let fired_call = self
-                        .builder
-                        .ins()
-                        .call(self.get_body_return_arm_fired_ref, &[]);
-                    let fired_v = self.builder.inst_results(fired_call)[0];
+                    // branch (fired, discharged, normal). Use
+                    // post-run_loop FIRED Value captured by the custom
+                    // body-call wrapper BEFORE its TLS restore. If the
+                    // wrapper wasn't called (body wasn't a direct Cps
+                    // call), fresh-load FIRED from TLS — discharge/normal
+                    // handles the rest.
+                    let fired_v = if let Some(captured) = self.pending_handle_helper_fired_v.take()
+                    {
+                        captured
+                    } else {
+                        let fired_call = self
+                            .builder
+                            .ins()
+                            .call(self.get_body_return_arm_fired_ref, &[]);
+                        self.builder.inst_results(fired_call)[0]
+                    };
                     let zero_i8 = self.builder.ins().iconst(types::I8, 0);
                     let is_fired = self.builder.ins().icmp(IntCC::NotEqual, fired_v, zero_i8);
                     let suppression_block = self.builder.create_block();

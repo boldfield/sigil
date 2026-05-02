@@ -529,10 +529,6 @@ pub(crate) fn unregister_outer_post_arm_k_stack_root_for_calling_thread(
 /// pairs every push with a perform that eventually drives a Done.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_outer_post_arm_k_push(closure_ptr: *mut u8, fn_ptr: *mut u8) {
-    eprintln!(
-        "G4_DIAG_PUSH: closure={closure_ptr:?} fn={fn_ptr:?} depth_before={}",
-        OUTER_POST_ARM_K_DEPTH.with(|c| c.get())
-    );
     OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
         let depth = depth_cell.get();
         if depth >= OUTER_POST_ARM_K_STACK_SIZE {
@@ -571,17 +567,12 @@ fn outer_post_arm_k_try_pop() -> Option<OuterPostArmKEntry> {
     OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
         let depth = depth_cell.get();
         if depth == 0 {
-            eprintln!("G4_DIAG_TRY_POP: empty (depth=0) → None");
             None
         } else {
             depth_cell.set(depth - 1);
             OUTER_POST_ARM_K_STACK.with(|stack_cell| {
                 let mut stack = stack_cell.get();
                 let popped = stack[depth - 1];
-                eprintln!(
-                    "G4_DIAG_TRY_POP: depth_before={depth} popped closure={:?} fn={:?}",
-                    popped.closure_ptr, popped.fn_ptr
-                );
                 // Clear the slot so a stale pointer doesn't survive
                 // in the TLS-rooted range across the next GC scan.
                 stack[depth - 1] = OuterPostArmKEntry {
@@ -1132,14 +1123,6 @@ pub unsafe extern "C" fn sigil_clear_body_return_arm() {
 pub unsafe extern "C" fn sigil_done_or_dispatch_return_arm(v: u64) -> *mut NextStep {
     let fired = BODY_RETURN_ARM_FIRED.with(|c| c.get());
     let fn_addr = BODY_RETURN_ARM_FN.with(|c| c.get());
-    eprintln!(
-        "G4_DIAG_HELPER: v={v} fired_before={fired} fn_addr={fn_addr:?} → action={}",
-        if !fired && !fn_addr.is_null() {
-            "WRAP"
-        } else {
-            "DONE"
-        }
-    );
     if !fired && !fn_addr.is_null() {
         let closure = BODY_RETURN_ARM_CLOSURE.with(|c| c.get());
         BODY_RETURN_ARM_FIRED.with(|c| c.set(true));
