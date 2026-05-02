@@ -11996,7 +11996,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                              set when groups is non-empty (B.4 body-call dispatch)"
                         )
                     });
-                    let v = self.lower_b4_cps_body_call(body, snap);
+                    // PR #75 review 2 BLOCKER fix: pass `&ra` and the
+                    // body's Cranelift type so the narrow at the end of
+                    // `lower_b4_cps_body_call` uses the *handler-overall*
+                    // type (return arm body's type, R) rather than the
+                    // body's type (B). When B != R, the run_loop result
+                    // is R-shaped — narrowing to B was wrong.
+                    let ra = return_arm.as_deref().unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen Task 78.5 G4 B.4: b4_eligible implies \
+                             return_arm.is_some() (per b4_shape_eligible gate)"
+                        )
+                    });
+                    let v = self.lower_b4_cps_body_call(body, snap, ra);
                     (v, true)
                 } else {
                     (self.lower_expr(body), false)
@@ -12976,6 +12988,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         &mut self,
         body: &crate::ast::Expr,
         frame_1_ptr_snapshot: Value,
+        ra: &crate::ast::HandleReturnArm,
     ) -> Value {
         use crate::ast::Expr;
         let (callee, args) = match body {
@@ -13004,7 +13017,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
              callee `{name}` has abi {:?}",
             callee_entry.abi
         );
-        let ret_ty = callee_entry.ret_ty;
+        // `body_ty` is the Cranelift type of the handle BODY's value
+        // (== callee's declared ret type, B). Used both for arg-pack
+        // type assertions below AND to seed the preview env when
+        // computing the handler-overall type (R) for the post-narrow.
+        let body_ty = callee_entry.ret_ty;
 
         // Pack user args + (return_arm_closure, return_arm_fn) into a
         // single stack slot of size `(N + 2) * 8` bytes. Mirrors
@@ -13113,56 +13130,51 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let raw_u64 = self.builder.inst_results(run_loop_call)[0];
 
-        // Narrow `raw_u64` back to the callee's declared return type.
-        // The DONE-path value was return-arm-wrapped (so its
-        // Cranelift type is the return arm body's type, == the
-        // handler's overall type, == the callee's ret_ty? — yes,
-        // because typecheck pinned `handler_overall == ra.body's
-        // type` AND for the B.4 path the wrapped value flowing
-        // back IS body's natural terminal which matches the
-        // callee's ret_ty… wait, the return arm transforms `v: B`
-        // (body's type) into a value of type R (handler overall).
-        // In the B.4 path, `r_loop` returns the R-typed value
-        // (return-arm output) widened to u64, NOT body's B-typed
-        // value. So the narrow target should be R = handler
-        // overall, not callee_entry.ret_ty.
+        // Narrow `raw_u64` back to the **handler-overall** Cranelift
+        // type, NOT the callee's body type.
         //
-        // **handler_overall_ty:** typecheck binds it on
-        // `handle_body_ty` for the body's type and the return arm's
-        // body's type IS the handler overall. The caller (handle
-        // lowering site) treats `body_val`'s type as the handler
-        // overall via the existing post-body merge — for B.4 we
-        // return body_val with the ret_ty narrow, and the caller
-        // passes it through unchanged (since `b4_routed_via_return_
-        // arm` short-circuits to `return body_val`).
+        // **PR #75 review 2 BLOCKER fix.** The DONE path through B.4's
+        // trailing-pair routing returns the *return-arm-wrapped* value:
+        // run_loop's Done branch sees the body's args buffer trailing
+        // pair (the return-arm pair we wrote at slots `k_closure_offset
+        // (N)` / `k_fn_offset(N)`) and re-dispatches as `Call(return_
+        // closure, return_fn, [arg, null, identity])`; the return-arm
+        // synth fn lowers `ra.body` and returns Done(R-typed value).
+        // So `raw_u64`'s logical Cranelift type is R (the handler
+        // overall), not B (the body's / callee's ret type).
         //
-        // **For the B.4 MVP:** handler-overall == callee.ret_ty
-        // when typecheck-time `B == R` (e.g., `comp() -> Int`,
-        // return arm `return(v) => v + 1` keeps R = Int = B). For
-        // mixed-type return arms (B = Int, R = Bool via `v > 50`),
-        // the run_loop result is R-shaped but Cranelift-typed to
-        // I64; narrowing via `ret_ty = callee.ret_ty` would be
-        // WRONG when R has narrower Cranelift type than B. To
-        // stay sound at the MVP, we narrow to the callee's
-        // ret_ty under the assertion that B == R for B.4-eligible
-        // shapes. The reachable B != R B.4 shape is the G4
-        // Generator port (B = Int, R = List[Int] both pointer_ty),
-        // where Cranelift type narrowing collapses both to
-        // pointer_ty. Mixed-narrow-int B != R + body-is-Cps-call +
-        // return-arm shapes are not currently exercised; if a
-        // future test surfaces one, this narrow needs to switch
-        // to the handler-overall Cranelift type computed by
-        // `type_of_expr(&ra.body, &preview)` (mirrors codegen.rs
-        // :12092-94).
-        if ret_ty == types::I64 {
+        // The DISCHARGED path returns the discharged arm's value, which
+        // by typecheck has the handler-overall type R as well (op arms'
+        // bodies typecheck against the handle's overall — same
+        // invariant the post-body discharge_block merge at
+        // codegen.rs:12146-12148 relies on). So both run_loop branches
+        // converge to the R-typed-but-u64-widened value.
+        //
+        // Mirrors the post-body return-arm dispatch's preview-env
+        // pattern (codegen.rs:12146-12148): seed `ra.binding` with
+        // `body_ty`, then ask `type_of_expr(&ra.body, &preview)` for
+        // the handler-overall Cranelift type. Pre-fix this code
+        // narrowed using `callee_entry.ret_ty` (B), which silently
+        // produced invalid Cranelift IR (e.g. `ireduce.i8 v_i64`
+        // misapplied to an I8 value, or no narrow on a pointer when R
+        // = I8) for any B != R shape. Currently masked by the e2e
+        // test (B == R == Int); future B != R B.4 shapes (Generator
+        // port: B = Int, R = List[Int] = pointer_ty; or mixed-int via
+        // `v > 50`) would have triggered Cranelift-verifier panics.
+        let mut preview: BTreeMap<String, Type> = BTreeMap::new();
+        preview.insert(ra.binding.clone(), body_ty);
+        let handler_overall_ty = self.type_of_expr(&ra.body, &preview);
+
+        if handler_overall_ty == types::I64 {
             raw_u64
-        } else if ret_ty.is_int() && ret_ty.bits() < 64 {
-            self.builder.ins().ireduce(ret_ty, raw_u64)
+        } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
+            self.builder.ins().ireduce(handler_overall_ty, raw_u64)
         } else {
             debug_assert_eq!(
-                ret_ty, self.pointer_ty,
-                "codegen Task 78.5 G4 B.4: callee `{name}` has unexpected \
-                 ret_ty {ret_ty:?}; expected I64 or pointer_ty"
+                handler_overall_ty, self.pointer_ty,
+                "codegen Task 78.5 G4 B.4: handler-overall type for handle \
+                 with body callee `{name}` is unexpected Cranelift type \
+                 {handler_overall_ty:?}; expected I64, narrower int, or pointer_ty"
             );
             raw_u64
         }
@@ -20586,6 +20598,92 @@ mod tests {
             result, None,
             "B.4 detector should reject ctor-shaped calls (Cons isn't \
              a user fn; lookup returns None)"
+        );
+    }
+
+    /// PR #75 review 2 concern 2 — pin the escape-barrier gate.
+    ///
+    /// The gate at codegen.rs:11990 disables B.4 when any op arm body
+    /// contains a `ClosureRecord` whose `code_fn_name` is registered in
+    /// `arm_k_pair_captures` (i.e., the lifted lambda captures the
+    /// k pair, so the trailing pair installed by B.4 would change what
+    /// the captured pair is — leaking a return-arm-wrapping into k(s)
+    /// invocations outside the handle's lexical scope).
+    ///
+    /// The detector composition is `!any_arm_has_k_pair_lambda`, where
+    /// `any_arm_has_k_pair_lambda` is built by walking each arm body
+    /// via `arm_body_has_k_pair_lambda(arm_body, arm_k_pair_captures)`.
+    /// This test pins that composition by constructing an arm body
+    /// shape that matches the gate's predicate (a `ClosureRecord` with
+    /// a `code_fn_name` registered in `arm_k_pair_captures`) and
+    /// asserts the underlying `arm_body_has_k_pair_lambda` returns
+    /// `true` — which is exactly what the gate negates to disable B.4.
+    ///
+    /// Without this test, a future refactor that breaks the gate (e.g.,
+    /// loses the `arm_k_pair_captures` lookup, or stops walking
+    /// `Expr::ClosureRecord`'s `code_fn_name`) would silently start
+    /// firing B.4 on escape-shape arms — producing the double-wrap
+    /// bug the gate exists to prevent (see codegen.rs:11937-11984).
+    /// E2e coverage of that bug already lives in
+    /// `handle_return_arm_with_outer_captures_in_k_pair_dispatch_path`
+    /// and friends; this lib test pins the gate's local predicate so
+    /// the failure mode is loud at lib-test time, not e2e regression.
+    #[test]
+    fn b4_escape_barrier_gate_predicate_fires_on_arm_body_with_k_pair_lifted_lambda() {
+        use crate::ast::{EnvSlotKind, Expr};
+        use crate::closure_convert::ArmKPairCapture;
+        use crate::errors::Span;
+        use crate::typecheck::Ty;
+
+        // Construct an arm body shape that matches the gate's predicate.
+        // The k-pair-bearing lifted lambda's `ClosureRecord` carries a
+        // `code_fn_name` that closure_convert registers in
+        // `arm_k_pair_captures`. The gate negates the result of
+        // `arm_body_has_k_pair_lambda` over each arm body — when any
+        // arm hits this shape, B.4 is disabled.
+        let span = Span::synthetic("x.sigil");
+        let lifted_fn_name = "lambda_lifted_k_capturing_synth_fn";
+        let arm_body = Expr::ClosureRecord {
+            code_fn_name: lifted_fn_name.to_string(),
+            env_exprs: vec![],
+            env_slot_kinds: vec![EnvSlotKind::Closure, EnvSlotKind::Closure],
+            span: span.clone(),
+        };
+
+        // Empty registry: the predicate must return false (the gate
+        // would not fire — B.4 stays eligible).
+        let empty: BTreeMap<String, ArmKPairCapture> = BTreeMap::new();
+        assert!(
+            !arm_body_has_k_pair_lambda(&arm_body, &empty),
+            "predicate must be false when the lifted fn name is not \
+             registered in arm_k_pair_captures (no k-pair escape — \
+             gate stays open, B.4 eligible)"
+        );
+
+        // Registered: the predicate must return true (the gate fires
+        // — B.4 disabled). The values inside `ArmKPairCapture` are
+        // not consulted by the predicate; only `contains_key` on
+        // `code_fn_name` matters.
+        let mut registered: BTreeMap<String, ArmKPairCapture> = BTreeMap::new();
+        registered.insert(
+            lifted_fn_name.to_string(),
+            ArmKPairCapture {
+                k_name: "k".to_string(),
+                k_closure_idx: 0,
+                k_fn_idx: 1,
+                op_ret_ty: Ty::Int,
+                handler_overall_ty: Ty::Int,
+                handle_span: span.clone(),
+                frame_ptr_idx: 2,
+            },
+        );
+        assert!(
+            arm_body_has_k_pair_lambda(&arm_body, &registered),
+            "predicate must be true when the lifted fn name IS \
+             registered in arm_k_pair_captures (k-pair escapes via \
+             the lifted lambda's closure record — gate must fire, \
+             B.4 must be disabled to avoid double-wrap of k(s) \
+             invocations outside the handle)"
         );
     }
 }

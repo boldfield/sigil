@@ -9059,3 +9059,83 @@ fn b4_handle_with_cps_body_call_and_return_arm_routes_via_trailing_pair() {
          → `v + 100` with v=7 → 107. stderr={stderr:?}"
     );
 }
+
+/// **Task 78.5 G4 Phase B.4 — DISCHARGED-bypass regression test.**
+///
+/// PR #75 review 1 concern 3. The PR description claims the trampoline's
+/// DISCHARGED branch bypasses BOTH `outer_post_arm_k` routing AND the
+/// trailing-pair routing on the body call's args buffer. Existing
+/// DISCHARGED-arm tests exercise this for Sync body shapes; this test
+/// pins it directly for a B.4-eligible Cps body call shape.
+///
+/// **Shape:** `handle comp() with { Trigger.fire(k) => 7, return(v) =>
+/// v + 1000 }` where `comp()` is Cps-color (matches
+/// `is_simple_chained_let_yield_then_pure_tail_body`: `let _ = perform
+/// Trigger.fire(); 99`). The B.4 detector fires (body is direct call to
+/// Cps user fn + return arm present), so `lower_b4_cps_body_call`
+/// installs `(return_arm_closure, return_arm_fn)` as the trailing pair
+/// on the body call's args buffer.
+///
+/// The op arm `Trigger.fire(k) => 7` discards `k` (no `k(...)` call in
+/// the arm body), so the trampoline's DISCHARGED branch fires:
+/// `sigil_next_step_discharged` builds a Discharged step, `run_loop`'s
+/// DISCHARGED branch bypasses `outer_post_arm_k` routing AND the
+/// trailing-pair routing on the body's args buffer, returning the
+/// discharge value (`7`) as `v` directly.
+///
+/// **Pre-B.4 behaviour:** body packs `(null, identity)` as trailing
+/// pair; arm discards k → DISCHARGED → run_loop returns 7. Post-body
+/// discharge_block detects the DISCHARGED tag and bypasses the return-
+/// arm dispatch (per algebraic-effects semantics: discharged value IS
+/// the handle's overall). Output: `7\n`.
+///
+/// **Post-B.4 behaviour:** body packs `(return_arm_closure,
+/// return_arm_fn)` as trailing pair; arm discards k → DISCHARGED →
+/// run_loop's DISCHARGED branch must STILL bypass the trailing-pair
+/// routing (otherwise it would re-dispatch through the return-arm fn,
+/// computing `7 + 1000 = 1007`). Output must remain `7\n`.
+///
+/// **What the test pins:** the DISCHARGED bypass holds in the B.4 path
+/// — `run_loop` does not consult the body's args buffer trailing pair
+/// when the deepest step is Discharged. If a future change to
+/// `sigil_run_loop` started routing DISCHARGED through the trailing
+/// pair, this test fails with `1007\n` (off by 1000) instead of
+/// passing with `7\n`.
+///
+/// **Complement to** `b4_handle_with_cps_body_call_and_return_arm_routes
+/// _via_trailing_pair` (the DONE path through the same trailing-pair
+/// routing). Together they pin both run_loop terminal tags' behaviour
+/// under B.4's trailing-pair installation.
+#[test]
+fn b4_discharged_bypass_skips_return_arm_trailing_pair() {
+    // comp's body is `let _ = perform Trigger.fire(); 99` — matches
+    // `is_simple_chained_let_yield_then_pure_tail_body` (1-step chain
+    // with pure IntLit tail), so `compute_user_fn_abi` classifies it
+    // as Cps. The handle body is a direct call to `comp`, so B.4's
+    // detector fires.
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 let _: Int = perform Trigger.fire();\n  \
+                 99\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle comp() with {\n    \
+                   Trigger.fire(k) => 7,\n    \
+                   return(v) => v + 1000,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "b4_discharged_bypass_skips_return_arm_trailing_pair");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "B.4 DISCHARGED bypass: arm `=> 7` discards k → trampoline \
+         DISCHARGED → run_loop must skip the trailing-pair (return-arm \
+         routing); discharge value 7 is handle's overall directly. \
+         If output is `1007\\n` (=7+1000), DISCHARGED is wrongly being \
+         routed through the return-arm trailing pair installed by B.4. \
+         stderr={stderr:?}"
+    );
+}
