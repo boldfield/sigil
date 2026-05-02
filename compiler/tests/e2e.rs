@@ -9442,7 +9442,7 @@ fn b4_discharged_bypass_skips_return_arm_trailing_pair() {
 ///
 /// **Invariant**: stdout = `"107\n"`, exit 0.
 #[test]
-fn b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail() {
+fn task_78_5_g4_b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail() {
     // Inline `Gen` effect + `IntList` ADT — no `import std.list` so the
     // test stands alone. Both `helper` and `caller` are Cps user fns;
     // caller's Cons-arm tail is `helper(x)` → triggers B.3 detection.
@@ -9477,7 +9477,7 @@ fn b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail() {
                }\n";
     let (stdout, stderr, code) = compile_and_run(
         src,
-        "b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail",
+        "task_78_5_g4_b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail",
     );
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(

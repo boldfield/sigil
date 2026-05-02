@@ -8239,34 +8239,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 8,
                             );
 
-                            // Helper: widen an SSA value of arbitrary
-                            // Cranelift type to I64 for closure-slot
-                            // storage. Mirrors the standard slot
-                            // encoding used in `lower_perform_to_value`'s
-                            // args buffer + chain-step closure-record
-                            // copy paths.
-                            let widen_to_i64 =
-                                |builder: &mut FunctionBuilder<'_>, v: Value| -> Value {
-                                    let t = builder.func.dfg.value_type(v);
-                                    if t == types::I64 {
-                                        v
-                                    } else if t.is_int() && t.bits() < 64 {
-                                        builder.ins().uextend(types::I64, v)
-                                    } else {
-                                        assert_eq!(
-                                            t, pointer_ty,
-                                            "codegen Phase B.2: unexpected \
-                                         capture Cranelift type {t:?} packing closure \
-                                         record"
-                                        );
-                                        v
-                                    }
-                                };
-
                             // Pack arm-pattern captures into the
                             // closure record at offsets 16, 24, ...
                             // SSA values come from `lowerer.env` (just
                             // installed via the bindings step above).
+                            // Widen via the shared `widen_to_i64`
+                            // helper, which mirrors the standard slot
+                            // encoding used in `lower_perform_to_value`'s
+                            // args buffer + chain-step closure-record
+                            // copy paths.
                             for (i, capture) in arm_pattern_captures.iter().enumerate() {
                                 let v = match lowerer.env.get(&capture.name).copied() {
                                     Some(v) => v,
@@ -8276,7 +8257,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         capture.name, f.name
                                     ),
                                 };
-                                let widened = widen_to_i64(&mut lowerer.builder, v);
+                                let widened = widen_to_i64(
+                                    &mut lowerer.builder,
+                                    v,
+                                    pointer_ty,
+                                    "Phase B.2 arm-pattern capture closure-record packing",
+                                );
                                 let offset: i32 = 16 + 8 * i as i32;
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
@@ -8298,7 +8284,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         capture.name, f.name
                                     ),
                                 };
-                                let widened = widen_to_i64(&mut lowerer.builder, v);
+                                let widened = widen_to_i64(
+                                    &mut lowerer.builder,
+                                    v,
+                                    pointer_ty,
+                                    "Phase B.2 helper-param capture closure-record packing",
+                                );
                                 let offset: i32 = 16 + 8 * (arm_pattern_captures.len() + j) as i32;
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
@@ -8356,7 +8347,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     StackSlotData::new(StackSlotKind::ExplicitSlot, slot_bytes, 3),
                                 );
                                 for (i, arg_v) in arg_values.into_iter().enumerate() {
-                                    let widened = widen_to_i64(&mut lowerer.builder, arg_v);
+                                    let widened = widen_to_i64(
+                                        &mut lowerer.builder,
+                                        arg_v,
+                                        pointer_ty,
+                                        "Phase B.2 perform-args buffer slot widen",
+                                    );
                                     lowerer.builder.ins().stack_store(
                                         widened,
                                         slot,
@@ -12143,42 +12139,76 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // arena-buffer allocation; the callee's body
                         // ignores `args_len` and reads its trailing
                         // pair at the statically-known offsets.
+                        // **Arity dependency:** the B.3 detector
+                        // matches purely on the call's *shape* (callee
+                        // is an Ident resolving to a Cps user fn) — it
+                        // does NOT validate `target_args.len()` against
+                        // the callee's declared parameter count. If
+                        // typecheck somehow let an arity-mismatched
+                        // call through, B.3 would still fire and emit
+                        // a `(args.len() + 2)`-slot args buffer; the
+                        // Cps callee's body unpacks at fixed offsets
+                        // (`p_i` at `i*8`, trailing pair at
+                        // `k_closure_offset(declared_arity)` /
+                        // `k_fn_offset(declared_arity)`), so a mismatch
+                        // would either read garbage user args or
+                        // misalign the trailing-pair slots. We rely on
+                        // typecheck (E0021 / arity-check pass) to
+                        // reject such calls upstream — Cps `UserFnEntry`
+                        // doesn't expose user-arg arity directly
+                        // (`param_tys` is the CPS `[ptr, ptr, I32]`
+                        // calling-convention layout, NOT the source-
+                        // level arity), so a debug-assert here would
+                        // require threading the source `Decl` through
+                        // and is left for a future cleanup if the gap
+                        // surfaces.
                         let b3_match =
                             b3_synth_cont_tail_is_cps_user_fn_call(tail_expr.as_ref(), |n| {
                                 lowerer.user_fns.get(n).map(|e| e.abi)
                             });
                         if let Some((target_name, target_args)) = b3_match {
-                            // Lower + widen each user arg.
+                            // Lower + widen each user arg via the shared
+                            // `widen_to_i64` helper; the assert-context
+                            // string identifies this site (CPS→CPS
+                            // direct dispatch arg packing) for any
+                            // type-mismatch report.
                             let mut widened_args: Vec<Value> =
                                 Vec::with_capacity(target_args.len());
                             for arg_expr in target_args {
                                 let arg_v = lowerer.lower_expr(arg_expr);
-                                let arg_ty = lowerer.builder.func.dfg.value_type(arg_v);
-                                let widened = if arg_ty == types::I64 {
-                                    arg_v
-                                } else if arg_ty.is_int() && arg_ty.bits() < 64 {
-                                    lowerer.builder.ins().uextend(types::I64, arg_v)
-                                } else {
-                                    assert_eq!(
-                                        arg_ty, pointer_ty,
-                                        "codegen Phase B.3: unexpected user-arg \
-                                         Cranelift type {arg_ty:?} packing direct \
-                                         CPS→CPS dispatch in fn `{}` (tail call \
-                                         `{target_name}`)",
-                                        synth.parent_fn_name
-                                    );
-                                    arg_v
-                                };
+                                let widened = widen_to_i64(
+                                    &mut lowerer.builder,
+                                    arg_v,
+                                    pointer_ty,
+                                    "Phase B.3 CPS→CPS direct-dispatch user-arg packing",
+                                );
                                 widened_args.push(widened);
                             }
 
                             // Resolve target Cps fn's FuncRef + fn addr.
+                            //
+                            // **Map-population invariant:** both
+                            // `lowerer.user_fns` (consulted by the B.3
+                            // detector via the `lookup_abi` closure) and
+                            // `lowerer.user_fn_refs` (consulted here)
+                            // are populated in the same user-fn pre-pass
+                            // in `emit_object`. Every fn registered with
+                            // an ABI in `user_fns` is also given a
+                            // `FuncRef` in `user_fn_refs`. So if the
+                            // detector returned `Some(Cps)` for
+                            // `target_name`, `user_fn_refs.get(target_name)`
+                            // MUST be `Some` — the `unreachable!` below
+                            // would only fire if the two maps drifted
+                            // apart, which is a codegen-invariant
+                            // violation rather than a user-program error.
                             let target_fn_ref = match lowerer.user_fn_refs.get(target_name) {
                                 Some(r) => *r,
                                 None => unreachable!(
                                     "codegen Phase B.3: target `{target_name}` \
                                      classified as Cps user fn but missing from \
-                                     user_fn_refs in synth-cont for fn `{}`",
+                                     user_fn_refs in synth-cont for fn `{}` \
+                                     (codegen invariant violation: user_fns and \
+                                     user_fn_refs drifted apart)",
                                     synth.parent_fn_name
                                 ),
                             };
@@ -12248,26 +12278,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             lowerer.builder.finalize();
                         } else {
                             let tail_value = lowerer.lower_expr(tail_expr.as_ref());
-                            // Read the actual lowered Cranelift type from
-                            // the DFG (per `feedback_sigil_dfg_value_type`)
-                            // — prefer it over `tail_ty` to insulate against
-                            // a width disagreement between the declared
-                            // return type and the Lowerer-produced value.
-                            let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
-                            let widened_tail = if actual_tail_ty == types::I64 {
-                                tail_value
-                            } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
-                                lowerer.builder.ins().uextend(types::I64, tail_value)
-                            } else {
-                                assert_eq!(
-                                    actual_tail_ty, pointer_ty,
-                                    "codegen Phase B.2: unexpected \
-                                     CompoundMatchArmPostPerform tail Cranelift \
-                                     type {actual_tail_ty:?} for fn `{}`",
-                                    synth.parent_fn_name
-                                );
-                                tail_value
-                            };
+                            // Widen via the shared `widen_to_i64` helper
+                            // (which reads the actual Cranelift type via
+                            // `dfg.value_type` per
+                            // `feedback_sigil_dfg_value_type`, insulating
+                            // against a width disagreement between the
+                            // declared return type and the Lowerer-
+                            // produced value).
+                            let widened_tail = widen_to_i64(
+                                &mut lowerer.builder,
+                                tail_value,
+                                pointer_ty,
+                                "Phase B.2 CompoundMatchArmPostPerform fallback tail widen",
+                            );
                             let next_step = emit_dispatch_to_post_arm_k(
                                 &mut lowerer.builder,
                                 lowerer.stackmap,
@@ -17222,6 +17245,43 @@ const TRAP_NONEXHAUSTIVE_MATCH: u8 = 0x41;
 /// `[DEVIATION Task 55] Phase 4f` concern #1 in
 /// `PLAN_B_DEVIATIONS.md`.
 const TRAP_HANDLE_DISCIPLINE_VIOLATION: u8 = 0x42;
+
+/// Widen an SSA value to I64 for closure-slot / args-buffer storage,
+/// using the standard slot encoding shared by every CPS-form packing
+/// site (perform args buffer, synth-cont closure-record captures,
+/// CPS→CPS direct-dispatch arg packing, post-arm-k tail-value widen).
+///
+/// Invariant: `pointer_ty == I64` on every supported target (the
+/// existing `assert_eq!` in the else-branch enforces this for the
+/// pointer-typed case). Sub-I64 ints get a `uextend`; pointer values
+/// pass through unchanged. The `context` arg is included in the
+/// assert-failure message so a Cranelift-type mismatch reports which
+/// emit site detected it (e.g. "Phase B.2 closure-record capture",
+/// "Phase B.3 user-arg packing", "Phase B.2 fallback tail").
+///
+/// Per `feedback_sigil_dfg_value_type`: callers MUST read the actual
+/// Cranelift type from `builder.func.dfg.value_type(v)` (which this
+/// helper does internally) rather than relying on a pre-stored type
+/// that may disagree with the lowered value's width.
+fn widen_to_i64(
+    builder: &mut FunctionBuilder<'_>,
+    v: Value,
+    pointer_ty: Type,
+    context: &str,
+) -> Value {
+    let t = builder.func.dfg.value_type(v);
+    if t == types::I64 {
+        v
+    } else if t.is_int() && t.bits() < 64 {
+        builder.ins().uextend(types::I64, v)
+    } else {
+        assert_eq!(
+            t, pointer_ty,
+            "widen_to_i64: unexpected Cranelift type {t:?} at site `{context}`"
+        );
+        v
+    }
+}
 
 /// Best-effort PC-offset approximation for Stage 1's placeholder stackmap.
 /// Cranelift's real stack-map API ships in Plan B; the number here is a
@@ -22795,7 +22855,7 @@ mod tests {
     // violating the trampoline charter per `feedback_sigil_trampoline_-
     // charter`). These tests pin the detection logic; the IR-level
     // emission path is exercised end-to-end by the e2e test
-    // `b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail`.
+    // `task_78_5_g4_b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail`.
     //
     // Symmetric with the B.4 detector tests (positive/negative shape
     // coverage for the `lookup_abi`-parameterised classifier).
