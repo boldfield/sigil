@@ -8136,6 +8136,13 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 /// **Invariant**: stdout = `"3\n"`, exit 0.
 #[test]
 fn task_78_5_g4_generator_recursive_perform_in_match_arm_body() {
+    // Probe 1 (depth=3, full B.1+B.2+B.3+B.4 path). Diagnostics
+    // wired: eprintln! before assert to defeat any test-runner
+    // truncation of the assert format-args; RUST_BACKTRACE=1 set on
+    // the child binary so any sigil-runtime Rust panic surfaces a
+    // backtrace (the sigil-emitted code is not Rust, but the runtime
+    // FFI helpers are; SIGSEGV from the emitted code still won't
+    // produce a backtrace, but a runtime-side abort will).
     let src = "import std.list\n\
                import std.io\n\
                \n\
@@ -8165,13 +8172,205 @@ fn task_78_5_g4_generator_recursive_perform_in_match_arm_body() {
                  perform IO.println(int_to_string(length(result)));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pr1_generator_collect");
+    let (stdout, stderr, code) =
+        compile_and_run_with_backtrace(src, "task_78_5_pr1_generator_collect");
+    eprintln!(
+        "--- PROBE 1 (depth=3, full B.1+B.2+B.3+B.4 path) ---\n\
+         stdout={stdout:?}\nstderr={stderr:?}\ncode={code}"
+    );
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "3\n",
         "generator should yield 3 elements collected into List[Int]; \
          stderr={stderr:?}"
     );
+}
+
+// ============================================================
+// Task 78.5 G4 closeout — diagnostic probes (per Brian's directive)
+//
+// Three probes designed to bisect the Generator failure to its
+// load-bearing seam. Each probe pushes raw stdout/stderr/code via
+// `eprintln!` before the assert (defeats any test-runner format-args
+// truncation) and runs the binary with RUST_BACKTRACE=1 (surfaces
+// sigil-runtime Rust panics; SIGSEGV from emitted code remains
+// silent but the runtime trampoline / GC / handler code is Rust).
+//
+// Probe 2: depths 1, 2, 4 (existing test is depth 3). If only some
+//   depths crash, the bug is depth-bounded (likely GC-frequency or
+//   stack-depth interaction). If all crash, the bug is structural.
+// Probe 3: variant without `return(_v) =>` arm. Exercises B.1+B.2+B.3
+//   without triggering B.4. If passes → bug is B.4-interaction; if
+//   crashes → B.4 is innocent.
+// ============================================================
+
+fn compile_and_run_with_backtrace(source: &str, test_name: &str) -> (String, String, i32) {
+    use std::path::Path;
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_{}_{}.sigil",
+        test_name,
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
+    let sigil_bin = sigil_binary();
+    let root = workspace_root();
+    let compile = Command::new(&sigil_bin)
+        .arg::<&Path>(src_path.as_ref())
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to invoke sigil compiler");
+    assert!(
+        compile.status.success(),
+        "compile failed for {test_name}: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+    let run = Command::new(&bin_path)
+        .env("RUST_BACKTRACE", "1")
+        .output()
+        .expect("failed to execute compiled binary");
+    let code = run.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    (stdout, stderr, code)
+}
+
+fn task_78_5_g4_generator_probe2_depth_helper(
+    depth: usize,
+    expected: &str,
+) -> (String, String, i32) {
+    // Build the input list of `depth` Cons nodes followed by Nil:
+    //   depth=1: Cons(1, Nil)
+    //   depth=2: Cons(1, Cons(2, Nil))
+    //   depth=4: Cons(1, Cons(2, Cons(3, Cons(4, Nil))))
+    let mut list_expr = String::from("Nil");
+    for i in (1..=depth).rev() {
+        list_expr = format!("Cons({i}, {list_expr})");
+    }
+    let src = format!(
+        "import std.list\n\
+         import std.io\n\
+         \n\
+         effect Gen[A] {{\n  \
+           yield: (A) -> Int,\n\
+         }}\n\
+         \n\
+         fn iterate(xs: List[Int]) -> Int ![Gen[Int]] {{\n  \
+           match xs {{\n    \
+             Nil => 0,\n    \
+             Cons(x, rest) => {{\n      \
+               let _: Int = perform Gen.yield(x);\n      \
+               iterate(rest)\n    \
+             }},\n  \
+           }}\n\
+         }}\n\
+         \n\
+         fn main() -> Int ![IO] {{\n  \
+           let xs: List[Int] = {list_expr};\n  \
+           let result: List[Int] = handle iterate(xs) with {{\n    \
+             Gen.yield(x, k) => {{\n      \
+               let rest: List[Int] = k(0);\n      \
+               Cons(x, rest)\n    \
+             }},\n    \
+             return(_v) => Nil,\n  \
+           }};\n  \
+           perform IO.println(int_to_string(length(result)));\n  \
+           0\n\
+         }}\n"
+    );
+    let test_name = format!("task_78_5_g4_generator_probe2_depth_{depth}");
+    let (stdout, stderr, code) = compile_and_run_with_backtrace(&src, &test_name);
+    eprintln!(
+        "--- PROBE 2 (depth={depth}, expected stdout={expected:?}) ---\n\
+         stdout={stdout:?}\nstderr={stderr:?}\ncode={code}"
+    );
+    (stdout, stderr, code)
+}
+
+#[test]
+fn task_78_5_g4_generator_probe2_depth_1() {
+    let (stdout, stderr, code) = task_78_5_g4_generator_probe2_depth_helper(1, "1\n");
+    assert_eq!(code, 0, "depth=1 exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n", "depth=1 length; stderr={stderr:?}");
+}
+
+#[test]
+fn task_78_5_g4_generator_probe2_depth_2() {
+    let (stdout, stderr, code) = task_78_5_g4_generator_probe2_depth_helper(2, "2\n");
+    assert_eq!(code, 0, "depth=2 exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "2\n", "depth=2 length; stderr={stderr:?}");
+}
+
+#[test]
+fn task_78_5_g4_generator_probe2_depth_4() {
+    let (stdout, stderr, code) = task_78_5_g4_generator_probe2_depth_helper(4, "4\n");
+    assert_eq!(code, 0, "depth=4 exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "4\n", "depth=4 length; stderr={stderr:?}");
+}
+
+#[test]
+fn task_78_5_g4_generator_probe3_no_return_arm() {
+    // Variant with NO `return(_v) =>` arm in the handle. This
+    // disables B.4 (the trailing-pair routing only fires when a
+    // return arm exists). Exercises B.1 + B.2 + B.3 only.
+    //
+    // Type contract change vs the main test: without the return
+    // arm, the handle's overall type is the body's tail-value type
+    // (= iterate's return type = Int), NOT List[Int]. The arm body
+    // must therefore return Int — drop the Cons-collecting shape;
+    // arm body just returns the op-arg `x`. With recursive iterate,
+    // the deepest iterate exit returns 0; k(0) at the outer arm
+    // bottoms out to 0; the outermost arm body returns its own `x`
+    // (= 1 for `Cons(1, ...)`). Expected stdout: "1\n".
+    //
+    // If THIS passes: bug is B.4-interaction. If THIS crashes:
+    // B.4 is innocent and the bug is in B.1+B.2+B.3.
+    let src = "import std.io\n\
+               import std.list\n\
+               \n\
+               effect Gen[A] {\n  \
+                 yield: (A) -> Int,\n\
+               }\n\
+               \n\
+               fn iterate(xs: List[Int]) -> Int ![Gen[Int]] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(x, rest) => {\n      \
+                     let _: Int = perform Gen.yield(x);\n      \
+                     iterate(rest)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = Cons(1, Cons(2, Cons(3, Nil)));\n  \
+                 let result: Int = handle iterate(xs) with {\n    \
+                   Gen.yield(x, k) => {\n      \
+                     let _: Int = k(0);\n      \
+                     x\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run_with_backtrace(src, "task_78_5_g4_generator_probe3_no_return_arm");
+    eprintln!(
+        "--- PROBE 3 (no return arm; B.1+B.2+B.3 only, B.4 disabled) ---\n\
+         stdout={stdout:?}\nstderr={stderr:?}\ncode={code}"
+    );
+    assert_eq!(
+        code, 0,
+        "PROBE 3 exit code (B.4-disabled variant); stderr={stderr:?}"
+    );
+    // Outermost arm's `x` = 1 (from Cons(1, ...)).
+    assert_eq!(stdout, "1\n", "PROBE 3 stdout; stderr={stderr:?}");
 }
 
 /// **Task 78.5 G4 Phase B.1 — non-recursive compound-match-with-arm-perform
