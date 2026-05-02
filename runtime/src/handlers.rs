@@ -1748,28 +1748,23 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                 // counterpart). The DISCHARGED bypass branch above
                 // explicitly drains depth back to entry-time; the DONE
                 // path's `try_pop`-then-route loop should leave depth
-                // <= entry-time naturally (each Middle's push paired
-                // with one terminal pop via the routing loop; PRE-
-                // run_loop pushes added by the caller are also
-                // routed-then-popped, leaving depth strictly below the
-                // post-push entry-time snapshot). Assert: depth at
-                // terminal must NOT exceed entry-time (which would
-                // indicate a leaked push), and must NOT be below 0
-                // (caught by `outer_post_arm_k_try_pop`'s underflow).
-                // A pre-pushed entry (Task 78.5 G4 B.4 fix —
-                // `lower_b4_cps_body_call` calls
-                // `sigil_outer_post_arm_k_push` before driving
-                // `sigil_run_loop` so the body's terminal Done routes
-                // through the return arm via the adapter) legitimately
-                // leaves depth at `entry_depth - 1`, which the relaxed
-                // `<=` permits.
+                // == entry-time naturally (each Middle's push paired
+                // with one terminal pop via the routing loop). Assert
+                // it: any future codegen path that pushes without a
+                // matching terminal pop, OR that pops entries belonging
+                // to an outer run_loop, would underflow / overflow this
+                // check. The drain assertion on the DISCHARGED path
+                // catches bypassed-leak; this assertion catches
+                // routing-asymmetry — symmetric coverage of the
+                // discipline.
                 let current_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
                 debug_assert!(
-                    current_depth <= outer_post_arm_k_entry_depth,
+                    current_depth == outer_post_arm_k_entry_depth,
                     "sigil_run_loop DONE terminal: outer_post_arm_k depth \
-                     leaked ({current_depth} > entry-time \
+                     mismatch ({current_depth} != entry-time \
                      {outer_post_arm_k_entry_depth}); a codegen path \
-                     pushed without a matching terminal pop"
+                     pushed without a matching terminal pop, OR popped \
+                     entries belonging to an outer run_loop"
                 );
                 LAST_TERMINAL_TAG.with(|c| c.set(tag));
                 LAST_TERMINAL_VALUE.with(|c| c.set(v));
