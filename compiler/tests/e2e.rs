@@ -8184,6 +8184,69 @@ fn task_78_5_pending_g4_recursive_perform_in_match_arm_body() {
     );
 }
 
+/// **Task 78.5 G4 Phase B.1 — non-recursive compound-match-with-arm-perform
+/// emits + runs.**
+///
+/// Pins the new B.1 emit branch (codegen.rs Phases 1–5: args unpack →
+/// Lowerer construction → `lower_block` → tail widening → `next_step_done`
+/// wrapping). Independent of B.2/B.3/B.4 — the perform-bearing arm has no
+/// recursive tail call, so the iter-5 identity-bypass behavior in
+/// `lower_perform_to_value` is sufficient. Sister test
+/// `task_78_5_pending_g4_recursive_perform_in_match_arm_body` exercises
+/// the recursive shape that B.3 closes; this test pins the simpler
+/// non-recursive path that B.1 alone is responsible for.
+///
+/// Pre-B.1: typechecks + runs as Sync (no body shape matched →
+/// fall-through). Post-B.1: ABI selection picks Cps, body emit dispatches
+/// through the new branch, output remains `"99\n"`.
+///
+/// **Invariant**: stdout = `"99\n"`, exit 0.
+#[test]
+fn task_78_5_g4_b1_non_recursive_compound_match_with_perform_arm_emits_and_runs() {
+    // Inline `Gen` effect + `IntList` ADT — no `import std.list` so the
+    // test stands alone (mirrors the lib-test `compute_user_fn_abi_cps_-
+    // for_compound_match_with_arm_perform_g4_b1` shape but adds end-to-end
+    // emission + execution). The arm-body's tail is the literal `99`
+    // (not a recursive call), so B.1's identity-k_fn placeholder behavior
+    // produces the correct value.
+    let src = "import std.io\n\
+               \n\
+               effect Gen { yield: (Int) -> Int }\n\
+               \n\
+               type IntList = | Nil | Cons(Int, IntList)\n\
+               \n\
+               fn yield_one(xs: IntList) -> Int ![Gen] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(x, _) => {\n      \
+                     let _: Int = perform Gen.yield(x);\n      \
+                     99\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: IntList = Cons(7, Nil);\n  \
+                 let result: Int = handle yield_one(xs) with {\n    \
+                   Gen.yield(_x, k) => k(0),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_b1_non_recursive_compound_match_with_perform_arm",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n",
+        "B.1 emit branch should drive the perform-bearing arm through the \
+         Lowerer's identity-k_fn path; arm tail `99` should reach \
+         `NextStep::Done` and unwind to main's `result` binding; \
+         stderr={stderr:?}"
+    );
+}
+
 /// **G1 variant 2 — outer-fn-scope let in post-arm-k tail.**
 ///
 /// Pinned shape (constructed, not Koka-imported): `let factor: Int = 7;

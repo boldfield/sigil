@@ -290,6 +290,46 @@ fn compute_user_fn_abi(
         }
         // K + N >= MAX_CLOSURE_ENV_SLOTS — fall through to Sync.
     }
+    // Plan B Task 78.5 G4 Phase B.1 — compound `Expr::Match`-as-body-tail
+    // shape. Body is `match scrut { ... }` where at least one arm body has
+    // a `let _ = perform p; tail_expr` (or bare `Stmt::Perform; tail_expr`)
+    // sub-shape and every other arm is a constant-tail (`IntLit`) shape.
+    //
+    // **Phase B linearity** (each seam is its own PR; this is B.1):
+    //   - **B.1 (this slice)**: classifier wired into ABI selection;
+    //     body emit dispatches Match arms via the existing Lowerer
+    //     (which routes the perform-bearing arm through the existing
+    //     identity-k_fn fallback in `lower_perform_to_value`). This
+    //     preserves current Sync→Cps interop behavior — the perform
+    //     synchronously drives `sigil_run_loop`, so the recursive-
+    //     perform Generator test (`task_78_5_pending_g4_recursive_-
+    //     perform_in_match_arm_body`) stays `#[ignore]`'d. What B.1
+    //     wires is the foundation: ABI selection + CPS body emit
+    //     dispatch reach the Match arms.
+    //   - **B.2 (next PR)**: replaces the identity-k_fn with a synth-
+    //     cont allocation that captures arm-pattern bindings (e.g.,
+    //     `rest` from `Cons(x, rest)`).
+    //   - **B.3 (after B.2)**: lowers the synth-cont's body's tail
+    //     `iterate(rest)` as a CPS→CPS direct dispatch
+    //     (`NextStep::Call`), replacing the nested `sigil_run_loop`
+    //     drive that currently breaks the trampoline charter for
+    //     recursive Cps callees.
+    //   - **B.4 (parallel)**: deep-handler return-arm semantics for
+    //     the trailing `(k_closure, k_fn)` pair installed at the
+    //     outermost handle's body call site.
+    //
+    // Conservative: false negatives are still acceptable here — a CPS-
+    // color fn whose body's Match shape doesn't match the classifier
+    // falls through to Sync ABI and uses the synchronous `sigil_run_-
+    // loop` path (the Phase 4d MVP behaviour).
+    //
+    // B.1 ignores the perform-arm-indices Vec returned by the classifier —
+    // B.2's synth-cont allocation pass will consume it (one synth-cont per
+    // index). For B.1 we only need to know whether the body matches the
+    // shape, not which arms.
+    if is_compound_match_with_arm_perform_body(body, &ctors).is_some() {
+        return UserFnAbi::Cps;
+    }
     UserFnAbi::Sync
 }
 
@@ -7093,7 +7133,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 perform_ref,
                 outer_post_arm_k_push_ref: _,
                 run_loop_ref,
-                next_step_done_ref: _,
+                // Plan B Task 78.5 G4 Phase B.1 — bound (was `_`) so
+                // the new compound-match-body branch can call
+                // `sigil_next_step_done` to wrap the Lowerer-produced
+                // tail value as `NextStep::Done(value)`.
+                next_step_done_ref,
                 next_step_discharged_ref: _,
                 last_terminal_tag_ref,
                 reset_last_terminal_tag_ref,
@@ -7180,7 +7224,268 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 //   - let-yield-then-pure-tail: perform is stmts[0] as
                 //     Stmt::Let.value; synth-cont binds k_arg as the
                 //     let's name, lowers the tail
+                //
+                // Plan B Task 78.5 G4 Phase B.1 — fourth shape:
+                // **compound-match-with-arm-perform** (no synth-cont
+                // entry). Body is `match scrut { Nil => 0, Cons(x, rest)
+                // => { let _ = perform p; iterate(rest) } }` shape per
+                // [`is_compound_match_with_arm_perform_body`]. Detected
+                // here BEFORE the existing dispatch-on-`synth_cont_idx_opt`
+                // would fire its `unreachable!()` arm (the existing path
+                // expects body.tail to be `Some(Expr::Perform)` for the
+                // None-synth-cont case; for compound-match it's
+                // `Some(Expr::Match)`).
+                //
+                // **B.1 emission strategy**: dispatch the body via the
+                // existing Lowerer (which handles `Expr::Match` arm
+                // dispatch + `lower_perform_to_value`'s identity-k_fn
+                // fallback for arm-body performs). The Lowerer returns a
+                // tail Value of the fn's declared return type; widen
+                // to I64 and return `NextStep::Done(value)` to the
+                // trampoline. This preserves current Sync→Cps interop
+                // semantics for the perform-bearing arm — the perform
+                // synchronously drives `sigil_run_loop` via identity-
+                // k_fn, then the arm's tail (e.g., `iterate(rest)`) runs
+                // and the result wraps to Done.
+                //
+                // **Phase B linearity** (each seam is its own PR):
+                //   - **B.1 (this slice)**: identity-k_fn placeholder
+                //     via Lowerer.lower_perform_to_value. The G4
+                //     recursive-perform Generator test
+                //     (`task_78_5_pending_g4_recursive_perform_in_match
+                //     _arm_body`) STAYS `#[ignore]`'d — un-ignoring
+                //     requires B.2 + B.3 + B.4. What B.1 wires is the
+                //     foundation: ABI selection + CPS body emit
+                //     dispatch reach the Match arms.
+                //   - **B.2**: replaces identity-k_fn with a synth-cont
+                //     allocation that captures arm-pattern bindings
+                //     (e.g., `rest` from `Cons(x, rest)`).
+                //   - **B.3**: lowers the synth-cont's tail call as a
+                //     CPS→CPS direct dispatch (`NextStep::Call`),
+                //     replacing the nested `sigil_run_loop` drive that
+                //     currently breaks the trampoline charter for
+                //     recursive Cps callees (see
+                //     `feedback_sigil_trampoline_charter`).
+                //   - **B.4 (parallel)**: deep-handler return-arm
+                //     semantics for the trailing `(k_closure, k_fn)`
+                //     pair installed at the outermost handle's body
+                //     call site.
+                //
+                // **Read-from-DFG type discipline** (per
+                // `feedback_sigil_dfg_value_type`): the tail value's
+                // Cranelift type is read via
+                // `dfg.value_type(tail_value)`, NOT pre-computed from
+                // `f.return_type` — the Lowerer may produce a value
+                // whose width disagrees with the declared type's
+                // surface width (e.g., narrower-int returns), and a
+                // pre-computed width risks an invalid `uextend.i64
+                // v_i64` IR.
+                //
+                // **Temporary trampoline-charter regression** (closes in
+                // B.3): B.1's emit reuses `lower_perform_to_value`'s
+                // synchronous `sigil_run_loop` drive for the perform-
+                // bearing arm. Because this branch fires inside a Cps-
+                // ABI fn (which is ITSELF driven by an outer
+                // `sigil_run_loop`), B.1 introduces a window where
+                // recursive perform-bearing fns produce nested
+                // `sigil_run_loop` calls (one per perform site). This
+                // violates `feedback_sigil_trampoline_charter` ("must
+                // stay stack-bounded; lambda-lift continuations") and is
+                // tracked as a runtime cost, not a correctness regression
+                // — the recursive Generator test stays `#[ignore]`'d
+                // through B.3, and B.3 closes the window via direct
+                // `NextStep::Call` dispatch from the synth-cont (B.2's
+                // allocation), making the inner driver redundant. See
+                // PR #74 body for the full charter-window rationale.
+                //
+                // B.1 ignores the perform-arm-indices Vec returned by
+                // `is_compound_match_with_arm_perform_body` — B.2's
+                // synth-cont allocation pass will consume it (one synth-
+                // cont per index). For B.1 we only need to know whether
+                // the body matches the shape (bool), not which arms.
+                let is_compound_match_body =
+                    is_compound_match_with_arm_perform_body(&f.body, &ctors).is_some();
+                if is_compound_match_body {
+                    // Phase 1 — unpack user args from `args_ptr` at
+                    // offsets `i*8`. Mirrors the tail-perform body's
+                    // Phase 1 (below). Each slot is u64; narrower
+                    // declared types ireduce back; pointer-typed args
+                    // load directly (pointer_ty == I64 on supported
+                    // targets).
+                    let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                    let closure_ptr = block_params[0];
+                    let args_ptr = block_params[1];
+                    // block_params[2] = args_len (statically known
+                    // from `f.params.len()`; same redundancy as the
+                    // tail-perform path).
+                    let _args_len = block_params[2];
+                    let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                    for (i, p) in f.params.iter().enumerate() {
+                        let declared_ty = cranelift_ty_for_type_expr(&p.ty, pointer_ty);
+                        let widened = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            (i * 8) as i32,
+                        );
+                        let value = if declared_ty == types::I64 {
+                            widened
+                        } else if declared_ty.is_int() && declared_ty.bits() < 64 {
+                            builder.ins().ireduce(declared_ty, widened)
+                        } else {
+                            assert_eq!(
+                                declared_ty, pointer_ty,
+                                "codegen Phase B.1: unexpected user-param Cranelift \
+                                 type {declared_ty:?} unpacking from args_ptr in \
+                                 compound-match Cps-ABI fn `{}`",
+                                f.name
+                            );
+                            widened
+                        };
+                        env.insert(p.name.clone(), value);
+                    }
+
+                    // Phase 2 — construct a Lowerer to lower `f.body`
+                    // (a `match scrut { ... }` shape). The Lowerer
+                    // dispatches arms via `lower_match`; arm-body
+                    // performs route through `lower_perform_to_value`
+                    // which uses identity-k_fn + synchronous
+                    // `sigil_run_loop` drive. This preserves the
+                    // current Sync→Cps interop behavior for the
+                    // perform-bearing arm — B.2 lifts this to a real
+                    // synth-cont with arm-pattern captures.
+                    let mut lowerer = Lowerer {
+                        builder,
+                        stackmap: &mut stackmap,
+                        env,
+                        pointer_ty,
+                        closure_ptr,
+                        lit_gvs,
+                        builtins,
+                        handler_frame_new_ref,
+                        handle_push_ref,
+                        handle_pop_ref,
+                        handler_frame_set_arm_ref,
+                        handler_frame_set_return_ref,
+                        perform_ref,
+                        run_loop_ref,
+                        last_terminal_tag_ref,
+                        reset_last_terminal_tag_ref,
+                        last_terminal_value_ref,
+                        reset_last_terminal_value_ref,
+                        next_step_call_ref,
+                        next_step_args_ptr_ref,
+                        handler_arm_refs_per_handle,
+                        handler_arm_synth: &handler_arm_synth,
+                        handler_arm_indices: &handler_arm_indices,
+                        handler_return_arm_refs_per_handle,
+                        handler_return_arm_synth: &handler_return_arm_synth,
+                        handler_return_arm_indices: &handler_return_arm_indices,
+                        continuation_identity_ref,
+                        effect_ids: &checked.effect_ids,
+                        op_ids: &checked.op_ids,
+                        effects: &checked.effects,
+                        user_fn_refs,
+                        sync_shim_refs,
+                        user_fns: &user_fns,
+                        type_layouts: &type_layouts,
+                        ctor_index: &ctor_index,
+                        match_scrut_tys: &checked.match_scrut_tys,
+                        match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                        current_fn_name: f.name.clone(),
+                        local_fn_types: BTreeMap::new(),
+                        call_callee_tys: &checked.call_callee_tys,
+                        captured_fn_sigs: BTreeMap::new(),
+                        arm_k_closure_v: None,
+                        arm_k_fn_v: None,
+                        arm_frame_ptr_v: None,
+                        arm_k_pair_self: None,
+                        arm_k_pair_captures: &cc.arm_k_pair_captures,
+                    };
+
+                    // Phase 3 — lower the body. The classifier
+                    // guarantees `body.stmts` is empty AND `body.tail`
+                    // is `Some(Expr::Match{...})`, so `lower_block`
+                    // returns `Some(tail_value)` of the match's
+                    // overall type (= the fn's declared return type).
+                    let tail_value = match lowerer.lower_block(&f.body) {
+                        Some(v) => v,
+                        None => unreachable!(
+                            "codegen Phase B.1: compound-match body for fn `{}` \
+                             unexpectedly had no tail value — classifier guarantees \
+                             body.tail is Some(Expr::Match)",
+                            f.name
+                        ),
+                    };
+
+                    // Phase 4 — widen tail value to I64 (matching
+                    // `sigil_next_step_done`'s signature). Read the
+                    // actual lowered Cranelift type via
+                    // `dfg.value_type` per
+                    // `feedback_sigil_dfg_value_type`.
+                    let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
+                    let widened_tail = if actual_tail_ty == types::I64 {
+                        tail_value
+                    } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
+                        lowerer.builder.ins().uextend(types::I64, tail_value)
+                    } else {
+                        assert_eq!(
+                            actual_tail_ty, pointer_ty,
+                            "codegen Phase B.1: unexpected compound-match tail \
+                             Cranelift type {actual_tail_ty:?} for fn `{}`",
+                            f.name
+                        );
+                        tail_value
+                    };
+
+                    // Phase 5 — build NextStep::Done(widened_tail) and
+                    // return it to the trampoline. The wrapper at the
+                    // call site drives `sigil_run_loop`, which observes
+                    // the Done and unwinds with the I64 value (narrowed
+                    // back to the callee's declared return type by the
+                    // CPS-interop wrapper, per the `lower_call`
+                    // UserFnAbi::Cps arm). `next_step_done_ref` is
+                    // pre-declared via `prepare_per_fn_refs` (just
+                    // above) — same FuncRef the synth-arm-fn body
+                    // emit uses for its terminal Done construction.
+                    let done_call = lowerer
+                        .builder
+                        .ins()
+                        .call(next_step_done_ref, &[widened_tail]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, done_call));
+                    let next_step = lowerer.builder.inst_results(done_call)[0];
+                    lowerer.builder.ins().return_(&[next_step]);
+                    lowerer.builder.finalize();
+
+                    module
+                        .define_function(entry.func_id, &mut ctx)
+                        .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
+                    module.clear_context(&mut ctx);
+                    continue;
+                }
+
                 let synth_cont_idx_opt = cps_continuation_synth_indices.get(&f.name).copied();
+                // Detection-before-dispatch ordering guard. The existing
+                // None-synth-cont arm `unreachable!()`'s on body tails
+                // that aren't `Some(Expr::Perform)` (e.g., compound
+                // `Expr::Match` body tails). B.1's compound-match branch
+                // (above) returns early via `continue` BEFORE we reach
+                // here, but a future PR adding another body shape that
+                // lands in this dispatch and isn't a tail-perform would
+                // silently break. This assert turns that silent break
+                // into a debug-build crash with a pointer at the
+                // precedent.
+                debug_assert!(
+                    matches!(f.body.tail, Some(crate::ast::Expr::Perform(_)))
+                        || synth_cont_idx_opt.is_some(),
+                    "compute_user_fn_abi: a fn body without a tail-perform AND without a synth-cont \
+                     reached the existing dispatch path. New body shapes (e.g. compound match) MUST \
+                     return earlier via their own dispatch arm. See codegen.rs:7180+ for B.1's \
+                     compound-match early-return precedent. fn=`{}`",
+                    f.name
+                );
                 let (body_perform, synth_cont_func_id_opt) = if let Some(idx) = synth_cont_idx_opt {
                     let p = match &f.body.stmts[0] {
                         crate::ast::Stmt::Perform(p) => p.clone(),
@@ -18257,6 +18562,81 @@ mod tests {
             compute_user_fn_abi("helper", &body_at_cap, &helper_params, &colored_at),
             UserFnAbi::Sync,
             "K+N >= MAX_CLOSURE_ENV_SLOTS: cap-check converts to Sync fall-through"
+        );
+    }
+
+    /// Plan B Task 78.5 G4 Phase B.1 — pin that
+    /// `compute_user_fn_abi` returns `Cps` for a fn whose body matches
+    /// the compound-match-with-arm-perform shape (the iterate-Generator
+    /// representative).
+    ///
+    /// **Pre-B.1 baseline**: this fn shape would get `Sync` ABI (no
+    /// classifier matched its body), routing the perform-bearing arm
+    /// through the synchronous `lower_perform_to_value` →
+    /// `sigil_run_loop` chain. Functionally correct under Phase 4d
+    /// MVP, but with the discard-`k` cross-call-boundary correctness
+    /// gap that Phase B+ closes.
+    ///
+    /// **Post-B.1**: the new
+    /// `is_compound_match_with_arm_perform_body` arm in
+    /// `compute_user_fn_abi` recognises the shape and returns `Cps`,
+    /// triggering the new compound-match body emission path that
+    /// dispatches the Match arms via the Lowerer + wraps the tail
+    /// value as `NextStep::Done`.
+    ///
+    /// **What B.1 does NOT change** (B.2/B.3/B.4 close): the perform-
+    /// bearing arm's perform site still uses identity-k_fn (via the
+    /// Lowerer's `lower_perform_to_value`), so recursive-perform
+    /// behavior remains the iter-5 identity-bypass shape — the
+    /// `task_78_5_pending_g4_recursive_perform_in_match_arm_body`
+    /// e2e test STAYS `#[ignore]`'d.
+    #[test]
+    fn compute_user_fn_abi_cps_for_compound_match_with_arm_perform_g4_b1() {
+        // Inline a Gen-style effect (no generic params) + custom
+        // IntList type (so we don't depend on `import std.list`
+        // resolution in unit tests). Mirrors the iterate-Generator
+        // shape: `match xs { Nil => 0, Cons(x, rest) => { let _ =
+        // perform Gen.yield(x); iterate(rest) } }`.
+        let src = "effect Gen { yield: (Int) -> Int }\n\
+                   type IntList = | Nil | Cons(Int, IntList)\n\
+                   fn iterate(xs: IntList) -> Int ![Gen] {\n  \
+                     match xs {\n    \
+                       Nil => 0,\n    \
+                       Cons(x, rest) => {\n      \
+                         let _: Int = perform Gen.yield(x);\n      \
+                         iterate(rest)\n    \
+                       },\n  \
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let xs: IntList = Cons(1, Cons(2, Nil));\n  \
+                     let n: Int = handle iterate(xs) with {\n    \
+                       Gen.yield(x, k) => k(0),\n  \
+                     };\n  \
+                     perform IO.println(int_to_string(n));\n  \
+                     0\n\
+                   }\n";
+        let (prog, colored) = colored_from_src(src);
+        let iterate_body = body_of(&prog, "iterate");
+        // Sanity: colorer marks iterate as CPS (non-IO Gen perform in
+        // body taints via `find_non_io_perform_in_block`).
+        assert!(
+            colored.needs_cps_transform("iterate"),
+            "colorer should classify iterate as CPS (non-IO Gen perform)"
+        );
+        // Pre-B.1, this returned Sync (no body shape matched). Post-B.1,
+        // `is_compound_match_with_arm_perform_body` recognises the
+        // body and `compute_user_fn_abi` returns Cps.
+        assert_eq!(
+            compute_user_fn_abi(
+                "iterate",
+                &iterate_body,
+                &params_of(&prog, "iterate"),
+                &colored
+            ),
+            UserFnAbi::Cps,
+            "B.1 wires compound-match-with-arm-perform shape into ABI \
+             selection; iterate-Generator representative should now be Cps"
         );
     }
 
