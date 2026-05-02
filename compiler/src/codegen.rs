@@ -7060,6 +7060,38 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_b4_return_arm_adapter: {e}"))?;
 
+    // Task 78.5 G4 B.4 fix-of-fix — (a'.1) install-then-body wrapper, Path B.
+    // Codegen-emitted (Linkage::Local) global synth fn that runs INSIDE
+    // `sigil_run_loop`'s depth-counting window. When dispatched, it
+    // pushes the B.4 return-arm adapter entry onto
+    // `outer_post_arm_k_stack` and returns `NextStep::Call(body_fn,
+    // user_args)` so the trampoline iterates into the body fn next.
+    //
+    // Closure record layout (header-prefixed; sigil standard):
+    //   +0:  header (TAG_CLOSURE | count=5 | bitmap=0b10100)
+    //   +8:  null code_ptr (unused — install_fn dispatches via
+    //         the post_arm_k entry's fn_ptr, not via this slot)
+    //   +16: body_fn_addr      (env slot 0; fn-ptr; bitmap bit 1 unset)
+    //   +24: body_closure_ptr  (env slot 1; pointer; bitmap bit 2 set)
+    //   +32: adapter_fn_addr   (env slot 2; fn-ptr; bitmap bit 3 unset)
+    //   +40: adapter_closure_ptr (env slot 3; pointer; bitmap bit 4 set)
+    //
+    // Closes the depth-invariant gap: pre-fix iter-2 (a') pushed the
+    // adapter onto outer_post_arm_k_stack from the OUTER fn's frame
+    // BEFORE sigil_run_loop, but run_loop's terminal-DONE check at
+    // handlers.rs:1761 fires when current_depth != entry_depth. Pushing
+    // outside the run_loop window = depth mismatch on cleanup. The
+    // wrapper moves the push INSIDE run_loop's cycle so the depth
+    // balances naturally (push by install_fn, pop by run_loop's DONE
+    // branch via outer_post_arm_k_try_pop).
+    let b4_install_then_body = module
+        .declare_function(
+            "sigil_b4_install_then_body",
+            Linkage::Local,
+            &continuation_identity_sig,
+        )
+        .map_err(|e| format!("declare sigil_b4_install_then_body: {e}"))?;
+
     // Plan B Task 57 — sigil_io_println_arm, the runtime-side default
     // handler for `IO.println` installed at the top-level `main` shim.
     // Same CPS arm fn ABI as `sigil_continuation_identity`. Reads the
@@ -7615,6 +7647,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         next_step_args_ptr,
         continuation_identity,
         b4_return_arm_adapter,
+        b4_install_then_body,
         handler_arm_indices: &handler_arm_indices,
         handler_arm_synth: &handler_arm_synth,
         handler_return_arm_synth: &handler_return_arm_synth,
@@ -7664,7 +7697,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // `sigil_outer_post_arm_k_push(adapter_closure,
                 // adapter_fn_addr)` before the body call. Replaces the
                 // pre-fix trailing-pair-on-args-buffer install.
-                outer_post_arm_k_push_ref,
+                outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 // Plan B Task 78.5 G4 Phase B.1 — bound (was `_`) so
                 // the new compound-match-body branch can call
@@ -7684,6 +7717,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // adapter's `func_addr` as the fn_ptr arg to
                 // `sigil_outer_post_arm_k_push`.
                 b4_return_arm_adapter_ref,
+                b4_install_then_body_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
@@ -7953,8 +7987,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_return_arm_synth: &handler_return_arm_synth,
                         handler_return_arm_indices: &handler_return_arm_indices,
                         continuation_identity_ref,
-                        outer_post_arm_k_push_ref,
                         b4_return_arm_adapter_ref,
+                        b4_install_then_body_ref,
                         effect_ids: &checked.effect_ids,
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
@@ -8839,8 +8873,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_synth: &handler_return_arm_synth,
                     handler_return_arm_indices: &handler_return_arm_indices,
                     continuation_identity_ref,
-                    outer_post_arm_k_push_ref,
                     b4_return_arm_adapter_ref,
+                    b4_install_then_body_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
@@ -8984,8 +9018,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_return_arm_synth: &handler_return_arm_synth,
                 handler_return_arm_indices: &handler_return_arm_indices,
                 continuation_identity_ref,
-                outer_post_arm_k_push_ref,
                 b4_return_arm_adapter_ref,
+                b4_install_then_body_ref,
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
@@ -9338,7 +9372,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_arm_ref,
                     handler_frame_set_return_ref,
                     perform_ref,
-                    outer_post_arm_k_push_ref,
+                    outer_post_arm_k_push_ref: _,
                     run_loop_ref,
                     next_step_done_ref: _,
                     next_step_discharged_ref,
@@ -9350,6 +9384,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
                     b4_return_arm_adapter_ref,
+                    b4_install_then_body_ref,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
@@ -9487,8 +9522,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_synth: &handler_return_arm_synth,
                     handler_return_arm_indices: &handler_return_arm_indices,
                     continuation_identity_ref,
-                    outer_post_arm_k_push_ref,
                     b4_return_arm_adapter_ref,
+                    b4_install_then_body_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
@@ -10281,7 +10316,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_arm_ref,
                     handler_frame_set_return_ref,
                     perform_ref,
-                    outer_post_arm_k_push_ref,
+                    outer_post_arm_k_push_ref: _,
                     run_loop_ref,
                     next_step_done_ref: _,
                     next_step_discharged_ref: _,
@@ -10293,6 +10328,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
                     b4_return_arm_adapter_ref,
+                    b4_install_then_body_ref,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
                     user_fn_refs,
@@ -10418,8 +10454,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_return_arm_synth: &handler_return_arm_synth,
                     handler_return_arm_indices: &handler_return_arm_indices,
                     continuation_identity_ref,
-                    outer_post_arm_k_push_ref,
                     b4_return_arm_adapter_ref,
+                    b4_install_then_body_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
@@ -10650,7 +10686,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_arm_ref,
                 handler_frame_set_return_ref,
                 perform_ref,
-                outer_post_arm_k_push_ref,
+                outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 next_step_done_ref,
                 next_step_discharged_ref: _,
@@ -10662,6 +10698,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
                 b4_return_arm_adapter_ref,
+                b4_install_then_body_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
@@ -10698,8 +10735,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_return_arm_synth: &handler_return_arm_synth,
                 handler_return_arm_indices: &handler_return_arm_indices,
                 continuation_identity_ref,
-                outer_post_arm_k_push_ref,
                 b4_return_arm_adapter_ref,
+                b4_install_then_body_ref,
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
@@ -10932,7 +10969,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_frame_set_arm_ref,
                         handler_frame_set_return_ref,
                         perform_ref,
-                        outer_post_arm_k_push_ref,
+                        outer_post_arm_k_push_ref: _,
                         run_loop_ref,
                         next_step_done_ref,
                         next_step_discharged_ref: _,
@@ -10944,6 +10981,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         next_step_args_ptr_ref,
                         continuation_identity_ref,
                         b4_return_arm_adapter_ref,
+                        b4_install_then_body_ref,
                         handler_arm_refs_per_handle,
                         handler_return_arm_refs_per_handle,
                         user_fn_refs,
@@ -10979,8 +11017,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_return_arm_synth: &handler_return_arm_synth,
                         handler_return_arm_indices: &handler_return_arm_indices,
                         continuation_identity_ref,
-                        outer_post_arm_k_push_ref,
                         b4_return_arm_adapter_ref,
+                        b4_install_then_body_ref,
                         effect_ids: &checked.effect_ids,
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
@@ -11586,6 +11624,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             next_step_args_ptr_ref,
                             continuation_identity_ref,
                             b4_return_arm_adapter_ref,
+                            b4_install_then_body_ref,
                             handler_arm_refs_per_handle,
                             handler_return_arm_refs_per_handle,
                             user_fn_refs,
@@ -11622,8 +11661,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_return_arm_synth: &handler_return_arm_synth,
                             handler_return_arm_indices: &handler_return_arm_indices,
                             continuation_identity_ref,
-                            outer_post_arm_k_push_ref,
                             b4_return_arm_adapter_ref,
+                            b4_install_then_body_ref,
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
@@ -12084,7 +12123,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_arm_ref,
                             handler_frame_set_return_ref,
                             perform_ref,
-                            outer_post_arm_k_push_ref,
+                            outer_post_arm_k_push_ref: _,
                             run_loop_ref,
                             next_step_done_ref: _,
                             next_step_discharged_ref: _,
@@ -12096,6 +12135,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             next_step_args_ptr_ref,
                             continuation_identity_ref,
                             b4_return_arm_adapter_ref,
+                            b4_install_then_body_ref,
                             handler_arm_refs_per_handle,
                             handler_return_arm_refs_per_handle,
                             user_fn_refs,
@@ -12132,8 +12172,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_return_arm_synth: &handler_return_arm_synth,
                             handler_return_arm_indices: &handler_return_arm_indices,
                             continuation_identity_ref,
-                            outer_post_arm_k_push_ref,
                             b4_return_arm_adapter_ref,
+                            b4_install_then_body_ref,
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
@@ -12538,6 +12578,149 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         module.clear_context(&mut ctx);
     }
 
+    // --- Task 78.5 G4 B.4 fix-of-fix (a'.1 Path B): emit
+    // `sigil_b4_install_then_body` global synth fn body. ONE-time
+    // emission per program (declared with Linkage::Local in the
+    // prelude); `lower_b4_cps_body_call` constructs per-handle install
+    // closure records that target this single fn via FuncRef.
+    //
+    // Signature (cps_arm_sig): `extern "C" fn(closure_ptr, args_ptr,
+    // args_len: i32) -> *mut NextStep`.
+    //
+    // **Why this fn exists.** It runs INSIDE `sigil_run_loop`'s
+    // depth-counting window. iter-2 (the rejected (a') variant)
+    // pushed the B.4 adapter onto outer_post_arm_k_stack from the
+    // outer fn's frame BEFORE sigil_run_loop, breaking the
+    // depth-balance invariant at handlers.rs:1761 (terminal-DONE
+    // check). Wrapping the push inside install_fn means the push
+    // happens at depth X+1 (where X is run_loop's entry_depth) and
+    // the matching pop happens via run_loop's DONE branch's
+    // outer_post_arm_k_try_pop also at depth X+1 → balances naturally.
+    //
+    // **Closure layout** (sigil standard header-prefixed; see
+    // `lower_b4_cps_body_call` for the alloc):
+    //   +0:  header (TAG_CLOSURE | count=5 | bitmap=0b10100)
+    //   +8:  null code_ptr (unused)
+    //   +16: body_fn_addr      (env slot 0; fn-ptr; non-GC)
+    //   +24: body_closure_ptr  (env slot 1; pointer; GC root via bit 2)
+    //   +32: adapter_fn_addr   (env slot 2; fn-ptr; non-GC)
+    //   +40: adapter_closure_ptr (env slot 3; pointer; GC root via bit 4)
+    //
+    // **Body algorithm**:
+    //   1. Load (body_fn_addr, body_closure_ptr, adapter_fn_addr,
+    //      adapter_closure_ptr) from closure_ptr at +16/+24/+32/+40.
+    //   2. Call sigil_outer_post_arm_k_push(adapter_closure_ptr,
+    //      adapter_fn_addr) — INSIDE run_loop's window.
+    //   3. Allocate fresh NextStep::Call(body_closure_ptr,
+    //      body_fn_addr, args_len) via sigil_next_step_call.
+    //   4. Get fresh args buffer via sigil_next_step_args_ptr.
+    //   5. Copy args_len u64 slots from incoming args_ptr to fresh
+    //      args buffer (loop, since args_len is dynamic).
+    //   6. Return the fresh NextStep so the trampoline iterates into
+    //      body_fn next.
+    {
+        let install_sig = cps_signature(pointer_ty, &module);
+        ctx.func.signature = install_sig;
+        ctx.func.name = UserFuncName::user(0, b4_install_then_body.as_u32());
+
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+
+        let block_entry = builder.create_block();
+        builder.append_block_params_for_function_params(block_entry);
+        builder.switch_to_block(block_entry);
+        builder.seal_block(block_entry);
+
+        let block_params: Vec<Value> = builder.block_params(block_entry).to_vec();
+        let closure_ptr = block_params[0];
+        let in_args_ptr = block_params[1];
+        let args_len_i32 = block_params[2];
+
+        // Load the four captures from the install closure record.
+        let body_fn_addr = builder
+            .ins()
+            .load(pointer_ty, MemFlags::trusted(), closure_ptr, 16);
+        let body_closure_ptr = builder
+            .ins()
+            .load(pointer_ty, MemFlags::trusted(), closure_ptr, 24);
+        let adapter_fn_addr = builder
+            .ins()
+            .load(pointer_ty, MemFlags::trusted(), closure_ptr, 32);
+        let adapter_closure_ptr =
+            builder
+                .ins()
+                .load(pointer_ty, MemFlags::trusted(), closure_ptr, 40);
+
+        // Step 2 — push the adapter onto outer_post_arm_k_stack.
+        let outer_push_ref = module.declare_func_in_func(outer_post_arm_k_push, builder.func);
+        builder
+            .ins()
+            .call(outer_push_ref, &[adapter_closure_ptr, adapter_fn_addr]);
+
+        // Step 3 — allocate fresh NextStep::Call(body, args_len).
+        let next_step_call_ref = module.declare_func_in_func(next_step_call, builder.func);
+        let new_ns_call = builder.ins().call(
+            next_step_call_ref,
+            &[body_closure_ptr, body_fn_addr, args_len_i32],
+        );
+        let new_next_step = builder.inst_results(new_ns_call)[0];
+
+        // Step 4 — get fresh args buffer pointer.
+        let next_step_args_ptr_ref = module.declare_func_in_func(next_step_args_ptr, builder.func);
+        let new_args_ptr_call = builder.ins().call(next_step_args_ptr_ref, &[new_next_step]);
+        let new_args_buf = builder.inst_results(new_args_ptr_call)[0];
+
+        // Step 5 — copy args_len u64 slots. `args_len` is i32; widen
+        // to i64 for byte-offset arithmetic (slot stride = 8 bytes).
+        let args_len_i64 = builder.ins().sextend(types::I64, args_len_i32);
+
+        let block_loop = builder.create_block();
+        let block_body = builder.create_block();
+        let block_exit = builder.create_block();
+
+        // Loop counter `i` flows in as the loop block's only param.
+        builder.append_block_param(block_loop, types::I64);
+
+        let zero_i64 = builder.ins().iconst(types::I64, 0);
+        builder.ins().jump(block_loop, &[zero_i64.into()]);
+
+        // === block_loop: branch on i < args_len_i64 ===
+        builder.switch_to_block(block_loop);
+        let i = builder.block_params(block_loop)[0];
+        let cmp = builder.ins().icmp(IntCC::SignedLessThan, i, args_len_i64);
+        builder.ins().brif(cmp, block_body, &[], block_exit, &[]);
+
+        // === block_body: copy slot i, increment, jump back ===
+        builder.switch_to_block(block_body);
+        builder.seal_block(block_body);
+
+        let stride = builder.ins().iconst(types::I64, 8);
+        let offset = builder.ins().imul(i, stride);
+        let src_addr = builder.ins().iadd(in_args_ptr, offset);
+        let val = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), src_addr, 0);
+        let dst_addr = builder.ins().iadd(new_args_buf, offset);
+        builder.ins().store(MemFlags::trusted(), val, dst_addr, 0);
+        let one = builder.ins().iconst(types::I64, 1);
+        let i_plus_1 = builder.ins().iadd(i, one);
+        builder.ins().jump(block_loop, &[i_plus_1.into()]);
+
+        // block_loop's predecessors are now both known (entry's
+        // initial jump + body's back-edge); seal it.
+        builder.seal_block(block_loop);
+
+        // === block_exit: return the fresh NextStep ===
+        builder.switch_to_block(block_exit);
+        builder.seal_block(block_exit);
+        builder.ins().return_(&[new_next_step]);
+
+        builder.finalize();
+        module
+            .define_function(b4_install_then_body, &mut ctx)
+            .map_err(|e| format_define_failure("sigil_b4_install_then_body", &e, &ctx))?;
+        module.clear_context(&mut ctx);
+    }
+
     // --- finish and add the stackmap section ----------------------------
     let mut product = module.finish();
 
@@ -12735,17 +12918,6 @@ struct Lowerer<'a, 'b> {
     /// arm body's `sigil_next_step_call` dispatches into the
     /// identity continuation, producing a terminal `Done(arg)`.
     continuation_identity_ref: FuncRef,
-    /// Task 78.5 G4 B.4 fix — `sigil_outer_post_arm_k_push` runtime
-    /// ref. `lower_b4_cps_body_call` calls this BEFORE the body
-    /// call to install the `(adapter_closure, adapter_fn_addr)` pair
-    /// on the `outer_post_arm_k_stack`. When `sigil_run_loop`'s DONE
-    /// branch sees the body's terminal value, it pops this entry and
-    /// dispatches `Call(adapter_closure, adapter_fn_addr, [v])`,
-    /// which the adapter then bridges into the return-arm synth
-    /// fn's 3-slot dispatch. Replaces the pre-fix
-    /// trailing-pair-on-body-args-buffer install (which run_loop's
-    /// DONE branch never consulted).
-    outer_post_arm_k_push_ref: FuncRef,
     /// Task 78.5 G4 B.4 fix — `sigil_b4_return_arm_adapter` runtime
     /// ref. `lower_b4_cps_body_call` takes this fn's `func_addr` as
     /// the `fn_ptr` arg to `sigil_outer_post_arm_k_push`. See
@@ -12753,6 +12925,13 @@ struct Lowerer<'a, 'b> {
     /// the bridging body + closure record layout the codegen emit
     /// allocates alongside.
     b4_return_arm_adapter_ref: FuncRef,
+    /// Task 78.5 G4 B.4 fix-of-fix (a'.1 Path B) —
+    /// `sigil_b4_install_then_body` codegen-emitted global synth fn
+    /// FuncRef. `lower_b4_cps_body_call` takes this fn's `func_addr`
+    /// to pack into the install closure record + builds the outer-fn-
+    /// side `NextStep::Call(install_closure, install_fn, user_args)`
+    /// that bootstraps the wrapper inside `sigil_run_loop`'s window.
+    b4_install_then_body_ref: FuncRef,
     /// Plan B Task 55 (Phase 3a) — effect-name → effect_id (u32) map
     /// from typecheck. `Expr::Handle` codegen looks up the handle's
     /// declared effect (the unique effect name in its arms; Phase 3a
@@ -14833,64 +15012,59 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // post-narrow.
         let body_ty = callee_entry.ret_ty;
 
-        // **Task 78.5 G4 B.4 fix (per Brian's approved (a′) plan).**
+        // **Task 78.5 G4 B.4 fix-of-fix (a'.1 install-then-body wrapper, Path B).**
         //
-        // Routing strategy: install the return-arm pair on the
-        // outer_post_arm_k_stack (via a 2-word adapter closure record +
-        // the global `sigil_b4_return_arm_adapter`) BEFORE the body
-        // call. The body call then runs with a normal `(null,
-        // identity)` trailing pair like every other Cps interop call.
+        // Routing strategy: bootstrap the body call through a Cranelift-
+        // emitted global synth fn `sigil_b4_install_then_body`. The
+        // outer-fn-side dispatch builds a `NextStep::Call(install_closure,
+        // install_fn, [user_args])` and drives `sigil_run_loop` with
+        // it. `install_fn` runs INSIDE run_loop's depth-counting window:
+        // pushes the B.4 adapter onto `outer_post_arm_k_stack`, then
+        // returns `NextStep::Call(body_fn, [user_args])` so the
+        // trampoline iterates into the body next.
         //
-        // **Why this routing.** The pre-fix B.4 wrote the return-arm
-        // pair into the body's args buffer at the trailing slots
-        // `k_closure_offset(N) / k_fn_offset(N)` and relied on
-        // `sigil_run_loop`'s DONE branch to consult those slots. But
-        // run_loop's DONE branch only consults `outer_post_arm_k_stack`
-        // (handlers.rs:1595-1608); it never reads the body's args
-        // buffer trailing slots. So the body's terminal value flowed
-        // back unwrapped — for `B == R` shapes (Probe 5: 0 instead of
-        // 1) the wrong value, for `B != R` shapes (Probe 4: terminal
-        // Int=0 cast as `List[Int]` pointer = NULL → length(NULL))
-        // SIGSEGV. Routing through outer_post_arm_k uses the existing
-        // (well-tested) DONE-branch routing path.
+        // **Why this shape (vs iter-2's pre-run_loop push).** iter-2 of
+        // the (a') family pushed the adapter onto outer_post_arm_k_stack
+        // from THIS outer fn's frame BEFORE sigil_run_loop. That broke
+        // the depth-balance invariant at handlers.rs:1761 — run_loop's
+        // terminal-DONE check requires `current_depth == entry_depth`,
+        // but the pre-push left `current_depth == entry_depth + 1` at
+        // run_loop entry. Wrapping the push inside install_fn means
+        // both push and pop happen INSIDE run_loop's cycle (push by
+        // install_fn at depth X+1, pop by run_loop's DONE branch via
+        // outer_post_arm_k_try_pop also at depth X+1) → invariant holds.
+        //
+        // **Why the install_fn (vs iter-1's args-buffer trailing pair).**
+        // iter-1 (PR #75 itself) wrote the return-arm pair into the
+        // body's args buffer at trailing slots and relied on run_loop's
+        // DONE branch to consult those slots. But the DONE branch only
+        // consults `outer_post_arm_k_stack` (handlers.rs:1595-1608); it
+        // never reads the body's args buffer trailing slots. So the
+        // body's terminal value flowed back unwrapped — for `B == R`
+        // shapes the wrong value, for `B != R` shapes a NULL deref /
+        // SIGSEGV. Routing through outer_post_arm_k_stack uses the
+        // existing (well-tested) DONE-branch routing path.
         //
         // **Adapter shape.** The adapter exists because
         // `outer_post_arm_k_try_pop`'s dispatch contract (Slice C,
         // handlers.rs:1602) builds a 1-arg `Call(closure, fn, [v])`,
         // but the return-arm synth fn expects a 3-slot args buffer
         // `[v, post_handle_k_closure, post_handle_k_fn]`. The adapter
-        // (runtime/src/handlers.rs::sigil_b4_return_arm_adapter)
+        // (`sigil_b4_return_arm_adapter`, runtime/src/handlers.rs)
         // bridges by reading `(return_closure, return_fn)` from its
         // own closure record's env slots and rebuilding a fresh
-        // `Call(return_closure, return_fn, [v, null,
-        // identity_fn_addr])`. The arity adaptation lives in the
-        // adapter — we keep `outer_post_arm_k_try_pop`'s 1-arg
-        // contract AND the return-arm synth fn's 3-slot contract
-        // unchanged.
+        // `Call(return_closure, return_fn, [v, null, identity])`. The
+        // arity adaptation lives in the adapter — we keep
+        // `outer_post_arm_k_try_pop`'s 1-arg contract AND the return-
+        // arm synth fn's 3-slot contract unchanged.
 
-        // Phase 1: pack user args into a stack slot of `N * 8` bytes.
-        // **No trailing pair** — the per-Brian-(a′) plan reverts the
-        // pre-fix `(N+2)*8` allocation. The B.4-eligible body shapes
-        // (compound-match-with-arm-perform, per
-        // `is_b4_eligible_cps_body_call`'s gate) never read the
-        // trailing pair from the body's args buffer: their arm-body
-        // performs route through `lower_perform_to_value`'s
-        // identity-k_fn path, which constructs its OWN args buffer
-        // for `sigil_perform`. The return-arm routing now happens
-        // entirely via the outer_post_arm_k_stack push below + the
-        // adapter, NOT through the body args buffer.
+        // Phase 1: lower each user arg expression and widen to I64
+        // (the args_buf slot stride). Per `feedback_sigil_dfg_value_type`:
+        // read the lowered Cranelift type from `dfg.value_type(arg_v)`.
         let user_arg_count = args.len();
-        let slot_bytes = (user_arg_count * 8) as u32;
-        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            slot_bytes.max(8),
-            3,
-        ));
-
-        for (i, arg_expr) in args.iter().enumerate() {
+        let mut widened_args: Vec<Value> = Vec::with_capacity(user_arg_count);
+        for arg_expr in args.iter() {
             let arg_v = self.lower_expr(arg_expr);
-            // Per `feedback_sigil_dfg_value_type`: read the lowered
-            // Cranelift type from `dfg.value_type(arg_v)`.
             let arg_ty = self.builder.func.dfg.value_type(arg_v);
             let widened = if arg_ty == types::I64 {
                 arg_v
@@ -14905,12 +15079,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 );
                 arg_v
             };
-            self.builder
-                .ins()
-                .stack_store(widened, slot, (i * 8) as i32);
+            widened_args.push(widened);
         }
 
-        // Phase 3: read the return-arm pair from the first-pushed
+        // Phase 2: read the return-arm pair from the first-pushed
         // frame's pinned offsets. Mirrors the Phase 4g return-arm
         // dispatch read.
         let return_closure_v = self.builder.ins().load(
@@ -14926,31 +15098,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             sigil_abi::effect::HANDLER_FRAME_RETURN_FN_OFF,
         );
 
-        // Phase 4: allocate a 2-word adapter closure record on the GC
-        // heap holding `[return_closure, return_fn]`. Layout (TAG_CLOSURE):
+        // Phase 3: allocate the adapter closure record on the GC heap
+        // holding `[return_closure, return_fn]`. Sigil's standard
+        // header-prefixed layout (TAG_CLOSURE):
         //
         //   +0:  header (TAG_CLOSURE | count=3 | bitmap=0b010)
-        //         - count = 1 (code_ptr) + 2 (env slots)
-        //         - bitmap bit 1 (env slot 0 / return_closure) is set
-        //           → the GC scans return_closure as a pointer root if
-        //             a collection happens between now and the
-        //             trampoline's adapter dispatch.
-        //         - bitmap bit 2 (env slot 1 / return_fn) is unset
-        //           → fn-ptr; non-GC by convention (mirrors B.2's
-        //             k_pair convention at codegen.rs:9580-9582).
-        //   +8:  null code_ptr (unused — adapter is dispatched via
-        //         the fn_ptr stored in the post_arm_k entry, not via
-        //         the record's code slot. Stored as null to keep the
-        //         layout uniform with other closure records and avoid
-        //         a divergent GC bitmap shape).
-        //   +16: return_closure (env slot 0; pointer; bitmap bit 1)
+        //   +8:  null code_ptr
+        //   +16: return_closure (env slot 0; pointer; bitmap bit 1 set)
         //   +24: return_fn      (env slot 1; fn-ptr;  bitmap bit 2 unset)
         //
-        // Mirrors B.2's step_0 closure-record allocation pattern at
-        // codegen.rs:9588-9620, simplified: 2 trailing slots, no extra
-        // captures.
+        // The runtime adapter `sigil_b4_return_arm_adapter` reads
+        // env slots from offsets 16/24 (matching this layout).
         let adapter_record_bitmap: u32 = 1u32 << 1; // bit 1: return_closure
-                                                    // bit 2: return_fn (fn-ptr) — unset.
         let adapter_record_count: u8 = 1 + 2; // 1 code_ptr + 2 env slots
         let adapter_record_header: u64 =
             header_word(TAG_CLOSURE, adapter_record_count, adapter_record_bitmap);
@@ -14970,62 +15129,136 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, adapter_alloc_call));
         let adapter_closure_ptr = self.builder.inst_results(adapter_alloc_call)[0];
-        // code_ptr at offset 8 = null.
-        let adapter_record_null_code_v = self.builder.ins().iconst(self.pointer_ty, 0);
-        self.builder.ins().store(
-            MemFlags::trusted(),
-            adapter_record_null_code_v,
-            adapter_closure_ptr,
-            8,
-        );
-        // return_closure at offset 16 (env slot 0).
+        let null_ptr_v = self.builder.ins().iconst(self.pointer_ty, 0);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), null_ptr_v, adapter_closure_ptr, 8);
         self.builder.ins().store(
             MemFlags::trusted(),
             return_closure_v,
             adapter_closure_ptr,
             16,
         );
-        // return_fn at offset 24 (env slot 1).
         self.builder
             .ins()
             .store(MemFlags::trusted(), return_fn_v, adapter_closure_ptr, 24);
 
-        // Phase 5: install the adapter on the outer_post_arm_k_stack
-        // BEFORE the body call. The runtime fn signature is
-        // `pub unsafe extern "C" fn sigil_outer_post_arm_k_push(
-        //      closure_ptr: *mut u8, fn_ptr: *mut u8)`
-        // (handlers.rs:476) — positional order is closure first, fn
-        // second. When the body call's `sigil_run_loop` reaches DONE,
-        // its `outer_post_arm_k_try_pop` finds this entry and builds
-        // `Call(adapter_closure_ptr, &adapter, [body_terminal_value])`
-        // (args_len=1). The adapter then bridges into the return-arm
-        // synth fn's 3-slot dispatch.
+        // Phase 4: allocate the install closure record on the GC heap
+        // holding `[body_fn_addr, body_closure_ptr=null, adapter_fn_addr,
+        // adapter_closure_ptr]`. Sigil's standard header-prefixed layout
+        // (TAG_CLOSURE):
+        //
+        //   +0:  header (TAG_CLOSURE | count=5 | bitmap=0b10100)
+        //         - count = 1 (code_ptr) + 4 (env slots)
+        //         - bitmap bit 2 (env slot 1 / body_closure_ptr) set →
+        //           pointer slot, GC-scan as a root
+        //         - bitmap bit 4 (env slot 3 / adapter_closure_ptr) set →
+        //           pointer slot, GC-scan as a root
+        //         - bits 1, 3 (env slots 0, 2 — fn-ptrs) unset (non-GC
+        //           by sigil's k_pair convention)
+        //   +8:  null code_ptr
+        //   +16: body_fn_addr      (env slot 0; fn-ptr; non-GC)
+        //   +24: body_closure_ptr  (env slot 1; null at top-level; GC)
+        //   +32: adapter_fn_addr   (env slot 2; fn-ptr; non-GC)
+        //   +40: adapter_closure_ptr (env slot 3; pointer; GC)
+        //
+        // `sigil_b4_install_then_body` reads these slots from offsets
+        // +16/+24/+32/+40 in its body. Its body emit lives in
+        // `emit_object` right before `module.finish()` (one-time
+        // global emission per program).
+        let install_record_bitmap: u32 = (1u32 << 2) | (1u32 << 4); // bits 2, 4
+        let install_record_count: u8 = 1 + 4; // 1 code_ptr + 4 env slots
+        let install_record_header: u64 =
+            header_word(TAG_CLOSURE, install_record_count, install_record_bitmap);
+        let install_record_payload_bytes: i64 = 8 + 8 * 4; // header + (code_ptr + 4 env)
+        let install_record_header_v = self
+            .builder
+            .ins()
+            .iconst(types::I64, install_record_header as i64);
+        let install_record_payload_v = self
+            .builder
+            .ins()
+            .iconst(self.pointer_ty, install_record_payload_bytes);
+        let install_alloc_call = self.builder.ins().call(
+            self.builtins.alloc_ref,
+            &[install_record_header_v, install_record_payload_v],
+        );
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, install_alloc_call));
+        let install_closure_ptr = self.builder.inst_results(install_alloc_call)[0];
+
+        // Body fn-addr from user_fn_refs.
+        let body_fn_ref = self.user_fn_refs[&name];
+        let body_fn_addr_v = self.builder.ins().func_addr(self.pointer_ty, body_fn_ref);
+        // Adapter fn-addr from b4_return_arm_adapter_ref.
         let adapter_fn_addr_v = self
             .builder
             .ins()
             .func_addr(self.pointer_ty, self.b4_return_arm_adapter_ref);
-        let push_call = self.builder.ins().call(
-            self.outer_post_arm_k_push_ref,
-            &[adapter_closure_ptr, adapter_fn_addr_v],
+
+        // null code_ptr at +8.
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), null_ptr_v, install_closure_ptr, 8);
+        // body_fn_addr at +16.
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), body_fn_addr_v, install_closure_ptr, 16);
+        // body_closure_ptr (null at +24 — top-level direct call has no
+        // closure captures; install_fn forwards this as the closure_ptr
+        // arg to body_fn).
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), null_ptr_v, install_closure_ptr, 24);
+        // adapter_fn_addr at +32.
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            adapter_fn_addr_v,
+            install_closure_ptr,
+            32,
         );
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, push_call));
+        // adapter_closure_ptr at +40.
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            adapter_closure_ptr,
+            install_closure_ptr,
+            40,
+        );
 
-        let args_ptr = self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
-        let args_len = self.builder.ins().iconst(types::I32, user_arg_count as i64);
-
-        // Phase 6: direct-call the Cps fn. Pass null closure_ptr
-        // (top-level direct call; closure_ptr is reserved for closure-
-        // converted lifted lambdas).
-        let func_ref = self.user_fn_refs[&name];
-        let null_closure_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
-        let cps_call = self
+        // Phase 5: build NextStep::Call(install_closure, install_fn,
+        // user_arg_count). `sigil_next_step_call` allocates a fresh
+        // NextStep + args buffer from the per-dispatch arena.
+        let install_fn_addr_v = self
             .builder
             .ins()
-            .call(func_ref, &[null_closure_ptr, args_ptr, args_len]);
+            .func_addr(self.pointer_ty, self.b4_install_then_body_ref);
+        let user_arg_count_v = self.builder.ins().iconst(types::I32, user_arg_count as i64);
+        let install_ns_call = self.builder.ins().call(
+            self.next_step_call_ref,
+            &[install_closure_ptr, install_fn_addr_v, user_arg_count_v],
+        );
         self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, cps_call));
-        let next_step = self.builder.inst_results(cps_call)[0];
+            .push_placeholder(function_code_offset(&self.builder, install_ns_call));
+        let install_next_step = self.builder.inst_results(install_ns_call)[0];
+
+        // Phase 6: pack widened user args into the install NextStep's
+        // args buffer. With user_arg_count == 0 the args buffer is
+        // null (per sigil_next_step_args_ptr's contract for zero-arg
+        // Calls); skip the call entirely in that case.
+        if user_arg_count > 0 {
+            let install_args_ptr_call = self
+                .builder
+                .ins()
+                .call(self.next_step_args_ptr_ref, &[install_next_step]);
+            let install_args_buf = self.builder.inst_results(install_args_ptr_call)[0];
+            for (i, w) in widened_args.iter().enumerate() {
+                self.builder
+                    .ins()
+                    .store(MemFlags::trusted(), *w, install_args_buf, (i * 8) as i32);
+            }
+        }
+
+        let next_step = install_next_step;
 
         // Phase 7: drive the trampoline. Returns u64.
         //
@@ -17972,6 +18205,14 @@ struct PerFnRefsCtx<'a> {
     /// `lower_b4_cps_body_call` can take the adapter's `func_addr`
     /// when calling `sigil_outer_post_arm_k_push` before the body call.
     b4_return_arm_adapter: cranelift_module::FuncId,
+    /// Task 78.5 G4 B.4 fix-of-fix (a'.1 Path B) —
+    /// `sigil_b4_install_then_body` FuncId. Codegen-emitted global
+    /// install-then-body wrapper synth fn. `lower_b4_cps_body_call`
+    /// builds `NextStep::Call(install_closure, install_fn, user_args)`
+    /// and drives sigil_run_loop with it; install_fn pushes the B.4
+    /// adapter onto outer_post_arm_k_stack INSIDE run_loop's depth
+    /// window, then returns `NextStep::Call(body_fn, user_args)`.
+    b4_install_then_body: cranelift_module::FuncId,
     handler_arm_indices: &'a BTreeMap<Span, Vec<usize>>,
     handler_arm_synth: &'a [HandlerArmSynth],
     /// Plan B Task 55 (Phase 4g) — per-handle return-arm `FuncId` if
@@ -18042,6 +18283,12 @@ struct PerFnRefs {
     /// Used by `lower_b4_cps_body_call` to take the adapter's
     /// `func_addr` for `sigil_outer_post_arm_k_push`.
     b4_return_arm_adapter_ref: FuncRef,
+    /// Task 78.5 G4 B.4 fix-of-fix (a'.1 Path B) —
+    /// `sigil_b4_install_then_body` FuncRef. Used by
+    /// `lower_b4_cps_body_call` to take the install fn's `func_addr`
+    /// when packing it into the install closure record + the
+    /// outer-fn-side `NextStep::Call` that bootstraps the wrapper.
+    b4_install_then_body_ref: FuncRef,
     handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>>,
     /// Plan B Task 55 (Phase 4g) — per-handle return-arm `FuncRef` if
     /// the handle has a return arm; absent otherwise. Keyed by handle
@@ -18175,6 +18422,8 @@ fn prepare_per_fn_refs(
         module.declare_func_in_func(ctx.continuation_identity, builder.func);
     let b4_return_arm_adapter_ref =
         module.declare_func_in_func(ctx.b4_return_arm_adapter, builder.func);
+    let b4_install_then_body_ref =
+        module.declare_func_in_func(ctx.b4_install_then_body, builder.func);
 
     // Per-handle synth-arm-fn FuncRefs, keyed by handle span. Built
     // from the `handler_arm_indices` side-table (one entry per
@@ -18266,6 +18515,7 @@ fn prepare_per_fn_refs(
         next_step_args_ptr_ref,
         continuation_identity_ref,
         b4_return_arm_adapter_ref,
+        b4_install_then_body_ref,
         handler_arm_refs_per_handle,
         handler_return_arm_refs_per_handle,
         user_fn_refs,
