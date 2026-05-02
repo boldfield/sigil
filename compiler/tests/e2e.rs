@@ -8143,9 +8143,17 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 /// way back up. `length(result) = 3`.
 ///
 /// **Invariant** (post-fix): stdout = `"3\n"`, exit 0.
+///
+/// Task 78.5 G4 Approach 6 deep-redo — un-ignored. The body-fn natural-
+/// exit emit at codegen.rs:8534 (B.2 ConstantDone arm — iterate's Nil
+/// arm) calls `sigil_done_or_dispatch_return_arm` which dispatches the
+/// return arm at the deepest k(0) terminus (deep-handler semantic);
+/// post_arm_k chain unwinds with Nil → Cons(3, Nil) → Cons(2, Cons(3,
+/// Nil)) → Cons(1, ...) → length 3. Phase 4g suppression check at
+/// codegen.rs:14289 reads `BODY_RETURN_ARM_FIRED` and skips the second
+/// nested run_loop that would double-wrap.
 #[test]
-#[ignore = "G4: codegen routes performs inside non-trivial fn-body shapes (match-arm Blocks, etc.) through identity k_fn instead of synthesizing a real CPS continuation; post-arm-k chain doesn't unwind through recursive perform sites. Surfaced during G1 fix debug at PR #67 iter 5"]
-fn task_78_5_pending_g4_recursive_perform_in_match_arm_body() {
+fn task_78_5_g4_recursive_perform_in_match_arm_body() {
     let src = "import std.list\n\
                import std.io\n\
                \n\
@@ -8180,6 +8188,132 @@ fn task_78_5_pending_g4_recursive_perform_in_match_arm_body() {
     assert_eq!(
         stdout, "3\n",
         "generator should yield 3 elements collected into List[Int]; \
+         stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Approach 6 deep-redo — Risk 3 regression: Cps
+/// sub-call inside body fn must NOT trigger outer return-arm wrap.**
+///
+/// Body fn calls a Cps sub-fn (sub_cps_fn) before its own perform.
+/// sub_cps_fn's natural-exit Done(99) flows back to body_fn directly;
+/// the helper at sub_cps_fn's natural-exit emit site must read TLS as
+/// CLEAR (not the outer body's return-arm pair) and fall through to
+/// plain `Done(99)`.
+///
+/// **Mechanism**: lower_call's `UserFnAbi::Cps` branch
+/// (codegen.rs:14971 area) wraps its nested run_loop with
+/// SAVE+CLEAR+RESTORE around BODY_RETURN_ARM TLS. During the sub-call's
+/// nested run_loop, BODY_RETURN_ARM is null → helper at
+/// sub_cps_fn natural exit emits Done(99) without wrap. After the
+/// sub-call returns, RESTORE re-installs the outer body's return-arm
+/// pair so body_fn's own natural-exit dispatches correctly.
+///
+/// **Trace**:
+///   - sub_cps_fn() → 99 (no wrap)
+///   - body_fn: n=99, perform Eff.op() → 0, tail = n+1 = 100
+///   - body_fn natural exit Done(100) → helper wraps → return arm v+1000 = 1100
+///
+/// **Invariant**: stdout = `"1100\n"`, exit 0. If wrong (e.g.,
+/// `"2100\n"`), Risk 3 surfaced (sub-call inherited outer's return arm).
+#[test]
+fn task_78_5_g4_approach6_risk3_cps_sub_call_does_not_trigger_outer_return_arm() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { op: () -> Int }\n\
+               effect Log { write: (String) -> Int }\n\
+               \n\
+               fn sub_cps_fn() -> Int ![Log] {\n  \
+                 let _: Int = perform Log.write(\"hi\");\n  \
+                 99\n\
+               }\n\
+               \n\
+               fn body_fn() -> Int ![Eff, Log] {\n  \
+                 let n: Int = sub_cps_fn();\n  \
+                 let _: Int = perform Eff.op();\n  \
+                 n + 1\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle body_fn() with {\n    \
+                   Log.write(_, k) => k(0),\n    \
+                   Eff.op(k) => k(0),\n    \
+                   return(v) => v + 1000,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_risk3_cps_sub_call_does_not_trigger_outer_return_arm",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1100\n",
+        "Risk 3: sub_cps_fn's Done(99) MUST NOT wrap via outer return arm; \
+         only body_fn's natural exit (n+1=100) should wrap to 1100. \
+         Wrong output (e.g. 2100) means the sub-call inherited the outer \
+         body's BODY_RETURN_ARM pair. stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Approach 6 deep-redo — nested handles: each handle's
+/// return-arm fires for its own body's natural exit only.**
+///
+/// Outer handle wraps outer_body via `v + 100`; inner handle inside
+/// outer_body wraps inner_body via `v + 1`. Verifies that the SAVE +
+/// SET + RESTORE pattern in the custom handle body-call wrapper
+/// preserves the outer's TLS triplet across the inner handle's
+/// run_loop, so inner_body's natural exit wraps via INNER's return arm
+/// and outer_body's natural exit wraps via OUTER's return arm.
+///
+/// **Trace**:
+///   - inner_body's natural exit Done(7) → inner helper wraps → 8
+///   - outer_body sees inner = 8; tail inner * 10 = 80
+///   - outer_body natural exit Done(80) → outer helper wraps → 180
+///
+/// **Invariant**: stdout = `"180\n"`, exit 0. Wrong outputs:
+/// `"108\n"` (outer wrap fires on inner's natural exit), `"800\n"`
+/// (no wrap), or other.
+#[test]
+fn task_78_5_g4_approach6_nested_handles_each_return_arm_fires_for_its_own_body() {
+    let src = "import std.io\n\
+               \n\
+               effect E1 { op1: () -> Int }\n\
+               effect E2 { op2: () -> Int }\n\
+               \n\
+               fn inner_body() -> Int ![E2] {\n  \
+                 let _: Int = perform E2.op2();\n  \
+                 7\n\
+               }\n\
+               \n\
+               fn outer_body() -> Int ![E1, E2] {\n  \
+                 let _: Int = perform E1.op1();\n  \
+                 let inner: Int = handle inner_body() with {\n    \
+                   E2.op2(k) => k(0),\n    \
+                   return(v) => v + 1,\n  \
+                 };\n  \
+                 inner * 10\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let outer: Int = handle outer_body() with {\n    \
+                   E1.op1(k) => k(0),\n    \
+                   E2.op2(k) => k(0),\n    \
+                   return(v) => v + 100,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(outer));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_nested_handles_each_return_arm_fires_for_its_own_body",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "180\n",
+        "Nested handles: inner return arm wraps inner's natural exit \
+         (7→8), outer return arm wraps outer's natural exit (80→180). \
          stderr={stderr:?}"
     );
 }
