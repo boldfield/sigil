@@ -2766,15 +2766,20 @@ enum CpsContinuationKind {
         /// only globals, captures, the optional let-binding, and any
         /// helper-internal scope visible at the perform site.
         tail_expr: Box<crate::ast::Expr>,
-        /// Cranelift type of `tail_expr`. Used to widen the lowered
-        /// tail value to I64 before wrapping in `Done(...)`.
-        tail_ty: Type,
         /// Optional let-binding introduced by `Stmt::Let { name, value:
         /// Expr::Perform }`. When `Some((name, ty, kind))`, the synth-
         /// cont reads `args_ptr[0]` (the resumed perform's value),
         /// narrows to `ty`, and binds it under `name` before lowering
         /// the tail. `None` when the perform-arm uses `Stmt::Perform`
         /// (which discards the value).
+        ///
+        /// Note (per PR #76 review): a former `tail_ty: Type` field was
+        /// dropped — actual widen logic uses
+        /// `dfg.value_type(tail_value)` (per
+        /// `feedback_sigil_dfg_value_type`), and the pre-stored
+        /// prediction was only ever referenced in an
+        /// assertion-failure message. The assertion now reports the
+        /// dynamic value type alone.
         let_binding: Option<(String, Type, EnvSlotKind)>,
     },
 }
@@ -3270,10 +3275,20 @@ fn walk_collect_arm_post_perform_captures(
         // Lowerer which handles these shapes once they become reachable.
         // For B.2's MVP (iterate-Generator shape) the tail is a Call
         // (iterate(rest)) or a literal — Handle/Lambda/ClosureRecord
-        // don't appear. Defensive structural recursion: walk the
-        // visible sub-expressions but skip the body-introducing parts
-        // (handler arms, lambda body) to avoid double-binding under
-        // the wrong scope.
+        // don't appear. Asymmetry rationale (per PR #76 review):
+        //   - `Handle { body, .. }` recurses into `body` because Handle
+        //     is transparent w.r.t. the surrounding scope: its body
+        //     evaluates with the same bindings as the parent expression
+        //     (handler arms introduce their own scope but we don't walk
+        //     them here — see below).
+        //   - `Lambda` / `ClosureRecord` do NOT recurse because they
+        //     introduce a fresh closure scope: their body's free
+        //     variables become the closure's own captures, which the
+        //     synth-cont closure doesn't (and shouldn't) see.
+        // The debug_assert below catches the surprise — if a future
+        // shape lands a Lambda/ClosureRecord in the post-perform tail,
+        // the walker needs to be extended (likely with a fresh
+        // capture-extraction pass for the lambda's own free vars).
         Expr::Handle { body, .. } => {
             walk_collect_arm_post_perform_captures(
                 body,
@@ -3284,7 +3299,14 @@ fn walk_collect_arm_post_perform_captures(
                 helper_param_out,
             );
         }
-        Expr::Lambda { .. } | Expr::ClosureRecord { .. } => {}
+        Expr::Lambda { .. } | Expr::ClosureRecord { .. } => {
+            debug_assert!(
+                false,
+                "compound-match-arm-post-perform tail with Lambda/ClosureRecord \
+                 — extend walker before adding tests of this shape; B.2's MVP \
+                 (iterate-Generator) doesn't admit these in the tail."
+            );
+        }
     }
 }
 
@@ -7962,6 +7984,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     //     closure record, call sigil_perform.
                     // Both produce a *mut NextStep that flows through
                     // the cont block's param.
+                    //
+                    // TODO (per PR #76 review, Review 2 #3): revisit
+                    // if `lower_match`'s dispatcher gains features
+                    // (guards, span-based diagnostics, exhaustiveness
+                    // changes) — this hand-rolled loop mirrors
+                    // `lower_match`'s arm-iteration scaffolding (the
+                    // `is_catchall` check, `test_blocks` allocation
+                    // pattern, `bindings` install + restore around
+                    // the body emission) and may drift if the
+                    // upstream evolves. Keeping the structures
+                    // visually parallel here makes the divergence
+                    // easier to spot at review time.
                     let mut chain_terminated = false;
                     for (arm_idx, arm) in match_arms.iter().enumerate() {
                         // Conditional vs catch-all dispatch — mirrors
@@ -8119,20 +8153,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 })
                                 .collect();
 
-                            // Compute the tail's declared Cranelift
-                            // type from typecheck context (for the
-                            // synth-cont's `tail_ty` field). We
-                            // approximate via Lowerer's
-                            // `type_of_expr` — synth-cont also
-                            // re-reads from `dfg.value_type` after
-                            // lowering, so an inexact prediction here
-                            // is non-fatal.
-                            let preview = arm_pat_binding_info
-                                .iter()
-                                .map(|(n, (t, _, _))| (n.clone(), *t))
-                                .chain(let_binding_info.iter().map(|(n, t, _)| (n.clone(), *t)))
-                                .collect::<BTreeMap<String, Type>>();
-                            let tail_ty = lowerer.type_of_expr(&tail_expr, &preview);
+                            // Per PR #76 review (Review 2 #1): the
+                            // former pre-stored `tail_ty` field on the
+                            // variant has been dropped — the synth-cont
+                            // definition pass reads the tail value's
+                            // actual Cranelift type from
+                            // `dfg.value_type(tail_value)` after
+                            // lowering (per
+                            // `feedback_sigil_dfg_value_type`), so a
+                            // pre-stored prediction adds no signal.
 
                             // Allocate the synth-cont FuncId. Names
                             // follow the global-index pattern to avoid
@@ -8154,7 +8183,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     arm_pattern_captures: arm_pattern_captures.clone(),
                                     helper_param_captures: helper_param_captures.clone(),
                                     tail_expr: Box::new(tail_expr.clone()),
-                                    tail_ty,
                                     let_binding: let_binding_info.clone(),
                                 },
                             });
@@ -11879,7 +11907,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_pattern_captures,
                         helper_param_captures,
                         tail_expr,
-                        tail_ty,
                         let_binding,
                     } => {
                         // Plan B Task 78.5 G4 Phase B.2 — compound-
@@ -11904,9 +11931,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // Type-of-bound-value via `dfg.value_type`
                         // (per `feedback_sigil_dfg_value_type`):
                         // Lowerer lowers tail_expr to a Cranelift
-                        // value of `tail_ty`'s width; we read the
+                        // value of arbitrary width; we read the
                         // actual SSA type from the DFG before widen
-                        // rather than blindly trusting `tail_ty`.
+                        // (a former `tail_ty` field that pre-stored
+                        // a typecheck-derived prediction was dropped
+                        // per PR #76 review — actual widen logic uses
+                        // `dfg.value_type(tail_value)` directly).
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
 
@@ -11966,31 +11996,39 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         }
 
                         // Optionally bind args_ptr[0] under
-                        // let_binding.0 (narrowed to let_binding.1
-                        // = the let's declared Cranelift type).
-                        // For Stmt::Perform-only arms, let_binding
-                        // is None and args_ptr[0] is ignored.
-                        if let Some((bn, bt, _bk)) = let_binding {
+                        // let_binding.0 (narrowed via
+                        // `narrow_for_kind` per let_binding.2 =
+                        // EnvSlotKind). For Stmt::Perform-only arms,
+                        // let_binding is None and args_ptr[0] is
+                        // ignored. Per PR #76 review (Review 2 #2):
+                        // narrowing now goes through `narrow_for_kind`
+                        // (the closure defined a few lines above)
+                        // for consistency with the capture-load
+                        // convention. The pointer-typed arm of
+                        // narrow_for_kind matches the prior assertion's
+                        // pointer-only fallback (everything else is
+                        // either Int = no-op or sub-I64 ireduce).
+                        // We retain a debug_assert that pre-pass-
+                        // declared `bt` is consistent with
+                        // narrow_for_kind's output width.
+                        if let Some((bn, bt, bk)) = let_binding {
                             let widened_arg = builder.ins().load(
                                 types::I64,
                                 MemFlags::trusted(),
                                 args_ptr,
                                 POST_ARM_K_ARG_OFF,
                             );
-                            let bound_value = if *bt == types::I64 {
-                                widened_arg
-                            } else if bt.is_int() && bt.bits() < 64 {
-                                builder.ins().ireduce(*bt, widened_arg)
-                            } else {
-                                assert_eq!(
-                                    *bt, pointer_ty,
-                                    "codegen Phase B.2: unexpected \
-                                     CompoundMatchArmPostPerform let-binding \
-                                     type {bt:?} for fn `{}`",
-                                    synth.parent_fn_name
-                                );
-                                widened_arg
-                            };
+                            let bound_value = narrow_for_kind(&mut builder, widened_arg, *bk);
+                            debug_assert_eq!(
+                                builder.func.dfg.value_type(bound_value),
+                                *bt,
+                                "codegen Phase B.2: \
+                                 CompoundMatchArmPostPerform let-binding \
+                                 EnvSlotKind {bk:?} narrowed to a \
+                                 Cranelift type that disagrees with \
+                                 pre-pass-declared {bt:?} for fn `{}`",
+                                synth.parent_fn_name
+                            );
                             env.insert(bn.clone(), bound_value);
                         }
 
@@ -12086,8 +12124,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 actual_tail_ty, pointer_ty,
                                 "codegen Phase B.2: unexpected \
                                  CompoundMatchArmPostPerform tail Cranelift \
-                                 type {actual_tail_ty:?} (declared {tail_ty:?}) \
-                                 for fn `{}`",
+                                 type {actual_tail_ty:?} for fn `{}`",
                                 synth.parent_fn_name
                             );
                             tail_value
@@ -22300,7 +22337,6 @@ mod tests {
                 kind: EnvSlotKind::Int,
             }],
             tail_expr: Box::new(Expr::IntLit(99, span.clone())),
-            tail_ty: types::I64,
             let_binding: None,
         };
         match kind {
@@ -22308,7 +22344,6 @@ mod tests {
                 arm_pattern_captures,
                 helper_param_captures,
                 ref tail_expr,
-                tail_ty,
                 let_binding,
             } => {
                 assert_eq!(arm_pattern_captures.len(), 1);
@@ -22318,7 +22353,6 @@ mod tests {
                 assert_eq!(helper_param_captures[0].name, "limit");
                 assert_eq!(helper_param_captures[0].kind, EnvSlotKind::Int);
                 assert!(matches!(tail_expr.as_ref(), Expr::IntLit(99, _)));
-                assert_eq!(tail_ty, types::I64);
                 assert!(let_binding.is_none());
             }
             _ => panic!("expected CompoundMatchArmPostPerform variant"),

@@ -8371,6 +8371,63 @@ fn task_78_5_g4_b2_synth_cont_captures_two_arm_pattern_bindings() {
     );
 }
 
+/// **Task 78.5 G4 Phase B.2 — ConstantDone-arm equivalence with B.1's
+/// `lower_block` dispatch.**
+///
+/// Pins B.2's hand-rolled match dispatcher's ConstantDone arm: when
+/// the dispatched arm is a constant tail (no perform), output should
+/// match what B.1's `lower_block`-dispatched path produced. Pre-B.2:
+/// B.1's `lower_block` dispatched the match → output `"0\n"`. Post-
+/// B.2: hand-rolled dispatcher's ConstantDone arm fires inline
+/// (`emit_dispatch_to_post_arm_k(constant)` → `Done(constant)`) →
+/// output should still be `"0\n"`.
+///
+/// Pin shape: same skeleton as the other B.2 tests (compound match
+/// with one constant arm + one perform arm in a Cps-ABI fn), but the
+/// scrutinee at `main` selects the constant arm — so the perform-arm
+/// path is unused at runtime, and the ConstantDone arm's IR is what
+/// the dispatcher must emit correctly.
+///
+/// **Invariant**: stdout = `"0\n"`, exit 0.
+#[test]
+fn task_78_5_g4_b2_compound_match_constant_arm_equivalence_with_b1_lower_block() {
+    let src = "import std.io\n\
+               \n\
+               effect Gen { yield: (Int) -> Int }\n\
+               \n\
+               type IntList = | Nil | Cons(Int, IntList)\n\
+               \n\
+               fn first_or_yield(xs: IntList) -> Int ![Gen] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(_, _) => {\n      \
+                     let _: Int = perform Gen.yield(7);\n      \
+                     42\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: IntList = Nil;\n  \
+                 let result: Int = handle first_or_yield(xs) with {\n    \
+                   Gen.yield(_, k) => k(0),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_b2_compound_match_constant_arm_equivalence",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "B.2's hand-rolled dispatcher ConstantDone arm should fire \
+         inline with `Done(0)`, mirroring B.1's `lower_block` path \
+         output. xs = Nil → constant arm → `0`. stderr={stderr:?}"
+    );
+}
+
 /// **G1 variant 2 — outer-fn-scope let in post-arm-k tail.**
 ///
 /// Pinned shape (constructed, not Koka-imported): `let factor: Int = 7;
