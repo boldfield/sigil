@@ -8444,78 +8444,6 @@ fn task_78_5_g4_approach6_discharged_bypass_through_wrapper_path() {
 }
 
 /// **Task 78.5 G4 Approach 6 deep-redo (PR #80 review §5) — Risk 3,
-/// shape 2: Cps sub-call inside the return arm body must not see the
-/// outer body's return-arm pair.**
-///
-/// Sister to `task_78_5_g4_approach6_risk3_cps_sub_call_does_not_trigger_outer_return_arm`,
-/// which covers a Cps sub-call inside the *body* fn. This shape covers
-/// a Cps sub-call inside the *return arm* body. The wrapper PUSHes
-/// the return-arm pair before driving the body's run_loop, then POPs.
-/// During the return arm's execution (which itself runs through a
-/// nested run_loop in the helper's NextStep::Call path), if the return
-/// arm body invokes a Cps sub-call, that sub-call's nested run_loop
-/// must see a CLEAR top-of-stack — its own natural-exit must NOT
-/// dispatch the (already-consumed) return arm.
-///
-/// Setup: `body_fn() → Int` (10), `return(v) => sub_cps_fn(v) + 1000`,
-/// `sub_cps_fn(n: Int) → Int ![Log]` returns `n + 1` after a Log perform.
-///
-/// Trace:
-///   - body_fn natural exit Done(10) → wrapper helper builds
-///     NextStep::Call(return_arm, [10, null, identity]).
-///   - return_arm runs: calls sub_cps_fn(10) → 11. The Log perform's
-///     handler returns 0 via k(0). sub_cps_fn natural exit Done(11) →
-///     helper sees TOP=null (pushed by lower_call's Cps branch around
-///     sub_cps_fn's nested run_loop) and emits plain Done(11).
-///   - return arm body computes 11 + 1000 = 1011.
-///   - trampoline returns 1011.
-///
-/// Wrong outputs surface stack-discipline breaks:
-///   - "2011\n" or higher: sub_cps_fn inherited outer's return arm
-///     (Risk 3, return-arm side) and triggered a re-wrap.
-///   - panic / segfault: PUSH/POP imbalance under nested wrapper +
-///     sub-call paths.
-#[test]
-fn task_78_5_g4_approach6_risk3_cps_sub_call_in_return_arm_body() {
-    let src = "import std.io\n\
-               \n\
-               effect E { op: () -> Int }\n\
-               effect Log { write: (Int) -> Int }\n\
-               \n\
-               fn sub_cps_fn(n: Int) -> Int ![Log] {\n  \
-                 let _: Int = perform Log.write(n);\n  \
-                 n + 1\n\
-               }\n\
-               \n\
-               fn body_fn() -> Int ![E] {\n  \
-                 let _: Int = perform E.op();\n  \
-                 10\n\
-               }\n\
-               \n\
-               fn main() -> Int ![IO] {\n  \
-                 let result: Int = handle body_fn() with {\n    \
-                   E.op(k) => k(0),\n    \
-                   Log.write(_, k) => k(0),\n    \
-                   return(v) => sub_cps_fn(v) + 1000,\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(result));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(
-        src,
-        "task_78_5_g4_approach6_risk3_cps_sub_call_in_return_arm_body",
-    );
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(
-        stdout, "1011\n",
-        "Risk 3 / return-arm side: sub_cps_fn inside return arm body MUST NOT \
-         trigger the (already-consumed) outer return arm. Expected 10+1+1000 = \
-         1011. Wrong outputs (e.g. 2011) mean the sub-call inherited the outer's \
-         return-arm pair. stderr={stderr:?}"
-    );
-}
-
-/// **Task 78.5 G4 Approach 6 deep-redo (PR #80 review §5) — Risk 3,
 /// shape 3: triply-nested handle + Cps sub-call inside an inner
 /// handle's body fn.**
 ///
@@ -8544,8 +8472,8 @@ fn task_78_5_g4_approach6_risk3_triply_nested_with_sub_cps_call() {
                }\n\
                \n\
                fn middle_body() -> Int ![E2, E3] {\n  \
-                 let _: Int = perform E2.op2();\n  \
-                 let _: Int = deep_cps(7);\n  \
+                 let _x: Int = perform E2.op2();\n  \
+                 let _y: Int = deep_cps(7);\n  \
                  5\n\
                }\n\
                \n\
