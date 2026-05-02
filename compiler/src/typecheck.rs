@@ -4280,20 +4280,68 @@ impl Tc {
                 let then_ty = self.check_block(then_block, row);
                 let else_ty = self.check_block(else_block, row);
                 match (then_ty, else_ty) {
-                    (Some(t), Some(e)) if t == e => Some(t),
                     (Some(t), Some(e)) => {
-                        self.push_error(
-                            "E0063",
-                            span.clone(),
-                            format!(
-                                "`if` branches have incompatible types: `then` is `{}` but `else` is `{}`",
-                                ty_display(&t),
-                                ty_display(&e),
-                            ),
-                        );
-                        // Recover with the `then` type so downstream
-                        // context has something to continue on.
-                        Some(t)
+                        // Task 78.5 G3 — defer cross-branch unify until
+                        // both branches are checked, then unify their
+                        // types so per-op fresh vars (e.g. `A` from
+                        // `raise[A,E](e: E) -> A ![Raise[E]]`) get
+                        // bound from whichever side is concrete before
+                        // emitting E0063. The prior raw-equality check
+                        // (`t == e`) rejected `?N` vs `Int` even when
+                        // `?N` came from a fresh per-op type var that
+                        // should bind to `Int` from the other branch's
+                        // literal type.
+                        //
+                        // Snapshot the error list around `unify_ty`
+                        // (mirroring `check_match`'s arm-unify pattern
+                        // at the cross-arm site below at line ~5569).
+                        // On failure, `unify_ty` may push generic
+                        // E0044 "type mismatch" (replaced here with
+                        // branch-specific E0063) plus E0126 occurs-
+                        // check / E0127 row-occurs (which name a real
+                        // soundness problem the generic E0063 wouldn't
+                        // capture — preserve those). Subst is
+                        // intentionally NOT rolled back on failure: in
+                        // HM, partial bindings made during a failed
+                        // compound unify are semantically correct
+                        // constraints that surface at downstream sites
+                        // via the normal cascade.
+                        let pre_unify_errors = self.errors.len();
+                        let unified = self.unify_ty(&t, &e, span);
+                        if unified {
+                            // Resolve through subst so the returned
+                            // type reflects bindings made during the
+                            // unify (e.g. fresh per-op `A` bound to
+                            // `Int`).
+                            Some(self.deref(&t))
+                        } else {
+                            let preserved: Vec<CompilerError> = self
+                                .errors
+                                .drain(pre_unify_errors..)
+                                .filter(|e| e.code.as_str() != "E0044")
+                                .collect();
+                            self.errors.extend(preserved);
+                            // Display the resolved (post-failed-
+                            // unify) types so the user sees concrete
+                            // names wherever subst made bindings —
+                            // consistent with E0063's existing user-
+                            // facing wording.
+                            let t_disp = self.deref(&t);
+                            let e_disp = self.deref(&e);
+                            self.push_error(
+                                "E0063",
+                                span.clone(),
+                                format!(
+                                    "`if` branches have incompatible types: `then` is `{}` but `else` is `{}`",
+                                    ty_display(&t_disp),
+                                    ty_display(&e_disp),
+                                ),
+                            );
+                            // Recover with the `then` type so
+                            // downstream context has something to
+                            // continue on.
+                            Some(t_disp)
+                        }
                     }
                     (Some(t), None) | (None, Some(t)) => Some(t),
                     (None, None) => None,
@@ -13302,6 +13350,64 @@ mod tests {
         assert!(
             has_code(&errs, "E0044"),
             "expected E0044 (Int arg vs String row instantiation); got {errs:?}"
+        );
+    }
+
+    // ===== Task 78.5 G3 — deferred cross-branch unify in `if` =====
+    //
+    // Per `feedback_sigil_typecheck_unit_tests_insufficient`, type-
+    // system surface lifts get unit-test pins in addition to the e2e
+    // regression (`task_78_5_pending_g3_raise_in_if_branch_expr_-
+    // position_polymorphism` in tests/e2e.rs). The unit tests below
+    // pin the typecheck-level invariant: an if-expression with one
+    // branch carrying a fresh per-op type var (from `raise[A,E]`'s
+    // `A`) and the other branch carrying a concrete type unifies the
+    // two via `unify_ty` after both branches are checked, binding the
+    // fresh var. Pre-fix the raw-equality `t == e` check rejected
+    // `?N == Int` even when `?N` would unify cleanly.
+
+    #[test]
+    fn task_78_5_g3_raise_in_then_branch_unifies_with_int_else() {
+        // G3 minimal-shape: raise in then-branch, Int literal in
+        // else. Cross-branch unify binds `A := Int`; no error.
+        let src = "import std.raise\n\
+                   fn safe_or_default(b: Bool) -> Int ![Raise[String]] {\n  \
+                     if b { raise(\"nope\") } else { 42 }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+    }
+
+    #[test]
+    fn task_78_5_g3_raise_in_else_branch_unifies_with_int_then() {
+        // Symmetric: raise in else-branch. Cross-branch unify must
+        // not be then-biased; either side may carry the fresh per-
+        // op `A`.
+        let src = "import std.raise\n\
+                   fn safe_or_default(b: Bool) -> Int ![Raise[String]] {\n  \
+                     if b { 42 } else { raise(\"nope\") }\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "expected clean, got: {errs:?}");
+    }
+
+    #[test]
+    fn task_78_5_g3_int_vs_string_branches_still_fires_e0063() {
+        // Regression guard: deferred unify must still catch genuine
+        // branch-type mismatches. `Int` vs `String` cannot unify;
+        // E0063 must fire (now post-unify rather than pre-unify,
+        // but the user-facing behavior is preserved).
+        let src = "fn main() -> Int ![] { let n: Int = if true { 1 } else { \"x\" }; 0 }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0063"), "expected E0063, got: {errs:?}");
+        // The drain-and-filter step replaces the internal E0044 from
+        // the failed unify with branch-specific E0063; E0044 must
+        // not leak through.
+        assert!(
+            !has_code(&errs, "E0044"),
+            "E0044 should be filtered out and replaced by E0063, got: {errs:?}"
         );
     }
 
