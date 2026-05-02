@@ -2384,6 +2384,26 @@ impl Tc {
         ));
     }
 
+    /// Task 78.5 G6 — shared E0137 emission for unbound row-variable
+    /// names. Used by both the `TypeExpr::Fn` walk in
+    /// `check_type_expr_known` (annotation position) and the
+    /// `Expr::Lambda` arm in `check_expr` (expression position).
+    /// Wording is generalised to "fn-type or lambda rows" so the same
+    /// string covers both call sites.
+    fn e0137_unbound_row_var(&mut self, name: &str, span: Span) {
+        self.push_error(
+            "E0137",
+            span,
+            format!(
+                "row variable `{}` is not bound by the enclosing function — \
+                 declare it on the fn's row (e.g. `fn f(...) -> R ![| {}]` or \
+                 `![<effects> | {}]`) so the row variable can be referenced in \
+                 fn-type or lambda rows",
+                name, name, name,
+            ),
+        );
+    }
+
     // ---------- Plan B task 48 — HM unification helpers ----------
 
     fn fresh_ty_var(&mut self) -> u32 {
@@ -3378,17 +3398,7 @@ impl Tc {
                 // pointing to the missing declaration.
                 if let Some(rv) = &fty.effect_row_var {
                     if !self.current_row_var_subst.contains_key(&rv.name) {
-                        self.push_error(
-                            "E0137",
-                            rv.span.clone(),
-                            format!(
-                                "row variable `{}` is not bound by the enclosing function — \
-                                 declare it on the fn's row (e.g. `fn f(...) -> R ![| {}]` or \
-                                 `![<effects> | {}]`) so the row variable can be referenced in \
-                                 inner fn-type rows",
-                                rv.name, rv.name, rv.name,
-                            ),
-                        );
+                        self.e0137_unbound_row_var(&rv.name, rv.span.clone());
                     }
                 }
             }
@@ -4457,20 +4467,59 @@ impl Tc {
                 // None when the row-var name doesn't resolve in the
                 // active subst (no enclosing row var, or unbound name).
                 //
-                // TODO (Task 78.5 G6): lambda surface row-var binding
-                // currently has no E0137 walk. `check_type_expr_known`
-                // emits E0137 only for `TypeExpr::Fn::effect_row_var`
-                // (type-annotation form, lines 3314-3328) — `Expr::-
-                // Lambda::effect_row_var` is parsed at expression
-                // position and never fed to that walk, so an unbound
-                // surface name (e.g. `fn () -> Int ![| q] => 0` with
-                // no enclosing `q` binder) silently degrades to a
-                // closed row instead of firing a diagnostic. File as
-                // G6 follow-up — wire `check_type_expr_known`-equivalent
-                // E0137 emission for `Expr::Lambda::effect_row_var`.
+                // Task 78.5 G6 — `Expr::Lambda::effect_row_var` is
+                // parsed at expression position and is NOT fed through
+                // `check_type_expr_known`'s walk (which fires E0137 at
+                // typecheck.rs:3379-3393 only for `TypeExpr::Fn::effect_-
+                // row_var`). Mirror that emission here so a lambda
+                // naming an unbound row-var (e.g. `fn () -> Int ![| q]
+                // => 0` where `q` is bound by no enclosing fn's row
+                // var) gets the same diagnostic precision.
+                //
+                // Subtlety: when `current_row_var_subst` is **empty**
+                // there's no enclosing row var at all — the legitimate
+                // "no row var available" case. In that situation the
+                // lambda's surface row stays closed silently (no
+                // diagnostic). Pre-G2.b this was the only behavior
+                // available; G2.b made the lookup meaningful when an
+                // enclosing binder exists, and G6 now treats a non-
+                // empty subst with no matching name as "user named a
+                // row var that isn't in scope" — a precision E0137.
+                //
+                // Asymmetry with `TypeExpr::Fn`'s E0137 path (intentional,
+                // long-term design — rank-1 ML preservation):
+                //
+                // * `TypeExpr::Fn` (annotation position, check_type_-
+                //   expr_known above) fires E0137 **unconditionally**
+                //   when the named row var isn't in `current_row_var_-
+                //   subst`. Annotations carry stronger user intent —
+                //   they're declarative type expressions and a stray
+                //   name there is always a typo / scope error.
+                //
+                // * `Expr::Lambda` (here, expression position) fires
+                //   E0137 only when the subst is **non-empty** and the
+                //   name doesn't match. Empty subst = "no enclosing
+                //   row var at all" → silent degradation to a closed
+                //   surface row, which preserves rank-1 ML (lambdas
+                //   never introduce a fresh generalised row var of
+                //   their own). Non-empty subst with no matching name
+                //   = "row var available but user named a different
+                //   one" → the precision E0137 added by G6.
+                //
+                // Both paths converge in spirit: when an enclosing
+                // row-var context exists, both reject unbound names.
+                // They diverge only in the "no enclosing row var"
+                // case, where annotation strictness > expression
+                // permissiveness — a deliberate trade-off, not a bug
+                // to harmonise.
                 let lambda_row_var_id: Option<u32> = effect_row_var
                     .as_ref()
                     .and_then(|rv| self.current_row_var_subst.get(&rv.name).copied());
+                if let Some(rv) = effect_row_var.as_ref() {
+                    if lambda_row_var_id.is_none() && !self.current_row_var_subst.is_empty() {
+                        self.e0137_unbound_row_var(&rv.name, rv.span.clone());
+                    }
+                }
                 // Plan D Task 114 — lambda's row carries args (same
                 // shape as the enclosing fn's body row).
                 let lambda_row =
@@ -12717,41 +12766,27 @@ mod tests {
     }
 
     #[test]
-    fn lambda_with_unbound_row_var_name_silently_degrades_pending_g6() {
+    fn lambda_with_unbound_row_var_name_fires_e0137() {
         // Negative-coverage: lambda's surface `effect_row_var` names
         // a row var (`q`) that is NOT bound by any enclosing fn's
         // row-var subst. The enclosing `outer[A]` IS row-poly (over
         // `e`), so `current_row_var_subst` is non-empty — but `q` is
         // not in it.
         //
-        // Pre-G2.b-fix: lambda's `effect_row_var` was hardcoded to
-        // `None` regardless of input — same outcome as today (closed).
-        // Post-G2.b-fix: `current_row_var_subst.get("q")` returns
-        // `None`, so `lambda_row_var_id = None` — also closed.
+        // Post-G6: when `current_row_var_subst` is non-empty AND the
+        // lambda's named row var doesn't resolve in it, the lambda
+        // arm emits E0137 mirroring `check_type_expr_known`'s
+        // emission for `TypeExpr::Fn::effect_row_var` (typecheck.rs
+        // :3379-3393). So this program now produces TWO E0137
+        // occurrences:
+        //   1. one from the let-binding's `TypeExpr::Fn` walk on
+        //      `() -> Int ![| q]` (LHS annotation).
+        //   2. one from the lambda RHS's own `effect_row_var` (G6
+        //      emission).
         //
-        // The point of this test is to pin **current (intentional)
-        // behavior** for the lookup-with-no-match path: silent
-        // degradation to closed row, no diagnostic.
-        // `check_type_expr_known` emits E0137 only for `TypeExpr::Fn`
-        // (type-annotation form), not for `Expr::Lambda`'s parsed
-        // `effect_row_var` at expression position. So `q` here gets
-        // no diagnostic at all — the lambda just types as closed
-        // `![]`.
-        //
-        // The let-binding annotated `() -> Int ![| q] = <lambda>` then
-        // uses the let-position type-expression path, which **does**
-        // walk through `check_type_expr_known` — so `q` on the LHS
-        // **does** fire E0137. We pin: error list contains exactly
-        // one E0137 (from the let-binding's TypeExpr::Fn walk), and
-        // does **not** carry a second E0137 from the lambda RHS.
-        //
-        // When G6 lands and wires `Expr::Lambda::effect_row_var`
-        // through `check_type_expr_known`-equivalent emission, this
-        // test will fail loudly because the error list will then
-        // carry **two** E0137 occurrences (one for the LHS annotation,
-        // one for the lambda RHS) — at which point this test should
-        // be updated alongside the G6 patch. Failing loudly is the
-        // desired signal.
+        // The legitimate "no row var at all" case (subst empty)
+        // continues to silently degrade to a closed row — covered
+        // by `lambda_with_no_enclosing_row_var_stays_closed_silently`.
         let src = "fn outer[A](b: () -> Int ![| e]) -> A ![| e] {\n  \
                      let lam: () -> Int ![| q] = fn () -> Int ![| q] => 0;\n  \
                      b();\n  \
@@ -12761,13 +12796,51 @@ mod tests {
         let errs = pipeline(src);
         let e0137_count = errs.iter().filter(|e| e.code.as_str() == "E0137").count();
         assert_eq!(
-            e0137_count, 1,
-            "pre-G6: expected exactly ONE E0137 (from the let-binding's \
-             TypeExpr::Fn walk on `() -> Int ![| q]`); the lambda RHS's \
-             unbound `q` silently degrades to closed without diagnostic. \
-             When G6 wires E0137 emission for `Expr::Lambda::effect_row_var`, \
-             this count will become 2 — update this test alongside the \
-             G6 patch. Got errs={errs:?}"
+            e0137_count, 2,
+            "post-G6: expected exactly TWO E0137 (one from the let-binding's \
+             TypeExpr::Fn walk on `() -> Int ![| q]`, one from the lambda \
+             RHS's surface `effect_row_var` — both flagging unbound `q`). \
+             Got errs={errs:?}"
+        );
+    }
+
+    #[test]
+    fn lambda_with_no_enclosing_row_var_stays_closed_silently() {
+        // Positive-coverage for G6's precision: when there is NO
+        // enclosing row var at all (`current_row_var_subst` is
+        // empty), a lambda whose surface row names a row var still
+        // silently degrades to a closed row — NO E0137 fires. This
+        // pins the "legitimate no-row-var-available" branch that G6
+        // explicitly preserves.
+        //
+        // The enclosing `main` carries a closed row `![]` (no row
+        // var), so `current_row_var_subst.is_empty()` at the lambda
+        // arm. Per the G6 fix, an empty subst skips the E0137
+        // emission — the lambda's `effect_row_var` is dropped (no
+        // resolved id) and the row stays closed.
+        //
+        // The let-binding `() -> Int ![] = <lambda>` then accepts the
+        // lambda's closed row; the program typechecks cleanly. (We
+        // strip the surface name `q` from the LHS annotation so the
+        // outer `check_type_expr_known` walk doesn't ALSO fire E0137
+        // — the goal here is to isolate the lambda-arm behavior.)
+        let src = "fn main() -> Int ![] {\n  \
+                     let lam: () -> Int ![] = fn () -> Int ![| q] => 0;\n  \
+                     lam()\n\
+                   }\n";
+        let errs = pipeline(src);
+        let e0137_count = errs.iter().filter(|e| e.code.as_str() == "E0137").count();
+        assert_eq!(
+            e0137_count, 0,
+            "post-G6 precision: lambda naming a row var when there's NO \
+             enclosing row var (empty current_row_var_subst) must NOT \
+             emit E0137 — the legitimate no-row-var-available case stays \
+             silent and the lambda's row degrades to closed. Got errs={errs:?}"
+        );
+        assert!(
+            errs.is_empty(),
+            "lambda with surface row-var name in non-row-poly context \
+             should typecheck cleanly (closed-row degradation): {errs:?}"
         );
     }
 
