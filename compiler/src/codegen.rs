@@ -14868,22 +14868,29 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // contract AND the return-arm synth fn's 3-slot contract
         // unchanged.
 
-        // Phase 1: pack user args into a stack slot of `N * 8` bytes.
-        // **No trailing pair** — the per-Brian-(a′) plan reverts the
-        // pre-fix `(N+2)*8` allocation. The B.4-eligible body shapes
-        // (compound-match-with-arm-perform, per
-        // `is_b4_eligible_cps_body_call`'s gate) never read the
-        // trailing pair from the body's args buffer: their arm-body
-        // performs route through `lower_perform_to_value`'s
-        // identity-k_fn path, which constructs its OWN args buffer
-        // for `sigil_perform`. The return-arm routing now happens
-        // entirely via the outer_post_arm_k_stack push below + the
-        // adapter, NOT through the body args buffer.
+        // Phase 1: pack user args + trailing `(null_k_closure,
+        // identity_fn)` pair into a stack slot of `(N + 2) * 8` bytes.
+        // The trailing-pair slots match the standard Cps interop
+        // wrapper convention (lower_call's Cps branch). The body's
+        // tail-perform emit reads the trailing pair at
+        // `k_closure_offset(N) / k_fn_offset(N)` to source its k for
+        // sigil_perform — even when body's perform-k is identity,
+        // the slot must exist (a smaller buffer would underflow on
+        // body read → SIGSEGV).
+        //
+        // **Note (per Brian's (a′) plan)**: the plan asked to drop the
+        // `(N+2)*8` allocation. The drop is unsafe for tail-perform
+        // body shapes (which read the trailing pair); kept the slot
+        // size, dropped the SEMANTIC use of trailing pair for return-
+        // arm routing (writes `(null, identity)` instead of `(return_
+        // closure, return_fn)`). The return-arm routing happens
+        // entirely via outer_post_arm_k_stack + adapter, NOT through
+        // the body's args buffer trailing pair.
         let user_arg_count = args.len();
-        let slot_bytes = (user_arg_count * 8) as u32;
+        let slot_bytes = ((user_arg_count + 2) * 8) as u32;
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            slot_bytes.max(8),
+            slot_bytes,
             3,
         ));
 
@@ -14909,6 +14916,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 .ins()
                 .stack_store(widened, slot, (i * 8) as i32);
         }
+
+        // Phase 2: write the standard `(null_k_closure, identity_fn)`
+        // trailing pair at the body call's args buffer trailing slots.
+        // The body Cps fn's tail-perform emit reads these to source
+        // its k for sigil_perform; if the body shape doesn't tail-
+        // perform, the slots are unread but must exist (the buffer
+        // size is `(N+2)*8` per the standard convention).
+        let null_k_closure_v = self.builder.ins().iconst(self.pointer_ty, 0);
+        let identity_fn_v = self
+            .builder
+            .ins()
+            .func_addr(self.pointer_ty, self.continuation_identity_ref);
+        self.builder
+            .ins()
+            .stack_store(null_k_closure_v, slot, k_closure_offset(user_arg_count));
+        self.builder
+            .ins()
+            .stack_store(identity_fn_v, slot, k_fn_offset(user_arg_count));
 
         // Phase 3: read the return-arm pair from the first-pushed
         // frame's pinned offsets. Mirrors the Phase 4g return-arm
