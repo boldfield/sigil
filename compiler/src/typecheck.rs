@@ -4945,6 +4945,79 @@ impl Tc {
                 (name, ty)
             })
             .collect();
+        // Task 78.5 G5 — E0145 escape barrier extension: a lambda
+        // that captures a `Ty::Continuation` value (the arm `k`, or a
+        // let-bound alias of it) inside a **generic** enclosing fn is
+        // an escape attempt that monomorphize cannot lower. When the
+        // surrounding fn is monomorphized, `Substitution::apply_to_ty`
+        // walks the lambda's captures (`monomorphize.rs:1054`) and
+        // hits the `Ty::Continuation` arm which panics with
+        // `unreachable!()` at `monomorphize.rs:1516` ("typecheck E0145
+        // should have rejected the cross-fn / generic-instantiation
+        // site"). G5 closes the typecheck-level gap so that panic is
+        // unreachable in well-formed programs.
+        //
+        // Why the narrowing to "generic enclosing fn":
+        //
+        // The `std/state.sigil`'s `run_state` shape (handler arms
+        // returning `(Int) -> Int ![]` lambdas that capture `k`) is
+        // SUPPORTED today for non-generic fns: codegen + runtime lower
+        // multi-shot continuation values into closures whose captures
+        // include the live continuation, and there is no monomorphize
+        // walk to surface the panic. Forbidding all lambda-capture-of-k
+        // would regress this shipped pattern. The escape only manifests
+        // at mono time, and mono only walks lambda captures when there
+        // is a generic clone in flight (`current_clone_fn_name` is
+        // `Some`). Mirroring that gate at typecheck — `current_generic_-
+        // subst` non-empty means the enclosing fn declared generics —
+        // narrows the diagnostic to exactly the shapes mono cannot
+        // lower, leaving the non-generic shipped pattern untouched.
+        //
+        // Other typecheck barriers don't cover this path: (1) the broad
+        // `unify_ty` arm fires on `Ty::Continuation` vs non-Continuation
+        // unifications, but a lambda built from `fn (...) -> A => k(s)`
+        // has type `Fn(...) -> A` (the lambda itself, not k), so no
+        // unify against Continuation occurs at the value level; and
+        // (2) the one-shot linearity check (`count_continuation_uses`)
+        // saturates at 2 for lambdas-capturing-k and fires E0220 — but
+        // only for effects WITHOUT `resumes: many`. Multi-shot effects
+        // (e.g. `effect State resumes: many`) skip the linearity check
+        // entirely (typecheck.rs:5571 `if !typing.resumes_many`), and
+        // the row-poly handler-arm-returns-lambda shape used by the
+        // multi-effect interpreter port (`task_78_5_g5_*` test) hits
+        // exactly this gap.
+        //
+        // Diagnostic site: the lambda-construction span (the surface
+        // `fn (...) -> ... => ...`). Iterates `captures` to find the
+        // first Ty::Continuation entry (deterministic — captures are
+        // accumulated in `collect_free_vars` declaration order). The
+        // lambda value is still recorded in `lambda_captures` so
+        // downstream typecheck walks see consistent state; the
+        // pipeline's error count gates codegen so the panic at mono
+        // is short-circuited regardless.
+        if !self.current_generic_subst.is_empty() {
+            for (cap_name, cap_ty) in &captures {
+                if matches!(cap_ty, Ty::Continuation(_)) {
+                    self.push_error(
+                        "E0145",
+                        span.clone(),
+                        format!(
+                            "continuation `{cap_name}` cannot escape its handle's arm body \
+                             via lambda capture inside a generic function — this lambda \
+                             closes over a continuation value, and the surrounding generic \
+                             function's monomorphization would carry the continuation \
+                             through the type-substitution pass which cannot lower \
+                             continuation values across generic instantiations. Either \
+                             rewrite the arm body to call `{cap_name}(arg)` directly \
+                             without intermediate lambda capture, or move the handler \
+                             out of the generic function (a non-generic wrapper around \
+                             the generic body)"
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
         self.lambda_captures.push((span.clone(), captures));
 
         // (3) extend env with params for the body walk. We *add*
@@ -11972,6 +12045,150 @@ mod tests {
             "passing `k` (or a let-aliased k) into a generic-typed param chain \
              must fire E0145 (the precision check sees the resolved arg type \
              post-deref): {errs:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Task 78.5 G5 — E0145 escape barrier extension: lambda-capture-
+    // of-continuation inside a generic enclosing fn.
+    //
+    // Pre-G5: the broad `unify_ty` arm + the precision check at
+    // `check_call` cover Ty::Continuation escapes through value-level
+    // unification (let-binding to non-Continuation, returning from
+    // non-Continuation-typed fn, passing to non-Continuation param).
+    // The lambda-construction site bypassed both: the lambda's value
+    // type is `Ty::Fn`, never `Ty::Continuation`, so no unify against
+    // Continuation occurs at the value level — the `Ty::Continuation`
+    // capture lives only in `lambda_captures` side-table. Inside a
+    // non-generic fn this is fine (codegen + runtime support multi-
+    // shot continuation captures via closure records — see
+    // `std/state.sigil`'s `run_state`). Inside a generic fn,
+    // monomorphize's `Substitution::apply_to_ty` walks the captures
+    // (`monomorphize.rs:1054`) and panics at line 1516 (`Ty::-
+    // Continuation reached mono substitution`).
+    //
+    // Fix: in `check_lambda`, after capture analysis, scan captures
+    // for any `Ty::Continuation` entry; if `current_generic_subst` is
+    // non-empty (enclosing fn is generic), push E0145 with a precise
+    // diagnostic at the lambda span. The narrowing keeps `run_state`
+    // and other shipped non-generic patterns working.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn task_78_5_g5_lambda_capturing_k_in_generic_fn_fires_e0145() {
+        // Minimal G5 reproducer: generic `fn f[A]` with handler arm
+        // that returns a lambda capturing `k`. State is multi-shot
+        // (`resumes: many`) so the existing one-shot linearity check
+        // (E0220) is intentionally bypassed. Pre-fix: typecheck
+        // succeeds and mono panics with `Ty::Continuation reached
+        // mono substitution`. Post-fix: E0145 fires at the lambda
+        // construction site naming the captured `k`.
+        let src = "effect State resumes: many { get: () -> Int }\n\
+                   fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
+                     let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
+                       return(v) => fn (s: Int) -> A ![| e] => v,\n    \
+                       State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s),\n  \
+                     };\n  \
+                     state_fn(initial)\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "lambda capturing arm `k` inside generic `run_state_poly[A]` must fire \
+             E0145 at the lambda span (typecheck-level escape barrier extension — \
+             prevents the panic at monomorphize.rs:1516 when subst.apply_to_ty walks \
+             lambda captures and hits Ty::Continuation): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn task_78_5_g5_lambda_capturing_k_in_non_generic_fn_does_not_fire_e0145() {
+        // Negative coverage / regression guard for the narrowing:
+        // the SAME shape inside a non-generic fn must NOT fire E0145.
+        // This mirrors `std/state.sigil`'s `run_state` exactly. The
+        // shipped multi-shot state-threading pattern depends on
+        // lambda-captures-k working at codegen + runtime (closure
+        // record holds the live continuation); rejecting it at
+        // typecheck would regress `std/state.sigil` and any user
+        // code using the same shape. The G5 fix narrows on
+        // `current_generic_subst.is_empty()` to preserve this.
+        //
+        // Linearity is also bypassed (State is `resumes: many`), so
+        // there's no E0220 either. The test additionally guards
+        // against E0220 leaking back in.
+        let src = "effect State resumes: many { get: () -> Int }\n\
+                   fn run_state(initial: Int, body: () -> Int ![State]) -> Int ![] {\n  \
+                     let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                       return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                       State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
+                     };\n  \
+                     state_fn(initial)\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0145"),
+            "lambda capturing arm `k` inside NON-generic `run_state` must NOT fire \
+             E0145 (regression guard for the narrowing — `std/state.sigil` ships \
+             this exact shape): {errs:?}"
+        );
+        assert!(
+            !has_code(&errs, "E0220"),
+            "multi-shot State must skip linearity check (sanity check that the \
+             negative test isn't relying on a different barrier): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn task_78_5_g5_lambda_capturing_let_aliased_k_in_generic_fn_fires_e0145() {
+        // Variant: `let f: Continuation[..] = k;` aliases k inside
+        // the arm body, then a lambda captures `f`. The let-bound
+        // alias is `Ty::Continuation` (the existing
+        // `continuation_annotation_inside_arm_body_typechecks` test
+        // confirms the let typechecks cleanly), so the lambda
+        // capture path sees `Ty::Continuation` for `f`. G5 must
+        // fire E0145 against `f` (not against `k`) since `f` is
+        // the captured name.
+        let src = "effect State resumes: many { get: () -> Int }\n\
+                   fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
+                     let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
+                       return(v) => fn (s: Int) -> A ![| e] => v,\n    \
+                       State.get(k) => {\n      \
+                         let f: Continuation[Int, (Int) -> A ![| e]] = k;\n      \
+                         fn (s: Int) -> A ![| e] => f(s)(s)\n    \
+                       },\n  \
+                     };\n  \
+                     state_fn(initial)\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0145"),
+            "lambda capturing a let-aliased `Continuation` inside generic fn must \
+             fire E0145 (the alias is Ty::Continuation, captured by the lambda; \
+             scan visits it and triggers the barrier): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn task_78_5_g5_arm_body_calls_k_directly_in_generic_fn_typechecks_cleanly() {
+        // Negative coverage: the supported alternative — call `k`
+        // directly without intermediate lambda capture — must NOT
+        // fire E0145 even inside a generic fn. The escape barrier
+        // is precisely about lambda-CAPTURE of k, not all uses of
+        // k inside generic fns. The existing PR #60 substrate test
+        // `cross_handle_k_unification_fires_e0145_with_scope_mismatch`
+        // doesn't cover the generic-fn scenario specifically.
+        let src = "effect Raise { fail: () -> Int }\n\
+                   fn run_raise_poly[A](default: A, body: () -> A ![Raise | e]) -> A ![| e] {\n  \
+                     handle body() with {\n    \
+                       Raise.fail(k) => k(0),\n  \
+                     }\n  \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0145"),
+            "calling `k` directly inside a generic fn's handler arm must NOT fire \
+             E0145 (the barrier targets lambda-captures-k, not direct k uses): \
+             {errs:?}"
         );
     }
 
