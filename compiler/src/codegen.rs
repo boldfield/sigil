@@ -12302,7 +12302,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_arm_ref,
                             handler_frame_set_return_ref,
                             perform_ref,
-                            outer_post_arm_k_push_ref: _,
+                            outer_post_arm_k_push_ref,
                             run_loop_ref,
                             next_step_done_ref: _,
                             next_step_discharged_ref: _,
@@ -12495,6 +12495,67 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             let target_fn_addr =
                                 lowerer.builder.ins().func_addr(pointer_ty, target_fn_ref);
 
+                            // Task 78.5 G4 Approach 6 deep-redo +
+                            // Option (α) — push the synth-cont's
+                            // incoming post-arm-k pair onto
+                            // outer_post_arm_k_stack BEFORE the B.3
+                            // dispatch, then use (null, identity) as
+                            // the recursive callee's trailing pair.
+                            //
+                            // Pre-Option-(α): B.3 forwarded the
+                            // synth-cont's incoming post-arm-k pair
+                            // verbatim as the recursive callee's
+                            // trailing pair. That preserved only the
+                            // LATEST pair across recursion (each B.3
+                            // hop overwrites with the new arm body's
+                            // post-arm-k from the synth-cont's args
+                            // buffer, which itself comes from the
+                            // arm body's k(arg) trailing slots).
+                            // Generator's chain `Cons(1, k(0))`,
+                            // `Cons(2, k(0))`, `Cons(3, k(0))` lost
+                            // post_arm_k_1 and post_arm_k_2 by the
+                            // time iterate(Nil) ran.
+                            //
+                            // Push-onto-stack mirrors Slice C helper
+                            // Middle's pattern (codegen.rs:12119-
+                            // 12138). Each push lives within
+                            // sigil_run_loop's depth window and gets
+                            // popped by the trampoline's Done branch
+                            // when the deepest natural exit
+                            // (iterate(Nil)'s Approach 6 helper)
+                            // unwinds. With LIFO discipline and
+                            // pushes in source order x1, x2, x3, the
+                            // pops fire in order x3, x2, x1 — exactly
+                            // the inside-out order the Cons-builder
+                            // chain needs to construct
+                            // `Cons(1, Cons(2, Cons(3, wrapped)))`.
+                            //
+                            // The recursive callee's trailing pair
+                            // becomes (null, identity) — a no-op
+                            // continuation. The callee's compound-
+                            // match body (also B.1/B.2/B.3) doesn't
+                            // consume its args_ptr trailing pair
+                            // directly (perform sites use codegen-
+                            // time-determined synth-cont k_pairs);
+                            // only the callee's synth-cont reads the
+                            // trailing pair, which it then pushes
+                            // onto the stack itself at its own B.3
+                            // dispatch. So the (null, identity) we
+                            // write here is consumed only if the
+                            // callee's synth-cont fires B.3 again —
+                            // in which case the (null, identity)
+                            // gets pushed (a no-op pop later) and
+                            // overwritten with the callee's own
+                            // trailing pair from its k(arg) slots.
+                            let push_call = lowerer.builder.ins().call(
+                                outer_post_arm_k_push_ref,
+                                &[post_arm_k_closure, post_arm_k_fn],
+                            );
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                push_call,
+                            ));
+
                             // arg_count = N + 2 so the trampoline
                             // allocates an arena args buffer with room
                             // for the trailing pair.
@@ -12532,19 +12593,27 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     (i * 8) as i32,
                                 );
                             }
-                            // Forward the synth-cont's incoming post-
-                            // arm-k pair as the callee's trailing pair.
-                            // Offsets match the Cps callee's body emit
-                            // reading convention.
+                            // Trailing pair = (null, identity). The
+                            // post-arm-k pair has been pushed onto
+                            // outer_post_arm_k_stack above; the
+                            // callee's synth-cont (if any) sees this
+                            // trailing pair as its post-arm-k pair
+                            // and (per the B.3 stack-push pattern)
+                            // pushes (null, identity) onto the stack
+                            // — a degenerate no-op pop at unwind.
+                            let identity_fn_addr_v = lowerer
+                                .builder
+                                .ins()
+                                .func_addr(pointer_ty, continuation_identity_ref);
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
-                                post_arm_k_closure,
+                                null_closure_v,
                                 argp_v,
                                 k_closure_offset(user_arg_count),
                             );
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
-                                post_arm_k_fn,
+                                identity_fn_addr_v,
                                 argp_v,
                                 k_fn_offset(user_arg_count),
                             );
