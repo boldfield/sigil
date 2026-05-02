@@ -36,6 +36,10 @@
 //!   `sigil_handle_pop`, `sigil_perform`, `sigil_run_loop`,
 //!   `sigil_next_step_done`, `sigil_next_step_call`,
 //!   `sigil_next_step_args_ptr`, `sigil_continuation_identity` (Plan B)
+//! - `sigil_b4_return_arm_adapter` (Task 78.5 G4 B.4 fix — bridges the
+//!   1-arg post_arm_k routing shape into the return-arm synth fn's
+//!   3-slot trailing-pair shape; routes the body's terminal value
+//!   through the return arm)
 //! - `sigil_next_step_discharged`, `sigil_last_terminal_tag` (Stage
 //!   6.8-followup Bug 2 fix — distinguish op-arm-discharge from
 //!   body-normal completion so handle expression skips return arm

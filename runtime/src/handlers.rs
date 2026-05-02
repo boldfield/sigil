@@ -1102,6 +1102,135 @@ pub unsafe extern "C" fn sigil_continuation_identity(
     sigil_next_step_done(value)
 }
 
+/// Task 78.5 G4 B.4 fix — per-program global return-arm adapter.
+///
+/// Conforms to the CPS arm fn ABI:
+/// `extern "C" fn(closure_ptr, args_ptr, args_len) -> *mut NextStep`.
+///
+/// **Why this exists (B.4 fix per Brian's approved (a′) plan).** The
+/// pre-fix B.4 implementation packed the return-arm pair into the
+/// body's args buffer trailing slots and relied on `sigil_run_loop`'s
+/// DONE branch to consult those slots. But the DONE branch only
+/// consults `outer_post_arm_k_stack` — never the body's args buffer
+/// trailing slots. So the body's terminal value flowed back to the
+/// caller unwrapped (the return arm never fired), producing wrong
+/// values for `B == R` shapes (Probe 5: 0 instead of 1) and SIGSEGV
+/// for `B != R` shapes (Probe 4: terminal Int=0 cast as `List[Int]`
+/// pointer = NULL → `length(NULL)`).
+///
+/// The fix routes through `outer_post_arm_k_stack` instead. The B.4
+/// emit path now (1) allocates a 2-word closure record holding the
+/// return arm's `(return_closure, return_fn)` pair, and (2) calls
+/// `sigil_outer_post_arm_k_push(adapter_closure, &this_adapter)` BEFORE
+/// the body call. When the body terminates with DONE(v), `run_loop`'s
+/// DONE branch's `outer_post_arm_k_try_pop` finds the entry and
+/// dispatches `Call(adapter_closure, &adapter, [v], args_len=1)` per
+/// the existing post_arm_k contract (handlers.rs:1595-1608).
+///
+/// This adapter then bridges from that 1-arg shape to the return-arm
+/// synth fn's 3-arg shape. It:
+///   1. Reads `v` from `args_ptr[0]` (the terminal value, widened I64).
+///   2. Reads `return_closure` from `closure_ptr + 16` (env slot 0 of
+///      the 2-word closure record; pointer-typed, GC-rooted via the
+///      record's bitmap bit 1).
+///   3. Reads `return_fn` from `closure_ptr + 24` (env slot 1; fn-ptr,
+///      non-GC by convention).
+///   4. Allocates a fresh `NextStep::Call(return_closure, return_fn,
+///      args_len=3)` via `sigil_next_step_call`.
+///   5. Writes `[v, null_k_closure, &sigil_continuation_identity]` to
+///      the new args buffer at offsets 0/8/16 (matching the return-arm
+///      synth fn's expected `[v, post_handle_k_closure,
+///      post_handle_k_fn]` shape — `(null, identity)` is the standard
+///      "no further chaining; terminate via Done(arg)" tail per the
+///      Phase 4e Slice A trailing-pair convention).
+///   6. Returns the new `NextStep::Call` ptr.
+///
+/// `run_loop` then dispatches the return-arm synth fn with the
+/// expected 3-slot args buffer; the synth fn's body lowers `ra.body`
+/// and emits its own terminal `Call` through identity → `Done(R-typed
+/// value)`. The trampoline returns that R-typed-but-u64-widened value
+/// to the body-call site, where `lower_b4_cps_body_call`'s post-narrow
+/// rebinds it to the source-level handler-overall type.
+///
+/// # Closure record layout (2-word; allocated at the B.4 emit site)
+///
+/// ```text
+/// +0:  header (TAG_CLOSURE | count=3 | bitmap = 0b010)
+/// +8:  null code_ptr (unused — adapter is dispatched via fn-ptr in
+///      the post_arm_k entry, not via the record's code slot)
+/// +16: return_closure (env slot 0; pointer; bitmap bit 1)
+/// +24: return_fn      (env slot 1; fn-ptr; bitmap bit 2 unset)
+/// ```
+///
+/// # Safety
+///
+/// - `args_ptr` must point to at least one readable u64 (`args_len >=
+///   1`). The trampoline guarantees this when dispatching from the
+///   `Call(adapter_closure, &adapter, [v])` constructed by
+///   `outer_post_arm_k_try_pop`'s routing loop.
+/// - `closure_ptr` must be a non-null TAG_CLOSURE record allocated by
+///   `lower_b4_cps_body_call` with the layout above. Codegen's
+///   `outer_post_arm_k_push` call site is the sole producer of this
+///   pair — no other path can call this adapter.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_b4_return_arm_adapter(
+    closure_ptr: *const u8,
+    args_ptr: *const u64,
+    args_len: u32,
+) -> *mut NextStep {
+    debug_assert!(
+        args_len >= 1,
+        "sigil_b4_return_arm_adapter: args_len must be >= 1 (post_arm_k \
+         routing loop in `sigil_run_loop` builds Call(..., [v]) with \
+         args_len=1); got {args_len}"
+    );
+    debug_assert!(
+        !args_ptr.is_null(),
+        "sigil_b4_return_arm_adapter: args_ptr must be non-null when args_len >= 1"
+    );
+    debug_assert!(
+        !closure_ptr.is_null(),
+        "sigil_b4_return_arm_adapter: closure_ptr must be a 2-word adapter \
+         record allocated by lower_b4_cps_body_call; got null"
+    );
+
+    // Step 1: read v from args_ptr[0]. SAFETY: args_len >= 1 and
+    // args_ptr is non-null per the post_arm_k routing contract.
+    let v = *args_ptr;
+
+    // Steps 2-3: load the (return_closure, return_fn) pair from the
+    // adapter's closure record. The record was allocated with
+    // header `header_word(TAG_CLOSURE, count=3, bitmap=0b010)` and
+    // payload `8 + 8*2 = 24` bytes, so reads at offsets 16/24 are
+    // in-bounds. The bitmap bit 1 ensures `return_closure` is treated
+    // as a GC root if a collection happens between the
+    // outer_post_arm_k_push call and this adapter dispatch.
+    // SAFETY: gc-heap-ptr arithmetic (env-slot 0 read; 24-byte payload makes offset 16 in-bounds; bitmap bit 1 pins return_closure across collections).
+    let return_closure = (closure_ptr.add(16) as *const *mut u8).read();
+    // SAFETY: gc-heap-ptr arithmetic (env-slot 1 read; 24-byte payload makes offset 24 in-bounds; fn-ptr is non-GC by convention).
+    let return_fn = (closure_ptr.add(24) as *const *mut u8).read();
+
+    // Step 4: allocate the NextStep::Call for dispatching to the
+    // return-arm synth fn. args_len=3 matches the synth fn's expected
+    // shape `[v, post_handle_k_closure, post_handle_k_fn]`.
+    let ns = sigil_next_step_call(return_closure, return_fn, 3);
+    let ns_args = sigil_next_step_args_ptr(ns);
+
+    // Step 5: write `[v, null_k_closure, &sigil_continuation_identity]`
+    // at offsets 0/8/16 (in u64 word units: 0/1/2). The null+identity
+    // trailing pair is the standard "no further chaining" terminator —
+    // when the return-arm body emits its own tail `Call(post_handle_k_*,
+    // [arm_value])` through this pair, identity returns
+    // `Done(arm_value)` and run_loop unwinds with the R-typed value.
+    ns_args.add(0).write(v);
+    ns_args.add(1).write(0u64); // null k_closure
+    ns_args
+        .add(2)
+        .write(sigil_continuation_identity as *const () as usize as u64);
+
+    ns
+}
+
 // ---------------------------------------------------------------------
 // Builtin top-level handler arm fns (Plan B Task 57)
 // ---------------------------------------------------------------------
