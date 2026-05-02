@@ -9383,3 +9383,114 @@ fn b4_discharged_bypass_skips_return_arm_trailing_pair() {
          stderr={stderr:?}"
     );
 }
+
+/// **Task 78.5 G4 Phase B.3 — CPS→CPS direct dispatch from synth-cont
+/// tail (non-recursive helper).**
+///
+/// Pins B.3's direct `NextStep::Call` dispatch from the
+/// `CompoundMatchArmPostPerform` synth-cont's tail: when the synth-cont's
+/// `tail_expr` is a direct call to a Cps-ABI top-level user fn, codegen
+/// emits a `NextStep::Call(target_cps, [args, post_arm_k_pair], N+2)`
+/// returning to the OUTER trampoline, instead of routing through
+/// `Lowerer::lower_expr` → `lower_call`'s Cps branch (which would pack
+/// `(null, identity)` as the callee's trailing pair AND drive a NESTED
+/// `sigil_run_loop`, violating the trampoline charter per
+/// `feedback_sigil_trampoline_charter`).
+///
+/// **Shape (intentionally non-recursive):** `caller`'s body is `match
+/// xs { Nil => 0, Cons(x, _) => { let _ = perform Gen.yield(x);
+/// helper(x) } }`. The Cons arm's tail is `helper(x)` — a Cps user fn
+/// call (helper's body is the chained-let-yield-then-pure-tail shape,
+/// classified Cps). The non-recursive shape pins B.3's dispatch
+/// mechanics independent of the recursive Generator shape (which the
+/// closeout PR exercises via
+/// `task_78_5_pending_g4_recursive_perform_in_match_arm_body`).
+///
+/// **Trace (unwinding the trampoline hops):**
+///   1. main: `handle caller(Cons(7, Nil)) with { Gen.yield(_, k) => k(0) }`.
+///      No return arm, so handle takes the standard path: `lower_call`'s
+///      Cps branch packs `(null, identity)` and drives `sigil_run_loop`
+///      synchronously to unwind to a Sync return.
+///   2. caller's body emit: B.1's compound-match dispatch fires; `Cons`
+///      arm allocates B.2's synth-cont (capturing `x = 7`), issues
+///      `sigil_perform(Gen.yield(7), k = (synth_cont_closure, synth_-
+///      cont_fn))`.
+///   3. Trampoline → handler arm `Gen.yield(_, k) => k(0)`. `k(0)` packs
+///      `[0, NULL, identity]` and dispatches to synth_cont via
+///      `next_step_call`.
+///   4. synth-cont fires: loads `x = 7` from closure record, binds
+///      `let _ = args_ptr[0] = 0` (discarded). **B.3 fires here**:
+///      `tail_expr = helper(x)` matches Cps user fn detector. Emit
+///      `next_step_call(NULL, helper_addr, 3)` with args buffer
+///      `[7, NULL, identity]` (forwarded from synth-cont's incoming
+///      post_arm_k pair). Return NS up to outer trampoline.
+///   5. Trampoline → helper(NULL, [7, NULL, identity], 3). helper's
+///      body: chained-let with 1 step + tail `n + 100`. The chain Final
+///      step lowers `n + 100 = 7 + 100 = 107`, dispatches via incoming
+///      post_arm_k pair `(NULL, identity)` → `next_step_call(NULL,
+///      identity, [107], 1)`.
+///   6. Trampoline → identity(NULL, [107], 1) → returns `Done(107)`.
+///   7. run_loop returns 107 to main's handle expression.
+///   8. main: `IO.println(int_to_string(107))` → stdout `"107\n"`.
+///
+/// **What B.3 specifically gives us:** the hop at step 5 is the OUTER
+/// trampoline (the one that started at step 1) dispatching helper
+/// directly. Pre-B.3 step 4 would call `lower_call`'s Cps branch on
+/// `helper(x)`, spawning a NESTED `sigil_run_loop` to drive helper's
+/// body (one extra trampoline level per recursive perform — exactly
+/// the trampoline-charter violation B.3 closes).
+///
+/// **Invariant**: stdout = `"107\n"`, exit 0.
+#[test]
+fn b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail() {
+    // Inline `Gen` effect + `IntList` ADT — no `import std.list` so the
+    // test stands alone. Both `helper` and `caller` are Cps user fns;
+    // caller's Cons-arm tail is `helper(x)` → triggers B.3 detection.
+    let src = "import std.io\n\
+               \n\
+               effect Gen { yield: (Int) -> Int }\n\
+               \n\
+               type IntList = | Nil | Cons(Int, IntList)\n\
+               \n\
+               fn helper(n: Int) -> Int ![Gen] {\n  \
+                 let _: Int = perform Gen.yield(n);\n  \
+                 n + 100\n\
+               }\n\
+               \n\
+               fn caller(xs: IntList) -> Int ![Gen] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(x, _) => {\n      \
+                     let _: Int = perform Gen.yield(x);\n      \
+                     helper(x)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: IntList = Cons(7, Nil);\n  \
+                 let result: Int = handle caller(xs) with {\n    \
+                   Gen.yield(_x, k) => k(0),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "107\n",
+        "B.3 direct dispatch: caller's synth-cont tail `helper(x)` \
+         (with x=7 captured from arm pattern) emits `NextStep::Call \
+         (helper, [7, NULL, identity], 3)` to the outer trampoline; \
+         helper's body resumes the perform chain with k(0), discards \
+         the 0, lowers `n + 100 = 107`, dispatches Done(107) via the \
+         forwarded `(NULL, identity)` trailing pair. If output is \
+         shape-different (e.g., 100 from helper running in a nested \
+         run_loop with broken capture handling), B.3's direct-dispatch \
+         args-packing or post-arm-k forwarding regressed. \
+         stderr={stderr:?}"
+    );
+}

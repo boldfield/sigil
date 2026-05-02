@@ -12108,34 +12108,174 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
                         };
 
-                        let tail_value = lowerer.lower_expr(tail_expr.as_ref());
-                        // Read the actual lowered Cranelift type from
-                        // the DFG (per `feedback_sigil_dfg_value_type`)
-                        // — prefer it over `tail_ty` to insulate against
-                        // a width disagreement between the declared
-                        // return type and the Lowerer-produced value.
-                        let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
-                        let widened_tail = if actual_tail_ty == types::I64 {
-                            tail_value
-                        } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
-                            lowerer.builder.ins().uextend(types::I64, tail_value)
-                        } else {
-                            assert_eq!(
-                                actual_tail_ty, pointer_ty,
-                                "codegen Phase B.2: unexpected \
-                                 CompoundMatchArmPostPerform tail Cranelift \
-                                 type {actual_tail_ty:?} for fn `{}`",
-                                synth.parent_fn_name
+                        // Plan B Task 78.5 G4 Phase B.3 — CPS→CPS direct
+                        // dispatch at synth-cont tail. When `tail_expr`
+                        // is `Expr::Call { callee: Ident(name), args }`
+                        // and `name` resolves to a Cps-ABI user fn,
+                        // emit a direct `NextStep::Call(target, [args,
+                        // post_arm_k_closure, post_arm_k_fn], N+2)`
+                        // returning to the OUTER trampoline (which is
+                        // already running this synth-cont). This avoids
+                        // routing through `lower_call`'s Cps branch,
+                        // which would pack `(null, identity)` as the
+                        // trailing pair AND drive `sigil_run_loop`
+                        // synchronously — the latter spawns a nested
+                        // trampoline that violates the trampoline
+                        // charter (per `feedback_sigil_trampoline_-
+                        // charter`) for recursive Cps callees.
+                        //
+                        // The forwarded trailing pair is THIS synth-
+                        // cont's incoming `(post_arm_k_closure, post_-
+                        // arm_k_fn)` (loaded above the match at the
+                        // outer scope as `post_arm_k_closure` / `post_-
+                        // arm_k_fn`). The deepest trampoline exit
+                        // dispatches through the existing post-arm-k
+                        // chain.
+                        //
+                        // Args layout matches the Cps callee's body
+                        // emit reading convention (`k_closure_offset
+                        // (N)` / `k_fn_offset(N)`):
+                        //   args_ptr[0..N*8]                = user args
+                        //   args_ptr[k_closure_offset(N)]   = post_arm_k_closure
+                        //   args_ptr[k_fn_offset(N)]        = post_arm_k_fn
+                        //
+                        // `arg_count = N + 2` for the trampoline's
+                        // arena-buffer allocation; the callee's body
+                        // ignores `args_len` and reads its trailing
+                        // pair at the statically-known offsets.
+                        let b3_match =
+                            b3_synth_cont_tail_is_cps_user_fn_call(tail_expr.as_ref(), |n| {
+                                lowerer.user_fns.get(n).map(|e| e.abi)
+                            });
+                        if let Some((target_name, target_args)) = b3_match {
+                            // Lower + widen each user arg.
+                            let mut widened_args: Vec<Value> =
+                                Vec::with_capacity(target_args.len());
+                            for arg_expr in target_args {
+                                let arg_v = lowerer.lower_expr(arg_expr);
+                                let arg_ty = lowerer.builder.func.dfg.value_type(arg_v);
+                                let widened = if arg_ty == types::I64 {
+                                    arg_v
+                                } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                                    lowerer.builder.ins().uextend(types::I64, arg_v)
+                                } else {
+                                    assert_eq!(
+                                        arg_ty, pointer_ty,
+                                        "codegen Phase B.3: unexpected user-arg \
+                                         Cranelift type {arg_ty:?} packing direct \
+                                         CPS→CPS dispatch in fn `{}` (tail call \
+                                         `{target_name}`)",
+                                        synth.parent_fn_name
+                                    );
+                                    arg_v
+                                };
+                                widened_args.push(widened);
+                            }
+
+                            // Resolve target Cps fn's FuncRef + fn addr.
+                            let target_fn_ref = match lowerer.user_fn_refs.get(target_name) {
+                                Some(r) => *r,
+                                None => unreachable!(
+                                    "codegen Phase B.3: target `{target_name}` \
+                                     classified as Cps user fn but missing from \
+                                     user_fn_refs in synth-cont for fn `{}`",
+                                    synth.parent_fn_name
+                                ),
+                            };
+                            let target_fn_addr =
+                                lowerer.builder.ins().func_addr(pointer_ty, target_fn_ref);
+
+                            // arg_count = N + 2 so the trampoline
+                            // allocates an arena args buffer with room
+                            // for the trailing pair.
+                            let user_arg_count = widened_args.len();
+                            let total_arg_count = user_arg_count + 2;
+                            let total_arg_count_v = lowerer
+                                .builder
+                                .ins()
+                                .iconst(types::I32, total_arg_count as i64);
+                            let null_closure_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                            let call_ns = lowerer.builder.ins().call(
+                                next_step_call_ref,
+                                &[null_closure_v, target_fn_addr, total_arg_count_v],
                             );
-                            tail_value
-                        };
-                        let next_step = emit_dispatch_to_post_arm_k(
-                            &mut lowerer.builder,
-                            lowerer.stackmap,
-                            widened_tail,
-                        );
-                        lowerer.builder.ins().return_(&[next_step]);
-                        lowerer.builder.finalize();
+                            lowerer
+                                .stackmap
+                                .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                            let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                            let argp_call = lowerer
+                                .builder
+                                .ins()
+                                .call(next_step_args_ptr_ref, &[ns_ptr]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                argp_call,
+                            ));
+                            let argp_v = lowerer.builder.inst_results(argp_call)[0];
+
+                            // Write user args at offsets 0..N*8.
+                            for (i, w) in widened_args.iter().enumerate() {
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    *w,
+                                    argp_v,
+                                    (i * 8) as i32,
+                                );
+                            }
+                            // Forward the synth-cont's incoming post-
+                            // arm-k pair as the callee's trailing pair.
+                            // Offsets match the Cps callee's body emit
+                            // reading convention.
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                post_arm_k_closure,
+                                argp_v,
+                                k_closure_offset(user_arg_count),
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                post_arm_k_fn,
+                                argp_v,
+                                k_fn_offset(user_arg_count),
+                            );
+
+                            // Return NextStep::Call up to the outer
+                            // trampoline. **Critical (per `feedback_-
+                            // sigil_trampoline_charter`):** we do NOT
+                            // call `sigil_run_loop` here — the outer
+                            // trampoline dispatches the callee directly.
+                            lowerer.builder.ins().return_(&[ns_ptr]);
+                            lowerer.builder.finalize();
+                        } else {
+                            let tail_value = lowerer.lower_expr(tail_expr.as_ref());
+                            // Read the actual lowered Cranelift type from
+                            // the DFG (per `feedback_sigil_dfg_value_type`)
+                            // — prefer it over `tail_ty` to insulate against
+                            // a width disagreement between the declared
+                            // return type and the Lowerer-produced value.
+                            let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
+                            let widened_tail = if actual_tail_ty == types::I64 {
+                                tail_value
+                            } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
+                                lowerer.builder.ins().uextend(types::I64, tail_value)
+                            } else {
+                                assert_eq!(
+                                    actual_tail_ty, pointer_ty,
+                                    "codegen Phase B.2: unexpected \
+                                     CompoundMatchArmPostPerform tail Cranelift \
+                                     type {actual_tail_ty:?} for fn `{}`",
+                                    synth.parent_fn_name
+                                );
+                                tail_value
+                            };
+                            let next_step = emit_dispatch_to_post_arm_k(
+                                &mut lowerer.builder,
+                                lowerer.stackmap,
+                                widened_tail,
+                            );
+                            lowerer.builder.ins().return_(&[next_step]);
+                            lowerer.builder.finalize();
+                        }
                     }
                 }
             }
@@ -18433,6 +18573,60 @@ fn b4_handle_body_is_cps_user_fn_call(
     None
 }
 
+/// Task 78.5 G4 Phase B.3 — does this `CompoundMatchArmPostPerform`
+/// synth-cont's `tail_expr` match the B.3-eligible shape (direct call
+/// to a Cps-ABI top-level user fn)?
+///
+/// Returns `Some((name, args))` iff:
+/// - `tail_expr` is `Expr::Call { callee: Expr::Ident(name), args }`.
+/// - `lookup_abi(name)` returns `Some(UserFnAbi::Cps)`. The caller
+///   provides the lookup closure, which encapsulates the
+///   "is this a top-level user fn?" check (returning `None` for
+///   constructors and local fn-typed bindings) plus the ABI query.
+///
+/// Otherwise `None`. The caller (the synth-cont definition pass for
+/// `CompoundMatchArmPostPerform`) uses `Some(_)` to gate routing into a
+/// direct `NextStep::Call` emission instead of going through
+/// `Lowerer::lower_expr` → `lower_call`'s Cps branch.
+///
+/// **Why narrow:** the standard `lower_call`'s Cps branch packs the
+/// Cps callee with a trailing `(null, identity)` pair AND drives
+/// `sigil_run_loop` synchronously to unwind back to a Sync return. That
+/// nested-`run_loop` pattern violates the trampoline charter (per
+/// `feedback_sigil_trampoline_charter`): the outer trampoline is
+/// already running this synth-cont, so spawning a nested trampoline
+/// for the recursive Cps callee leaks stack growth across each
+/// recursive perform. B.3 closes the window by returning a
+/// `NextStep::Call` directly to the OUTER trampoline. The forwarded
+/// trailing pair is THIS synth-cont's incoming
+/// `(post_arm_k_closure, post_arm_k_fn)` (read from `args_ptr` at
+/// `POST_ARM_K_CLOSURE_OFF` / `POST_ARM_K_FN_OFF`), so the deepest
+/// trampoline exit dispatches through the existing post-arm-k chain.
+/// Other body shapes (ctor application, indirect calls, lambdas,
+/// blocks) fall back to `lower_expr` + `emit_dispatch_to_post_arm_k`,
+/// which handles all non-Cps-call tails correctly.
+///
+/// **Closure-based lookup:** parameterising over `lookup_abi` keeps
+/// this function stateless / map-shape-agnostic and unit-testable
+/// without constructing real `UserFnEntry` records (which require a
+/// `cranelift_module::FuncId` from a populated module). Production
+/// call sites pass `|n| user_fns.get(n).map(|e| e.abi)` closures that
+/// consult the per-fn ABI map.
+fn b3_synth_cont_tail_is_cps_user_fn_call(
+    tail_expr: &crate::ast::Expr,
+    lookup_abi: impl Fn(&str) -> Option<UserFnAbi>,
+) -> Option<(&str, &[crate::ast::Expr])> {
+    use crate::ast::Expr;
+    if let Expr::Call { callee, args, .. } = tail_expr {
+        if let Expr::Ident(name, _) = callee.as_ref() {
+            if matches!(lookup_abi(name), Some(UserFnAbi::Cps)) {
+                return Some((name.as_str(), args.as_slice()));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -22587,5 +22781,187 @@ mod tests {
         let (rest_ty, rest_kind, _) = out.get("rest").expect("rest binding present");
         assert_eq!(*rest_ty, types::I64); // pointer_ty == I64 on x86_64
         assert_eq!(*rest_kind, EnvSlotKind::User);
+    }
+
+    // ======================================================================
+    // Plan B Task 78.5 G4 Phase B.3 — CPS→CPS direct dispatch detector
+    //
+    // The detector `b3_synth_cont_tail_is_cps_user_fn_call` decides whether
+    // a `CompoundMatchArmPostPerform` synth-cont's `tail_expr` should be
+    // lowered as a direct `NextStep::Call(target_cps, [args, post_arm_k_-
+    // pair], N+2)` (returning to the OUTER trampoline) instead of going
+    // through `Lowerer::lower_expr` → `lower_call`'s Cps branch (which
+    // packs `(null, identity)` AND drives a NESTED `sigil_run_loop`,
+    // violating the trampoline charter per `feedback_sigil_trampoline_-
+    // charter`). These tests pin the detection logic; the IR-level
+    // emission path is exercised end-to-end by the e2e test
+    // `b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail`.
+    //
+    // Symmetric with the B.4 detector tests (positive/negative shape
+    // coverage for the `lookup_abi`-parameterised classifier).
+    // ======================================================================
+
+    /// Build a minimal `Expr::Call { callee: Ident(name), args }`.
+    fn b3_make_call_expr(name: &str, args: Vec<crate::ast::Expr>) -> crate::ast::Expr {
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        Expr::Call {
+            callee: Box::new(Expr::Ident(name.to_string(), span.clone())),
+            args,
+            span,
+        }
+    }
+
+    #[test]
+    fn b3_detector_accepts_call_to_cps_user_fn_with_args() {
+        // Tail shape: `helper(7)` where `helper` is a top-level user fn
+        // with Cps ABI. The detector returns Some so the synth-cont's
+        // body emit routes into the direct `NextStep::Call` dispatch
+        // path (no nested `run_loop` drive).
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = b3_make_call_expr("helper", vec![Expr::IntLit(7, span)]);
+        let result = b3_synth_cont_tail_is_cps_user_fn_call(&tail, |name| {
+            (name == "helper").then_some(UserFnAbi::Cps)
+        });
+        assert_eq!(
+            result.map(|(n, args)| (n, args.len())),
+            Some(("helper", 1)),
+            "B.3 detector should accept direct call to Cps user fn \
+             (preserves arg count)"
+        );
+    }
+
+    #[test]
+    fn b3_detector_accepts_recursive_cps_call_with_arm_pattern_arg() {
+        // Tail shape: `iterate(rest)` — the canonical iterate-Generator
+        // recursive shape. arg is an Ident bound by the arm pattern.
+        // Detector accepts; synth-cont emits direct `NextStep::Call`
+        // (closes the trampoline-charter regression window for the
+        // recursive Generator shape).
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = b3_make_call_expr("iterate", vec![Expr::Ident("rest".to_string(), span)]);
+        let result = b3_synth_cont_tail_is_cps_user_fn_call(&tail, |name| {
+            (name == "iterate").then_some(UserFnAbi::Cps)
+        });
+        assert_eq!(
+            result.map(|(n, args)| (n, args.len())),
+            Some(("iterate", 1)),
+            "B.3 detector should accept recursive Cps call (iterate(rest))"
+        );
+    }
+
+    #[test]
+    fn b3_detector_rejects_call_to_sync_user_fn() {
+        // Tail shape: `comp(7)` where `comp` is a top-level user fn but
+        // with Sync ABI. The standard sync call path handles Sync
+        // callees correctly; B.3's direct dispatch only applies to Cps
+        // callees (where the trampoline is the dispatch mechanism that
+        // would otherwise need a nested `run_loop` drive).
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = b3_make_call_expr("comp", vec![Expr::IntLit(7, span)]);
+        let result = b3_synth_cont_tail_is_cps_user_fn_call(&tail, |name| {
+            (name == "comp").then_some(UserFnAbi::Sync)
+        });
+        assert_eq!(
+            result.map(|(n, args)| (n, args.len())),
+            None,
+            "B.3 detector should reject Sync-ABI callees (standard \
+             sync call path handles them; no nested `run_loop`)"
+        );
+    }
+
+    #[test]
+    fn b3_detector_rejects_unknown_callee() {
+        // Tail shape: `mystery()` where `mystery` is NOT a top-level
+        // user fn (could be a constructor, a local fn-typed binding,
+        // or simply unresolved). The detector returns None; the synth-
+        // cont's body falls through to standard `Lowerer::lower_expr`
+        // dispatch, which then handles ctor application / indirect call
+        // / etc.
+        let tail = b3_make_call_expr("mystery", vec![]);
+        let result = b3_synth_cont_tail_is_cps_user_fn_call(&tail, |_| None);
+        assert_eq!(
+            result.map(|(n, _)| n),
+            None,
+            "B.3 detector should reject unknown callees (not in user_fns)"
+        );
+    }
+
+    #[test]
+    fn b3_detector_rejects_non_call_tail() {
+        // Tail shape: an integer literal (`99`) — no call at all. The
+        // standard fallback path lowers the constant via Lowerer and
+        // dispatches via post-arm-k. B.3 doesn't apply.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let tail = Expr::IntLit(99, Span::synthetic("x.sigil"));
+        let result = b3_synth_cont_tail_is_cps_user_fn_call(&tail, |_| Some(UserFnAbi::Cps));
+        assert_eq!(
+            result.map(|(n, _)| n),
+            None,
+            "B.3 detector should reject non-Call tail shapes (constant, \
+             arithmetic, ctor application, etc.)"
+        );
+    }
+
+    #[test]
+    fn b3_detector_rejects_indirect_call_callee_shape() {
+        // Tail shape: `(get_fn())(rest)` — the callee is itself a call,
+        // not an Ident. The detector returns None; standard lowering
+        // takes the indirect-call path. Critical for `run_state`-style
+        // higher-order shapes which pass fns through closure params.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let inner_call = Expr::Call {
+            callee: Box::new(Expr::Ident("get_fn".to_string(), span.clone())),
+            args: vec![],
+            span: span.clone(),
+        };
+        let tail = Expr::Call {
+            callee: Box::new(inner_call),
+            args: vec![Expr::Ident("rest".to_string(), span.clone())],
+            span,
+        };
+        let result = b3_synth_cont_tail_is_cps_user_fn_call(&tail, |_| Some(UserFnAbi::Cps));
+        assert_eq!(
+            result.map(|(n, _)| n),
+            None,
+            "B.3 detector should reject indirect-call shapes (callee \
+             is not an Ident); preserves higher-order indirect dispatch"
+        );
+    }
+
+    #[test]
+    fn b3_detector_rejects_ctor_shaped_call() {
+        // Tail shape: `Cons(1, rest)` — Ident callee but resolves to a
+        // constructor (lookup returns None because ctors aren't in
+        // `user_fns`). The detector returns None; standard lowering
+        // takes the ctor-alloc path.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let tail = b3_make_call_expr(
+            "Cons",
+            vec![
+                Expr::IntLit(1, span.clone()),
+                Expr::Ident("rest".to_string(), span),
+            ],
+        );
+        // Ctors aren't in user_fns; lookup returns None.
+        let result = b3_synth_cont_tail_is_cps_user_fn_call(&tail, |_| None);
+        assert_eq!(
+            result.map(|(n, _)| n),
+            None,
+            "B.3 detector should reject ctor-shaped calls (Cons isn't \
+             a user fn; lookup returns None)"
+        );
     }
 }
