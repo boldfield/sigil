@@ -12116,7 +12116,7 @@ mod tests {
 
     // ----------------------------------------------------------------
     // Task 78.5 G5 — E0145 escape barrier extension: lambda-capture-
-    // of-continuation inside a generic enclosing fn.
+    // of-continuation in a program containing generics.
     //
     // Pre-G5: the broad `unify_ty` arm + the precision check at
     // `check_call` cover Ty::Continuation escapes through value-level
@@ -12125,19 +12125,26 @@ mod tests {
     // The lambda-construction site bypassed both: the lambda's value
     // type is `Ty::Fn`, never `Ty::Continuation`, so no unify against
     // Continuation occurs at the value level — the `Ty::Continuation`
-    // capture lives only in `lambda_captures` side-table. Inside a
-    // non-generic fn this is fine (codegen + runtime support multi-
+    // capture lives only in `lambda_captures` side-table. In a no-
+    // generics program this is fine (codegen + runtime support multi-
     // shot continuation captures via closure records — see
-    // `std/state.sigil`'s `run_state`). Inside a generic fn,
-    // monomorphize's `Substitution::apply_to_ty` walks the captures
-    // (`monomorphize.rs:1054`) and panics at line 1516 (`Ty::-
-    // Continuation reached mono substitution`).
+    // `std/state.sigil`'s `run_state`). When mono runs (any generic
+    // anywhere in the program), `Substitution::apply_to_ty` walks
+    // every reachable fn's captures (`monomorphize.rs:1054`) and
+    // panics at line 1516 (`Ty::Continuation reached mono
+    // substitution`) — even on non-generic fns embedded in the same
+    // program.
     //
-    // Fix: in `check_lambda`, after capture analysis, scan captures
-    // for any `Ty::Continuation` entry; if `current_generic_subst` is
-    // non-empty (enclosing fn is generic), push E0145 with a precise
-    // diagnostic at the lambda span. The narrowing keeps `run_state`
-    // and other shipped non-generic patterns working.
+    // Fix (review-2 widening): in `check_lambda`, after capture
+    // analysis, scan captures for any `Ty::Continuation` entry; if
+    // `self.program_has_generics` is true (any user generic fn /
+    // type / Apply use anywhere in the program — mirrors
+    // `monomorphize::program_has_generics`), push E0145 with a
+    // precise diagnostic at the lambda span. The widened gate
+    // predicts mono's behaviour exactly: fire E0145 anywhere a
+    // lambda captures `Ty::Continuation` in a program that will
+    // trigger mono. Pure no-generics programs keep `run_state` and
+    // other shipped lambda-captures-k patterns working unchanged.
     // ----------------------------------------------------------------
 
     #[test]
