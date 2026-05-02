@@ -427,6 +427,19 @@ thread_local! {
 // `OUTER_POST_ARM_K_STACK`'s registration. Pop clears the popped
 // slot's pointers so a stale entry doesn't outlive its useful
 // lifetime in the rooted range.
+//
+// **Cap = 32** is shared with `OUTER_POST_ARM_K_STACK_SIZE` and
+// reflects the same depth ceiling: at most one entry per nested
+// `sigil_run_loop` invocation on the calling thread (handle-body
+// wrapper or sub-Cps-call wrapper), so it bounds **handle-body
+// nesting + sub-Cps-call nesting**, not user-fn recursion depth in
+// general. Typical Sigil programs nest 1-3 deep; the worst-case
+// program that would hit the cap is one whose call chain
+// alternates Sync→Cps wrappers at each frame (32+ levels). Overflow
+// aborts via `eprintln!` + `abort()` in `sigil_body_return_arm_push`
+// rather than dynamic resize — codegen invariant violations should
+// surface loudly. v2 follow-up: revisit if profiles show the cap
+// is binding for any real workload.
 
 const BODY_RETURN_ARM_STACK_SIZE: usize = 32;
 
@@ -1044,6 +1057,18 @@ pub unsafe extern "C" fn sigil_reset_last_terminal_value() {
 /// Aborts on stack overflow (cap = `BODY_RETURN_ARM_STACK_SIZE` = 32).
 /// Every push must be paired with one `sigil_body_return_arm_pop` (the
 /// codegen wrapper that pushes also emits the matching pop).
+///
+/// # Panic-safety (PR #80 review iter 3 N4)
+///
+/// If a Rust panic propagates through `sigil_run_loop` between push
+/// and the matching pop, the pop is skipped and depth stays
+/// incremented; subsequent push/pop pairs on the same thread still
+/// balance correctly relative to each other but observe a stale
+/// outer frame at depths above the panic site. In practice Rust
+/// panics through `extern "C"` boundaries are UB anyway and our
+/// runtime aborts loudly on `sigil_alloc` exhaustion / unreachable!,
+/// so this is theoretical. v2 follow-up: revisit if any runtime path
+/// catches panics.
 ///
 /// # Safety
 ///

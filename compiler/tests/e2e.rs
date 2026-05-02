@@ -8154,6 +8154,14 @@ fn generic_tuple_scrutinee_via_call_resolves() {
 /// nested run_loop that would double-wrap.
 #[test]
 fn task_78_5_g4_recursive_perform_in_match_arm_body() {
+    // PR #80 review iter 3 §"New issue: Generator test discriminator
+    // is too weak" — earlier asserted only `length(result) == 3`,
+    // which would silently pass under wrong unwind order
+    // (Cons(3, Cons(2, Cons(1, Nil)))) or wrong intermediate values
+    // (Cons(0, Cons(0, Cons(0, Nil)))). Approach 6's whole point is
+    // the post-arm-k chain unwinding in the right order with the
+    // right intermediates — print each element so `"1\n2\n3\n"`
+    // pins both content and order.
     let src = "import std.list\n\
                import std.io\n\
                \n\
@@ -8171,6 +8179,16 @@ fn task_78_5_g4_recursive_perform_in_match_arm_body() {
                  }\n\
                }\n\
                \n\
+               fn print_list(xs: List[Int]) -> Int ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => {\n      \
+                     perform IO.println(int_to_string(h));\n      \
+                     print_list(t)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
                fn main() -> Int ![IO] {\n  \
                  let xs: List[Int] = Cons(1, Cons(2, Cons(3, Nil)));\n  \
                  let result: List[Int] = handle iterate(xs) with {\n    \
@@ -8180,15 +8198,16 @@ fn task_78_5_g4_recursive_perform_in_match_arm_body() {
                    },\n    \
                    return(_v) => Nil,\n  \
                  };\n  \
-                 perform IO.println(int_to_string(length(result)));\n  \
-                 0\n\
+                 print_list(result)\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_78_5_pr1_generator_collect");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "3\n",
-        "generator should yield 3 elements collected into List[Int]; \
-         stderr={stderr:?}"
+        stdout, "1\n2\n3\n",
+        "Generator should yield 3 elements collected into List[Int] in \
+         source-order: 1, 2, 3. Wrong outputs surface unwind-order or \
+         intermediate-value regressions that the prior length-only \
+         assertion would have masked. stderr={stderr:?}"
     );
 }
 

@@ -15261,25 +15261,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             .push_placeholder(function_code_offset(&self.builder, cps_call));
                         let next_step = self.builder.inst_results(cps_call)[0];
 
-                        // Task 78.5 G4 Approach 6 deep-redo —
-                        // SAVE+CLEAR+RESTORE BODY_RETURN_ARM TLS
-                        // around the nested run_loop. This Cps branch
-                        // is the Sync→Cps interop wrapper used for
-                        // sub-Cps-fn calls inside body fns. Without
-                        // CLEAR, the sub-call inherits the outer body's
-                        // return-arm pair and the helper at the
-                        // sub-call's natural-exit dispatches the outer
-                        // return arm with the sub-call's value (Risk 3
-                        // double-wrap). SAVE before CLEAR + RESTORE
-                        // after run_loop preserves the outer's pair so
-                        // body's natural-exit (after the sub-call
-                        // returns) still dispatches correctly.
-                        //
-                        // We also save+restore the FIRED flag — sub-call
-                        // execution shouldn't observe that the OUTER
-                        // body's helper has fired, and outer's fired
-                        // state should be preserved across the sub-call.
-                        // PR #80 review §1: PUSH (null, null) onto
+                        // Task 78.5 G4 Approach 6 deep-redo (PR #80
+                        // review §1): PUSH (null, null) onto
                         // BODY_RETURN_ARM_STACK before the nested
                         // run_loop, POP after. The null pair masks the
                         // outer body's return arm — the helper at the
