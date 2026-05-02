@@ -7092,6 +7092,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_b4_install_then_body: {e}"))?;
 
+    // Step 2 diagnostic breadcrumb (per Brian's directive 2026-05-02).
+    // `sigil_g4_install_breadcrumb()` — void→void runtime helper that
+    // eprintln!s "G4_INSTALL_FN_ENTRY". Called from the entry of
+    // `sigil_b4_install_then_body`'s Cranelift body. Remove after CI
+    // surfaces the diagnostic trace.
+    let g4_install_breadcrumb_sig = Signature::new(isa_call_conv(&module));
+    let g4_install_breadcrumb = module
+        .declare_function(
+            "sigil_g4_install_breadcrumb",
+            Linkage::Import,
+            &g4_install_breadcrumb_sig,
+        )
+        .map_err(|e| format!("declare sigil_g4_install_breadcrumb: {e}"))?;
+
     // Plan B Task 57 — sigil_io_println_arm, the runtime-side default
     // handler for `IO.println` installed at the top-level `main` shim.
     // Same CPS arm fn ABI as `sigil_continuation_identity`. Reads the
@@ -12629,6 +12643,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         builder.append_block_params_for_function_params(block_entry);
         builder.switch_to_block(block_entry);
         builder.seal_block(block_entry);
+
+        // Step 2 diagnostic breadcrumb (per Brian's directive 2026-05-02).
+        // Emit a call to `sigil_g4_install_breadcrumb` immediately after
+        // entering the install_fn body so CI's stderr proves install_fn
+        // was actually dispatched. Remove after the diagnostic CI cycle.
+        let g4_install_breadcrumb_ref =
+            module.declare_func_in_func(g4_install_breadcrumb, builder.func);
+        builder.ins().call(g4_install_breadcrumb_ref, &[]);
 
         let block_params: Vec<Value> = builder.block_params(block_entry).to_vec();
         let closure_ptr = block_params[0];

@@ -1178,6 +1178,13 @@ pub unsafe extern "C" fn sigil_b4_return_arm_adapter(
     args_ptr: *const u64,
     args_len: u32,
 ) -> *mut NextStep {
+    // Step 2 diagnostic breadcrumb (per Brian's directive 2026-05-02 to
+    // disambiguate install_fn vs adapter dispatch). Remove after
+    // CI surfaces a single Probe 5 failure trace.
+    eprintln!(
+        "G4_ADAPTER_ENTRY: closure={closure_ptr:?}, args_ptr={args_ptr:?}, args_len={args_len}"
+    );
+
     debug_assert!(
         args_len >= 1,
         "sigil_b4_return_arm_adapter: args_len must be >= 1 (post_arm_k \
@@ -1229,6 +1236,22 @@ pub unsafe extern "C" fn sigil_b4_return_arm_adapter(
         .write(sigil_continuation_identity as *const () as usize as u64);
 
     ns
+}
+
+/// Step 2 diagnostic breadcrumb (per Brian's directive 2026-05-02).
+/// Called from the entry of `sigil_b4_install_then_body`'s Cranelift
+/// body to confirm that install_fn was actually dispatched. Remove
+/// after CI surfaces a single Probe 5 failure trace.
+///
+/// # Safety
+///
+/// No safety obligations on the caller. This fn takes no arguments
+/// and only writes to stderr; it is `unsafe extern "C"` solely to
+/// match the `#[no_mangle]` runtime-FFI convention used throughout
+/// `handlers.rs`.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_g4_install_breadcrumb() {
+    eprintln!("G4_INSTALL_FN_ENTRY");
 }
 
 // ---------------------------------------------------------------------
