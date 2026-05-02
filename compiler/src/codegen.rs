@@ -322,6 +322,11 @@ fn compute_user_fn_abi(
     // color fn whose body's Match shape doesn't match the classifier
     // falls through to Sync ABI and uses the synchronous `sigil_run_-
     // loop` path (the Phase 4d MVP behaviour).
+    //
+    // B.1 ignores the perform-arm-indices Vec returned by the classifier —
+    // B.2's synth-cont allocation pass will consume it (one synth-cont per
+    // index). For B.1 we only need to know whether the body matches the
+    // shape, not which arms.
     if is_compound_match_with_arm_perform_body(body, &ctors).is_some() {
         return UserFnAbi::Cps;
     }
@@ -7275,6 +7280,29 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // surface width (e.g., narrower-int returns), and a
                 // pre-computed width risks an invalid `uextend.i64
                 // v_i64` IR.
+                //
+                // **Temporary trampoline-charter regression** (closes in
+                // B.3): B.1's emit reuses `lower_perform_to_value`'s
+                // synchronous `sigil_run_loop` drive for the perform-
+                // bearing arm. Because this branch fires inside a Cps-
+                // ABI fn (which is ITSELF driven by an outer
+                // `sigil_run_loop`), B.1 introduces a window where
+                // recursive perform-bearing fns produce nested
+                // `sigil_run_loop` calls (one per perform site). This
+                // violates `feedback_sigil_trampoline_charter` ("must
+                // stay stack-bounded; lambda-lift continuations") and is
+                // tracked as a runtime cost, not a correctness regression
+                // — the recursive Generator test stays `#[ignore]`'d
+                // through B.3, and B.3 closes the window via direct
+                // `NextStep::Call` dispatch from the synth-cont (B.2's
+                // allocation), making the inner driver redundant. See
+                // PR #74 body for the full charter-window rationale.
+                //
+                // B.1 ignores the perform-arm-indices Vec returned by
+                // `is_compound_match_with_arm_perform_body` — B.2's
+                // synth-cont allocation pass will consume it (one synth-
+                // cont per index). For B.1 we only need to know whether
+                // the body matches the shape (bool), not which arms.
                 let is_compound_match_body =
                     is_compound_match_with_arm_perform_body(&f.body, &ctors).is_some();
                 if is_compound_match_body {
@@ -7439,6 +7467,25 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 }
 
                 let synth_cont_idx_opt = cps_continuation_synth_indices.get(&f.name).copied();
+                // Detection-before-dispatch ordering guard. The existing
+                // None-synth-cont arm `unreachable!()`'s on body tails
+                // that aren't `Some(Expr::Perform)` (e.g., compound
+                // `Expr::Match` body tails). B.1's compound-match branch
+                // (above) returns early via `continue` BEFORE we reach
+                // here, but a future PR adding another body shape that
+                // lands in this dispatch and isn't a tail-perform would
+                // silently break. This assert turns that silent break
+                // into a debug-build crash with a pointer at the
+                // precedent.
+                debug_assert!(
+                    matches!(f.body.tail, Some(crate::ast::Expr::Perform(_)))
+                        || synth_cont_idx_opt.is_some(),
+                    "compute_user_fn_abi: a fn body without a tail-perform AND without a synth-cont \
+                     reached the existing dispatch path. New body shapes (e.g. compound match) MUST \
+                     return earlier via their own dispatch arm. See codegen.rs:7180+ for B.1's \
+                     compound-match early-return precedent. fn=`{}`",
+                    f.name
+                );
                 let (body_perform, synth_cont_func_id_opt) = if let Some(idx) = synth_cont_idx_opt {
                     let p = match &f.body.stmts[0] {
                         crate::ast::Stmt::Perform(p) => p.clone(),
