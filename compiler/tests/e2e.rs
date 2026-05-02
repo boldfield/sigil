@@ -8318,6 +8318,72 @@ fn task_78_5_g4_approach6_nested_handles_each_return_arm_fires_for_its_own_body(
     );
 }
 
+/// **Task 78.5 G4 Approach 6 deep-redo (PR #80 review §4) — B != R
+/// regression: body type B is narrower than handler-overall R.**
+///
+/// The custom handle body-call wrapper drives the body's run_loop which
+/// (when the body's natural exit fires the helper) returns the return
+/// arm's R-typed value as the trampoline's u64. An earlier iteration of
+/// this PR narrowed the wrapper's `raw_u64` to B (the callee's declared
+/// return type) before handing it to Phase 4g — Phase 4g's suppression
+/// branch then re-widened to I64 with `uextend` (zero-extend), which
+/// CLIPS bits whenever R is wider than B in Cranelift width. For
+/// String / pointer-typed R (I64) and Char-typed B (I32) the upper
+/// 32 bits of the return-arm pointer are lost; downstream
+/// `IO.println(result)` then dereferences a corrupt pointer and either
+/// segfaults or prints garbage.
+///
+/// **Setup**: body is `body_returning_char()` — a Cps fn returning
+/// `Char` (I32) that performs `E.op` and tails on a Char literal. The
+/// handle declares `result: String` and `return(_c) => "ok"` — so R =
+/// String (pointer_ty = I64). The arm `E.op(k) => k(0)` keeps the body
+/// running so its tail Char `'a'` becomes the helper's argument, then
+/// the helper invokes return_arm which yields the String "ok".
+///
+/// The wrapper now returns `(body_val, raw_u64, fired_v)`: `body_val`
+/// stays narrowed to B for Phase 4g's non-suppression paths, but the
+/// suppression branch consumes `raw_u64` directly (full 64 bits) and
+/// narrows once to handler_overall_ty.
+///
+/// **Invariant**: stdout = `"ok\n"`, exit 0. Pre-fix output is
+/// non-deterministic (segfault, garbage bytes, or panic) depending on
+/// the host's pointer layout — any non-`"ok\n"` outcome surfaces the
+/// regression.
+#[test]
+fn task_78_5_g4_approach6_b_neq_r_pointer_return_arm_through_char_body() {
+    let src = "import std.io\n\
+               \n\
+               effect E { op: () -> Int }\n\
+               \n\
+               fn body_returning_char() -> Char ![E] {\n  \
+                 let _: Int = perform E.op();\n  \
+                 'a'\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: String = handle body_returning_char() with {\n    \
+                   E.op(k) => k(0),\n    \
+                   return(_c) => \"ok\",\n  \
+                 };\n  \
+                 perform IO.println(result);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_b_neq_r_pointer_return_arm_through_char_body",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "ok\n",
+        "B != R: body returns Char (I32, narrower), handler returns \
+         String (pointer_ty = I64, wider). Pre-fix wrapper narrowed \
+         raw_u64 to Char and the suppression branch's re-widen via \
+         uextend lost the upper 32 bits of the \"ok\" String pointer. \
+         Wrong stdout (or segfault) surfaces the regression. \
+         stderr={stderr:?}"
+    );
+}
+
 /// **Task 78.5 G4 Phase B.1 — non-recursive compound-match-with-arm-perform
 /// emits + runs.**
 ///

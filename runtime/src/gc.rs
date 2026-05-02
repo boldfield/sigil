@@ -136,6 +136,7 @@ pub extern "C" fn sigil_gc_init() {
     {
         crate::handlers::register_handler_stack_root_for_calling_thread();
         crate::handlers::register_outer_post_arm_k_stack_root_for_calling_thread();
+        crate::handlers::register_body_return_arm_stack_root_for_calling_thread();
         crate::arena::register_arena_root_for_calling_thread();
     }
 }

@@ -237,61 +237,6 @@ thread_local! {
     /// stack slot at consumption time.
     static LAST_TERMINAL_VALUE: Cell<u64> = const { Cell::new(0) };
 
-    /// Task 78.5 G4 Approach 6 deep-redo — body-fn natural-exit
-    /// return-arm dispatch pair (closure + fn-ptr).
-    ///
-    /// Set by codegen at the handle expression's body-call entry
-    /// (custom Sync→Cps wrapper for direct-Cps-call bodies); read by
-    /// `sigil_done_or_dispatch_return_arm` at body-fn natural-exit
-    /// emit sites (codegen.rs:8415, 10713, 10983, 11402) to wrap the
-    /// terminal value via the return arm.
-    ///
-    /// **Why TLS** (vs the existing `HandlerFrame.return_closure` /
-    /// `return_fn` fields used by Phase 4g): Phase 4g fires post-body-
-    /// `run_loop` on the chain-unwound value (shallow handler
-    /// semantics). Generator's collecting handler requires deep
-    /// semantics — wrap at the deepest `k(arg)` terminus so the
-    /// `outer_post_arm_k_stack` chain unwinds with already-wrapped
-    /// values. The TLS pair is set/cleared/saved/restored at run_loop
-    /// boundaries by codegen so the helper can read the active handle's
-    /// return arm without traversing the handler-frame stack.
-    ///
-    /// **GC reasoning**: stores a heap pointer (closure record) but
-    /// no separate Boehm root is registered — the same closure record
-    /// is also stored on the handle's `HandlerFrame.return_closure`
-    /// (registered via `sigil_handler_frame_set_return`), and that
-    /// frame is rooted via `HANDLER_STACK`. The TLS read path
-    /// (`sigil_done_or_dispatch_return_arm`) executes while the body's
-    /// frame is still on the handler stack, so the closure record is
-    /// reachable. Codegen save/restore around nested `run_loop` calls
-    /// (lower_call's Cps branch + Sync shim) holds the saved values in
-    /// Cranelift SSA Values which Boehm's conservative scan covers via
-    /// register / spill discipline.
-    static BODY_RETURN_ARM_CLOSURE: Cell<*mut u8> = const { Cell::new(ptr::null_mut()) };
-    /// Companion fn-ptr slot to `BODY_RETURN_ARM_CLOSURE`. Non-GC
-    /// (fn-ptrs are not heap pointers).
-    static BODY_RETURN_ARM_FN: Cell<*mut u8> = const { Cell::new(ptr::null_mut()) };
-    /// Task 78.5 G4 Approach 6 deep-redo — suppression flag, set by
-    /// `sigil_done_or_dispatch_return_arm` when it dispatches the
-    /// return arm. Two readers:
-    ///
-    /// 1. The helper itself, on subsequent invocations within the same
-    ///    body `run_loop` (e.g., during `outer_post_arm_k_stack` chain
-    ///    unwinding when the post-arm-k synth fn's body Done emit is
-    ///    site 10713 / 10983, which we replace with the helper) — if
-    ///    set, the helper falls through to `sigil_next_step_done(v)`
-    ///    instead of double-wrapping.
-    /// 2. The handle expression's Phase 4g code (codegen.rs:13826) —
-    ///    if set, skips the second nested `run_loop` that would
-    ///    otherwise apply the return arm to the (already-wrapped) body
-    ///    value.
-    ///
-    /// Reset to `false` by codegen at the handle expression's body-call
-    /// entry, alongside setting `BODY_RETURN_ARM_*`. Saved/restored
-    /// across nested `run_loop` boundaries by codegen along with the
-    /// closure/fn pair.
-    static BODY_RETURN_ARM_FIRED: Cell<bool> = const { Cell::new(false) };
-
     /// Plan D Task 117 — push/pop relink discipline tracker.
     ///
     /// Each entry is `(frame_ptr, did_link)`: the frame whose
@@ -447,6 +392,103 @@ thread_local! {
     };
     static OUTER_POST_ARM_K_DEPTH: Cell<usize> = const { Cell::new(0) };
     static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
+}
+
+// ---------------------------------------------------------------------
+// Task 78.5 G4 Approach 6 deep-redo — body-return-arm stack
+// (replaces the iter-2 single-cell triplet TLS per PR #80 review §1)
+// ---------------------------------------------------------------------
+//
+// Mirrors `OUTER_POST_ARM_K_STACK`'s discipline. Each entry holds a
+// (closure_ptr, fn_ptr, fired) triple identifying the active handle's
+// return arm at the body-fn natural-exit emit sites. Stack discipline:
+//
+//   - **Custom handle body-call wrapper** pushes (return_arm_closure,
+//     return_arm_fn) BEFORE driving the body's run_loop; pops AFTER,
+//     yielding the popped entry's `fired` flag for Phase 4g.
+//   - **Sync→Cps interop wrappers** (`lower_call`'s Cps branch + Sync
+//     shim) push (null, null) BEFORE the nested run_loop to mask the
+//     outer pair (Risk 3 discipline — sub-Cps-fn calls' natural-exit
+//     helpers see null and emit `Done(v)` directly); pop AFTER.
+//   - **Helper** `sigil_done_or_dispatch_return_arm` reads the top
+//     entry; if depth==0 OR fn==null OR fired → emit `Done(v)`; else
+//     mark top.fired=true + dispatch return arm.
+//
+// **Why a stack** (vs the iter-2 single-cell triplet): the stack
+// pattern co-locates push+pop discipline at every nested-run_loop
+// boundary, eliminating the SAVE+CLEAR+SET / RESTORE call-quartet that
+// future Cps-interop sites could forget (Risk-3-style silent bug).
+// Mirrors the existing `OUTER_POST_ARM_K_STACK` discipline so push/pop
+// invariants and Boehm-rooting reasoning are uniform across both.
+//
+// **GC rooting**: closures are heap pointers — the stack array is
+// registered as a Boehm root via
+// `register_body_return_arm_stack_root_for_calling_thread`, mirroring
+// `OUTER_POST_ARM_K_STACK`'s registration. Pop clears the popped
+// slot's pointers so a stale entry doesn't outlive its useful
+// lifetime in the rooted range.
+
+const BODY_RETURN_ARM_STACK_SIZE: usize = 32;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct BodyReturnArmEntry {
+    closure_ptr: *mut u8,
+    fn_ptr: *mut u8,
+    fired: bool,
+}
+
+thread_local! {
+    static BODY_RETURN_ARM_STACK: Cell<[BodyReturnArmEntry; BODY_RETURN_ARM_STACK_SIZE]> = const {
+        Cell::new([BodyReturnArmEntry {
+            closure_ptr: ptr::null_mut(),
+            fn_ptr: ptr::null_mut(),
+            fired: false,
+        }; BODY_RETURN_ARM_STACK_SIZE])
+    };
+    static BODY_RETURN_ARM_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static BODY_RETURN_ARM_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Register the calling thread's `BODY_RETURN_ARM_STACK` TLS cell as
+/// a Boehm GC root. Idempotent per thread. Mirrors
+/// [`register_outer_post_arm_k_stack_root_for_calling_thread`].
+pub(crate) fn register_body_return_arm_stack_root_for_calling_thread() -> (*mut c_void, *mut c_void)
+{
+    BODY_RETURN_ARM_STACK.with(|cell| {
+        let start =
+            cell as *const Cell<[BodyReturnArmEntry; BODY_RETURN_ARM_STACK_SIZE]> as *mut c_void;
+        let end = unsafe {
+            (start as *mut u8).add(core::mem::size_of::<
+                [BodyReturnArmEntry; BODY_RETURN_ARM_STACK_SIZE],
+            >()) as *mut c_void
+        };
+        let already_registered = BODY_RETURN_ARM_STACK_ROOTED.with(|rooted| {
+            let r = rooted.get();
+            rooted.set(true);
+            r
+        });
+        if !already_registered {
+            unsafe {
+                crate::gc::GC_add_roots(start, end);
+            }
+        }
+        (start, end)
+    })
+}
+
+/// Inverse of [`register_body_return_arm_stack_root_for_calling_thread`].
+/// Used by `GcThreadEnrolment::drop` in tests.
+#[cfg(test)]
+pub(crate) fn unregister_body_return_arm_stack_root_for_calling_thread(
+    start: *mut c_void,
+    end: *mut c_void,
+) {
+    BODY_RETURN_ARM_STACK_ROOTED.with(|rooted| rooted.set(false));
+    BODY_RETURN_ARM_DEPTH.with(|depth| depth.set(0));
+    unsafe {
+        crate::gc::GC_remove_roots(start, end);
+    }
 }
 
 /// Register the calling thread's `OUTER_POST_ARM_K_STACK` TLS cell as
@@ -981,168 +1023,157 @@ pub unsafe extern "C" fn sigil_reset_last_terminal_value() {
 }
 
 // ---------------------------------------------------------------------
-// Task 78.5 G4 Approach 6 deep-redo — body-fn-natural-exit return-arm
-// dispatch (deep-handler semantics)
+// Task 78.5 G4 Approach 6 deep-redo — body-return-arm stack helpers
+// (PR #80 review §1: replaces single-cell-triplet TLS + SAVE+CLEAR+SET
+// /RESTORE call quartet with stack discipline mirroring
+// `OUTER_POST_ARM_K_STACK`)
 // ---------------------------------------------------------------------
 
-/// Set the per-thread `BODY_RETURN_ARM_CLOSURE` / `BODY_RETURN_ARM_FN`
-/// pair. Codegen calls this at the handle expression's body-call entry
-/// (custom Sync→Cps wrapper for direct-Cps-call bodies) so the helper
-/// at body-fn natural-exit emit sites can dispatch through the active
-/// handle's return arm.
+/// Push a body-return-arm entry onto the thread-local stack with
+/// `fired = false`. Codegen emits this:
 ///
-/// Does NOT reset `BODY_RETURN_ARM_FIRED`. Use
-/// `sigil_clear_body_return_arm` for the full-reset semantic.
+/// 1. From the **custom handle body-call wrapper** with the active
+///    handle's `(return_arm_closure, return_arm_fn)` — the body's
+///    natural-exit helper sites read the top entry and dispatch the
+///    return arm.
+/// 2. From **`lower_call`'s `UserFnAbi::Cps` branch + Sync shim**
+///    around their nested `run_loop` calls with `(null, null)` —
+///    masks the outer pair so sub-Cps-fn calls' natural-exit helpers
+///    see null and emit `Done(v)` directly (Risk 3 discipline).
+///
+/// Aborts on stack overflow (cap = `BODY_RETURN_ARM_STACK_SIZE` = 32).
+/// Every push must be paired with one `sigil_body_return_arm_pop` (the
+/// codegen wrapper that pushes also emits the matching pop).
 ///
 /// # Safety
 ///
-/// Safe to call. Writes thread-local state; no other side effects.
-/// `closure` may be null (when the return arm has no captures, mirroring
-/// the existing `HandlerFrame.return_closure` discipline). `fn_addr` is
-/// expected non-null by the helper read path; passing null effectively
-/// disables the helper (helper falls through to plain `Done(v)`).
+/// Safe to call. Writes thread-local state. `closure_ptr` may be null
+/// (return arms with no captures, or sub-call-mask pushes); `fn_ptr`
+/// may be null (sub-call-mask pushes — the helper checks for null fn
+/// and emits `Done(v)` instead of dispatching).
 #[no_mangle]
-pub unsafe extern "C" fn sigil_set_body_return_arm(closure: *mut u8, fn_addr: *mut u8) {
-    BODY_RETURN_ARM_CLOSURE.with(|c| c.set(closure));
-    BODY_RETURN_ARM_FN.with(|c| c.set(fn_addr));
+pub unsafe extern "C" fn sigil_body_return_arm_push(closure_ptr: *mut u8, fn_ptr: *mut u8) {
+    BODY_RETURN_ARM_DEPTH.with(|depth_cell| {
+        let depth = depth_cell.get();
+        if depth >= BODY_RETURN_ARM_STACK_SIZE {
+            eprintln!(
+                "sigil_body_return_arm_push: stack overflow (depth {} >= cap {})",
+                depth, BODY_RETURN_ARM_STACK_SIZE
+            );
+            std::process::abort();
+        }
+        BODY_RETURN_ARM_STACK.with(|stack_cell| {
+            let mut stack = stack_cell.get();
+            stack[depth] = BodyReturnArmEntry {
+                closure_ptr,
+                fn_ptr,
+                fired: false,
+            };
+            stack_cell.set(stack);
+        });
+        depth_cell.set(depth + 1);
+    });
 }
 
-/// Set the per-thread `BODY_RETURN_ARM_FIRED` flag from a u8 (0/non-0).
-/// Codegen calls this when restoring TLS after a nested `run_loop`
-/// (lower_call's Cps branch's save+restore pattern around sub-Cps-fn
-/// calls).
+/// Pop the top body-return-arm entry. Returns the popped entry's
+/// `fired` flag as a u8 (0 or 1) so Phase 4g's suppression branch can
+/// check it without a separate TLS read. Aborts on underflow (push/pop
+/// imbalance is a codegen bug, not a user-program error).
 ///
 /// # Safety
 ///
-/// Safe to call. Writes thread-local state.
+/// Safe to call. Writes thread-local state. The popped slot's pointer
+/// fields are zeroed so a stale entry doesn't survive in the
+/// Boehm-rooted range across the next GC scan.
 #[no_mangle]
-pub unsafe extern "C" fn sigil_set_body_return_arm_fired(fired: u8) {
-    BODY_RETURN_ARM_FIRED.with(|c| c.set(fired != 0));
+pub unsafe extern "C" fn sigil_body_return_arm_pop() -> u8 {
+    BODY_RETURN_ARM_DEPTH.with(|depth_cell| {
+        let depth = depth_cell.get();
+        if depth == 0 {
+            eprintln!("sigil_body_return_arm_pop: underflow (depth=0)");
+            std::process::abort();
+        }
+        depth_cell.set(depth - 1);
+        BODY_RETURN_ARM_STACK.with(|stack_cell| {
+            let mut stack = stack_cell.get();
+            let popped = stack[depth - 1];
+            stack[depth - 1] = BodyReturnArmEntry {
+                closure_ptr: ptr::null_mut(),
+                fn_ptr: ptr::null_mut(),
+                fired: false,
+            };
+            stack_cell.set(stack);
+            if popped.fired {
+                1
+            } else {
+                0
+            }
+        })
+    })
 }
 
-/// Read the per-thread `BODY_RETURN_ARM_CLOSURE`. Codegen reads this
-/// to save TLS before clearing for nested `run_loop` calls.
+/// Body-fn natural-exit terminal helper. Codegen replaces the Done
+/// emit at four body-fn natural-exit sites with a call to this helper:
+///
+/// - **B.2 hand-rolled compound-match dispatcher's ConstantDone arm**
+///   (e.g., Generator `iterate`'s `Nil` arm).
+/// - **Slice B post-arm-k synth fn body Done emit** (e.g., Generator's
+///   `Cons(x, rest)` arm body during outer_post_arm_k_stack chain
+///   unwind).
+/// - **Slice C post-arm-k chain Final step Done emit**.
+/// - **`CpsContinuationKind::ConstantDone` synth-cont dispatch**.
+///
+/// **Behavior** (reads top of `BODY_RETURN_ARM_STACK`):
+///
+/// - If stack is empty OR top entry has null fn OR top entry's fired
+///   flag is set → emit `sigil_next_step_done(v)`. The fired-set case
+///   fires during chain-unwinding helper invocations after the body's
+///   deepest natural-exit already wrapped; the null-fn case fires
+///   under sub-Cps-fn-call masks pushed by `lower_call`'s Cps branch
+///   (Risk 3); the empty case fires when the body fn isn't running
+///   under any handle.
+/// - Otherwise: dispatch the return arm via
+///   `NextStep::Call(closure, fn, [v, null, identity])` per the
+///   Phase 4g return-arm-synth-fn dispatch contract. Marks the top
+///   entry's fired=true so subsequent invocations skip re-wrapping
+///   AND Phase 4g's pop-returned `fired` lets the handle expression
+///   skip the second nested `run_loop`.
 ///
 /// # Safety
 ///
-/// Safe to call. Reads thread-local state.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_get_body_return_arm_closure() -> *mut u8 {
-    BODY_RETURN_ARM_CLOSURE.with(|c| c.get())
-}
-
-/// Read the per-thread `BODY_RETURN_ARM_FN`. Codegen reads this to
-/// save TLS before clearing for nested `run_loop` calls.
-///
-/// # Safety
-///
-/// Safe to call. Reads thread-local state.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_get_body_return_arm_fn() -> *mut u8 {
-    BODY_RETURN_ARM_FN.with(|c| c.get())
-}
-
-/// Read the per-thread `BODY_RETURN_ARM_FIRED` flag as u8 (0 or 1).
-/// Two readers:
-///
-/// 1. Codegen at the handle expression's Phase 4g (codegen.rs:13826) —
-///    after body's `run_loop` returns, if this flag is set, the helper
-///    already wrapped via the return arm; Phase 4g skips the second
-///    nested `run_loop` that would double-wrap.
-/// 2. Codegen save/restore around nested `run_loop` calls (lower_call
-///    Cps branch + Sync shim).
-///
-/// # Safety
-///
-/// Safe to call. Reads thread-local state.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_get_body_return_arm_fired() -> u8 {
-    if BODY_RETURN_ARM_FIRED.with(|c| c.get()) {
-        1
-    } else {
-        0
-    }
-}
-
-/// Clear the body-return-arm TLS triplet (closure, fn, fired). Codegen
-/// calls this at handle expression entry before SET to ensure clean
-/// state across handle expressions (the SET helper does not reset
-/// FIRED; this combined helper does).
-///
-/// Also called by lower_call's Cps branch to clear TLS before driving
-/// a nested `run_loop` for a sub-Cps-fn call (so the sub-call does NOT
-/// inherit the outer body's return-arm pair — Risk 3 discipline). The
-/// caller then `sigil_set_body_return_arm` + `sigil_set_body_return_arm_fired`
-/// to restore after the nested run_loop returns.
-///
-/// # Safety
-///
-/// Safe to call. Writes thread-local state.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_clear_body_return_arm() {
-    BODY_RETURN_ARM_CLOSURE.with(|c| c.set(ptr::null_mut()));
-    BODY_RETURN_ARM_FN.with(|c| c.set(ptr::null_mut()));
-    BODY_RETURN_ARM_FIRED.with(|c| c.set(false));
-}
-
-/// Body-fn natural-exit terminal helper. Codegen replaces 4 Done-emit
-/// sites with a call to this helper:
-///
-/// - codegen.rs:8415 — B.2 hand-rolled compound-match dispatcher's
-///   ConstantDone arm (e.g., Generator iterate's Nil arm).
-/// - codegen.rs:10713 — Slice B post-arm-k synth fn body Done emit
-///   (e.g., Generator's `Cons(x, rest)` arm body during chain unwind).
-/// - codegen.rs:10983 — Slice C post-arm-k chain Final step Done emit.
-/// - codegen.rs:11402 — `CpsContinuationKind::ConstantDone` synth-cont
-///   dispatch.
-///
-/// **Behavior:**
-///
-/// - If `BODY_RETURN_ARM_FIRED == true`: emit `sigil_next_step_done(v)`
-///   directly. This case fires during `outer_post_arm_k_stack` chain
-///   unwinding AFTER the helper has already wrapped at the deepest
-///   natural exit — the post-arm-k synth fns at sites 10713 / 10983
-///   evaluate their arm-body tail with the (already-wrapped) `r`
-///   binding and emit Done; we must not re-wrap their result.
-/// - Else if `BODY_RETURN_ARM_FN` is non-null: dispatch the return arm
-///   via `NextStep::Call(closure, fn, [v, null, identity])` per the
-///   Phase 4g return-arm-synth-fn dispatch contract (3-slot trailing
-///   pair). The trailing pair is `(null, sigil_continuation_identity)`
-///   matching Phase 4g's hard-coded "no further chaining" terminator.
-///   Sets `BODY_RETURN_ARM_FIRED = true` so subsequent invocations + the
-///   handle expression's Phase 4g check skip re-wrapping.
-/// - Else: emit `sigil_next_step_done(v)`. Body fn is not running under
-///   an active handle (or no return arm declared) — standard Done emit.
-///
-/// # Safety
-///
-/// Safe to call. Reads/writes thread-local state. The returned NextStep
-/// pointer is owned by the per-dispatch arena; the trampoline frees it
-/// after dispatch.
+/// Safe to call. Reads/mutates the top of the thread-local stack.
+/// Returned NextStep pointer is owned by the per-dispatch arena.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_done_or_dispatch_return_arm(v: u64) -> *mut NextStep {
-    let fired = BODY_RETURN_ARM_FIRED.with(|c| c.get());
-    let fn_addr = BODY_RETURN_ARM_FN.with(|c| c.get());
-    if !fired && !fn_addr.is_null() {
-        let closure = BODY_RETURN_ARM_CLOSURE.with(|c| c.get());
-        BODY_RETURN_ARM_FIRED.with(|c| c.set(true));
-        let ns = sigil_next_step_call(closure, fn_addr, 3);
-        let args = sigil_next_step_args_ptr(ns);
-        // Trailing-pair slots match Phase 4g's return-arm-synth-fn
-        // dispatch contract: [v, null_post_handle_k_closure,
-        // identity_post_handle_k_fn]. The synth fn's body emits
-        // Call(post_handle_k_closure_loaded, post_handle_k_fn_loaded,
-        // [tail_widened, null, identity]); identity → Done(tail).
-        ptr::write(args.add(0), v);
-        ptr::write(args.add(1), 0u64);
-        ptr::write(
-            args.add(2),
-            sigil_continuation_identity as *const () as usize as u64,
-        );
-        ns
-    } else {
-        sigil_next_step_done(v)
+    let depth = BODY_RETURN_ARM_DEPTH.with(|c| c.get());
+    if depth == 0 {
+        return sigil_next_step_done(v);
     }
+    let top = BODY_RETURN_ARM_STACK.with(|c| c.get()[depth - 1]);
+    if top.fired || top.fn_ptr.is_null() {
+        return sigil_next_step_done(v);
+    }
+    // Mark top.fired = true (read entry, modify, write back —
+    // Cell<[Entry; N]> doesn't allow direct interior mutation).
+    BODY_RETURN_ARM_STACK.with(|stack_cell| {
+        let mut stack = stack_cell.get();
+        stack[depth - 1].fired = true;
+        stack_cell.set(stack);
+    });
+    let ns = sigil_next_step_call(top.closure_ptr, top.fn_ptr, 3);
+    let args = sigil_next_step_args_ptr(ns);
+    // Trailing-pair slots match Phase 4g's return-arm-synth-fn
+    // dispatch contract: [v, null_post_handle_k_closure,
+    // identity_post_handle_k_fn]. The synth fn's body emits
+    // Call(post_handle_k_loaded, post_handle_k_fn_loaded,
+    // [tail_widened, null, identity]); identity → Done(tail).
+    ptr::write(args.add(0), v);
+    ptr::write(args.add(1), 0u64);
+    ptr::write(
+        args.add(2),
+        sigil_continuation_identity as *const () as usize as u64,
+    );
+    ns
 }
 
 /// Allocate a `NEXT_STEP_TAG_DISCHARGED` record from the per-dispatch
