@@ -11931,7 +11931,63 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // `compute_user_fn_abi` to route compound-match fns
                 // to `UserFnAbi::Cps`, B.4's detector starts firing
                 // for them automatically.
-                let b4_eligible = return_arm.is_some() && self.is_b4_eligible_cps_body_call(body);
+                let b4_shape_eligible =
+                    return_arm.is_some() && self.is_b4_eligible_cps_body_call(body);
+
+                // **B.4 escape-barrier gate (PR #75 iter 2 fix):** if
+                // any op arm body returns / contains a k-pair-bearing
+                // lifted lambda (Stage-6.8-followup Layer 3c shape —
+                // `Trigger.fire(k) => fn (s) => k(s)(s)` and
+                // friends), the captured (k_closure, k_fn) pair
+                // ESCAPES the handle via the lambda. The B.4 trailing-
+                // pair installation changes what gets captured: pre-
+                // B.4 captures `(null, identity)` so post-handle k(s)
+                // round-trips through identity → Done(s); B.4-active
+                // captures `(return_closure, return_fn)` so post-
+                // handle k(s) routes through the return arm —
+                // observable as DOUBLE-WRAPPING when the existing
+                // `lower_k_pair_call` Layer 2 self-apply-return-arm
+                // path then ALSO applies the return arm (designed
+                // against the pre-B.4 identity round-trip).
+                //
+                // The shipped tests
+                // `handle_return_arm_with_outer_captures_in_k_pair_dispatch_path`,
+                // `handle_returning_k_capturing_lambda_invoked_outside_handle`,
+                // and
+                // `integration_bug2_plus_layer2_only_tail_perform_canonical_arms`
+                // exercise this shape (CPS body call + return arm +
+                // arm body returning k-capturing lambda). They
+                // depend on the captured k pair being identity for
+                // the post-handle k(s) round-trip semantics. B.4
+                // must NOT fire for these to preserve their behavior.
+                //
+                // **Detection:** walk every op arm's synth body; if
+                // any contains a `ClosureRecord` whose `code_fn_name`
+                // is registered in `arm_k_pair_captures` (i.e., a
+                // lifted k-pair-bearing lambda), the captured k pair
+                // leaks outside the handle. Per
+                // `feedback_sigil_handle_stack_discipline`, this
+                // mirrors the existing
+                // `arm_body_has_k_pair_lambda` query the handle
+                // pre-pass uses to decide whether arm closure
+                // records need the trailing-triple's frame_ptr slot.
+                //
+                // **Forward concern:** future shapes that DO want
+                // B.4 trailing-pair routing AND have escaping
+                // k-capturing lambdas would need either (a) the
+                // lambda lift to inherit the trailing pair from
+                // the surrounding handle's frame instead of
+                // capturing it from the perform site, or (b) the
+                // Layer 2 self-apply-return-arm path to detect
+                // when the captured k_fn IS the return-arm fn and
+                // skip the wrap. Both are larger lifts; the
+                // escape barrier gate at HEAD keeps the MVP shape
+                // narrow + the existing tests passing.
+                let any_arm_has_k_pair_lambda = arm_indices_for_handle.iter().any(|&synth_idx| {
+                    let arm_body = &self.handler_arm_synth[synth_idx].body;
+                    arm_body_has_k_pair_lambda(arm_body, self.arm_k_pair_captures)
+                });
+                let b4_eligible = b4_shape_eligible && !any_arm_has_k_pair_lambda;
 
                 let (body_val, b4_routed_via_return_arm) = if b4_eligible {
                     let snap = frame_1_ptr_snapshot.unwrap_or_else(|| {
