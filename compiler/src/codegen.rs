@@ -2707,6 +2707,81 @@ enum CpsContinuationKind {
         /// issues the next perform; `Final` lowers the tail.
         role: ChainStepRole,
     },
+    /// **Plan B Task 78.5 G4 Phase B.2 — compound-match per-arm post-
+    /// perform synth-cont**: one entry per perform-bearing arm of a fn
+    /// matching `is_compound_match_with_arm_perform_body`. The synth-
+    /// cont's body executes the rest of the arm body (the tail
+    /// expression after the perform).
+    ///
+    /// Each perform-arm has shape `Block { stmts: [Stmt::Let { name,
+    /// value: Expr::Perform } | Stmt::Perform], tail: Some(tail_expr) }`
+    /// (per [`arm_body_perform_then_tail_shape`]'s `PerformThenTail`
+    /// classification). At the parent helper's body-emit site, when
+    /// the match arm dispatcher reaches the perform-arm, it:
+    ///   1. Allocates a closure record holding `arm_pattern_captures
+    ///      ++ helper_param_captures` (both lists of [`SynthContCapture`]).
+    ///   2. Calls `sigil_perform(p, ..., k_closure=record,
+    ///      k_fn=synth_cont_func_addr)`.
+    ///   3. Returns the resulting `*mut NextStep` directly (no
+    ///      synchronous `sigil_run_loop` drive).
+    ///
+    /// The synth-cont's body (defined in the `cps_continuation_synth`
+    /// definition pass at the bottom of `emit_object`):
+    ///   1. Loads captures from `closure_ptr` at offsets 16+8*i (arm-
+    ///      pattern captures first, then helper-param captures).
+    ///   2. If `let_binding` is `Some`, narrows `args_ptr[0]` to the
+    ///      let-binding's type and binds it under the let's name.
+    ///      (For `Stmt::Perform`-only arms, `let_binding` is `None`
+    ///      and `args_ptr[0]` is ignored — the perform's value is
+    ///      discarded by source semantics.)
+    ///   3. Lowers `tail_expr` via Lowerer with all captures + let-
+    ///      binding bound in env. Widens to I64.
+    ///   4. Returns `Done(widen(tail_value, I64))` to the trampoline.
+    ///
+    /// **B.2 scope boundary** (per `feedback_sigil_trampoline_charter`):
+    /// the synth-cont's tail expression may invoke a Cps callee (e.g.,
+    /// `iterate(rest)` where `iterate` is the recursive helper itself).
+    /// At B.2 that recursive call routes through `Lowerer.lower_call`'s
+    /// existing Sync→Cps interop wrapper, which spawns a nested
+    /// `sigil_run_loop`. **B.3 closes this** by lowering the tail call
+    /// as `NextStep::Call` directly; **B.2's correctness gate** is only
+    /// that the synth-cont gets the arm-pattern captures into env
+    /// correctly — the tail's call mechanics are unchanged.
+    CompoundMatchArmPostPerform {
+        /// Arm-pattern bindings in scope at the perform site (e.g.,
+        /// `x`, `rest` from `Cons(x, rest)`). Captured at the perform-
+        /// call site by reading the bound SSA values from the parent
+        /// fn's `Lowerer.env` and packing them into the closure record.
+        /// Ordered as the captures walker encounters them in the tail
+        /// expression (free-var dedup preserves first-encounter order).
+        arm_pattern_captures: Vec<SynthContCapture>,
+        /// Helper user-param captures (free vars in tail expression
+        /// that resolve to a parent-fn user param, not an arm-pattern
+        /// binding). Concatenated AFTER `arm_pattern_captures` in the
+        /// closure record layout. Loaded by the synth-cont at offsets
+        /// 16 + 8*(arm_pattern_captures.len() + i).
+        helper_param_captures: Vec<SynthContCapture>,
+        /// The tail expression that the synth-cont lowers. Lowered with
+        /// all captures + optional let-binding bound in env. References
+        /// only globals, captures, the optional let-binding, and any
+        /// helper-internal scope visible at the perform site.
+        tail_expr: Box<crate::ast::Expr>,
+        /// Optional let-binding introduced by `Stmt::Let { name, value:
+        /// Expr::Perform }`. When `Some((name, ty, kind))`, the synth-
+        /// cont reads `args_ptr[0]` (the resumed perform's value),
+        /// narrows to `ty`, and binds it under `name` before lowering
+        /// the tail. `None` when the perform-arm uses `Stmt::Perform`
+        /// (which discards the value).
+        ///
+        /// Note (per PR #76 review): a former `tail_ty: Type` field was
+        /// dropped — actual widen logic uses
+        /// `dfg.value_type(tail_value)` (per
+        /// `feedback_sigil_dfg_value_type`), and the pre-stored
+        /// prediction was only ever referenced in an
+        /// assertion-failure message. The assertion now reports the
+        /// dynamic value type alone.
+        let_binding: Option<(String, Type, EnvSlotKind)>,
+    },
 }
 
 /// Plan B' Stage 6.7 (B.2) — what a [`CpsContinuationKind::ChainedLetBindStep`]
@@ -2857,6 +2932,442 @@ fn collect_chained_synth_cont_captures(
     }
     walk_collect_captures(tail_expr, &mut bound, helper_params, &mut out);
     out
+}
+
+/// Plan B Task 78.5 G4 Phase B.2 — collect free vars in a perform-arm's
+/// post-perform tail expression that resolve to either an arm-pattern
+/// binding or a helper user param. Two parallel output vecs are
+/// populated; the caller concatenates them in (arm-patterns, helper-
+/// params) order to lay out the synth-cont closure record.
+///
+/// `arm_pattern_names`: source-level names introduced by the arm's
+/// pattern (e.g., `x`, `rest` from `Cons(x, rest)`). At body-emit time
+/// the caller derives EnvSlotKind for each captured arm-pattern name
+/// from the typechecker's `Ty` for that binding (via `slot_kind_for_ty`
+/// applied to the variant.field_tys lookup); this walker only collects
+/// the names — kinds are filled in by the caller.
+///
+/// `helper_params`: parent fn's user params. Each free var resolving to
+/// a helper param produces a [`SynthContCapture`] with kind derived
+/// from the param's `TypeExpr` via `slot_kind_for_type_expr_post_mono`.
+///
+/// `bound`: pre-bound names (the optional let-binding name from the
+/// perform itself, e.g. `_` or `v` from `let v: Int = perform p; ...`).
+/// References to these in the tail are NOT captured (they're synth-
+/// cont-internal, threaded forward via `args_ptr[0]`).
+///
+/// The walker mirrors [`walk_collect_captures`]'s recursive shape, with
+/// per-arm pattern shadowing for nested matches (a nested match arm's
+/// pattern bindings shadow outer-scope captures).
+/// Plan B Task 78.5 G4 Phase B.2 — collect `(Cranelift Type, EnvSlotKind,
+/// Ty)` triples for every name introduced by a pattern, given the
+/// scrutinee's `Ty`. Mirrors [`Lowerer::predict_pattern_bindings`]'s
+/// recursive traversal but additionally yields the typecheck `Ty` for
+/// each binding (needed to derive `EnvSlotKind` via [`crate::closure_-
+/// convert::slot_kind_for_ty`]).
+///
+/// At codegen, `scrut_ty` may be `None` for catch-all-or-Var-only
+/// patterns whose width fallback is I64 (mirroring the predict
+/// fallback). Such bindings receive `EnvSlotKind::Int` (the
+/// canonical I64 fallback). Subsequent ctor-pattern recursion uses the
+/// constructor's variant field types from `type_layouts`, so the
+/// fallback only fires when `scrut_ty` is wholly absent — a corner the
+/// classifier doesn't admit (compound-match always has a typed
+/// scrutinee), but defended-in-depth here for surface stability.
+fn collect_pattern_binding_tys(
+    p: &crate::ast::Pattern,
+    scrut_ty: Option<&crate::typecheck::Ty>,
+    type_layouts: &BTreeMap<String, crate::layout::TypeLayout>,
+    ctor_index: &BTreeMap<String, (String, usize)>,
+    pointer_ty: Type,
+    out: &mut BTreeMap<String, (Type, EnvSlotKind, crate::typecheck::Ty)>,
+) {
+    use crate::ast::{CtorPatternFields, Pattern};
+    use crate::typecheck::Ty;
+    match p {
+        Pattern::Wildcard(_)
+        | Pattern::IntLit(..)
+        | Pattern::BoolLit(..)
+        | Pattern::CharLit(..) => {}
+        Pattern::Var(name, _) => {
+            // Check nullary-ctor-promotion: if `name` matches a Unit
+            // variant of `scrut_ty`'s user-type, the pattern is a
+            // discriminant check, not a binding. Mirrors the codegen
+            // promotion in `emit_pattern_test`.
+            let is_nullary_ctor = match scrut_ty {
+                Some(Ty::User(type_name, _)) => type_layouts
+                    .get(type_name)
+                    .and_then(|l| l.variants.iter().find(|v| &v.name == name))
+                    .is_some_and(|v| v.field_tys.is_empty()),
+                _ => false,
+            };
+            if is_nullary_ctor {
+                return;
+            }
+            let (cl_ty, sk, ty) = match scrut_ty {
+                Some(t) => (
+                    cranelift_ty_of_ty(t, pointer_ty),
+                    crate::closure_convert::slot_kind_for_ty(t),
+                    t.clone(),
+                ),
+                None => (types::I64, EnvSlotKind::Int, Ty::Int),
+            };
+            out.insert(name.clone(), (cl_ty, sk, ty));
+        }
+        Pattern::Ctor { name, fields, .. } => {
+            let (type_name, variant_index) = match ctor_index.get(name).cloned() {
+                Some(x) => x,
+                None => return,
+            };
+            let variant = match type_layouts
+                .get(&type_name)
+                .and_then(|l| l.variants.get(variant_index))
+            {
+                Some(v) => v.clone(),
+                None => return,
+            };
+            match fields {
+                CtorPatternFields::Unit => {}
+                CtorPatternFields::Positional(pats) => {
+                    for (i, sub) in pats.iter().enumerate() {
+                        if let Some(field_ty) = variant.field_tys.get(i) {
+                            collect_pattern_binding_tys(
+                                sub,
+                                Some(field_ty),
+                                type_layouts,
+                                ctor_index,
+                                pointer_ty,
+                                out,
+                            );
+                        }
+                    }
+                }
+                CtorPatternFields::Record(pat_fields) => {
+                    for f in pat_fields {
+                        if let Some(idx) = variant.field_names.iter().position(|n| n == &f.name) {
+                            if let Some(field_ty) = variant.field_tys.get(idx) {
+                                collect_pattern_binding_tys(
+                                    &f.pattern,
+                                    Some(field_ty),
+                                    type_layouts,
+                                    ctor_index,
+                                    pointer_ty,
+                                    out,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Pattern::Tuple(pats, _) => {
+            if let Some(Ty::Tuple(elem_tys)) = scrut_ty {
+                if pats.len() == elem_tys.len() {
+                    for (sub, ety) in pats.iter().zip(elem_tys.iter()) {
+                        collect_pattern_binding_tys(
+                            sub,
+                            Some(ety),
+                            type_layouts,
+                            ctor_index,
+                            pointer_ty,
+                            out,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn walk_collect_arm_post_perform_captures(
+    e: &crate::ast::Expr,
+    bound: &mut std::collections::BTreeSet<String>,
+    arm_pattern_names: &std::collections::BTreeSet<String>,
+    helper_params: &[crate::ast::Param],
+    arm_pat_out: &mut Vec<String>,
+    helper_param_out: &mut Vec<SynthContCapture>,
+) {
+    use crate::ast::Expr;
+    match e {
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::ClosureEnvLoad { .. } => {}
+        Expr::Ident(name, _) => {
+            if bound.contains(name) {
+                return;
+            }
+            // Arm-pattern bindings take priority over helper-param
+            // captures. The shadow ordering matches the source-language
+            // semantics: an arm's pattern binding masks any outer
+            // helper-param of the same name for the duration of the
+            // arm body's evaluation.
+            if arm_pattern_names.contains(name) {
+                if !arm_pat_out.iter().any(|n| n == name) {
+                    arm_pat_out.push(name.clone());
+                }
+            } else if let Some(param) = helper_params.iter().find(|p| p.name == *name) {
+                if !helper_param_out.iter().any(|c| c.name == *name) {
+                    helper_param_out.push(SynthContCapture {
+                        name: name.clone(),
+                        kind: slot_kind_for_type_expr_post_mono(&param.ty),
+                    });
+                }
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_collect_arm_post_perform_captures(
+                lhs,
+                bound,
+                arm_pattern_names,
+                helper_params,
+                arm_pat_out,
+                helper_param_out,
+            );
+            walk_collect_arm_post_perform_captures(
+                rhs,
+                bound,
+                arm_pattern_names,
+                helper_params,
+                arm_pat_out,
+                helper_param_out,
+            );
+        }
+        Expr::Unary { operand, .. } => {
+            walk_collect_arm_post_perform_captures(
+                operand,
+                bound,
+                arm_pattern_names,
+                helper_params,
+                arm_pat_out,
+                helper_param_out,
+            );
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            walk_collect_arm_post_perform_captures(
+                cond,
+                bound,
+                arm_pattern_names,
+                helper_params,
+                arm_pat_out,
+                helper_param_out,
+            );
+            walk_collect_arm_post_perform_captures_block(
+                then_block,
+                bound,
+                arm_pattern_names,
+                helper_params,
+                arm_pat_out,
+                helper_param_out,
+            );
+            walk_collect_arm_post_perform_captures_block(
+                else_block,
+                bound,
+                arm_pattern_names,
+                helper_params,
+                arm_pat_out,
+                helper_param_out,
+            );
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            walk_collect_arm_post_perform_captures(
+                scrutinee,
+                bound,
+                arm_pattern_names,
+                helper_params,
+                arm_pat_out,
+                helper_param_out,
+            );
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                collect_pattern_bindings(&arm.pattern, &mut arm_bound);
+                walk_collect_arm_post_perform_captures(
+                    &arm.body,
+                    &mut arm_bound,
+                    arm_pattern_names,
+                    helper_params,
+                    arm_pat_out,
+                    helper_param_out,
+                );
+            }
+        }
+        Expr::Block(b) => walk_collect_arm_post_perform_captures_block(
+            b,
+            bound,
+            arm_pattern_names,
+            helper_params,
+            arm_pat_out,
+            helper_param_out,
+        ),
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                walk_collect_arm_post_perform_captures(
+                    &f.value,
+                    bound,
+                    arm_pattern_names,
+                    helper_params,
+                    arm_pat_out,
+                    helper_param_out,
+                );
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                walk_collect_arm_post_perform_captures(
+                    el,
+                    bound,
+                    arm_pattern_names,
+                    helper_params,
+                    arm_pat_out,
+                    helper_param_out,
+                );
+            }
+        }
+        // Call / Perform / Handle / Lambda / ClosureRecord — recurse
+        // structurally so a free Ident inside a call's args (e.g.,
+        // `iterate(rest)` references `rest`) gets captured. Unlike
+        // `walk_collect_captures` (which is for chain-helper bodies
+        // restricted to pure expressions by classifier), the post-
+        // perform tail here is permitted to contain Calls — that's
+        // the canonical iterate(rest) shape — so we recurse.
+        Expr::Call { callee, args, .. } => {
+            walk_collect_arm_post_perform_captures(
+                callee,
+                bound,
+                arm_pattern_names,
+                helper_params,
+                arm_pat_out,
+                helper_param_out,
+            );
+            for a in args {
+                walk_collect_arm_post_perform_captures(
+                    a,
+                    bound,
+                    arm_pattern_names,
+                    helper_params,
+                    arm_pat_out,
+                    helper_param_out,
+                );
+            }
+        }
+        Expr::Perform(p) => {
+            for a in &p.args {
+                walk_collect_arm_post_perform_captures(
+                    a,
+                    bound,
+                    arm_pattern_names,
+                    helper_params,
+                    arm_pat_out,
+                    helper_param_out,
+                );
+            }
+        }
+        // Handle / Lambda / ClosureRecord in the tail are out of B.2
+        // scope; the synth-cont's tail-lowering uses the standard
+        // Lowerer which handles these shapes once they become reachable.
+        // For B.2's MVP (iterate-Generator shape) the tail is a Call
+        // (iterate(rest)) or a literal — Handle/Lambda/ClosureRecord
+        // don't appear. Asymmetry rationale (per PR #76 review):
+        //   - `Handle { body, .. }` recurses into `body` because Handle
+        //     is transparent w.r.t. the surrounding scope: its body
+        //     evaluates with the same bindings as the parent expression
+        //     (handler arms introduce their own scope but we don't walk
+        //     them here — see below).
+        //   - `Lambda` / `ClosureRecord` do NOT recurse because they
+        //     introduce a fresh closure scope: their body's free
+        //     variables become the closure's own captures, which the
+        //     synth-cont closure doesn't (and shouldn't) see.
+        // The debug_assert below catches the surprise — if a future
+        // shape lands a Lambda/ClosureRecord in the post-perform tail,
+        // the walker needs to be extended (likely with a fresh
+        // capture-extraction pass for the lambda's own free vars).
+        Expr::Handle { body, .. } => {
+            walk_collect_arm_post_perform_captures(
+                body,
+                bound,
+                arm_pattern_names,
+                helper_params,
+                arm_pat_out,
+                helper_param_out,
+            );
+        }
+        Expr::Lambda { .. } | Expr::ClosureRecord { .. } => {
+            debug_assert!(
+                false,
+                "compound-match-arm-post-perform tail with Lambda/ClosureRecord \
+                 — extend walker before adding tests of this shape; B.2's MVP \
+                 (iterate-Generator) doesn't admit these in the tail."
+            );
+        }
+    }
+}
+
+fn walk_collect_arm_post_perform_captures_block(
+    b: &crate::ast::Block,
+    bound: &mut std::collections::BTreeSet<String>,
+    arm_pattern_names: &std::collections::BTreeSet<String>,
+    helper_params: &[crate::ast::Param],
+    arm_pat_out: &mut Vec<String>,
+    helper_param_out: &mut Vec<SynthContCapture>,
+) {
+    use crate::ast::Stmt;
+    let saved: std::collections::BTreeSet<String> = bound.clone();
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                walk_collect_arm_post_perform_captures(
+                    &l.value,
+                    bound,
+                    arm_pattern_names,
+                    helper_params,
+                    arm_pat_out,
+                    helper_param_out,
+                );
+                bound.insert(l.name.clone());
+            }
+            Stmt::Perform(p) => {
+                for a in &p.args {
+                    walk_collect_arm_post_perform_captures(
+                        a,
+                        bound,
+                        arm_pattern_names,
+                        helper_params,
+                        arm_pat_out,
+                        helper_param_out,
+                    );
+                }
+            }
+            Stmt::Expr(e) => {
+                walk_collect_arm_post_perform_captures(
+                    e,
+                    bound,
+                    arm_pattern_names,
+                    helper_params,
+                    arm_pat_out,
+                    helper_param_out,
+                );
+            }
+        }
+    }
+    if let Some(t) = &b.tail {
+        walk_collect_arm_post_perform_captures(
+            t,
+            bound,
+            arm_pattern_names,
+            helper_params,
+            arm_pat_out,
+            helper_param_out,
+        );
+    }
+    *bound = saved;
 }
 
 fn walk_collect_captures(
@@ -7303,9 +7814,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // synth-cont allocation pass will consume it (one synth-
                 // cont per index). For B.1 we only need to know whether
                 // the body matches the shape (bool), not which arms.
-                let is_compound_match_body =
-                    is_compound_match_with_arm_perform_body(&f.body, &ctors).is_some();
-                if is_compound_match_body {
+                let perform_arm_indices_opt =
+                    is_compound_match_with_arm_perform_body(&f.body, &ctors);
+                if let Some(perform_arm_indices) = perform_arm_indices_opt {
                     // Phase 1 — unpack user args from `args_ptr` at
                     // offsets `i*8`. Mirrors the tail-perform body's
                     // Phase 1 (below). Each slot is u64; narrower
@@ -7345,15 +7856,48 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         env.insert(p.name.clone(), value);
                     }
 
-                    // Phase 2 — construct a Lowerer to lower `f.body`
-                    // (a `match scrut { ... }` shape). The Lowerer
-                    // dispatches arms via `lower_match`; arm-body
-                    // performs route through `lower_perform_to_value`
-                    // which uses identity-k_fn + synchronous
-                    // `sigil_run_loop` drive. This preserves the
-                    // current Sync→Cps interop behavior for the
-                    // perform-bearing arm — B.2 lifts this to a real
-                    // synth-cont with arm-pattern captures.
+                    // Phase 2 — construct a Lowerer to lower the
+                    // scrutinee + per-arm pattern tests + per-arm
+                    // bodies. Each arm body produces a `*mut NextStep`
+                    // value (the pointer-typed cont-block param);
+                    // the parent helper returns that NextStep
+                    // directly to the trampoline.
+                    //
+                    // Phase B.2 strategy diverges from B.1: B.1
+                    // dispatched `lowerer.lower_block(&f.body)` which
+                    // routed through `lower_match` → `lower_perform_to_value`
+                    // (identity-k_fn + synchronous run_loop). B.2
+                    // hand-rolls the match dispatcher here so the
+                    // perform-arm path can:
+                    //   1. Allocate a per-arm synth-cont FuncId.
+                    //   2. Build a closure record holding the arm-
+                    //      pattern bindings (e.g., `x`, `rest` from
+                    //      `Cons(x, rest)`) PLUS any helper user
+                    //      params referenced in the arm's tail.
+                    //   3. Call `sigil_perform` with that record +
+                    //      synth-cont func_addr as `(k_closure, k_fn)`.
+                    //   4. Return the resulting NextStep::Call to
+                    //      the trampoline.
+                    //
+                    // The synth-cont (defined at the bottom of
+                    // `emit_object` from the entries pushed below)
+                    // loads the captures, lowers the tail expression
+                    // with them in env, and dispatches its Done value
+                    // through `args_ptr`'s trailing post_arm_k pair
+                    // (the standard tail-`k`-arm convention).
+                    //
+                    // **B.2 → B.3 boundary** (per
+                    // `feedback_sigil_trampoline_charter`): the synth-
+                    // cont's tail expression may invoke a Cps callee
+                    // (e.g., `iterate(rest)` in the canonical
+                    // recursive Generator shape). At B.2 that callee
+                    // routes through `Lowerer.lower_call`'s Sync→Cps
+                    // interop wrapper, which spawns a nested
+                    // `sigil_run_loop` (charter window). B.3 closes
+                    // this by lowering the tail call as
+                    // `NextStep::Call` directly. B.2's correctness
+                    // gate is only that captures are correctly
+                    // captured + bound in the synth-cont env.
                     let mut lowerer = Lowerer {
                         builder,
                         stackmap: &mut stackmap,
@@ -7403,59 +7947,530 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
                     };
 
-                    // Phase 3 — lower the body. The classifier
-                    // guarantees `body.stmts` is empty AND `body.tail`
-                    // is `Some(Expr::Match{...})`, so `lower_block`
-                    // returns `Some(tail_value)` of the match's
-                    // overall type (= the fn's declared return type).
-                    let tail_value = match lowerer.lower_block(&f.body) {
-                        Some(v) => v,
-                        None => unreachable!(
-                            "codegen Phase B.1: compound-match body for fn `{}` \
-                             unexpectedly had no tail value — classifier guarantees \
-                             body.tail is Some(Expr::Match)",
+                    // Phase 3 — extract scrutinee + arms from the
+                    // body. Classifier guarantees body.stmts is empty
+                    // and body.tail is Some(Expr::Match{...}).
+                    let (match_scrutinee, match_arms, match_span) = match &f.body.tail {
+                        Some(crate::ast::Expr::Match {
+                            scrutinee,
+                            arms,
+                            span,
+                        }) => (scrutinee.as_ref(), arms.as_slice(), span.clone()),
+                        _ => unreachable!(
+                            "codegen Phase B.2: classifier guarantees compound-match \
+                             body has body.tail = Some(Expr::Match) for fn `{}`",
                             f.name
                         ),
                     };
 
-                    // Phase 4 — widen tail value to I64 (matching
-                    // `sigil_next_step_done`'s signature). Read the
-                    // actual lowered Cranelift type via
-                    // `dfg.value_type` per
-                    // `feedback_sigil_dfg_value_type`.
-                    let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
-                    let widened_tail = if actual_tail_ty == types::I64 {
-                        tail_value
-                    } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
-                        lowerer.builder.ins().uextend(types::I64, tail_value)
-                    } else {
-                        assert_eq!(
-                            actual_tail_ty, pointer_ty,
-                            "codegen Phase B.1: unexpected compound-match tail \
-                             Cranelift type {actual_tail_ty:?} for fn `{}`",
-                            f.name
-                        );
-                        tail_value
-                    };
+                    // Phase 4 — lower scrutinee, predict scrut_ty (for
+                    // arm-pattern type extraction), and create the
+                    // cont block. Cont's param is `pointer_ty` (the
+                    // *mut NextStep produced by each arm).
+                    let scrut_v = lowerer.lower_expr(match_scrutinee);
+                    let scrut_ty = lowerer
+                        .match_scrut_tys_resolved
+                        .get(&(lowerer.current_fn_name.clone(), match_span.clone()))
+                        .cloned()
+                        .or_else(|| lowerer.match_scrut_tys.get(&match_span).cloned());
+                    let cont = lowerer.builder.create_block();
+                    lowerer.builder.append_block_param(cont, pointer_ty);
 
-                    // Phase 5 — build NextStep::Done(widened_tail) and
-                    // return it to the trampoline. The wrapper at the
-                    // call site drives `sigil_run_loop`, which observes
-                    // the Done and unwinds with the I64 value (narrowed
-                    // back to the callee's declared return type by the
-                    // CPS-interop wrapper, per the `lower_call`
-                    // UserFnAbi::Cps arm). `next_step_done_ref` is
-                    // pre-declared via `prepare_per_fn_refs` (just
-                    // above) — same FuncRef the synth-arm-fn body
-                    // emit uses for its terminal Done construction.
-                    let done_call = lowerer
-                        .builder
-                        .ins()
-                        .call(next_step_done_ref, &[widened_tail]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, done_call));
-                    let next_step = lowerer.builder.inst_results(done_call)[0];
+                    // Phase 5 — per-arm dispatch. For each arm,
+                    // emit pattern tests (jumping to `next` on miss),
+                    // install bindings, then emit per-shape:
+                    //   - ConstantDone: build NextStep::Done(c) inline.
+                    //   - PerformThenTail: allocate synth-cont +
+                    //     closure record, call sigil_perform.
+                    // Both produce a *mut NextStep that flows through
+                    // the cont block's param.
+                    //
+                    // TODO (per PR #76 review, Review 2 #3): revisit
+                    // if `lower_match`'s dispatcher gains features
+                    // (guards, span-based diagnostics, exhaustiveness
+                    // changes) — this hand-rolled loop mirrors
+                    // `lower_match`'s arm-iteration scaffolding (the
+                    // `is_catchall` check, `test_blocks` allocation
+                    // pattern, `bindings` install + restore around
+                    // the body emission) and may drift if the
+                    // upstream evolves. Keeping the structures
+                    // visually parallel here makes the divergence
+                    // easier to spot at review time.
+                    let mut chain_terminated = false;
+                    for (arm_idx, arm) in match_arms.iter().enumerate() {
+                        // Conditional vs catch-all dispatch — mirrors
+                        // `lower_match`'s structure.
+                        let is_catchall =
+                            lowerer.is_catchall_pattern(&arm.pattern, scrut_ty.as_ref());
+                        // Pair `(next_block, body_block)` for
+                        // conditional arms; None for catchall (the
+                        // builder is already positioned in the
+                        // right block, no test required).
+                        let test_blocks: Option<(Block, Block)> = if is_catchall {
+                            None
+                        } else {
+                            Some((
+                                lowerer.builder.create_block(),
+                                lowerer.builder.create_block(),
+                            ))
+                        };
+                        let mut bindings: Vec<(String, Value)> = Vec::new();
+                        if let Some((nb, bb)) = test_blocks {
+                            lowerer.emit_pattern_test(
+                                &arm.pattern,
+                                scrut_v,
+                                scrut_ty.as_ref(),
+                                nb,
+                                &mut bindings,
+                            );
+                            lowerer.builder.ins().jump(bb, &[]);
+                            lowerer.builder.switch_to_block(bb);
+                            lowerer.builder.seal_block(bb);
+                        } else if let crate::ast::Pattern::Var(name, _) = &arm.pattern {
+                            // Var-as-catchall: bind the scrutinee.
+                            bindings.push((name.clone(), scrut_v));
+                        }
+
+                        // Install bindings; snapshot prior env entries.
+                        let saved: Vec<(String, Option<Value>)> = bindings
+                            .iter()
+                            .cloned()
+                            .map(|(name, val)| {
+                                let prev = lowerer.env.insert(name.clone(), val);
+                                (name, prev)
+                            })
+                            .collect();
+
+                        // Per-shape emission.
+                        let arm_next_step: Value = if perform_arm_indices.contains(&arm_idx) {
+                            // PerformThenTail arm. Extract the perform
+                            // (Stmt::Let or Stmt::Perform) + the tail
+                            // expression. Classifier guarantees the
+                            // arm body is `Block { stmts: [...],
+                            // tail: Some(_) }`.
+                            let arm_block = match &arm.body {
+                                crate::ast::Expr::Block(b) => b,
+                                _ => unreachable!(
+                                    "codegen Phase B.2: classifier guarantees \
+                                     PerformThenTail arm body is Expr::Block for fn `{}`",
+                                    f.name
+                                ),
+                            };
+                            let (perform_expr, let_binding_info): (
+                                &crate::ast::PerformExpr,
+                                Option<(String, Type, EnvSlotKind)>,
+                            ) = match &arm_block.stmts[0] {
+                                crate::ast::Stmt::Let(l) => {
+                                    let p = match &l.value {
+                                        crate::ast::Expr::Perform(p) => p,
+                                        _ => unreachable!(
+                                            "codegen Phase B.2: classifier guarantees \
+                                             Let value is Expr::Perform"
+                                        ),
+                                    };
+                                    let bt = cranelift_ty_for_type_expr(&l.ty, pointer_ty);
+                                    let bk = slot_kind_for_type_expr_post_mono(&l.ty);
+                                    (p, Some((l.name.clone(), bt, bk)))
+                                }
+                                crate::ast::Stmt::Perform(p) => (p, None),
+                                _ => unreachable!(
+                                    "codegen Phase B.2: classifier guarantees \
+                                     PerformThenTail arm stmt[0] is Let or Perform"
+                                ),
+                            };
+                            let tail_expr = match &arm_block.tail {
+                                Some(t) => t.clone(),
+                                None => unreachable!(
+                                    "codegen Phase B.2: classifier guarantees tail is Some"
+                                ),
+                            };
+
+                            // Compute arm-pattern binding name → (Type,
+                            // SlotKind, Ty) map for THIS arm. Used to
+                            // select Cranelift type / SlotKind for
+                            // each captured arm-pattern binding when
+                            // packing the closure record.
+                            let mut arm_pat_binding_info: BTreeMap<
+                                String,
+                                (Type, EnvSlotKind, crate::typecheck::Ty),
+                            > = BTreeMap::new();
+                            collect_pattern_binding_tys(
+                                &arm.pattern,
+                                scrut_ty.as_ref(),
+                                lowerer.type_layouts,
+                                lowerer.ctor_index,
+                                pointer_ty,
+                                &mut arm_pat_binding_info,
+                            );
+                            let arm_pat_names: std::collections::BTreeSet<String> =
+                                arm_pat_binding_info.keys().cloned().collect();
+
+                            // Free-var analysis on the tail expression.
+                            // Pre-bound: the let-binding's name (if any)
+                            // — references inside tail to that name
+                            // resolve to the synth-cont-internal
+                            // `args_ptr[0]` load, NOT a capture.
+                            // (Source semantics: the let binds before
+                            // the tail evaluates, and the synth-cont
+                            // re-binds it from args_ptr[0] when the
+                            // arm body's `k(value)` resumes.)
+                            let mut bound_in_tail: std::collections::BTreeSet<String> =
+                                std::collections::BTreeSet::new();
+                            if let Some((bn, _, _)) = &let_binding_info {
+                                bound_in_tail.insert(bn.clone());
+                            }
+                            let mut arm_pat_capture_names: Vec<String> = Vec::new();
+                            let mut helper_param_captures: Vec<SynthContCapture> = Vec::new();
+                            walk_collect_arm_post_perform_captures(
+                                &tail_expr,
+                                &mut bound_in_tail,
+                                &arm_pat_names,
+                                &f.params,
+                                &mut arm_pat_capture_names,
+                                &mut helper_param_captures,
+                            );
+
+                            // Build SynthContCapture entries for arm-
+                            // pattern captures (look up types from
+                            // `arm_pat_binding_info`).
+                            let arm_pattern_captures: Vec<SynthContCapture> = arm_pat_capture_names
+                                .iter()
+                                .map(|n| {
+                                    let (_ty, sk, _ty_typecheck) =
+                                        arm_pat_binding_info.get(n).cloned().unwrap_or_else(|| {
+                                            unreachable!(
+                                                "codegen Phase B.2: arm-pattern \
+                                                     capture `{n}` has no binding info \
+                                                     entry; pattern walker out of sync \
+                                                     with capture walker for fn `{}`",
+                                                f.name
+                                            )
+                                        });
+                                    SynthContCapture {
+                                        name: n.clone(),
+                                        kind: sk,
+                                    }
+                                })
+                                .collect();
+
+                            // Per PR #76 review (Review 2 #1): the
+                            // former pre-stored `tail_ty` field on the
+                            // variant has been dropped — the synth-cont
+                            // definition pass reads the tail value's
+                            // actual Cranelift type from
+                            // `dfg.value_type(tail_value)` after
+                            // lowering (per
+                            // `feedback_sigil_dfg_value_type`), so a
+                            // pre-stored prediction adds no signal.
+
+                            // Allocate the synth-cont FuncId. Names
+                            // follow the global-index pattern to avoid
+                            // collisions with chained-let / constant-
+                            // tail synth-conts (see
+                            // `cps_continuation_synth.len()` based
+                            // naming at the existing pre-pass).
+                            let synth_cont_sig = cps_signature(pointer_ty, &module);
+                            let synth_cont_global_idx = cps_continuation_synth.len();
+                            let synth_cont_name =
+                                format!("sigil_post_yield_cont_{synth_cont_global_idx}");
+                            let synth_cont_func_id = module
+                                .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
+                                .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
+                            cps_continuation_synth.push(CpsContinuationSynth {
+                                func_id: synth_cont_func_id,
+                                parent_fn_name: f.name.clone(),
+                                kind: CpsContinuationKind::CompoundMatchArmPostPerform {
+                                    arm_pattern_captures: arm_pattern_captures.clone(),
+                                    helper_param_captures: helper_param_captures.clone(),
+                                    tail_expr: Box::new(tail_expr.clone()),
+                                    let_binding: let_binding_info.clone(),
+                                },
+                            });
+
+                            // Allocate the closure record holding
+                            // `arm_pattern_captures ++ helper_param_
+                            // captures`. Layout: TAG_CLOSURE header at
+                            // +0, null code_ptr at +8, captures at
+                            // +16, +24, ... (8-byte slots, raw I64
+                            // encoding for both Int and pointer kinds).
+                            let total_capture_slots =
+                                arm_pattern_captures.len() + helper_param_captures.len();
+                            assert!(
+                                total_capture_slots < MAX_CLOSURE_ENV_SLOTS,
+                                "Plan B Task 78.5 G4 Phase B.2: synth-cont closure \
+                                 env {total_capture_slots} >= {MAX_CLOSURE_ENV_SLOTS} \
+                                 exceeds bitmap layout for fn `{}` arm {arm_idx}. \
+                                 Reduce per-arm capture count.",
+                                f.name
+                            );
+                            let mut bitmap: u32 = 0;
+                            for (i, c) in arm_pattern_captures.iter().enumerate() {
+                                if c.kind.is_pointer() {
+                                    bitmap |= 1u32 << (i + 1);
+                                }
+                            }
+                            for (j, c) in helper_param_captures.iter().enumerate() {
+                                if c.kind.is_pointer() {
+                                    bitmap |= 1u32 << (arm_pattern_captures.len() + j + 1);
+                                }
+                            }
+                            let count: u8 = 1 + total_capture_slots as u8;
+                            let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
+                            let payload_bytes: i64 = 8 + 8 * total_capture_slots as i64;
+
+                            let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
+                            let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                            let alloc_call = lowerer
+                                .builder
+                                .ins()
+                                .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                alloc_call,
+                            ));
+                            let closure_record = lowerer.builder.inst_results(alloc_call)[0];
+
+                            // Null code_ptr at +8.
+                            let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                null_v,
+                                closure_record,
+                                8,
+                            );
+
+                            // Helper: widen an SSA value of arbitrary
+                            // Cranelift type to I64 for closure-slot
+                            // storage. Mirrors the standard slot
+                            // encoding used in `lower_perform_to_value`'s
+                            // args buffer + chain-step closure-record
+                            // copy paths.
+                            let widen_to_i64 =
+                                |builder: &mut FunctionBuilder<'_>, v: Value| -> Value {
+                                    let t = builder.func.dfg.value_type(v);
+                                    if t == types::I64 {
+                                        v
+                                    } else if t.is_int() && t.bits() < 64 {
+                                        builder.ins().uextend(types::I64, v)
+                                    } else {
+                                        assert_eq!(
+                                            t, pointer_ty,
+                                            "codegen Phase B.2: unexpected \
+                                         capture Cranelift type {t:?} packing closure \
+                                         record"
+                                        );
+                                        v
+                                    }
+                                };
+
+                            // Pack arm-pattern captures into the
+                            // closure record at offsets 16, 24, ...
+                            // SSA values come from `lowerer.env` (just
+                            // installed via the bindings step above).
+                            for (i, capture) in arm_pattern_captures.iter().enumerate() {
+                                let v = match lowerer.env.get(&capture.name).copied() {
+                                    Some(v) => v,
+                                    None => unreachable!(
+                                        "codegen Phase B.2: arm-pattern capture \
+                                         `{}` not in env for fn `{}` arm {arm_idx}",
+                                        capture.name, f.name
+                                    ),
+                                };
+                                let widened = widen_to_i64(&mut lowerer.builder, v);
+                                let offset: i32 = 16 + 8 * i as i32;
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    widened,
+                                    closure_record,
+                                    offset,
+                                );
+                            }
+                            // Pack helper-param captures at offsets
+                            // 16 + 8 * (arm_pattern_captures.len() + j).
+                            // Helper params live in env from Phase 1's
+                            // user-arg unpack.
+                            for (j, capture) in helper_param_captures.iter().enumerate() {
+                                let v = match lowerer.env.get(&capture.name).copied() {
+                                    Some(v) => v,
+                                    None => unreachable!(
+                                        "codegen Phase B.2: helper-param capture \
+                                         `{}` not in env for fn `{}` arm {arm_idx}",
+                                        capture.name, f.name
+                                    ),
+                                };
+                                let widened = widen_to_i64(&mut lowerer.builder, v);
+                                let offset: i32 = 16 + 8 * (arm_pattern_captures.len() + j) as i32;
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    widened,
+                                    closure_record,
+                                    offset,
+                                );
+                            }
+
+                            // Lower perform's args via Lowerer (env
+                            // has helper params + arm-pattern bindings
+                            // available, mirroring the source-level
+                            // scope at the perform call site).
+                            let effect_id =
+                                match lowerer.effect_ids.get(&perform_expr.effect).copied() {
+                                    Some(id) => id,
+                                    None => unreachable!(
+                                        "codegen Phase B.2: effect `{}` missing from \
+                                     effect_ids; typecheck E0042 should have caught",
+                                        perform_expr.effect
+                                    ),
+                                };
+                            let op_id = match lowerer
+                                .op_ids
+                                .get(&(perform_expr.effect.clone(), perform_expr.op.clone()))
+                                .copied()
+                            {
+                                Some(id) => id,
+                                None => unreachable!(
+                                    "codegen Phase B.2: op_id missing for `{}.{}`; \
+                                     typecheck E0043 should have caught",
+                                    perform_expr.effect, perform_expr.op
+                                ),
+                            };
+                            let effect_id_v =
+                                lowerer.builder.ins().iconst(types::I32, effect_id as i64);
+                            let op_id_v = lowerer.builder.ins().iconst(types::I32, op_id as i64);
+
+                            let (perform_args_ptr, perform_args_len_v) = if perform_expr
+                                .args
+                                .is_empty()
+                            {
+                                (
+                                    lowerer.builder.ins().iconst(pointer_ty, 0),
+                                    lowerer.builder.ins().iconst(types::I32, 0),
+                                )
+                            } else {
+                                let arg_values: Vec<Value> = perform_expr
+                                    .args
+                                    .iter()
+                                    .map(|a| lowerer.lower_expr(a))
+                                    .collect();
+                                let slot_bytes = (perform_expr.args.len() * 8) as u32;
+                                let slot = lowerer.builder.create_sized_stack_slot(
+                                    StackSlotData::new(StackSlotKind::ExplicitSlot, slot_bytes, 3),
+                                );
+                                for (i, arg_v) in arg_values.into_iter().enumerate() {
+                                    let widened = widen_to_i64(&mut lowerer.builder, arg_v);
+                                    lowerer.builder.ins().stack_store(
+                                        widened,
+                                        slot,
+                                        (i * 8) as i32,
+                                    );
+                                }
+                                (
+                                    lowerer.builder.ins().stack_addr(pointer_ty, slot, 0),
+                                    lowerer
+                                        .builder
+                                        .ins()
+                                        .iconst(types::I32, perform_expr.args.len() as i64),
+                                )
+                            };
+
+                            // func_addr for the synth-cont fn — used
+                            // as `k_fn` for the perform call so the
+                            // resumed arm's `k(value)` lands in our
+                            // synth-cont with the closure_record.
+                            let synth_cont_fn_ref = module
+                                .declare_func_in_func(synth_cont_func_id, lowerer.builder.func);
+                            let synth_cont_fn_addr = lowerer
+                                .builder
+                                .ins()
+                                .func_addr(pointer_ty, synth_cont_fn_ref);
+
+                            // Call sigil_perform. Returns *mut NextStep
+                            // (a NextStep::Call dispatching the
+                            // matched arm with k = (closure_record,
+                            // synth_cont_fn_addr)).
+                            let perform_call = lowerer.builder.ins().call(
+                                lowerer.perform_ref,
+                                &[
+                                    effect_id_v,
+                                    op_id_v,
+                                    perform_args_ptr,
+                                    perform_args_len_v,
+                                    closure_record,
+                                    synth_cont_fn_addr,
+                                ],
+                            );
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                perform_call,
+                            ));
+                            lowerer.builder.inst_results(perform_call)[0]
+                        } else {
+                            // ConstantDone arm. Classifier guarantees
+                            // `arm.body` is `Expr::IntLit(n, _)`.
+                            let constant_value = match &arm.body {
+                                crate::ast::Expr::IntLit(n, _) => *n,
+                                _ => unreachable!(
+                                    "codegen Phase B.2: classifier guarantees \
+                                     ConstantDone arm body is IntLit for fn `{}`",
+                                    f.name
+                                ),
+                            };
+                            let const_v = lowerer.builder.ins().iconst(types::I64, constant_value);
+                            let done_call =
+                                lowerer.builder.ins().call(next_step_done_ref, &[const_v]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                done_call,
+                            ));
+                            lowerer.builder.inst_results(done_call)[0]
+                        };
+
+                        // Restore env: remove arm-pattern bindings.
+                        for (name, prev) in saved {
+                            match prev {
+                                Some(p) => {
+                                    lowerer.env.insert(name, p);
+                                }
+                                None => {
+                                    lowerer.env.remove(&name);
+                                }
+                            }
+                        }
+
+                        // Jump to cont with the arm's NextStep ptr.
+                        lowerer
+                            .builder
+                            .ins()
+                            .jump(cont, &[BlockArg::Value(arm_next_step)]);
+
+                        match test_blocks {
+                            Some((nb, _)) => {
+                                lowerer.builder.switch_to_block(nb);
+                                lowerer.builder.seal_block(nb);
+                            }
+                            None => {
+                                chain_terminated = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Defensive trap on non-exhaustive match — mirrors
+                    // `lower_match`'s trap. Typecheck E0066/E0120
+                    // should make this unreachable for well-typed
+                    // programs.
+                    if !chain_terminated {
+                        lowerer
+                            .builder
+                            .ins()
+                            .trap(TrapCode::unwrap_user(TRAP_NONEXHAUSTIVE_MATCH));
+                    }
+
+                    // Phase 6 — at cont, return the arm's NextStep
+                    // ptr to the trampoline. Cont's param is
+                    // `pointer_ty` (NextStep ptr).
+                    lowerer.builder.switch_to_block(cont);
+                    lowerer.builder.seal_block(cont);
+                    let next_step = lowerer.builder.block_params(cont)[0];
                     lowerer.builder.ins().return_(&[next_step]);
                     lowerer.builder.finalize();
 
@@ -10887,6 +11902,240 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 lowerer.builder.finalize();
                             }
                         }
+                    }
+                    CpsContinuationKind::CompoundMatchArmPostPerform {
+                        arm_pattern_captures,
+                        helper_param_captures,
+                        tail_expr,
+                        let_binding,
+                    } => {
+                        // Plan B Task 78.5 G4 Phase B.2 — compound-
+                        // match per-arm post-perform synth-cont body.
+                        // Loads `arm_pattern_captures ++ helper_param
+                        // _captures` from `closure_ptr` at offsets
+                        // 16+8*i (arm-patterns first), optionally
+                        // narrows args_ptr[0] under `let_binding.0`
+                        // when the arm uses `Stmt::Let`, lowers
+                        // `tail_expr` via Lowerer with all captures
+                        // bound in env, widens to I64, and dispatches
+                        // through `args_ptr`'s trailing post_arm_k
+                        // pair (loaded at the top of this match's
+                        // outer scope as `post_arm_k_closure` /
+                        // `post_arm_k_fn`). The trailing-pair shape
+                        // matches the chained-let `Final` step's
+                        // dispatch convention so a tail-`k` arm
+                        // (`(null, identity)`) terminates with `Done
+                        // (tail_value)` and a non-tail-`k` arm routes
+                        // through the outer chain.
+                        //
+                        // Type-of-bound-value via `dfg.value_type`
+                        // (per `feedback_sigil_dfg_value_type`):
+                        // Lowerer lowers tail_expr to a Cranelift
+                        // value of arbitrary width; we read the
+                        // actual SSA type from the DFG before widen
+                        // (a former `tail_ty` field that pre-stored
+                        // a typecheck-derived prediction was dropped
+                        // per PR #76 review — actual widen logic uses
+                        // `dfg.value_type(tail_value)` directly).
+                        let args_ptr = block_params[1];
+                        let synth_closure_ptr = block_params[0];
+
+                        let mut env: BTreeMap<String, Value> = BTreeMap::new();
+
+                        // Helper: narrow an I64-loaded slot to the
+                        // user-visible Cranelift type per `EnvSlotKind`.
+                        // Mirrors `ChainedLetBindStep`'s `narrow_for_kind`
+                        // closure.
+                        let narrow_for_kind = |builder: &mut FunctionBuilder<'_>,
+                                               raw: Value,
+                                               kind: EnvSlotKind|
+                         -> Value {
+                            match kind {
+                                EnvSlotKind::Int => raw,
+                                EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
+                                    builder.ins().ireduce(types::I8, raw)
+                                }
+                                EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
+                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
+                                    if pointer_ty == types::I64 {
+                                        raw
+                                    } else {
+                                        builder.ins().ireduce(pointer_ty, raw)
+                                    }
+                                }
+                            }
+                        };
+
+                        // Load arm-pattern captures from synth-cont's
+                        // closure_ptr at offsets 16 + 8*i for i in
+                        // 0..arm_pattern_captures.len().
+                        for (i, capture) in arm_pattern_captures.iter().enumerate() {
+                            let offset: i32 = 16 + 8 * i as i32;
+                            let raw = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                synth_closure_ptr,
+                                offset,
+                            );
+                            let val = narrow_for_kind(&mut builder, raw, capture.kind);
+                            env.insert(capture.name.clone(), val);
+                        }
+
+                        // Load helper-param captures at offsets
+                        // 16 + 8 * (arm_pattern_captures.len() + j).
+                        for (j, capture) in helper_param_captures.iter().enumerate() {
+                            let offset: i32 = 16 + 8 * (arm_pattern_captures.len() + j) as i32;
+                            let raw = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                synth_closure_ptr,
+                                offset,
+                            );
+                            let val = narrow_for_kind(&mut builder, raw, capture.kind);
+                            env.insert(capture.name.clone(), val);
+                        }
+
+                        // Optionally bind args_ptr[0] under
+                        // let_binding.0 (narrowed via
+                        // `narrow_for_kind` per let_binding.2 =
+                        // EnvSlotKind). For Stmt::Perform-only arms,
+                        // let_binding is None and args_ptr[0] is
+                        // ignored. Per PR #76 review (Review 2 #2):
+                        // narrowing now goes through `narrow_for_kind`
+                        // (the closure defined a few lines above)
+                        // for consistency with the capture-load
+                        // convention. The pointer-typed arm of
+                        // narrow_for_kind matches the prior assertion's
+                        // pointer-only fallback (everything else is
+                        // either Int = no-op or sub-I64 ireduce).
+                        // We retain a debug_assert that pre-pass-
+                        // declared `bt` is consistent with
+                        // narrow_for_kind's output width.
+                        if let Some((bn, bt, bk)) = let_binding {
+                            let widened_arg = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                args_ptr,
+                                POST_ARM_K_ARG_OFF,
+                            );
+                            let bound_value = narrow_for_kind(&mut builder, widened_arg, *bk);
+                            debug_assert_eq!(
+                                builder.func.dfg.value_type(bound_value),
+                                *bt,
+                                "codegen Phase B.2: \
+                                 CompoundMatchArmPostPerform let-binding \
+                                 EnvSlotKind {bk:?} narrowed to a \
+                                 Cranelift type that disagrees with \
+                                 pre-pass-declared {bt:?} for fn `{}`",
+                                synth.parent_fn_name
+                            );
+                            env.insert(bn.clone(), bound_value);
+                        }
+
+                        let PerFnRefs {
+                            builtins,
+                            handler_frame_new_ref,
+                            handle_push_ref,
+                            handle_pop_ref,
+                            handler_frame_set_arm_ref,
+                            handler_frame_set_return_ref,
+                            perform_ref,
+                            outer_post_arm_k_push_ref: _,
+                            run_loop_ref,
+                            next_step_done_ref: _,
+                            next_step_discharged_ref: _,
+                            last_terminal_tag_ref,
+                            reset_last_terminal_tag_ref,
+                            last_terminal_value_ref,
+                            reset_last_terminal_value_ref,
+                            next_step_call_ref,
+                            next_step_args_ptr_ref,
+                            continuation_identity_ref,
+                            handler_arm_refs_per_handle,
+                            handler_return_arm_refs_per_handle,
+                            user_fn_refs,
+                            sync_shim_refs,
+                            lit_gvs,
+                        } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
+
+                        let closure_ptr = block_params[0];
+                        let mut lowerer = Lowerer {
+                            builder,
+                            stackmap: &mut stackmap,
+                            env,
+                            pointer_ty,
+                            closure_ptr,
+                            lit_gvs,
+                            builtins,
+                            handler_frame_new_ref,
+                            handle_push_ref,
+                            handle_pop_ref,
+                            handler_frame_set_arm_ref,
+                            handler_frame_set_return_ref,
+                            perform_ref,
+                            run_loop_ref,
+                            last_terminal_tag_ref,
+                            reset_last_terminal_tag_ref,
+                            last_terminal_value_ref,
+                            reset_last_terminal_value_ref,
+                            next_step_call_ref,
+                            next_step_args_ptr_ref,
+                            handler_arm_refs_per_handle,
+                            handler_arm_synth: &handler_arm_synth,
+                            handler_arm_indices: &handler_arm_indices,
+                            handler_return_arm_refs_per_handle,
+                            handler_return_arm_synth: &handler_return_arm_synth,
+                            handler_return_arm_indices: &handler_return_arm_indices,
+                            continuation_identity_ref,
+                            effect_ids: &checked.effect_ids,
+                            op_ids: &checked.op_ids,
+                            effects: &checked.effects,
+                            user_fn_refs,
+                            sync_shim_refs,
+                            user_fns: &user_fns,
+                            type_layouts: &type_layouts,
+                            ctor_index: &ctor_index,
+                            match_scrut_tys: &checked.match_scrut_tys,
+                            match_scrut_tys_resolved: &cc.colored.mono.match_scrut_tys_resolved,
+                            current_fn_name: synth.parent_fn_name.clone(),
+                            local_fn_types: BTreeMap::new(),
+                            call_callee_tys: &checked.call_callee_tys,
+                            captured_fn_sigs: BTreeMap::new(),
+                            arm_k_closure_v: None,
+                            arm_k_fn_v: None,
+                            arm_frame_ptr_v: None,
+                            arm_k_pair_self: None,
+                            arm_k_pair_captures: &cc.arm_k_pair_captures,
+                        };
+
+                        let tail_value = lowerer.lower_expr(tail_expr.as_ref());
+                        // Read the actual lowered Cranelift type from
+                        // the DFG (per `feedback_sigil_dfg_value_type`)
+                        // — prefer it over `tail_ty` to insulate against
+                        // a width disagreement between the declared
+                        // return type and the Lowerer-produced value.
+                        let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
+                        let widened_tail = if actual_tail_ty == types::I64 {
+                            tail_value
+                        } else if actual_tail_ty.is_int() && actual_tail_ty.bits() < 64 {
+                            lowerer.builder.ins().uextend(types::I64, tail_value)
+                        } else {
+                            assert_eq!(
+                                actual_tail_ty, pointer_ty,
+                                "codegen Phase B.2: unexpected \
+                                 CompoundMatchArmPostPerform tail Cranelift \
+                                 type {actual_tail_ty:?} for fn `{}`",
+                                synth.parent_fn_name
+                            );
+                            tail_value
+                        };
+                        let next_step = emit_dispatch_to_post_arm_k(
+                            &mut lowerer.builder,
+                            lowerer.stackmap,
+                            widened_tail,
+                        );
+                        lowerer.builder.ins().return_(&[next_step]);
+                        lowerer.builder.finalize();
                     }
                 }
             }
@@ -21065,5 +22314,278 @@ mod tests {
              B.4 must be disabled to avoid double-wrap of k(s) \
              invocations outside the handle)"
         );
+    }
+
+    // ===== Plan B Task 78.5 G4 Phase B.2 — synth-cont arm-pattern
+    // captures =====
+
+    /// Pin the new `CompoundMatchArmPostPerform` variant's structural
+    /// shape: each field is reachable from the pattern bindings list,
+    /// and the variant is constructible.
+    #[test]
+    fn cps_continuation_kind_compound_match_arm_post_perform_constructs() {
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let kind = CpsContinuationKind::CompoundMatchArmPostPerform {
+            arm_pattern_captures: vec![SynthContCapture {
+                name: "rest".to_string(),
+                kind: EnvSlotKind::User,
+            }],
+            helper_param_captures: vec![SynthContCapture {
+                name: "limit".to_string(),
+                kind: EnvSlotKind::Int,
+            }],
+            tail_expr: Box::new(Expr::IntLit(99, span.clone())),
+            let_binding: None,
+        };
+        match kind {
+            CpsContinuationKind::CompoundMatchArmPostPerform {
+                arm_pattern_captures,
+                helper_param_captures,
+                ref tail_expr,
+                let_binding,
+            } => {
+                assert_eq!(arm_pattern_captures.len(), 1);
+                assert_eq!(arm_pattern_captures[0].name, "rest");
+                assert_eq!(arm_pattern_captures[0].kind, EnvSlotKind::User);
+                assert_eq!(helper_param_captures.len(), 1);
+                assert_eq!(helper_param_captures[0].name, "limit");
+                assert_eq!(helper_param_captures[0].kind, EnvSlotKind::Int);
+                assert!(matches!(tail_expr.as_ref(), Expr::IntLit(99, _)));
+                assert!(let_binding.is_none());
+            }
+            _ => panic!("expected CompoundMatchArmPostPerform variant"),
+        }
+    }
+
+    /// Free-var walker: `iterate(rest)` tail captures the arm-pattern
+    /// binding `rest` into arm_pat_out, NO helper-param captures.
+    /// Mirrors the canonical iterate-Generator shape.
+    #[test]
+    fn arm_post_perform_captures_arm_pattern_binding_only() {
+        use crate::ast::{Expr, Param, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // Tail: `iterate(rest)` — Call with callee=Ident("iterate"),
+        // args=[Ident("rest")].
+        let tail = Expr::Call {
+            callee: Box::new(Expr::Ident("iterate".to_string(), span.clone())),
+            args: vec![Expr::Ident("rest".to_string(), span.clone())],
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "xs".to_string(),
+            ty: TypeExpr::Named("IntList".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        let mut arm_pat_names = std::collections::BTreeSet::new();
+        arm_pat_names.insert("x".to_string());
+        arm_pat_names.insert("rest".to_string());
+        let mut bound = std::collections::BTreeSet::new();
+        let mut arm_pat_out: Vec<String> = Vec::new();
+        let mut helper_out: Vec<SynthContCapture> = Vec::new();
+        walk_collect_arm_post_perform_captures(
+            &tail,
+            &mut bound,
+            &arm_pat_names,
+            &helper_params,
+            &mut arm_pat_out,
+            &mut helper_out,
+        );
+        // `rest` is captured (arm-pattern binding); `iterate` is a
+        // global fn name (not in arm-pattern names, not in helper
+        // params) → not captured. `xs` is a helper param but not
+        // referenced → not captured.
+        assert_eq!(arm_pat_out, vec!["rest".to_string()]);
+        assert!(helper_out.is_empty());
+    }
+
+    /// Tail referencing both an arm-pattern binding and a helper
+    /// param: arm-pattern goes to arm_pat_out, helper-param goes to
+    /// helper_out.
+    #[test]
+    fn arm_post_perform_captures_both_arm_pattern_and_helper_param() {
+        use crate::ast::{BinOp, Expr, Param, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // Tail: `x + threshold` where `x` is arm-pattern, `threshold`
+        // is helper param.
+        let tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("x".to_string(), span.clone())),
+            rhs: Box::new(Expr::Ident("threshold".to_string(), span.clone())),
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "threshold".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        let mut arm_pat_names = std::collections::BTreeSet::new();
+        arm_pat_names.insert("x".to_string());
+        let mut bound = std::collections::BTreeSet::new();
+        let mut arm_pat_out: Vec<String> = Vec::new();
+        let mut helper_out: Vec<SynthContCapture> = Vec::new();
+        walk_collect_arm_post_perform_captures(
+            &tail,
+            &mut bound,
+            &arm_pat_names,
+            &helper_params,
+            &mut arm_pat_out,
+            &mut helper_out,
+        );
+        assert_eq!(arm_pat_out, vec!["x".to_string()]);
+        assert_eq!(helper_out.len(), 1);
+        assert_eq!(helper_out[0].name, "threshold");
+        assert_eq!(helper_out[0].kind, EnvSlotKind::Int);
+    }
+
+    /// Pre-bound let-binding name in `bound` shadows a same-named
+    /// arm-pattern binding for the duration of the tail — i.e., a
+    /// reference in the tail to that name resolves to the synth-cont's
+    /// args_ptr[0] load, not a closure-record capture.
+    #[test]
+    fn arm_post_perform_captures_let_binding_shadows_arm_pattern() {
+        use crate::ast::{Expr, Param, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // Tail: `v` — a single Ident reference.
+        let tail = Expr::Ident("v".to_string(), span.clone());
+        let helper_params = vec![Param {
+            name: "limit".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        // Even though `v` happens to also be an arm-pattern name, the
+        // pre-bound `bound` set (containing the let-binding name `v`)
+        // takes precedence — `v` resolves to the synth-cont-internal
+        // args_ptr[0] load, NOT a capture.
+        let mut arm_pat_names = std::collections::BTreeSet::new();
+        arm_pat_names.insert("v".to_string());
+        let mut bound = std::collections::BTreeSet::new();
+        bound.insert("v".to_string());
+        let mut arm_pat_out: Vec<String> = Vec::new();
+        let mut helper_out: Vec<SynthContCapture> = Vec::new();
+        walk_collect_arm_post_perform_captures(
+            &tail,
+            &mut bound,
+            &arm_pat_names,
+            &helper_params,
+            &mut arm_pat_out,
+            &mut helper_out,
+        );
+        assert!(arm_pat_out.is_empty());
+        assert!(helper_out.is_empty());
+    }
+
+    /// Nested match arm pattern bindings inside the tail shadow
+    /// outer-scope arm-pattern bindings AND helper params. A free
+    /// reference inside an inner arm body that resolves to the inner
+    /// arm's pattern binding is NOT captured.
+    #[test]
+    fn arm_post_perform_captures_nested_match_pattern_shadows() {
+        use crate::ast::{Expr, MatchArm, Param, Pattern, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        // Tail: `match scrut { x => x }` where the OUTER arm-pattern
+        // also has `x` and helper-param `x` exists too. Inner arm's
+        // pattern `Var(x)` shadows; reference to `x` in arm body
+        // resolves to the inner binding → NO capture.
+        let tail = Expr::Match {
+            scrutinee: Box::new(Expr::IntLit(0, span.clone())),
+            arms: vec![MatchArm {
+                pattern: Pattern::Var("x".to_string(), span.clone()),
+                body: Expr::Ident("x".to_string(), span.clone()),
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        let helper_params = vec![Param {
+            name: "x".to_string(),
+            ty: TypeExpr::Named("Int".to_string(), span.clone()),
+            span: span.clone(),
+        }];
+        let mut arm_pat_names = std::collections::BTreeSet::new();
+        arm_pat_names.insert("x".to_string());
+        let mut bound = std::collections::BTreeSet::new();
+        let mut arm_pat_out: Vec<String> = Vec::new();
+        let mut helper_out: Vec<SynthContCapture> = Vec::new();
+        walk_collect_arm_post_perform_captures(
+            &tail,
+            &mut bound,
+            &arm_pat_names,
+            &helper_params,
+            &mut arm_pat_out,
+            &mut helper_out,
+        );
+        assert!(arm_pat_out.is_empty());
+        assert!(helper_out.is_empty());
+    }
+
+    /// `collect_pattern_binding_tys` walks `Cons(x, rest): IntList`
+    /// and yields type info for both `x` (Int) and `rest` (IntList,
+    /// User-typed pointer).
+    #[test]
+    fn pattern_binding_tys_extracts_cons_x_rest() {
+        use crate::ast::{CtorPatternFields, Pattern};
+        use crate::errors::Span;
+        use crate::layout::{TypeLayout, VariantLayout};
+        use crate::typecheck::Ty;
+        let span = Span::synthetic("x.sigil");
+        let pat = Pattern::Ctor {
+            name: "Cons".to_string(),
+            fields: CtorPatternFields::Positional(vec![
+                Pattern::Var("x".to_string(), span.clone()),
+                Pattern::Var("rest".to_string(), span.clone()),
+            ]),
+            span: span.clone(),
+        };
+        let scrut_ty = Ty::User("IntList".to_string(), Vec::new());
+        let mut type_layouts: BTreeMap<String, TypeLayout> = BTreeMap::new();
+        type_layouts.insert(
+            "IntList".to_string(),
+            TypeLayout {
+                type_name: "IntList".to_string(),
+                type_tag: 1,
+                variants: vec![
+                    VariantLayout {
+                        name: "Nil".to_string(),
+                        discriminant: 0,
+                        payload_words: 1,
+                        pointer_bitmap: 0,
+                        field_tys: Vec::new(),
+                        field_names: Vec::new(),
+                    },
+                    VariantLayout {
+                        name: "Cons".to_string(),
+                        discriminant: 1,
+                        payload_words: 3,
+                        pointer_bitmap: 0b100,
+                        field_tys: vec![Ty::Int, Ty::User("IntList".to_string(), Vec::new())],
+                        field_names: Vec::new(),
+                    },
+                ],
+            },
+        );
+        let mut ctor_index: BTreeMap<String, (String, usize)> = BTreeMap::new();
+        ctor_index.insert("Nil".to_string(), ("IntList".to_string(), 0));
+        ctor_index.insert("Cons".to_string(), ("IntList".to_string(), 1));
+        let mut out: BTreeMap<String, (Type, EnvSlotKind, Ty)> = BTreeMap::new();
+        collect_pattern_binding_tys(
+            &pat,
+            Some(&scrut_ty),
+            &type_layouts,
+            &ctor_index,
+            types::I64,
+            &mut out,
+        );
+        assert_eq!(out.len(), 2);
+        let (x_ty, x_kind, _) = out.get("x").expect("x binding present");
+        assert_eq!(*x_ty, types::I64);
+        assert_eq!(*x_kind, EnvSlotKind::Int);
+        let (rest_ty, rest_kind, _) = out.get("rest").expect("rest binding present");
+        assert_eq!(*rest_ty, types::I64); // pointer_ty == I64 on x86_64
+        assert_eq!(*rest_kind, EnvSlotKind::User);
     }
 }
