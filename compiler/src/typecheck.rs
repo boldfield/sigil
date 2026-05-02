@@ -42,6 +42,30 @@ use std::collections::BTreeMap;
 /// E0132. The row variable alone carries the polymorphism.
 /// Reviewer-recommended option (b) per the test doc-comment at
 /// `compiler/tests/e2e.rs::task_78_5_pending_g2a_*`.
+///
+/// ## Applied at
+///
+/// Four FnDecl-consuming sites filter through this helper (pre-fix
+/// line numbers, pre-PR-#69):
+/// - `typecheck.rs:1114` — scheme registration
+///   `fresh_generic_subst` → `Scheme.type_vars`
+/// - `typecheck.rs:1179` — E0112 sweep pre-pass
+/// - `typecheck.rs:1322-1331` — `fn_param_names` builder
+/// - `typecheck.rs:3785` — `check_fn` body entry
+///
+/// ## Edge case (deferred)
+///
+/// Name-based filter strips `[a]` whenever a same-named row var
+/// exists, regardless of whether `a` is also referenced as a type
+/// in the fn signature/body. Sigil convention is "type vars
+/// uppercase, row vars lowercase," but the parser doesn't enforce
+/// it. A user writing `fn foo[a](x: a) -> a ![| a]` would have
+/// their type-kind `a` silently stripped; `x: a` resolves to the
+/// typecheck fallback for unknown names. Tracked as Task 78.5 G6
+/// follow-up — when a real user surface hits this, add an E0XXX
+/// diagnostic for the legitimate-collision case (GP stripped
+/// because of an alias AND the same name appears in a
+/// `TypeExpr::Named` position in the fn signature).
 fn effective_fn_generic_params(f: &FnDecl) -> Vec<GenericParam> {
     let row_alias: Option<&str> = f.effect_row_var.as_ref().map(|rv| rv.name.as_str());
     f.generic_params
