@@ -8384,6 +8384,205 @@ fn task_78_5_g4_approach6_b_neq_r_pointer_return_arm_through_char_body() {
     );
 }
 
+/// **Task 78.5 G4 Approach 6 deep-redo (PR #80 review §6) —
+/// DISCHARGED-bypass through the wrapper path.**
+///
+/// `handle_with_op_arm_discharge_skips_return_arm` already covers the
+/// general Phase 4g discharge case, but its body is a bare `perform`
+/// expression — not a direct Cps user fn call. That shape skips the
+/// custom wrapper entirely (no PUSH/POP, no `wrapper_state`); Phase 4g
+/// reaches the discharge_block via the existing `lower_expr` path.
+///
+/// This test exercises the *wrapper-engaged* discharge path: body is
+/// `body_fn()` (a direct Cps user fn call → wrapper engages → PUSH a
+/// real return-arm pair → run_loop), and body_fn performs an op whose
+/// arm discharges `k`. The trampoline records LAST_TERMINAL_TAG =
+/// DISCHARGED, returns the discharged value (99 here) as the
+/// trampoline's u64. The wrapper POPs (fired = false because helper
+/// never reached a body-fn natural-exit emit site — body discharged
+/// before that), and Phase 4g's three-way branch:
+///
+///   - fired_v == 0 → not the suppression branch
+///   - tag == DISCHARGED → discharge_block (NOT normal_block)
+///   - discharge_block: body_val IS handle's overall → 99
+///
+/// Pre-fix or stack-discipline regression symptoms:
+///   - "9900\n": return arm wrapped 99 → 9900 (DISCHARGED bypass broke).
+///   - segfault / panic: stack underflow if PUSH/POP imbalanced under
+///     the discharge path.
+#[test]
+fn task_78_5_g4_approach6_discharged_bypass_through_wrapper_path() {
+    let src = "import std.io\n\
+               \n\
+               effect Raise { fail: () -> Int }\n\
+               \n\
+               fn body_fn() -> Int ![Raise] {\n  \
+                 let _: Int = perform Raise.fail();\n  \
+                 0\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle body_fn() with {\n    \
+                   Raise.fail(k) => 99,\n    \
+                   return(v) => v * 100,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_discharged_bypass_through_wrapper_path",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n",
+        "Approach 6 wrapper + DISCHARGED bypass: body_fn performs Raise.fail; \
+         arm discharges k → 99 IS handle's overall; return arm MUST NOT fire. \
+         \"9900\\n\" means return arm wrapped (DISCHARGED bypass broke). \
+         stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Approach 6 deep-redo (PR #80 review §5) — Risk 3,
+/// shape 2: Cps sub-call inside the return arm body must not see the
+/// outer body's return-arm pair.**
+///
+/// Sister to `task_78_5_g4_approach6_risk3_cps_sub_call_does_not_trigger_outer_return_arm`,
+/// which covers a Cps sub-call inside the *body* fn. This shape covers
+/// a Cps sub-call inside the *return arm* body. The wrapper PUSHes
+/// the return-arm pair before driving the body's run_loop, then POPs.
+/// During the return arm's execution (which itself runs through a
+/// nested run_loop in the helper's NextStep::Call path), if the return
+/// arm body invokes a Cps sub-call, that sub-call's nested run_loop
+/// must see a CLEAR top-of-stack — its own natural-exit must NOT
+/// dispatch the (already-consumed) return arm.
+///
+/// Setup: `body_fn() → Int` (10), `return(v) => sub_cps_fn(v) + 1000`,
+/// `sub_cps_fn(n: Int) → Int ![Log]` returns `n + 1` after a Log perform.
+///
+/// Trace:
+///   - body_fn natural exit Done(10) → wrapper helper builds
+///     NextStep::Call(return_arm, [10, null, identity]).
+///   - return_arm runs: calls sub_cps_fn(10) → 11. The Log perform's
+///     handler returns 0 via k(0). sub_cps_fn natural exit Done(11) →
+///     helper sees TOP=null (pushed by lower_call's Cps branch around
+///     sub_cps_fn's nested run_loop) and emits plain Done(11).
+///   - return arm body computes 11 + 1000 = 1011.
+///   - trampoline returns 1011.
+///
+/// Wrong outputs surface stack-discipline breaks:
+///   - "2011\n" or higher: sub_cps_fn inherited outer's return arm
+///     (Risk 3, return-arm side) and triggered a re-wrap.
+///   - panic / segfault: PUSH/POP imbalance under nested wrapper +
+///     sub-call paths.
+#[test]
+fn task_78_5_g4_approach6_risk3_cps_sub_call_in_return_arm_body() {
+    let src = "import std.io\n\
+               \n\
+               effect E { op: () -> Int }\n\
+               effect Log { write: (Int) -> Int }\n\
+               \n\
+               fn sub_cps_fn(n: Int) -> Int ![Log] {\n  \
+                 let _: Int = perform Log.write(n);\n  \
+                 n + 1\n\
+               }\n\
+               \n\
+               fn body_fn() -> Int ![E] {\n  \
+                 let _: Int = perform E.op();\n  \
+                 10\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle body_fn() with {\n    \
+                   E.op(k) => k(0),\n    \
+                   Log.write(_, k) => k(0),\n    \
+                   return(v) => sub_cps_fn(v) + 1000,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_risk3_cps_sub_call_in_return_arm_body",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1011\n",
+        "Risk 3 / return-arm side: sub_cps_fn inside return arm body MUST NOT \
+         trigger the (already-consumed) outer return arm. Expected 10+1+1000 = \
+         1011. Wrong outputs (e.g. 2011) mean the sub-call inherited the outer's \
+         return-arm pair. stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 G4 Approach 6 deep-redo (PR #80 review §5) — Risk 3,
+/// shape 3: triply-nested handle + Cps sub-call inside an inner
+/// handle's body fn.**
+///
+/// Three handle expressions stack up; the middle one's body is a Cps
+/// user fn that itself calls a Cps sub-fn. The sub-fn must not see any
+/// of the three return arms — its natural exit emits plain Done.
+///
+/// outer wraps middle's overall via `v + 1000`.
+/// middle wraps middle_body's natural exit via `v + 100`.
+/// inner has no return arm but discharges via op arm.
+///
+/// middle_body() → 5: calls deep_cps(7) — must return 7+1=8 plainly,
+/// then middle_body returns 5 → middle return wraps → 105 → outer
+/// return wraps → 1105.
+#[test]
+fn task_78_5_g4_approach6_risk3_triply_nested_with_sub_cps_call() {
+    let src = "import std.io\n\
+               \n\
+               effect E1 { op1: () -> Int }\n\
+               effect E2 { op2: () -> Int }\n\
+               effect E3 { op3: () -> Int }\n\
+               \n\
+               fn deep_cps(n: Int) -> Int ![E3] {\n  \
+                 let _: Int = perform E3.op3();\n  \
+                 n + 1\n\
+               }\n\
+               \n\
+               fn middle_body() -> Int ![E2, E3] {\n  \
+                 let _: Int = perform E2.op2();\n  \
+                 let _: Int = deep_cps(7);\n  \
+                 5\n\
+               }\n\
+               \n\
+               fn outer_body() -> Int ![E1, E2, E3] {\n  \
+                 let _: Int = perform E1.op1();\n  \
+                 let m: Int = handle middle_body() with {\n    \
+                   E2.op2(k) => k(0),\n    \
+                   E3.op3(k) => k(0),\n    \
+                   return(v) => v + 100,\n  \
+                 };\n  \
+                 m\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle outer_body() with {\n    \
+                   E1.op1(k) => k(0),\n    \
+                   E2.op2(k) => k(0),\n    \
+                   E3.op3(k) => k(0),\n    \
+                   return(v) => v + 1000,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_78_5_g4_approach6_risk3_triply_nested_with_sub_cps_call",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1105\n",
+        "Triply-nested + sub-Cps-call: deep_cps's natural exit is plain Done(8), \
+         middle_body returns 5 → middle return wraps → 105 → outer return wraps \
+         → 1105. Wrong outputs surface stack-discipline breaks across nested \
+         wrapper invocations. stderr={stderr:?}"
+    );
+}
+
 /// **Task 78.5 G4 Phase B.1 — non-recursive compound-match-with-arm-perform
 /// emits + runs.**
 ///

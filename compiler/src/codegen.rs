@@ -13075,6 +13075,32 @@ struct Lowerer<'a, 'b> {
     arm_k_pair_captures: &'b BTreeMap<String, crate::closure_convert::ArmKPairCapture>,
 }
 
+/// Task 78.5 G4 Approach 6 deep-redo (PR #80 review §7) — free-fn
+/// kernel of `Lowerer::body_as_direct_cps_call`. Detects whether the
+/// handle expression's body is a direct call to a Cps-ABI top-level
+/// user fn. Returns `Some((name, args))` for the eligible shape,
+/// `None` otherwise.
+///
+/// `lookup_abi(name)` returns the ABI of `name` if it's a top-level
+/// user fn, otherwise `None`. The Lowerer wrapper passes
+/// `|n| self.user_fns.get(n).map(|e| e.abi)`; unit tests pass ad-hoc
+/// closures so the detector's structural rules can be pinned without
+/// constructing a full Lowerer.
+fn body_as_direct_cps_call_with_lookup(
+    body: &crate::ast::Expr,
+    lookup_abi: impl Fn(&str) -> Option<UserFnAbi>,
+) -> Option<(&str, &[crate::ast::Expr])> {
+    use crate::ast::Expr;
+    if let Expr::Call { callee, args, .. } = body {
+        if let Expr::Ident(name, _) = callee.as_ref() {
+            if matches!(lookup_abi(name), Some(UserFnAbi::Cps)) {
+                return Some((name.as_str(), args.as_slice()));
+            }
+        }
+    }
+    None
+}
+
 impl<'a, 'b> Lowerer<'a, 'b> {
     /// Lower a `Block`. Returns the tail expression's value if any,
     /// `None` when the block has no tail (statement-only block, value
@@ -13098,25 +13124,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// fn. Returns `Some((name, args))` for the eligible shape, `None`
     /// otherwise.
     ///
+    /// Thin Lowerer-method wrapper around the free helper
+    /// [`body_as_direct_cps_call_with_lookup`] — Lowerer instances
+    /// pass `self.user_fns` as the ABI lookup; unit tests bypass the
+    /// Lowerer and construct ad-hoc lookup closures (see the
+    /// `body_as_direct_cps_call_*` tests in this module).
+    ///
     /// Used by `Expr::Handle`'s lower_expr arm to gate routing into
     /// `lower_handle_body_direct_cps_call` (the custom Sync→Cps interop
-    /// wrapper that SETs `BODY_RETURN_ARM` TLS instead of clearing it,
-    /// per Approach 6's deep-handler semantic for the body fn).
+    /// wrapper that PUSHes the active handle's return-arm pair onto
+    /// BODY_RETURN_ARM_STACK, per Approach 6's deep-handler semantic
+    /// for the body fn).
     fn body_as_direct_cps_call<'expr>(
         &self,
         body: &'expr crate::ast::Expr,
     ) -> Option<(&'expr str, &'expr [crate::ast::Expr])> {
-        use crate::ast::Expr;
-        if let Expr::Call { callee, args, .. } = body {
-            if let Expr::Ident(name, _) = callee.as_ref() {
-                if let Some(entry) = self.user_fns.get(name) {
-                    if matches!(entry.abi, UserFnAbi::Cps) {
-                        return Some((name.as_str(), args.as_slice()));
-                    }
-                }
-            }
-        }
-        None
+        body_as_direct_cps_call_with_lookup(body, |name| {
+            self.user_fns.get(name).map(|entry| entry.abi)
+        })
     }
 
     /// Task 78.5 G4 Approach 6 deep-redo — custom Sync→Cps interop
@@ -22965,5 +22990,189 @@ mod tests {
             "B.3 detector should reject ctor-shaped calls (Cons isn't \
              a user fn; lookup returns None)"
         );
+    }
+
+    // ======================================================================
+    // Task 78.5 G4 Approach 6 deep-redo (PR #80 review §7) — Lowerer's
+    // `body_as_direct_cps_call` shape detector tests.
+    //
+    // The detector at `body_as_direct_cps_call_with_lookup` (free
+    // helper; the Lowerer method is a thin wrapper) returns
+    // `Some((name, args))` iff the handle body is a direct call to a
+    // Cps-ABI top-level user fn. The handle expression's `lower_expr`
+    // arm uses this signal to gate routing into
+    // `lower_handle_body_direct_cps_call`, which PUSHes the active
+    // handle's return-arm pair onto BODY_RETURN_ARM_STACK around the
+    // body's nested run_loop (so the helper at body-fn natural-exit
+    // emit sites can dispatch through the active handle's return arm
+    // for deep-handler semantic).
+    //
+    // These tests pin the structural acceptance/rejection invariants;
+    // the IR-level emission path is exercised end-to-end by the e2e
+    // tests in `compiler/tests/e2e.rs` (Generator, B!=R, Risk 3 matrix,
+    // DISCHARGED-bypass, nested handles).
+    //
+    // Ported from the now-removed PR #75 `b4_handle_body_is_cps_user_-
+    // fn_call` test suite to keep coverage of the detector contract.
+    // ======================================================================
+
+    /// Build a minimal `Expr::Call { callee: Ident(name), args: [] }`.
+    fn body_as_direct_cps_call_make_call_expr(name: &str) -> crate::ast::Expr {
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        Expr::Call {
+            callee: Box::new(Expr::Ident(name.to_string(), span.clone())),
+            args: vec![],
+            span,
+        }
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_accepts_direct_call_to_cps_user_fn() {
+        // Body shape: `iterate()` where `iterate` is a top-level user
+        // fn with Cps ABI. The detector returns Some so the handle
+        // expression routes into `lower_handle_body_direct_cps_call`.
+        let body = body_as_direct_cps_call_make_call_expr("iterate");
+        let result = body_as_direct_cps_call_with_lookup(&body, |name| {
+            (name == "iterate").then_some(UserFnAbi::Cps)
+        });
+        assert_eq!(
+            result.map(|(n, args)| (n, args.len())),
+            Some(("iterate", 0)),
+            "Approach 6 detector should accept direct call to Cps user fn"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_rejects_call_to_sync_user_fn() {
+        // Body shape: `comp()` where `comp` is a top-level user fn but
+        // with Sync ABI. The standard sync body lowering handles Sync
+        // callees correctly; Approach 6's wrapper only applies to Cps
+        // callees (where the body's nested run_loop hosts the helper
+        // dispatch).
+        let body = body_as_direct_cps_call_make_call_expr("comp");
+        let result = body_as_direct_cps_call_with_lookup(&body, |name| {
+            (name == "comp").then_some(UserFnAbi::Sync)
+        });
+        assert!(
+            result.is_none(),
+            "Approach 6 detector should reject Sync-ABI callees \
+             (standard sync body lowering handles them)"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_rejects_unknown_callee() {
+        // Body shape: `mystery()` where `mystery` is NOT a top-level
+        // user fn (could be a constructor, a local fn-typed binding,
+        // or simply unresolved). The detector returns None; the
+        // handle expression falls through to standard `lower_expr`,
+        // which then dispatches according to the standard rules.
+        let body = body_as_direct_cps_call_make_call_expr("mystery");
+        let result = body_as_direct_cps_call_with_lookup(&body, |_| None);
+        assert!(
+            result.is_none(),
+            "Approach 6 detector should reject unknown callees (not in user_fns)"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_rejects_non_call_body() {
+        // Body shape: an integer literal. Not a call at all; the
+        // standard `lower_expr` produces an inline `iconst` value. No
+        // trampoline body call to wrap, so Approach 6 doesn't apply.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let body = Expr::IntLit(42, Span::synthetic("x.sigil"));
+        let result = body_as_direct_cps_call_with_lookup(&body, |_| Some(UserFnAbi::Cps));
+        assert!(
+            result.is_none(),
+            "Approach 6 detector should reject non-Call body shapes"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_rejects_indirect_call_callee_shape() {
+        // Body shape: `(get_fn())()` — the callee is itself a call,
+        // not an Ident. This is the indirect-call shape (e.g., `body()`
+        // in run_state where `body` is a fn parameter). The detector
+        // returns None; standard lowering takes the indirect-call path
+        // via `local_fn_types` / `call_callee_tys`. Critically, this
+        // means run_state's `body()` body shape is unaffected by
+        // Approach 6 — the existing run_state ships unchanged.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let inner_call = Expr::Call {
+            callee: Box::new(Expr::Ident("get_fn".to_string(), span.clone())),
+            args: vec![],
+            span: span.clone(),
+        };
+        let body = Expr::Call {
+            callee: Box::new(inner_call),
+            args: vec![],
+            span,
+        };
+        let result = body_as_direct_cps_call_with_lookup(&body, |_| Some(UserFnAbi::Cps));
+        assert!(
+            result.is_none(),
+            "Approach 6 detector should reject indirect-call shapes \
+             (callee is not an Ident); preserves run_state's body() lowering"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_rejects_call_with_args_when_callee_unknown() {
+        // Edge: the call has args but the callee isn't in user_fns.
+        // Detector returns None regardless of args. (Documents that
+        // arg shape doesn't influence detection — only callee-name
+        // resolution + ABI check do.)
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Call {
+            callee: Box::new(Expr::Ident("Cons".to_string(), span.clone())),
+            args: vec![
+                Expr::IntLit(1, span.clone()),
+                Expr::Ident("rest".to_string(), span.clone()),
+            ],
+            span,
+        };
+        // Cons is a constructor; not in user_fns (so lookup returns None).
+        let result = body_as_direct_cps_call_with_lookup(&body, |_| None);
+        assert!(
+            result.is_none(),
+            "Approach 6 detector should reject ctor-shaped calls (Cons isn't \
+             a user fn; lookup returns None)"
+        );
+    }
+
+    #[test]
+    fn body_as_direct_cps_call_threads_args_through_to_caller() {
+        // Approach 6 / Item 7 specific: confirm the args slice is
+        // propagated correctly. The wrapper needs to lower each arg
+        // expression for its Cps-call's stack-slot pack — the detector
+        // returning the args slice (not just the name) saves the
+        // caller from re-walking the AST.
+        use crate::ast::Expr;
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Expr::Call {
+            callee: Box::new(Expr::Ident("iterate".to_string(), span.clone())),
+            args: vec![
+                Expr::IntLit(1, span.clone()),
+                Expr::Ident("xs".to_string(), span.clone()),
+            ],
+            span,
+        };
+        let result = body_as_direct_cps_call_with_lookup(&body, |name| {
+            (name == "iterate").then_some(UserFnAbi::Cps)
+        });
+        let (name, args) = result.expect("should accept Cps user fn call with args");
+        assert_eq!(name, "iterate");
+        assert_eq!(args.len(), 2, "args slice should preserve length");
+        assert!(matches!(args[0], Expr::IntLit(1, _)));
+        assert!(matches!(args[1], Expr::Ident(ref n, _) if n == "xs"));
     }
 }
