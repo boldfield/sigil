@@ -8373,6 +8373,114 @@ fn task_78_5_g4_generator_probe3_no_return_arm() {
     assert_eq!(stdout, "1\n", "PROBE 3 stdout; stderr={stderr:?}");
 }
 
+#[test]
+fn task_78_5_g4_generator_probe4_empty_list_b4_immediate_done() {
+    // PROBE 4 — empty list input. iterate(Nil) → match Nil => 0 → Int=0.
+    // Handle's body produces Int=0 immediately; NO perform, NO recursion.
+    // Return-arm fires with v=0, returns Nil (List[Int]). length(Nil) = 0.
+    //
+    // This isolates B.4's install + immediate-Done routing in the absence
+    // of any synth-cont allocation or B.3 dispatch. If this crashes,
+    // the bug is in B.4's install / immediate-Done routing alone (no
+    // interaction with B.2's closure or B.3's CPS→CPS direct dispatch).
+    // Investigate `lower_b4_cps_body_call` against handler frame read
+    // at codegen.rs:11781-11824 area.
+    //
+    // Expected: exit 0, stdout "0\n".
+    let src = "import std.list\n\
+               import std.io\n\
+               \n\
+               effect Gen[A] {\n  \
+                 yield: (A) -> Int,\n\
+               }\n\
+               \n\
+               fn iterate(xs: List[Int]) -> Int ![Gen[Int]] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(x, rest) => {\n      \
+                     let _: Int = perform Gen.yield(x);\n      \
+                     iterate(rest)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = Nil;\n  \
+                 let result: List[Int] = handle iterate(xs) with {\n    \
+                   Gen.yield(x, k) => {\n      \
+                     let rest: List[Int] = k(0);\n      \
+                     Cons(x, rest)\n    \
+                   },\n    \
+                   return(_v) => Nil,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(length(result)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run_with_backtrace(src, "task_78_5_g4_generator_probe4_empty_list");
+    eprintln!(
+        "--- PROBE 4 (empty list; B.4 install + immediate-Done routing alone) ---\n\
+         stdout={stdout:?}\nstderr={stderr:?}\ncode={code}"
+    );
+    assert_eq!(code, 0, "PROBE 4 exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "PROBE 4 stdout; stderr={stderr:?}");
+}
+
+#[test]
+fn task_78_5_g4_generator_probe5_single_element_b4_min_recursion() {
+    // PROBE 5 — single-element list. iterate(Cons(7, Nil)) →
+    // perform Gen.yield(7) (one perform, one synth-cont allocation) →
+    // arm body invokes k(0) (one B.3 CPS→CPS dispatch back into iterate)
+    // → iterate(Nil) → 0 → return-arm fires v=0 → Nil.
+    // k(0) returns Nil; arm body computes Cons(7, Nil) → handle = [7].
+    // length([7]) = 1. Print "1\n".
+    //
+    // Minimum recursion depth that exercises B.2's closure record alloc +
+    // B.3's CPS→CPS dispatch + B.4's trailing-pair routing through ALL of
+    // them. If Probe 4 passes and Probe 5 fails, the bug is at the
+    // B.4 + synth-cont dispatch interaction. Investigate B.2's closure
+    // allocation lifetime + B.4's trailing-pair forwarding through B.3.
+    //
+    // Expected: exit 0, stdout "1\n".
+    let src = "import std.list\n\
+               import std.io\n\
+               \n\
+               effect Gen[A] {\n  \
+                 yield: (A) -> Int,\n\
+               }\n\
+               \n\
+               fn iterate(xs: List[Int]) -> Int ![Gen[Int]] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(x, rest) => {\n      \
+                     let _: Int = perform Gen.yield(x);\n      \
+                     iterate(rest)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = Cons(7, Nil);\n  \
+                 let result: List[Int] = handle iterate(xs) with {\n    \
+                   Gen.yield(x, k) => {\n      \
+                     let rest: List[Int] = k(0);\n      \
+                     Cons(x, rest)\n    \
+                   },\n    \
+                   return(_v) => Nil,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(length(result)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run_with_backtrace(src, "task_78_5_g4_generator_probe5_single_element");
+    eprintln!(
+        "--- PROBE 5 (single element; B.4 + B.2 + B.3 minimum-recursion path) ---\n\
+         stdout={stdout:?}\nstderr={stderr:?}\ncode={code}"
+    );
+    assert_eq!(code, 0, "PROBE 5 exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n", "PROBE 5 stdout; stderr={stderr:?}");
+}
+
 /// **Task 78.5 G4 Phase B.1 — non-recursive compound-match-with-arm-perform
 /// emits + runs.**
 ///
