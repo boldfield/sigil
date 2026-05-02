@@ -4440,12 +4440,38 @@ impl Tc {
                 // lambda (rank-1 ML). The surface name binds to the
                 // currently-active row-var if present, else stays
                 // closed.
-                let _ = effect_row_var;
+                //
+                // Task 78.5 G2.b — resolve the parsed `effect_row_var`
+                // name through the enclosing fn's `current_row_var_-
+                // subst` (mirrors the inner-fn-type path at typecheck.
+                // rs:6493). Pre-fix this lookup was elided (`let _ =
+                // effect_row_var;`) and the lambda's `FnSig` hardcoded
+                // `effect_row_var: None`, typing a row-bearing lambda
+                // as **closed**. A surrounding `let f: (..) -> .. ![|
+                // e] = <lambda>` then ran symmetric `unify_row(open
+                // tail, closed empty)` which collapsed the enclosing
+                // fn's row var to closed empty, corrupting its scheme
+                // and surfacing E0128 at every poly-call site whose
+                // body had extra effects (Koka `algeff/expr.kk` port).
+                // None when the row-var name doesn't resolve in the
+                // active subst (no enclosing row var, or unbound name —
+                // E0137 has already surfaced the unbound case at parse-
+                // time scheme registration).
+                let lambda_row_var_id: Option<u32> = effect_row_var
+                    .as_ref()
+                    .and_then(|rv| self.current_row_var_subst.get(&rv.name).copied());
                 // Plan D Task 114 — lambda's row carries args (same
                 // shape as the enclosing fn's body row).
                 let lambda_row =
                     effect_refs_to_insts(effects, &self.types, &self.current_generic_subst);
-                self.check_lambda(params, return_type, &lambda_row, body, span.clone())
+                self.check_lambda(
+                    params,
+                    return_type,
+                    &lambda_row,
+                    lambda_row_var_id,
+                    body,
+                    span.clone(),
+                )
             }
             // `ClosureRecord` / `ClosureEnvLoad` are post-closure-
             // conversion nodes synthesized by plan A2 task 31. They
@@ -4831,6 +4857,17 @@ impl Tc {
         params: &[Param],
         return_type: &TypeExpr,
         effects: &[EffectInst],
+        // Task 78.5 G2.b — resolved row-var id for the lambda's row,
+        // looked up by name through the enclosing fn's `current_row_-
+        // var_subst` at the call site. None when the lambda's surface
+        // row carries no row-var (`![IO]`-only) or when the named
+        // row-var doesn't resolve (no enclosing row var). The pre-fix
+        // shape silently dropped the parsed `effect_row_var`, which
+        // typed every row-bearing lambda as closed and (via symmetric
+        // `unify_row` on a surrounding annotated `let`) collapsed the
+        // enclosing fn's row var to closed empty. See the call site
+        // in `check_expr` for the full root-cause trace.
+        effect_row_var_id: Option<u32>,
         body: &Expr,
         span: Span,
     ) -> Option<Ty> {
@@ -4845,7 +4882,9 @@ impl Tc {
         // own generics (`(fn [B](x: B) ...)` would require parser
         // work in Stage 6+); this is the rank-1 ML choice. Row
         // variables on lambdas similarly inherit the active row-var
-        // subst from the enclosing fn.
+        // subst from the enclosing fn (closed by Task 78.5 G2.b — the
+        // lookup happens at the call site and arrives here as
+        // `effect_row_var_id`).
         let param_tys: Vec<Ty> = params
             .iter()
             .map(|p| self.ty_from_type_expr_here(&p.ty).unwrap_or(Ty::Unit))
@@ -4855,7 +4894,7 @@ impl Tc {
             params: param_tys.clone(),
             ret: ret_ty.clone(),
             effects: effects.to_vec(),
-            effect_row_var: None,
+            effect_row_var: effect_row_var_id,
         };
 
         // (2) capture analysis: snapshot the outer env *before*
@@ -12562,6 +12601,163 @@ mod tests {
         let f = mk_decl(Vec::new(), Some("e"));
         let kept = effective_fn_generic_params(&f);
         assert!(kept.is_empty());
+    }
+
+    // ===== Task 78.5 G2.b — lambda inherits enclosing row var =====
+    //
+    // Pre-fix (`let _ = effect_row_var;` at typecheck.rs:4328 +
+    // hardcoded `effect_row_var: None` at :4769) typed every
+    // row-bearing lambda as closed; the surrounding annotated
+    // `let f: (..) -> .. ![| e] = <lambda>` then ran symmetric
+    // `unify_row(open tail, closed empty)` and bound the enclosing
+    // fn's row var to closed empty, surfacing E0128 at every
+    // row-poly call site whose body had extra effects.
+    //
+    // The unit tests below pin the typecheck-level behavior that the
+    // e2e regression pins (`task_78_5_g2b_minimal_lambda_row_var_-
+    // inheritance` and `task_78_5_pending_g5_continuation_in_handler_-
+    // lambda_through_mono` in tests/e2e.rs) exercise end-to-end. Per
+    // `feedback_sigil_typecheck_unit_tests_insufficient`, type-system
+    // surface lifts get unit tests in addition to e2e.
+
+    #[test]
+    fn lambda_inside_row_poly_fn_inherits_enclosing_row_var() {
+        // The lambda `fn (x: Int) -> Int ![| e] => x` declares the
+        // outer fn's row-var `e` in its row. Pre-fix the lambda's
+        // FnSig dropped `e` and was typed as closed, breaking the
+        // surrounding annotated `let lam: (Int) -> Int ![| e] = ...`
+        // by symmetric `unify_row` that collapsed outer's `e` to
+        // closed empty. Post-fix the lambda inherits `e` via
+        // `current_row_var_subst` lookup; the let unifies cleanly
+        // and `outer`'s scheme stays row-polymorphic.
+        //
+        // The lambda value is bound but not invoked here — the bug
+        // surfaces at the let-annotation typecheck (the symmetric
+        // unify_row path), not at the call site. Leaving the lambda
+        // uninvoked keeps the test focused on the inheritance path.
+        let src = "fn outer[A](k: () -> A ![| e]) -> A ![| e] {\n  \
+                     let lam: (Int) -> Int ![| e] = fn (x: Int) -> Int ![| e] => x;\n  \
+                     k()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "lambda's row-var name should resolve through the enclosing \
+             fn's current_row_var_subst rather than dropping to closed; \
+             got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn row_poly_fn_with_lambda_let_preserves_open_row_at_call_site() {
+        // Cross-fn shape: `outer[A]` is row-poly over `e`; main calls
+        // it with an `IO`-bearing body. Pre-fix, the lambda binding
+        // inside `outer`'s body had its `e` dropped, the surrounding
+        // annotated `let` collapsed `outer`'s scheme row var to
+        // closed empty, and the call site `outer(io_body)` fired
+        // E0128 ("closed row `![]` cannot unify with closed row
+        // `![IO]`"). Post-fix the scheme stays open and the call
+        // unifies cleanly with `e := [IO]`.
+        let src = "import std.io\n\
+                   effect Eff { go: () -> Int }\n\
+                   fn outer[A](k: () -> A ![Eff | e]) -> A ![| e] {\n  \
+                     let lam: () -> A ![| e] = fn () -> A ![| e] => handle k() with {\n    \
+                       Eff.go(c) => c(0),\n  \
+                     };\n  \
+                     lam()\n\
+                   }\n\
+                   fn io_body() -> Int ![Eff, IO] {\n  \
+                     perform IO.println(\"x\");\n  \
+                     perform Eff.go()\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     outer(io_body)\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "row-poly fn with lambda-bound let inside its body should preserve \
+             scheme row var across call sites (lambda inherits row-var via \
+             current_row_var_subst); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn lambda_in_non_row_poly_fn_stays_closed() {
+        // Negative-coverage: when the enclosing fn has NO row var,
+        // the lambda's surface row is effectively closed. The fix
+        // resolves the row-var name through `current_row_var_subst`,
+        // which is empty here, so the lookup returns None and the
+        // lambda's `effect_row_var` stays None — preserving the
+        // rank-1 ML choice of "no fresh row vars introduced on
+        // lambdas". The annotated let on `() -> Int ![]` accepts
+        // the lambda's closed row; the program typechecks.
+        let src = "fn main() -> Int ![] {\n  \
+                     let lam: () -> Int ![] = fn () -> Int ![] => 0;\n  \
+                     lam()\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "lambda in non-row-poly fn should stay closed and typecheck \
+             cleanly; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn lambda_with_unbound_row_var_name_silently_degrades_pending_g6() {
+        // Negative-coverage: lambda's surface `effect_row_var` names
+        // a row var (`q`) that is NOT bound by any enclosing fn's
+        // row-var subst. The enclosing `outer[A]` IS row-poly (over
+        // `e`), so `current_row_var_subst` is non-empty — but `q` is
+        // not in it.
+        //
+        // Pre-G2.b-fix: lambda's `effect_row_var` was hardcoded to
+        // `None` regardless of input — same outcome as today (closed).
+        // Post-G2.b-fix: `current_row_var_subst.get("q")` returns
+        // `None`, so `lambda_row_var_id = None` — also closed.
+        //
+        // The point of this test is to pin **current (intentional)
+        // behavior** for the lookup-with-no-match path: silent
+        // degradation to closed row, no diagnostic.
+        // `check_type_expr_known` emits E0137 only for `TypeExpr::Fn`
+        // (type-annotation form), not for `Expr::Lambda`'s parsed
+        // `effect_row_var` at expression position. So `q` here gets
+        // no diagnostic at all — the lambda just types as closed
+        // `![]`.
+        //
+        // The let-binding annotated `() -> Int ![| q] = <lambda>` then
+        // uses the let-position type-expression path, which **does**
+        // walk through `check_type_expr_known` — so `q` on the LHS
+        // **does** fire E0137. We pin: error list contains exactly
+        // one E0137 (from the let-binding's TypeExpr::Fn walk), and
+        // does **not** carry a second E0137 from the lambda RHS.
+        //
+        // When G6 lands and wires `Expr::Lambda::effect_row_var`
+        // through `check_type_expr_known`-equivalent emission, this
+        // test will fail loudly because the error list will then
+        // carry **two** E0137 occurrences (one for the LHS annotation,
+        // one for the lambda RHS) — at which point this test should
+        // be updated alongside the G6 patch. Failing loudly is the
+        // desired signal.
+        let src = "fn outer[A](b: () -> Int ![| e]) -> A ![| e] {\n  \
+                     let lam: () -> Int ![| q] = fn () -> Int ![| q] => 0;\n  \
+                     b();\n  \
+                     lam()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        let e0137_count = errs.iter().filter(|e| e.code.as_str() == "E0137").count();
+        assert_eq!(
+            e0137_count, 1,
+            "pre-G6: expected exactly ONE E0137 (from the let-binding's \
+             TypeExpr::Fn walk on `() -> Int ![| q]`); the lambda RHS's \
+             unbound `q` silently degrades to closed without diagnostic. \
+             When G6 wires E0137 emission for `Expr::Lambda::effect_row_var`, \
+             this count will become 2 — update this test alongside the \
+             G6 patch. Got errs={errs:?}"
+        );
     }
 
     #[test]

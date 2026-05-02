@@ -8461,55 +8461,107 @@ fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
     );
 }
 
-/// **Task 78.5 — Multi-effect interpreter (Raise+State+IO) [PENDING `_pending_row_poly_lambda_drops_effect_row_var`].**
+/// **Task 78.5 G2.b — minimal regression pin: lambda inside row-poly
+/// fn inherits the enclosing row variable.**
+///
+/// Constructed (not Koka-imported) — isolates G2.b to a single shape
+/// that exercises only the lambda-effect-row-var inheritance path.
+/// Sister test `task_78_5_g2b_multi_effect_interpreter_row_poly_lambda`
+/// is the third-party-grounded representative; this one is the
+/// minimum reproducer.
+///
+/// ## Pre-fix failure
+///
+/// E0128 "effect row mismatch: closed row `![]` cannot unify with
+/// closed row `![Eff]`" at the `outer(inner)` call site. Pre-fix the
+/// `fn () -> Int ![| e] => ...` lambda dropped its parsed `e` row-var
+/// and was typed as closed `![]`; the surrounding `let lam: () -> Int
+/// ![| e] = <lambda>` ran symmetric unify_row that bound `outer`'s
+/// row var to closed empty; at `outer(inner)` the body row collapsed
+/// to closed `![]`, mismatching `inner`'s declared `![Eff]`.
+///
+/// ## Post-fix invariant
+///
+/// `outer(inner)` runs the inner action under the `Eff.go` discharger;
+/// the discharger resumes with `7`, which `inner` adds to `35` →
+/// `42`. stdout = `"42\n"`, exit 0.
+#[test]
+fn task_78_5_g2b_minimal_lambda_row_var_inheritance() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { go: () -> Int }\n\
+               \n\
+               fn outer[A](action: () -> A ![Eff | e]) -> A ![| e] {\n  \
+                 let lam: () -> A ![| e] = fn () -> A ![| e] => handle action() with {\n    \
+                   Eff.go(k) => k(7),\n  \
+                 };\n  \
+                 lam()\n\
+               }\n\
+               \n\
+               fn inner() -> Int ![Eff] {\n  \
+                 let v: Int = perform Eff.go();\n  \
+                 v + 35\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = outer(inner);\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_78_5_g2b_minimal_lambda_row_var");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "outer(inner) should resume with 7 + 35 = 42; stderr={stderr:?}"
+    );
+}
+
+/// **Task 78.5 — Multi-effect interpreter (Raise+State+IO).**
 ///
 /// Source pattern: `koka/test/algeff/expr.kk` lines 145–165 (`eval2`
 /// with state + exc) extended with IO trace per eval3 (lines 179–195).
 /// First sigil e2e exercising 3-effect recursive evaluation under
 /// stacked dischargers.
 ///
-/// ## Status — gap representative for G2.b
+/// ## Status — G2.b regression pin (closed)
 ///
-/// **`#[ignore]`'d**: surfaced E0128 "effect row mismatch: closed row
-/// `![State]` cannot unify with closed row `![ArithError, IO,
-/// Raise[String], State]`" at the run_state_poly call site. Originally
-/// authored alongside Plotkin (G2.a); typecheck trace confirmed
-/// **different root sites** so kept as the dedicated G2.b pin.
+/// Originally `#[ignore]`'d as the G2.b representative: pre-fix
+/// surfaced E0128 "effect row mismatch: closed row `![State]` cannot
+/// unify with closed row `![ArithError, IO, Raise[String], State]`"
+/// at the `run_state_poly` call site. The G2.b fix (typecheck.rs
+/// Lambda arm — resolve the parsed `effect_row_var` name through
+/// `current_row_var_subst` at lambda construction, mirroring the
+/// inner-fn-type resolution at typecheck.rs:6493) closes the gap.
 ///
-/// ## G2.b root site
+/// ## G2.b root site (pre-fix)
 ///
 /// `compiler/src/typecheck.rs:4328` (the `let _ = effect_row_var;`)
-/// and `:4743` (hardcoded `effect_row_var: None` on the lambda's
-/// `FnSig`). Lambda typing **drops the parsed `effect_row_var`**, so a
-/// lambda with declared row `![State | e]` (e.g. inside the body of a
-/// row-poly user fn) is typed as **closed**. Then the surrounding
+/// and `:4769` (hardcoded `effect_row_var: None` on the lambda's
+/// `FnSig`). Lambda typing **dropped the parsed `effect_row_var`**, so
+/// a lambda with declared row `![State | e]` (e.g. inside the body of
+/// a row-poly user fn) was typed as **closed**. Then the surrounding
 /// `let state_fn: (Int) -> A ![| e] = handle body() with { ... }`
-/// runs `unify_ty(decl, got)` symmetrically (typecheck.rs:3957→2780),
-/// `unify_row` takes the `(Some(a_tail), None)` branch (typecheck.rs:
-/// 3007), and `bind_row_var(id, Row{[], None})` (3021–3028) **binds
-/// run_state_poly's outer row var to closed empty**. The corrupted
-/// scheme stored at line 3873 is what's instantiated at every call
-/// site — the body param's `![State | e]` collapses to closed
+/// ran `unify_ty(decl, got)` symmetrically (typecheck.rs:3957→2780),
+/// `unify_row` took the `(Some(a_tail), None)` branch (typecheck.rs:
+/// 3007), and `bind_row_var(id, Row{[], None})` (3021–3028) bound
+/// run_state_poly's outer row var to closed empty. The corrupted
+/// scheme stored at line 3873 was what got instantiated at every call
+/// site — the body param's `![State | e]` collapsed to closed
 /// `![State]`. At main's call `run_state_poly(0, lambda_with_extra_-
 /// effects)`, `unify_row(closed [State], closed [Raise,State,
-/// ArithError,IO])` fires E0128 at 2942/2970.
+/// ArithError,IO])` fired E0128 at 2942/2970.
 ///
-/// ## Closure path — recommended option (1)
+/// ## Fix
 ///
-/// Two-pronged fix at typecheck.rs. Reviewer preference: (1) first.
-///
-/// 1. **Lambda construction inherits the enclosing fn's row variable:
-///    resolve `effect_row_var` name through `current_row_var_subst` at
-///    lambda construction (mirroring the inner-fn-type resolution at
-///    line 6493).** Smaller blast radius — single-site change at
-///    typecheck.rs:4328+4743 plus one lookup. **Recommended; land
-///    first.**
-/// 2. AND/OR let-annotation→RHS uses asymmetric `subsume_row`-
-///    direction logic so the annotation's open row absorbs the
-///    closed RHS's effects without binding the row var to closed.
-///    Broader — touches `unify_row` direction semantics across all
-///    let-annot→RHS sites, not just lambda-shaped RHS. Revisit
-///    only if some V-variant requires it after (1) lands.
+/// At the `Expr::Lambda` arm in `check_expr` (typecheck.rs:4314),
+/// resolve the parsed `effect_row_var` name through
+/// `self.current_row_var_subst` and thread the resolved `Option<u32>`
+/// into `check_lambda` to populate `FnSig::effect_row_var`. Mirrors
+/// the inner-fn-type pattern at typecheck.rs:6493
+/// (`row_var_subst.get(&rv.name).copied()`). When the lookup returns
+/// `None` (no enclosing row var, or unbound name), the lambda's row
+/// stays closed exactly as before — preserving the rank-1 ML choice
+/// of "no fresh row vars introduced on lambdas".
 ///
 /// ## Note on the typed-let raise() workaround
 ///
@@ -8526,8 +8578,7 @@ fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
 /// → `(16/2)/3 = 2`. tick prints once per Div node; final value 2.
 /// stdout = `"tick\ntick\n2\n"`, exit 0.
 #[test]
-#[ignore = "G2.b: lambda typing drops parsed effect_row_var (typecheck.rs:4328/4743); symmetric let-annot unify_row collapses outer row var to closed empty. Recommended fix: option (1) — lambda inherits enclosing row var via current_row_var_subst lookup"]
-fn task_78_5_pending_g2b_lambda_drops_effect_row_var() {
+fn task_78_5_g2b_multi_effect_interpreter_row_poly_lambda() {
     let src = "import std.raise\n\
                import std.result\n\
                import std.io\n\
