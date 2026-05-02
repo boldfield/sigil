@@ -8466,7 +8466,7 @@ fn task_78_5_nim_mini_perfect_strategy_alice_wins_seven() {
 ///
 /// Constructed (not Koka-imported) — isolates G2.b to a single shape
 /// that exercises only the lambda-effect-row-var inheritance path.
-/// Sister test `task_78_5_g2b_multi_effect_interpreter_row_poly_lambda`
+/// Sister test `task_78_5_pending_g5_continuation_in_handler_lambda_through_mono`
 /// is the third-party-grounded representative; this one is the
 /// minimum reproducer.
 ///
@@ -8531,7 +8531,8 @@ fn task_78_5_g2b_minimal_lambda_row_var_inheritance() {
 /// at the `run_state_poly` call site. The G2.b fix (typecheck.rs
 /// Lambda arm — resolve the parsed `effect_row_var` name through
 /// `current_row_var_subst` at lambda construction, mirroring the
-/// inner-fn-type resolution at typecheck.rs:6493) **closes the
+/// inner-fn-type resolution at typecheck.rs:6532-6535 — the
+/// `TypeExpr::Fn` arm of `ty_from_type_expr_with_rows`) **closes the
 /// typecheck-level gap**: the test progresses past typecheck into
 /// monomorphize. Sister test `task_78_5_g2b_minimal_lambda_row_var_-
 /// inheritance` is the clean G2.b regression pin and passes
@@ -8578,7 +8579,7 @@ fn task_78_5_g2b_minimal_lambda_row_var_inheritance() {
 /// node; final value 2. stdout = `"tick\ntick\n2\n"`, exit 0.
 #[test]
 #[ignore = "G5 (post-G2.b): handler arm returns lambda capturing arm k; monomorphize panics at Ty::Continuation. G2.b (lambda effect_row_var inheritance) is closed by this PR — see task_78_5_g2b_minimal_lambda_row_var_inheritance. G5 is its own follow-up: extend monomorphize / Ty::Continuation propagation through row-poly handler-returns-lambda shapes."]
-fn task_78_5_g2b_multi_effect_interpreter_row_poly_lambda() {
+fn task_78_5_pending_g5_continuation_in_handler_lambda_through_mono() {
     let src = "import std.raise\n\
                import std.result\n\
                import std.io\n\

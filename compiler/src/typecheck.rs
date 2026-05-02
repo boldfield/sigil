@@ -4444,19 +4444,30 @@ impl Tc {
                 // Task 78.5 G2.b — resolve the parsed `effect_row_var`
                 // name through the enclosing fn's `current_row_var_-
                 // subst` (mirrors the inner-fn-type path at typecheck.
-                // rs:6493). Pre-fix this lookup was elided (`let _ =
-                // effect_row_var;`) and the lambda's `FnSig` hardcoded
-                // `effect_row_var: None`, typing a row-bearing lambda
-                // as **closed**. A surrounding `let f: (..) -> .. ![|
+                // rs:6532-6535 — the `TypeExpr::Fn` arm of `ty_from_-
+                // type_expr_with_rows`). Pre-fix this lookup was elided
+                // (`let _ = effect_row_var;`) and the lambda's `FnSig`
+                // hardcoded `effect_row_var: None`, typing a row-bearing
+                // lambda as **closed**. A surrounding `let f: (..) -> .. ![|
                 // e] = <lambda>` then ran symmetric `unify_row(open
                 // tail, closed empty)` which collapsed the enclosing
                 // fn's row var to closed empty, corrupting its scheme
                 // and surfacing E0128 at every poly-call site whose
                 // body had extra effects (Koka `algeff/expr.kk` port).
                 // None when the row-var name doesn't resolve in the
-                // active subst (no enclosing row var, or unbound name —
-                // E0137 has already surfaced the unbound case at parse-
-                // time scheme registration).
+                // active subst (no enclosing row var, or unbound name).
+                //
+                // TODO (Task 78.5 G6): lambda surface row-var binding
+                // currently has no E0137 walk. `check_type_expr_known`
+                // emits E0137 only for `TypeExpr::Fn::effect_row_var`
+                // (type-annotation form, lines 3314-3328) — `Expr::-
+                // Lambda::effect_row_var` is parsed at expression
+                // position and never fed to that walk, so an unbound
+                // surface name (e.g. `fn () -> Int ![| q] => 0` with
+                // no enclosing `q` binder) silently degrades to a
+                // closed row instead of firing a diagnostic. File as
+                // G6 follow-up — wire `check_type_expr_known`-equivalent
+                // E0137 emission for `Expr::Lambda::effect_row_var`.
                 let lambda_row_var_id: Option<u32> = effect_row_var
                     .as_ref()
                     .and_then(|rv| self.current_row_var_subst.get(&rv.name).copied());
