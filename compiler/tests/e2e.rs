@@ -7365,26 +7365,22 @@ fn std_state_run_state_get_only_reflects_initial() {
     assert_eq!(stdout, "42\n", "stderr={stderr:?}");
 }
 
-/// **Pin the v1 wrapper-fn-frame composition gap** documented as
-/// `[DEVIATION Task 72]` constraint #3. When user-side wrapper fns
-/// (`get_state` / `set_state`) introduce a function-call frame
-/// between the body's call site and the underlying `perform State.x`,
-/// the discharge-with-lambda continuation chain produces the wrong
-/// runtime result — `run_state(5, comp_via_wrappers)` returns the
-/// initial value `5` instead of the canonical threaded `11`.
+/// **Pin wrapper-fn-frame composition** for the `std/state` surface
+/// (closure of `[DEVIATION Task 72]` constraint #3 via Plan D Task
+/// 112). User-side wrapper fns (`get_state` / `set_state`) introduce
+/// a function-call frame between the body's call site and the
+/// underlying `perform State.x`. Pre-Task-112 the discharge-with-
+/// lambda continuation chain produced the initial value `5` instead
+/// of the threaded `11` (the failure shape that surfaced on PR #45's
+/// first CI run with commit `c71c1e4`). Post-Task-112 the chained-
+/// let-yield classifier accepts wrapper-Call let-RHS and the helper-
+/// body / Middle-step emit threads the chain's k-pair through the
+/// wrapper boundary.
 ///
-/// The assertion below pins the **future-correct (v2)** value
-/// `"11\n"`. Pre-fix, actual stdout is `"5\n"` — the very failure
-/// shape that surfaced on PR #45's first CI run with commit
-/// `c71c1e4`.
-///
-/// **Resolution path:** v2 closure for the deferred Plan B' /
-/// Stage 6.8 wrapper-fn-frame composition fix (tracked in
-/// `PLAN_C_PROGRESS.md`'s "Plan B' Stage-6.8-followup architectural
-/// carryovers" section). When that lands, **un-ignore this test
-/// and confirm it passes**.
+/// Test name retains the historical "_pending_v2_wrapper_fn_frame_fix"
+/// suffix as a permanent pointer to the closure event in commit
+/// history; future cleanup may rename to drop the "pending" framing.
 #[test]
-#[ignore = "FIXME [DEVIATION Task 72] constraint #3 — un-ignore when v2 closes wrapper-fn-frame composition"]
 fn std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix() {
     let src = "import std.state\n\
                fn get_state() -> Int ![State] { perform State.get() }\n\
@@ -7409,6 +7405,173 @@ fn std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix() {
         "expected wrapper-fn-frame composition to thread state \
          identically to inline-perform; pre-v2 actual is \"5\\n\" \
          (initial value passes through). stderr={stderr:?}"
+    );
+}
+
+/// Plan D Task 112 — wrapper-fn-frame composition fix. Self-contained
+/// version of `std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix`
+/// that pins the codegen-side gap (no stdlib dependency). Pre-fix:
+/// `set_state(10)` wraps `perform S.set(10)`; the calling fn's body
+/// `let _ = set_state(10); let v = get_state(); v + 1` selects Sync
+/// ABI because the chained-let-yield classifier rejects wrapper-Call
+/// in let-RHS. The Sync→Cps interop wrapper hardcodes
+/// `(null_k_closure, identity_k_fn)` as the trailing pair; the
+/// discharge-with-lambda arm `fn (s) => k(arg)(arg)` thus captures
+/// identity and produces garbage instead of the threaded state.
+/// Post-fix: classifier accepts wrapper-Call let-RHS; calling fn
+/// becomes Cps; wrapped-Cps-call k-pair threading delivers the real
+/// continuation; result = 11 (set 10, get 10, tail = 10+1).
+#[test]
+fn task_112_wrapper_fn_frame_composition_state_set_get_returns_11() {
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               fn set_state(n: Int) -> Int ![S] { perform S.set(n) }\n\
+               fn get_state() -> Int ![S] { perform S.get() }\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _: Int = set_state(10);\n  \
+                 let v: Int = get_state();\n  \
+                 v + 1\n\
+               }\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112_wrappers_set_get");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "11\n",
+        "Task 112 post-fix: wrappers compose with discharge-with-lambda — \
+         set_state(10) → S.set(10) threads 10; get_state() → S.get() returns \
+         10; tail v+1 = 11. Pre-fix actual is garbage (often `0\\n` or \
+         `5\\n` depending on initial-value pass-through). stderr={stderr:?}"
+    );
+}
+
+/// Plan D Task 112 sister test — multi-let chain with wrappers.
+/// Three sequential `set_state` calls thread 1, 2, 3 in turn; final
+/// `get_state` reads back 3. Pins the chain-length-3+ branch of
+/// the Middle-step CallCps emit (each Middle dispatches the next
+/// wrapper-Call with its own k-pair).
+#[test]
+fn task_112_wrapper_chain_three_sets_then_get_returns_3() {
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               fn set_state(n: Int) -> Int ![S] { perform S.set(n) }\n\
+               fn get_state() -> Int ![S] { perform S.get() }\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _: Int = set_state(1);\n  \
+                 let _: Int = set_state(2);\n  \
+                 let _: Int = set_state(3);\n  \
+                 get_state()\n\
+               }\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112_wrapper_chain_three");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3\n",
+        "set_state(1) → set_state(2) → set_state(3) → get_state() = 3. \
+         stderr={stderr:?}"
+    );
+}
+
+/// Plan D Task 112 sister test — wrapper-Call returning a bound
+/// value that the chain's tail uses. Tests that the binding
+/// receives the actual perform-resume value (not garbage) and
+/// flows correctly into a non-trivial tail expression.
+#[test]
+fn task_112_wrapper_returns_binding_used_in_tail() {
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               fn set_state(n: Int) -> Int ![S] { perform S.set(n) }\n\
+               fn get_state() -> Int ![S] { perform S.get() }\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _: Int = set_state(7);\n  \
+                 let v: Int = get_state();\n  \
+                 v + v\n\
+               }\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112_wrapper_binding_in_tail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "14\n",
+        "v = get_state() = 7; v + v = 14. stderr={stderr:?}"
+    );
+}
+
+/// Plan D Task 112 sister test — mixed inline-`perform` and
+/// wrapper-Call let-RHS. Pins that the chain accepts both shapes
+/// in the same body without falling back to Sync ABI.
+#[test]
+fn task_112_mixed_inline_perform_and_wrapper_in_chain() {
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               fn set_state(n: Int) -> Int ![S] { perform S.set(n) }\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _: Int = perform S.set(0);\n  \
+                 let _: Int = set_state(20);\n  \
+                 let v: Int = perform S.get();\n  \
+                 v + 5\n\
+               }\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112_mixed_inline_wrapper");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "25\n",
+        "perform S.set(0) → set_state(20) → perform S.get() = 20; tail v + 5 = 25. \
+         stderr={stderr:?}"
     );
 }
 
