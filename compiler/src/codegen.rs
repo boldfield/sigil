@@ -2723,6 +2723,20 @@ enum CpsContinuationKind {
         /// What this step does after binding + loading. `Middle`
         /// issues the next perform; `Final` lowers the tail.
         role: ChainStepRole,
+        /// Plan D Task 112 — `true` iff the immediately-preceding
+        /// chain position was a wrapper-Call (`ChainedNextStep::CallCps`).
+        /// At step body entry, the synth-cont POPs the (null, null)
+        /// pair that the preceding emit pushed onto BODY_RETURN_ARM_STACK
+        /// to mask the outer body's return arm during the sub-Cps-call's
+        /// natural exit (Risk 3 protection from PR #80 deep-redo,
+        /// generalized to chain-routing).
+        ///
+        /// For step_0: prior is the helper body's first step
+        /// (body_first_step kind).
+        /// For step_i (i > 0): prior is step_{i-1}'s next_step kind.
+        /// `false` always for Perform-only chains (the discipline only
+        /// kicks in when wrapper-Calls participate).
+        prior_was_call_cps: bool,
     },
     /// **Plan B Task 78.5 G4 Phase B.2 — compound-match per-arm post-
     /// perform synth-cont**: one entry per perform-bearing arm of a fn
@@ -7655,6 +7669,28 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 tail_ty,
                             }
                         };
+                        // Plan D Task 112 — `prior_was_call_cps` flag
+                        // tells the synth-cont body whether to POP
+                        // BODY_RETURN_ARM_STACK at entry (Risk 3
+                        // protection for the preceding CallCps emit's
+                        // PUSH).
+                        // - step_0's prior is the helper body's first
+                        //   step kind (steps[0] itself, since the
+                        //   helper body emits the dispatch to step_0).
+                        // - step_i's (i>0) prior is steps[i] itself —
+                        //   the step we're currently building handles
+                        //   the result of dispatching steps[i]'s
+                        //   predecessor in the chain. Wait, this is
+                        //   off-by-one. step_0 fires AFTER the helper
+                        //   body's first step (steps[0]). step_i (i>0)
+                        //   fires AFTER steps[i-1]'s dispatch... hmm
+                        //   actually step_i fires AFTER step_{i-1}'s
+                        //   Middle next_step dispatches to step_i. So
+                        //   step_i's prior dispatch is step_{i-1}'s
+                        //   next_step (which is steps[i]). So:
+                        //   prior_step_kind for step_i = steps[i].
+                        let prior_was_call_cps =
+                            matches!(steps[step], ChainedNextStep::CallCps { .. });
                         cps_continuation_synth.push(CpsContinuationSynth {
                             func_id: step_func_ids[step],
                             parent_fn_name: f.name.clone(),
@@ -7665,6 +7701,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 captures: captures.clone(),
                                 prior_bindings,
                                 role,
+                                prior_was_call_cps,
                             },
                         });
                     }
@@ -9284,10 +9321,44 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             })
                             .collect();
                         let null_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
+                        // arg_count = user_arg_count + 2 (the trailing
+                        // (k_closure, k_fn) pair). `sigil_next_step_call`
+                        // allocates `arg_count * 8` bytes for the args
+                        // buffer; we need room for both user args AND
+                        // the trailing pair. The Cps callee's body
+                        // ignores args_len at runtime (uses the static
+                        // user_arg_count from f.params.len()), so this
+                        // count is only consumed by the runtime arena
+                        // allocator and the trampoline's MAX_INLINE_ARGS
+                        // check. Mirrors the synth-arm-fn tail-k path
+                        // (codegen.rs:10180-ish), which also passes
+                        // `total slots = user_arg_count + 2`.
+                        let total_arg_count = user_arg_count_call + 2;
                         let arg_count_v = lowerer
                             .builder
                             .ins()
-                            .iconst(types::I32, user_arg_count_call as i64);
+                            .iconst(types::I32, total_arg_count as i64);
+
+                        // Plan D Task 112 — Risk 3 protection PUSH.
+                        // PUSH (null, null) onto BODY_RETURN_ARM_STACK
+                        // before the wrapper-Call NextStep so the
+                        // callee's natural-exit emit reads (null,
+                        // null) and falls through to plain Done
+                        // (avoiding the outer body's return-arm wrap
+                        // firing on the sub-Cps-call's exit). The
+                        // POP happens at the next chain step's body
+                        // entry, gated on `prior_was_call_cps` (set
+                        // by pre-pass).
+                        let null_brk_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
+                        let null_brk_fn = lowerer.builder.ins().iconst(pointer_ty, 0);
+                        let push_call = lowerer
+                            .builder
+                            .ins()
+                            .call(body_return_arm_push_ref, &[null_brk_closure, null_brk_fn]);
+                        lowerer
+                            .stackmap
+                            .push_placeholder(function_code_offset(&lowerer.builder, push_call));
+
                         let call_ns = lowerer.builder.ins().call(
                             lowerer.next_step_call_ref,
                             &[null_closure, callee_fn_addr, arg_count_v],
@@ -11796,6 +11867,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // than `prepare_per_fn_refs`).
                 let done_or_dispatch_return_arm_ref =
                     module.declare_func_in_func(done_or_dispatch_return_arm, builder.func);
+                // Plan D Task 112 — Risk 3 protection POP at chain
+                // step body entry (gated on `prior_was_call_cps`).
+                // PUSH at Middle-step CallCps emit uses
+                // `body_return_arm_push_ref` from `prepare_per_fn_refs`
+                // (declared later in the Middle-step branch's
+                // Lowerer-construction scope).
+                let body_return_arm_pop_ref =
+                    module.declare_func_in_func(body_return_arm_pop, builder.func);
 
                 // Slice A: load post-arm-k pair from args_ptr at the
                 // trailing-pair offsets defined by the convention
@@ -11919,6 +11998,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         captures,
                         prior_bindings,
                         role,
+                        prior_was_call_cps,
                     } => {
                         // Plan B' Stage 6.7 Tasks 94+95 (B.2 Phase B+C):
                         // chained let-yield-then-pure-tail synth-cont.
@@ -11953,6 +12033,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // with `Done(tail_value)`).
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
+
+                        // Plan D Task 112 — Risk 3 protection POP.
+                        // If this step's predecessor in the chain was
+                        // a wrapper-Call (`prior_was_call_cps`), the
+                        // emit-side pushed (null, null) onto
+                        // BODY_RETURN_ARM_STACK before NextStep::Call;
+                        // pop here so subsequent natural-exit emits
+                        // (in this step's own perform-side OR in the
+                        // Final step's tail) read the correct outer
+                        // body's return-arm pair. Symmetric with the
+                        // PUSH at the helper-body / Middle-step
+                        // CallCps emit. Discards the popped fired
+                        // flag (chain-pushed entries are always (null,
+                        // null) so the flag is irrelevant).
+                        if *prior_was_call_cps {
+                            let pop_call = builder.ins().call(body_return_arm_pop_ref, &[]);
+                            stackmap.push_placeholder(function_code_offset(&builder, pop_call));
+                        }
 
                         // Bind args_ptr[0] under binding_name.
                         let widened_arg =
@@ -12488,10 +12586,38 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             .collect();
                                         let null_closure =
                                             lowerer.builder.ins().iconst(pointer_ty, 0);
+                                        // arg_count = user_arg_count +
+                                        // 2 (trailing pair). See
+                                        // helper-body Phase 6 CallCps
+                                        // branch comment for the
+                                        // rationale; same allocation +
+                                        // OOB-on-undersize discipline.
+                                        let total_arg_count = user_arg_count + 2;
                                         let arg_count_v = lowerer
                                             .builder
                                             .ins()
-                                            .iconst(types::I32, user_arg_count as i64);
+                                            .iconst(types::I32, total_arg_count as i64);
+
+                                        // Plan D Task 112 — Risk 3
+                                        // protection PUSH. See helper-
+                                        // body Phase 6 CallCps emit
+                                        // for the rationale; symmetric
+                                        // POP at next chain step's
+                                        // entry (gated on
+                                        // prior_was_call_cps).
+                                        let null_brk_closure_v =
+                                            lowerer.builder.ins().iconst(pointer_ty, 0);
+                                        let null_brk_fn_v =
+                                            lowerer.builder.ins().iconst(pointer_ty, 0);
+                                        let push_call = lowerer.builder.ins().call(
+                                            body_return_arm_push_ref,
+                                            &[null_brk_closure_v, null_brk_fn_v],
+                                        );
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            push_call,
+                                        ));
+
                                         let call_ns = lowerer.builder.ins().call(
                                             lowerer.next_step_call_ref,
                                             &[null_closure, callee_fn_addr, arg_count_v],

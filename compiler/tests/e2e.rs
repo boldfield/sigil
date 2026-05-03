@@ -7472,9 +7472,9 @@ fn task_112_wrapper_chain_three_sets_then_get_returns_3() {
                fn set_state(n: Int) -> Int ![S] { perform S.set(n) }\n\
                fn get_state() -> Int ![S] { perform S.get() }\n\
                fn comp() -> Int ![S] {\n  \
-                 let _: Int = set_state(1);\n  \
-                 let _: Int = set_state(2);\n  \
-                 let _: Int = set_state(3);\n  \
+                 let _a: Int = set_state(1);\n  \
+                 let _b: Int = set_state(2);\n  \
+                 let _c: Int = set_state(3);\n  \
                  get_state()\n\
                }\n\
                fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
@@ -7548,8 +7548,8 @@ fn task_112_mixed_inline_perform_and_wrapper_in_chain() {
                }\n\
                fn set_state(n: Int) -> Int ![S] { perform S.set(n) }\n\
                fn comp() -> Int ![S] {\n  \
-                 let _: Int = perform S.set(0);\n  \
-                 let _: Int = set_state(20);\n  \
+                 let _a: Int = perform S.set(0);\n  \
+                 let _b: Int = set_state(20);\n  \
                  let v: Int = perform S.get();\n  \
                  v + 5\n\
                }\n\
