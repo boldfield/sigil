@@ -3725,116 +3725,14 @@ fn discard_k_handler_use_k_arm_runs_synth_cont_with_bound_value() {
     );
 }
 
-#[test]
-fn arm_uses_k_inside_if_branch_is_rejected_pointing_at_phase_4e() {
-    // Phase 4d MVP — Phase 4e closure point: multi-branch tail-`k`
-    // shapes (`if c { k(x) } else { k(y) }`) require a join-block
-    // lowering returning `*NextStep`, beyond Phase 4d MVP scope.
-    // The walker (`arm_body_walk`) and the synth-pass detector
-    // (`arm_body_tail_is_k_call`) must agree on the recursion
-    // shape: both treat tail position as propagating only through
-    // `Expr::Block` tails (NOT `Expr::If` then/else, NOT `Expr::Match`
-    // arm bodies). A regression where the walker accepted these as
-    // tail-k while the detector rejected would manifest as a hard
-    // compiler crash at the synth pass's `lower_expr` (k as an
-    // indirect-call callee → `unreachable!`).
-    //
-    // This test pins the walker's rejection. Inverts to a positive
-    // test (asserting either branch's value flows correctly) when
-    // Phase 4e ships the join-block lowering.
-    let src = "effect E { op: () -> Int }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle (perform E.op()) with {\n    \
-                   E.op(k) => if true { k(1) } else { k(2) },\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(n));\n  \
-                 0\n\
-               }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4d_if_branch_k_reject_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4d_if_branch_k_reject_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail — k(arg) inside if-branch is non-tail under \
-         Phase 4d MVP detector; got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("non-tail") || stderr.contains("Phase 4e"),
-        "error message should reference non-tail k / Phase 4e; got stderr={stderr:?}",
-    );
-}
-
-#[test]
-fn arm_uses_k_inside_match_arm_is_rejected_pointing_at_phase_4e() {
-    // Phase 4d MVP — Phase 4e closure point: same shape as the
-    // if-branch test above but via `match`. The walker's
-    // `Expr::Match` arm-body walk must align with
-    // `arm_body_tail_is_k_call`'s "Block tails only" recursion —
-    // accepting tail-k inside match arms would cause the same
-    // walker-vs-detector mismatch that crashes the synth pass.
-    //
-    // Test source matches on a `Bool` scrutinee with both arms
-    // calling `k`. Inverts to a positive test when Phase 4e ships
-    // the join-block lowering.
-    let src = "effect E { op: () -> Int }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let n: Int = handle (perform E.op()) with {\n    \
-                   E.op(k) => match true { true => k(1), false => k(2) },\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(n));\n  \
-                 0\n\
-               }\n";
-    let tmp = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4d_match_arm_k_reject_{}.sigil",
-        std::process::id()
-    ));
-    std::fs::write(&tmp, src).expect("write source");
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_phase4d_match_arm_k_reject_{}",
-        std::process::id()
-    ));
-    let sigil_bin = sigil_binary();
-    let out = Command::new(&sigil_bin)
-        .arg(&tmp)
-        .arg("-o")
-        .arg(&bin_path)
-        .arg("--human-errors")
-        .output()
-        .expect("invoke sigil");
-    let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        !out.status.success(),
-        "compile must fail — k(arg) inside match arm body is non-tail under \
-         Phase 4d MVP detector; got success with stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("non-tail") || stderr.contains("Phase 4e"),
-        "error message should reference non-tail k / Phase 4e; got stderr={stderr:?}",
-    );
-}
+// Plan D Task 118 supersedes the Phase 4d-era rejection-pin tests
+// `arm_uses_k_inside_if_branch_is_rejected_pointing_at_phase_4e` and
+// `arm_uses_k_inside_match_arm_is_rejected_pointing_at_phase_4e` that
+// previously occupied this slot. Both pinned the pre-Task-118 walker
+// rejection of `if c { k(x) } else { k(y) }` and `match s { A => k(x),
+// B => k(y) }` shapes. With Task 118's branched-routing path
+// (`lower_arm_body_to_next_step`) those shapes are now supported; the
+// positive-path coverage lives in `task_118_*` tests further down.
 
 #[test]
 fn arm_body_with_inner_block_and_outer_capture_works() {
@@ -5548,7 +5446,6 @@ fn task_117_let_bound_k_alias_then_match_pattern_shadows_k_rejected_at_walker() 
 // =====================================================================
 
 #[test]
-#[ignore = "pending Plan D Task 118 architectural codegen extension — see PR #81 surface"]
 fn task_118_conditional_k_call_inside_if_drives_both_ways() {
     // (a) Conditional k-call inside `if`. The arm body is
     // `if cond { k(10) } else { k(20) }`. `cond` is the perform's
@@ -5579,7 +5476,6 @@ fn task_118_conditional_k_call_inside_if_drives_both_ways() {
 }
 
 #[test]
-#[ignore = "pending Plan D Task 118 architectural codegen extension — see PR #81 surface"]
 fn task_118_conditional_k_call_inside_match_drives_both_ways() {
     // (b) Conditional k-call inside `match`. The arm body matches
     // an op-arg tag and calls `k` with different ints per variant.
@@ -5611,7 +5507,6 @@ fn task_118_conditional_k_call_inside_match_drives_both_ways() {
 }
 
 #[test]
-#[ignore = "pending Plan D Task 118 architectural codegen extension — see PR #81 surface"]
 fn task_118_k_call_in_one_branch_else_discharges() {
     // (c) k-call in one branch and a non-k constant in the other.
     // When cond=true → `k(0)` → body returns 0 (perform resumes
@@ -5643,7 +5538,6 @@ fn task_118_k_call_in_one_branch_else_discharges() {
 }
 
 #[test]
-#[ignore = "pending Plan D Task 118 architectural codegen extension — see PR #81 surface"]
 fn task_118_recursive_choose_first_choice_three_candidates() {
     // (d) Sudoku-canonical "for each candidate { try k(c); on fail
     // try next }" recursive shape. Smaller fixture: 3 candidates,
