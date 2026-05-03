@@ -7893,6 +7893,137 @@ fn task_112c_case_d_three_layer_wrapper_chain_with_slice_b_outer_arm_returns_11(
     );
 }
 
+/// Plan D Task 112-mutually-recursive — empirical demonstration of
+/// structural unreachability.
+///
+/// **Background.** PR #85 (Task 112b) introduced a visited-set in
+/// `is_supported_cps_user_fn_inner` to support arbitrary-depth wrapper-
+/// of-chained-let-yield composition. The visited-set bails to `false`
+/// on cycles (mutually-recursive Cps fns), causing the surrounding fn
+/// to fall back to Sync ABI. PR #85's review prose flagged this as a
+/// potential failure mode under discharge-with-lambda handlers — the
+/// fallback path could re-exhibit the original Task 112 silent-garbage
+/// behavior.
+///
+/// **Architectural read (Task 112-mutually-recursive resolution).**
+/// The cycle case is **structurally unreachable** in any terminating
+/// Sigil program. The chained-let-yield body shape
+/// (`is_simple_chained_let_yield_then_pure_tail_body` at
+/// `compiler/src/codegen.rs`) has rigid constraints:
+///
+/// 1. Every stmt must be `Stmt::Let`.
+/// 2. Every let-RHS must be `Expr::Perform` OR `Expr::Call`. NO other
+///    shapes — no `If`, no `Match`, no `Block`.
+/// 3. Tail must satisfy `expr_is_pure`, which excludes non-ctor calls.
+///    `If`/`Match` in tail are permitted only with pure branches.
+///
+/// Mutual recursion via let-RHS (the only way the visited-set can
+/// trip) requires a base case to terminate. A base case requires a
+/// runtime conditional on whether the recursive call happens. But
+/// chained-let-yield let-RHS is unconditionally evaluated — there's
+/// no `if`-around-Call shape allowed. The if-in-tail can be pure but
+/// can't gate the let-RHS. So the recursion is unconditional.
+///
+/// **Empirical demonstration.** This test compiles two mutually-
+/// recursive chained-let-yield Cps wrappers (`helper_a` calls
+/// `helper_b`'s let-RHS; `helper_b` calls `helper_a`'s let-RHS), each
+/// with body shape `let _x = other(n); 0`. Pre-fix observation
+/// (verified locally on 2026-05-03): the program compiles
+/// successfully (classifier rejects helpers as "supported chained-
+/// let-yield wrappers" and falls back to Sync ABI for both, but Sync
+/// ABI compilation succeeds), and runs to a SIGSEGV stack overflow
+/// (exit code 139 on macOS) essentially instantly. Stdout is empty
+/// (the `perform IO.println(int_to_string(result))` is never
+/// reached).
+///
+/// The point is **NOT** that the program does something useful. The
+/// point is that the visited-set bail is **never observable as a
+/// silent-garbage failure mode** — programs that would hit it stack-
+/// overflow before reaching any state where the discharge-with-
+/// lambda lambda chain could matter.
+///
+/// **Conclusion.** The "Task 112-mutually-recursive" follow-up
+/// originally framed during PR #85 review is closed by analysis: the
+/// visited-set's bail-to-false is correct for the shapes it applies
+/// to, and the worry that it could regress to Task 112 silent-garbage
+/// is unfounded because the worry's prerequisite (a terminating
+/// program with mutually-recursive chained-let-yield Cps wrappers
+/// under discharge-with-lambda) doesn't exist.
+///
+/// Test asserts: compile succeeds, runtime exit is non-zero (stack
+/// overflow), stdout is empty.
+#[test]
+fn task_112_mutually_recursive_chained_wrappers_stack_overflow_not_silent_garbage() {
+    let src = "import std.io\n\
+               \n\
+               effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               \n\
+               fn helper_a(n: Int) -> Int ![S] {\n  \
+                 let _x: Int = helper_b(n);\n  \
+                 0\n\
+               }\n\
+               \n\
+               fn helper_b(n: Int) -> Int ![S] {\n  \
+                 let _x: Int = helper_a(n);\n  \
+                 0\n\
+               }\n\
+               \n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               fn comp() -> Int ![S] {\n  \
+                 let _y: Int = helper_a(0);\n  \
+                 let v: Int = perform S.get();\n  \
+                 v\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "task_112_mutually_recursive");
+    // Compile must succeed (otherwise compile_and_run would have
+    // panicked with "compile failed for ...").
+    //
+    // Runtime must exit non-zero (stack overflow). On macOS this is
+    // typically SIGSEGV (exit 139); on Linux SIGSEGV (exit 139) or
+    // SIGBUS (exit 138). The test is platform-portable by checking
+    // !=0 rather than asserting a specific signal code.
+    assert_ne!(
+        code, 0,
+        "Task 112-mutually-recursive: program must NOT exit cleanly. \
+         Mutually-recursive chained-let-yield Cps wrappers with no \
+         base case are structurally non-terminating; expected stack \
+         overflow (exit 139 on macOS, similar on Linux). exit={code}, \
+         stdout={stdout:?}"
+    );
+    // Stdout must be empty — the `perform IO.println(...)` is never
+    // reached because run_state never returns. If stdout were non-
+    // empty (e.g., a number), it would mean the recursion somehow
+    // terminated and produced a value, which would surface a
+    // potential silent-garbage failure mode the visited-set was
+    // worried about.
+    assert!(
+        stdout.is_empty(),
+        "Task 112-mutually-recursive: stdout must be empty. \
+         Non-empty stdout means the program reached \
+         `perform IO.println` AFTER mutual recursion somehow \
+         terminated, which would indicate the visited-set bail did \
+         produce a silent garbage value (the original failure mode \
+         worry). Got stdout={stdout:?}"
+    );
+}
+
 /// Plan D Task 112 sister test — multi-let chain with wrappers.
 /// Three sequential `set_state` calls thread 1, 2, 3 in turn; final
 /// `get_state` reads back 3. Pins the chain-length-3+ branch of

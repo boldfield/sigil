@@ -113,18 +113,27 @@ closeout (or earlier if scope permits bundling).
 **Active sequence (in flight):**
 
 - Task 112c — Case D fix (caller_k_fn-first gate + post_arm_k forwarding).
-  Status: **PR #86 in flight**. Closes the wrapper-in-chain + Slice B outer
-  arm intersection that PR #85 tracked via `#[ignore]`'d sister test.
+  Status: **DONE** — PR #86 merged at sigil/main `bc12950`. Closes the
+  wrapper-in-chain + Slice B outer arm intersection that PR #85 tracked
+  via `#[ignore]`'d sister test.
 - Task 112-mutually-recursive — Cps cycle handling under discharge-with-
-  lambda. Status: **next pickup after PR #86 merges**. Visited-set bails to
-  false on cycles → Sync ABI fallback re-exhibits original Task 112 silent-
-  garbage failure for state-threading handlers calling mutually-recursive
-  Cps fns. Architectural read needed: runtime depth-tracking vs different
-  cycle disposition vs ship-as-v1-limit-with-clear-error-message.
+  lambda. Status: **CLOSED BY ANALYSIS** (2026-05-03). Architectural read
+  established the cycle case is structurally unreachable in any terminating
+  Sigil program: chained-let-yield body shape forbids let-RHS conditionals,
+  mutual recursion via unconditional let-RHS Calls is structurally non-
+  terminating regardless of classifier output. Empirical confirmation via
+  `task_112_mutually_recursive_chained_wrappers_stack_overflow_not_silent_garbage`:
+  compiles successfully, runs to SIGSEGV before reaching any state where
+  discharge-with-lambda lambda chain matters. No silent-garbage failure
+  mode is reachable. Visited-set's bail-to-false is correct as-is. See
+  `is_supported_cps_user_fn`'s docstring for the structural argument and
+  the future-fragility note (unreachability is mechanism-by-coincidence
+  on current shape rigidity; relaxing let-RHS shape constraints would
+  require re-evaluation).
 - Task 111 disposition — TLS → packed multi-return for `sigil_run_loop`
-  terminal. Status: **third in active sequence**. Three prior implementation
-  attempts (PR #50) failed; either 4th lift attempt OR explicit close as
-  v1-known-limit with successor plan named in spec §14.
+  terminal. Status: **next pickup**. Three prior implementation attempts
+  (PR #50) failed; either 4th lift attempt OR explicit close as v1-known-
+  limit with successor plan named in spec §14.
 
 **Post-Plan-D-closeout follow-ups (named, not floating):**
 

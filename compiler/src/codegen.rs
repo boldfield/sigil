@@ -20365,6 +20365,48 @@ fn is_simple_tail_perform_with_pure_args_body(
 /// "wrapper-of-chained shape under discharge-with-lambda still
 /// produces silent garbage" hazard. The visited-set extension here
 /// closes that gap.
+///
+/// **Cycle handling — structural unreachability** (Task 112-mutually-
+/// recursive resolution, 2026-05-03). The visited-set bails to `false`
+/// on cycles (mutually-recursive Cps fns). PR #85 review prose flagged
+/// this as a potential silent-garbage failure mode under discharge-
+/// with-lambda handlers — the fallback Sync ABI path could re-exhibit
+/// the original Task 112 chain breakage. Empirical analysis closed
+/// that worry by showing the cycle case is unreachable in any
+/// terminating Sigil program:
+///
+/// 1. The chained-let-yield body shape (`is_simple_chained_let_yield_
+///    then_pure_tail_body`) requires every let-RHS to be `Expr::Perform`
+///    OR `Expr::Call` — no `If`, `Match`, or `Block` shapes are
+///    permitted as let-RHS.
+/// 2. Mutual recursion via let-RHS (the only path that trips the
+///    visited-set) requires a base case to terminate. A base case
+///    requires a runtime conditional gating whether the recursive
+///    call happens. But chained-let-yield let-RHS evaluates
+///    unconditionally; the body shape disallows `if`-around-Call.
+/// 3. The if-in-tail (permitted under `expr_is_pure`) can be conditional
+///    but doesn't gate the let-RHS calls — those evaluate before tail.
+///
+/// So any program that would trip the visited-set bail is
+/// structurally non-terminating — the recursion runs unbounded and
+/// stack-overflows at runtime regardless of classifier output. The
+/// visited-set's bail is correct: rejecting these as "unsupported
+/// chained-let-yield wrappers" doesn't produce silent garbage because
+/// the program never reaches a state where the discharge-with-lambda
+/// lambda chain matters.
+///
+/// `compiler/tests/e2e.rs::task_112_mutually_recursive_chained_wrappers
+/// _stack_overflow_not_silent_garbage` pins this empirically: compiles
+/// successfully, runs to SIGSEGV (exit 139 on macOS, similar on
+/// Linux), stdout empty.
+///
+/// Future-fragility note: if a future change relaxes constraint #1
+/// or #2 (e.g., permits `If`-as-let-RHS, or some shape that gates
+/// let-RHS calls conditionally), terminating mutually-recursive
+/// chained-let-yield programs become possible, and the visited-set
+/// bail's correctness needs re-evaluation. The unreachability
+/// argument is mechanism-by-coincidence on the current shape's
+/// rigidity.
 fn is_supported_cps_user_fn(
     callee_name: &str,
     fns_by_name: &std::collections::BTreeMap<&str, &crate::ast::FnDecl>,
