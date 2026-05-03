@@ -7258,81 +7258,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_done_or_dispatch_return_arm: {e}"))?;
 
-    // sigil_last_terminal_tag() -> u32
-    //
-    // Stage-6.8-followup Bug 2 fix: queried by the handle expression's
-    // outer codegen logic immediately after `sigil_run_loop` returns
-    // body_val. If tag == NEXT_STEP_TAG_DISCHARGED, the body
-    // terminated via op arm body's discard-`k` tail and the return
-    // arm dispatch is bypassed (body_val IS handle's overall). If
-    // tag == NEXT_STEP_TAG_DONE, the body completed normally and the
-    // return arm dispatch fires (body_val passed as `v`).
-    let mut last_terminal_tag_sig = Signature::new(isa_call_conv(&module));
-    last_terminal_tag_sig
-        .returns
-        .push(AbiParam::new(types::I32));
-    let last_terminal_tag = module
-        .declare_function(
-            "sigil_last_terminal_tag",
-            Linkage::Import,
-            &last_terminal_tag_sig,
-        )
-        .map_err(|e| format!("declare sigil_last_terminal_tag: {e}"))?;
-
-    // sigil_reset_last_terminal_tag() -> ()
-    //
-    // Stage-6.8-followup Bug 2 fix: emitted by handle expression's
-    // outer codegen logic at the start of each handle lowering,
-    // before body lowering. Resets the per-thread `LAST_TERMINAL_TAG`
-    // to `NEXT_STEP_TAG_DONE` so handles whose bodies do not invoke
-    // `sigil_run_loop` see a clean DONE state when querying after
-    // body lowering. Without this reset, the tag would carry over
-    // from any prior run_loop on the same thread, producing
-    // spurious return-arm-skips for handles whose bodies don't
-    // discharge.
-    let reset_last_terminal_tag_sig = Signature::new(isa_call_conv(&module));
-    let reset_last_terminal_tag = module
-        .declare_function(
-            "sigil_reset_last_terminal_tag",
-            Linkage::Import,
-            &reset_last_terminal_tag_sig,
-        )
-        .map_err(|e| format!("declare sigil_reset_last_terminal_tag: {e}"))?;
-
-    // sigil_last_terminal_value() -> u64
-    //
-    // Stage-6.8-followup Bug 1 fix: queried by the handle expression's
-    // outer codegen logic in the discharge_block when the body has
-    // post-perform code. Body's IR-locally-computed body_val reflects
-    // body's natural terminal (the value of body's tail expression),
-    // NOT the discharged arm's value. The runtime stores the
-    // trampoline's terminal u64 in `LAST_TERMINAL_VALUE` so codegen
-    // can recover it when the tag indicates DISCHARGED.
-    let mut last_terminal_value_sig = Signature::new(isa_call_conv(&module));
-    last_terminal_value_sig
-        .returns
-        .push(AbiParam::new(types::I64));
-    let last_terminal_value = module
-        .declare_function(
-            "sigil_last_terminal_value",
-            Linkage::Import,
-            &last_terminal_value_sig,
-        )
-        .map_err(|e| format!("declare sigil_last_terminal_value: {e}"))?;
-
-    // sigil_reset_last_terminal_value() -> ()
-    //
-    // Stage-6.8-followup Bug 1 fix: emitted alongside
-    // `sigil_reset_last_terminal_tag` at the entry of each handle
-    // lowering so a stale value from a prior run isn't observable.
-    let reset_last_terminal_value_sig = Signature::new(isa_call_conv(&module));
-    let reset_last_terminal_value = module
-        .declare_function(
-            "sigil_reset_last_terminal_value",
-            Linkage::Import,
-            &reset_last_terminal_value_sig,
-        )
-        .map_err(|e| format!("declare sigil_reset_last_terminal_value: {e}"))?;
+    // Plan D Task 111d — `sigil_last_terminal_tag`,
+    // `sigil_reset_last_terminal_tag`, `sigil_last_terminal_value`,
+    // `sigil_reset_last_terminal_value` declarations are gone. The
+    // handle-exit tag/value queries now load directly from the
+    // caller-owned `TerminalResult` slot at offsets 0 (value) and 8
+    // (tag) via `terminal_out_param`. The handle-entry reset is
+    // inline two stores to the same slot. See `TerminalResult` in
+    // `runtime/src/handlers.rs` for the layout and discipline.
 
     // sigil_run_loop(initial: *mut NextStep) -> u64. Drives the CPS
     // trampoline to a terminal NextStep::Done and returns its value.
@@ -8027,10 +7960,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         outer_post_arm_k_push,
         run_loop,
         next_step_discharged,
-        last_terminal_tag,
-        reset_last_terminal_tag,
-        last_terminal_value,
-        reset_last_terminal_value,
         next_step_call,
         next_step_args_ptr,
         continuation_identity,
@@ -8084,10 +8013,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 next_step_discharged_ref,
-                last_terminal_tag_ref,
-                reset_last_terminal_tag_ref,
-                last_terminal_value_ref,
-                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
@@ -8348,7 +8273,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         env,
                         pointer_ty,
                         closure_ptr,
-                        terminal_out_param: Some(terminal_out),
+                        terminal_out_param: terminal_out,
                         lit_gvs,
                         builtins,
                         handler_frame_new_ref,
@@ -8358,10 +8283,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_frame_set_return_ref,
                         perform_ref,
                         run_loop_ref,
-                        last_terminal_tag_ref,
-                        reset_last_terminal_tag_ref,
-                        last_terminal_value_ref,
-                        reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
                         next_step_discharged_ref,
@@ -9385,7 +9306,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env,
                     pointer_ty,
                     closure_ptr,
-                    terminal_out_param: Some(terminal_out),
+                    terminal_out_param: terminal_out,
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -9395,10 +9316,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
-                    last_terminal_tag_ref,
-                    reset_last_terminal_tag_ref,
-                    last_terminal_value_ref,
-                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     next_step_discharged_ref,
@@ -9746,7 +9663,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 env,
                 pointer_ty,
                 closure_ptr,
-                terminal_out_param: Some(terminal_out_param),
+                terminal_out_param,
                 lit_gvs,
                 builtins,
                 handler_frame_new_ref,
@@ -9756,10 +9673,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_return_ref,
                 perform_ref,
                 run_loop_ref,
-                last_terminal_tag_ref,
-                reset_last_terminal_tag_ref,
-                last_terminal_value_ref,
-                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 next_step_discharged_ref,
@@ -10149,10 +10062,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     outer_post_arm_k_push_ref: _,
                     run_loop_ref,
                     next_step_discharged_ref,
-                    last_terminal_tag_ref,
-                    reset_last_terminal_tag_ref,
-                    last_terminal_value_ref,
-                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
@@ -10277,7 +10186,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env,
                     pointer_ty,
                     closure_ptr,
-                    terminal_out_param: Some(terminal_out),
+                    terminal_out_param: terminal_out,
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -10287,10 +10196,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
-                    last_terminal_tag_ref,
-                    reset_last_terminal_tag_ref,
-                    last_terminal_value_ref,
-                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     next_step_discharged_ref,
@@ -11114,10 +11019,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     outer_post_arm_k_push_ref: _,
                     run_loop_ref,
                     next_step_discharged_ref,
-                    last_terminal_tag_ref,
-                    reset_last_terminal_tag_ref,
-                    last_terminal_value_ref,
-                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     continuation_identity_ref,
@@ -11230,7 +11131,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env,
                     pointer_ty,
                     closure_ptr,
-                    terminal_out_param: Some(terminal_out),
+                    terminal_out_param: terminal_out,
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -11240,10 +11141,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     run_loop_ref,
-                    last_terminal_tag_ref,
-                    reset_last_terminal_tag_ref,
-                    last_terminal_value_ref,
-                    reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
                     next_step_discharged_ref,
@@ -11492,10 +11389,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 next_step_discharged_ref,
-                last_terminal_tag_ref,
-                reset_last_terminal_tag_ref,
-                last_terminal_value_ref,
-                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 continuation_identity_ref,
@@ -11516,7 +11409,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 env,
                 pointer_ty,
                 closure_ptr,
-                terminal_out_param: Some(terminal_out),
+                terminal_out_param: terminal_out,
                 lit_gvs,
                 builtins,
                 handler_frame_new_ref,
@@ -11526,10 +11419,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_return_ref,
                 perform_ref,
                 run_loop_ref,
-                last_terminal_tag_ref,
-                reset_last_terminal_tag_ref,
-                last_terminal_value_ref,
-                reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
                 next_step_discharged_ref,
@@ -11791,10 +11680,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         outer_post_arm_k_push_ref: _,
                         run_loop_ref,
                         next_step_discharged_ref,
-                        last_terminal_tag_ref,
-                        reset_last_terminal_tag_ref,
-                        last_terminal_value_ref,
-                        reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
                         continuation_identity_ref,
@@ -11814,7 +11699,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         env,
                         pointer_ty,
                         closure_ptr: synth_closure_ptr,
-                        terminal_out_param: Some(terminal_out),
+                        terminal_out_param: terminal_out,
                         lit_gvs,
                         builtins,
                         handler_frame_new_ref,
@@ -11824,10 +11709,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_frame_set_return_ref,
                         perform_ref,
                         run_loop_ref,
-                        last_terminal_tag_ref,
-                        reset_last_terminal_tag_ref,
-                        last_terminal_value_ref,
-                        reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
                         next_step_discharged_ref,
@@ -12517,10 +12398,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             outer_post_arm_k_push_ref,
                             run_loop_ref,
                             next_step_discharged_ref,
-                            last_terminal_tag_ref,
-                            reset_last_terminal_tag_ref,
-                            last_terminal_value_ref,
-                            reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             continuation_identity_ref,
@@ -12541,7 +12418,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             env,
                             pointer_ty,
                             closure_ptr,
-                            terminal_out_param: Some(terminal_out),
+                            terminal_out_param: terminal_out,
                             lit_gvs,
                             builtins,
                             handler_frame_new_ref,
@@ -12551,10 +12428,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_return_ref,
                             perform_ref,
                             run_loop_ref,
-                            last_terminal_tag_ref,
-                            reset_last_terminal_tag_ref,
-                            last_terminal_value_ref,
-                            reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             next_step_discharged_ref,
@@ -14089,10 +13962,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             outer_post_arm_k_push_ref,
                             run_loop_ref,
                             next_step_discharged_ref,
-                            last_terminal_tag_ref,
-                            reset_last_terminal_tag_ref,
-                            last_terminal_value_ref,
-                            reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             continuation_identity_ref,
@@ -14113,7 +13982,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             env,
                             pointer_ty,
                             closure_ptr,
-                            terminal_out_param: Some(terminal_out),
+                            terminal_out_param: terminal_out,
                             lit_gvs,
                             builtins,
                             handler_frame_new_ref,
@@ -14123,10 +13992,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_return_ref,
                             perform_ref,
                             run_loop_ref,
-                            last_terminal_tag_ref,
-                            reset_last_terminal_tag_ref,
-                            last_terminal_value_ref,
-                            reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
                             next_step_discharged_ref,
@@ -14731,7 +14596,7 @@ struct Lowerer<'a, 'b> {
     /// 8-byte header and the 8-byte code_ptr word).
     closure_ptr: Value,
 
-    /// Plan D Task 111b/c — the surrounding fn's caller-passed
+    /// Plan D Task 111 — the surrounding fn's caller-passed
     /// `*mut TerminalResult` pointer for the terminal channel (`out`
     /// parameter of `sigil_run_loop`). Bound from the trailing block
     /// param of the surrounding fn at fn entry; threaded through every
@@ -14748,16 +14613,11 @@ struct Lowerer<'a, 'b> {
     ///   dispatch, Slice B fallback, return-arm dispatch): passed as
     ///   the `out` argument so handle-exit terminal writes inside the
     ///   driven trampoline land in the caller's slot.
-    ///
-    /// **Post-111c invariant:** every Lowerer construction site
-    /// populates `Some(...)` from the surrounding fn's trailing ABI
-    /// block param (Sync user fn body emit, all Cps body emit shapes,
-    /// synth-arm fn, synth return-arm fn, post-arm-k synth fn,
-    /// chained-let-bind synth-cont, Final synth-cont). The `Option`
-    /// type and the helper's null-fallback branch (`terminal_out_or_-
-    /// null`) persist for one PR — 111d removes the TLS path and
-    /// relaxes this to plain `Value` alongside the cleanup.
-    terminal_out_param: Option<Value>,
+    /// - **Handle-exit terminal reads**: loaded from offsets `0`
+    ///   (value) and `8` (tag) of this pointer at every site that
+    ///   used to call the now-removed `sigil_last_terminal_*` TLS
+    ///   FFI helpers (Plan D Task 111d).
+    terminal_out_param: Value,
 
     /// Per-string-literal `(span, GV, byte-length)` tuples declared at
     /// fn-entry time. Span-keyed so closure-conversion reordering of
@@ -14810,27 +14670,6 @@ struct Lowerer<'a, 'b> {
     /// `sigil_perform`. Returns the final `NextStep::Done`'s value
     /// as u64; native code uses this directly.
     run_loop_ref: FuncRef,
-    /// Stage-6.8-followup Bug 2 fix — `sigil_last_terminal_tag`
-    /// runtime ref. Queried by handle expression's lower_expr
-    /// immediately after `sigil_run_loop` returns body_val to
-    /// branch on whether the body terminated via DONE (dispatch
-    /// return arm) or DISCHARGED (skip return arm; body_val IS
-    /// handle's overall).
-    last_terminal_tag_ref: FuncRef,
-    /// Stage-6.8-followup Bug 2 fix — `sigil_reset_last_terminal_tag`
-    /// runtime ref. Emitted by handle expression's lower_expr
-    /// before body lowering so handles whose bodies don't run a
-    /// perform start with a clean DONE tag state.
-    reset_last_terminal_tag_ref: FuncRef,
-    /// Stage-6.8-followup Bug 1 fix — `sigil_last_terminal_value`
-    /// FuncRef. Read in the handle expression's discharge_block to
-    /// recover the trampoline's terminal value when body has post-
-    /// perform code.
-    last_terminal_value_ref: FuncRef,
-    /// Stage-6.8-followup Bug 1 fix — `sigil_reset_last_terminal_value`
-    /// FuncRef. Emitted alongside `reset_last_terminal_tag_ref` at
-    /// each handle lowering's entry.
-    reset_last_terminal_value_ref: FuncRef,
     /// Plan B Task 55 (Phase 3b) — per-handle-span synthetic arm fn
     /// refs. Used by `Expr::Handle` codegen to emit `func_addr`
     /// pointers for `sigil_handler_frame_set_arm`. Keyed by the
@@ -15082,33 +14921,6 @@ fn body_as_direct_cps_call_with_lookup(
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
-    /// Plan D Task 111b — yield `terminal_out` for forwarding into a
-    /// Sync-ABI call or `sigil_run_loop`.
-    ///
-    /// **Plan D Task 111c update.** Every Lowerer construction site
-    /// now populates `terminal_out_param` from the surrounding fn's
-    /// trailing ABI block param (Sync user fn, Cps user fn body emit,
-    /// synth-arm fn, synth return-arm fn, post-arm-k synth fn,
-    /// chained-let-bind synth-cont, Final synth-cont) — the field is
-    /// `Some(...)` everywhere a Lowerer is constructed. The helper
-    /// retains the `Option<Value>` field type for one more PR (111d
-    /// removes the TLS path and is the natural place to relax the
-    /// type) and asserts the invariant in debug builds; the
-    /// `unwrap_or_else` null-fallback branch shipped in 111b is
-    /// dead but kept defensive against any future construction site
-    /// added without populating the field.
-    fn terminal_out_or_null(&mut self) -> Value {
-        debug_assert!(
-            self.terminal_out_param.is_some(),
-            "Plan D Task 111c invariant: every Lowerer construction site \
-             must populate terminal_out_param from the surrounding fn's \
-             trailing ABI block param. None reached the call sites — a \
-             new Lowerer site likely shipped without wiring the field."
-        );
-        self.terminal_out_param
-            .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0))
-    }
-
     /// Lower a `Block`. Returns the tail expression's value if any,
     /// `None` when the block has no tail (statement-only block, value
     /// is `Unit`).
@@ -15265,7 +15077,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // 4th positional arg per the new cps_signature shape.
         let func_ref = self.user_fn_refs[name];
         let null_closure_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
-        let terminal_out = self.terminal_out_or_null();
+        let terminal_out = self.terminal_out_param;
         let cps_call = self.builder.ins().call(
             func_ref,
             &[null_closure_ptr, args_ptr, args_len, terminal_out],
@@ -15285,7 +15097,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         );
 
         // Drive the trampoline. Returns u64.
-        let terminal_out = self.terminal_out_or_null();
+        let terminal_out = self.terminal_out_param;
         let run_loop_call = self
             .builder
             .ins()
@@ -15655,7 +15467,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .store(MemFlags::trusted(), identity_addr, argp, POST_ARM_K_FN_OFF);
 
         // Drive the nested run_loop. Returns u64 (raw bits).
-        let terminal_out = self.terminal_out_or_null();
+        let terminal_out = self.terminal_out_param;
         let run_loop_call = self
             .builder
             .ins()
@@ -16052,7 +15864,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // dispatches the Call (invokes the arm), then any further
         // Calls the arm returns, until a terminal `Done(value)`.
         // Returns u64.
-        let terminal_out = self.terminal_out_or_null();
+        let terminal_out = self.terminal_out_param;
         let run_loop_call = self
             .builder
             .ins()
@@ -16514,34 +16326,45 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // calls that walk the handler stack; the topmost
                 // matching frame's arm runs.
                 //
-                // Stage-6.8-followup Bug 2 fix: emit
-                // `sigil_reset_last_terminal_tag()` before body
-                // lowering. If the body invokes `sigil_run_loop`
-                // (any perform site under synchronous lowering), the
-                // trampoline writes either DONE or DISCHARGED at
-                // terminal. If the body has no perform (e.g.,
-                // `handle 5 with { ... }`), the tag stays at the
-                // reset DONE so the post-body check at handle exit
-                // dispatches the return arm correctly.
-                // Stage-6.8-followup Bug 1 fix: reset both
-                // LAST_TERMINAL_TAG and LAST_TERMINAL_VALUE before
-                // body lowering. Both return-arm-bearing AND
-                // no-return-arm handles need the reset so a prior
-                // run_loop's discharge tag/value doesn't shadow this
-                // handle's body completion when this body never runs
-                // a perform.
-                let reset_tag_call = self
+                // Plan D Task 111d — initialize the caller-owned
+                // `TerminalResult` slot to `(value=0, tag=DONE)`
+                // before body lowering. Both return-arm-bearing AND
+                // no-return-arm handles need the reset:
+                //
+                // - If the body invokes `sigil_run_loop` (any perform
+                //   site under synchronous lowering), the trampoline
+                //   overwrites the slot with the body's terminal
+                //   `(value, tag)` at completion.
+                // - If the body has no perform (e.g., `handle 5 with
+                //   { ... }`), the slot stays at the initialized DONE
+                //   so the post-body tag query dispatches the return
+                //   arm correctly.
+                // - When the surrounding fn contains multiple handle
+                //   exprs, the second handle's body must not observe
+                //   the first handle's terminal state — the same fn-
+                //   wide slot is reused; this init clears it.
+                //
+                // Pre-111d this discipline lived in `sigil_reset_last_-
+                // terminal_{tag,value}` TLS FFI calls; with the slot
+                // becoming the sole channel, two stores replace those
+                // FFI calls.
+                let zero_v = self.builder.ins().iconst(types::I64, 0);
+                let done_v = self
                     .builder
                     .ins()
-                    .call(self.reset_last_terminal_tag_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, reset_tag_call));
-                let reset_v_call = self
-                    .builder
-                    .ins()
-                    .call(self.reset_last_terminal_value_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, reset_v_call));
+                    .iconst(types::I64, sigil_abi::effect::NEXT_STEP_TAG_DONE as i64);
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    zero_v,
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_VALUE_OFF,
+                );
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    done_v,
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_TAG_OFF,
+                );
 
                 // Task 78.5 G4 Approach 6 deep-redo — if the body is a
                 // direct Cps user fn call AND the handle has a return
@@ -16722,12 +16545,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // DONE (dispatch return arm) or DISCHARGED (skip
                     // return arm — discharged value IS handle's
                     // overall per algebraic-effects semantics).
-                    let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, tag_call));
-                    let tag_v = self.builder.inst_results(tag_call)[0];
+                    //
+                    // Plan D Task 111d — load the tag from the
+                    // caller-owned TerminalResult slot at offset 8.
+                    // `sigil_run_loop` writes (value, tag) to the
+                    // slot at every terminal site (Done / Discharged)
+                    // before returning, replacing the TLS path that
+                    // 111a-c kept dual-writing.
+                    let tag_v = self.builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_TAG_OFF,
+                    );
                     let discharged_const = self.builder.ins().iconst(
-                        types::I32,
+                        types::I64,
                         sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
                     );
                     let is_discharged =
@@ -16853,19 +16685,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // perform's return value). For body shapes with
                     // post-perform code (`{ let _ = perform; tail }`),
                     // body_val is body's tail value, NOT the discharged
-                    // arm's value — the runtime preserves the latter
-                    // in `LAST_TERMINAL_VALUE`.
+                    // arm's value — the runtime preserves the latter in
+                    // the caller-owned `TerminalResult.value` slot
+                    // (Plan D Task 111d; previously TLS).
                     //
-                    // SAFETY (Round-3 review §7): the TLS slot
-                    // `LAST_TERMINAL_VALUE` may hold a heap-allocated
-                    // closure-record / handler-frame pointer at terminal
-                    // time. The discipline (declared at the TLS site
-                    // in `runtime/src/handlers.rs`'s `LAST_TERMINAL_VALUE`
-                    // doc) requires consuming the read into a Cranelift
-                    // SSA Value before any allocation that could trigger
-                    // GC — Boehm's conservative scan must find the
-                    // pointer in a register or spill slot. The
-                    // `inst_results(lv_call)[0]` capture below is that
+                    // SAFETY (Round-3 review §7 / Plan D Task 111d):
+                    // the slot may hold a heap-allocated closure-record
+                    // / handler-frame pointer at terminal time. The
+                    // discipline (declared at `TerminalResult` in
+                    // `runtime/src/handlers.rs`) requires consuming the
+                    // load into a Cranelift SSA Value before any
+                    // allocation that could trigger GC — Boehm's
+                    // conservative scan must find the pointer in a
+                    // register or spill slot. The load below is that
                     // SSA Value; Cranelift's regalloc threads it through
                     // the merge_block param and into any subsequent
                     // narrow / store / call without dropping the
@@ -16876,10 +16708,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // a future regression that adds such a call MUST
                     // route the value through a stack slot or
                     // explicitly stackmap-root the SSA value first.
-                    let lv_call = self.builder.ins().call(self.last_terminal_value_ref, &[]);
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, lv_call));
-                    let last_terminal_v_u64 = self.builder.inst_results(lv_call)[0];
+                    let last_terminal_v_u64 = self.builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_VALUE_OFF,
+                    );
 
                     // Narrow u64 → handler_overall_ty.
                     let discharge_val = if handler_overall_ty == types::I64 {
@@ -17016,7 +16850,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // the trampoline calls identity which returns
                     // Done(tail_widened); run_loop returns the value
                     // as u64.
-                    let terminal_out = self.terminal_out_or_null();
+                    let terminal_out = self.terminal_out_param;
                     let run_loop_call = self
                         .builder
                         .ins()
@@ -17099,12 +16933,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     body_val
                 };
 
-                let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, tag_call));
-                let tag_v = self.builder.inst_results(tag_call)[0];
+                // Plan D Task 111d — load tag from caller-owned
+                // TerminalResult slot at offset 8.
+                let tag_v = self.builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_TAG_OFF,
+                );
                 let discharged_const = self.builder.ins().iconst(
-                    types::I32,
+                    types::I64,
                     sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
                 );
                 let is_discharged = self
@@ -17129,13 +16967,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     &[],
                 );
 
-                // Discharge block: read LAST_TERMINAL_VALUE, narrow.
+                // Discharge block: load value from caller-owned
+                // TerminalResult slot at offset 0, narrow.
+                // Plan D Task 111d — replaces the prior TLS-FFI read.
                 self.builder.switch_to_block(discharge_block_nra);
                 self.builder.seal_block(discharge_block_nra);
-                let lv_call = self.builder.ins().call(self.last_terminal_value_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, lv_call));
-                let lv_u64 = self.builder.inst_results(lv_call)[0];
+                let lv_u64 = self.builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_VALUE_OFF,
+                );
                 let discharge_val = if handler_overall_ty == types::I64 {
                     lv_u64
                 } else if handler_overall_ty.is_int() && handler_overall_ty.bits() < 64 {
@@ -17388,7 +17230,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         );
 
         // sigil_run_loop(ns) → u64
-        let terminal_out = self.terminal_out_or_null();
+        let terminal_out = self.terminal_out_param;
         let run_loop_call = self
             .builder
             .ins()
@@ -17472,13 +17314,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         {
             let _synth = &self.handler_return_arm_synth[idx];
             {
-                // Query terminal tag and branch.
-                let tag_call = self.builder.ins().call(self.last_terminal_tag_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, tag_call));
-                let tag_v = self.builder.inst_results(tag_call)[0];
+                // Query terminal tag and branch. Plan D Task 111d —
+                // load from caller-owned TerminalResult slot.
+                let tag_v = self.builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_TAG_OFF,
+                );
                 let discharged_const = self.builder.ins().iconst(
-                    types::I32,
+                    types::I64,
                     sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
                 );
                 let is_discharged = self
@@ -17572,7 +17417,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     POST_ARM_K_FN_OFF,
                 );
 
-                let terminal_out_2 = self.terminal_out_or_null();
+                let terminal_out_2 = self.terminal_out_param;
                 let run_loop_call_2 = self
                     .builder
                     .ins()
@@ -17675,7 +17520,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
                         // Plan D Task 111b — Sync→Sync: forward the
                         // current fn's `terminal_out` to the callee.
-                        let terminal_out = self.terminal_out_or_null();
+                        let terminal_out = self.terminal_out_param;
                         let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
                         all_args.push(null_closure);
                         all_args.extend(arg_vals);
@@ -17770,7 +17615,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         // terminal_out as the 4th positional arg.
                         let func_ref = self.user_fn_refs[name];
                         let null_closure_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
-                        let terminal_out = self.terminal_out_or_null();
+                        let terminal_out = self.terminal_out_param;
                         let cps_call = self.builder.ins().call(
                             func_ref,
                             &[null_closure_ptr, args_ptr, args_len, terminal_out],
@@ -17801,7 +17646,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         // handle-exit terminal writes inside the Cps
                         // callee propagate back through the caller's
                         // terminal channel.
-                        let terminal_out = self.terminal_out_or_null();
+                        let terminal_out = self.terminal_out_param;
                         let run_loop_call = self
                             .builder
                             .ins()
@@ -18582,7 +18427,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                          named-Cps direct-call branch."
                     );
                 }
-                let terminal_out = self.terminal_out_or_null();
+                let terminal_out = self.terminal_out_param;
                 let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
                 all_args.push(closure_value);
                 all_args.extend(arg_vals);
@@ -18701,7 +18546,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
                 // Lower args; prepend closure_ptr; append terminal_out.
                 let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-                let terminal_out = self.terminal_out_or_null();
+                let terminal_out = self.terminal_out_param;
                 let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
                 all_args.push(closure_value);
                 all_args.extend(arg_vals);
@@ -20395,6 +20240,16 @@ const POST_ARM_K_ARG_OFF: i32 = 0;
 const POST_ARM_K_CLOSURE_OFF: i32 = 8;
 const POST_ARM_K_FN_OFF: i32 = 16;
 
+/// Plan D Task 111d — byte offsets into the caller-owned
+/// `TerminalResult` slot pointed to by `terminal_out_param`. Mirror
+/// of `runtime/src/handlers.rs::TerminalResult`'s `#[repr(C)]`
+/// layout: `{ value: u64 @ 0, tag: u64 @ 8 }`. Codegen loads
+/// 8 bytes from each offset at the handle-exit terminal-tag /
+/// terminal-value query sites that previously called the now-
+/// removed `sigil_last_terminal_*` TLS FFI helpers.
+const TERMINAL_RESULT_VALUE_OFF: i32 = 0;
+const TERMINAL_RESULT_TAG_OFF: i32 = 8;
+
 /// Builtin runtime-primitive FuncIds, declared once at `emit_object`'s
 /// top and read by [`prepare_per_fn_refs`] when constructing the
 /// per-fn FuncRef set. Aggregated into one struct so adding a new
@@ -20602,31 +20457,12 @@ struct PerFnRefsCtx<'a> {
     run_loop: cranelift_module::FuncId,
     /// Stage-6.8-followup Bug 2 fix — `sigil_next_step_discharged`
     /// FuncId. Op arm fn body's discard-`k` tail emit replaces
-    /// `next_step_done` with this so the trampoline's
-    /// `LAST_TERMINAL_TAG` records DISCHARGED at terminal; handle
-    /// expression's outer logic queries `last_terminal_tag` and skips
-    /// return arm dispatch when the body terminated via discharge.
+    /// `next_step_done` with this so the trampoline's terminal
+    /// records DISCHARGED in the caller-owned `TerminalResult.tag`
+    /// slot (Plan D Task 111d; previously TLS); handle expression's
+    /// outer logic loads the tag and skips return arm dispatch
+    /// when the body terminated via discharge.
     next_step_discharged: cranelift_module::FuncId,
-    /// Stage-6.8-followup Bug 2 fix — `sigil_last_terminal_tag`
-    /// FuncId. Queried by handle expression's `lower_expr`
-    /// immediately after `sigil_run_loop` returns body_val to decide
-    /// whether to dispatch the return arm (DONE) or use body_val
-    /// directly as handle's overall (DISCHARGED).
-    last_terminal_tag: cranelift_module::FuncId,
-    /// Stage-6.8-followup Bug 2 fix — `sigil_reset_last_terminal_tag`
-    /// FuncId. Emitted by handle expression's `lower_expr` before
-    /// body lowering so handles whose bodies don't run a perform
-    /// (no run_loop call) see a clean DONE tag state.
-    reset_last_terminal_tag: cranelift_module::FuncId,
-    /// Stage-6.8-followup Bug 1 fix — `sigil_last_terminal_value`
-    /// FuncId. Read in the handle expression's discharge_block to
-    /// recover the trampoline's terminal value when body has post-
-    /// perform code that overwrites body_val.
-    last_terminal_value: cranelift_module::FuncId,
-    /// Stage-6.8-followup Bug 1 fix — `sigil_reset_last_terminal_value`
-    /// FuncId. Emitted alongside `reset_last_terminal_tag` at the
-    /// entry of each handle lowering.
-    reset_last_terminal_value: cranelift_module::FuncId,
     next_step_call: cranelift_module::FuncId,
     next_step_args_ptr: cranelift_module::FuncId,
     continuation_identity: cranelift_module::FuncId,
@@ -20690,14 +20526,6 @@ struct PerFnRefs {
     run_loop_ref: FuncRef,
     /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::next_step_discharged`.
     next_step_discharged_ref: FuncRef,
-    /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::last_terminal_tag`.
-    last_terminal_tag_ref: FuncRef,
-    /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::reset_last_terminal_tag`.
-    reset_last_terminal_tag_ref: FuncRef,
-    /// Stage-6.8-followup Bug 1 fix — see `PerFnRefsCtx::last_terminal_value`.
-    last_terminal_value_ref: FuncRef,
-    /// Stage-6.8-followup Bug 1 fix — see `PerFnRefsCtx::reset_last_terminal_value`.
-    reset_last_terminal_value_ref: FuncRef,
     next_step_call_ref: FuncRef,
     next_step_args_ptr_ref: FuncRef,
     continuation_identity_ref: FuncRef,
@@ -20825,13 +20653,6 @@ fn prepare_per_fn_refs(
     let run_loop_ref = module.declare_func_in_func(ctx.run_loop, builder.func);
     let next_step_discharged_ref =
         module.declare_func_in_func(ctx.next_step_discharged, builder.func);
-    let last_terminal_tag_ref = module.declare_func_in_func(ctx.last_terminal_tag, builder.func);
-    let reset_last_terminal_tag_ref =
-        module.declare_func_in_func(ctx.reset_last_terminal_tag, builder.func);
-    let last_terminal_value_ref =
-        module.declare_func_in_func(ctx.last_terminal_value, builder.func);
-    let reset_last_terminal_value_ref =
-        module.declare_func_in_func(ctx.reset_last_terminal_value, builder.func);
     let next_step_call_ref = module.declare_func_in_func(ctx.next_step_call, builder.func);
     let next_step_args_ptr_ref = module.declare_func_in_func(ctx.next_step_args_ptr, builder.func);
     let continuation_identity_ref =
@@ -20924,10 +20745,6 @@ fn prepare_per_fn_refs(
         outer_post_arm_k_push_ref,
         run_loop_ref,
         next_step_discharged_ref,
-        last_terminal_tag_ref,
-        reset_last_terminal_tag_ref,
-        last_terminal_value_ref,
-        reset_last_terminal_value_ref,
         next_step_call_ref,
         next_step_args_ptr_ref,
         continuation_identity_ref,

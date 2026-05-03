@@ -10799,3 +10799,82 @@ fn task_78_5_g4_b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail()
          stderr={stderr:?}"
     );
 }
+
+/// **Plan D Task 111d — caller-owned terminal channel propagation.**
+///
+/// Pins the new pointer-side path end-to-end: a handle-exit terminal
+/// value (DISCHARGED tag + payload) must flow through nested Sync
+/// user-fn calls (each thread its caller's `*mut TerminalResult` as
+/// the trailing ABI param), be written by `sigil_run_loop` at the
+/// innermost perform site (`*out = TerminalResult { value, tag }`),
+/// and be observed by the outer handle's tag/value loads from the
+/// SAME caller-owned slot.
+///
+/// Test shape — three levels of Sync user fn nesting between the
+/// handle and the perform:
+///
+///   ```sigil
+///   handle a() with { Eff.kill(_,_) => 17 }
+///   ```
+///   - `a()` calls `b()`, `b()` calls `c()`, `c()` performs `Eff.kill`.
+///   - The arm discards `k` and returns `17`, which the trampoline
+///     records as DISCHARGED with value 17.
+///   - The terminal flow: c's perform site's `sigil_run_loop` writes
+///     `*out = (17, DISCHARGED)`. c returns. b returns. a returns to
+///     the handle expression. The handle-exit tag-load reads
+///     `*out.tag = DISCHARGED` from the SAME slot (threaded down 3
+///     levels and back), routes to the discharge_block, loads
+///     `*out.value = 17`, narrows to `Int`, and returns 17 as the
+///     handle's overall.
+///
+/// Pre-111d this routing went through TLS (`LAST_TERMINAL_TAG` /
+/// `LAST_TERMINAL_VALUE`); 111d removed TLS and made the
+/// caller-owned slot the sole terminal channel. If 111d's ABI
+/// threading (Sync→Sync trailing-param forwarding) or the run_loop's
+/// `*out` write or codegen's load is broken, the discharge tag won't
+/// be observed at handle exit, return-arm dispatch fires
+/// incorrectly, and the output diverges from `"17\n"`.
+///
+/// **Invariant:** stdout = `"17\n"`, exit 0.
+#[test]
+fn task_111d_terminal_channel_propagation_through_nested_sync_calls() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { kill: () -> Int }\n\
+               \n\
+               fn c() -> Int ![Eff] {\n  \
+                 perform Eff.kill()\n\
+               }\n\
+               \n\
+               fn b() -> Int ![Eff] {\n  \
+                 c()\n\
+               }\n\
+               \n\
+               fn a() -> Int ![Eff] {\n  \
+                 b()\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = handle a() with {\n    \
+                   Eff.kill(_k) => 17,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_111d_terminal_channel_propagation_through_nested_sync_calls",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "17\n",
+        "Plan D Task 111d: handle-exit terminal value (17, DISCHARGED) \
+         must propagate through 3 levels of Sync user fn calls (a → b → \
+         c) via the caller-owned `*mut TerminalResult` slot threaded as \
+         the trailing Sync ABI param. The arm discards k and returns \
+         17; the trampoline writes (17, DISCHARGED) to the slot at the \
+         perform site's run_loop terminal; codegen at the handle exit \
+         loads tag and value from the SAME slot and routes through \
+         discharge_block. stderr={stderr:?}"
+    );
+}
