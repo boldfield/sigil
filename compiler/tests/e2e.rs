@@ -7497,12 +7497,12 @@ fn task_112b_chained_let_yield_wrapper_state_threading_returns_21() {
                  set: (Int) -> Int,\n\
                }\n\
                fn double_set(a: Int, b: Int) -> Int ![S] {\n  \
-                 let _: Int = perform S.set(a);\n  \
-                 let _: Int = perform S.set(b);\n  \
+                 let _a: Int = perform S.set(a);\n  \
+                 let _b: Int = perform S.set(b);\n  \
                  0\n\
                }\n\
                fn comp() -> Int ![S] {\n  \
-                 let _: Int = double_set(10, 20);\n  \
+                 let _c: Int = double_set(10, 20);\n  \
                  let v: Int = perform S.get();\n  \
                  v + 1\n\
                }\n\
