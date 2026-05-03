@@ -350,13 +350,16 @@ fn compute_user_fn_abi(
     // routing per leaf instead of `lower_expr + gate`). See
     // `is_let_yield_prefix_then_branched_cps_tail_body`'s docstring for
     // the architectural argument.
-    let is_cps_user_fn_lookup = |name: &str| colored.needs_cps_transform(name);
-    if let Some(chain_length) = is_let_yield_prefix_then_branched_cps_tail_body(
-        body,
-        &ctors,
-        &lookup,
-        &is_cps_user_fn_lookup,
-    ) {
+    // At compute_user_fn_abi level there's no visited-set in scope —
+    // the strict and branch-leaf predicates are the same `lookup`. Self-
+    // recursion in Pattern C is handled at the body classifier (Pattern
+    // C accepts the let-prefix unconditionally; branch-leaf check goes
+    // through `lookup` which calls `is_supported_cps_user_fn` with a
+    // fresh visited-set — and that visited-set's bail provides the
+    // tied-knot semantic when the recursion comes back to this fn).
+    if let Some(chain_length) =
+        is_let_yield_prefix_then_branched_cps_tail_body(body, &ctors, &lookup, &lookup)
+    {
         let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
         let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
         for stmt in &body.stmts {
@@ -7678,14 +7681,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let lookup = |callee_name: &str| {
                         is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     };
-                    let is_cps_user_fn_lookup = |name: &str| cc.colored.needs_cps_transform(name);
                     is_simple_chained_let_yield_then_pure_tail_body(&f.body, &ctors, &lookup)
                         .or_else(|| {
+                            // Same `lookup` for both predicates — at
+                            // pre-pass level there's no visited-set in
+                            // scope; tied-knot semantic is provided by
+                            // `is_supported_cps_user_fn`'s internal
+                            // visited-set when the recursion reaches
+                            // is_supported_cps_user_fn_inner.
                             is_let_yield_prefix_then_branched_cps_tail_body(
-                                &f.body,
-                                &ctors,
-                                &lookup,
-                                &is_cps_user_fn_lookup,
+                                &f.body, &ctors, &lookup, &lookup,
                             )
                         })
                 } {
@@ -12550,11 +12555,33 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // dispatch (mirror PR #81's
                                 // lower_match_arms_to_next_step). Out of
                                 // scope for this Pattern C fix.
-                                let cps_lookup = |name: &str| cc.colored.needs_cps_transform(name);
+                                // PR #87 review fix — use the STRICT
+                                // `is_supported_cps_user_fn` predicate
+                                // (mirrors the let-RHS check) rather
+                                // than the loose `needs_cps_transform`
+                                // color check. Cps-call branch leaves
+                                // forward caller_k_pair into the
+                                // callee's args trailing slots; this
+                                // composition is correct only when the
+                                // callee respects the trailing-pair
+                                // convention (tail-perform / chained-
+                                // let-yield / Pattern C). Generic non-
+                                // wrapper Cps fns dispatch through
+                                // BODY_RETURN_ARM_STACK and would
+                                // silently mis-route the chain (the
+                                // exact bug Pattern C is fixing).
+                                let supported_lookup = |callee_name: &str| {
+                                    is_supported_cps_user_fn(
+                                        callee_name,
+                                        &fns_by_name,
+                                        &cc.colored,
+                                        &ctors,
+                                    )
+                                };
                                 let pattern_c_dispatch = detect_pattern_c_dispatch(
                                     tail_expr.as_ref(),
                                     &ctors,
-                                    &cps_lookup,
+                                    &supported_lookup,
                                 );
 
                                 if let Some((cond, then_leaf, else_leaf, then_kind, else_kind)) =
@@ -12603,25 +12630,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     .jump(gate_entry_block, &[widened.into()]);
                                             }
                                             BranchedCpsLeaf::CpsCall => {
-                                                // Emit NextStep::Call(
-                                                // callee, args +
-                                                // caller_k_pair_forwarded,
-                                                // N+2). caller_k_pair is
-                                                // loaded from this synth-
-                                                // cont's closure record's
-                                                // trailing slots — same
-                                                // source the gate's
-                                                // wrapper_forward branch
-                                                // uses. Forwarding
-                                                // threads caller_k_pair
-                                                // through the recursion;
-                                                // the recursive callee's
-                                                // helper-body Phase 6
-                                                // alloc will load it from
-                                                // its own args_ptr
-                                                // trailing slots and
-                                                // store into its step_0
-                                                // closure as caller_k_pair.
+                                                // Emit NextStep::Call with
+                                                // caller_k_pair forwarded.
+                                                // See classifier docstring
+                                                // for the composition
+                                                // mechanism.
                                                 let (callee_name, call_args) = match block_tail {
                                                     crate::ast::Expr::Call {
                                                         callee, args, ..
@@ -20842,12 +20855,36 @@ fn is_supported_cps_user_fn_inner(
         // records (Task 112b) and the Final's tail emit branches per-
         // leaf (gate for pure leaves; NextStep::Call for Cps-call
         // leaves). Both leaf paths forward caller_k_pair correctly.
-        let is_cps_user_fn_lookup = |name: &str| colored.needs_cps_transform(name);
+        //
+        // **Branch-leaf tied-knot lookup** (PR #87 review fix). The
+        // strict `inner_lookup` bails to false on cycles (visited-set
+        // contains the callee). For chained-let-yield's let-RHS this
+        // is correct (cycle via unconditional let-RHS is non-
+        // terminating per Task 112-mutually-recursive's analysis).
+        // For Pattern C's branch-leaf, the recursion is GUARDED by a
+        // conditional and CAN terminate via a base case — visited-bail
+        // would mis-classify legitimate self/mutual-recursive Pattern
+        // C as unsupported. The tied-knot variant accepts visited
+        // callees as supported (assuming the partial classification
+        // holds; if it doesn't, the outer recursion will detect that
+        // independently). Cycle-handling correctness: callees in
+        // visited are currently being classified — we're in the
+        // middle of asking "is X supported"; treating tied-knot
+        // recursion to X as "yes, X is supported" is the fixpoint
+        // accept. Programs that don't terminate will still
+        // stack-overflow at runtime; the classifier's job is shape
+        // recognition, not termination analysis.
+        let branch_leaf_lookup = |inner_name: &str| {
+            if visited.borrow().contains(inner_name) {
+                return true;
+            }
+            is_supported_cps_user_fn_inner(inner_name, fns_by_name, colored, ctors, visited)
+        };
         is_let_yield_prefix_then_branched_cps_tail_body(
             &f.body,
             ctors,
             &inner_lookup,
-            &is_cps_user_fn_lookup,
+            &branch_leaf_lookup,
         )
         .is_some()
     })();
@@ -21278,8 +21315,8 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
 fn is_let_yield_prefix_then_branched_cps_tail_body(
     body: &crate::ast::Block,
     ctors: &std::collections::BTreeSet<String>,
-    is_supported: &impl Fn(&str) -> bool,
-    is_cps_user_fn: &impl Fn(&str) -> bool,
+    is_supported_strict: &impl Fn(&str) -> bool,
+    is_supported_for_branch_leaf: &impl Fn(&str) -> bool,
 ) -> Option<usize> {
     use crate::ast::{Expr, Stmt};
     if body.stmts.is_empty() {
@@ -21304,7 +21341,13 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                     Expr::Ident(n, _) => n,
                     _ => return None,
                 };
-                if !is_supported(callee_name) {
+                // Let-RHS uses STRICT check: callee must satisfy
+                // `is_supported_cps_user_fn` (visited-bail-to-false on
+                // cycles). Cycle-via-let-RHS in chained-let-yield is
+                // structurally non-terminating per Task
+                // 112-mutually-recursive's analysis; rejecting is
+                // correct.
+                if !is_supported_strict(callee_name) {
                     return None;
                 }
                 if !args.iter().all(|a| expr_is_pure(a, ctors)) {
@@ -21319,6 +21362,15 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
     // desugars `if cond { ... } else { ... }` into `Expr::Match { ... }`
     // so by codegen time the body's tail in Pattern C source comes
     // through as Match.
+    //
+    // Branch-leaf Cps-call validation uses
+    // `is_supported_for_branch_leaf` — a TIED-KNOT variant that
+    // accepts callees currently under classification (visited-set
+    // contains them) as supported. This handles legitimate
+    // self/mutual-recursive Pattern C: the recursion is at branch tail
+    // (guarded by the conditional), so it CAN terminate via the
+    // base-case branch — unlike chained-let-yield's let-RHS recursion
+    // which is unconditional and structurally non-terminating.
     let mut has_cps_call = false;
     match tail {
         Expr::If {
@@ -21326,8 +21378,10 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
             else_block,
             ..
         } => {
-            let then_kind = classify_branched_cps_tail_branch(then_block, ctors, is_cps_user_fn)?;
-            let else_kind = classify_branched_cps_tail_branch(else_block, ctors, is_cps_user_fn)?;
+            let then_kind =
+                classify_branched_cps_tail_branch(then_block, ctors, is_supported_for_branch_leaf)?;
+            let else_kind =
+                classify_branched_cps_tail_branch(else_block, ctors, is_supported_for_branch_leaf)?;
             if matches!(then_kind, BranchedCpsLeaf::CpsCall)
                 || matches!(else_kind, BranchedCpsLeaf::CpsCall)
             {
@@ -21335,15 +21389,12 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
             }
         }
         Expr::Match { arms, .. } => {
-            // Each arm body must be classifiable. We accept arm bodies
-            // as the same shape as If branches: `Expr::Block { stmts: [],
-            // tail: pure_or_cps_call }` OR a bare expression directly
-            // (some elaborated arms have their tail expression at top
-            // level instead of wrapped in a Block). Normalize via a
-            // helper that accepts either.
             for arm in arms {
-                let kind =
-                    classify_branched_cps_tail_branch_expr(&arm.body, ctors, is_cps_user_fn)?;
+                let kind = classify_branched_cps_tail_branch_expr(
+                    &arm.body,
+                    ctors,
+                    is_supported_for_branch_leaf,
+                )?;
                 if matches!(kind, BranchedCpsLeaf::CpsCall) {
                     has_cps_call = true;
                 }
@@ -21365,18 +21416,18 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
 fn classify_branched_cps_tail_branch_expr(
     e: &crate::ast::Expr,
     ctors: &std::collections::BTreeSet<String>,
-    is_cps_user_fn: &impl Fn(&str) -> bool,
+    is_supported: &impl Fn(&str) -> bool,
 ) -> Option<BranchedCpsLeaf> {
     use crate::ast::Expr;
     if let Expr::Block(b) = e {
-        return classify_branched_cps_tail_branch(b, ctors, is_cps_user_fn);
+        return classify_branched_cps_tail_branch(b, ctors, is_supported);
     }
     if expr_is_pure(e, ctors) {
         return Some(BranchedCpsLeaf::Pure);
     }
     if let Expr::Call { callee, args, .. } = e {
         if let Expr::Ident(name, _) = callee.as_ref() {
-            if is_cps_user_fn(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
+            if is_supported(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
                 return Some(BranchedCpsLeaf::CpsCall);
             }
         }
@@ -21406,7 +21457,7 @@ fn classify_branched_cps_tail_branch_expr(
 fn detect_pattern_c_dispatch<'a>(
     tail: &'a crate::ast::Expr,
     ctors: &std::collections::BTreeSet<String>,
-    is_cps_user_fn: &impl Fn(&str) -> bool,
+    is_supported: &impl Fn(&str) -> bool,
 ) -> Option<(
     &'a crate::ast::Expr,
     &'a crate::ast::Expr,
@@ -21423,9 +21474,9 @@ fn detect_pattern_c_dispatch<'a>(
             ..
         } => {
             let then_kind =
-                classify_branched_cps_tail_branch(then_block.as_ref(), ctors, is_cps_user_fn)?;
+                classify_branched_cps_tail_branch(then_block.as_ref(), ctors, is_supported)?;
             let else_kind =
-                classify_branched_cps_tail_branch(else_block.as_ref(), ctors, is_cps_user_fn)?;
+                classify_branched_cps_tail_branch(else_block.as_ref(), ctors, is_supported)?;
             if !matches!(then_kind, BranchedCpsLeaf::CpsCall)
                 && !matches!(else_kind, BranchedCpsLeaf::CpsCall)
             {
@@ -21461,9 +21512,9 @@ fn detect_pattern_c_dispatch<'a>(
             };
             // Each arm body must classify as Pure or CpsCall.
             let then_kind =
-                classify_branched_cps_tail_branch_expr(&then_arm.body, ctors, is_cps_user_fn)?;
+                classify_branched_cps_tail_branch_expr(&then_arm.body, ctors, is_supported)?;
             let else_kind =
-                classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_cps_user_fn)?;
+                classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_supported)?;
             if !matches!(then_kind, BranchedCpsLeaf::CpsCall)
                 && !matches!(else_kind, BranchedCpsLeaf::CpsCall)
             {
@@ -21494,10 +21545,21 @@ fn detect_pattern_c_dispatch<'a>(
 
 /// Plan D Task 112d — branch-leaf classifier for
 /// [`is_let_yield_prefix_then_branched_cps_tail_body`].
+///
+/// **Strict callee check** (PR #87 review fix). Cps-call leaves use
+/// `is_supported` — the same predicate the let-RHS uses — so a Cps-call
+/// branch leaf must target a callee that respects the caller_k_pair
+/// trailing-pair convention (tail-perform / chained-let-yield / Pattern
+/// C). Generic non-wrapper Cps fns ignore the trailing pair and dispatch
+/// via `done_or_dispatch_return_arm_ref` against `BODY_RETURN_ARM_STACK`
+/// — forwarding caller_k_pair into one would silently produce the same
+/// chain-bypass garbage Pattern C is trying to fix. Initial PR #87
+/// implementation used `is_cps_user_fn` (loose color check); strict
+/// is correct.
 fn classify_branched_cps_tail_branch(
     block: &crate::ast::Block,
     ctors: &std::collections::BTreeSet<String>,
-    is_cps_user_fn: &impl Fn(&str) -> bool,
+    is_supported: &impl Fn(&str) -> bool,
 ) -> Option<BranchedCpsLeaf> {
     use crate::ast::Expr;
     if !block.stmts.is_empty() {
@@ -21509,7 +21571,7 @@ fn classify_branched_cps_tail_branch(
     }
     if let Expr::Call { callee, args, .. } = tail {
         if let Expr::Ident(name, _) = callee.as_ref() {
-            if is_cps_user_fn(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
+            if is_supported(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
                 return Some(BranchedCpsLeaf::CpsCall);
             }
         }
