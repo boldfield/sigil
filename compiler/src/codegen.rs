@@ -1747,20 +1747,19 @@ fn arm_body_walk(
             else_block,
             ..
         } => arm_body_walk(cond, scopes, k_name, globals, false)
-            // `If` then/else branches are NOT propagated as tail
-            // for `k`-call detection: `arm_body_tail_is_k_call`
-            // (which the synth pass uses to route tail-k vs done)
-            // only recurses through `Expr::Block` tails. If we
-            // accept `if c { k(x) } else { k(y) }` as tail-k here,
-            // the detector returns `None` and the synth-pass falls
-            // into the non-tail path; `lower_expr` then tries to
-            // resolve `k` as an indirect callee and panics with
-            // `unreachable!("indirect call …")`. The walker stays
-            // strictly aligned with the detector's recursion shape;
-            // multi-branch tail-`k` lowerings (join-block returning
-            // `*NextStep`) are deferred to a future phase.
-            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, false))
-            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, false)),
+            // Plan D Task 118 — propagate `tail` into If branches'
+            // tail position so `if cond { k(x) } else { k(y) }` in
+            // tail position of the arm body lets through (the
+            // Expr::Call walker arm sees tail=true at the k-call
+            // site and skips the non-tail rejection). The
+            // detector + lowering side must mirror this; without
+            // matched changes, the synth-pass will route into the
+            // discharged path and `lower_expr` will hit
+            // `unreachable!` when it walks the k-call. This change
+            // alone is structurally insufficient — see the Stage
+            // 13 review checkpoint surfacing.
+            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, tail))
+            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, tail)),
         Expr::Block(b) => arm_body_walk_block(b, scopes, k_name, globals, tail),
         Expr::Match {
             scrutinee, arms, ..
@@ -1773,15 +1772,14 @@ fn arm_body_walk(
                     std::collections::BTreeSet::new();
                 collect_pattern_bindings(&a.pattern, &mut pat_scope);
                 scopes.push(pat_scope);
-                // Match arm bodies are NOT in tail position for
-                // `k`-call detection — same rationale as `Expr::If`
-                // above (the synth-pass detector
-                // `arm_body_tail_is_k_call` recurses only through
-                // `Expr::Block` tails). Multi-branch tail-`k` shapes
-                // (`match s { Variant1 => k(x), Variant2 => k(y) }`)
-                // are walker-rejected as non-tail; lifting requires
-                // a join-block lowering deferred to a future phase.
-                let r = arm_body_walk(&a.body, scopes, k_name, globals, false);
+                // Plan D Task 118 — propagate `tail` into Match arm
+                // bodies so `match s { A => k(x), B => k(y) }` in
+                // tail position lets through the Expr::Call walker.
+                // Same caveat as the Expr::If site above: the
+                // detector + lowering side need matched changes for
+                // codegen to actually handle this; the lift is
+                // currently incomplete (Stage 13 surfacing).
+                let r = arm_body_walk(&a.body, scopes, k_name, globals, tail);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -21564,6 +21562,63 @@ mod tests {
             result.is_none(),
             "expected None (accept) for 3-let arm body of resumes:many effect; \
              got {result:?}"
+        );
+    }
+
+    /// Plan D Task 118 — post-lift acceptance check. Constructs the
+    /// AST for `Eff.op(k) => if cond { k(10) } else { k(20) }` and
+    /// asserts `arm_body_unsupported_construct` returns None
+    /// (walker accepts the shape because the post-lift `Expr::If`
+    /// arm propagates `tail=true` into branch tails). Pre-lift this
+    /// returned Some with the "non-tail position" wording.
+    #[test]
+    fn task_118_walker_accepts_conditional_k_call_inside_if() {
+        use crate::ast::{Block, Expr, HandleOpArm};
+        use crate::errors::Span;
+        use std::collections::{BTreeMap, BTreeSet};
+        let span = Span::synthetic("x.sigil");
+        let make_k_call = |arg: i64| Expr::Call {
+            callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+            args: vec![Expr::IntLit(arg, span.clone())],
+            span: span.clone(),
+        };
+        let body = Expr::If {
+            cond: Box::new(Expr::Ident("cond".to_string(), span.clone())),
+            then_block: Box::new(Block {
+                stmts: vec![],
+                tail: Some(make_k_call(10)),
+                span: span.clone(),
+            }),
+            else_block: Box::new(Block {
+                stmts: vec![],
+                tail: Some(make_k_call(20)),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let arm = HandleOpArm {
+            effect: "Pick".to_string(),
+            effect_span: span.clone(),
+            op: "pick".to_string(),
+            op_span: span.clone(),
+            params: vec![crate::ast::HandleArmParam {
+                name: "cond".to_string(),
+                span: span.clone(),
+            }],
+            k_name: "k".to_string(),
+            k_span: span.clone(),
+            body,
+            span: span.clone(),
+        };
+        let globals: BTreeSet<String> = BTreeSet::new();
+        let ctors: BTreeSet<String> = BTreeSet::new();
+        let effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
+        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many);
+        assert!(
+            result.is_none(),
+            "Task 118 post-lift: walker must accept conditional-k-inside-if \
+             arm body shape (tail=true propagates into If branches). Got \
+             rejection: {result:?}"
         );
     }
 

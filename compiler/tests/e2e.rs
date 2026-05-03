@@ -5528,6 +5528,164 @@ fn task_117_let_bound_k_alias_then_match_pattern_shadows_k_rejected_at_walker() 
     );
 }
 
+// =====================================================================
+// Plan D Task 118 — Conditional/branched k-call lift.
+//
+// Pre-lift, `arm_body_walk` rejects `k`-call inside `if`/`match`
+// branches with "non-tail position outside the supported shapes" /
+// "computed conditional `k`-use" diagnostic (codegen.rs around the
+// `Expr::If` and `Expr::Match` arms). Task 117's machinery (Ty::
+// Continuation + lifted-lambda k-pair capture) handles let-bound
+// aliases at the top of an arm body but not direct conditional
+// k-calls inside branches.
+//
+// The four targeted shapes:
+//   (a) `Eff.op(k) => if cond { k(x) } else { k(y) }`
+//   (b) `Eff.op(k) => match s { A => k(x), B => k(y) }`
+//   (c) `Eff.op(k) => if cond { k(x) } else { v }` — non-k branch
+//   (d) recursive Choose-style "for each candidate { try k(c); on
+//       fail try next }"
+// =====================================================================
+
+#[test]
+fn task_118_conditional_k_call_inside_if_drives_both_ways() {
+    // (a) Conditional k-call inside `if`. The arm body is
+    // `if cond { k(10) } else { k(20) }`. `cond` is the perform's
+    // op-arg (in scope at the arm body via the standard arm-fn
+    // closure). Drive both branches by calling `run` twice with
+    // different op-arg values.
+    let src = "effect Pick { pick: (Bool) -> Int }\n\
+               fn body(b: Bool) -> Int ![Pick] {\n  \
+                 perform Pick.pick(b)\n\
+               }\n\
+               fn run(b: Bool) -> Int ![] {\n  \
+                 handle body(b) with {\n    \
+                   Pick.pick(cond, k) => if cond { k(10) } else { k(20) },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run(true)));\n  \
+                 perform IO.println(int_to_string(run(false)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_118_cond_k_in_if");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "10\n20\n",
+        "conditional k-call inside `if`: cond=true → k(10) → body returns 10; \
+         cond=false → k(20) → body returns 20. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn task_118_conditional_k_call_inside_match_drives_both_ways() {
+    // (b) Conditional k-call inside `match`. The arm body matches
+    // an op-arg tag and calls `k` with different ints per variant.
+    let src = "type Tag = | TagA | TagB\n\
+               effect Pick { pick: (Tag) -> Int }\n\
+               fn body(t: Tag) -> Int ![Pick] {\n  \
+                 perform Pick.pick(t)\n\
+               }\n\
+               fn run(t: Tag) -> Int ![] {\n  \
+                 handle body(t) with {\n    \
+                   Pick.pick(tag, k) => match tag {\n      \
+                     TagA => k(10),\n      \
+                     TagB => k(20),\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run(TagA)));\n  \
+                 perform IO.println(int_to_string(run(TagB)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_118_cond_k_in_match");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "10\n20\n",
+        "conditional k-call inside `match`: TagA → k(10) → body 10; TagB → \
+         k(20) → body 20. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn task_118_k_call_in_one_branch_else_discharges() {
+    // (c) k-call in one branch and a non-k constant in the other.
+    // When cond=true → `k(0)` → body returns 0 (perform resumes
+    // with 0). When cond=false → arm body evaluates to 42 without
+    // invoking k → handle's overall is 42 (DISCHARGED path; no
+    // return-arm wrapper since this handle has no return arm).
+    let src = "effect Pick { pick: (Bool) -> Int }\n\
+               fn body(b: Bool) -> Int ![Pick] {\n  \
+                 perform Pick.pick(b)\n\
+               }\n\
+               fn run(b: Bool) -> Int ![] {\n  \
+                 handle body(b) with {\n    \
+                   Pick.pick(cond, k) => if cond { k(0) } else { 42 },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run(true)));\n  \
+                 perform IO.println(int_to_string(run(false)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_118_one_branch_k_else_discharge");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n42\n",
+        "one-branch-k / one-branch-discharge: cond=true → k(0) → body 0; \
+         cond=false → arm discharges with 42 (handle's overall, no return \
+         arm). stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn task_118_recursive_choose_first_choice_three_candidates() {
+    // (d) Sudoku-canonical "for each candidate { try k(c); on fail
+    // try next }" recursive shape. Smaller fixture: 3 candidates,
+    // simple match-fail pattern. Pins the recursive Choose-style
+    // discipline that Sudoku's first_choice discharger exercises.
+    //
+    // body picks 0..2 via Choose.choose(3) and returns ISome iff
+    // the picked value is 1 (only candidate 1 succeeds). Discharger
+    // tries k(0), then k(1), then k(2) in nested-match shape; the
+    // first ISome wins. Expect ISome(1).
+    let src = "type IntOpt = | INone | ISome(Int)\n\
+               effect Choose resumes: many { choose: (Int) -> Int, fail: () -> Int }\n\
+               fn body() -> IntOpt ![Choose] {\n  \
+                 let n: Int = perform Choose.choose(3);\n  \
+                 if n == 1 { ISome(n) } else { INone }\n\
+               }\n\
+               fn run() -> IntOpt ![] {\n  \
+                 handle body() with {\n    \
+                   Choose.choose(arg, k) => match k(0) {\n      \
+                     ISome(s) => ISome(s),\n      \
+                     INone => match k(1) {\n        \
+                       ISome(s) => ISome(s),\n        \
+                       INone => k(2),\n      \
+                     },\n    \
+                   },\n    \
+                   Choose.fail(k) => INone,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: IntOpt = run();\n  \
+                 let v: Int = match r {\n    \
+                   ISome(x) => x,\n    \
+                   INone => 0 - 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_118_recursive_choose_first_choice");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1\n",
+        "recursive first_choice over 3 candidates: k(0) → INone; k(1) → \
+         ISome(1) — short-circuits, returns ISome(1); v=1. stderr={stderr:?}"
+    );
+}
+
 #[test]
 fn handle_with_return_arm_inside_match_arm_compiles() {
     // Plan B Task 55 (Phase 4g) review-fix #2: regression test
