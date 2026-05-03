@@ -909,6 +909,25 @@ pub(crate) fn collect_ctor_names(
     ctors
 }
 
+/// Plan D Task 117 (b) Phase 4 — for a user FnDecl, collect the
+/// names of parameters whose declared type is `Continuation[op_ret,
+/// ret]`. Consumed by the Lowerer at user-fn body codegen to populate
+/// `Lowerer::cont_param_names`, driving `lower_call`'s continuation-
+/// param dispatch for `Ident(name)` callees and Continuation-typed
+/// arg packing.
+pub(crate) fn collect_user_fn_cont_param_names(
+    f: &crate::ast::FnDecl,
+) -> std::collections::BTreeSet<String> {
+    use crate::ast::TypeExpr;
+    let mut out = std::collections::BTreeSet::new();
+    for p in &f.params {
+        if matches!(&p.ty, TypeExpr::Apply { name, .. } if name == "Continuation") {
+            out.insert(p.name.clone());
+        }
+    }
+    out
+}
+
 /// Plan D Task 117 (b) — pre-pass scan: build `callee_name → Vec<bool>`
 /// where the Vec entry at index `i` is `true` iff parameter `i` of the
 /// callee is annotated as `Continuation[op_ret, ret]`. Used by
@@ -1042,32 +1061,6 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     // allow `helper(k, ...)` shapes when the helper's signature
     // declares a Continuation param at that arg index.
     let cont_param_callees = collect_cont_param_callees(program);
-    // Plan D Task 117 (b) Phase 4 pending — typecheck now allows
-    // `Continuation[op_ret, ret]` as a fn parameter type (the lift
-    // makes runtime-N dischargers like `all_choices` /
-    // `first_choice` typecheck cleanly), but the codegen calling
-    // convention for fns receiving a continuation as a parameter
-    // has not yet shipped (the (k_closure, k_fn, frame_ptr) triple
-    // needs to flow through the user-fn ABI as 3 pointer slots
-    // instead of 1, with `lower_k_pair_call` dispatched on the
-    // param's bound triple). Until Phase 4 lands, surface a clean
-    // codegen-pre-pass diagnostic instead of letting the indirect-
-    // call lowering panic with `unreachable!`. Tracked at
-    // `[DEVIATION Task 73]` as the remaining v1 closure path.
-    if !cont_param_callees.is_empty() {
-        let names: Vec<&str> = cont_param_callees.keys().map(String::as_str).collect();
-        return Some(format!(
-            "fn(s) {names:?} declare a `Continuation[op_ret, ret]` parameter — \
-             typecheck accepts this surface (Plan D Task 117 (b) scope-id \
-             polymorphism), but the codegen calling convention for fns receiving \
-             a continuation as a parameter is not yet wired (the (k_closure, k_fn, \
-             frame_ptr) triple needs to flow as 3 pointer slots through the user-fn \
-             ABI instead of 1). Until Phase 4 lands, runtime-N dischargers like \
-             `all_choices` / `first_choice` over `Choose.choose(arg)` for arbitrary \
-             `arg` cannot be expressed via a recursive helper that takes `k` as a \
-             parameter. See `[DEVIATION Task 73]` for the closure path"
-        ));
-    }
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
             if let Some(msg) =
@@ -2353,6 +2346,14 @@ struct HandlerArmSynth {
     /// `None` for arms whose body doesn't match the multi-let
     /// shape OR whose effect isn't `resumes: many`.
     post_arm_k_chain: Option<PostArmKChain>,
+    /// Plan D Task 117 (b) Phase 4 — span of the enclosing
+    /// `Expr::Handle`, threaded so the synth-pass body emit can
+    /// look up `handler_return_arm_refs_per_handle[handle_span]`
+    /// when packing a Continuation arg (the alloc must wire the
+    /// return-arm pair into the value object so invocations from
+    /// outside the arm body still wrap the body's value via the
+    /// handle's return arm).
+    handle_span: Span,
 }
 
 /// Plan B Task 55 (Phase 4g) — per-`Expr::Handle` return-arm synthetic
@@ -4895,6 +4896,7 @@ fn collect_handle_arms_in_expr(
                     k_name: arm.k_name.clone(),
                     post_arm_k,
                     post_arm_k_chain,
+                    handle_span: span.clone(),
                 });
                 arm_indices.push(global_idx);
             }
@@ -6412,6 +6414,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     if let Some(msg) = unsupported_handle_construct(&checked.program) {
         return Err(msg);
     }
+    // Plan D Task 117 (b) Phase 4 — pre-pass map of user-fn
+    // param-Continuation flags. Computed once here so every Lowerer
+    // ctor site can pass it as a borrowed reference. Keys are
+    // post-mono callee fn names (e.g. `fold_choices$$Int`); each
+    // entry is a Vec<bool> indexed by param position.
+    let cont_param_callees = collect_cont_param_callees(&checked.program);
 
     // Plan B' Stage 6.8 Task 104 (R2 finding 1) — reject indirect-
     // call callee shapes that Phase C v1 doesn't support, with a
@@ -7190,6 +7198,66 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     let clock_os_now = module
         .declare_function("sigil_clock_os_now", Linkage::Import, &clock_os_now_sig)
         .map_err(|e| format!("declare sigil_clock_os_now: {e}"))?;
+
+    // Plan D Task 117 (b) Phase 4 — Continuation value object alloc
+    // + load helpers. Used at sites that flow a continuation into a
+    // fn-parameter (boxing the (k_closure, k_fn, return_closure,
+    // return_fn) quadruple) and at sites inside the receiver that
+    // invoke or forward the parameter.
+    // sigil_continuation_alloc(k_closure, k_fn, return_closure, return_fn) -> *mut u8
+    let mut cont_alloc_sig = Signature::new(isa_call_conv(&module));
+    cont_alloc_sig.params.push(AbiParam::new(pointer_ty));
+    cont_alloc_sig.params.push(AbiParam::new(pointer_ty));
+    cont_alloc_sig.params.push(AbiParam::new(pointer_ty));
+    cont_alloc_sig.params.push(AbiParam::new(pointer_ty));
+    cont_alloc_sig.returns.push(AbiParam::new(pointer_ty));
+    let cont_alloc = module
+        .declare_function("sigil_continuation_alloc", Linkage::Import, &cont_alloc_sig)
+        .map_err(|e| format!("declare sigil_continuation_alloc: {e}"))?;
+    // sigil_continuation_load_closure(cont) -> *mut u8
+    let mut cont_load_closure_sig = Signature::new(isa_call_conv(&module));
+    cont_load_closure_sig.params.push(AbiParam::new(pointer_ty));
+    cont_load_closure_sig.returns.push(AbiParam::new(pointer_ty));
+    let cont_load_closure = module
+        .declare_function(
+            "sigil_continuation_load_closure",
+            Linkage::Import,
+            &cont_load_closure_sig,
+        )
+        .map_err(|e| format!("declare sigil_continuation_load_closure: {e}"))?;
+    // sigil_continuation_load_fn(cont) -> *mut u8
+    let mut cont_load_fn_sig = Signature::new(isa_call_conv(&module));
+    cont_load_fn_sig.params.push(AbiParam::new(pointer_ty));
+    cont_load_fn_sig.returns.push(AbiParam::new(pointer_ty));
+    let cont_load_fn = module
+        .declare_function(
+            "sigil_continuation_load_fn",
+            Linkage::Import,
+            &cont_load_fn_sig,
+        )
+        .map_err(|e| format!("declare sigil_continuation_load_fn: {e}"))?;
+    // sigil_continuation_load_return_closure(cont) -> *mut u8
+    let mut cont_load_ret_closure_sig = Signature::new(isa_call_conv(&module));
+    cont_load_ret_closure_sig.params.push(AbiParam::new(pointer_ty));
+    cont_load_ret_closure_sig.returns.push(AbiParam::new(pointer_ty));
+    let cont_load_ret_closure = module
+        .declare_function(
+            "sigil_continuation_load_return_closure",
+            Linkage::Import,
+            &cont_load_ret_closure_sig,
+        )
+        .map_err(|e| format!("declare sigil_continuation_load_return_closure: {e}"))?;
+    // sigil_continuation_load_return_fn(cont) -> *mut u8
+    let mut cont_load_ret_fn_sig = Signature::new(isa_call_conv(&module));
+    cont_load_ret_fn_sig.params.push(AbiParam::new(pointer_ty));
+    cont_load_ret_fn_sig.returns.push(AbiParam::new(pointer_ty));
+    let cont_load_ret_fn = module
+        .declare_function(
+            "sigil_continuation_load_return_fn",
+            Linkage::Import,
+            &cont_load_ret_fn_sig,
+        )
+        .map_err(|e| format!("declare sigil_continuation_load_return_fn: {e}"))?;
 
     // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
     // Phase 3a wires the frame allocation + push/pop ABI from Task
@@ -8122,6 +8190,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             string_length,
             random_pseudo_int,
             clock_os_now,
+            cont_alloc,
+            cont_load_closure,
+            cont_load_fn,
+            cont_load_ret_closure,
+            cont_load_ret_fn,
         },
         handler_frame_new,
         handle_push,
@@ -8488,6 +8561,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_frame_ptr_v: None,
                         arm_k_pair_self: None,
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
+                        cont_param_names: collect_user_fn_cont_param_names(f),
+                        cont_param_callees: &cont_param_callees,
+                        arm_handle_span: None,
                     };
 
                     // Phase 3 — extract scrutinee + arms from the
@@ -9519,6 +9595,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
+                    cont_param_names: collect_user_fn_cont_param_names(f),
+                    cont_param_callees: &cont_param_callees,
+                    arm_handle_span: None,
                 };
 
                 // Phase 5 + Phase 6 — branch on body's first step
@@ -9906,6 +9985,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_frame_ptr_v: None,
                 arm_k_pair_self: cc.arm_k_pair_captures.get(&f.name).cloned(),
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
+                cont_param_names: collect_user_fn_cont_param_names(f),
+                cont_param_callees: &cont_param_callees,
+                arm_handle_span: None,
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -10409,6 +10491,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: frame_ptr_v,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
+                    cont_param_names: std::collections::BTreeSet::new(),
+                    cont_param_callees: &cont_param_callees,
+                    arm_handle_span: Some(synth.handle_span.clone()),
                 };
 
                 // Plan B Task 55 (Phase 4d): route between the two
@@ -11352,6 +11437,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
+                    cont_param_names: std::collections::BTreeSet::new(),
+                    cont_param_callees: &cont_param_callees,
+                    arm_handle_span: None,
                 };
 
                 let body_value = lowerer.lower_expr(&synth.body);
@@ -11632,6 +11720,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_frame_ptr_v: None,
                 arm_k_pair_self: None,
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
+                cont_param_names: std::collections::BTreeSet::new(),
+                cont_param_callees: &cont_param_callees,
+                arm_handle_span: None,
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
@@ -11924,6 +12015,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_frame_ptr_v: None,
                         arm_k_pair_self: None,
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
+                        cont_param_names: std::collections::BTreeSet::new(),
+                        cont_param_callees: &cont_param_callees,
+                        arm_handle_span: None,
                     };
 
                     match &step.role {
@@ -12645,6 +12739,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             arm_frame_ptr_v: None,
                             arm_k_pair_self: None,
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
+                            cont_param_names: std::collections::BTreeSet::new(),
+                            cont_param_callees: &cont_param_callees,
+                            arm_handle_span: None,
                         };
 
                         match role {
@@ -14211,6 +14308,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             arm_frame_ptr_v: None,
                             arm_k_pair_self: None,
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
+                            cont_param_names: std::collections::BTreeSet::new(),
+                            cont_param_callees: &cont_param_callees,
+                            arm_handle_span: None,
                         };
 
                         // Plan B Task 78.5 G4 Phase B.3 — CPS→CPS direct
@@ -15099,6 +15199,43 @@ struct Lowerer<'a, 'b> {
     /// trailing 2 slots get k_closure / k_fn from the surrounding
     /// arm fn's `arm_k_closure_v` / `arm_k_fn_v`.
     arm_k_pair_captures: &'b BTreeMap<String, crate::closure_convert::ArmKPairCapture>,
+    /// Plan D Task 117 (b) Phase 4 — set of names of fn parameters
+    /// whose declared type is `Continuation[op_ret, ret]`. Populated
+    /// at user-fn Lowerer construction by scanning the fn's params
+    /// for `Ty::Continuation` (or post-mono `TypeExpr::Apply { name:
+    /// "Continuation", .. }`). Empty for synth fns / arm fns / lifted
+    /// lambdas — they don't have continuation-typed user params (they
+    /// receive `k` via the trailing-pair convention on args_ptr or
+    /// via `arm_k_pair_captures` on the lifted lambda's closure
+    /// record).
+    ///
+    /// Consumed by `lower_call`:
+    ///   - When the callee is `Ident(name)` AND name is in this set,
+    ///     dispatch as a continuation invocation: load the
+    ///     `(k_closure, k_fn)` pair from the Continuation value
+    ///     object held in `env[name]`, build a `NextStep::Call`,
+    ///     drive `sigil_run_loop` to the terminal value.
+    ///   - When generic-call args contain `Ident(arm_k_name)` at a
+    ///     position whose callee param is Continuation-typed, alloc
+    ///     a Continuation value via `sigil_continuation_alloc(arm_-
+    ///     k_closure_v, arm_k_fn_v)` and pass the resulting pointer
+    ///     as the actual fn argument.
+    cont_param_names: std::collections::BTreeSet<String>,
+    /// Plan D Task 117 (b) Phase 4 — global map of user-fn names to
+    /// their per-param Continuation flags. Borrowed reference (lives
+    /// for `'b` alongside the other side-tables). Used by `lower_call`
+    /// to determine which arg positions need Continuation-value-object
+    /// allocation when packing arguments for a Sync user fn that
+    /// declares Continuation params.
+    cont_param_callees: &'b std::collections::BTreeMap<String, Vec<bool>>,
+    /// Plan D Task 117 (b) Phase 4 — when this Lowerer is for a
+    /// synth arm fn, the span of the enclosing `Expr::Handle`. Used
+    /// at Continuation arg-packing sites to look up the handle's
+    /// return-arm fn pointer (via
+    /// `handler_return_arm_refs_per_handle`) and frame-resident
+    /// return_closure (via `arm_frame_ptr_v` + frame offset). None
+    /// for non-arm Lowerers.
+    arm_handle_span: Option<Span>,
 }
 
 /// Task 78.5 G4 Approach 6 deep-redo (PR #80 review §7) — free-fn
@@ -17786,6 +17923,370 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         }
     }
 
+    /// Plan D Task 117 (b) Phase 4 — for an alloc site inside an
+    /// arm body, source the (return_closure, return_fn) pair to
+    /// embed in a fresh Continuation value object so post-invoke
+    /// the captured continuation's body value wraps via the
+    /// handle's `return(v) => ...` arm. Sources:
+    ///
+    ///   - return_fn: `handler_return_arm_refs_per_handle[span]` if
+    ///     the handle has a return arm; otherwise null.
+    ///   - return_closure: loaded from the arm fn's `arm_frame_ptr_v`
+    ///     at offset `HANDLER_FRAME_RETURN_CLOSURE_OFF` (the same
+    ///     slot `sigil_handler_frame_set_return` writes at handle
+    ///     setup time). Null when the return arm has no captures or
+    ///     no return arm.
+    ///
+    /// Both null when this Lowerer isn't an arm fn (no
+    /// `arm_handle_span`) — the caller's site-shape walker should
+    /// have prevented this path, but defensively returns nulls.
+    fn source_arm_return_pair_for_continuation_arg(&mut self) -> (Value, Value) {
+        let null_ptr_a = self.builder.ins().iconst(self.pointer_ty, 0);
+        let null_ptr_b = self.builder.ins().iconst(self.pointer_ty, 0);
+        let span = match &self.arm_handle_span {
+            Some(s) => s.clone(),
+            None => return (null_ptr_a, null_ptr_b),
+        };
+        let return_fn_ref_opt = self.handler_return_arm_refs_per_handle.get(&span).copied();
+        let Some(return_fn_ref) = return_fn_ref_opt else {
+            return (null_ptr_a, null_ptr_b);
+        };
+        let return_fn_addr = self
+            .builder
+            .ins()
+            .func_addr(self.pointer_ty, return_fn_ref);
+        // Load return_closure from the handler frame at offset
+        // HANDLER_FRAME_RETURN_CLOSURE_OFF. arm_frame_ptr_v is set
+        // by the synth arm fn ctor when the arm body has any k-pair-
+        // bearing nested ClosureRecord; for our case (the arm body
+        // is `helper(k, ...)`, not a lifted lambda), arm_frame_ptr_v
+        // may be None. Use null_closure in that case — the runtime
+        // tolerates null return_closure (per
+        // `sigil_handler_frame_set_return`'s null-for-empty
+        // discipline).
+        let return_closure = if let Some(frame_ptr) = self.arm_frame_ptr_v {
+            self.builder.ins().load(
+                self.pointer_ty,
+                MemFlags::trusted(),
+                frame_ptr,
+                sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
+            )
+        } else {
+            null_ptr_a
+        };
+        (return_closure, return_fn_addr)
+    }
+
+    /// Plan D Task 117 (b) Phase 4 — produce a Cranelift Value
+    /// representing a Continuation argument flowing into a callee's
+    /// `Continuation[op_ret, ret]` parameter slot. Two source shapes
+    /// are supported in v1:
+    ///
+    ///   - Arm-bound `k`: the call site is inside an arm body whose
+    ///     synth fn has `arm_k_pair_self` set. Box the
+    ///     `(arm_k_closure_v, arm_k_fn_v)` pair into a fresh
+    ///     Continuation value object via `sigil_continuation_alloc`.
+    ///
+    ///   - Forwarded fn-param `k`: the call site is inside a fn
+    ///     whose own param `k` is Continuation-typed (forwarding to
+    ///     a recursive helper). The value is already a pointer in
+    ///     `env[name]`; pass through.
+    ///
+    /// Other shapes (let-bound continuation aliases, captured
+    /// continuations from lifted lambdas, etc.) are not yet
+    /// supported in this slice and trip an `unreachable!` — the
+    /// codegen pre-pass walker (`arm_body_walk`'s generic-call
+    /// branch) only allows the two shapes above for k-as-arg flowing
+    /// into a Cont-typed param.
+    fn lower_continuation_arg(&mut self, arg: &crate::ast::Expr) -> Value {
+        use crate::ast::Expr;
+        if let Expr::Ident(name, _) = arg {
+            // Forwarded fn-param: env[name] is already a Continuation
+            // value object pointer.
+            if self.cont_param_names.contains(name) {
+                return *self.env.get(name).unwrap_or_else(|| {
+                    unreachable!(
+                        "codegen: cont fn-param `{name}` missing from env at call site"
+                    )
+                });
+            }
+            // Arm-bound k: box (arm_k_closure_v, arm_k_fn_v) into a
+            // fresh Continuation value object.
+            if let Some(info) = self.arm_k_pair_self.clone() {
+                if name == &info.k_name {
+                    let k_closure = self.arm_k_closure_v.unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen: arm_k_closure_v unset at Continuation arg packing site"
+                        )
+                    });
+                    let k_fn = self.arm_k_fn_v.unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen: arm_k_fn_v unset at Continuation arg packing site"
+                        )
+                    });
+                    // Source the originating handle's return-arm
+                    // pair so the boxed continuation, when invoked
+                    // from outside the arm body (e.g. in a recursive
+                    // helper), still wraps the body's value via
+                    // `return(v) => ...`.
+                    let (return_closure, return_fn) =
+                        self.source_arm_return_pair_for_continuation_arg();
+                    let alloc_call = self.builder.ins().call(
+                        self.builtins.cont_alloc_ref,
+                        &[k_closure, k_fn, return_closure, return_fn],
+                    );
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, alloc_call));
+                    return self.builder.inst_results(alloc_call)[0];
+                }
+            }
+            // Synth-arm fn (not k-pair-bearing) where k is the arm's
+            // own k_name — sourced from the arm fn's args buffer
+            // (loaded into arm_k_closure_v / arm_k_fn_v at the synth
+            // fn's entry block). This is the `Choose.choose(arg, k)
+            // => helper(k, ...)` arm-body site.
+            if let (Some(k_closure), Some(k_fn)) = (self.arm_k_closure_v, self.arm_k_fn_v) {
+                // Heuristic: if the arm fn's k_name is "k" or matches
+                // by convention any binder shadowed in env, use the
+                // arm-fn-loaded pair. Without an arm.k_name field on
+                // the Lowerer, accept any Ident that isn't a regular
+                // local — falls to the alloc path. Since the walker
+                // already validated this site, the pair is the right
+                // source. (A future polish pass should track arm.k_name
+                // on the Lowerer for a precise check.)
+                if !self.env.contains_key(name) && !self.user_fn_refs.contains_key(name) {
+                    // Source the originating handle's return-arm
+                    // pair so the boxed continuation, when invoked
+                    // from outside the arm body (e.g. in a recursive
+                    // helper), still wraps the body's value via
+                    // `return(v) => ...`.
+                    let (return_closure, return_fn) =
+                        self.source_arm_return_pair_for_continuation_arg();
+                    let alloc_call = self.builder.ins().call(
+                        self.builtins.cont_alloc_ref,
+                        &[k_closure, k_fn, return_closure, return_fn],
+                    );
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, alloc_call));
+                    return self.builder.inst_results(alloc_call)[0];
+                }
+            }
+        }
+        unreachable!(
+            "lower_continuation_arg: unsupported Continuation-arg shape {arg:?}; \
+             v1 supports `Ident(arm_k_name)` (boxes arm-fn k-pair) and \
+             `Ident(cont_param_name)` (forwards env value); other shapes are \
+             not yet implemented"
+        )
+    }
+
+    /// Plan D Task 117 (b) Phase 4 — invoke a continuation held in a
+    /// fn parameter (a boxed Continuation value object pointer).
+    /// Loads `(k_closure, k_fn)` from the value object via the
+    /// runtime helpers, builds a `NextStep::Call` with the
+    /// trailing-pair convention `[arg, null, identity]`, and drives
+    /// `sigil_run_loop` to the terminal value. Mirrors
+    /// [`Lowerer::lower_k_pair_call`]'s shape — the difference is the
+    /// (k_closure, k_fn) source: closure-record trailing slots in
+    /// arm-fn k-pair-bearing lifted lambdas vs. the boxed Continuation
+    /// value object's offsets 8 / 16 here.
+    ///
+    /// Frame_ptr is NOT re-pushed: the originating handler frame is
+    /// still alive on the handler stack (the receiving fn was called
+    /// from inside an arm body via `helper(k, ...)`, which means the
+    /// arm body — and therefore its frame — is on the call stack
+    /// above us).
+    fn lower_continuation_param_call(
+        &mut self,
+        name: &str,
+        args: &[crate::ast::Expr],
+    ) -> Value {
+        debug_assert_eq!(
+            args.len(),
+            1,
+            "lower_continuation_param_call: continuation arity is fixed at 1, got {}",
+            args.len()
+        );
+
+        // Load Continuation value object pointer from env.
+        let cont_ptr = *self.env.get(name).unwrap_or_else(|| {
+            unreachable!(
+                "codegen: cont param `{name}` missing from env — fn-entry param \
+                 binding should have populated it"
+            )
+        });
+
+        // Load (k_closure, k_fn) via the runtime helpers (kept as
+        // function calls rather than inline loads so the runtime owns
+        // the layout convention; flips a single header tag adjustment
+        // into a runtime-only change instead of a codegen+runtime
+        // co-edit).
+        let load_closure_call = self
+            .builder
+            .ins()
+            .call(self.builtins.cont_load_closure_ref, &[cont_ptr]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, load_closure_call));
+        let k_closure = self.builder.inst_results(load_closure_call)[0];
+        let load_fn_call = self
+            .builder
+            .ins()
+            .call(self.builtins.cont_load_fn_ref, &[cont_ptr]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, load_fn_call));
+        let k_fn = self.builder.inst_results(load_fn_call)[0];
+
+        // Lower the resume arg, widen to I64 for the args buffer.
+        let arg_v = self.lower_expr(&args[0]);
+        let arg_ty = self.builder.func.dfg.value_type(arg_v);
+        let widened_arg = if arg_ty == types::I64 {
+            arg_v
+        } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+            self.builder.ins().uextend(types::I64, arg_v)
+        } else {
+            assert_eq!(
+                arg_ty, self.pointer_ty,
+                "lower_continuation_param_call: unexpected arg Cranelift type {arg_ty:?}"
+            );
+            arg_v
+        };
+
+        // sigil_next_step_call(k_closure, k_fn, 3) — trailing-pair
+        // convention `[widened_arg, null_post_arm_k_closure,
+        // identity_fn_addr]` so the resume code sees the same args
+        // layout the existing tail-`k(arg)` lowering produces.
+        let arg_count_v = self.builder.ins().iconst(types::I32, 3);
+        let next_step_call = self
+            .builder
+            .ins()
+            .call(self.next_step_call_ref, &[k_closure, k_fn, arg_count_v]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, next_step_call));
+        let ns = self.builder.inst_results(next_step_call)[0];
+
+        let args_ptr_call = self.builder.ins().call(self.next_step_args_ptr_ref, &[ns]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, args_ptr_call));
+        let args_buf = self.builder.inst_results(args_ptr_call)[0];
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), widened_arg, args_buf, 0);
+
+        // Use identity for the trailing pair on the FIRST run_loop
+        // dispatch; the captured continuation's resume forwards to
+        // identity which returns `Done(body_val)` (mirrors the
+        // existing tail-perform `lower_perform_to_value` pattern).
+        // The return-arm wrap is applied as a SECOND run_loop
+        // dispatch below — this matches `lower_k_pair_call`'s
+        // structure (line ~17725) where the return arm is invoked
+        // explicitly rather than threaded through the captured
+        // continuation's internal forwarding.
+        let identity_addr = self
+            .builder
+            .ins()
+            .func_addr(self.pointer_ty, self.continuation_identity_ref);
+        let null_post = self.builder.ins().iconst(self.pointer_ty, 0);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), null_post, args_buf, 8);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), identity_addr, args_buf, 16);
+
+        // sigil_run_loop(ns, terminal_out) → u64 (body's natural value)
+        let terminal_out = self.terminal_out_param;
+        let run_loop_call = self
+            .builder
+            .ins()
+            .call(self.run_loop_ref, &[ns, terminal_out]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
+        let body_widened = self.builder.inst_results(run_loop_call)[0];
+
+        // Plan D Task 117 (b) Phase 4 — load the originating handle's
+        // return-arm pair from the Continuation value object. If
+        // ret_fn is null (no return arm), pass body_widened through
+        // unchanged (B == R for handles without an explicit
+        // `return(v) => ...` arm). Otherwise build a second
+        // NextStep::Call that invokes the return arm with the
+        // body value, drive sigil_run_loop, return the wrapped
+        // R-typed value.
+        let load_ret_closure_call = self
+            .builder
+            .ins()
+            .call(self.builtins.cont_load_ret_closure_ref, &[cont_ptr]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, load_ret_closure_call));
+        let ret_closure = self.builder.inst_results(load_ret_closure_call)[0];
+        let load_ret_fn_call = self
+            .builder
+            .ins()
+            .call(self.builtins.cont_load_ret_fn_ref, &[cont_ptr]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, load_ret_fn_call));
+        let ret_fn = self.builder.inst_results(load_ret_fn_call)[0];
+
+        let null_const = self.builder.ins().iconst(self.pointer_ty, 0);
+        let is_null = self.builder.ins().icmp(IntCC::Equal, ret_fn, null_const);
+
+        let skip_block = self.builder.create_block();
+        let apply_block = self.builder.create_block();
+        let merge_block = self.builder.create_block();
+        self.builder.append_block_param(merge_block, types::I64);
+        self.builder
+            .ins()
+            .brif(is_null, skip_block, &[], apply_block, &[]);
+
+        // skip_block: no return arm; pass body's value through.
+        self.builder.switch_to_block(skip_block);
+        self.builder.seal_block(skip_block);
+        self.builder.ins().jump(merge_block, &[body_widened.into()]);
+
+        // apply_block: invoke the return arm via sigil_next_step_call(
+        // ret_closure, ret_fn, 3) with args [body_widened, null,
+        // identity]; drive a second sigil_run_loop.
+        self.builder.switch_to_block(apply_block);
+        self.builder.seal_block(apply_block);
+        let three_v_2 = self.builder.ins().iconst(types::I32, 3);
+        let nsc2 = self
+            .builder
+            .ins()
+            .call(self.next_step_call_ref, &[ret_closure, ret_fn, three_v_2]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, nsc2));
+        let ns2 = self.builder.inst_results(nsc2)[0];
+        let argp2 = self.builder.ins().call(self.next_step_args_ptr_ref, &[ns2]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, argp2));
+        let argp2_v = self.builder.inst_results(argp2)[0];
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), body_widened, argp2_v, 0);
+        let null2 = self.builder.ins().iconst(self.pointer_ty, 0);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), null2, argp2_v, 8);
+        let identity2 = self
+            .builder
+            .ins()
+            .func_addr(self.pointer_ty, self.continuation_identity_ref);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), identity2, argp2_v, 16);
+        let rl2 = self
+            .builder
+            .ins()
+            .call(self.run_loop_ref, &[ns2, terminal_out]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, rl2));
+        let wrapped = self.builder.inst_results(rl2)[0];
+        self.builder.ins().jump(merge_block, &[wrapped.into()]);
+
+        self.builder.switch_to_block(merge_block);
+        self.builder.seal_block(merge_block);
+        self.builder.block_params(merge_block)[0]
+    }
+
     fn lower_call(
         &mut self,
         callee: &crate::ast::Expr,
@@ -17807,6 +18308,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         if let (Expr::Ident(name, _), Some(info)) = (callee, self.arm_k_pair_self.clone()) {
             if name == &info.k_name {
                 return self.lower_k_pair_call(args, &info);
+            }
+        }
+
+        // Plan D Task 117 (b) Phase 4 — Continuation-as-fn-param
+        // dispatch. When the surrounding fn declares a parameter of
+        // type `Continuation[op_ret, ret]` and the call's callee is
+        // an `Ident` matching that parameter's name, dispatch via
+        // the boxed-Continuation invocation shape: load (k_closure,
+        // k_fn) from the value object held in `env[name]`, build a
+        // `NextStep::Call(k_closure, k_fn, 1)`, write the resume arg
+        // into the args buffer, and drive `sigil_run_loop` to the
+        // terminal value.
+        if let Expr::Ident(name, _) = callee {
+            if self.cont_param_names.contains(name) {
+                return self.lower_continuation_param_call(name, args);
             }
         }
 
@@ -17845,8 +18361,37 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 };
                 match callee_entry.abi {
                     UserFnAbi::Sync => {
-                        let arg_vals: Vec<Value> =
-                            args.iter().map(|a| self.lower_expr(a)).collect();
+                        // Plan D Task 117 (b) Phase 4 — Continuation
+                        // arg packing. For each param position the
+                        // callee declares as `Continuation[op_ret,
+                        // ret]`, materialize a Continuation value
+                        // object pointer instead of dispatching
+                        // `lower_expr` (which would fail to resolve
+                        // `Ident(arm_k_name)` since arm-bound `k` is
+                        // not in `env`). Two source shapes:
+                        //   - `Ident(arm_k_name)` with this Lowerer's
+                        //     `arm_k_pair_self` set: alloc a fresh
+                        //     value object boxing `(arm_k_closure_v,
+                        //     arm_k_fn_v)`.
+                        //   - `Ident(name)` where name is in
+                        //     `self.cont_param_names`: the value is
+                        //     already a Continuation pointer in env;
+                        //     forward it directly.
+                        let cont_flags: Option<&Vec<bool>> =
+                            self.cont_param_callees.get(name);
+                        let arg_vals: Vec<Value> = args
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| {
+                                let is_cont_pos = cont_flags
+                                    .map_or(false, |f| f.get(i).copied().unwrap_or(false));
+                                if is_cont_pos {
+                                    self.lower_continuation_arg(a)
+                                } else {
+                                    self.lower_expr(a)
+                                }
+                            })
+                            .collect();
                         let func_ref = self.user_fn_refs[name];
                         let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
                         // Plan D Task 111b — Sync→Sync: forward the
@@ -20686,6 +21231,14 @@ struct BuiltinFuncIds {
     /// Plan C Task 76 — OS clock (nanos since epoch). Backs the
     /// `os_clock` handler in `std/clock.sigil`.
     clock_os_now: cranelift_module::FuncId,
+    /// Plan D Task 117 (b) Phase 4 — Continuation value object alloc
+    /// + load helpers. Used at sites that flow a continuation into
+    /// a fn-parameter (alloc) or invoke/forward the parameter (load).
+    cont_alloc: cranelift_module::FuncId,
+    cont_load_closure: cranelift_module::FuncId,
+    cont_load_fn: cranelift_module::FuncId,
+    cont_load_ret_closure: cranelift_module::FuncId,
+    cont_load_ret_fn: cranelift_module::FuncId,
 }
 
 /// Per-fn FuncRefs for the builtin runtime primitives. Sibling of
@@ -20767,6 +21320,13 @@ struct BuiltinFuncRefs {
     random_pseudo_int_ref: FuncRef,
     /// Plan C Task 76 — OS clock FuncRef.
     clock_os_now_ref: FuncRef,
+    /// Plan D Task 117 (b) Phase 4 — Continuation value object
+    /// alloc / load helpers (FuncRefs).
+    cont_alloc_ref: FuncRef,
+    cont_load_closure_ref: FuncRef,
+    cont_load_fn_ref: FuncRef,
+    cont_load_ret_closure_ref: FuncRef,
+    cont_load_ret_fn_ref: FuncRef,
 }
 
 /// Plan B Task 55, Phase 4e — input context for [`prepare_per_fn_refs`].
@@ -20978,6 +21538,12 @@ fn prepare_builtin_func_refs(
         string_length_ref: module.declare_func_in_func(ids.string_length, builder.func),
         random_pseudo_int_ref: module.declare_func_in_func(ids.random_pseudo_int, builder.func),
         clock_os_now_ref: module.declare_func_in_func(ids.clock_os_now, builder.func),
+        cont_alloc_ref: module.declare_func_in_func(ids.cont_alloc, builder.func),
+        cont_load_closure_ref: module.declare_func_in_func(ids.cont_load_closure, builder.func),
+        cont_load_fn_ref: module.declare_func_in_func(ids.cont_load_fn, builder.func),
+        cont_load_ret_closure_ref: module
+            .declare_func_in_func(ids.cont_load_ret_closure, builder.func),
+        cont_load_ret_fn_ref: module.declare_func_in_func(ids.cont_load_ret_fn, builder.func),
     }
 }
 
