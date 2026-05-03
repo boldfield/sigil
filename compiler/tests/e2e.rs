@@ -1245,17 +1245,21 @@ fn task_117_layout_skip_generic_templates_pointer_payload_in_some() {
 }
 
 /// Plan D Task 117 smoke gate. 4×4 Sudoku via binary-choose +
-/// recursive backtracking (per Brian's 2026-05-01 restructure;
-/// runtime-N `all_choices` deferred to v3). Verifies the
-/// binary-choose 2-let arm-body shape compiles end-to-end through
-/// existing Slice C machinery WITHOUT requiring Task 117's k-as-
-/// value capability — proves the smoke gate is reachable under
-/// today's Slice C, so the typecheck infrastructure PR (a) ships
-/// is gated on a real working demo, not a speculative one.
+/// recursive backtracking. Verifies the binary-choose 2-let
+/// arm-body shape compiles end-to-end through Slice C machinery
+/// WITHOUT requiring Task 117's k-as-value capability — proves the
+/// smoke gate is reachable under today's Slice C.
 ///
 /// Grid: cell 11 is the only empty cell; valid digit is 3 (every
 /// other digit conflicts with row, col, or box). Output is
 /// `array_get(solved, 11)` = "3\n".
+///
+/// **Note (Plan C completion).** Runtime-N `all_choices` /
+/// `first_choice` over `Choose.choose(arg)` for arbitrary `arg`
+/// requires lifting the typecheck barrier on `Continuation` as a
+/// fn parameter type (currently rejected by E0145 at
+/// `check_type_expr_known`). That lift is in scope for Plan C
+/// completion — `[DEVIATION Task 73]` tracks the closure path.
 #[test]
 fn task_117_smoke_gate_sudoku_solves_4x4() {
     let root = workspace_root();
