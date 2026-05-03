@@ -39,12 +39,13 @@ pub const NEXT_STEP_TAG_CALL: u32 = 1;
 /// `NextStep` discriminant: terminal-from-arm — the carrying op arm
 /// body's discard-`k` tail emitted this. Trampoline propagates the
 /// value identically to `NEXT_STEP_TAG_DONE` (including routing
-/// through the outer post_arm_k stack), but records the
-/// "from-arm-discharge" state in `sigil_last_terminal_tag` so the
-/// handle expression's outer codegen logic can skip return arm
-/// dispatch — the discharged arm's value is the handle's final
-/// value directly per algebraic-effects semantics, not subject to
-/// the return clause's wrapper.
+/// through the outer post_arm_k stack), but writes the
+/// "from-arm-discharge" state to the caller-owned
+/// `TerminalResult.tag` slot (Plan D Task 111d; previously the
+/// `sigil_last_terminal_tag` TLS) so the handle expression's outer
+/// codegen logic can skip return arm dispatch — the discharged
+/// arm's value is the handle's final value directly per algebraic-
+/// effects semantics, not subject to the return clause's wrapper.
 ///
 /// **Why distinct from `DONE`:** Phase 4g shipped uniform return arm
 /// dispatch (PR #29 `dd10379`) on the assumption that "the return

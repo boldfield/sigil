@@ -1690,15 +1690,16 @@ pub struct TerminalResult {
 ///
 /// # Plan D Task 111 — `out: *mut TerminalResult`
 ///
-/// **Contract.** When non-null, the trampoline writes the terminal's
-/// `(value, tag)` pair to `*out` before returning. The write happens
-/// at exactly the same moment as the existing TLS write (both DONE
-/// branch and DISCHARGED bypass writes are mirrored to `*out`) —
-/// same value, same tag, same instant. When null, the `*out` write
-/// is skipped; only TLS is updated. **Null is an accepted ABI value**
-/// for 111a's transitional state where the compiler passes null at
-/// every call site; PRs 111b/c thread a caller-owned pointer through
-/// every fn ABI.
+/// **Contract.** The trampoline writes the terminal's `(value, tag)`
+/// pair to `*out` before returning at every terminal site (DONE and
+/// DISCHARGED bypass). The slot is the **sole terminal channel**
+/// post-111d — TLS-mirrored writes that ran during the 111a→111c
+/// transition are removed. Codegen always passes a non-null pointer
+/// (main shim allocates the root slot; every Sync/Cps/synth fn ABI
+/// threads it through). **Null is an accepted ABI value** for
+/// runtime unit tests that drive `sigil_run_loop` directly with
+/// `ptr::null_mut()` to test dispatch shape without observing the
+/// terminal — the `*out` write is skipped under null.
 ///
 /// **Alignment.** `TerminalResult` requires 8-byte alignment (`u64`
 /// fields). Callers passing non-null pointers must satisfy this. A
@@ -1886,7 +1887,14 @@ pub unsafe extern "C" fn sigil_run_loop(
                      entries belonging to an outer run_loop"
                 );
                 // Plan D Task 111d — see DISCHARGED bypass site above
-                // for the channel discipline note.
+                // for the channel discipline note. The `!out.is_null()`
+                // check is **unreachable from generated code** post-
+                // 111d (codegen always threads a non-null pointer
+                // from the main shim's stack-allocated slot through
+                // every Sync/Cps/synth ABI). It exists for runtime
+                // unit tests that drive `sigil_run_loop` directly
+                // with `ptr::null_mut()` to test dispatch shape
+                // without observing the terminal channel.
                 if !out.is_null() {
                     ptr::write(
                         out,

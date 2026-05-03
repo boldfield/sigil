@@ -7186,10 +7186,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // Stage-6.8-followup Bug 2 fix: emitted by op arm fn bodies on the
     // discard-`k` tail path (replaces sigil_next_step_done at that
     // specific site). Trampoline propagates the value identically to
-    // Done; LAST_TERMINAL_TAG records the source so the handle
-    // expression's outer codegen logic queries
-    // `sigil_last_terminal_tag` and skips return-arm dispatch on
-    // discharge per algebraic-effects semantics.
+    // Done; the caller-owned `TerminalResult.tag` slot records the
+    // source (Plan D Task 111d; previously TLS) so the handle
+    // expression's outer codegen logic loads the tag from the slot
+    // and skips return-arm dispatch on discharge per algebraic-
+    // effects semantics.
     let mut next_step_discharged_sig = Signature::new(isa_call_conv(&module));
     next_step_discharged_sig
         .params
@@ -10927,10 +10928,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // `k`, so per algebraic-effects semantics this
                     // value IS the handle's final value (not subject
                     // to the return clause's wrapper). The trampoline
-                    // records DISCHARGED in `LAST_TERMINAL_TAG`; the
-                    // handle expression's outer codegen logic
-                    // queries `sigil_last_terminal_tag` and skips the
-                    // return arm dispatch. Pre-Stage-6.8-followup,
+                    // writes DISCHARGED to the caller-owned
+                    // `TerminalResult.tag` slot (Plan D Task 111d;
+                    // previously TLS); the handle expression's outer
+                    // codegen logic loads the tag from the slot and
+                    // skips the return arm dispatch.
+                    // Pre-Stage-6.8-followup,
                     // this site emitted `next_step_done`, which let
                     // the unconditional return arm dispatch in the
                     // handle's outer logic apply the return clause
@@ -14700,7 +14703,8 @@ struct Lowerer<'a, 'b> {
     next_step_args_ptr_ref: FuncRef,
     /// Plan D Task 118 — `sigil_next_step_discharged` runtime ref.
     /// Wraps a non-k arm-body tail value in `NextStep::Discharged`
-    /// so the trampoline records DISCHARGED in `LAST_TERMINAL_TAG`
+    /// so the trampoline writes DISCHARGED to the caller-owned
+    /// `TerminalResult.tag` slot (Plan D Task 111d; previously TLS)
     /// and the handle expression's outer codegen skips return-arm
     /// dispatch (the discharged value IS the handle's overall).
     /// Used by [`Lowerer::emit_discharged_next_step`] (the leaf
@@ -15370,8 +15374,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
     /// Plan D Task 118 — wrap a discharged-leaf value (any non-`k`
     /// tail expression) in `NextStep::Discharged`. The trampoline
-    /// records DISCHARGED in `LAST_TERMINAL_TAG`; the handle's outer
-    /// codegen queries the tag and skips the return arm dispatch
+    /// writes DISCHARGED to the caller-owned `TerminalResult.tag`
+    /// slot (Plan D Task 111d; previously TLS); the handle's outer
+    /// codegen loads the tag and skips the return arm dispatch
     /// (the discharged value IS the handle's overall).
     fn emit_discharged_next_step(&mut self, body_value: Value) -> Value {
         let body_actual_ty = self.builder.func.dfg.value_type(body_value);
@@ -16348,6 +16353,48 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // terminal_{tag,value}` TLS FFI calls; with the slot
                 // becoming the sole channel, two stores replace those
                 // FFI calls.
+                //
+                // PR #92 R1 issue 1 — nested-handle slot leak. The
+                // surrounding fn's `terminal_out_param` is shared
+                // across every handle expression in the fn AND every
+                // nested run_loop call. When an outer handle's body
+                // contains an inner handle whose op-arm DISCHARGES,
+                // the inner's `sigil_run_loop` writes `(value,
+                // DISCHARGED)` to the slot; the inner handle's exit
+                // logic loads tag/value and routes through its
+                // discharge_block, but the slot RETAINS that
+                // `(value, DISCHARGED)` state. The outer body then
+                // continues evaluating post-inner-handle expressions
+                // synchronously (no further `sigil_run_loop` writes),
+                // so when the outer handle's exit-tag query loads
+                // from the slot, it reads the inner's leftover
+                // DISCHARGED tag and incorrectly skips the outer's
+                // return arm + reads the inner's leftover value as
+                // the handle's overall.
+                //
+                // Fix: snapshot the slot's pre-handle state at entry
+                // (`snap_value_v`, `snap_tag_v`) and restore the
+                // snapshot at this handle's exit (every merge-block
+                // path) so the outer's exit query sees only its OWN
+                // body's terminal state. Pre-111d this leak existed
+                // identically in TLS form but was masked by the
+                // dual-write — the inner's TLS write also clobbered
+                // the outer. Post-111d the slot is the sole source
+                // of truth, so the leak surfaces directly. Confirmed
+                // by `task_111d_nested_handle_inner_discharge_does_-
+                // not_leak_to_outer`'s `1090` invariant.
+                let snap_value_v = self.builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_VALUE_OFF,
+                );
+                let snap_tag_v = self.builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_TAG_OFF,
+                );
                 let zero_v = self.builder.ins().iconst(types::I64, 0);
                 let done_v = self
                     .builder
@@ -16479,8 +16526,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // (Phase 4f shape).
                 //
                 // **Stage-6.8-followup Bug 2 fix:** dispatch is now
-                // CONDITIONAL on the body's terminal tag (queried
-                // via `sigil_last_terminal_tag` after body lowering).
+                // CONDITIONAL on the body's terminal tag (loaded
+                // from the caller-owned `TerminalResult.tag` slot
+                // after body lowering — Plan D Task 111d; previously
+                // a `sigil_last_terminal_tag` TLS query).
                 // If the body terminated via op arm body's discard-
                 // `k` tail (DISCHARGED), per algebraic-effects
                 // semantics the discharged arm's value IS the
@@ -16678,8 +16727,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.builder.switch_to_block(discharge_block);
                     self.builder.seal_block(discharge_block);
                     // Stage-6.8-followup Bug 1 fix: read the trampoline's
-                    // terminal value from `sigil_last_terminal_value`
-                    // instead of using body_val. body_val reflects body's
+                    // terminal value from the caller-owned
+                    // `TerminalResult.value` slot at offset 0 (Plan D
+                    // Task 111d; previously a `sigil_last_terminal_value`
+                    // TLS query) instead of using body_val. body_val
+                    // reflects body's
                     // IR-locally-computed terminal expression (correct
                     // only for tail-perform body where body's value IS
                     // perform's return value). For body shapes with
@@ -16893,7 +16945,26 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // values of that type.
                     self.builder.switch_to_block(merge_block);
                     self.builder.seal_block(merge_block);
-                    return self.builder.block_params(merge_block)[0];
+                    let merge_val = self.builder.block_params(merge_block)[0];
+                    // PR #92 R1 issue 1 — restore the slot snapshot
+                    // captured at this handle's entry. Prevents this
+                    // handle's terminal `(value, tag)` from leaking
+                    // into the surrounding fn's later code (e.g., an
+                    // outer handle's exit-tag query reading this
+                    // inner handle's leftover DISCHARGED state).
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        snap_value_v,
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_VALUE_OFF,
+                    );
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        snap_tag_v,
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_TAG_OFF,
+                    );
+                    return merge_val;
                 }
 
                 // No return arm declared. Stage-6.8-followup Bug 1
@@ -16902,13 +16973,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // wrong when the body has post-perform code AND an
                 // op arm fires with discard-k. The arm's discharge
                 // value flows back through the trampoline's terminal
-                // (preserved in `LAST_TERMINAL_VALUE`); body's
+                // (preserved in the caller-owned `TerminalResult.value`
+                // slot — Plan D Task 111d; previously TLS); body's
                 // synchronous lowering then continues past the
                 // perform site and produces a different terminal in
                 // body_val. Algebraic semantics says the discharged
                 // value IS handle's overall when an arm discharges.
                 //
-                // The pre-body TLS reset above (Bug 1's
+                // The pre-body slot reset above (Bug 1's
                 // unconditional reset emit at the handle expression's
                 // entry, gated only on group setup, not on
                 // `return_arm.is_some()`) covers BOTH return-arm-
@@ -17009,7 +17081,23 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
                 self.builder.switch_to_block(merge_block_nra);
                 self.builder.seal_block(merge_block_nra);
-                self.builder.block_params(merge_block_nra)[0]
+                let merge_val = self.builder.block_params(merge_block_nra)[0];
+                // PR #92 R1 issue 1 — restore the slot snapshot
+                // captured at this handle's entry. See the return-arm
+                // branch above for the full mechanism note.
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    snap_value_v,
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_VALUE_OFF,
+                );
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    snap_tag_v,
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_TAG_OFF,
+                );
+                merge_val
             }
             // Plan D Task 113 — tuple constructor. Heap-allocate a
             // record with `header (TAG_TUPLE, count=N, bitmap)` plus
