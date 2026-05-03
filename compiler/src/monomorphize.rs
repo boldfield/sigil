@@ -113,6 +113,14 @@ pub type LambdaCapturesResolved = BTreeMap<(String, Span), Vec<(String, Ty)>>;
 /// `match_scrut_tys`. See `MonoProgram::match_scrut_tys_resolved`.
 pub type MatchScrutTysResolved = BTreeMap<(String, Span), Ty>;
 
+/// Plan D Task 119b — per-clone resolved `handle_body_ty`. See
+/// `MonoProgram::handle_body_ty_resolved`.
+pub type HandleBodyTyResolved = BTreeMap<(String, Span), Ty>;
+
+/// Plan D Task 119b — per-clone resolved `call_callee_tys`. See
+/// `MonoProgram::call_callee_tys_resolved`.
+pub type CallCalleeTysResolved = BTreeMap<(String, Span), Ty>;
+
 #[derive(Clone, Debug)]
 pub struct MonoProgram {
     pub anf: AnfProgram,
@@ -143,6 +151,24 @@ pub struct MonoProgram {
     /// map is empty and codegen falls back to the span-keyed
     /// `CheckedProgram` side-table.
     pub match_scrut_tys_resolved: MatchScrutTysResolved,
+    /// Plan D Task 119b — per-clone resolved `handle_body_ty` keyed
+    /// by (clone_fn_name, handle_span). Mirrors
+    /// `match_scrut_tys_resolved` for `Expr::Handle`. Codegen's
+    /// pre-pass at the return-arm dispatch reads from this map to
+    /// recover the concrete body Ty for generic clones (the
+    /// span-keyed `CheckedProgram::handle_body_ty` is shared across
+    /// every clone of a generic source fn and leaks `Ty::Var(_)` for
+    /// generic clones).
+    pub handle_body_ty_resolved: HandleBodyTyResolved,
+    /// Plan D Task 119b — per-clone resolved `call_callee_tys` keyed
+    /// by (clone_fn_name, call_span). Mirrors
+    /// `match_scrut_tys_resolved` for indirect-call sites whose
+    /// callee is `Expr::Call(..)` (the inner Call's return Ty
+    /// resolves the outer Call's signature in `lower_call`'s
+    /// indirect path). The pre-mono `CheckedProgram::call_callee_tys`
+    /// is span-keyed and leaks `Ty::Var(_)` for calls inside generic
+    /// clones (the source side-table is shared across every clone).
+    pub call_callee_tys_resolved: CallCalleeTysResolved,
 }
 
 /// Run monomorphization on the post-elaborate IR. Returns the input
@@ -156,10 +182,19 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
             anf,
             lambda_captures_resolved: BTreeMap::new(),
             match_scrut_tys_resolved: BTreeMap::new(),
+            handle_body_ty_resolved: BTreeMap::new(),
+            call_callee_tys_resolved: BTreeMap::new(),
         };
     }
 
-    let (new_items, lambda_captures_resolved, match_scrut_tys_resolved, builtin_specializations) = {
+    let (
+        new_items,
+        lambda_captures_resolved,
+        match_scrut_tys_resolved,
+        handle_body_ty_resolved,
+        call_callee_tys_resolved,
+        builtin_specializations,
+    ) = {
         let mono = Monomorphizer::new(&anf.checked);
         mono.run_with_lambda_captures()
     };
@@ -204,6 +239,8 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
         anf,
         lambda_captures_resolved,
         match_scrut_tys_resolved,
+        handle_body_ty_resolved,
+        call_callee_tys_resolved,
     }
 }
 
@@ -486,6 +523,30 @@ struct Monomorphizer<'a> {
     /// concrete (post-substitution) scrutinee types regardless of
     /// scrutinee expression shape.
     match_scrut_tys_resolved: MatchScrutTysResolved,
+    /// Plan D Task 119b — typecheck's per-`Expr::Handle`-span body
+    /// type (the Ty of the handle's `body` expression). Read at
+    /// clone time to populate `handle_body_ty_resolved` per
+    /// (clone_fn_name, handle_span). Mirrors `match_scrut_tys` —
+    /// codegen needs the post-substitution body Ty when sizing the
+    /// return arm's `v` binding's Cranelift type, and the span-keyed
+    /// CheckedProgram entry leaks `Ty::Var` from the pre-mono
+    /// parent for generic clones.
+    handle_body_ty: &'a BTreeMap<Span, Ty>,
+    /// Plan D Task 119b — per-clone resolved `handle_body_ty`
+    /// populated by the Handle arm of `rewrite_expr`, keyed by
+    /// (clone_fn_name, handle_span). Lifted into `MonoProgram` so
+    /// codegen's pre-pass can recover the concrete body Ty without
+    /// re-substituting from the span-keyed source side-table.
+    handle_body_ty_resolved: HandleBodyTyResolved,
+    /// Plan D Task 119b — typecheck's per-Call-span return Ty.
+    /// Read at clone time to populate `call_callee_tys_resolved`
+    /// per (clone_fn_name, call_span). Codegen reads the resolved
+    /// map for indirect-call signature derivation in generic clones.
+    call_callee_tys: &'a BTreeMap<Span, Ty>,
+    /// Plan D Task 119b — per-clone resolved `call_callee_tys`
+    /// populated by the Call arm of `rewrite_expr`, keyed by
+    /// (clone_fn_name, call_span).
+    call_callee_tys_resolved: CallCalleeTysResolved,
     /// Plan D Task 117 (a) — mangled names of builtin generic
     /// specializations encountered during `rewrite_type_expr`'s
     /// `Apply` rewrite. Builtin generic types (`Array`, `MutArray`)
@@ -546,6 +607,10 @@ impl<'a> Monomorphizer<'a> {
             lambda_captures_resolved: BTreeMap::new(),
             current_clone_fn_name: None,
             match_scrut_tys_resolved: BTreeMap::new(),
+            handle_body_ty: &checked.handle_body_ty,
+            handle_body_ty_resolved: BTreeMap::new(),
+            call_callee_tys: &checked.call_callee_tys,
+            call_callee_tys_resolved: BTreeMap::new(),
             builtin_specializations: BTreeSet::new(),
         }
     }
@@ -561,6 +626,8 @@ impl<'a> Monomorphizer<'a> {
         Vec<Item>,
         LambdaCapturesResolved,
         MatchScrutTysResolved,
+        HandleBodyTyResolved,
+        CallCalleeTysResolved,
         BTreeSet<String>,
     ) {
         let mut this = self;
@@ -569,6 +636,8 @@ impl<'a> Monomorphizer<'a> {
             items,
             this.lambda_captures_resolved,
             this.match_scrut_tys_resolved,
+            this.handle_body_ty_resolved,
+            this.call_callee_tys_resolved,
             this.builtin_specializations,
         )
     }
@@ -953,6 +1022,22 @@ impl<'a> Monomorphizer<'a> {
                         }
                     }
                 }
+                // Plan D Task 119b — record the post-substitution
+                // call-callee Ty into the per-clone resolved map so
+                // codegen's indirect-call signature builder can
+                // recover the concrete return Ty for generic
+                // clones. Mirrors `match_scrut_tys_resolved` /
+                // `handle_body_ty_resolved`.
+                let callee_ty_concrete: Option<Ty> = self
+                    .call_callee_tys
+                    .get(span)
+                    .map(|t| subst.apply_to_ty(t));
+                if let (Some(fn_name), Some(callee_ty)) =
+                    (&self.current_clone_fn_name, &callee_ty_concrete)
+                {
+                    self.call_callee_tys_resolved
+                        .insert((fn_name.clone(), span.clone()), callee_ty.clone());
+                }
                 let new_callee = self.rewrite_expr(callee, subst);
                 Expr::Call {
                     callee: Box::new(new_callee),
@@ -1143,6 +1228,28 @@ impl<'a> Monomorphizer<'a> {
                 op_arms,
                 span,
             } => {
+                // Plan D Task 119b — record the post-substitution
+                // handle body type into the per-clone resolved map
+                // so codegen's pre-pass can recover the concrete
+                // body Ty at the same span without leaking
+                // `Ty::Var(_)` from the pre-mono parent's
+                // `handle_body_ty` side-table. The span-keyed
+                // `CheckedProgram::handle_body_ty` is shared across
+                // every clone of a generic fn (spans are preserved
+                // by design); for generic clones the source entry
+                // holds outer-fn `Ty::Var`s. Mirrors the
+                // `match_scrut_tys_resolved` discipline introduced
+                // by Plan D Task 113 R1 finding 2.
+                let body_ty_concrete: Option<Ty> = self
+                    .handle_body_ty
+                    .get(span)
+                    .map(|t| subst.apply_to_ty(t));
+                if let (Some(fn_name), Some(body_ty)) =
+                    (&self.current_clone_fn_name, &body_ty_concrete)
+                {
+                    self.handle_body_ty_resolved
+                        .insert((fn_name.clone(), span.clone()), body_ty.clone());
+                }
                 let new_body = self.rewrite_expr(body, subst);
                 let new_return_arm = return_arm.as_ref().map(|ra| {
                     Box::new(crate::ast::HandleReturnArm {
@@ -1505,19 +1612,20 @@ impl Substitution {
                 // surface for first-class function values.
                 effect_row_var: sig.effect_row_var,
             })),
-            // Plan D Task 117 — Continuation values cannot reach
-            // mono substitution (escape barrier rejects all paths
-            // upstream). Restored to `unreachable!()` after PR #60
-            // review #3 closed the bind_ty_var bypass via
-            // check_call's precision check at typecheck.rs:4403-
-            // 4445; defensive forwarding here was the temporary
-            // cover for that bypass. Walker consistency: matches
-            // canon_ty above and ty_to_type_expr below.
-            Ty::Continuation(_) => unreachable!(
-                "monomorphize::Substitution::apply_to_ty: Ty::Continuation reached mono \
-                 substitution — typecheck E0145 should have rejected the cross-fn / \
-                 generic-instantiation site"
-            ),
+            // Plan D Task 119b — lift Continuation values through
+            // monomorphization. The op_ret and ret types substitute
+            // recursively; the scope_id is a static handler-location
+            // identifier (not a type-level binding) and stays
+            // unchanged across instantiations. Runtime ScopeId
+            // enforcement (RELINK_STACK + dynamic checks) is the
+            // load-bearing soundness path for actual escapes.
+            Ty::Continuation(c) => {
+                Ty::Continuation(Box::new(crate::typecheck::ContinuationTy {
+                    op_ret: self.apply_to_ty(&c.op_ret),
+                    ret: self.apply_to_ty(&c.ret),
+                    scope_id: c.scope_id.clone(),
+                }))
+            }
         }
     }
 

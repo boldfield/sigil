@@ -1098,14 +1098,6 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     }
 
     let fn_env: BTreeMap<String, Ty> = builtin_fn_env();
-    // Task 78.5 G5 (review-2 widening) — pre-compute whether the
-    // program contains ANY generics (user-declared generic fn / type,
-    // or any `TypeExpr::Apply` use site). Mirrors mono's gate so the
-    // typecheck-level lambda-captures-k barrier (`check_lambda`) fires
-    // E0145 in any program where mono will run, surfacing the v1
-    // limitation as a clean diagnostic instead of a runtime panic at
-    // `monomorphize.rs:1516`. See `Tc.program_has_generics` doc.
-    let program_has_generics = crate::monomorphize::program_has_generics(&program);
     let mut tc = Tc {
         errors,
         string_literals: Vec::new(),
@@ -1131,7 +1123,6 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         handle_arm_captures: BTreeMap::new(),
         handle_return_arm_captures: BTreeMap::new(),
         handle_body_ty: BTreeMap::new(),
-        program_has_generics,
     };
     // Plan C Task 65 — builtin generic schemes for `array_alloc` /
     // `array_empty` / `array_length` / `array_get` / `array_set`.
@@ -2369,35 +2360,6 @@ struct Tc {
     /// Cranelift type correctly. See
     /// `CheckedProgram::handle_body_ty`.
     handle_body_ty: BTreeMap<Span, Ty>,
-    /// Task 78.5 G5 (review-2 widening) — pre-computed flag indicating
-    /// whether the program contains ANY generics (user-declared
-    /// generic fn / type, or any `TypeExpr::Apply` use site such as
-    /// `Array[Int]`). Mirrors `monomorphize::program_has_generics`'s
-    /// logic so the typecheck-level gate predicts exactly when mono
-    /// will walk a fn body and trip the `Ty::Continuation` mono panic.
-    ///
-    /// Why this is wider than `current_generic_subst.is_empty() == false`:
-    ///
-    /// The previous narrowing ("enclosing fn is generic") missed the
-    /// case where a NON-generic fn (e.g., `std/state.sigil`'s
-    /// `run_state`) lives in a program that ALSO contains generics
-    /// elsewhere. Mono walks every reachable fn (including non-generic
-    /// ones) when `program_has_generics` is true (`monomorphize.rs:153`),
-    /// and the lambda-captures rewrite at `monomorphize.rs:1052-1054`
-    /// calls `subst.apply_to_ty(t)` unconditionally on every capture's
-    /// `Ty` — `apply_to_ty(Ty::Continuation(_))` panics regardless of
-    /// whether the substitution is empty. The widened gate fires E0145
-    /// in any program where mono will run, surfacing the v1 limitation
-    /// as a clean diagnostic instead of a runtime panic.
-    ///
-    /// Honest about the constraint: any program that triggers mono
-    /// (i.e., contains any user-declared generic fn/type or any builtin
-    /// generic Apply like `Array[Int]`) cannot contain a lambda-
-    /// captures-`k` shape anywhere. This regresses
-    /// `std/state.sigil`'s `run_state` for users who ALSO use generics
-    /// — but it surfaces the real limitation as a clean E0145
-    /// diagnostic instead of a runtime panic in mono.
-    program_has_generics: bool,
 }
 
 /// Plan B task 54 — one handler's effect-instantiation cache.
@@ -5097,36 +5059,36 @@ impl Tc {
         // downstream typecheck walks see consistent state; the
         // pipeline's error count gates codegen so the panic at mono
         // is short-circuited regardless.
-        if self.program_has_generics {
-            for (cap_name, cap_ty) in &captures {
-                if matches!(cap_ty, Ty::Continuation(_)) {
-                    self.push_error(
-                        "E0145",
-                        span.clone(),
-                        format!(
-                            "continuation `{cap_name}` cannot be captured by a lambda \
-                             in a program containing generic functions (v1 limitation: \
-                             continuation values cannot cross generic-instantiation \
-                             boundaries, and monomorphization walks every reachable \
-                             function — including non-generic ones — once any generic \
-                             exists in the program). Either rewrite the arm body to \
-                             call `{cap_name}(arg)` directly without intermediate \
-                             lambda capture, or move the handler into a non-generic \
-                             wrapper around the generic body."
-                        ),
-                    );
-                    // v1 single-error-per-lambda: only the first
-                    // `Ty::Continuation` capture is reported. The
-                    // user fixes one capture, recompiles, and any
-                    // remaining captures surface on the next pass.
-                    // Acceptable for v1: each fix is local (rewrite
-                    // the arm body / hoist out of generic scope) so
-                    // an iterative fix loop matches user intent
-                    // better than a flood of duplicates here.
-                    break;
-                }
-            }
-        }
+        // Plan D Task 119b — `program_has_generics` E0145 gate
+        // removed. The broad rejection was a workaround for the
+        // `monomorphize::Substitution::apply_to_ty(Ty::Continuation)`
+        // panic. With apply_to_ty now substituting through Continuation
+        // (recursive op_ret/ret + preserved scope_id), the panic is
+        // gone and the gate is no longer load-bearing. Soundness for
+        // captured-k-in-lambdas is enforced at runtime via ScopeId
+        // checks (RELINK_STACK + dynamic-extent dispatch); a
+        // captured-k that escapes its handle's dynamic extent aborts
+        // at the runtime k-call site. The narrower E0145 emit sites
+        // (cross-fn / generic-instantiation precision check at
+        // `check_call`'s arg-unify, cross-handle scope-mismatch in
+        // `unify_ty`) remain.
+        //
+        // **Lambda-capture Ty::Var deref discipline (Plan D Task
+        // 119b).** Captured types are stored AFTER applying the
+        // current substitution (`self.subst.apply_ty`), so a
+        // capture's Ty::Var is bound in the enclosing fn's
+        // unification scope. When mono later visits the lambda with
+        // a generic substitution, those Ty::Vars resolve through the
+        // outer fn's generic_subst at clone time. Without this
+        // pre-deref, Ty::Vars allocated during the lambda's body
+        // typecheck (e.g., via `fresh_ty_var`) would leak through
+        // mono's `apply_to_ty` (no binding in `by_var`) and reach
+        // codegen as unresolved vars, triggering the panic at
+        // `codegen.rs::cranelift_ty_of_ty`'s `Ty::Var` arm.
+        let captures: Vec<(String, Ty)> = captures
+            .into_iter()
+            .map(|(n, t)| (n, self.subst.apply_ty(&t)))
+            .collect();
         self.lambda_captures.push((span.clone(), captures));
 
         // (3) extend env with params for the body walk. We *add*
@@ -10612,12 +10574,6 @@ mod tests {
             handle_arm_captures: BTreeMap::new(),
             handle_return_arm_captures: BTreeMap::new(),
             handle_body_ty: BTreeMap::new(),
-            // Unit-test default: no enclosing program, so the
-            // program-level G5 widening gate is off. Tests that need
-            // the gate on go through `pipeline()` (full top-level
-            // `typecheck()` entry, which computes the flag from the
-            // parsed program).
-            program_has_generics: false,
         }
     }
 
@@ -12197,14 +12153,16 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn task_78_5_g5_lambda_capturing_k_in_generic_fn_fires_e0145() {
-        // Minimal G5 reproducer: generic `fn f[A]` with handler arm
-        // that returns a lambda capturing `k`. State is multi-shot
-        // (`resumes: many`) so the existing one-shot linearity check
-        // (E0220) is intentionally bypassed. Pre-fix: typecheck
-        // succeeds and mono panics with `Ty::Continuation reached
-        // mono substitution`. Post-fix: E0145 fires at the lambda
-        // construction site naming the captured `k`.
+    fn task_78_5_g5_lambda_capturing_k_in_generic_fn_typechecks_post_119b() {
+        // Plan D Task 119b — broad-E0145 gate lifted. Generic
+        // `run_state_poly[A]` with a lambda capturing `k` now
+        // typechecks cleanly: mono substitutes through
+        // `Ty::Continuation` (recursive op_ret/ret + preserved
+        // scope_id) instead of panicking; per-clone resolved maps
+        // (`call_callee_tys_resolved`, `handle_body_ty_resolved`)
+        // chain through hoisted-lambda parent-clone lookup so
+        // codegen sees fully-substituted Tys. Soundness is enforced
+        // at runtime via ScopeId checks.
         let src = "effect State resumes: many { get: () -> Int }\n\
                    fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
                      let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
@@ -12215,11 +12173,9 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(
-            has_code(&errs, "E0145"),
-            "lambda capturing arm `k` inside generic `run_state_poly[A]` must fire \
-             E0145 at the lambda span (typecheck-level escape barrier extension — \
-             prevents the panic at monomorphize.rs:1516 when subst.apply_to_ty walks \
-             lambda captures and hits Ty::Continuation): {errs:?}"
+            !has_code(&errs, "E0145"),
+            "post-119b: lambda capturing `k` inside generic `run_state_poly[A]` \
+             must NOT fire E0145; the broad gate is lifted. errs={errs:?}"
         );
     }
 
@@ -12272,19 +12228,14 @@ mod tests {
     }
 
     #[test]
-    fn task_78_5_g5_run_state_non_generic_fn_with_any_program_generic_fires_e0145() {
-        // Reviewer's reproducer (review 2 BLOCKER): non-generic
-        // `run_state` (the shipped `std/state.sigil` shape) used
-        // alongside ANY generic fn in the same program must fire
-        // E0145 at the lambda-capture-of-k site. Pre-widening this
-        // typechecked clean (the narrow gate "enclosing fn is
-        // generic" returned false for `run_state`'s lambda) and
-        // panicked at `monomorphize.rs:1516` because mono walks
-        // every reachable fn — including non-generic ones — when
-        // `program_has_generics` is true. The widened gate
-        // (`self.program_has_generics`) predicts mono's behaviour
-        // exactly: fire E0145 at the lambda construction site,
-        // surfacing the v1 limitation as a clean diagnostic.
+    fn task_78_5_g5_run_state_non_generic_fn_with_any_program_generic_typechecks_post_119b() {
+        // Plan D Task 119b — broad-E0145 gate lifted. Non-generic
+        // `run_state` alongside a generic `id[A]` in the same
+        // program now typechecks cleanly. Pre-119b this fired
+        // E0145 (the "review-2 widening" workaround for the mono
+        // panic); post-119b mono substitutes through Continuation,
+        // and codegen's per-clone resolved-Ty maps + parent-clone
+        // walk close the leak.
         let src = "effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
                    fn id[A](x: A) -> A ![] { x }\n\
                    fn run_state(initial: Int, body: () -> Int ![State]) -> Int ![] {\n  \
@@ -12307,25 +12258,17 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(
-            has_code(&errs, "E0145"),
-            "lambda capturing `k` inside NON-generic `run_state` must fire E0145 \
-             when the enclosing program contains ANY generic fn (here `id[A]`) — \
-             mono walks every reachable fn body when `program_has_generics` is \
-             true and would panic at `monomorphize.rs:1516` on the captured \
-             `Ty::Continuation`. Widened gate must surface this: {errs:?}"
+            !has_code(&errs, "E0145"),
+            "post-119b: non-generic `run_state` + generic `id[A]` must NOT fire \
+             E0145; the broad gate is lifted. errs={errs:?}"
         );
     }
 
     #[test]
-    fn task_78_5_g5_lambda_capturing_let_aliased_k_in_generic_fn_fires_e0145() {
-        // Variant: `let f: Continuation[..] = k;` aliases k inside
-        // the arm body, then a lambda captures `f`. The let-bound
-        // alias is `Ty::Continuation` (the existing
-        // `continuation_annotation_inside_arm_body_typechecks` test
-        // confirms the let typechecks cleanly), so the lambda
-        // capture path sees `Ty::Continuation` for `f`. G5 must
-        // fire E0145 against `f` (not against `k`) since `f` is
-        // the captured name.
+    fn task_78_5_g5_lambda_capturing_let_aliased_k_in_generic_fn_typechecks_post_119b() {
+        // Plan D Task 119b — broad-E0145 gate lifted. The
+        // `let f: Continuation[..] = k;` alias captured into a
+        // lambda inside a generic fn now typechecks cleanly.
         let src = "effect State resumes: many { get: () -> Int }\n\
                    fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
                      let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
@@ -12339,20 +12282,9 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(
-            has_code(&errs, "E0145"),
-            "lambda capturing a let-aliased `Continuation` inside generic fn must \
-             fire E0145 (the alias is Ty::Continuation, captured by the lambda; \
-             scan visits it and triggers the barrier): {errs:?}"
-        );
-        // Precision claim: E0145 must fire against `f` (the alias name
-        // visible in the lambda's capture set), not `k` — confirms the
-        // capture-scan iterates derefed captures by name and reports
-        // the captured binding rather than the original arm parameter.
-        assert!(
-            errs.iter()
-                .any(|e| e.code.as_str() == "E0145" && e.message.contains("`f`")),
-            "E0145 must name the lambda-captured alias `f`, not the underlying \
-             arm `k`: {errs:?}"
+            !has_code(&errs, "E0145"),
+            "post-119b: let-aliased Continuation captured into lambda inside \
+             generic `run_state_poly[A]` must NOT fire E0145. errs={errs:?}"
         );
     }
 
@@ -14273,7 +14205,7 @@ mod tests {
         // (wrapper fns don't compose with the discharge-with-
         // lambda pattern in v1).
         let src = "import std.state\n\
-                   fn comp() -> Int ![State] {\n  \
+                   fn comp() -> Int ![State[Int]] {\n  \
                      let _: Int = perform State.set(10);\n  \
                      let v: Int = perform State.get();\n  \
                      v + 1\n\
@@ -14305,7 +14237,7 @@ mod tests {
     fn perform_state_set_with_string_arg_fires_e0044() {
         // State.set takes Int; passing String should fire E0044.
         let src = "import std.state\n\
-                   fn bad() -> Int ![State] {\n  \
+                   fn bad() -> Int ![State[Int]] {\n  \
                      perform State.set(\"not an int\")\n\
                    }\n\
                    fn main() -> Int ![] { 0 }\n";

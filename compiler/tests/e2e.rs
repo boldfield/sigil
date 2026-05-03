@@ -7335,7 +7335,7 @@ fn std_raise_catch_conditional_branch() {
 #[test]
 fn std_state_run_state_set_get_returns_11() {
     let src = "import std.state\n\
-               fn comp() -> Int ![State] {\n  \
+               fn comp() -> Int ![State[Int]] {\n  \
                  let _: Int = perform State.set(10);\n  \
                  let v: Int = perform State.get();\n  \
                  v + 1\n\
@@ -7356,7 +7356,7 @@ fn std_state_run_state_set_get_returns_11() {
 #[test]
 fn std_state_run_state_get_only_reflects_initial() {
     let src = "import std.state\n\
-               fn get_only() -> Int ![State] { perform State.get() }\n\
+               fn get_only() -> Int ![State[Int]] { perform State.get() }\n\
                fn main() -> Int ![IO] {\n  \
                  let result: Int = run_state(42, get_only);\n  \
                  perform IO.println(int_to_string(result));\n  \
@@ -7385,9 +7385,9 @@ fn std_state_run_state_get_only_reflects_initial() {
 #[test]
 fn std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix() {
     let src = "import std.state\n\
-               fn get_state() -> Int ![State] { perform State.get() }\n\
-               fn set_state(s: Int) -> Int ![State] { perform State.set(s) }\n\
-               fn comp() -> Int ![State] {\n  \
+               fn get_state() -> Int ![State[Int]] { perform State.get() }\n\
+               fn set_state(s: Int) -> Int ![State[Int]] { perform State.set(s) }\n\
+               fn comp() -> Int ![State[Int]] {\n  \
                  let _: Int = set_state(10);\n  \
                  let v: Int = get_state();\n  \
                  v + 1\n\
@@ -10242,52 +10242,30 @@ fn task_78_5_g2b_minimal_lambda_row_var_inheritance() {
 }
 
 /// **Task 78.5 G5 — generic handler arm returns a lambda capturing
-/// `k`: must fire E0145 at typecheck (negative pin).**
+/// `k`: compiles + runs through mono post-119b.**
 ///
 /// Source pattern: `koka/test/algeff/expr.kk` lines 145–165 (`eval2`
 /// with state + exc) extended with IO trace per eval3 (lines 179–195).
-/// Originally a positive end-to-end test of 3-effect recursive
-/// evaluation under stacked dischargers; restructured into a negative
-/// E0145 pin as part of the G5 closure (the surface shape is not
-/// monomorphizable; the diagnostic now redirects users to the
-/// non-generic pattern).
+/// 3-effect recursive evaluation under stacked dischargers
+/// (Raise[String] / State / IO + ArithError marker).
 ///
-/// ## Status — G5 closed (typecheck-level rejection)
+/// ## Status — Plan D Task 119b (E0145 lifted)
 ///
-/// Pre-G5: G2.b's lambda-row-var inheritance fix made this test
+/// Pre-G5: G2.b's lambda-row-var inheritance fix made this fixture
 /// progress past typecheck and panic at monomorphize.rs:1516
-/// (`Ty::Continuation reached mono substitution`). The arm body
-/// `State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s)` returns a
-/// lambda capturing `k` (`Ty::Continuation`). Inside the **generic**
-/// `run_state_poly[A]`, monomorphize's `Substitution::apply_to_ty`
-/// walked the lambda's captures (`monomorphize.rs:1054`) and hit
-/// `Ty::Continuation` in `apply_to_ty`'s arm at line 1516.
+/// (`Ty::Continuation reached mono substitution`).
 ///
-/// Post-G5: typecheck rejects the surface shape with E0145 at the
-/// lambda construction site. The fix narrows the new escape-barrier
-/// arm in `check_lambda` to fire only when the **enclosing fn is
-/// generic** (`current_generic_subst` non-empty) — the non-generic
-/// `run_state` shape in `std/state.sigil` is unaffected and continues
-/// to compile and run.
+/// G5–119a: typecheck rejected the surface shape with E0145 — a
+/// workaround for the mono panic.
 ///
-/// ## G5 root site
-///
-/// `compiler/src/typecheck.rs` `check_lambda` — after captures are
-/// gathered with their derefed `Ty`s, scan for `Ty::Continuation`
-/// entries when `self.current_generic_subst.is_empty() == false`.
-/// Push E0145 with a precise diagnostic naming the captured `k`.
-///
-/// ## Recommended user fix
-///
-/// Either rewrite the handler arms to call `k(arg)` directly (without
-/// intermediate lambda capture — the trade-off is that the State
-/// state-threading pattern requires lambdas), or move the handler
-/// out of the generic function (a non-generic wrapper `run_state`
-/// like `std/state.sigil` ships, then call that wrapper from the
-/// generic body via inversion of control). See
-/// `task_78_5_g5_run_state_non_generic_handler_arm_lambda_capture_-
-/// is_supported` (in typecheck unit tests) for the supported
-/// non-generic pattern.
+/// 119b (post-lift): mono substitutes through `Ty::Continuation`
+/// (recursive op_ret/ret + preserved scope_id); per-clone resolved
+/// maps (`call_callee_tys_resolved`, `handle_body_ty_resolved`)
+/// chain through hoisted-lambda parent-clone lookup so codegen sees
+/// fully-substituted Tys. The `program_has_generics` E0145 gate is
+/// gone. Soundness for captured-k that escapes its handle's dynamic
+/// extent is enforced at runtime via ScopeId checks (RELINK_STACK +
+/// dynamic-extent dispatch).
 ///
 /// ## Note on the typed-let raise() workaround
 ///
@@ -10298,7 +10276,7 @@ fn task_78_5_g2b_minimal_lambda_row_var_inheritance() {
 /// `task_78_5_pending_g3_raise_in_if_branch_expr_position_polymorphism`
 /// for the isolated G3 pin.
 #[test]
-fn task_78_5_g5_continuation_in_handler_lambda_through_mono_fires_e0145() {
+fn task_78_5_g5_continuation_in_handler_lambda_through_mono_runs_post_119b() {
     let src = "import std.raise\n\
                import std.result\n\
                import std.io\n\
@@ -10344,40 +10322,45 @@ fn task_78_5_g5_continuation_in_handler_lambda_through_mono_fires_e0145() {
                  };\n  \
                  0\n\
                }\n";
-    assert_compile_fails_with_code(
-        src,
-        "E0145",
-        &["cannot be captured by a lambda"],
-        "task_78_5_g5_multi_effect_interpreter",
+    let (stdout, stderr, status) = compile_and_run(src, "task_78_5_g5_multi_effect_interpreter");
+    assert_eq!(
+        status, 0,
+        "post-119b: multi-effect interpreter compile+run must succeed; stderr={stderr}",
+    );
+    assert_eq!(
+        stdout, "tick\ntick\n2\n",
+        "post-119b: expected two `tick` IO lines (one per DivE eval) and final `2` from `(16/2)/3`",
     );
 }
 
-/// **Task 78.5 G5 (review-2 BLOCKER reproducer) — non-generic
-/// `run_state` shape combined with ANY generic fn elsewhere fires
-/// E0145 at the lambda-capture-of-k site.**
+/// **Plan D Task 119b (post-lift) — non-generic `run_state` shape
+/// combined with a generic `id[A]` elsewhere now compiles + runs
+/// cleanly.**
 ///
-/// Reviewer-constructed reproducer for the gate-narrowing blocker on
-/// PR #72. Pre-widening (`current_generic_subst.is_empty() == false`)
-/// this typechecked clean and panicked at `monomorphize.rs:1516`
-/// because mono walks every reachable fn — including non-generic
-/// ones — when `program_has_generics` is true. Post-widening
-/// (`self.program_has_generics`) the gate fires E0145 at the lambda
-/// construction site, surfacing the v1 limitation as a clean
-/// diagnostic instead of a runtime panic.
+/// Pre-119b this fixture pinned the wide `program_has_generics` gate
+/// that rejected ANY lambda-captures-k shape in any program containing
+/// any generic. The gate was a workaround for the
+/// `Substitution::apply_to_ty(Ty::Continuation)` panic in mono.
 ///
-/// This e2e pin complements the in-typecheck unit-level reproducer
-/// `task_78_5_g5_run_state_non_generic_fn_with_any_program_generic_-
-/// fires_e0145` by running through the full compiler driver — pinning
-/// that the diagnostic surfaces in `stderr` exactly as users will see
-/// it.
+/// Post-lift (Plan D Task 119b): mono substitutes through
+/// `Ty::Continuation` (recursive op_ret/ret + preserved scope_id);
+/// per-clone resolved maps (`call_callee_tys_resolved`,
+/// `handle_body_ty_resolved`) chain through hoisted-lambda parent-clone
+/// lookup so codegen sees fully-substituted Tys. Soundness for
+/// captured-k that escapes its handle's dynamic extent is enforced at
+/// runtime via ScopeId checks (RELINK_STACK + dynamic-extent dispatch).
+///
+/// Pinning: this fixture must compile and produce the canonical
+/// `"11\n"` runtime output — the program-with-any-generic shape must
+/// no longer regress `std/state.sigil`'s `run_state`.
 #[test]
-fn task_78_5_g5_lambda_captures_k_with_any_generic_in_program_fires_e0145() {
+fn task_78_5_g5_lambda_captures_k_with_any_generic_in_program_runs_post_119b() {
     let src = "import std.state\n\
                import std.io\n\
                \n\
                fn id[A](x: A) -> A ![] { x }\n\
                \n\
-               fn comp() -> Int ![State] {\n  \
+               fn comp() -> Int ![State[Int]] {\n  \
                  let _: Int = perform State.set(10);\n  \
                  let v: Int = perform State.get();\n  \
                  v + 1\n\
@@ -10389,12 +10372,15 @@ fn task_78_5_g5_lambda_captures_k_with_any_generic_in_program_fires_e0145() {
                  perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
-    assert_compile_fails_with_code(
+    let (stdout, stderr, status) = compile_and_run(
         src,
-        "E0145",
-        &["cannot be captured by a lambda"],
-        "task_78_5_g5_lambda_captures_k_with_any_generic_in_program",
+        "task_78_5_g5_lambda_captures_k_with_any_generic_in_program_runs_post_119b",
     );
+    assert_eq!(
+        status, 0,
+        "post-119b: compile+run must succeed; stderr={stderr}",
+    );
+    assert_eq!(stdout, "11\n", "post-119b: expected canonical run_state output");
 }
 
 /// **Task 78.5 G5 (review-2 widening) — `std/state.sigil`'s
@@ -10422,7 +10408,7 @@ fn task_78_5_g5_run_state_lambda_capture_in_no_generics_program_compiles_cleanly
     let src = "import std.state\n\
                import std.io\n\
                \n\
-               fn comp() -> Int ![State] {\n  \
+               fn comp() -> Int ![State[Int]] {\n  \
                  let _: Int = perform State.set(10);\n  \
                  let v: Int = perform State.get();\n  \
                  v + 1\n\

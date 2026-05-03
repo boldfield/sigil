@@ -96,6 +96,26 @@ pub struct ClosureConvertedProgram {
     ///   via `sigil_next_step_call(load_k_closure, load_k_fn, arg)`
     ///   using the trailing slots.
     pub arm_k_pair_captures: BTreeMap<String, ArmKPairCapture>,
+    /// Plan D Task 119b — set of user-defined top-level fn names
+    /// that closure-conversion saw materialized as a value (rewritten
+    /// to `Expr::ClosureRecord`). Codegen consumes this set to gate
+    /// `__sync_shim` emission for Cps-ABI fns: only fns in this set
+    /// need a Sync shim, because the shim is exclusively consumed by
+    /// `lower_closure_record`'s `code_ptr` slot when materializing a
+    /// Cps fn as a value (the shim wraps the Cps ABI in the Sync
+    /// closure-convention shape so indirect calls through the
+    /// closure record's `code_ptr` see uniform Sync ABI). Cps fns
+    /// never used as values get no shim — closes Plan B'
+    /// Stage-6.8-followup architectural carryover #2 / issue #48.
+    pub top_level_fn_names_seen_as_value: BTreeSet<String>,
+    /// Plan D Task 119b — map from hoisted-lambda fn names
+    /// (`$lambda_N`) to the parent clone fn name in whose body the
+    /// lambda was hoisted. Codegen consumes this to look up mono's
+    /// per-clone resolved-Ty maps (call_callee_tys_resolved,
+    /// match_scrut_tys_resolved, handle_body_ty_resolved) by the
+    /// parent clone's name when a span lives inside a hoisted
+    /// lambda's body.
+    pub hoisted_lambda_parent_clone: BTreeMap<String, String>,
 }
 
 /// Plan B' Stage 6.8 Task 107 Phase B — k-pair capture info for a
@@ -207,6 +227,8 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
         arm_k_context_stack: Vec::new(),
         arm_k_pair_captures: BTreeMap::new(),
         top_level_fn_names,
+        top_level_fn_names_seen_as_value: BTreeSet::new(),
+        hoisted_lambda_parent_clone: BTreeMap::new(),
     };
 
     // Rewrite every user fn's body in its own param scope with no enclosing
@@ -233,6 +255,8 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
         hoisted,
         hoisted_captures,
         arm_k_pair_captures,
+        top_level_fn_names_seen_as_value,
+        hoisted_lambda_parent_clone,
         ..
     } = conv;
     new_items.extend(hoisted);
@@ -273,6 +297,8 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
         captures,
         captures_typed,
         arm_k_pair_captures,
+        top_level_fn_names_seen_as_value,
+        hoisted_lambda_parent_clone,
     }
 }
 
@@ -328,6 +354,28 @@ struct Converter {
     /// short-circuits the rewrite for callees in this set so direct
     /// dispatch is preserved.
     top_level_fn_names: BTreeSet<String>,
+    /// Plan D Task 119b — subset of `top_level_fn_names` that the
+    /// rewrite walker actually saw used as a value (rewritten to
+    /// `Expr::ClosureRecord`). Codegen gates `__sync_shim` emission
+    /// for Cps-ABI fns on membership in this set: a Cps fn never
+    /// materialized as a value never needs a Sync shim because no
+    /// closure record's `code_ptr` slot will ever point at its
+    /// address (the only consumer of the Sync shim is the indirect-
+    /// call path via `lower_closure_record`'s shim-or-direct
+    /// resolution at `code_ptr` store time). Closes Plan B'
+    /// Stage-6.8-followup architectural carryover #2 / issue #48.
+    top_level_fn_names_seen_as_value: BTreeSet<String>,
+    /// Plan D Task 119b — map from each hoisted-lambda fn name
+    /// (`$lambda_N`) to the parent clone fn name in whose body the
+    /// lambda was hoisted (e.g., `run_state_poly$$Int`). Codegen
+    /// uses this to look up mono's per-clone resolved-Ty maps
+    /// (`call_callee_tys_resolved`, `match_scrut_tys_resolved`,
+    /// `handle_body_ty_resolved`) for spans inside the hoisted
+    /// lambda's body — mono keys those by `(parent_clone_fn_name,
+    /// span)`, but at codegen time the surrounding fn is the
+    /// hoisted lambda, not the parent. This map closes the lookup
+    /// gap.
+    hoisted_lambda_parent_clone: BTreeMap<String, String>,
 }
 
 /// Plan B' Stage 6.8 Task 107 Phase B — per-arm continuation context
@@ -474,6 +522,17 @@ impl Converter {
                     // `Expr::Call { callee: Ident(name), .. }` arm
                     // short-circuits this rewrite for callee names so
                     // direct dispatch via `user_fn_refs` is preserved.
+                    //
+                    // Plan D Task 119b — record this fn name in
+                    // `top_level_fn_names_seen_as_value` so codegen
+                    // can gate `__sync_shim` emission. Cps-ABI fns
+                    // not seen as values don't need the shim (no
+                    // closure record's code_ptr will ever point at
+                    // their address); skipping the emit saves
+                    // ~100 bytes per never-as-value Cps fn. Plan B'
+                    // Stage-6.8-followup carryover #2 / issue #48.
+                    self.top_level_fn_names_seen_as_value
+                        .insert(name.clone());
                     Expr::ClosureRecord {
                         code_fn_name: name,
                         env_exprs: Vec::new(),
@@ -714,6 +773,19 @@ impl Converter {
                 self.hoisted_captures.insert(fn_name.clone(), caps);
                 if let Some(info) = k_pair_info {
                     self.arm_k_pair_captures.insert(fn_name.clone(), info);
+                }
+                // Plan D Task 119b — record the parent clone fn
+                // name so codegen can look up mono's per-clone
+                // resolved maps (call_callee_tys_resolved,
+                // match_scrut_tys_resolved, handle_body_ty_resolved)
+                // for spans inside the hoisted lambda's body. Mono
+                // keys those maps by `(parent_clone_fn_name,
+                // span)`; the hoisted lambda's body inherits those
+                // spans, so codegen needs the parent's name to
+                // resolve them.
+                if let Some(parent_fn) = &self.current_fn_name {
+                    self.hoisted_lambda_parent_clone
+                        .insert(fn_name.clone(), parent_fn.clone());
                 }
 
                 Expr::ClosureRecord {

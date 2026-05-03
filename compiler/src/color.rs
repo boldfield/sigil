@@ -1185,6 +1185,8 @@ mod tests {
             anf,
             lambda_captures_resolved: BTreeMap::new(),
             match_scrut_tys_resolved: BTreeMap::new(),
+            handle_body_ty_resolved: BTreeMap::new(),
+            call_callee_tys_resolved: BTreeMap::new(),
         }
     }
 
