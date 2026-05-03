@@ -7258,6 +7258,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             &cont_load_ret_fn_sig,
         )
         .map_err(|e| format!("declare sigil_continuation_load_return_fn: {e}"))?;
+    // sigil_continuation_invoke(cont, arg, terminal_out) -> u64
+    // Wraps the dispatch + run_loop drive + return-arm wrap +
+    // outer_post_arm_k snapshot/restore in a single runtime call.
+    let mut cont_invoke_sig = Signature::new(isa_call_conv(&module));
+    cont_invoke_sig.params.push(AbiParam::new(pointer_ty)); // cont
+    cont_invoke_sig.params.push(AbiParam::new(types::I64)); // arg (widened)
+    cont_invoke_sig.params.push(AbiParam::new(pointer_ty)); // terminal_out
+    cont_invoke_sig.returns.push(AbiParam::new(types::I64));
+    let cont_invoke = module
+        .declare_function(
+            "sigil_continuation_invoke",
+            Linkage::Import,
+            &cont_invoke_sig,
+        )
+        .map_err(|e| format!("declare sigil_continuation_invoke: {e}"))?;
 
     // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
     // Phase 3a wires the frame allocation + push/pop ABI from Task
@@ -8195,6 +8210,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             cont_load_fn,
             cont_load_ret_closure,
             cont_load_ret_fn,
+            cont_invoke,
         },
         handler_frame_new,
         handle_push,
@@ -18082,20 +18098,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
     /// Plan D Task 117 (b) Phase 4 — invoke a continuation held in a
     /// fn parameter (a boxed Continuation value object pointer).
-    /// Loads `(k_closure, k_fn)` from the value object via the
-    /// runtime helpers, builds a `NextStep::Call` with the
-    /// trailing-pair convention `[arg, null, identity]`, and drives
-    /// `sigil_run_loop` to the terminal value. Mirrors
-    /// [`Lowerer::lower_k_pair_call`]'s shape — the difference is the
-    /// (k_closure, k_fn) source: closure-record trailing slots in
-    /// arm-fn k-pair-bearing lifted lambdas vs. the boxed Continuation
-    /// value object's offsets 8 / 16 here.
-    ///
-    /// Frame_ptr is NOT re-pushed: the originating handler frame is
-    /// still alive on the handler stack (the receiving fn was called
-    /// from inside an arm body via `helper(k, ...)`, which means the
-    /// arm body — and therefore its frame — is on the call stack
-    /// above us).
+    /// Delegates the dispatch to the runtime helper
+    /// `sigil_continuation_invoke`, which:
+    ///   1. Snapshots `OUTER_POST_ARM_K_DEPTH` so any pushes the
+    ///      captured continuation's internal synth-conts perform
+    ///      get drained before returning (otherwise post-arm-k
+    ///      stack entries leak across the Sync→Cps→Sync invoke
+    ///      boundary).
+    ///   2. Builds NextStep::Call(k_closure, k_fn, [arg, null,
+    ///      identity], 3); drives `sigil_run_loop` to the body's
+    ///      natural value.
+    ///   3. If the boxed Continuation carries a non-null return_fn,
+    ///      builds a SECOND NextStep::Call(return_closure,
+    ///      return_fn, [body_val, null, identity], 3); drives
+    ///      `sigil_run_loop` again for the return-arm wrap.
+    ///   4. Restores `OUTER_POST_ARM_K_DEPTH`.
+    /// Returns the wrapped R-typed value.
     fn lower_continuation_param_call(
         &mut self,
         name: &str,
@@ -18116,27 +18134,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             )
         });
 
-        // Load (k_closure, k_fn) via the runtime helpers (kept as
-        // function calls rather than inline loads so the runtime owns
-        // the layout convention; flips a single header tag adjustment
-        // into a runtime-only change instead of a codegen+runtime
-        // co-edit).
-        let load_closure_call = self
-            .builder
-            .ins()
-            .call(self.builtins.cont_load_closure_ref, &[cont_ptr]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, load_closure_call));
-        let k_closure = self.builder.inst_results(load_closure_call)[0];
-        let load_fn_call = self
-            .builder
-            .ins()
-            .call(self.builtins.cont_load_fn_ref, &[cont_ptr]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, load_fn_call));
-        let k_fn = self.builder.inst_results(load_fn_call)[0];
-
-        // Lower the resume arg, widen to I64 for the args buffer.
+        // Lower the resume arg, widen to I64.
         let arg_v = self.lower_expr(&args[0]);
         let arg_ty = self.builder.func.dfg.value_type(arg_v);
         let widened_arg = if arg_ty == types::I64 {
@@ -18151,140 +18149,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             arg_v
         };
 
-        // sigil_next_step_call(k_closure, k_fn, 3) — trailing-pair
-        // convention `[widened_arg, null_post_arm_k_closure,
-        // identity_fn_addr]` so the resume code sees the same args
-        // layout the existing tail-`k(arg)` lowering produces.
-        let arg_count_v = self.builder.ins().iconst(types::I32, 3);
-        let next_step_call = self
-            .builder
-            .ins()
-            .call(self.next_step_call_ref, &[k_closure, k_fn, arg_count_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, next_step_call));
-        let ns = self.builder.inst_results(next_step_call)[0];
-
-        let args_ptr_call = self.builder.ins().call(self.next_step_args_ptr_ref, &[ns]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, args_ptr_call));
-        let args_buf = self.builder.inst_results(args_ptr_call)[0];
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), widened_arg, args_buf, 0);
-
-        // Use identity for the trailing pair on the FIRST run_loop
-        // dispatch; the captured continuation's resume forwards to
-        // identity which returns `Done(body_val)` (mirrors the
-        // existing tail-perform `lower_perform_to_value` pattern).
-        // The return-arm wrap is applied as a SECOND run_loop
-        // dispatch below — this matches `lower_k_pair_call`'s
-        // structure (line ~17725) where the return arm is invoked
-        // explicitly rather than threaded through the captured
-        // continuation's internal forwarding.
-        let identity_addr = self
-            .builder
-            .ins()
-            .func_addr(self.pointer_ty, self.continuation_identity_ref);
-        let null_post = self.builder.ins().iconst(self.pointer_ty, 0);
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), null_post, args_buf, 8);
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), identity_addr, args_buf, 16);
-
-        // sigil_run_loop(ns, terminal_out) → u64 (body's natural value)
+        // Single runtime helper call wraps everything: dispatch +
+        // run_loop + return-arm wrap + outer_post_arm_k snapshot.
         let terminal_out = self.terminal_out_param;
-        let run_loop_call = self
-            .builder
-            .ins()
-            .call(self.run_loop_ref, &[ns, terminal_out]);
+        let invoke_call = self.builder.ins().call(
+            self.builtins.cont_invoke_ref,
+            &[cont_ptr, widened_arg, terminal_out],
+        );
         self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-        let body_widened = self.builder.inst_results(run_loop_call)[0];
-
-        // Plan D Task 117 (b) Phase 4 — load the originating handle's
-        // return-arm pair from the Continuation value object. If
-        // ret_fn is null (no return arm), pass body_widened through
-        // unchanged (B == R for handles without an explicit
-        // `return(v) => ...` arm). Otherwise build a second
-        // NextStep::Call that invokes the return arm with the
-        // body value, drive sigil_run_loop, return the wrapped
-        // R-typed value.
-        let load_ret_closure_call = self
-            .builder
-            .ins()
-            .call(self.builtins.cont_load_ret_closure_ref, &[cont_ptr]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, load_ret_closure_call));
-        let ret_closure = self.builder.inst_results(load_ret_closure_call)[0];
-        let load_ret_fn_call = self
-            .builder
-            .ins()
-            .call(self.builtins.cont_load_ret_fn_ref, &[cont_ptr]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, load_ret_fn_call));
-        let ret_fn = self.builder.inst_results(load_ret_fn_call)[0];
-
-        let null_const = self.builder.ins().iconst(self.pointer_ty, 0);
-        let is_null = self.builder.ins().icmp(IntCC::Equal, ret_fn, null_const);
-
-        let skip_block = self.builder.create_block();
-        let apply_block = self.builder.create_block();
-        let merge_block = self.builder.create_block();
-        self.builder.append_block_param(merge_block, types::I64);
-        self.builder
-            .ins()
-            .brif(is_null, skip_block, &[], apply_block, &[]);
-
-        // skip_block: no return arm; pass body's value through.
-        self.builder.switch_to_block(skip_block);
-        self.builder.seal_block(skip_block);
-        self.builder.ins().jump(merge_block, &[body_widened.into()]);
-
-        // apply_block: invoke the return arm via sigil_next_step_call(
-        // ret_closure, ret_fn, 3) with args [body_widened, null,
-        // identity]; drive a second sigil_run_loop.
-        self.builder.switch_to_block(apply_block);
-        self.builder.seal_block(apply_block);
-        let three_v_2 = self.builder.ins().iconst(types::I32, 3);
-        let nsc2 = self
-            .builder
-            .ins()
-            .call(self.next_step_call_ref, &[ret_closure, ret_fn, three_v_2]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, nsc2));
-        let ns2 = self.builder.inst_results(nsc2)[0];
-        let argp2 = self.builder.ins().call(self.next_step_args_ptr_ref, &[ns2]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, argp2));
-        let argp2_v = self.builder.inst_results(argp2)[0];
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), body_widened, argp2_v, 0);
-        let null2 = self.builder.ins().iconst(self.pointer_ty, 0);
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), null2, argp2_v, 8);
-        let identity2 = self
-            .builder
-            .ins()
-            .func_addr(self.pointer_ty, self.continuation_identity_ref);
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), identity2, argp2_v, 16);
-        let rl2 = self
-            .builder
-            .ins()
-            .call(self.run_loop_ref, &[ns2, terminal_out]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, rl2));
-        let wrapped = self.builder.inst_results(rl2)[0];
-        self.builder.ins().jump(merge_block, &[wrapped.into()]);
-
-        self.builder.switch_to_block(merge_block);
-        self.builder.seal_block(merge_block);
-        self.builder.block_params(merge_block)[0]
+            .push_placeholder(function_code_offset(&self.builder, invoke_call));
+        self.builder.inst_results(invoke_call)[0]
     }
 
     fn lower_call(
@@ -21239,6 +21113,7 @@ struct BuiltinFuncIds {
     cont_load_fn: cranelift_module::FuncId,
     cont_load_ret_closure: cranelift_module::FuncId,
     cont_load_ret_fn: cranelift_module::FuncId,
+    cont_invoke: cranelift_module::FuncId,
 }
 
 /// Per-fn FuncRefs for the builtin runtime primitives. Sibling of
@@ -21321,12 +21196,13 @@ struct BuiltinFuncRefs {
     /// Plan C Task 76 — OS clock FuncRef.
     clock_os_now_ref: FuncRef,
     /// Plan D Task 117 (b) Phase 4 — Continuation value object
-    /// alloc / load helpers (FuncRefs).
+    /// alloc / load / invoke helpers (FuncRefs).
     cont_alloc_ref: FuncRef,
     cont_load_closure_ref: FuncRef,
     cont_load_fn_ref: FuncRef,
     cont_load_ret_closure_ref: FuncRef,
     cont_load_ret_fn_ref: FuncRef,
+    cont_invoke_ref: FuncRef,
 }
 
 /// Plan B Task 55, Phase 4e — input context for [`prepare_per_fn_refs`].
@@ -21544,6 +21420,7 @@ fn prepare_builtin_func_refs(
         cont_load_ret_closure_ref: module
             .declare_func_in_func(ids.cont_load_ret_closure, builder.func),
         cont_load_ret_fn_ref: module.declare_func_in_func(ids.cont_load_ret_fn, builder.func),
+        cont_invoke_ref: module.declare_func_in_func(ids.cont_invoke, builder.func),
     }
 }
 

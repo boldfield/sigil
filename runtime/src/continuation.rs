@@ -129,6 +129,92 @@ pub unsafe extern "C" fn sigil_continuation_load_return_fn(cont: *const u8) -> *
     p.read()
 }
 
+/// Plan D Task 117 (b) Phase 4 — invoke a boxed Continuation value
+/// from inside a regular Sync user fn (e.g., `fold_choices`'s `k(i)`
+/// recursion). Wraps the dispatch + run_loop drive + return-arm
+/// wrap + outer_post_arm_k snapshot in a single runtime call so
+/// codegen doesn't have to inline the trampoline-state discipline.
+///
+/// Behaviour:
+///
+///   1. Snapshot `OUTER_POST_ARM_K_DEPTH` so any pushes performed
+///      by the captured continuation (e.g., chained-let-yield
+///      synth-conts in the originating perform body) get drained
+///      back to the entry depth before this helper returns. Without
+///      the snapshot, post-arm-k stack pushes leak across the
+///      Sync→Cps→Sync invoke boundary, and a subsequent k(i+1) call
+///      would see the wrong stack state.
+///
+///   2. Build NextStep::Call(k_closure, k_fn, [arg, null,
+///      identity], len=3); drive sigil_run_loop. The trailing pair
+///      uses identity so the captured continuation's terminal
+///      Done(body_val) lands as run_loop's terminal value. The
+///      terminal channel writes to `terminal_out`; the routing
+///      logic in run_loop's DONE handler may pop entries that the
+///      captured continuation pushed — the snapshot/restore around
+///      this drive isolates that.
+///
+///   3. If `return_fn` is non-null, build a SECOND NextStep::Call(
+///      return_closure, return_fn, [body_val, null, identity],
+///      len=3); drive sigil_run_loop again to wrap the body's
+///      natural value via the originating handle's return arm. The
+///      wrapped value is the continuation's R-typed result.
+///
+///   4. Restore `OUTER_POST_ARM_K_DEPTH` to the snapshot.
+///
+/// # Safety
+///
+/// `cont` must be a valid `TAG_CONTINUATION` header. `terminal_out`
+/// must be a non-null, 8-byte-aligned `TerminalResult` slot. The
+/// helper assumes (and the typecheck guarantees) the receiving fn
+/// is invoked from inside the originating handle's arm body — i.e.,
+/// the handler frame is alive on the handler stack above this
+/// frame.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_continuation_invoke(
+    cont: *const u8,
+    arg: u64,
+    terminal_out: *mut crate::handlers::TerminalResult,
+) -> u64 {
+    use crate::handlers::{
+        sigil_continuation_identity, sigil_next_step_args_ptr, sigil_next_step_call,
+        sigil_run_loop,
+    };
+
+    let snapshot = crate::handlers::outer_post_arm_k_depth_snapshot();
+
+    // Phase 1: dispatch the captured continuation.
+    let k_closure = sigil_continuation_load_closure(cont);
+    let k_fn = sigil_continuation_load_fn(cont);
+    let identity_addr = sigil_continuation_identity as *mut u8;
+    let ns = sigil_next_step_call(k_closure, k_fn, 3);
+    let args = sigil_next_step_args_ptr(ns);
+    args.write(arg);
+    args.add(1).write(0);
+    args.add(2).write(identity_addr as u64);
+    let body_val = sigil_run_loop(ns, terminal_out);
+
+    // Phase 2: wrap via return arm if present.
+    let return_fn = sigil_continuation_load_return_fn(cont);
+    let wrapped = if return_fn.is_null() {
+        body_val
+    } else {
+        let return_closure = sigil_continuation_load_return_closure(cont);
+        let ns2 = sigil_next_step_call(return_closure, return_fn, 3);
+        let args2 = sigil_next_step_args_ptr(ns2);
+        args2.write(body_val);
+        args2.add(1).write(0);
+        args2.add(2).write(identity_addr as u64);
+        sigil_run_loop(ns2, terminal_out)
+    };
+
+    // Phase 3: restore outer_post_arm_k depth — drain anything that
+    // leaked from the captured continuation's internal pushes.
+    crate::handlers::outer_post_arm_k_depth_restore(snapshot);
+
+    wrapped
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {

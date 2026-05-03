@@ -80,6 +80,28 @@ fn effective_fn_generic_params(f: &FnDecl) -> Vec<GenericParam> {
 /// whether to allocate a scope_var for the fn's signature; if no
 /// param/return TypeExpr mentions Continuation, the scope_var slot
 /// stays empty and `Scheme.scope_vars` is `Vec::new()`.
+/// Plan D Task 117 (b) Phase 4 — structural-shape check used by
+/// `check_fn`'s post-walk re-insert guard. Returns true when two
+/// `Ty`s have the same outer constructor shape (same variant, same
+/// User-type name + arity, same Fn arity). Used to detect when the
+/// existing fn_schemes entry for a fn name was registered by THIS
+/// fn (signature shape matches) vs. by a sibling-module fn with the
+/// same name but different params.
+fn ty_constructors_match(a: &Ty, b: &Ty) -> bool {
+    use Ty::*;
+    match (a, b) {
+        (Int, Int) | (String, String) | (Unit, Unit) | (Bool, Bool) | (Char, Char) | (Byte, Byte) => true,
+        (Var(_), Var(_)) => true,
+        (User(name_a, args_a), User(name_b, args_b)) => {
+            name_a == name_b && args_a.len() == args_b.len()
+        }
+        (Tuple(elems_a), Tuple(elems_b)) => elems_a.len() == elems_b.len(),
+        (Fn(sig_a), Fn(sig_b)) => sig_a.params.len() == sig_b.params.len(),
+        (Continuation(_), Continuation(_)) => true,
+        _ => false,
+    }
+}
+
 fn type_expr_has_continuation(t: &TypeExpr) -> bool {
     match t {
         TypeExpr::Named(..) => false,
@@ -1182,6 +1204,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         next_scope_id: 0,
         next_scope_var: 0,
         current_fn_scope_var: None,
+        current_fn_file: None,
         current_arm_scope_id: None,
         subst: Subst::new(),
         current_generic_subst: BTreeMap::new(),
@@ -1299,6 +1322,16 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 scope_vars: scope_var_id.map(|id| vec![id]).unwrap_or_default(),
                 body: Ty::Fn(Box::new(sig)),
             };
+            // Plan D Task 117 (b) Phase 4 — also register a
+            // file-qualified alias so a fn body's recursive
+            // self-reference can resolve to ITS OWN module's scheme
+            // rather than colliding with a same-named fn from a
+            // different module (e.g., `map` in `std.list` vs
+            // `std.option`). The bare-name entry follows
+            // last-wins (compatible with prior behavior); the
+            // file-qualified entry is unique per fn.
+            let qualified_key = format!("{}::{}", f.span.file, f.name);
+            tc.fn_schemes.insert(qualified_key, scheme.clone());
             tc.fn_schemes.insert(f.name.clone(), scheme);
         }
     }
@@ -2391,6 +2424,13 @@ struct Tc {
     /// walks; reset to `None` before each fn signature walk and
     /// inspected after.
     current_fn_scope_var: Option<u32>,
+    /// Plan D Task 117 (b) Phase 4 — source file of the fn whose
+    /// body is currently being typechecked. Used by `check_call`'s
+    /// fn-lookup path to try a file-qualified key (`<file>::<name>`)
+    /// before the bare name, so a fn body's recursive call to a
+    /// same-named sibling-module fn (e.g., `map` in `std.list` vs
+    /// `std.option`) resolves to ITS OWN module's scheme.
+    current_fn_file: Option<String>,
     /// Plan D Task 117 (continuation-surface) — current handler arm
     /// body's scope id, set during arm-body typecheck walks. When
     /// `Some(N)`, user-written `Continuation[op_ret, ret]` type
@@ -4067,6 +4107,8 @@ impl Tc {
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
+        let saved_fn_file = self.current_fn_file.take();
+        self.current_fn_file = Some(f.span.file.clone());
         // Fresh per-function local env: holds only parameters and
         // `let` bindings. Top-level function signatures live in
         // `self.fn_env`, consulted as a fallback during Ident
@@ -4209,6 +4251,14 @@ impl Tc {
                 scope_vars: Vec::new(),
                 body: resolved,
             };
+            // Plan D Task 117 (b) Phase 4 — write to BOTH the
+            // file-qualified key (unique per fn) AND the bare key
+            // (last-wins for user-facing lookup). The qualified key
+            // ensures cross-module same-name fns each have their
+            // own resolved scheme; the bare key keeps user code's
+            // default-resolution behavior unchanged.
+            let qualified_key = format!("{}::{}", f.span.file, f.name);
+            self.fn_schemes.insert(qualified_key, scheme.clone());
             self.fn_schemes.insert(f.name.clone(), scheme);
         }
 
@@ -4219,6 +4269,7 @@ impl Tc {
         self.current_generic_subst = saved_generic_subst;
         self.current_row_var_subst = saved_row_var_subst;
         self.current_fn_scope_var = saved_fn_scope_var;
+        self.current_fn_file = saved_fn_file;
     }
 
     /// Typecheck a block and return its type.
@@ -4532,7 +4583,17 @@ impl Tc {
                 if let Some(ty) = self.env.get(name).cloned() {
                     return Some(ty);
                 }
-                if let Some(scheme) = self.fn_schemes.get(name).cloned() {
+                // Plan D Task 117 (b) Phase 4 — try the file-qualified
+                // key first so a fn body's recursive call to a same-
+                // named sibling-module fn resolves to its own module's
+                // scheme. Falls back to the bare name (last-wins
+                // across modules; user-facing default).
+                let scheme_opt = self
+                    .current_fn_file
+                    .as_ref()
+                    .and_then(|file| self.fn_schemes.get(&format!("{file}::{name}")).cloned())
+                    .or_else(|| self.fn_schemes.get(name).cloned());
+                if let Some(scheme) = scheme_opt {
                     let (ty, fresh_ids) = self.instantiate_with_vars(&scheme);
                     // Plan B task 49 — capture every top-level-fn use
                     // site (callee in a Call, or value-position Ident
@@ -10752,6 +10813,7 @@ mod tests {
             next_scope_id: 0,
             next_scope_var: 0,
             current_fn_scope_var: None,
+            current_fn_file: None,
             current_arm_scope_id: None,
             subst: Subst::new(),
             current_generic_subst: BTreeMap::new(),

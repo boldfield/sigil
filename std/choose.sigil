@@ -1,20 +1,24 @@
 // sigil: 0.1
 //
-// std/choose.sigil — Plan C Task 73.
+// std/choose.sigil — Plan C Task 73 + Plan D Task 117 (b) Phase 4.
 //
 // `Choose` is the canonical nondeterminism / backtracking effect:
 // a computation performs `Choose.choose(n)` to pick a value
 // 0..n-1, and `Choose.fail()` to abandon a branch. Multi-shot
-// handlers enumerate all branches (`all_choices`) or search for
-// the first non-failing leaf (`first_choice`).
+// dischargers `all_choices` (collect every result) and
+// `first_choice` (find the first non-failing leaf) are written in
+// pure sigil using the runtime-N continuation-as-fn-param surface
+// shipped in Plan D Task 117 (b) Phase 4 (E0145 lifted; boxed
+// Continuation value object).
 //
 // Compare to Koka / Effekt's `choose` / `flip` and the
 // Hutton-Wright list-of-successes backtracking monad.
 //
-// ## Usage (v1, inline handler)
+// ## Usage
 //
 // ```sigil
 // import std.choose
+// import std.io
 //
 // fn pick_and_combine() -> Int ![Choose] {
 //   let a: Int = perform Choose.choose(2);
@@ -22,67 +26,109 @@
 // }
 //
 // fn main() -> Int ![IO] {
-//   let value: Int = handle pick_and_combine() with {
-//     Choose.choose(arg, k) => k(0),    // pick first
-//     Choose.fail(k) => 0,              // discard k on fail
-//   };
-//   perform IO.println(int_to_string(value));  // prints 10
+//   let results: List[Int] = all_choices(pick_and_combine);
+//   perform IO.println(int_to_string(length(results)));   // "2"
 //   0
 // }
 // ```
 //
-// ## v1 design choices
+// ## Design notes
 //
-// 1. **Effect declaration only; `all_choices` / `first_choice`
-//    dischargers are deferred to v2.** The plan body specifies:
+// 1. **`Choose` is non-generic on the value type.** v1 ships
+//    `choose: (Int) -> Int` and `fail: () -> Int`. Generalising to
+//    `Choose[A]` is orthogonal to Phase 4 and is a separate
+//    follow-up.
 //
-//    ```text
-//    Choose resumes: many effect + all_choices, first_choice
-//    ```
+// 2. **No perform wrappers (`pick(n)` / `fail_choice()`).** Wrapper
+//    fns introduce a function-call frame that breaks the
+//    discharge-with-lambda pattern multi-shot handlers depend on.
 //
-//    Both dischargers require codegen surface that Sigil v1 doesn't
-//    provide. `all_choices(body) -> List[Int]` needs runtime-N
-//    multi-shot dispatch (invoking `k(0)`, `k(1)`, …, `k(arg-1)`
-//    where `arg` is the perform's runtime value); v1's arm-body
-//    recognizer `arm_body_n_let_then_pure_tail_shape` only accepts
-//    statically-fixed N let-chains of direct `k(arg_i)` calls.
-//    `first_choice(body) -> Option[Int]` additionally needs
-//    short-circuit semantics (`match k(0) { Some(v) => Some(v),
-//    None => k(1) }`), which v1's walker rejects as "computed
-//    conditional `k`-use" at codegen.rs:1591-1603. Both shapes
-//    require pulling first-class continuations forward from v2 — a
-//    multi-PR architectural slice (~4-8 weeks). See `[DEVIATION
-//    Task 73]` for the full closure path.
+// 3. **Dischargers receive a fresh per-call Continuation value
+//    object.** `all_choices` / `first_choice` arm bodies pass the
+//    arm's `k` to a recursive helper as a Continuation parameter.
+//    The codegen at the call site allocates a TAG_CONTINUATION
+//    record holding `(k_closure, k_fn, return_closure, return_fn)`
+//    so each `k(i)` invocation inside the helper:
 //
-// 2. **`choose` and `fail` are non-generic.** Plan body's spec is
-//    `Choose resumes: many` — left implicit on the value type.
-//    Sigil v1's parser rejects type-parameterized effect references
-//    in rows (same constraint as Tasks 71/72). v1 ships
-//    `choose: (Int) -> Int` and `fail: () -> Int` (Int placeholder
-//    for fail per Plan B Task 57's `ArithError.div_by_zero`
-//    precedent — at runtime the perform never returns when fail is
-//    discharged via discard-k).
+//      a. Drives the captured continuation (the body's post-perform
+//         code) to its natural value via `sigil_run_loop`.
+//      b. Wraps that value via the originating handle's return arm
+//         in a second `sigil_run_loop` drive.
+//      c. Returns the wrapped value, which `all_choices` collects
+//         into a list / `first_choice` matches against
+//         `Some(v)` / `None`.
 //
-// 3. **No perform wrappers (`pick(n)` / `fail_choice()`).**
-//    Wrapper functions would introduce a function-call frame
-//    between the user's call site and the perform. Task 72 (PR #45
-//    CI) discovered that wrapper-fn frames break the discharge-with-
-//    lambda pattern that multi-shot Choose handlers need; until v2
-//    closes the wrapper-fn-frame composition gap (see Plan B'
-//    Stage-6.8-followup architectural carryovers in
-//    PLAN_C_PROGRESS.md), wrappers around `perform Choose.X` are a
-//    footgun. Users do `perform Choose.choose(n)` /
-//    `perform Choose.fail()` directly. v2 ships wrappers as an
-//    additive ergonomic layer once the discharge-side gap closes.
-//
-// 4. **`resumes: many` annotation despite no v1 multi-shot
-//    discharger.** The annotation matches the plan body's
-//    `Choose resumes: many` and keeps the effect-declaration
-//    surface stable across the v1 → v2 shift: when v2 ships the
-//    multi-shot dischargers, the same effect declaration consumes
-//    them without a breaking change.
+//    Soundness for captured continuations escaping their handle's
+//    dynamic extent is enforced at runtime via ScopeId checks; the
+//    boxed Continuation carries the originating handle's return
+//    arm so `k(i)` from the helper still produces the
+//    handle's R-typed value, not the body's natural type.
+
+import std.list
+import std.option
 
 effect Choose resumes: many {
   choose: (Int) -> Int,
   fail: () -> Int,
+}
+
+// `all_choices_helper(k, i, n, acc)` — internal recursion for
+// `all_choices`. For each i in 0..n, invokes `k(i)` to drive the
+// captured continuation, appends the result to `acc`. Pure
+// effect-row (the discharger has lifted away `Choose`).
+fn all_choices_helper[A](
+  k: Continuation[Int, List[A]],
+  i: Int,
+  n: Int,
+  acc: List[A],
+) -> List[A] ![] {
+  if i >= n {
+    acc
+  } else {
+    let result_i: List[A] = k(i);
+    all_choices_helper(k, i + 1, n, append(acc, result_i))
+  }
+}
+
+// `all_choices(body)` discharges `Choose` by enumerating every
+// branch of the body. Returns a list containing the result of each
+// non-failing branch, in `0..arg-1` order for each
+// `Choose.choose(arg)` site. Failed branches contribute no entries.
+fn all_choices[A](body: () -> A ![Choose | e]) -> List[A] ![| e] {
+  handle body() with {
+    return(v) => Cons(v, Nil),
+    Choose.fail(k) => Nil,
+    Choose.choose(arg, k) => all_choices_helper(k, 0, arg, Nil),
+  }
+}
+
+// `first_choice_helper(k, i, n)` — internal recursion for
+// `first_choice`. Tries `k(i)` for each i; returns `Some(v)` on the
+// first non-failing branch, `None` if every branch fails.
+fn first_choice_helper[A](
+  k: Continuation[Int, Option[A]],
+  i: Int,
+  n: Int,
+) -> Option[A] ![] {
+  if i >= n {
+    None
+  } else {
+    let r: Option[A] = k(i);
+    match r {
+      Some(v) => Some(v),
+      None => first_choice_helper(k, i + 1, n),
+    }
+  }
+}
+
+// `first_choice(body)` discharges `Choose` by searching for the
+// first non-failing branch. Returns `Some(v)` if any branch
+// completes normally, `None` if every branch performs
+// `Choose.fail()`.
+fn first_choice[A](body: () -> A ![Choose | e]) -> Option[A] ![| e] {
+  handle body() with {
+    return(v) => Some(v),
+    Choose.fail(k) => None,
+    Choose.choose(arg, k) => first_choice_helper(k, 0, arg),
+  }
 }
