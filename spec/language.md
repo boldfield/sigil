@@ -745,29 +745,65 @@ files are the authoritative API reference.
 
 ### §14 — v1 limits (deferred to v2)
 
-- **First-class continuations:** `k` cannot be passed as a value,
-  captured into closures, or stored in records. Blocks
-  arbitrary-arity multi-shot handlers (`std.choose` dischargers,
-  Sudoku demo).
-- **Conditional / branched k-call:** `match k(0) { … => k(1) }` and
-  `if cond { k(x) } else { k(y) }` are walker-rejected.
-- **Wrapper-fn-frame discharge composition:** `perform State.get`
-  inside a helper fn breaks `run_state`'s state-threading.
-- **Type-parameterized effect rows:** `![Raise[E]]`, `![State[S]]`
-  do not parse.
-- **Tuple types / `Pair[A, B]`:** no native tuple literal syntax;
-  use a custom record or sum type.
-- **Row-polymorphic fn-typed params:** higher-order helpers'
-  effect rows are closed.
-- **`Float` type:** no v1 floating-point.
-- **`Unit` literal:** Unit values can only be obtained as the
-  return of a `Mem` mutation op or `IO.println`.
-- **`for` / `while`:** no looping syntax; recursion is the only
-  iteration mechanism.
+The Plan D architectural cluster (Tasks 111–118) closed every limit
+in this section that originally pointed at a v2 lift in Plan C
+deviations. Survivors below are limits with no Plan D / Plan C
+closure path — they ship as permanent v1 design choices or queue
+for a future plan-tier slice.
 
-Each limit links to a corresponding `[DEVIATION Task NN]` entry in
-[`PLAN_C_DEVIATIONS.md`](../PLAN_C_DEVIATIONS.md) with the v2
-closure path.
+- **`Float` type:** no v1 floating-point. No closure path scheduled
+  in any current plan.
+- **`Unit` literal:** Unit values can only be obtained as the
+  return of a `Mem` mutation op or `IO.println`. Permanent v1
+  surface decision (no `()` literal).
+- **`for` / `while`:** no looping syntax; recursion is the only
+  iteration mechanism. Permanent v1 surface decision.
+- **Captured-k inside lambdas across generic-fn boundaries
+  (E0145):** `Plan D Task 117`'s `Ty::Continuation` escape barrier
+  rejects captured-k inside any lambda when the program contains a
+  generic fn (monomorphization walks every reachable fn once any
+  generic exists, and continuation values cannot cross generic-
+  instantiation boundaries). Mechanical fix path: move the handler
+  into a non-generic wrapper around the generic body, or rewrite
+  the arm body to call `k(arg)` directly without intermediate
+  lambda capture. Plan-C-completion or future-PR territory.
+
+The following limits ship as **closed in v1** by Plan D and remain
+documented here as a closure log for the v1 → v2 transition:
+
+- **First-class continuations:** Closed by Plan D Task 117 (PR #60
+  substrate `4b3f0b4` + follow-up type-position `Continuation[op_-
+  ret, ret]` surface). `Ty::Continuation` + escape barrier +
+  ScopeId enforce dynamic extent; both single-shot (`let f = k;
+  f(42)`) and multi-shot 2-let (`let f = k; let r1 = f(true); let
+  r2 = f(false); r1 + r2`) work end-to-end.
+- **Conditional / branched k-call:** Closed by Plan D Task 118
+  (PR #81 squash `3904a12`). `lower_arm_body_to_next_step`
+  recursively descends arm-body tail through `Expr::Block` /
+  `Expr::If` / `Expr::Match`, emitting one `*NextStep` ptr per leaf.
+- **Wrapper-fn-frame discharge composition:** Closed by Plan D
+  Task 112 (a + b + c). Tail-perform Cps wrapper composition
+  (PR #83), chained-let-yield Cps wrapper composition (PR #85),
+  Case D wrapper-in-chain + Slice B outer arm (PR #86).
+- **Type-parameterized effect rows:** Closed by Plan D Task 114
+  (PR #54). `EffectRef`/`EffectInst` split with structural row
+  unification + E0143 row-arg arity check.
+- **Tuple types / `Pair[A, B]`:** Closed by Plan D Task 113
+  (PR #53). `(T1, T2, ...)` types, `(e1, e2, ...)` values,
+  `Pattern::Tuple` element-wise unification + destructure,
+  `std/pair.sigil` with `fst[A,B]` / `snd[A,B]`.
+- **Row-polymorphic fn-typed params:** Closed by Plan D Task 116
+  (PR #56). Row vars in inner `FnTypeExpr`s resolve through the
+  enclosing fn's `effect_row_var`; E0137 narrowed to fire only on
+  unbound row vars.
+
+Each Plan-D-shipped closure cross-references its `[DEVIATION
+Task NN]` entry by task number in
+[`PLAN_D_DEVIATIONS.md`](../PLAN_D_DEVIATIONS.md); the non-Plan-D
+survivors live as named entries in
+[`PLAN_C_DEVIATIONS.md`](../PLAN_C_DEVIATIONS.md). Reader's grep
+target: search by `[DEVIATION Task <N>]` for any task number cited
+above.
 
 ### §15 — Build and run
 

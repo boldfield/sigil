@@ -545,7 +545,7 @@ The `run_state` implementation reuses `examples/state.sigil`'s state-bearing-lam
 
 1. Parser surface for type-parameterized effect references in rows (`![State[S]]`). **Closed** by Plan D Task 114 (PR #54). The `EffectRef`/`EffectInst` split with structural row unification + E0143 row-arg arity check ships the surface.
 2. Tuple type / `Pair[A, B]` stdlib (or `(A, S)` syntax). **Closed** by Plan D Task 113 (PR #53). Tuple types `(T1, T2, ...)`, tuple values `(e1, e2, ...)`, `Pattern::Tuple` element-wise unification + destructure, and `std/pair.sigil` with `fst[A,B]` / `snd[A,B]` over binary tuples shipped. `run_state` returning `(A, S)` is now expressible at the surface; updating `std/state.sigil` to actually return `(A, S)` is a follow-up Plan-C-completion task — the v1 blocker was the syntax, not the discharge mechanism.
-3. Wrapper-fn frame composition fix for the discharge-with-lambda pattern. After this lands, std/state.sigil grows `get_state` / `set_state` ergonomic wrappers. **Deferred** — Plan D Task 112 deferred to Task 117 follow-up; see `PLAN_D_DEVIATIONS.md` `[DEVIATION Task 112]`.
+3. Wrapper-fn frame composition fix for the discharge-with-lambda pattern. After this lands, std/state.sigil grows `get_state` / `set_state` ergonomic wrappers. **Closed** by Plan D Task 112 (a + b + c). Tail-perform Cps wrapper composition shipped via PR #83 (Task 112a); chained-let-yield Cps wrapper composition shipped via PR #85 (Task 112b); the Case D wrapper-in-chain + Slice B outer arm intersection closed via PR #86 (Task 112c). The ergonomic-wrappers std/state.sigil migration is still a Plan-C-completion follow-up — Plan D's wrapper-fn-frame mechanism is the load-bearing v2 surface; consuming it via stdlib stays in Plan C scope per the hard-rule split.
 4. Row-poly Fn type parameters (`(() -> A ![State[S] | e]) -> ...`). **Closed** by Plan D Task 116 (PR #56). Row vars in inner FnTypeExprs resolve through the enclosing fn's `effect_row_var`; E0137 narrowed to fire only on unbound row vars.
 
 std/state.sigil migration to `effect State[S] { get: () -> S, set: (S) -> Unit }` + `(A, S)` tuple return + row-poly `run_state` defers to Plan C completion alongside std/raise + std/result migrations as a single stdlib-update PR. Plan D's hard-rule scope says stdlib migrations consuming Plan D's surface belong to Plan C completion, not Plan D itself.
@@ -570,11 +570,54 @@ with `Choose.choose(n)` picking a value 0..n-1 and `Choose.fail()` abandoning a 
 
 1. **Parser rejects type-parameterized effect references in rows.** Same constraint as `[DEVIATION Task 71]` constraint #1 / `[DEVIATION Task 72]` constraint #1. **Closed** by Plan D Task 114 (PR #54).
 
-2. **Static-N arm-body chain.** The arm-body recognizer at `compiler/src/codegen.rs::arm_body_n_let_then_pure_tail_shape` (currently around line 3744) requires arm bodies of the form `{ let r1: T = k(arg1); let r2: T = k(arg2); ...; let rN: T = k(argN); pure_tail }` — N is statically fixed at compile time. `all_choices(body) -> List[Int]` would need runtime-N dispatch (invoking `k(0)`, `k(1)`, …, `k(arg-1)` where `arg` is the perform's runtime value), which is not expressible in v1's flat let-chain shape. **Open** — Plan D Task 117 (first-class continuations).
+2. **Static-N arm-body chain.** The arm-body recognizer
+   `arm_body_n_let_then_pure_tail_shape` requires arm bodies of the
+   form `{ let r1: T = k(arg1); let r2: T = k(arg2); ...; let rN: T
+   = k(argN); pure_tail }` — N is statically fixed at compile time.
+   `all_choices(body) -> List[Int]` would need runtime-N dispatch
+   (invoking `k(0)`, `k(1)`, …, `k(arg-1)` where `arg` is the
+   perform's runtime value), which was not expressible in v1's
+   flat let-chain shape. **Closed** by Plan D Task 117 (first-class
+   continuations via `Ty::Continuation` substrate + escape barrier
+   + type-position surface). Runtime-N dispatch over `k` lifts to
+   user code via the lambda-discharger pattern that Task 117
+   unlocks. (Original code-pointer breadcrumbs to `compiler/src/-
+   codegen.rs` line numbers omitted — the recognizer's location and
+   the rejection-diagnostic strings have moved post-Plan-D; reader's
+   grep target is the function name above.)
 
-3. **No first-class continuations.** `arm_body_walk` (currently around codegen.rs:1569) explicitly rejects `k` referenced as a value (passed to a helper, captured into a closure, stored in a record) with the diagnostic "first-class continuations are deferred to v2". The closure path that would make `all_choices` expressible — `Choose.choose(arg, k) => list_fold(range(0, arg), Nil, fn (acc, i) => append(acc, k(i)))` — runs `k` inside a hoisted lambda whose closure env captures `k`, which closure_convert can't model in v1. **Open** — Plan D Task 117 closes this directly.
+3. **No first-class continuations.** `arm_body_walk` explicitly
+   rejected `k` referenced as a value (passed to a helper, captured
+   into a closure, stored in a record) with a "first-class
+   continuations are deferred to v2"-style diagnostic. The closure
+   path that would make `all_choices` expressible — `Choose.choose(arg,
+   k) => list_fold(range(0, arg), Nil, fn (acc, i) => append(acc,
+   k(i)))` — runs `k` inside a hoisted lambda whose closure env
+   captures `k`, which closure_convert couldn't model in v1.
+   **Closed** by Plan D Task 117 (PR #60 substrate `4b3f0b4` +
+   follow-up type-position surface PR). `Ty::Continuation` + escape
+   barrier + ScopeId enforce dynamic extent; both single-shot
+   (`let f = k; f(42)`) and multi-shot 2-let (`let f = k; let r1
+   = f(true); let r2 = f(false); r1 + r2`) work end-to-end. The
+   pre-Task-117 rejection diagnostic is retired; the new gate is
+   the **E0145** escape-barrier check on captured-k inside lambdas
+   in programs containing generic fns (see spec §14 + this file's
+   E0145 entry).
 
-4. **No conditional / branched `k`-call.** `arm_body_walk` (currently around codegen.rs:1652) rejects "computed conditional `k`-use" — `match k(0) { Some(v) => Some(v), None => k(1) }` and `if cond { k(x) } else { k(y) }` shapes are not in tail position for `k`-detection (the synth-pass detector `arm_body_tail_is_k_call` recurses only through `Expr::Block` tails). `first_choice` short-circuit semantics ("try `k(i+1)` only if `k(i)` failed") cannot be expressed without this. **Open** — Plan D Task 118 (conditional/branched k-call, builds on Task 117).
+4. **No conditional / branched `k`-call.** `arm_body_walk` rejected
+   "computed conditional `k`-use" — `match k(0) { Some(v) => Some(v),
+   None => k(1) }` and `if cond { k(x) } else { k(y) }` shapes were
+   not in tail position for `k`-detection (the synth-pass detector
+   `arm_body_tail_is_k_call` recursed only through `Expr::Block`
+   tails). `first_choice` short-circuit semantics ("try `k(i+1)`
+   only if `k(i)` failed") could not be expressed without this.
+   **Closed** by Plan D Task 118 (PR #81 squash `3904a12`).
+   Branched-routing path: new Lowerer method
+   `lower_arm_body_to_next_step` recursively descends arm-body tail
+   through `Expr::Block` / `Expr::If` / `Expr::Match`, emitting one
+   `*NextStep` ptr per leaf (k-call → `NextStep::Call`; non-k value
+   → `NextStep::Discharged`); If/Match join at a Cranelift block.
+   4 e2e tests cover all four shapes.
 
 5. **No per-op generic params on user-declared effects.** Same as `[DEVIATION Task 71]` constraint #2 / `[DEVIATION Task 72]` constraint #4. **Closed** by Plan D Task 115 (PR #55).
 
