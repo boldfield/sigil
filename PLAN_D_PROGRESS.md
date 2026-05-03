@@ -101,3 +101,47 @@ Internal ordering: 114 must precede 115; 113 and 116 are independent.
 - All tasks marked `done` with implementing commit references in this file.
 - Sudoku and JSON parser half compile + run via e2e harness on both hosts; demo-PR landings on `main` are not required for Plan D closure (those belong to Plan C completion).
 - Plan file `git mv`'d from `in-progress/` to `done/` once the human review checkpoint after Task 119 signs off.
+
+## Plan D follow-ups (named to prevent shadow deferrals)
+
+Tagged 2026-05-03 during Task 112c work. The user's standing directive in this
+session is to STOP shipping deferrals without named owners — these entries
+exist so the items below are queued with concrete scope and order, not
+floating as "we'll get to it." Each ships as its own PR after Task 119
+closeout (or earlier if scope permits bundling).
+
+**Active sequence (in flight):**
+
+- Task 112c — Case D fix (caller_k_fn-first gate + post_arm_k forwarding).
+  Status: **PR #86 in flight**. Closes the wrapper-in-chain + Slice B outer
+  arm intersection that PR #85 tracked via `#[ignore]`'d sister test.
+- Task 112-mutually-recursive — Cps cycle handling under discharge-with-
+  lambda. Status: **next pickup after PR #86 merges**. Visited-set bails to
+  false on cycles → Sync ABI fallback re-exhibits original Task 112 silent-
+  garbage failure for state-threading handlers calling mutually-recursive
+  Cps fns. Architectural read needed: runtime depth-tracking vs different
+  cycle disposition vs ship-as-v1-limit-with-clear-error-message.
+- Task 111 disposition — TLS → packed multi-return for `sigil_run_loop`
+  terminal. Status: **third in active sequence**. Three prior implementation
+  attempts (PR #50) failed; either 4th lift attempt OR explicit close as
+  v1-known-limit with successor plan named in spec §14.
+
+**Post-Plan-D-closeout follow-ups (named, not floating):**
+
+- Perf-gate close (Stage A from `PLAN_B_DEVIATIONS.md`'s "Pre-existing
+  perf-floor flake on debug profile (Plan B Task 51 era)" entry). Wrap the
+  5 perf tests' timing asserts in `#[cfg(not(debug_assertions))]`. ~30-50
+  LOC, ~30 min. Closes the open deviation that's been carried since PR #18.
+  **Owner: post-Task-119 follow-up PR.** Mechanical; no architectural
+  question.
+- `fib_perf` release-mode investigation (Stage C). Local M-series in release
+  mode shows fib_perf at 541ms vs 50ms budget. CI release historically
+  passes. Profile via `instruments` (macOS) / `perf record` (Linux) +
+  `--print-runtime-stats` to identify whether it's a Boehm GC init artifact
+  (likely benign), Cranelift release-mode code-gen quality regression
+  (worth fixing), or a hardware-difference-CI-runner-faster-than-laptop
+  artifact (budget needs raising). **Owner: post-Stage-A follow-up.** May
+  defer indefinitely if Stage A closes the developer-experience problem
+  AND CI continues passing.
+
+These are queued, named, and scoped — not deferred without owners.
