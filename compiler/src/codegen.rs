@@ -327,10 +327,21 @@ fn compute_user_fn_abi(
         };
         let captures =
             collect_chained_synth_cont_captures(&steps, tail_expr, &binding_names, helper_params);
-        if captures.len() + chain_length < MAX_CLOSURE_ENV_SLOTS {
+        // Plan D Task 112b — bound tightened by 1 to account for the
+        // 2 caller_k_pair slots appended to every chained-let-yield
+        // closure record. Old bound `K + N < MAX` ignored the +2,
+        // letting cases on the boundary (K + N = MAX-1, MAX-2) classify
+        // as Cps then hard-panic at the Middle alloc's `next_slot_count
+        // < MAX_CLOSURE_ENV_SLOTS` assert (which now requires
+        // `K + N + 1 < MAX` because `next_slot_count = K + (N-1) + 1
+        // + 2 = K + N + 2`, and N=1 needs `K + 2 < MAX` at helper-body
+        // alloc — both unified by `K + N + 1 < MAX`). Reviewer (PR #85
+        // review 2 🔴) flagged this off-by-one; the fix gates the
+        // boundary cases off to Sync ABI cleanly instead of panicking.
+        if captures.len() + chain_length + 1 < MAX_CLOSURE_ENV_SLOTS {
             return UserFnAbi::Cps;
         }
-        // K + N >= MAX_CLOSURE_ENV_SLOTS — fall through to Sync.
+        // K + N + 1 >= MAX_CLOSURE_ENV_SLOTS — fall through to Sync.
     }
     // Plan B Task 78.5 G4 Phase B.1 — compound `Expr::Match`-as-body-tail
     // shape. Body is `match scrut { ... }` where at least one arm body has
@@ -9026,10 +9037,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                     let k_closure = if is_chained_kind {
                         // Plan D Task 112b — chained-let-yield
-                        // body. Always allocate, with captures +
-                        // 2 trailing slots holding caller_k_pair
+                        // body. Always allocate (even when
+                        // captures.is_empty()), with captures + 2
+                        // trailing slots holding caller_k_pair
                         // (caller_k_closure at idx captures.len(),
                         // caller_k_fn at idx captures.len()+1).
+                        //
+                        // **Always-alloc rationale (PR #85 review 2
+                        // smaller).** The pre-Task-112b empty-
+                        // captures fast path returned a null
+                        // k_closure (zero-alloc). Post-Task-112b,
+                        // the Final-step's runtime gate LOADs
+                        // caller_k_pair from this closure record's
+                        // trailing slots — so the slots MUST exist
+                        // even when the user fn has no captures.
+                        // Empty-captures bodies pay the same 32-
+                        // byte alloc cost (header + code_ptr +
+                        // caller_k_closure + caller_k_fn) as
+                        // captures-bearing bodies; the optimization
+                        // surface is gone.
+                        //
                         // Each chain step's closure record carries
                         // caller_k_pair end-to-end so the Final
                         // step can dispatch the helper's caller's
@@ -12506,6 +12533,77 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     .builder
                                     .ins()
                                     .func_addr(pointer_ty, lowerer.continuation_identity_ref);
+                                // **Identity-sentinel invariant (PR
+                                // #85 review 2 🟡).** The runtime
+                                // gate's correctness depends on the
+                                // invariant that ONLY the canonical
+                                // tail-k pattern writes
+                                // `identity_fn_addr` to a synth-cont's
+                                // args_ptr POST_ARM_K_FN_OFF slot.
+                                // Today this holds — every writer of
+                                // POST_ARM_K_FN_OFF that I'm aware of
+                                // is one of:
+                                //
+                                // - `lower_k_pair_call`'s tail-k path
+                                //   (`compiler/src/codegen.rs:16093-
+                                //   16102`) writes
+                                //   `identity_fn_addr_for_post_arm_k`
+                                //   when the lifted lambda's body is
+                                //   `k(arg)` (no `let r = k(arg);
+                                //   pure_tail` shape). This is the
+                                //   "tail-k" / wrapper-in-chain case
+                                //   the gate routes via caller_k_pair.
+                                // - Phase 4g normal_block's return-
+                                //   arm dispatch
+                                //   (`compiler/src/codegen.rs:15717-
+                                //   15726`) writes
+                                //   `identity_fn_addr` as the post-
+                                //   handle continuation. Used to
+                                //   terminate the return arm's run_
+                                //   loop with `Done(arg)`.
+                                // - Phase 4g suppression_block
+                                //   (`compiler/src/codegen.rs:15600+`)
+                                //   does not write — it widens a
+                                //   pre-existing `raw_u64`.
+                                // - The above-this-block
+                                //   `caller_dispatch_block`
+                                //   (Task 112b) writes
+                                //   `identity_fn_addr` at
+                                //   POST_ARM_K_FN_OFF as the new
+                                //   trailing pair when forwarding
+                                //   into caller_k_pair — the
+                                //   downstream synth-cont (caller's
+                                //   chain step) sees identity in its
+                                //   own POST_ARM_K_FN_OFF and the
+                                //   gate routes it correctly via
+                                //   caller_k_pair AGAIN. (Recursive;
+                                //   terminates at the top-level
+                                //   handle's caller_k_pair = (null,
+                                //   identity_k_fn) where dispatching
+                                //   identity returns Done.)
+                                // - Slice B's `let r = k(arg);
+                                //   pure_tail` arm body (codegen.rs
+                                //   ~10380-10470) writes a DISTINCT
+                                //   `post_arm_k_fn_addr` (the
+                                //   per-arm post-arm-k synth fn,
+                                //   never identity).
+                                //
+                                // Any FUTURE emit path that writes
+                                // identity to POST_ARM_K_FN_OFF must
+                                // be designed for the same
+                                // canonical-tail-k semantic. Adding
+                                // a new writer that uses identity for
+                                // some other purpose would silently
+                                // mis-route through caller_k_pair —
+                                // the gate's correctness is
+                                // mechanism-by-coincidence on the
+                                // singular meaning of "identity at
+                                // POST_ARM_K_FN_OFF". Keep it that
+                                // way; if a new shape needs identity
+                                // dispatch with different routing
+                                // semantics, introduce a new sentinel
+                                // (or a runtime tag) and discriminate
+                                // explicitly.
                                 let is_post_arm_k_identity = lowerer.builder.ins().icmp(
                                     IntCC::Equal,
                                     post_arm_k_fn,
@@ -12563,6 +12661,32 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 ));
                                 let argp_v_caller =
                                     lowerer.builder.inst_results(argp_call_caller)[0];
+                                // Trailing-pair writes are
+                                // unconditional (PR #85 review 2
+                                // smaller). Top-level case
+                                // (caller_k_fn = identity_k_fn from
+                                // PR #80's pack) ignores
+                                // POST_ARM_K_CLOSURE_OFF /
+                                // POST_ARM_K_FN_OFF — identity reads
+                                // only `*args_ptr`. Wrapper-in-chain
+                                // case (caller_k_fn = a synth-cont
+                                // addr) consumes the POST_ARM_K
+                                // pair to drive its own gate
+                                // recursively (the downstream synth-
+                                // cont's POST_ARM_K is identity, so
+                                // its gate routes via ITS
+                                // caller_k_pair, etc., terminating
+                                // at the top-level handle).
+                                // Specializing the trailing writes
+                                // when caller_k_fn is statically
+                                // known to equal identity at
+                                // dispatch time would require a
+                                // 4-block branch (top-level / non-
+                                // top-level) above this 2-block
+                                // gate, which is more emit code for
+                                // a 2-store savings on a path that
+                                // typically allocates a fresh args
+                                // buffer anyway. Not worth it.
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
                                     widened_tail,
@@ -20002,51 +20126,95 @@ fn is_simple_tail_perform_with_pure_args_body(
 /// Plan D Task 112b — `true` iff `callee_name` resolves to a top-
 /// level Cps user fn whose body matches EITHER the tail-perform
 /// shape OR the chained-let-yield-then-pure-tail shape (where the
-/// latter's let-RHS are restricted to direct performs only — no
-/// nested wrapper-Calls — to keep the lookup non-recursive without
-/// requiring depth bookkeeping). Used by the chained-let-yield
-/// classifier's let-RHS check at outer call sites.
+/// latter's let-RHS may themselves be wrapper-Calls to other
+/// supported Cps fns — recursion bounded by a visited-set). Used by
+/// the chained-let-yield classifier's let-RHS check at outer call
+/// sites.
 ///
 /// Tail-perform wrappers compose via the existing trailing-pair
 /// k_pair forwarding (Task 112a). Chained-let-yield wrappers
 /// compose via Task 112b's caller-k_pair plumbing through chain
 /// step closure records — each chain step's record carries the
 /// helper's caller_k_pair as 2 extra slots after captures +
-/// prior_bindings; the Final step substitutes its terminal
-/// `emit_dispatch_to_post_arm_k(tail)` with `NextStep::Call(
-/// caller_k_pair, [tail, null, identity], 3)`, dispatching the
-/// caller's continuation directly with `tail`. At top-level
-/// (caller_k_pair = (null, identity_k_fn)) this routes via
+/// prior_bindings; the Final step's terminal dispatch routes
+/// `tail` through `caller_k_pair` (when post_arm_k is identity, via
+/// the runtime gate) or through `post_arm_k` (Slice B). At top-
+/// level (caller_k_pair = (null, identity_k_fn)) this routes via
 /// identity → `Done(tail)`; inside an outer chain caller, it
 /// dispatches the next chain step's synth-cont with `tail`.
 ///
-/// **Conservative inner restriction.** When the callee body is
-/// chained-let-yield, this helper passes a `|_| false` inner
-/// lookup to the recursive classifier so the callee's own let-
-/// RHS must be direct performs (not wrapper-Calls). Permits the
-/// canonical `state_set_set_get`-shaped wrappers without needing
-/// recursion-termination bookkeeping. Wrapper-of-chained shapes
-/// (e.g., `comp -> wrapper_a -> wrapper_b` where both `wrapper_a`
-/// and `wrapper_b` are chained) fall back to Sync ABI here. A
-/// future revision could lift the restriction with a visited-set.
+/// **Visited-set recursion termination (PR #85 review 1, Option A).**
+/// When the callee body is chained-let-yield, the inner classifier
+/// recursively looks up THIS predicate via a closure that shares a
+/// `RefCell<BTreeSet<String>>` visited set. Each `is_supported`
+/// call inserts `callee_name` before recursing into its body's
+/// classifier, and removes on return. Cycles (mutually-recursive
+/// Cps fns where each calls the other) are gracefully rejected on
+/// the second visit (`insert` returns false → return false → falls
+/// back to Sync ABI for the cycle members). Acyclic deep nesting
+/// (e.g., `comp → wrapper_a → wrapper_b → wrapper_c` where each is
+/// chained) is permitted — every level classifies as Cps and the
+/// caller_k_pair plumbing chains end-to-end through each Final
+/// step's runtime gate.
+///
+/// Pre-PR-#85-review-1, this helper used a `|_| false` inner lookup
+/// (rejecting all nested wrapper-Calls in chained callees). That
+/// was a NEW deferral introduced by the implementation that the
+/// deviation entry didn't anticipate; reviewer 1 flagged it as the
+/// "wrapper-of-chained shape under discharge-with-lambda still
+/// produces silent garbage" hazard. The visited-set extension here
+/// closes that gap.
 fn is_supported_cps_user_fn(
     callee_name: &str,
     fns_by_name: &std::collections::BTreeMap<&str, &crate::ast::FnDecl>,
     colored: &crate::color::ColoredProgram,
     ctors: &std::collections::BTreeSet<String>,
 ) -> bool {
+    let visited: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        std::cell::RefCell::new(std::collections::BTreeSet::new());
+    is_supported_cps_user_fn_inner(callee_name, fns_by_name, colored, ctors, &visited)
+}
+
+/// Plan D Task 112b — recursive worker for [`is_supported_cps_user_fn`].
+/// Threads a `RefCell<BTreeSet<String>>` of currently-on-stack
+/// callee names through the recursion to terminate on cycles. See
+/// the public entry's docstring for the semantic contract.
+fn is_supported_cps_user_fn_inner(
+    callee_name: &str,
+    fns_by_name: &std::collections::BTreeMap<&str, &crate::ast::FnDecl>,
+    colored: &crate::color::ColoredProgram,
+    ctors: &std::collections::BTreeSet<String>,
+    visited: &std::cell::RefCell<std::collections::BTreeSet<String>>,
+) -> bool {
     if !colored.needs_cps_transform(callee_name) {
         return false;
     }
-    let f = match fns_by_name.get(callee_name) {
-        Some(f) => f,
-        None => return false,
-    };
-    if is_simple_tail_perform_with_pure_args_body(&f.body, ctors) {
-        return true;
+    if !visited.borrow_mut().insert(callee_name.to_string()) {
+        // Cycle: callee already on the recursion stack. Bail to
+        // false so the caller's classifier rejects this let-RHS and
+        // the surrounding fn falls back to Sync ABI. (Mutually-
+        // recursive Cps fns are well-typed at color analysis but
+        // aren't chained-wrapper-composable — Sync fallback gives
+        // the canonical SAVE+CLEAR+RESTORE BODY_RETURN_ARM_STACK
+        // behavior which doesn't lose correctness, just composition
+        // efficiency.)
+        return false;
     }
-    let no_inner_wrappers = |_: &str| false;
-    is_simple_chained_let_yield_then_pure_tail_body(&f.body, ctors, &no_inner_wrappers).is_some()
+    let result = (|| {
+        let f = match fns_by_name.get(callee_name) {
+            Some(f) => f,
+            None => return false,
+        };
+        if is_simple_tail_perform_with_pure_args_body(&f.body, ctors) {
+            return true;
+        }
+        let inner_lookup = |inner_name: &str| {
+            is_supported_cps_user_fn_inner(inner_name, fns_by_name, colored, ctors, visited)
+        };
+        is_simple_chained_let_yield_then_pure_tail_body(&f.body, ctors, &inner_lookup).is_some()
+    })();
+    visited.borrow_mut().remove(callee_name);
+    result
 }
 
 /// Plan D Task 112a — build the `name -> &FnDecl` lookup table

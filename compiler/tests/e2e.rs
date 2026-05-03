@@ -7633,6 +7633,141 @@ fn task_112b_chained_let_yield_wrapper_chain_length_3_returns_3() {
     );
 }
 
+/// Plan D Task 112b sister test (PR #85 review 1, Option A) — 3-
+/// deep nested chained-let-yield Cps wrappers. Pins that the
+/// visited-set extension to `is_supported_cps_user_fn` lets each
+/// nesting level classify as Cps and the caller_k_pair plumbing
+/// chains end-to-end through every level.
+///
+/// Pre-extension (the conservative `|_| false` inner lookup), this
+/// would have rejected `level_3` (its let-RHS is `level_2()`, a
+/// non-tail-perform wrapper-Call), causing `level_3` to fall back
+/// to Sync ABI and exhibit the original Task 112 silent-garbage
+/// failure mode under discharge-with-lambda.
+///
+/// Trace under `run_state` (initial=0):
+/// - level_1 fires `S.set(1)`; arm returns L_set_1 = `fn(s)=>k(1)(1)`. Discharges.
+/// - state_fn = L_set_1. state_fn(0) = k(1)(1):
+///   - k(1) → level_1's Final dispatches via caller_k_pair (level_2's chain pair) → level_2's Final → level_3's chain pair → level_3's Final → comp's chain pair → comp_step_0_synth_cont (Middle, binds `_d=0`) → issues `perform S.get`.
+///   - S.get arm fires: returns L_get = `fn(s)=>k(s)(s)`. Discharges. k(1) returns L_get.
+///   - k(1)(1) = L_get(1) → k_get(1)(1):
+///     - k_get(1) → comp_step_1_synth_cont (Final, binds v=1, tail=v=1) → caller_k_pair=(null,identity) → Done(1) → return arm wrap → L_ret. k_get(1)=L_ret.
+///     - k_get(1)(1) = L_ret(1) = 1.
+///   - L_get(1) = 1. k(1)(1) = 1.
+/// - L_set_1(0) = 1. state_fn(0) = 1.
+#[test]
+fn task_112b_chained_wrapper_3_deep_nested_via_visited_set_returns_1() {
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               fn level_1() -> Int ![S] {\n  \
+                 let _a: Int = perform S.set(1);\n  \
+                 0\n\
+               }\n\
+               fn level_2() -> Int ![S] {\n  \
+                 let _b: Int = level_1();\n  \
+                 0\n\
+               }\n\
+               fn level_3() -> Int ![S] {\n  \
+                 let _c: Int = level_2();\n  \
+                 0\n\
+               }\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _d: Int = level_3();\n  \
+                 let v: Int = perform S.get();\n  \
+                 v\n\
+               }\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112b_3_deep_nested");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1\n",
+        "Task 112b 3-deep nested chained wrappers via visited-set \
+         classifier extension: caller_k_pair chains end-to-end through \
+         level_1 → level_2 → level_3 → comp's chain step → S.get arm; \
+         only S.set(1) executes so state=1; tail v=1. \
+         stderr={stderr:?}"
+    );
+}
+
+/// Plan D Task 112b sister test (PR #85 review, open Case D) —
+/// chained-let-yield wrapper called from inside ANOTHER chained
+/// body (wrapper-in-chain), under a handler whose arm body uses
+/// the Slice B `let r = k(arg); pure_tail` shape. Currently
+/// `#[ignore]`'d because:
+///
+/// 1. The semantic the gate's comment claims ("Slice B's pure_tail
+///    IS the discharge value, the chain doesn't continue") is
+///    plausible but theoretical — no test in the corpus exercises
+///    the intersection of wrapper-in-chain + Slice B outer-arm.
+/// 2. Designing the right test requires settling the semantic
+///    question first: does the user expect `pure_tail` to be the
+///    handle's discharge value, OR does the user expect the outer
+///    chain step to fire after `pure_tail` evaluates?
+/// 3. The (2c) gate's runtime branch routes via post_arm_k (Slice
+///    B path) when `post_arm_k_fn != identity`, which means the
+///    Slice B synth fn fires and the outer chain step does NOT
+///    fire. This is the "discharge value" semantic. A test that
+///    expects the OTHER semantic (chain continues) would surface
+///    a (2c)-gate gap.
+///
+/// Marked `#[ignore]` rather than removed so the gap is tracked in
+/// code rather than only in prose (per PR #85 review 2 🟡 Case D).
+/// Un-ignore after the semantic is settled and a concrete expected
+/// stdout is decided. Owner: future Task 112c (or a Task 78.5
+/// follow-up exercising deeper Koka subset surface).
+#[test]
+#[ignore = "Task 112b Case D — wrapper-in-chain + Slice B outer arm; semantic question open, gap tracked here"]
+fn task_112b_case_d_wrapper_in_chain_with_slice_b_outer_arm_pending_semantic() {
+    let src = "effect Eff { fail: () -> Int }\n\
+               fn helper() -> Int ![Eff] {\n  \
+                 let _a: Int = perform Eff.fail();\n  \
+                 99\n\
+               }\n\
+               fn comp() -> Int ![Eff] {\n  \
+                 let _x: Int = helper();\n  \
+                 0\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle comp() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(7);\n      \
+                     r + 1\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (_stdout, _stderr, _code) = compile_and_run(src, "task_112b_case_d_pending_semantic");
+    // Expected stdout to be filled in once Case D's semantic is
+    // settled. Two candidates per the gate's docstring:
+    //   - "1\n" if Slice B's pure_tail IS the discharge value
+    //     (helper's tail=99 fed to k via post_arm_k → Slice B
+    //     synth fn computes r+1=100, but then comp's chain step
+    //     never fires because the trampoline returned the Slice
+    //     B's value as the discharge — chain breakage).
+    //   - "1\n" if Case D routes correctly through both: helper
+    //     returns 99 → Slice B fires (r=99, r+1=100) → outer
+    //     chain step fires with 100 as binding → comp tail = 0
+    //     → handle's overall = 100? Or 0? Depends on which path
+    //     wins.
+    // Un-ignore + fill in the correct expectation in the
+    // Task-112c PR (or wherever Case D is dispositioned).
+}
+
 /// Plan D Task 112 sister test — multi-let chain with wrappers.
 /// Three sequential `set_state` calls thread 1, 2, 3 in turn; final
 /// `get_state` reads back 3. Pins the chain-length-3+ branch of
