@@ -7458,6 +7458,79 @@ fn task_112_wrapper_fn_frame_composition_state_set_get_returns_11() {
     );
 }
 
+/// Plan D Task 112b — chained-let-yield Cps wrapper composition fix.
+/// Self-contained test exercising a chained-let-yield Cps wrapper
+/// (`double_set` body has chain_length=2 with a pure tail) called as
+/// `let _ = double_set(10, 20)` inside `comp`'s chained-let-yield
+/// body, against a discharge-with-lambda handler (run_state).
+///
+/// **Pre-fix (Task 112a state):** `is_tail_perform_cps_user_fn` lookup
+/// rejects `double_set` (it's chained-let-yield, not tail-perform).
+/// Classifier rejects this `Expr::Call` let-RHS; `comp` falls back to
+/// Sync ABI; lower_call's Cps branch handles `double_set` via the
+/// SAVE+CLEAR+RESTORE BODY_RETURN_ARM mechanism. Under discharge-
+/// with-lambda the lambda chain breaks (chained-let-yield wrapper's
+/// inner perform captures the wrapper's INTERNAL chain pair, NOT
+/// the caller's k, so state-threading via `state_fn(initial)` walks
+/// the wrong chain).
+///
+/// **Post-fix (Task 112b):** classifier widened to accept chained-
+/// let-yield Cps callees; chain step closure records carry the
+/// caller's trailing-pair (caller_k_pair) end-to-end; the wrapper's
+/// own Final chain step substitutes its terminal
+/// `done_or_dispatch_return_arm(tail)` with
+/// `NextStep::Call(caller_k_pair, [tail, null, identity], 3)`, which
+/// dispatches the caller's continuation directly with `tail`. At
+/// top-level (caller_k_pair = (null, identity_k_fn)) this routes via
+/// identity → `Done(tail)` so the surrounding handle's Phase 4g
+/// wraps via return arm normally. Inside an outer chained-let-yield
+/// caller, the caller_k_pair points at the next chain step's synth-
+/// cont, so the wrapper's tail flows directly into the caller's
+/// chain — no need for OUTER_POST_ARM_K_STACK routing.
+///
+/// Expected: `"21\n"` (set 10, set 20 — state threads to 20; tail
+/// `v+1` = 21).
+#[test]
+fn task_112b_chained_let_yield_wrapper_state_threading_returns_21() {
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               fn double_set(a: Int, b: Int) -> Int ![S] {\n  \
+                 let _: Int = perform S.set(a);\n  \
+                 let _: Int = perform S.set(b);\n  \
+                 0\n\
+               }\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _: Int = double_set(10, 20);\n  \
+                 let v: Int = perform S.get();\n  \
+                 v + 1\n\
+               }\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112b_chained_wrapper_state");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "21\n",
+        "Task 112b post-fix: chained-let-yield Cps wrapper composition \
+         under discharge-with-lambda — double_set threads state through \
+         its internal chain, then comp continues with comp_step_0 firing \
+         after double_set's Done; perform S.get returns 20; tail v+1 = 21. \
+         stderr={stderr:?}"
+    );
+}
+
 /// Plan D Task 112 sister test — multi-let chain with wrappers.
 /// Three sequential `set_state` calls thread 1, 2, 3 in turn; final
 /// `get_state` reads back 3. Pins the chain-length-3+ branch of
