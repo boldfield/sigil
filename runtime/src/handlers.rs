@@ -187,60 +187,6 @@ thread_local! {
     /// `register_handler_stack_root_for_calling_thread`, idempotent
     /// per thread.
     static HANDLER_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
-    /// Per-thread last-terminal tag: records whether the most recent
-    /// `sigil_run_loop` invocation terminated via `Done` (body normal
-    /// completion, value subject to return arm wrapping) or
-    /// `Discharged` (op arm body's discard-`k` tail, value IS the
-    /// handle's final value, return arm bypassed).
-    ///
-    /// Initial value `NEXT_STEP_TAG_DONE` so any caller that queries
-    /// before any run_loop has run gets the conservative answer
-    /// (don't bypass return arm). Set by `sigil_run_loop` immediately
-    /// before returning the terminal value; queried by codegen via
-    /// `sigil_last_terminal_tag` after the run_loop call returns.
-    ///
-    /// **No GC root** — the value is `u32`, not a heap pointer. No
-    /// `register_*_for_calling_thread` is needed.
-    ///
-    /// **Single-threaded v1**: the TLS keeps the API multi-thread-safe
-    /// for future expansion; today's `sigil_run_loop` runs on a single
-    /// thread, but the per-thread design avoids globally-mutable state.
-    static LAST_TERMINAL_TAG: Cell<u32> = const { Cell::new(NEXT_STEP_TAG_DONE) };
-
-    /// Per-thread last-terminal value: records the u64 value the most
-    /// recent `sigil_run_loop` invocation returned at terminal time
-    /// (whether DONE or DISCHARGED).
-    ///
-    /// Stage-6.8-followup Bug 1 fix companion to `LAST_TERMINAL_TAG`.
-    /// Codegen at `Expr::Handle`'s `lower_expr` queries this when the
-    /// body has post-perform code (`{ let _ = perform; tail }` shape):
-    /// without it, body_val computed by synchronous body lowering
-    /// reflects the body's IR-local terminal value, NOT the discharged
-    /// arm's value. The arm's discharged value flows back through the
-    /// trampoline's terminal but gets narrowed at the perform's
-    /// narrow-back to perform's declared return type (lossy when arm
-    /// discharges a value of a different type) and then the body's
-    /// post-perform code overwrites it. By saving the run_loop's raw
-    /// terminal u64 here, the handle expression can recover the
-    /// discharged value when tag == DISCHARGED.
-    ///
-    /// Initial value `0` (any value is safe — codegen only reads when
-    /// LAST_TERMINAL_TAG == DISCHARGED, and the discharge tag is only
-    /// set by `sigil_run_loop`'s terminal). Set by `sigil_run_loop`
-    /// immediately before returning the terminal value; queried by
-    /// codegen via `sigil_last_terminal_value` after run_loop returns.
-    ///
-    /// **No GC root** — the value is u64. The TLS does NOT carry a
-    /// stable heap-pointer rooting contract; codegen must consume the
-    /// value before any GC-triggering operation that could reclaim a
-    /// heap object whose pointer was parked here. In practice the
-    /// consumer site (`Expr::Handle` discharge_block) reads the value
-    /// immediately and threads it through the merge_block's param,
-    /// where Cranelift's register / spill discipline keeps it live for
-    /// Boehm's conservative scan. A future precise-GC pass would
-    /// require either rooting this TLS or moving the value into a
-    /// stack slot at consumption time.
-    static LAST_TERMINAL_VALUE: Cell<u64> = const { Cell::new(0) };
 
     /// Plan D Task 117 — push/pop relink discipline tracker.
     ///
@@ -963,82 +909,15 @@ pub unsafe extern "C" fn sigil_next_step_done(value: u64) -> *mut NextStep {
     ns
 }
 
-/// Read the per-thread `LAST_TERMINAL_TAG` set by the most recent
-/// `sigil_run_loop` invocation. Returns `NEXT_STEP_TAG_DONE` if the
-/// run_loop terminated via body-normal completion (return arm should
-/// fire), or `NEXT_STEP_TAG_DISCHARGED` if it terminated via op arm
-/// body's discard-`k` tail (return arm should be bypassed —
-/// discharged value IS the handle's final value per algebraic-effects
-/// semantics).
-///
-/// Initial value (before any `sigil_run_loop` runs) is
-/// `NEXT_STEP_TAG_DONE` — conservative for callers that query before
-/// running anything.
-///
-/// # Safety
-///
-/// Safe to call. Reads thread-local state without mutation.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_last_terminal_tag() -> u32 {
-    LAST_TERMINAL_TAG.with(|c| c.get())
-}
-
-/// Reset the per-thread `LAST_TERMINAL_TAG` to `NEXT_STEP_TAG_DONE`.
-/// Emitted by codegen at the entry of each `Expr::Handle` lowering
-/// before the body is lowered, so that handle bodies which do not
-/// invoke `sigil_run_loop` (e.g., `handle 5 with { ... }`) see a
-/// clean `DONE` state when their outer logic queries
-/// `sigil_last_terminal_tag` post-body. Without this reset, the tag
-/// would carry over from any prior run_loop on the same thread,
-/// producing spurious return-arm-skips for handles whose bodies
-/// never discharge.
-///
-/// # Safety
-///
-/// Safe to call. Writes thread-local state with no other side effects.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_reset_last_terminal_tag() {
-    LAST_TERMINAL_TAG.with(|c| c.set(NEXT_STEP_TAG_DONE));
-}
-
-/// Read the per-thread `LAST_TERMINAL_VALUE` set by the most recent
-/// `sigil_run_loop` invocation. Returns the raw u64 the trampoline
-/// returned at terminal time (whether DONE or DISCHARGED).
-///
-/// Stage-6.8-followup Bug 1 fix companion to `sigil_last_terminal_tag`.
-/// Codegen reads this when `LAST_TERMINAL_TAG == NEXT_STEP_TAG_DISCHARGED`
-/// to recover the discharged value when body has post-perform code that
-/// would otherwise overwrite the natural body_val with body's IR-locally-
-/// computed terminal.
-///
-/// Initial value (before any `sigil_run_loop` runs) is `0`. Codegen only
-/// reads when the tag indicates DISCHARGED, so the initial-zero is never
-/// observable in well-formed programs.
-///
-/// # Safety
-///
-/// Safe to call. Reads thread-local state without mutation.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_last_terminal_value() -> u64 {
-    LAST_TERMINAL_VALUE.with(|c| c.get())
-}
-
-/// Reset the per-thread `LAST_TERMINAL_VALUE` to `0`. Emitted alongside
-/// `sigil_reset_last_terminal_tag` at the top of each `Expr::Handle`
-/// lowering so handles whose body never runs the trampoline see a
-/// clean state instead of inheriting a prior run's value. Reading this
-/// when the tag is DONE is undefined behavior at the source level
-/// (codegen's discharge_block is gated on tag == DISCHARGED), but
-/// resetting prevents any future code path from observing a stale
-/// value.
-///
-/// # Safety
-///
-/// Safe to call. Writes thread-local state with no other side effects.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_reset_last_terminal_value() {
-    LAST_TERMINAL_VALUE.with(|c| c.set(0));
-}
+// Plan D Task 111d — `sigil_last_terminal_tag`,
+// `sigil_reset_last_terminal_tag`, `sigil_last_terminal_value`,
+// `sigil_reset_last_terminal_value` are gone. Codegen reads / inits
+// the caller-owned `TerminalResult` slot directly via load/store at
+// `terminal_out_param`'s pointer. The four FFI helpers + their TLS
+// statics shipped in Plan B (Phase 4f / Stage-6.8-followup Bug 1+2
+// fixes) and dual-wrote alongside `*out` from 111a–111c; the slot
+// became authoritative once the ABI threading completed and the TLS
+// path is now removed entirely.
 
 // ---------------------------------------------------------------------
 // Task 78.5 G4 Approach 6 deep-redo — body-return-arm stack helpers
@@ -1215,8 +1094,9 @@ pub unsafe extern "C" fn sigil_done_or_dispatch_return_arm(v: u64) -> *mut NextS
 /// return clause's wrapper). The trampoline propagates the value
 /// identically to `Done` (including routing through the outer post_arm_k
 /// stack for multi-shot composition); the distinction is recorded in
-/// `LAST_TERMINAL_TAG` for the handle expression's outer codegen logic
-/// to query via `sigil_last_terminal_tag`.
+/// the caller-owned `TerminalResult` slot's `tag` field (Plan D Task
+/// 111d; previously TLS) for the handle expression's outer codegen
+/// logic to query via a load from `terminal_out_param + 8`.
 ///
 /// See `[DEVIATION Stage-6.8-followup Bug 2] Return arm dispatch on
 /// op-arm-discharge values violates algebraic-effects semantics` for
@@ -1771,30 +1651,24 @@ pub unsafe extern "C" fn sigil_perform(
 ///
 /// **Why `tag: u64` not `u32`.** Uniform 8-byte fields keep the layout
 /// simple: every slot is `Store/Load.i64`-shaped, no half-word
-/// arithmetic, no padding question. Pre-fix this PR briefly stored
-/// `tag` as `u32` (matching the pre-existing `LAST_TERMINAL_TAG`
-/// type); the `u64` widening is a deliberate uniform-field choice for
-/// the new caller-owned ABI, not a load-bearing requirement. The
-/// high 32 bits are unused.
+/// arithmetic, no padding question. The high 32 bits of `tag` are
+/// unused.
 ///
 /// **Threading discipline (post-111d).** Caller-owned: the top-level
-/// shim allocates a `TerminalResult` on the C stack and passes its
-/// pointer to `user_main` via a `+1` ABI param. Every Sigil user fn
-/// (Sync OR Cps) propagates the pointer to its callees. Every
-/// `sigil_run_loop` invocation receives the pointer from its caller
-/// (Sync→Cps interop wrapper, custom handle body-call wrapper, Phase
-/// 4g return-arm dispatch). The trampoline writes to `*out` at terminal
-/// time. Cross-fn discharge propagation works because all writes/reads
-/// reference the SAME memory location threaded through the call chain.
-///
-/// **Threading discipline (this PR — 111a, transitional).** Compiler
-/// passes **null** at every `sigil_run_loop` call site. The trampoline
-/// writes to `*out` only when non-null; with null, only the existing
-/// TLS write fires. TLS remains authoritative for handle-exit reads.
-/// PR 111b switches the Sync ABI to thread a caller-owned slot
-/// pointer through every Sync user fn signature; 111c extends to Cps
-/// ABI + synth fns; 111d switches handle-exit reads from TLS to the
-/// caller-owned pointer and removes TLS storage + 4 FFI helpers.
+/// `main` shim allocates a `TerminalResult` on the C stack and passes
+/// its pointer to `user_main` via the trailing Sync ABI param. Every
+/// Sigil user fn (Sync OR Cps) propagates the pointer to its callees
+/// (Sync ABI's trailing param, Cps ABI's 4th positional param via
+/// `cps_signature`). Every `sigil_run_loop` invocation receives the
+/// pointer from its caller (Sync→Cps interop wrapper, custom handle
+/// body-call wrapper, perform-side run_loop drive, branched k-call
+/// dispatch, Slice B fallback, Phase 4g return-arm dispatch); the
+/// trampoline writes `(value, tag)` to `*out` at every terminal site
+/// (DONE + DISCHARGED) before returning. Codegen at handle-exit
+/// queries the slot via load from `terminal_out_param + {0,8}` to
+/// determine return-arm dispatch. Cross-fn discharge propagation
+/// works because all writes/reads reference the SAME memory location
+/// threaded through the call chain.
 #[repr(C)]
 pub struct TerminalResult {
     pub value: u64,
@@ -1816,15 +1690,16 @@ pub struct TerminalResult {
 ///
 /// # Plan D Task 111 — `out: *mut TerminalResult`
 ///
-/// **Contract.** When non-null, the trampoline writes the terminal's
-/// `(value, tag)` pair to `*out` before returning. The write happens
-/// at exactly the same moment as the existing TLS write (both DONE
-/// branch and DISCHARGED bypass writes are mirrored to `*out`) —
-/// same value, same tag, same instant. When null, the `*out` write
-/// is skipped; only TLS is updated. **Null is an accepted ABI value**
-/// for 111a's transitional state where the compiler passes null at
-/// every call site; PRs 111b/c thread a caller-owned pointer through
-/// every fn ABI.
+/// **Contract.** The trampoline writes the terminal's `(value, tag)`
+/// pair to `*out` before returning at every terminal site (DONE and
+/// DISCHARGED bypass). The slot is the **sole terminal channel**
+/// post-111d — TLS-mirrored writes that ran during the 111a→111c
+/// transition are removed. Codegen always passes a non-null pointer
+/// (main shim allocates the root slot; every Sync/Cps/synth fn ABI
+/// threads it through). **Null is an accepted ABI value** for
+/// runtime unit tests that drive `sigil_run_loop` directly with
+/// `ptr::null_mut()` to test dispatch shape without observing the
+/// terminal — the `*out` write is skipped under null.
 ///
 /// **Alignment.** `TerminalResult` requires 8-byte alignment (`u64`
 /// fields). Callers passing non-null pointers must satisfy this. A
@@ -1892,14 +1767,16 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // site can correctly skip return arm dispatch on the
                 // R-typed discharge value.
                 if tag == NEXT_STEP_TAG_DISCHARGED {
-                    LAST_TERMINAL_TAG.with(|c| c.set(tag));
-                    LAST_TERMINAL_VALUE.with(|c| c.set(v));
-                    // Plan D Task 111 (transitional 111a) — also write
-                    // to caller-owned `*out`. PRs 111b/c will switch
-                    // codegen reads from TLS to this slot; 111d will
-                    // remove TLS. Null check guards against test
-                    // callers that pass null while iterating to the
-                    // new contract.
+                    // Plan D Task 111d — caller-owned `TerminalResult`
+                    // slot is the sole terminal channel. Codegen
+                    // always passes a non-null pointer (main shim
+                    // allocates the root slot; every Sync/Cps/synth
+                    // fn ABI threads it through). Null is tolerated
+                    // here for runtime tests that drive `sigil_run_-
+                    // loop` directly without observing the terminal
+                    // (e.g., testing dispatch shape rather than
+                    // value); they pass `ptr::null_mut()` and ignore
+                    // the channel.
                     if !out.is_null() {
                         ptr::write(
                             out,
@@ -1907,27 +1784,6 @@ pub unsafe extern "C" fn sigil_run_loop(
                                 value: v,
                                 tag: tag as u64,
                             },
-                        );
-                        // PR #90 R1 issue 3 — TLS-vs-pointer agreement.
-                        // Read both back and assert they hold the same
-                        // (tag, v). Tautological under single-threaded
-                        // sequential execution today but documents the
-                        // load-bearing invariant during the 111a→111d
-                        // transition: dual-write must converge. Catches
-                        // any future reordering, aliasing, or write
-                        // failure that desyncs the two channels before
-                        // 111d removes TLS.
-                        debug_assert_eq!(
-                            ptr::read(out).value,
-                            LAST_TERMINAL_VALUE.with(|c| c.get()),
-                            "sigil_run_loop DISCHARGED: *out.value disagrees with \
-                             LAST_TERMINAL_VALUE TLS — dual-write desync"
-                        );
-                        debug_assert_eq!(
-                            ptr::read(out).tag,
-                            LAST_TERMINAL_TAG.with(|c| c.get()) as u64,
-                            "sigil_run_loop DISCHARGED: *out.tag disagrees with \
-                             LAST_TERMINAL_TAG TLS — dual-write desync"
                         );
                     }
                     // Drain outer_post_arm_k stack back to entry-time
@@ -1982,8 +1838,9 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // through the outer chain identically to a Done value;
                 // the discharge-vs-done distinction matters only at
                 // the top-level run_loop terminal, where the handle
-                // expression's outer codegen logic queries
-                // `LAST_TERMINAL_TAG` to decide return-arm dispatch.
+                // expression's outer codegen logic loads the tag from
+                // the caller-owned `TerminalResult.tag` slot to
+                // decide return-arm dispatch (Plan D Task 111d).
                 if let Some(entry) = outer_post_arm_k_try_pop() {
                     // Reset the arena before allocating the new Call.
                     crate::arena::sigil_arena_reset();
@@ -2029,10 +1886,15 @@ pub unsafe extern "C" fn sigil_run_loop(
                      pushed without a matching terminal pop, OR popped \
                      entries belonging to an outer run_loop"
                 );
-                LAST_TERMINAL_TAG.with(|c| c.set(tag));
-                LAST_TERMINAL_VALUE.with(|c| c.set(v));
-                // Plan D Task 111 (transitional 111a) — see DISCHARGED
-                // bypass site above for the full mechanism note.
+                // Plan D Task 111d — see DISCHARGED bypass site above
+                // for the channel discipline note. The `!out.is_null()`
+                // check is **unreachable from generated code** post-
+                // 111d (codegen always threads a non-null pointer
+                // from the main shim's stack-allocated slot through
+                // every Sync/Cps/synth ABI). It exists for runtime
+                // unit tests that drive `sigil_run_loop` directly
+                // with `ptr::null_mut()` to test dispatch shape
+                // without observing the terminal channel.
                 if !out.is_null() {
                     ptr::write(
                         out,
@@ -2040,20 +1902,6 @@ pub unsafe extern "C" fn sigil_run_loop(
                             value: v,
                             tag: tag as u64,
                         },
-                    );
-                    // PR #90 R1 issue 3 — TLS-vs-pointer agreement.
-                    // See DISCHARGED bypass site above for full note.
-                    debug_assert_eq!(
-                        ptr::read(out).value,
-                        LAST_TERMINAL_VALUE.with(|c| c.get()),
-                        "sigil_run_loop DONE: *out.value disagrees with \
-                         LAST_TERMINAL_VALUE TLS — dual-write desync"
-                    );
-                    debug_assert_eq!(
-                        ptr::read(out).tag,
-                        LAST_TERMINAL_TAG.with(|c| c.get()) as u64,
-                        "sigil_run_loop DONE: *out.tag disagrees with \
-                         LAST_TERMINAL_TAG TLS — dual-write desync"
                     );
                 }
                 // Reset the arena before returning so the next

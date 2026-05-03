@@ -998,7 +998,8 @@ fn catch_example_recovers_with_42() {
 /// - Stage-6.8-followup Layer 2: lifted lambda's k(arg) self-applies
 ///   originating handle's return arm.
 /// - Stage-6.8-followup Bug 1: recover discharged value across
-///   non-tail-perform body via LAST_TERMINAL_VALUE TLS.
+///   non-tail-perform body via the caller-owned `TerminalResult.value`
+///   slot (Plan D Task 111d; previously TLS).
 /// - Stage-6.8-followup Layer 3a: tag-conditional return-arm
 ///   self-apply (skip on DISCHARGED, apply on DONE).
 /// - Stage-6.8-followup Layer 3b: Sync shims for Cps-ABI fns at
@@ -4596,10 +4597,11 @@ fn handle_with_post_perform_body_code_uses_arm_discharge_value() {
     // arm's lambda. The handle's overall came out as body's identity
     // lambda; `f(7)` evaluated to 7 instead of 107.
     //
-    // Post-fix: runtime saves the trampoline's terminal value in
-    // `LAST_TERMINAL_VALUE`; the handle expression's discharge_block
-    // reads it (and similarly in the no-return-arm path's new
-    // discharge branch), recovering the arm's discharge value
+    // Post-fix: runtime writes the trampoline's terminal `(value,
+    // tag)` to the caller-owned `TerminalResult` slot (Plan D Task
+    // 111d; previously TLS); the handle expression's discharge_block
+    // loads from offset 0 (and similarly in the no-return-arm path's
+    // new discharge branch), recovering the arm's discharge value
     // regardless of body shape. f = arm's `fn (x) => x + 100`.
     // f(7) = 107.
     //
@@ -9547,8 +9549,9 @@ fn task_78_5_g4_approach6_b_neq_r_pointer_return_arm_through_char_body() {
 /// This test exercises the *wrapper-engaged* discharge path: body is
 /// `body_fn()` (a direct Cps user fn call → wrapper engages → PUSH a
 /// real return-arm pair → run_loop), and body_fn performs an op whose
-/// arm discharges `k`. The trampoline records LAST_TERMINAL_TAG =
-/// DISCHARGED, returns the discharged value (99 here) as the
+/// arm discharges `k`. The trampoline writes DISCHARGED to the
+/// caller-owned `TerminalResult.tag` slot (Plan D Task 111d;
+/// previously TLS), returns the discharged value (99 here) as the
 /// trampoline's u64. The wrapper POPs (fired = false because helper
 /// never reached a body-fn natural-exit emit site — body discharged
 /// before that), and Phase 4g's three-way branch:
@@ -10797,5 +10800,170 @@ fn task_78_5_g4_b3_non_recursive_cps_to_cps_direct_dispatch_in_synth_cont_tail()
          run_loop with broken capture handling), B.3's direct-dispatch \
          args-packing or post-arm-k forwarding regressed. \
          stderr={stderr:?}"
+    );
+}
+
+/// **Plan D Task 111d — caller-owned terminal channel propagation.**
+///
+/// Pins the new pointer-side path end-to-end: a handle-exit terminal
+/// value (DISCHARGED tag + payload) must flow through nested Sync
+/// user-fn calls (each thread its caller's `*mut TerminalResult` as
+/// the trailing ABI param), be written by `sigil_run_loop` at the
+/// innermost perform site (`*out = TerminalResult { value, tag }`),
+/// and be observed by the outer handle's tag/value loads from the
+/// SAME caller-owned slot.
+///
+/// Test shape — three levels of Sync user fn nesting between the
+/// handle and the perform:
+///
+///   ```sigil
+///   handle a() with { Eff.kill(_,_) => 17 }
+///   ```
+///   - `a()` calls `b()`, `b()` calls `c()`, `c()` performs `Eff.kill`.
+///   - The arm discards `k` and returns `17`, which the trampoline
+///     records as DISCHARGED with value 17.
+///   - The terminal flow: c's perform site's `sigil_run_loop` writes
+///     `*out = (17, DISCHARGED)`. c returns. b returns. a returns to
+///     the handle expression. The handle-exit tag-load reads
+///     `*out.tag = DISCHARGED` from the SAME slot (threaded down 3
+///     levels and back), routes to the discharge_block, loads
+///     `*out.value = 17`, narrows to `Int`, and returns 17 as the
+///     handle's overall.
+///
+/// Pre-111d this routing went through TLS (`LAST_TERMINAL_TAG` /
+/// `LAST_TERMINAL_VALUE`); 111d removed TLS and made the
+/// caller-owned slot the sole terminal channel. If 111d's ABI
+/// threading (Sync→Sync trailing-param forwarding) or the run_loop's
+/// `*out` write or codegen's load is broken, the discharge tag won't
+/// be observed at handle exit, return-arm dispatch fires
+/// incorrectly, and the output diverges from `"17\n"`.
+///
+/// **Invariant:** stdout = `"17\n"`, exit 0.
+#[test]
+fn task_111d_terminal_channel_propagation_through_nested_sync_calls() {
+    let src = "import std.io\n\
+               \n\
+               effect Eff { kill: () -> Int }\n\
+               \n\
+               fn c() -> Int ![Eff] {\n  \
+                 perform Eff.kill()\n\
+               }\n\
+               \n\
+               fn b() -> Int ![Eff] {\n  \
+                 c()\n\
+               }\n\
+               \n\
+               fn a() -> Int ![Eff] {\n  \
+                 b()\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = handle a() with {\n    \
+                   Eff.kill(_k) => 17,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_111d_terminal_channel_propagation_through_nested_sync_calls",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "17\n",
+        "Plan D Task 111d: handle-exit terminal value (17, DISCHARGED) \
+         must propagate through 3 levels of Sync user fn calls (a → b → \
+         c) via the caller-owned `*mut TerminalResult` slot threaded as \
+         the trailing Sync ABI param. The arm discards k and returns \
+         17; the trampoline writes (17, DISCHARGED) to the slot at the \
+         perform site's run_loop terminal; codegen at the handle exit \
+         loads tag and value from the SAME slot and routes through \
+         discharge_block. stderr={stderr:?}"
+    );
+}
+
+/// **Plan D Task 111d PR #92 R1 issue 1 — nested-handle slot leak.**
+///
+/// Pins the snapshot/restore discipline at every handle expression's
+/// entry/exit boundary. The surrounding fn's `terminal_out_param`
+/// slot is shared across every handle expression in the fn AND every
+/// nested `sigil_run_loop` call. Without snapshot/restore, an inner
+/// handle whose op-arm DISCHARGES leaves `(value, DISCHARGED)` in
+/// the slot; the outer handle's exit-tag query then reads the
+/// inner's leftover and incorrectly:
+///
+/// 1. Skips the outer's return arm (DISCHARGED → discharge_block),
+///    AND
+/// 2. Loads the inner's leftover value as the handle's overall.
+///
+/// The fix snapshots the slot at handle entry and restores it at
+/// every exit path (return-arm and no-return-arm merge-blocks).
+/// This test program's expected output:
+///
+///   - `outer_body` performs `E1.op1()` (resumed by main's E1 arm
+///     via `k(0)` → run_loop terminates DONE, slot = (0, DONE))
+///   - inner handle: `inner_body()` performs `E2.op2()` which the
+///     inner arm DISCHARGES with 99 → slot = (99, DISCHARGED).
+///     Inner's exit reads tag = DISCHARGED → discharge_block →
+///     `inner = 99`.
+///   - **Inner's exit restores the snapshot** = (0, DONE).
+///   - `outer_body` continues: `inner * 10 = 990`. Returns 990.
+///   - main's outer handle exit: reads tag = DONE (snapshot
+///     correctly restored) → return arm fires: `990 + 100 = 1090`.
+///
+/// Pre-fix output is `99\n` (inner's discharged value leaked through
+/// outer's exit). Post-fix output is `1090\n`.
+///
+/// Pre-111d this leak existed identically in TLS form (the inner's
+/// run_loop also wrote `LAST_TERMINAL_TAG = DISCHARGED` which the
+/// outer's exit-tag query read), but no test exercised the
+/// composition. Brian flagged the gap on PR #92 R1 issue 1; the
+/// snapshot/restore fix lands in 111d before declaring `[DEVIATION
+/// Task 111]` fully closed.
+///
+/// **Invariant:** stdout = `"1090\n"`, exit 0.
+#[test]
+fn task_111d_nested_handle_inner_discharge_does_not_leak_to_outer() {
+    let src = "import std.io\n\
+               \n\
+               effect E1 { op1: () -> Int }\n\
+               effect E2 { op2: () -> Int }\n\
+               \n\
+               fn inner_body() -> Int ![E2] {\n  \
+                 let _: Int = perform E2.op2();\n  \
+                 7\n\
+               }\n\
+               \n\
+               fn outer_body() -> Int ![E1, E2] {\n  \
+                 let _: Int = perform E1.op1();\n  \
+                 let inner: Int = handle inner_body() with {\n    \
+                   E2.op2(_k) => 99,\n  \
+                 };\n  \
+                 inner * 10\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let outer: Int = handle outer_body() with {\n    \
+                   E1.op1(k) => k(0),\n    \
+                   E2.op2(k) => k(0),\n    \
+                   return(v) => v + 100,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(outer));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "task_111d_nested_handle_inner_discharge_does_not_leak_to_outer",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1090\n",
+        "Plan D Task 111d snapshot/restore: inner handle's \
+         (value=99, tag=DISCHARGED) terminal must NOT leak into the \
+         outer handle's exit-tag query. Outer body returns naturally \
+         (`inner * 10 = 990`); outer's exit must read DONE (the \
+         restored snapshot) and dispatch the return arm (`v + 100 = \
+         1090`). Pre-fix output is `99` (leaked DISCHARGED + leaked \
+         inner value). stderr={stderr:?}"
     );
 }
