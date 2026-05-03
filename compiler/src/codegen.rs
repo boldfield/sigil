@@ -262,9 +262,34 @@ fn compute_user_fn_abi(
     // helper the pre-pass uses, so the ABI selection sees the real
     // K + N combination instead of the conservative `N >=
     // MAX_CLOSURE_ENV_SLOTS` that the classifier alone enforces.
-    let is_cps_user_fn = |callee_name: &str| colored.needs_cps_transform(callee_name);
+    // Plan D Task 112 — callee lookup for the wrapper-Call let-RHS
+    // shape. Accept only TAIL-PERFORM Cps user fns (those whose
+    // body matches `is_simple_tail_perform_with_pure_args_body`).
+    // Build a fns_by_name map upfront so the closure can look up
+    // each callee's body without walking the program per call site.
+    let fns_by_name: std::collections::BTreeMap<&str, &crate::ast::FnDecl> = colored
+        .mono
+        .anf
+        .checked
+        .program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            crate::ast::Item::Fn(f) => Some((f.name.as_str(), f.as_ref())),
+            _ => None,
+        })
+        .collect();
+    let is_tail_perform_cps_user_fn = |callee_name: &str| {
+        if !colored.needs_cps_transform(callee_name) {
+            return false;
+        }
+        match fns_by_name.get(callee_name) {
+            Some(f) => is_simple_tail_perform_with_pure_args_body(&f.body, &ctors),
+            None => false,
+        }
+    };
     if let Some(chain_length) =
-        is_simple_chained_let_yield_then_pure_tail_body(body, &ctors, &is_cps_user_fn)
+        is_simple_chained_let_yield_then_pure_tail_body(body, &ctors, &is_tail_perform_cps_user_fn)
     {
         let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
         let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
@@ -7552,12 +7577,35 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     });
                     cps_continuation_synth_indices.insert(f.name.clone(), synth_cont_idx);
                 } else if let Some(chain_length) = {
-                    let is_cps_user_fn =
-                        |callee_name: &str| cc.colored.needs_cps_transform(callee_name);
+                    // Plan D Task 112 — same callee restriction as
+                    // `compute_user_fn_abi`'s call site: only accept
+                    // tail-perform Cps user fns.
+                    let fns_by_name: std::collections::BTreeMap<&str, &crate::ast::FnDecl> = cc
+                        .colored
+                        .mono
+                        .anf
+                        .checked
+                        .program
+                        .items
+                        .iter()
+                        .filter_map(|item| match item {
+                            crate::ast::Item::Fn(f) => Some((f.name.as_str(), f.as_ref())),
+                            _ => None,
+                        })
+                        .collect();
+                    let is_tail_perform_cps_user_fn = |callee_name: &str| {
+                        if !cc.colored.needs_cps_transform(callee_name) {
+                            return false;
+                        }
+                        match fns_by_name.get(callee_name) {
+                            Some(f) => is_simple_tail_perform_with_pure_args_body(&f.body, &ctors),
+                            None => false,
+                        }
+                    };
                     is_simple_chained_let_yield_then_pure_tail_body(
                         &f.body,
                         &ctors,
-                        &is_cps_user_fn,
+                        &is_tail_perform_cps_user_fn,
                     )
                 } {
                     // Extract per-step let-binding info (name +
@@ -7946,7 +7994,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_arm_ref,
                 handler_frame_set_return_ref,
                 perform_ref,
-                outer_post_arm_k_push_ref,
+                outer_post_arm_k_push_ref: _,
                 run_loop_ref,
                 next_step_discharged_ref,
                 last_terminal_tag_ref,
@@ -9359,34 +9407,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             .stackmap
                             .push_placeholder(function_code_offset(&lowerer.builder, push_call));
 
-                        // Plan D Task 112 — chain-routing PUSH on
-                        // OUTER_POST_ARM_K_STACK. PUSH the chain's
-                        // first-step pair (= k_closure_loaded /
-                        // k_fn_loaded — for chained-let-yield case
-                        // this is `(closure_with_captures, step_0_addr)`)
-                        // so the wrapper Cps fn's natural-exit Done
-                        // routes through the chain's first step.
-                        // For tail-perform wrappers this push is
-                        // redundant (the trailing-pair k_pair
-                        // forwarding handles routing via the perform's
-                        // arm) and gets drained on Discharged terminal.
-                        // For chained-let-yield Cps wrappers (e.g.
-                        // sub_cps_fn whose body is `let _ = perform
-                        // E.op(); body_tail`) the wrapper IGNORES the
-                        // trailing-pair k_pair (uses its own internal
-                        // chain pair); without this push, the
-                        // wrapper's Done would terminate the chain
-                        // prematurely and the wrap-handler would fire
-                        // on the wrapper's value (Risk-3-like leak
-                        // through the OUTER_POST_ARM_K side-channel).
-                        let push_outer_call = lowerer
-                            .builder
-                            .ins()
-                            .call(outer_post_arm_k_push_ref, &[k_closure_loaded, k_fn_loaded]);
-                        lowerer.stackmap.push_placeholder(function_code_offset(
-                            &lowerer.builder,
-                            push_outer_call,
-                        ));
+                        // Plan D Task 112 followup-deferred —
+                        // chain-routing OUTER_POST_ARM_K_STACK push
+                        // for chained-let-yield Cps wrappers
+                        // (Risk 3 shape) was attempted in commit
+                        // 7b56eec and reverted: the unconditional
+                        // push caused re-dispatch abort for tail-
+                        // perform wrappers (the routing pop
+                        // re-invokes the chain step that already
+                        // fired via the perform's k_pair). A
+                        // wrapper-shape-conditional push is needed
+                        // (only push when callee is chained-let-
+                        // yield Cps, not tail-perform Cps); deferred
+                        // to a follow-up. For now: tail-perform
+                        // wrapper tests pass (state, std/state,
+                        // random, clock); chained-let-yield Cps
+                        // wrapper tests (task_78_5_g4_approach6_-
+                        // risk3_*) produce 1099 / 1108 instead of
+                        // 1100 / 1105 (Risk 3 protection partially
+                        // works via BODY_RETURN_ARM push but
+                        // routing back to chain step doesn't fire).
 
                         let call_ns = lowerer.builder.ins().call(
                             lowerer.next_step_call_ref,
@@ -12647,23 +12687,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             push_call,
                                         ));
 
-                                        // Plan D Task 112 — chain-
-                                        // routing PUSH on
-                                        // OUTER_POST_ARM_K_STACK. PUSH
-                                        // step_(i+1)_pair (= the
-                                        // next-step closure_ptr /
-                                        // synth-cont fn_addr we just
-                                        // computed). See helper-body
-                                        // Phase 6 CallCps emit for
-                                        // rationale.
-                                        let push_outer_call = lowerer.builder.ins().call(
-                                            outer_post_arm_k_push_ref,
-                                            &[next_closure_ptr, next_step_fn_addr],
-                                        );
-                                        lowerer.stackmap.push_placeholder(function_code_offset(
-                                            &lowerer.builder,
-                                            push_outer_call,
-                                        ));
+                                        // Plan D Task 112 followup-
+                                        // deferred — chain-routing
+                                        // OUTER_POST_ARM_K_STACK push
+                                        // for chained-let-yield Cps
+                                        // wrappers (Risk 3 shape) was
+                                        // attempted and reverted; see
+                                        // helper-body Phase 6 CallCps
+                                        // emit for the disposition
+                                        // (wrapper-shape-conditional
+                                        // push needed; deferred).
 
                                         let call_ns = lowerer.builder.ins().call(
                                             lowerer.next_step_call_ref,
@@ -19816,7 +19849,7 @@ fn is_simple_yield_then_constant_tail_body(
 fn is_simple_chained_let_yield_then_pure_tail_body(
     body: &crate::ast::Block,
     ctors: &std::collections::BTreeSet<String>,
-    is_cps_user_fn: &impl Fn(&str) -> bool,
+    is_tail_perform_cps_user_fn: &impl Fn(&str) -> bool,
 ) -> Option<usize> {
     use crate::ast::{Expr, Stmt};
     if body.stmts.is_empty() {
@@ -19839,19 +19872,40 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
             }
             // Plan D Task 112 — wrapper-Call let-RHS. Accept iff:
             // (a) callee is a bare `Expr::Ident(name)` resolving
-            //     to a top-level Cps user fn (per the Cps-color
-            //     sweep — `is_cps_user_fn(name)` returns true), and
+            //     to a TAIL-PERFORM Cps user fn (its body matches
+            //     `is_simple_tail_perform_with_pure_args_body`),
+            //     and
             // (b) every arg is pure (same purity check as
-            //     perform-args). The wrapper body itself yields
-            //     (it's Cps), so it threads the chain's k-pair
-            //     into its own perform site via the trailing-pair
-            //     args buffer convention.
+            //     perform-args).
+            //
+            // The tail-perform restriction is load-bearing: tail-
+            // perform Cps wrappers FORWARD the trailing-pair k_pair
+            // to their inner perform site (via Phase 6's
+            // synth_cont_func_id_opt = None branch loading from
+            // args_ptr trailing slots). This makes them transparent
+            // to the chain's k-pair propagation — the perform's
+            // arm captures the chain's pair, and the chain
+            // continues through the lambda chain (state-threading
+            // pattern) or through the arm's tail-k → step_(i+1)
+            // dispatch (normal-resume pattern).
+            //
+            // Chained-let-yield Cps wrappers (e.g., sub_cps_fn whose
+            // body is `let _ = perform E.op(); body_tail` —
+            // chain_length>=1) IGNORE the trailing-pair k_pair
+            // (use their own internal chain pair), breaking
+            // chain composition. Supporting them requires an
+            // additional OUTER_POST_ARM_K_STACK push to route the
+            // wrapper's natural-exit Done back to the outer chain
+            // step — but the unconditional push regressed tail-
+            // perform tests via re-dispatch. Wrapper-shape-
+            // conditional push is the closure path; deferred to
+            // a Task 112 follow-up. See PLAN_D_DEVIATIONS.md.
             Expr::Call { callee, args, .. } => {
                 let callee_name = match callee.as_ref() {
                     Expr::Ident(n, _) => n,
                     _ => return None,
                 };
-                if !is_cps_user_fn(callee_name) {
+                if !is_tail_perform_cps_user_fn(callee_name) {
                     return None;
                 }
                 if !args.iter().all(|a| expr_is_pure(a, ctors)) {
