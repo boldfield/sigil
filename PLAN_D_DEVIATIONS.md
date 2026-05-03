@@ -95,41 +95,55 @@ Plan B' Stage-6.8-followup carryover #1 (TLS → packed multi-return) status upd
 
 **Reverted commits (do NOT cherry-pick):** `4dfdbc7`, `670f7a1`, `5e2686e`, `4086307` — all on the abandoned `plan-d-task-111` branch (closed without merge per PR #50). The branch is preserved for the diagnostic record.
 
-## 2026-04-30 — [DEVIATION Task 112] Deferred — wrapper-fn-frame composition is structurally similar to Task 111, defer alongside it
+## 2026-04-30 — [DEVIATION Task 112] Original entry SUPERSEDED 2026-05-03 by [DEVIATION Task 112a] + [DEVIATION Task 112b]
 
-**Context.** Plan D Task 112 calls for a "wrapper-fn-frame composition fix" that closes `[DEVIATION Task 72]` constraint #3 and un-ignores `std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix`. The plan body framed this as a "narrow, well-pinned" Stage 11 foundation lift. Investigation surfaced architectural complexity comparable to Task 111.
+The original Task 112 deferral (initial deferral 2026-04-30) was reopened 2026-05-03 after the architectural read in this session demonstrated Task 117's substrate does NOT unblock Task 112 (the surfaces are disjoint). Task 112 was then split into two sub-tasks by user direction:
 
-**Bug shape.** `std/state.sigil`'s discharge-with-lambda arm bodies (`State.set(arg, k) => fn (s) => k(arg)(arg)`) only thread state correctly when the body has the **chained-let-yield** shape (let-perform; let-perform; tail), where the body is Cps and the perform-chain lifts into synth-cont steps. The arm's captured `k` IS a synth-cont step; when state_fn(initial) invokes `k(arg)(arg)`, it re-enters the synth-cont chain at the perform site to thread state.
+- **Task 112a — tail-perform Cps wrapper composition.** Shipped via PR #83. See `[DEVIATION Task 112a]` below.
+- **Task 112b — chained-let-yield Cps wrapper composition.** Deferred with named closure path. See `[DEVIATION Task 112b]` below.
 
-With wrappers (`set_state(s) = perform State.set(s)`), the calling fn's (e.g., `comp`'s) body shape becomes `let _ = fn_call(args); let v = fn_call(); tail` — **Sync ABI**. Sync calls have run_loop drives at each call site but no synth-cont chain. `set_state` itself is Cps tail-perform, but its emitted `k` is `continuation_identity` (not a chain step). When state_fn(5) invokes `k(10)(10)`, k=identity returns 10, and `10(10)` is a fn-call on an Int — producing the observed "5" via runtime garbage (likely a jump to address 5).
+The original deferral entry's content (Bug shape / Why architecturally similar to Task 111 / Fix paths considered / Closure path / Stage 11 implication / Smoke-gate impact) is preserved verbatim above this paragraph for commit-history readability; the substantive disposition is in the two new entries below.
 
-**Why architecturally similar to Task 111.** Both Stage 11 tasks turn out to require cross-fn behavior:
+## 2026-05-03 — [DEVIATION Task 112a] Tail-perform Cps wrapper composition — CLOSED
 
-| Task | Structural issue |
-|---|---|
-| 111 | Cross-fn discharge tag visibility (TLS achieves it implicitly) |
-| 112 | Cross-fn synth-cont chain (the wrapper Sync call breaks the chain) |
+**Context.** Plan D Task 112's deferral was reopened after Task 117's substrate was confirmed disjoint from Task 112's blocker. User authorized a single-PR architectural slice (1500-line budget). Implementation surfaced that the lift cleanly handles tail-perform Cps wrappers (callee body matches `is_simple_tail_perform_with_pure_args_body`) but requires additional codegen mechanism for chained-let-yield Cps wrappers (callee has chain length ≥ 1). User then split into 112a (tail-perform shipped this PR) and 112b (chained-let-yield deferred).
 
-**Fix paths considered:**
+**What shipped.** Tail-perform Cps wrapper composition. The chained-let-yield classifier (`is_simple_chained_let_yield_then_pure_tail_body`) now accepts `let _ = wrapper_call(args)` shapes when the callee is a tail-perform Cps user fn. Body classifies as Cps; helper-body and Middle-step emit thread the chain's k-pair through the wrapper boundary via the trailing-pair args-buffer convention.
 
-- **(A) Inline `is_simple_tail_perform_with_pure_args_body` wrappers at the call site.** Extend the chained-let-yield body recognizer to treat `let _ = wrapper_call(args)` as `let _ = perform E.op(args)`; emit the chain accordingly. Localized but real codegen change.
-- **(B) Wrapper-frame-aware continuation walk** in the discharge-with-lambda machinery. Substantial rework.
-- **(C) Defer alongside Task 111.** Stage 11 collapses to no foundation lifts shipped; both tasks land alongside Task 117 first-class-k where the broader continuation surface is open for redesign.
+**Mechanism (Candidate (a)).** Direct k-pair threading via args-buffer trailing slots. Tail-perform Cps wrappers FORWARD the trailing-pair k_pair to their inner perform site (Phase 6's `synth_cont_func_id_opt = None` branch loads from `args_ptr` trailing slots). The wrapper is transparent to the chain's k-pair propagation — the perform's arm captures the chain's pair, and the chain continues through the lambda chain (state-threading) or the arm's tail-k → step_(i+1) dispatch (normal-resume).
 
-Option (C) chosen by user direction (2026-04-30) on the same architectural-complexity grounds as Task 111. The inline-perform shape (`examples/state.sigil` and `std_state_run_state_set_get_returns_11`) continues to work; user-visible state-threading is preserved. Wrappers stay deferred without breaking anything currently passing.
+**Codegen sites.** See PR #83 body for full file:line citations. Key:
+- `is_simple_chained_let_yield_then_pure_tail_body` (codegen.rs:19277): accept `Expr::Call` let-RHS gated on `is_tail_perform_cps_user_fn` lookup.
+- `walk_collect_captures` (codegen.rs:3378): descend into `Expr::Call` args.
+- `ChainedNextStep` enum (new): `Perform(PerformExpr)` + `CallCps { callee_name, args }`.
+- Helper-body Phase 6 emit + Middle-step emit: branch on step kind; CallCps emits `NextStep::Call(callee_addr, args + k_pair, user_arg_count + 2)` (the +2 is the trailing pair, mirroring synth-arm-fn tail-k convention).
+- Risk 3 protection: PUSH (null, null) on BODY_RETURN_ARM_STACK at CallCps emit + conditional POP at chain step entry (gated on new `prior_was_call_cps: bool` field on `ChainedLetBindStep`).
 
-**Why accepted (deferral over re-attempt).** Quality-of-life improvement, not a correctness-of-existing-tests gate. Inline-perform shape continues to work for state-threading. JSON parser part 2 (Plan C completion's Task 80 part 2), originally cited as the smoke-gate downstream consumer of Task 112, continues to defer with this entry — the parser's recursive-descent shape that needed the wrapper-fn-frame fix can wait for Task 117's broader continuation work.
+**Tests.** 4 new e2e tests (`task_112_*`) covering the canonical state-threading shape, chain length 4, binding-in-tail, mixed inline/wrapper. Un-ignored: `std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix` (the original deferral test). Pre-existing tests preserved: `task_78_5_g4_approach6_risk3_*` (chained-let-yield wrapper case — falls back to Sync ABI, lower_call's Cps branch handles via SAVE+CLEAR+RESTORE BODY_RETURN_ARM); `std_clock_two_calls_monotonic`, `std_random_two_calls_produce_two_outputs` (tail-perform wrappers — pass via new chain emit).
 
-**Failure mode.** None at the user-visible surface. The `#[ignore]`'d test `std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix` stays `#[ignore]`'d.
+**Closure points.** Partial close of `PLAN_C_DEVIATIONS.md` `[DEVIATION Task 72]` constraint #3 — wrapper-fn-frame discharge composition. Plan B' Stage-6.8-followup architectural carryover (wrapper-fn-frame fix) — partial: tail-perform shipped; chained-let-yield outstanding (Task 112b).
 
-**Closure path.** Same closure path as `[DEVIATION Task 111]`:
+**Implementing PR.** PR #83. Commits on branch `task-112-wrapper-fn-frame-composition-fix`:
+- `ac45a09` — initial architectural slice (classifier + ChainedNextStep enum + helper/middle emit).
+- `8290719` — OOB args buffer fix + Risk 3 BODY_RETURN_ARM PUSH/POP discipline + sister-test rename.
+- `7b56eec` — chain-routing OUTER_POST_ARM_K push attempt (REVERTED by next commit; preserved for empirical evidence).
+- `f5a2618` — revert OUTER push + restrict classifier to tail-perform Cps wrappers (keeps tail-perform tests passing; preserves Risk 3 fallback for chained-let-yield wrappers).
 
-1. **Recommended:** defer to Task 117 first-class-k follow-up. The continuation-surface rework Task 117 entails is the natural co-ship point; whichever architectural choice Task 117 settles on can subsume both Task 111 and Task 112's cross-fn requirements.
-2. **Alternative:** ship option (A) wrapper-inline as its own task. Comparable scope to Plan B' B.3 surface lifts.
+## 2026-05-03 — [DEVIATION Task 112b] Chained-let-yield Cps wrapper composition — DEFERRED
 
-**Stage 11 implication.** Stage 11 ("foundation lifts: Tasks 111 + 112") has both tasks deferred. Plan D effectively skips Stage 11 and proceeds directly to Stage 12. The Stage 11 review checkpoint is replaced by a single deferral checkpoint covering both tasks.
+**Context.** Task 112's split into 112a (tail-perform, shipped) + 112b (chained-let-yield, deferred). PR #83 attempted to handle both via an unconditional OUTER_POST_ARM_K_STACK push at CallCps emit (commit `7b56eec`); the push regressed tail-perform wrapper tests via re-dispatch abort and was reverted. The chained-let-yield Cps wrapper case requires a wrapper-shape-conditional codegen path; deferred to its own PR.
 
-**Smoke-gate impact.** JSON parser part 2 (Plan C completion's Task 80 part 2) was named as the Stage 11 smoke target via Task 112. With Task 112 deferred, JSON parser part 2 stays deferred to Plan C completion's broader v2 follow-up. Plan D's done-criteria #3 (Sudoku + JSON parser half compile and run) is partially scoped down: the architectural cluster lands without these specific demo gates; the demos remain expressible-after-Plan-D for the components Plan D ships, with Sudoku and JSON parser deferring on the Task 117 / 112 axes respectively.
+**Failure mode.** Discharge-with-lambda handler arm (`fn(s) => k(arg)(arg)` state-threading shape) called against a body that uses a chained-let-yield Cps wrapper helper produces silent garbage value (same shape as the original Task 112 deferral, just narrowed to chained-let-yield-class wrappers — tail-perform wrappers now compose correctly via Task 112a). Reproduces under `task_78_5_g4_approach6_risk3_*` shape if the wrapper itself is chained-let-yield (e.g., the test's `sub_cps_fn` whose body is `let _ = perform Log.write("hi"); 99` — chain length 1).
+
+Today the chained-let-yield wrapper case is masked: classifier rejects (per Task 112a), body falls back to Sync ABI, `lower_call`'s Cps branch handles via SAVE+CLEAR+RESTORE BODY_RETURN_ARM_STACK pattern. This preserves `task_78_5_g4_approach6_risk3_*` correctness but at the cost of NOT being able to compose chained-let-yield wrappers into a chained-let-yield body (the body stays Sync; no chain emit fires).
+
+**Why deferred.** Chained-let-yield Cps wrappers IGNORE the trailing-pair k_pair (use their own internal chain pair instead of forwarding the caller's pair to their perform). Routing requires an OUTER_POST_ARM_K_STACK push of the chain's next-step pair — but the unconditional push regressed tail-perform wrapper tests via re-dispatch (PR #83 commit `7b56eec` → `f5a2618` reverted). Fix requires wrapper-shape-conditional push: detect at codegen time whether the callee is tail-perform vs chained-let-yield and emit the OUTER_POST_ARM_K_STACK push only for the latter.
+
+**Closure path.** Codegen-side wrapper-shape detector + conditional OUTER_POST_ARM_K_STACK push at the helper-body Phase 6 CallCps emit and Middle-step CallCps emit. The shape detector is straightforward (look up callee body via `fns_by_name` and check `is_simple_chained_let_yield_then_pure_tail_body` returns `Some(_)` AND `is_simple_tail_perform_with_pure_args_body` returns `false`). The conditional push wires into the existing CallCps emit path with a runtime `if`-on-callee-shape... actually simpler at CODEGEN time (before emit, decide which emit form). Architecturally similar to PR #83's scope — single-PR territory (~200-400 lines codegen + tests).
+
+**Owner.** Task 112b (Plan D scope; named here as a successor to Task 112a).
+
+**Gate.** Plan D Task 119 closeout MUST wait for Task 112b shipping IF the JSON parser-half (or any other Plan D smoke-gate consumer) requires chained-let-yield wrapper helpers. Tail-perform wrapper helpers (the canonical `fn next_token() -> Token ![Tokens] { perform Tokens.peek() }` shape) work today via Task 112a; if the parser-half can be expressed entirely in tail-perform wrappers, Task 119 closeout proceeds without waiting for 112b.
 
 **Implementing commit.** [HEAD] (this entry).
 
