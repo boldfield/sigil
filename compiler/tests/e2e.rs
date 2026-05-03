@@ -7475,7 +7475,8 @@ fn task_112_wrapper_chain_three_sets_then_get_returns_3() {
                  let _a: Int = set_state(1);\n  \
                  let _b: Int = set_state(2);\n  \
                  let _c: Int = set_state(3);\n  \
-                 get_state()\n\
+                 let v: Int = get_state();\n  \
+                 v\n\
                }\n\
                fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
                  let state_fn: (Int) -> Int ![] = handle body() with {\n    \

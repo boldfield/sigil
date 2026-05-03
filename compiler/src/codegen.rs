@@ -7946,7 +7946,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_arm_ref,
                 handler_frame_set_return_ref,
                 perform_ref,
-                outer_post_arm_k_push_ref: _,
+                outer_post_arm_k_push_ref,
                 run_loop_ref,
                 next_step_discharged_ref,
                 last_terminal_tag_ref,
@@ -9358,6 +9358,35 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         lowerer
                             .stackmap
                             .push_placeholder(function_code_offset(&lowerer.builder, push_call));
+
+                        // Plan D Task 112 — chain-routing PUSH on
+                        // OUTER_POST_ARM_K_STACK. PUSH the chain's
+                        // first-step pair (= k_closure_loaded /
+                        // k_fn_loaded — for chained-let-yield case
+                        // this is `(closure_with_captures, step_0_addr)`)
+                        // so the wrapper Cps fn's natural-exit Done
+                        // routes through the chain's first step.
+                        // For tail-perform wrappers this push is
+                        // redundant (the trailing-pair k_pair
+                        // forwarding handles routing via the perform's
+                        // arm) and gets drained on Discharged terminal.
+                        // For chained-let-yield Cps wrappers (e.g.
+                        // sub_cps_fn whose body is `let _ = perform
+                        // E.op(); body_tail`) the wrapper IGNORES the
+                        // trailing-pair k_pair (uses its own internal
+                        // chain pair); without this push, the
+                        // wrapper's Done would terminate the chain
+                        // prematurely and the wrap-handler would fire
+                        // on the wrapper's value (Risk-3-like leak
+                        // through the OUTER_POST_ARM_K side-channel).
+                        let push_outer_call = lowerer
+                            .builder
+                            .ins()
+                            .call(outer_post_arm_k_push_ref, &[k_closure_loaded, k_fn_loaded]);
+                        lowerer.stackmap.push_placeholder(function_code_offset(
+                            &lowerer.builder,
+                            push_outer_call,
+                        ));
 
                         let call_ns = lowerer.builder.ins().call(
                             lowerer.next_step_call_ref,
@@ -12616,6 +12645,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         lowerer.stackmap.push_placeholder(function_code_offset(
                                             &lowerer.builder,
                                             push_call,
+                                        ));
+
+                                        // Plan D Task 112 — chain-
+                                        // routing PUSH on
+                                        // OUTER_POST_ARM_K_STACK. PUSH
+                                        // step_(i+1)_pair (= the
+                                        // next-step closure_ptr /
+                                        // synth-cont fn_addr we just
+                                        // computed). See helper-body
+                                        // Phase 6 CallCps emit for
+                                        // rationale.
+                                        let push_outer_call = lowerer.builder.ins().call(
+                                            outer_post_arm_k_push_ref,
+                                            &[next_closure_ptr, next_step_fn_addr],
+                                        );
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            push_outer_call,
                                         ));
 
                                         let call_ns = lowerer.builder.ins().call(
