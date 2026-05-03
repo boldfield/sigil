@@ -1748,6 +1748,46 @@ pub unsafe extern "C" fn sigil_perform(
     std::process::abort();
 }
 
+/// Plan D Task 111 — caller-owned terminal channel for `sigil_run_loop`.
+///
+/// **Layout** (`#[repr(C)]`, 16 bytes):
+/// - `value: u64` at offset 0 — the terminal value (DONE's payload OR
+///   DISCHARGED's payload).
+/// - `tag: u64` at offset 8 — `NEXT_STEP_TAG_DONE` (= 0) or
+///   `NEXT_STEP_TAG_DISCHARGED` (= 2).
+///
+/// **Why `tag: u64` not `u32`.** Uniform 8-byte fields keep the layout
+/// simple: every slot is `Store/Load.i64`-shaped, no half-word
+/// arithmetic, no padding question. Pre-fix this PR briefly stored
+/// `tag` as `u32` (matching the pre-existing `LAST_TERMINAL_TAG`
+/// type); the `u64` widening is a deliberate uniform-field choice for
+/// the new caller-owned ABI, not a load-bearing requirement. The
+/// high 32 bits are unused.
+///
+/// **Threading discipline (post-111d).** Caller-owned: the top-level
+/// shim allocates a `TerminalResult` on the C stack and passes its
+/// pointer to `user_main` via a `+1` ABI param. Every Sigil user fn
+/// (Sync OR Cps) propagates the pointer to its callees. Every
+/// `sigil_run_loop` invocation receives the pointer from its caller
+/// (Sync→Cps interop wrapper, custom handle body-call wrapper, Phase
+/// 4g return-arm dispatch). The trampoline writes to `*out` at terminal
+/// time. Cross-fn discharge propagation works because all writes/reads
+/// reference the SAME memory location threaded through the call chain.
+///
+/// **Threading discipline (this PR — 111a, transitional).** Compiler
+/// passes **null** at every `sigil_run_loop` call site. The trampoline
+/// writes to `*out` only when non-null; with null, only the existing
+/// TLS write fires. TLS remains authoritative for handle-exit reads.
+/// PR 111b switches the Sync ABI to thread a caller-owned slot
+/// pointer through every Sync user fn signature; 111c extends to Cps
+/// ABI + synth fns; 111d switches handle-exit reads from TLS to the
+/// caller-owned pointer and removes TLS storage + 4 FFI helpers.
+#[repr(C)]
+pub struct TerminalResult {
+    pub value: u64,
+    pub tag: u64,
+}
+
 /// Drive the CPS trampoline starting from `initial_step`. Each
 /// iteration:
 ///
@@ -1761,13 +1801,40 @@ pub unsafe extern "C" fn sigil_perform(
 ///
 /// Every iteration increments `SIGIL_COUNTER_TRAMPOLINE_DISPATCH_COUNT`.
 ///
+/// # Plan D Task 111 — `out: *mut TerminalResult`
+///
+/// **Contract.** When non-null, the trampoline writes the terminal's
+/// `(value, tag)` pair to `*out` before returning. The write happens
+/// at exactly the same moment as the existing TLS write (both DONE
+/// branch and DISCHARGED bypass writes are mirrored to `*out`) —
+/// same value, same tag, same instant. When null, the `*out` write
+/// is skipped; only TLS is updated. **Null is an accepted ABI value**
+/// for 111a's transitional state where the compiler passes null at
+/// every call site; PRs 111b/c thread a caller-owned pointer through
+/// every fn ABI.
+///
+/// **Alignment.** `TerminalResult` requires 8-byte alignment (`u64`
+/// fields). Callers passing non-null pointers must satisfy this. A
+/// `debug_assert!` at function entry catches violations in debug
+/// builds.
+///
 /// # Safety
 ///
 /// `initial_step` must be a valid `*mut NextStep` produced by
 /// `sigil_next_step_done` or `sigil_next_step_call`. The fns referenced
 /// by any `CALL` step must satisfy the CPS calling convention.
+/// `out` must be either null or a valid pointer to a writable
+/// 8-byte-aligned `TerminalResult`.
 #[no_mangle]
-pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
+pub unsafe extern "C" fn sigil_run_loop(
+    initial_step: *mut NextStep,
+    out: *mut TerminalResult,
+) -> u64 {
+    debug_assert!(
+        out.is_null() || (out as usize).is_multiple_of(core::mem::align_of::<TerminalResult>()),
+        "sigil_run_loop: `out` pointer must be 8-byte aligned (got {:p})",
+        out
+    );
     let mut current = initial_step;
     // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
     // run_loop entry. On the DISCHARGED bypass terminal (introduced by
@@ -1814,6 +1881,21 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                 if tag == NEXT_STEP_TAG_DISCHARGED {
                     LAST_TERMINAL_TAG.with(|c| c.set(tag));
                     LAST_TERMINAL_VALUE.with(|c| c.set(v));
+                    // Plan D Task 111 (transitional 111a) — also write
+                    // to caller-owned `*out`. PRs 111b/c will switch
+                    // codegen reads from TLS to this slot; 111d will
+                    // remove TLS. Null check guards against test
+                    // callers that pass null while iterating to the
+                    // new contract.
+                    if !out.is_null() {
+                        ptr::write(
+                            out,
+                            TerminalResult {
+                                value: v,
+                                tag: tag as u64,
+                            },
+                        );
+                    }
                     // Drain outer_post_arm_k stack back to entry-time
                     // depth. Entries pushed by synth-cont Middle steps
                     // during this run_loop's chain stay leaked across
@@ -1915,6 +1997,17 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                 );
                 LAST_TERMINAL_TAG.with(|c| c.set(tag));
                 LAST_TERMINAL_VALUE.with(|c| c.set(v));
+                // Plan D Task 111 (transitional 111a) — see DISCHARGED
+                // bypass site above for the full mechanism note.
+                if !out.is_null() {
+                    ptr::write(
+                        out,
+                        TerminalResult {
+                            value: v,
+                            tag: tag as u64,
+                        },
+                    );
+                }
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
@@ -2113,10 +2206,103 @@ mod tests {
         reset_state();
         let ns = unsafe { sigil_next_step_done(99) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns, std::ptr::null_mut()) };
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 99);
         assert_eq!(dispatches_after - dispatches_before, 1);
+        reset_state();
+    }
+
+    /// Plan D Task 111a — verify `sigil_run_loop` writes to caller-
+    /// passed `*out` at the DONE terminal. Pins the new ABI's contract
+    /// so PRs 111b/c can rely on it without proving the runtime side
+    /// works on top of their codegen-side diff.
+    #[test]
+    fn run_loop_done_terminal_writes_caller_passed_terminal_result() {
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let mut term = TerminalResult { value: 0, tag: 0 };
+        let ns = unsafe { sigil_next_step_done(0xDEAD_BEEF_u64) };
+        let v = unsafe { sigil_run_loop(ns, &mut term as *mut _) };
+        assert_eq!(v, 0xDEAD_BEEF_u64);
+        assert_eq!(
+            term.value, 0xDEAD_BEEF_u64,
+            "*out.value must hold the DONE terminal's value"
+        );
+        assert_eq!(
+            term.tag, NEXT_STEP_TAG_DONE as u64,
+            "*out.tag must be NEXT_STEP_TAG_DONE on DONE-terminal"
+        );
+        reset_state();
+    }
+
+    /// Plan D Task 111a — verify `sigil_run_loop` writes to caller-
+    /// passed `*out` at the DISCHARGED bypass terminal.
+    #[test]
+    fn run_loop_discharged_terminal_writes_caller_passed_terminal_result() {
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let mut term = TerminalResult { value: 0, tag: 0 };
+        let ns = unsafe { sigil_next_step_discharged(0xCAFE_BABE_u64) };
+        let v = unsafe { sigil_run_loop(ns, &mut term as *mut _) };
+        assert_eq!(v, 0xCAFE_BABE_u64);
+        assert_eq!(
+            term.value, 0xCAFE_BABE_u64,
+            "*out.value must hold the DISCHARGED terminal's value"
+        );
+        assert_eq!(
+            term.tag, NEXT_STEP_TAG_DISCHARGED as u64,
+            "*out.tag must be NEXT_STEP_TAG_DISCHARGED on DISCHARGED-bypass terminal"
+        );
+        reset_state();
+    }
+
+    /// Plan D Task 111a — verify the null-`*out` ABI is accepted and
+    /// the trampoline still produces correct DONE values via the TLS
+    /// path (the path codegen actually uses in 111a). Sanity check
+    /// that pre-fix-state still works exactly as before.
+    #[test]
+    fn run_loop_null_out_does_not_panic_and_returns_value() {
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let ns = unsafe { sigil_next_step_done(7_u64) };
+        let v = unsafe { sigil_run_loop(ns, std::ptr::null_mut()) };
+        assert_eq!(v, 7);
+        reset_state();
+    }
+
+    /// Plan D Task 111a — verify the trampoline does NOT write `*out`
+    /// during non-terminal iteration (only at terminal time). Pins the
+    /// contract that *out is touched at most once per `sigil_run_loop`
+    /// invocation, on terminal.
+    #[test]
+    fn run_loop_does_not_write_out_during_non_terminal_iteration() {
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        // Pre-fill *out with a sentinel that the trampoline must not
+        // overwrite during non-terminal iteration.
+        let mut term = TerminalResult {
+            value: 0xFFFF_FFFF_FFFF_FFFF_u64,
+            tag: 0xAAAA_AAAA_AAAA_AAAA_u64,
+        };
+        // Drive a Call → Done sequence; the Call iteration is
+        // non-terminal, so *out must stay at sentinel until the Done
+        // terminal overwrites with the actual value.
+        let ns = unsafe { sigil_next_step_call(ptr::null_mut(), cps_done_plus_one as *mut u8, 1) };
+        let args = unsafe { sigil_next_step_args_ptr(ns) };
+        unsafe { args.write(41) };
+        let v = unsafe { sigil_run_loop(ns, &mut term as *mut _) };
+        assert_eq!(v, 42);
+        // After the terminal, *out reflects the DONE value (42, DONE
+        // tag). If *out had been written during the non-terminal Call
+        // iteration, we'd see some intermediate state — the existing
+        // contract guarantees we don't.
+        assert_eq!(term.value, 42, "*out.value at terminal");
+        assert_eq!(term.tag, NEXT_STEP_TAG_DONE as u64, "*out.tag at terminal");
         reset_state();
     }
 
@@ -2129,7 +2315,7 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(41) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns, std::ptr::null_mut()) };
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 42);
         assert_eq!(dispatches_after - dispatches_before, 2);
@@ -2146,7 +2332,7 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(5) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns, std::ptr::null_mut()) };
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         // 5 -> Call(cps_call_then_plus_one, 5)
         // -> Call(cps_done_plus_one, 5+10=15)
@@ -2201,7 +2387,7 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(42) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns, std::ptr::null_mut()) };
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 42);
         // 2 dispatches: one for the Call (loop dispatches identity,
@@ -2405,7 +2591,7 @@ mod tests {
             assert_eq!(depth_sum_after - depth_sum_before, 1);
 
             // Dispatch the resulting NextStep through the trampoline.
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 700);
 
             // Pop the frame to leave a clean handler stack.
@@ -2438,7 +2624,7 @@ mod tests {
             let depth_after = counters::read(CounterId::HandlerWalkDepthSum);
             // Outer is on top, target is one below; walk depth = 2.
             assert_eq!(depth_after - depth_before, 2);
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 300);
             let _ = sigil_handle_pop();
             let _ = sigil_handle_pop();
@@ -2481,7 +2667,7 @@ mod tests {
             // SAFETY: gc-heap-ptr arithmetic (user_args is a stack local).
             let user_args_ptr = user_args.as_ptr();
             let ns = sigil_perform(7, 0, user_args_ptr, 2, 0xCC as *mut u8, 0xDD as *mut u8);
-            let _ = sigil_run_loop(ns);
+            let _ = sigil_run_loop(ns, std::ptr::null_mut());
             let _ = sigil_handle_pop();
         }
         reset_state();
@@ -2571,7 +2757,7 @@ mod tests {
                 3,
                 "expected walk depth 3 (outer + middle + target)"
             );
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 400);
             let _ = sigil_handle_pop();
             let _ = sigil_handle_pop();
@@ -2619,7 +2805,7 @@ mod tests {
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 1100);
             let _ = sigil_handle_pop();
         }
@@ -2725,7 +2911,7 @@ mod tests {
             let arg = 9u64;
             let arg_ptr = &arg as *const u64;
             let ns = sigil_perform(4242, 0, arg_ptr, 1, ptr::null_mut(), ptr::null_mut());
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 900);
             let _ = sigil_handle_pop();
         }
@@ -2785,7 +2971,7 @@ mod tests {
             // arm_read_closure_sentinel with closure_ptr = the original
             // closure; it reads the sentinel and returns it.
             let ns = sigil_perform(7777, 0, ptr::null(), 0, ptr::null_mut(), ptr::null_mut());
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
             let _ = sigil_handle_pop();
         }
@@ -2835,7 +3021,7 @@ mod tests {
             // would read freed bytes (could be anything; sentinel
             // mismatch would fire the assert).
             let initial = sigil_next_step_call(ptr::null_mut(), cps_alloc_then_gc as *mut u8, 0);
-            let result = sigil_run_loop(initial);
+            let result = sigil_run_loop(initial, std::ptr::null_mut());
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
         }
         reset_state();
@@ -3044,7 +3230,7 @@ mod tests {
 
         unsafe {
             let initial = sigil_next_step_call(ptr::null_mut(), cps_push_then_done as *mut u8, 0);
-            let result = sigil_run_loop(initial);
+            let result = sigil_run_loop(initial, std::ptr::null_mut());
             // 42 + 1 = 43; cps_done_with_arg adds 1 to its arg.
             assert_eq!(result, 43);
         }
