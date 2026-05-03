@@ -1831,8 +1831,7 @@ pub unsafe extern "C" fn sigil_run_loop(
     out: *mut TerminalResult,
 ) -> u64 {
     debug_assert!(
-        out.is_null()
-            || (out as usize).is_multiple_of(core::mem::align_of::<TerminalResult>()),
+        out.is_null() || (out as usize).is_multiple_of(core::mem::align_of::<TerminalResult>()),
         "sigil_run_loop: `out` pointer must be 8-byte aligned (got {:p})",
         out
     );
