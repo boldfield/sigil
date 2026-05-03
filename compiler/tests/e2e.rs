@@ -7703,35 +7703,53 @@ fn task_112b_chained_wrapper_3_deep_nested_via_visited_set_returns_1() {
     );
 }
 
-/// Plan D Task 112b sister test (PR #85 review, open Case D) —
-/// chained-let-yield wrapper called from inside ANOTHER chained
-/// body (wrapper-in-chain), under a handler whose arm body uses
-/// the Slice B `let r = k(arg); pure_tail` shape. Currently
-/// `#[ignore]`'d because:
+/// Plan D Task 112c — Case D fix: chained-let-yield wrapper-in-chain
+/// with Slice B outer arm. The wrapper-in-chain semantic is "chain
+/// continues": the wrapper's tail flows through caller's chain via
+/// caller_k_pair, and Slice B fires once at the OUTERMOST body's tail
+/// (not at the wrapper's tail).
 ///
-/// 1. The semantic the gate's comment claims ("Slice B's pure_tail
-///    IS the discharge value, the chain doesn't continue") is
-///    plausible but theoretical — no test in the corpus exercises
-///    the intersection of wrapper-in-chain + Slice B outer-arm.
-/// 2. Designing the right test requires settling the semantic
-///    question first: does the user expect `pure_tail` to be the
-///    handle's discharge value, OR does the user expect the outer
-///    chain step to fire after `pure_tail` evaluates?
-/// 3. The (2c) gate's runtime branch routes via post_arm_k (Slice
-///    B path) when `post_arm_k_fn != identity`, which means the
-///    Slice B synth fn fires and the outer chain step does NOT
-///    fire. This is the "discharge value" semantic. A test that
-///    expects the OTHER semantic (chain continues) would surface
-///    a (2c)-gate gap.
+/// **Pre-fix**: gate at chained-let-yield Final discriminated solely
+/// on `post_arm_k_fn`. With wrapper-in-chain + Slice B outer arm, the
+/// args_ptr trailing pair was (slice_b_synth_closure, slice_b_synth_fn)
+/// — non-identity — so the gate routed via post_arm_k_dispatch and
+/// fired Slice B at the WRAPPER's Final with the wrapper's tail (99).
+/// `r=99 → r+1=100`. WRONG: comp's chain step never fired; the
+/// "outer chain continues" invariant broken.
 ///
-/// Marked `#[ignore]` rather than removed so the gap is tracked in
-/// code rather than only in prose (per PR #85 review 2 🟡 Case D).
-/// Un-ignore after the semantic is settled and a concrete expected
-/// stdout is decided. Owner: future Task 112c (or a Task 78.5
-/// follow-up exercising deeper Koka subset surface).
+/// **Post-fix**: gate now discriminates on `caller_k_fn` first. When
+/// caller_k_fn != identity (wrapper-in-chain), gate routes via
+/// caller_k_pair AND forwards post_arm_k as the new args_ptr trailing
+/// pair. helper's tail (99) flows into comp's chain step → comp
+/// binds _x=99 → comp's tail = 0 → comp's Final fires. comp's gate
+/// sees caller_k_fn = identity (top-level) AND post_arm_k_fn =
+/// slice_b_synth_fn (forwarded) → routes via top_post_arm_k_dispatch
+/// → Slice B fires with comp's tail (0). `r=0 → r+1=1`. CORRECT.
+///
+/// **Trace**:
+/// - perform Eff.fail() at helper. Handler arm fires.
+/// - Lifted lambda for `let r = k(7); r+1`. k(7) emit (Slice B):
+///   NextStep::Call(perform_synth_cont, 3) with args_ptr =
+///   [7, slice_b_closure, slice_b_fn].
+/// - perform_synth_cont = helper's step_0 synth-cont. Binds _a=7.
+///   Runs helper's tail = 99. Helper's Final's gate. caller_k_fn
+///   loaded from synth_closure_ptr = comp_step_0_fn (non-identity →
+///   wrapper-in-chain). Forward post_arm_k.
+/// - Dispatch NextStep::Call(comp_step_0_pair, [99, slice_b_closure,
+///   slice_b_fn], 3).
+/// - comp_step_0 (Final, since comp's chain has only one wrapper-Call
+///   step) binds _x=99. Runs comp's tail = 0. comp's Final's gate.
+///   caller_k_fn loaded from synth_closure_ptr = identity_k_fn (top-
+///   level — comp is the outermost body). Branch into top_level_block.
+///   post_arm_k_fn loaded from args_ptr = slice_b_synth_fn (forwarded
+///   from helper's gate dispatch). Branch into
+///   top_post_arm_k_dispatch_block. Dispatch
+///   NextStep::Call(slice_b_pair, [0], 1).
+/// - Slice B synth fn binds r=0. Computes pure_tail = r+1 = 1.
+///   Done(1).
+/// - Trampoline returns 1 to the handle's body run_loop. n=1.
 #[test]
-#[ignore = "Task 112b Case D — wrapper-in-chain + Slice B outer arm; semantic question open, gap tracked here"]
-fn task_112b_case_d_wrapper_in_chain_with_slice_b_outer_arm_pending_semantic() {
+fn task_112c_case_d_wrapper_in_chain_with_slice_b_outer_arm_returns_1() {
     let src = "effect Eff { fail: () -> Int }\n\
                fn helper() -> Int ![Eff] {\n  \
                  let _a: Int = perform Eff.fail();\n  \
@@ -7751,21 +7769,128 @@ fn task_112b_case_d_wrapper_in_chain_with_slice_b_outer_arm_pending_semantic() {
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
-    let (_stdout, _stderr, _code) = compile_and_run(src, "task_112b_case_d_pending_semantic");
-    // Expected stdout to be filled in once Case D's semantic is
-    // settled. Two candidates per the gate's docstring:
-    //   - "1\n" if Slice B's pure_tail IS the discharge value
-    //     (helper's tail=99 fed to k via post_arm_k → Slice B
-    //     synth fn computes r+1=100, but then comp's chain step
-    //     never fires because the trampoline returned the Slice
-    //     B's value as the discharge — chain breakage).
-    //   - "1\n" if Case D routes correctly through both: helper
-    //     returns 99 → Slice B fires (r=99, r+1=100) → outer
-    //     chain step fires with 100 as binding → comp tail = 0
-    //     → handle's overall = 100? Or 0? Depends on which path
-    //     wins.
-    // Un-ignore + fill in the correct expectation in the
-    // Task-112c PR (or wherever Case D is dispositioned).
+    let (stdout, stderr, code) = compile_and_run(src, "task_112c_case_d");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1\n",
+        "Task 112c Case D: wrapper-in-chain + Slice B outer arm. \
+         k(7) → helper continues with _a=7, returns 99 → comp \
+         binds _x=99, returns 0 → Slice B fires with r=0, \
+         r+1=1. Wrong outputs (e.g., 100) surface a regression \
+         in the chained-let-yield Final's caller_k_fn-first gate. \
+         stderr={stderr:?}"
+    );
+}
+
+/// Plan D Task 112c sister test — Case D with deeper wrapper nesting.
+/// `comp` calls `outer_helper` which calls `inner_helper` which
+/// performs. Outer arm is Slice B `let r = k(arg); r * 2`. Tests
+/// that post_arm_k forwarding propagates correctly through TWO
+/// wrapper-in-chain layers.
+///
+/// **Trace**:
+/// - inner_helper's Final's gate. caller_k_fn = outer_helper's chain-
+///   step fn (non-identity). Forward post_arm_k via caller_k_pair.
+///   Dispatch outer_helper_step_0 with [inner_tail=10, slice_b...].
+/// - outer_helper_step_0 (Final) binds _i=10. Runs outer_helper's
+///   tail = 20. outer_helper's Final's gate. caller_k_fn = comp's
+///   chain-step fn (non-identity). Forward post_arm_k.
+/// - comp_step_0 (Final) binds _o=20. Runs comp's tail = 30. comp's
+///   Final's gate. caller_k_fn = identity (top-level). post_arm_k_fn
+///   = slice_b_synth_fn → top_post_arm_k_dispatch.
+/// - Slice B fires with r=30. r*2 = 60.
+#[test]
+fn task_112c_case_d_two_layer_wrapper_chain_with_slice_b_outer_arm_returns_60() {
+    let src = "effect Eff { fail: () -> Int }\n\
+               fn inner_helper() -> Int ![Eff] {\n  \
+                 let _a: Int = perform Eff.fail();\n  \
+                 10\n\
+               }\n\
+               fn outer_helper() -> Int ![Eff] {\n  \
+                 let _i: Int = inner_helper();\n  \
+                 20\n\
+               }\n\
+               fn comp() -> Int ![Eff] {\n  \
+                 let _o: Int = outer_helper();\n  \
+                 30\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle comp() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r * 2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112c_case_d_two_layer");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "60\n",
+        "Task 112c Case D 2-layer: post_arm_k forwarding propagates \
+         through inner_helper → outer_helper → comp. Slice B fires \
+         with comp's tail=30, r*2=60. Wrong outputs surface a \
+         post_arm_k forwarding regression at depth >1. stderr={stderr:?}"
+    );
+}
+
+/// Plan D Task 112c sister test (PR #86 review nit) — Case D with
+/// 3-deep wrapper nesting. Mirrors Task 112b's
+/// `task_112b_chained_wrapper_3_deep_nested_via_visited_set_returns_1`
+/// in nesting depth, but with a Slice B outer arm to exercise
+/// post_arm_k forwarding through THREE wrapper-in-chain layers.
+///
+/// **Trace** (handler arm body = `{ let r = k(0); r + 7 }`):
+/// - level_1's Final fires after `perform Eff.fail()` resumes with 0.
+///   level_1 returns 1. caller_k_fn = level_2's chain-step fn (non-
+///   identity → wrapper-forward). Forward post_arm_k.
+/// - level_2_step_0 (Final) binds _a=1. level_2 returns 2.
+///   caller_k_fn = level_3's chain-step fn → wrapper-forward.
+/// - level_3_step_0 (Final) binds _b=2. level_3 returns 3. caller_k_fn
+///   = comp's chain-step fn → wrapper-forward.
+/// - comp_step_0 (Final) binds _c=3. comp returns 4. caller_k_fn =
+///   identity (top-level). post_arm_k_fn = slice_b_synth_fn → top_post
+///   _arm_k_dispatch.
+/// - Slice B fires with r=4. r+7 = 11.
+#[test]
+fn task_112c_case_d_three_layer_wrapper_chain_with_slice_b_outer_arm_returns_11() {
+    let src = "effect Eff { fail: () -> Int }\n\
+               fn level_1() -> Int ![Eff] {\n  \
+                 let _x: Int = perform Eff.fail();\n  \
+                 1\n\
+               }\n\
+               fn level_2() -> Int ![Eff] {\n  \
+                 let _a: Int = level_1();\n  \
+                 2\n\
+               }\n\
+               fn level_3() -> Int ![Eff] {\n  \
+                 let _b: Int = level_2();\n  \
+                 3\n\
+               }\n\
+               fn comp() -> Int ![Eff] {\n  \
+                 let _c: Int = level_3();\n  \
+                 4\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle comp() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r + 7\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112c_case_d_three_layer");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "11\n",
+        "Task 112c Case D 3-layer: post_arm_k forwarding propagates \
+         through level_1 → level_2 → level_3 → comp (3 wrapper-forward \
+         hops). Slice B fires with comp's tail=4, r+7=11. Hardens the \
+         arbitrary-depth recursion claim from PR #86. stderr={stderr:?}"
+    );
 }
 
 /// Plan D Task 112 sister test — multi-let chain with wrappers.

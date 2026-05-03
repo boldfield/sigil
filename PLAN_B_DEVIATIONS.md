@@ -720,6 +720,44 @@ and the three new Stage 6 perf tests, and updates this entry to
 **Implementing commit:** None yet — this entry tracks the debt
 forward. Surfacing entry shipped with PR #18 review fixups.
 
+**2026-05-03 follow-up tagging (during Plan D Task 112c work).** This
+entry has been open since Plan B PR #18 (Task 51 era). Re-confirmed
+on local M-series during Task 112c work: in DEFAULT (debug) mode,
+all 3 of `fib_perf_example_prints_6765_under_50ms`,
+`fib_cps_perf_example_prints_6765_under_500ms`, and
+`tree_example_prints_32767_under_500ms` exceed budget. In `--release`
+mode, 2 pass (fib_cps_perf, tree); `fib_perf` still exceeds at
+541ms vs the 50ms budget on local hardware. CI release runs
+historically pass — possibly hardware-dependent (CI macos-14 runners
+vs local M-series), possibly an undetected runtime regression.
+
+**Named follow-up disposition.** Two-stage close:
+
+- **Stage A — mechanical close (option 2 from above)**: wrap the
+  timing asserts in `#[cfg(not(debug_assertions))]` across all 5 perf
+  tests (the 2 pre-existing + 3 Plan B Task 60 tests). Closes the
+  developer-experience gap of local debug runs looking failed without
+  validating perf. ~30-50 LOC, ~30 min. **Owner: post-Plan-D
+  follow-up PR (after Plan D Task 119 closeout).** Not bundled with
+  the active Plan D Task 112c / Task 112-mutually-recursive / Task
+  111 sequence.
+
+- **Stage C — release-mode investigation**: profile `fib_perf` on
+  local M-series in release mode to identify why it exceeds the 50ms
+  budget. Possible causes: Boehm GC initialization cost dominating
+  small-program budget; Cranelift release-mode code-gen quality
+  regression; GC pressure during ~17710 fib calls; CI-runner-faster-
+  than-laptop artifact making the budget unrealistic for current
+  hardware. Profiling via `perf record` (Linux) / `instruments`
+  (macOS) and `--print-runtime-stats` if exposed. **Owner: post-Stage
+  A follow-up.** If Stage A's release-only gates close the
+  developer-experience problem AND CI continues passing, Stage C may
+  be deferred indefinitely as "not user-visible." If profiling
+  surfaces an actual code-gen regression, opens a real perf task.
+
+Both stages tagged as follow-ups to the Plan D close-out cluster
+(after Task 112c, Task 112-mutually-recursive, Task 111 land).
+
 ---
 
 ## [DEVIATION Task 53] Handler op-arm shape uses qualified `Effect.op(...)`
