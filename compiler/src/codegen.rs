@@ -12413,48 +12413,121 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     tail_value
                                 };
 
-                                // Plan D Task 112b — substitute the
-                                // Final step's terminal dispatch with
-                                // a Call to the helper's CALLER's
-                                // continuation. caller_k_pair is
-                                // loaded from this step's
-                                // synth_closure_ptr's last 2 slots
-                                // (set by the helper-body alloc and
-                                // propagated through every Middle's
-                                // copy). Args buffer follows the
-                                // synth-cont trailing-pair convention
-                                // [tail, null_post_arm_k_closure,
-                                // identity_fn_addr] so the dispatched
-                                // continuation's own Final step
-                                // (when it's a synth-cont) reads
-                                // (null, identity) and terminates via
-                                // identity → Done(its tail). At top-
-                                // level (caller_k_pair = (null,
-                                // identity_k_fn) from
-                                // `lower_handle_body_direct_cps_call`'s
-                                // pack) this dispatches identity
-                                // directly → Done(tail). When the
-                                // helper was called from another
-                                // chain's CallCps emit, caller_k_pair
-                                // points at the calling chain's next-
-                                // step synth-cont, so `tail` flows
-                                // into that step's binding.
+                                // Plan D Task 112b — runtime-gate the
+                                // Final step's terminal dispatch on
+                                // whether `post_arm_k_fn` (loaded at
+                                // the top of the chain step body
+                                // from `synth_cont_args_ptr` at
+                                // POST_ARM_K_FN_OFF) equals
+                                // `identity_fn_addr`. The gate
+                                // discriminates four cases that
+                                // semantically need different
+                                // terminal dispatch:
                                 //
-                                // Replaces the prior emit_dispatch_to
-                                // _post_arm_k(tail) call which loaded
-                                // post_arm_k from the args_ptr
-                                // trailing slots — that source held
-                                // the (null, identity) pair written
-                                // by the lifted lambda's
-                                // lower_k_pair_call, equivalent to
-                                // caller_k_pair only at top-level. In
-                                // the wrapper-in-chain case the args
-                                // _ptr post_arm_k pair is still
-                                // (null, identity) but the helper's
-                                // CALLER's continuation is a chain
-                                // synth-cont — caller_k_pair from
-                                // the closure record is the right
-                                // routing target.
+                                // - **post_arm_k_fn == identity**:
+                                //   the lifted lambda's `k(arg)`
+                                //   wrote (null, identity) into this
+                                //   chain step's args_ptr trailing
+                                //   slots (the canonical tail-k
+                                //   pattern via `lower_k_pair_call`).
+                                //   - At top-level (helper called
+                                //     directly from a handle), the
+                                //     helper's caller_k_pair is also
+                                //     (null, identity_k_fn) (PR #80's
+                                //     `lower_handle_body_direct_cps
+                                //     _call` pack). Either dispatch
+                                //     route lands in `identity` →
+                                //     `Done(tail)`. Equivalent.
+                                //   - Inside a wrapper-in-chain
+                                //     caller (helper called from
+                                //     another chain's CallCps), the
+                                //     args_ptr post_arm_k is still
+                                //     (null, identity), but the
+                                //     helper's caller_k_pair is the
+                                //     calling chain step's synth-cont
+                                //     pair — `tail` MUST flow into
+                                //     that synth-cont's binding,
+                                //     not be Done'd. Use caller_k
+                                //     _pair dispatch with [tail, null,
+                                //     identity] (3-slot trailing-pair
+                                //     convention).
+                                //
+                                //   The two sub-cases are unified by
+                                //   ALWAYS using caller_k_pair when
+                                //   post_arm_k_fn == identity. At
+                                //   top-level, caller_k_fn ==
+                                //   identity_k_fn so the dispatch
+                                //   goes through `identity` directly,
+                                //   matching the prior behavior.
+                                //
+                                // - **post_arm_k_fn != identity**:
+                                //   the lifted lambda's arm body has
+                                //   the Slice B `let r = k(arg);
+                                //   pure_tail` shape (codegen.rs
+                                //   ~10388-10470). The lifted lambda
+                                //   wrote post_arm_k_fn =
+                                //   post_arm_k_synth_fn_addr into
+                                //   the args_ptr trailing slots. The
+                                //   post-arm-k synth fn lowers
+                                //   `pure_tail` taking `r` from
+                                //   args_ptr[0]. Use the original
+                                //   post_arm_k dispatch (1-slot
+                                //   args_buf [tail]) so the synth fn
+                                //   fires after the chain Final's
+                                //   tail value. Plan D Task 112b's
+                                //   caller_k_pair routing does NOT
+                                //   apply here — Slice B is handled
+                                //   by the existing post_arm_k path,
+                                //   which correctly composes with
+                                //   the outer fn-frame for top-level
+                                //   handle bodies.
+                                //
+                                // **Open question (Case D):** wrapper-
+                                // in-chain WITH a Slice B arm body in
+                                // the OUTER handle. post_arm_k_fn
+                                // would be a Slice B synth fn; the
+                                // gate would route via post_arm_k
+                                // (skipping caller_k_pair). The Slice
+                                // B synth fn computes its tail in the
+                                // outer arm's context, returning Done
+                                // — which terminates the run_loop
+                                // driving the wrapper. The OUTER
+                                // chain step (caller_k_pair) does not
+                                // fire. This is the correct semantic
+                                // for "wrapper's perform yields and
+                                // outer arm captures the wrapper's
+                                // continuation in a `let r = k(...)`,
+                                // then computes pure_tail" — pure_tail
+                                // IS the discharge value, the chain
+                                // doesn't continue. Test corpus
+                                // doesn't exercise Case D today;
+                                // worth a follow-up sister test.
+                                let identity_fn_addr = lowerer
+                                    .builder
+                                    .ins()
+                                    .func_addr(pointer_ty, lowerer.continuation_identity_ref);
+                                let is_post_arm_k_identity = lowerer.builder.ins().icmp(
+                                    IntCC::Equal,
+                                    post_arm_k_fn,
+                                    identity_fn_addr,
+                                );
+                                let caller_dispatch_block = lowerer.builder.create_block();
+                                let post_arm_k_dispatch_block = lowerer.builder.create_block();
+                                let merge_block = lowerer.builder.create_block();
+                                lowerer.builder.append_block_param(merge_block, pointer_ty);
+                                lowerer.builder.ins().brif(
+                                    is_post_arm_k_identity,
+                                    caller_dispatch_block,
+                                    &[],
+                                    post_arm_k_dispatch_block,
+                                    &[],
+                                );
+
+                                // -- caller_dispatch_block: route
+                                //    via helper's caller_k_pair (top-
+                                //    level OR wrapper-in-chain).
+                                lowerer.builder.switch_to_block(caller_dispatch_block);
+                                lowerer.builder.seal_block(caller_dispatch_block);
                                 let caller_k_closure_off: i32 =
                                     16 + 8 * (captures.len() + prior_bindings.len()) as i32;
                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
@@ -12470,32 +12543,30 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     synth_closure_ptr,
                                     caller_k_fn_off,
                                 );
-
                                 let three_v = lowerer.builder.ins().iconst(types::I32, 3);
-                                let call_ns = lowerer.builder.ins().call(
+                                let call_ns_caller = lowerer.builder.ins().call(
                                     lowerer.next_step_call_ref,
                                     &[caller_k_closure_loaded, caller_k_fn_loaded, three_v],
                                 );
                                 lowerer.stackmap.push_placeholder(function_code_offset(
                                     &lowerer.builder,
-                                    call_ns,
+                                    call_ns_caller,
                                 ));
-                                let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
-
-                                let argp_call = lowerer
+                                let ns_ptr_caller = lowerer.builder.inst_results(call_ns_caller)[0];
+                                let argp_call_caller = lowerer
                                     .builder
                                     .ins()
-                                    .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
+                                    .call(lowerer.next_step_args_ptr_ref, &[ns_ptr_caller]);
                                 lowerer.stackmap.push_placeholder(function_code_offset(
                                     &lowerer.builder,
-                                    argp_call,
+                                    argp_call_caller,
                                 ));
-                                let argp_v = lowerer.builder.inst_results(argp_call)[0];
-
+                                let argp_v_caller =
+                                    lowerer.builder.inst_results(argp_call_caller)[0];
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
                                     widened_tail,
-                                    argp_v,
+                                    argp_v_caller,
                                     POST_ARM_K_ARG_OFF,
                                 );
                                 let null_post_arm_k_closure =
@@ -12503,21 +12574,66 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
                                     null_post_arm_k_closure,
-                                    argp_v,
+                                    argp_v_caller,
                                     POST_ARM_K_CLOSURE_OFF,
                                 );
-                                let identity_fn_addr = lowerer
-                                    .builder
-                                    .ins()
-                                    .func_addr(pointer_ty, lowerer.continuation_identity_ref);
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
                                     identity_fn_addr,
-                                    argp_v,
+                                    argp_v_caller,
                                     POST_ARM_K_FN_OFF,
                                 );
+                                lowerer
+                                    .builder
+                                    .ins()
+                                    .jump(merge_block, &[ns_ptr_caller.into()]);
 
-                                lowerer.builder.ins().return_(&[ns_ptr]);
+                                // -- post_arm_k_dispatch_block: route
+                                //    via the post-arm-k synth fn
+                                //    written by the lifted lambda's
+                                //    Slice B path (`let r = k(arg);
+                                //    pure_tail`). 1-slot args_buf
+                                //    [tail]. Mirrors the original
+                                //    `emit_dispatch_to_post_arm_k`
+                                //    helper.
+                                lowerer.builder.switch_to_block(post_arm_k_dispatch_block);
+                                lowerer.builder.seal_block(post_arm_k_dispatch_block);
+                                let one_v = lowerer.builder.ins().iconst(types::I32, 1);
+                                let call_ns_post = lowerer.builder.ins().call(
+                                    lowerer.next_step_call_ref,
+                                    &[post_arm_k_closure, post_arm_k_fn, one_v],
+                                );
+                                lowerer.stackmap.push_placeholder(function_code_offset(
+                                    &lowerer.builder,
+                                    call_ns_post,
+                                ));
+                                let ns_ptr_post = lowerer.builder.inst_results(call_ns_post)[0];
+                                let argp_call_post = lowerer
+                                    .builder
+                                    .ins()
+                                    .call(lowerer.next_step_args_ptr_ref, &[ns_ptr_post]);
+                                lowerer.stackmap.push_placeholder(function_code_offset(
+                                    &lowerer.builder,
+                                    argp_call_post,
+                                ));
+                                let argp_v_post = lowerer.builder.inst_results(argp_call_post)[0];
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    widened_tail,
+                                    argp_v_post,
+                                    0,
+                                );
+                                lowerer
+                                    .builder
+                                    .ins()
+                                    .jump(merge_block, &[ns_ptr_post.into()]);
+
+                                // -- merge_block: yield the chosen
+                                //    NextStep ptr.
+                                lowerer.builder.switch_to_block(merge_block);
+                                lowerer.builder.seal_block(merge_block);
+                                let final_ns_ptr = lowerer.builder.block_params(merge_block)[0];
+                                lowerer.builder.ins().return_(&[final_ns_ptr]);
                                 lowerer.builder.finalize();
                             }
                             ChainStepRole::Middle {
