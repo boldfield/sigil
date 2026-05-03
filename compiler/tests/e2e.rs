@@ -8553,6 +8553,79 @@ fn std_choose_inline_fail_returns_minus_one() {
     assert_eq!(stdout, "-1\n", "stderr={stderr:?}");
 }
 
+// ===== Plan D Task 117 (b) Phase 4 — runtime-N Choose dischargers =====
+
+/// `all_choices` over a body whose perform is in tail position.
+/// Each `k(i)` resumes the captured continuation with `i`; identity
+/// trailing-pair returns `Done(i)` immediately, return arm wraps as
+/// `Cons(i, Nil)`, helper appends. 3 picks → list of length 3.
+#[test]
+fn std_choose_all_choices_tail_perform_returns_three() {
+    let src = "import std.choose\n\
+               fn pick() -> Int ![Choose] {\n  \
+                 perform Choose.choose(3)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let results: List[Int] = all_choices(pick);\n  \
+                 perform IO.println(int_to_string(length(results)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_all_choices_tail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n", "stderr={stderr:?}");
+}
+
+/// `all_choices` over a body with non-tail post-perform code
+/// (`let x = perform Choose.choose(3); x + 100`). Tests the
+/// `OUTER_POST_ARM_K` snapshot/restore in `sigil_continuation_invoke`
+/// — without it, the synth-cont's post-arm-k push leaks across the
+/// `k(i)` invoke boundary and the return-arm dispatch trips an
+/// args_len mismatch.
+#[test]
+fn std_choose_all_choices_non_tail_perform_returns_three() {
+    let src = "import std.choose\n\
+               fn pick() -> Int ![Choose] {\n  \
+                 let x: Int = perform Choose.choose(3);\n  \
+                 x + 100\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let results: List[Int] = all_choices(pick);\n  \
+                 perform IO.println(int_to_string(length(results)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_all_choices_non_tail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n", "stderr={stderr:?}");
+}
+
+/// `first_choice` short-circuits on the first non-failing branch.
+/// `pick()` performs `Choose.choose(5)`; the first invocation
+/// resumes with `0`, body returns `0`, return-arm wraps as
+/// `Some(0)`, helper short-circuits and returns `Some(0)` without
+/// trying `k(1)..k(4)`.
+#[test]
+fn std_choose_first_choice_short_circuits_on_zero() {
+    let src = "import std.choose\n\
+               fn pick() -> Int ![Choose] {\n  \
+                 perform Choose.choose(5)\n\
+               }\n\
+               fn unwrap_or_int(o: Option[Int], dflt: Int) -> Int ![] {\n  \
+                 match o {\n    \
+                   Some(x) => x,\n    \
+                   None => dflt,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Option[Int] = first_choice(pick);\n  \
+                 let v: Int = unwrap_or_int(r, 0 - 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_first_choice_short_circuit");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 69 — boxed Int64 run-and-check-output =====
 
 /// Construct two Int64s, add them, stringify and print. Pins the

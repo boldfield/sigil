@@ -80,28 +80,6 @@ fn effective_fn_generic_params(f: &FnDecl) -> Vec<GenericParam> {
 /// whether to allocate a scope_var for the fn's signature; if no
 /// param/return TypeExpr mentions Continuation, the scope_var slot
 /// stays empty and `Scheme.scope_vars` is `Vec::new()`.
-/// Plan D Task 117 (b) Phase 4 — structural-shape check used by
-/// `check_fn`'s post-walk re-insert guard. Returns true when two
-/// `Ty`s have the same outer constructor shape (same variant, same
-/// User-type name + arity, same Fn arity). Used to detect when the
-/// existing fn_schemes entry for a fn name was registered by THIS
-/// fn (signature shape matches) vs. by a sibling-module fn with the
-/// same name but different params.
-fn ty_constructors_match(a: &Ty, b: &Ty) -> bool {
-    use Ty::*;
-    match (a, b) {
-        (Int, Int) | (String, String) | (Unit, Unit) | (Bool, Bool) | (Char, Char) | (Byte, Byte) => true,
-        (Var(_), Var(_)) => true,
-        (User(name_a, args_a), User(name_b, args_b)) => {
-            name_a == name_b && args_a.len() == args_b.len()
-        }
-        (Tuple(elems_a), Tuple(elems_b)) => elems_a.len() == elems_b.len(),
-        (Fn(sig_a), Fn(sig_b)) => sig_a.params.len() == sig_b.params.len(),
-        (Continuation(_), Continuation(_)) => true,
-        _ => false,
-    }
-}
-
 fn type_expr_has_continuation(t: &TypeExpr) -> bool {
     match t {
         TypeExpr::Named(..) => false,
@@ -120,9 +98,7 @@ fn type_expr_has_continuation(t: &TypeExpr) -> bool {
 /// return TypeExpr contains a `Continuation` annotation. Drives
 /// the pre-pass scope_var allocation in `typecheck`.
 fn fn_decl_signature_has_continuation(f: &FnDecl) -> bool {
-    f.params
-        .iter()
-        .any(|p| type_expr_has_continuation(&p.ty))
+    f.params.iter().any(|p| type_expr_has_continuation(&p.ty))
         || type_expr_has_continuation(&f.return_type)
 }
 
@@ -3589,9 +3565,7 @@ impl Tc {
                     // a runtime ScopeId check (storage in heap
                     // values requires the scope_id be tracked at
                     // runtime through GC; out of v1 scope).
-                    if self.current_arm_scope_id.is_none()
-                        && self.current_fn_scope_var.is_none()
-                    {
+                    if self.current_arm_scope_id.is_none() && self.current_fn_scope_var.is_none() {
                         self.push_error(
                             "E0145",
                             span.clone(),
@@ -6878,13 +6852,7 @@ pub(crate) fn ty_from_type_expr(
     // never appear inside a handler arm body or a fn-decl signature
     // walk, so `Continuation` is rejected here — `check_type_expr_-
     // known` surfaces E0145 separately at the use site.
-    ty_from_type_expr_with_rows(
-        t,
-        types,
-        generic_subst,
-        &empty_rows,
-        ContScopeCtx::Reject,
-    )
+    ty_from_type_expr_with_rows(t, types, generic_subst, &empty_rows, ContScopeCtx::Reject)
 }
 
 /// Plan D Task 116 — variant of `ty_from_type_expr` that threads a

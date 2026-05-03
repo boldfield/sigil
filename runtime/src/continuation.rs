@@ -177,8 +177,7 @@ pub unsafe extern "C" fn sigil_continuation_invoke(
     terminal_out: *mut crate::handlers::TerminalResult,
 ) -> u64 {
     use crate::handlers::{
-        sigil_continuation_identity, sigil_next_step_args_ptr, sigil_next_step_call,
-        sigil_run_loop,
+        sigil_continuation_identity, sigil_next_step_args_ptr, sigil_next_step_call, sigil_run_loop,
     };
 
     let snapshot = crate::handlers::outer_post_arm_k_depth_snapshot();
@@ -250,7 +249,11 @@ mod tests {
             );
             let header_word: *const u64 = cont.cast();
             let h = Header(header_word.read());
-            assert_eq!(h.type_tag(), TAG_CONTINUATION, "tag must be TAG_CONTINUATION");
+            assert_eq!(
+                h.type_tag(),
+                TAG_CONTINUATION,
+                "tag must be TAG_CONTINUATION"
+            );
             assert_eq!(h.payload_count(), 4, "count must be 4");
             assert_eq!(
                 h.pointer_bitmap(),

@@ -941,15 +941,19 @@ pub(crate) fn collect_cont_param_callees(
     use crate::ast::{Item, TypeExpr};
     fn type_expr_is_continuation(t: &TypeExpr) -> bool {
         matches!(t, TypeExpr::Apply { name, .. } if name == "Continuation")
-            // Pre-mono surface uses TypeExpr::Apply; post-mono surface
-            // (after `rewrite_type_expr`) preserves Apply for
-            // Continuation specifically, so this single check covers
-            // both.
+        // Pre-mono surface uses TypeExpr::Apply; post-mono surface
+        // (after `rewrite_type_expr`) preserves Apply for
+        // Continuation specifically, so this single check covers
+        // both.
     }
     let mut out: std::collections::BTreeMap<String, Vec<bool>> = std::collections::BTreeMap::new();
     for item in &program.items {
         if let Item::Fn(f) = item {
-            let flags: Vec<bool> = f.params.iter().map(|p| type_expr_is_continuation(&p.ty)).collect();
+            let flags: Vec<bool> = f
+                .params
+                .iter()
+                .map(|p| type_expr_is_continuation(&p.ty))
+                .collect();
             if flags.iter().any(|&b| b) {
                 out.insert(f.name.clone(), flags);
             }
@@ -1063,9 +1067,13 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     let cont_param_callees = collect_cont_param_callees(program);
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
-            if let Some(msg) =
-                block_unsupported_handle(&f.body, &globals, &ctors, &effects_resumes_many, &cont_param_callees)
-            {
+            if let Some(msg) = block_unsupported_handle(
+                &f.body,
+                &globals,
+                &ctors,
+                &effects_resumes_many,
+                &cont_param_callees,
+            ) {
                 return Some(format!("in fn `{}`: {}", f.name, msg));
             }
         }
@@ -1302,23 +1310,36 @@ fn block_unsupported_handle(
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                if let Some(msg) =
-                    expr_unsupported_handle(&l.value, globals, ctors, effects_resumes_many, cont_param_callees)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    &l.value,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
             Stmt::Expr(e) => {
-                if let Some(msg) = expr_unsupported_handle(e, globals, ctors, effects_resumes_many, cont_param_callees)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    e,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    if let Some(msg) =
-                        expr_unsupported_handle(a, globals, ctors, effects_resumes_many, cont_param_callees)
-                    {
+                    if let Some(msg) = expr_unsupported_handle(
+                        a,
+                        globals,
+                        ctors,
+                        effects_resumes_many,
+                        cont_param_callees,
+                    ) {
                         return Some(msg);
                     }
                 }
@@ -1326,7 +1347,13 @@ fn block_unsupported_handle(
         }
     }
     if let Some(tail) = &b.tail {
-        if let Some(msg) = expr_unsupported_handle(tail, globals, ctors, effects_resumes_many, cont_param_callees) {
+        if let Some(msg) = expr_unsupported_handle(
+            tail,
+            globals,
+            ctors,
+            effects_resumes_many,
+            cont_param_callees,
+        ) {
             return Some(msg);
         }
     }
@@ -1348,60 +1375,127 @@ fn expr_unsupported_handle(
         | Expr::CharLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => None,
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_unsupported_handle(lhs, globals, ctors, effects_resumes_many, cont_param_callees)
-                .or_else(|| expr_unsupported_handle(rhs, globals, ctors, effects_resumes_many, cont_param_callees))
-        }
-        Expr::Unary { operand, .. } => {
-            expr_unsupported_handle(operand, globals, ctors, effects_resumes_many, cont_param_callees)
-        }
+        Expr::Binary { lhs, rhs, .. } => expr_unsupported_handle(
+            lhs,
+            globals,
+            ctors,
+            effects_resumes_many,
+            cont_param_callees,
+        )
+        .or_else(|| {
+            expr_unsupported_handle(
+                rhs,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            )
+        }),
+        Expr::Unary { operand, .. } => expr_unsupported_handle(
+            operand,
+            globals,
+            ctors,
+            effects_resumes_many,
+            cont_param_callees,
+        ),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => expr_unsupported_handle(cond, globals, ctors, effects_resumes_many, cont_param_callees)
-            .or_else(|| block_unsupported_handle(then_block, globals, ctors, effects_resumes_many, cont_param_callees))
-            .or_else(|| block_unsupported_handle(else_block, globals, ctors, effects_resumes_many, cont_param_callees)),
-        Expr::Block(b) => block_unsupported_handle(b, globals, ctors, effects_resumes_many, cont_param_callees),
+        } => expr_unsupported_handle(
+            cond,
+            globals,
+            ctors,
+            effects_resumes_many,
+            cont_param_callees,
+        )
+        .or_else(|| {
+            block_unsupported_handle(
+                then_block,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            )
+        })
+        .or_else(|| {
+            block_unsupported_handle(
+                else_block,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            )
+        }),
+        Expr::Block(b) => {
+            block_unsupported_handle(b, globals, ctors, effects_resumes_many, cont_param_callees)
+        }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            if let Some(msg) =
-                expr_unsupported_handle(scrutinee, globals, ctors, effects_resumes_many, cont_param_callees)
-            {
+            if let Some(msg) = expr_unsupported_handle(
+                scrutinee,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            ) {
                 return Some(msg);
             }
             for a in arms {
-                if let Some(msg) =
-                    expr_unsupported_handle(&a.body, globals, ctors, effects_resumes_many, cont_param_callees)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    &a.body,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
             None
         }
         Expr::Call { callee, args, .. } => {
-            if let Some(msg) = expr_unsupported_handle(callee, globals, ctors, effects_resumes_many, cont_param_callees)
-            {
+            if let Some(msg) = expr_unsupported_handle(
+                callee,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            ) {
                 return Some(msg);
             }
             for a in args {
-                if let Some(msg) = expr_unsupported_handle(a, globals, ctors, effects_resumes_many, cont_param_callees)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    a,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
             None
         }
         Expr::Perform(_) => None,
-        Expr::Lambda { body, .. } => {
-            expr_unsupported_handle(body, globals, ctors, effects_resumes_many, cont_param_callees)
-        }
+        Expr::Lambda { body, .. } => expr_unsupported_handle(
+            body,
+            globals,
+            ctors,
+            effects_resumes_many,
+            cont_param_callees,
+        ),
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
-                if let Some(msg) = expr_unsupported_handle(ee, globals, ctors, effects_resumes_many, cont_param_callees)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    ee,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
@@ -1409,9 +1503,13 @@ fn expr_unsupported_handle(
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                if let Some(msg) =
-                    expr_unsupported_handle(&f.value, globals, ctors, effects_resumes_many, cont_param_callees)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    &f.value,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
@@ -1533,9 +1631,13 @@ fn expr_unsupported_handle(
             // `ClosureRecord` shapes. The arm body is otherwise free
             // to use any expression over its op-args + globals.
             for arm in op_arms.iter() {
-                if let Some(msg) =
-                    arm_body_unsupported_construct(arm, globals, ctors, effects_resumes_many, cont_param_callees)
-                {
+                if let Some(msg) = arm_body_unsupported_construct(
+                    arm,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(format!(
                         "`handle` expression at {:?} has arm `{}.{}` body that {} \
                          (Plan B Task 55, in progress)",
@@ -1579,15 +1681,25 @@ fn expr_unsupported_handle(
             // are never enforced — at runtime that can register arms
             // under the wrong effect_id and crash inside `sigil_perform`'s
             // handler-stack walk.
-            if let Some(msg) = expr_unsupported_handle(body, globals, ctors, effects_resumes_many, cont_param_callees) {
+            if let Some(msg) = expr_unsupported_handle(
+                body,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            ) {
                 return Some(msg);
             }
             // Recurse into arm bodies so nested handles deeper in
             // the AST surface their own diagnostics.
             for arm in op_arms {
-                if let Some(msg) =
-                    expr_unsupported_handle(&arm.body, globals, ctors, effects_resumes_many, cont_param_callees)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    &arm.body,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
@@ -1596,9 +1708,13 @@ fn expr_unsupported_handle(
             // their own diagnostics (parallel to op-arm body
             // recursion above).
             if let Some(ra) = return_arm {
-                if let Some(msg) =
-                    expr_unsupported_handle(&ra.body, globals, ctors, effects_resumes_many, cont_param_callees)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    &ra.body,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
@@ -1606,8 +1722,13 @@ fn expr_unsupported_handle(
         }
         Expr::Tuple { elems, .. } => {
             for e in elems {
-                if let Some(msg) = expr_unsupported_handle(e, globals, ctors, effects_resumes_many, cont_param_callees)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    e,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
@@ -1830,7 +1951,14 @@ fn arm_body_unsupported_construct(
     // arm body IS the synthetic CPS fn's return value (wrapped in
     // `sigil_next_step_done` or `sigil_next_step_call` depending on
     // whether the tail is a captured-k invocation).
-    arm_body_walk(&arm.body, &mut scopes, &arm.k_name, globals, cont_param_callees, true)
+    arm_body_walk(
+        &arm.body,
+        &mut scopes,
+        &arm.k_name,
+        globals,
+        cont_param_callees,
+        true,
+    )
 }
 
 /// Plan B Task 55 (Phase 4d) — walks an arm body to surface the still-
@@ -1929,9 +2057,13 @@ fn arm_body_walk(
             // Phase 4d (codegen builds a per-arm closure record).
             None
         }
-        Expr::Binary { lhs, rhs, .. } => arm_body_walk(lhs, scopes, k_name, globals, cont_param_callees, false)
-            .or_else(|| arm_body_walk(rhs, scopes, k_name, globals, cont_param_callees, false)),
-        Expr::Unary { operand, .. } => arm_body_walk(operand, scopes, k_name, globals, cont_param_callees, false),
+        Expr::Binary { lhs, rhs, .. } => {
+            arm_body_walk(lhs, scopes, k_name, globals, cont_param_callees, false)
+                .or_else(|| arm_body_walk(rhs, scopes, k_name, globals, cont_param_callees, false))
+        }
+        Expr::Unary { operand, .. } => {
+            arm_body_walk(operand, scopes, k_name, globals, cont_param_callees, false)
+        }
         Expr::If {
             cond,
             then_block,
@@ -1949,8 +2081,26 @@ fn arm_body_walk(
             // for branched-k). Post-Task-118 codegen routes through
             // `lower_arm_body_to_next_step` when
             // `arm_body_needs_branched_routing` fires.
-            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, cont_param_callees, tail))
-            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, cont_param_callees, tail)),
+            .or_else(|| {
+                arm_body_walk_block(
+                    then_block,
+                    scopes,
+                    k_name,
+                    globals,
+                    cont_param_callees,
+                    tail,
+                )
+            })
+            .or_else(|| {
+                arm_body_walk_block(
+                    else_block,
+                    scopes,
+                    k_name,
+                    globals,
+                    cont_param_callees,
+                    tail,
+                )
+            }),
         Expr::Block(b) => arm_body_walk_block(b, scopes, k_name, globals, cont_param_callees, tail),
         Expr::Match {
             scrutinee, arms, ..
@@ -1963,8 +2113,17 @@ fn arm_body_walk(
             // walker which would reject k-as-callee in non-tail). Other
             // scrutinee shapes walk in non-tail context as before.
             let scrut_diag = match (tail, match_k_call_arg(scrutinee, k_name)) {
-                (true, Some(arg_expr)) => arm_body_walk(arg_expr, scopes, k_name, globals, cont_param_callees, false),
-                _ => arm_body_walk(scrutinee, scopes, k_name, globals, cont_param_callees, false),
+                (true, Some(arg_expr)) => {
+                    arm_body_walk(arg_expr, scopes, k_name, globals, cont_param_callees, false)
+                }
+                _ => arm_body_walk(
+                    scrutinee,
+                    scopes,
+                    k_name,
+                    globals,
+                    cont_param_callees,
+                    false,
+                ),
             };
             if let Some(r) = scrut_diag {
                 return Some(r);
@@ -2020,7 +2179,14 @@ fn arm_body_walk(
                     // contain disallowed shapes; outer-scope captures
                     // in the arg are allowed under Phase 4d's normal
                     // capture path).
-                    return arm_body_walk(&args[0], scopes, k_name, globals, cont_param_callees, false);
+                    return arm_body_walk(
+                        &args[0],
+                        scopes,
+                        k_name,
+                        globals,
+                        cont_param_callees,
+                        false,
+                    );
                 }
             }
             // Generic call. Callee + args are non-tail.
@@ -2038,16 +2204,20 @@ fn arm_body_walk(
                 Expr::Ident(callee_name, _) => cont_param_callees.get(callee_name),
                 _ => None,
             };
-            if let Some(r) = arm_body_walk(callee, scopes, k_name, globals, cont_param_callees, false) {
+            if let Some(r) =
+                arm_body_walk(callee, scopes, k_name, globals, cont_param_callees, false)
+            {
                 return Some(r);
             }
             for (i, a) in args.iter().enumerate() {
                 let is_k_arg_to_cont_param = matches!(a, Expr::Ident(name, _) if name == k_name)
-                    && cont_flags.map_or(false, |flags| flags.get(i).copied().unwrap_or(false));
+                    && cont_flags.is_some_and(|flags| flags.get(i).copied().unwrap_or(false));
                 if is_k_arg_to_cont_param {
                     continue;
                 }
-                if let Some(r) = arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false) {
+                if let Some(r) =
+                    arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false)
+                {
                     return Some(r);
                 }
             }
@@ -2055,7 +2225,9 @@ fn arm_body_walk(
         }
         Expr::Perform(p) => {
             for a in &p.args {
-                if let Some(r) = arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false) {
+                if let Some(r) =
+                    arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false)
+                {
                     return Some(r);
                 }
             }
@@ -2093,7 +2265,9 @@ fn arm_body_walk(
             // Recurse into env_exprs so nested-shape violations (e.g.,
             // an Apply inside an env-expr's value) still surface.
             for env_expr in env_exprs {
-                if let Some(r) = arm_body_walk(env_expr, scopes, k_name, globals, cont_param_callees, false) {
+                if let Some(r) =
+                    arm_body_walk(env_expr, scopes, k_name, globals, cont_param_callees, false)
+                {
                     return Some(r);
                 }
             }
@@ -2101,7 +2275,9 @@ fn arm_body_walk(
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                if let Some(r) = arm_body_walk(&f.value, scopes, k_name, globals, cont_param_callees, false) {
+                if let Some(r) =
+                    arm_body_walk(&f.value, scopes, k_name, globals, cont_param_callees, false)
+                {
                     return Some(r);
                 }
             }
@@ -2127,7 +2303,14 @@ fn arm_body_walk(
             // body's value); tail position only re-enters at the
             // nested arm bodies if the nested handle expression is
             // itself in this arm's tail position.
-            if let Some(r) = arm_body_walk(inner_body, scopes, k_name, globals, cont_param_callees, false) {
+            if let Some(r) = arm_body_walk(
+                inner_body,
+                scopes,
+                k_name,
+                globals,
+                cont_param_callees,
+                false,
+            ) {
                 return Some(r);
             }
             for inner_arm in inner_op_arms {
@@ -2146,7 +2329,14 @@ fn arm_body_walk(
                 // Inner arm body's tail position is independent of
                 // the outer arm's tail (the inner CPS arm fn wraps
                 // its own tail expression).
-                let r = arm_body_walk(&inner_arm.body, scopes, &inner_arm.k_name, globals, cont_param_callees, true);
+                let r = arm_body_walk(
+                    &inner_arm.body,
+                    scopes,
+                    &inner_arm.k_name,
+                    globals,
+                    cont_param_callees,
+                    true,
+                );
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -2167,7 +2357,9 @@ fn arm_body_walk(
         }
         Expr::Tuple { elems, .. } => {
             for el in elems {
-                if let Some(r) = arm_body_walk(el, scopes, k_name, globals, cont_param_callees, false) {
+                if let Some(r) =
+                    arm_body_walk(el, scopes, k_name, globals, cont_param_callees, false)
+                {
                     return Some(r);
                 }
             }
@@ -2219,7 +2411,9 @@ fn arm_body_walk_block(
                 scopes.push(local.clone());
                 let mut found = None;
                 for a in &p.args {
-                    if let Some(r) = arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false) {
+                    if let Some(r) =
+                        arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false)
+                    {
                         found = Some(r);
                         break;
                     }
@@ -7214,50 +7408,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     let cont_alloc = module
         .declare_function("sigil_continuation_alloc", Linkage::Import, &cont_alloc_sig)
         .map_err(|e| format!("declare sigil_continuation_alloc: {e}"))?;
-    // sigil_continuation_load_closure(cont) -> *mut u8
-    let mut cont_load_closure_sig = Signature::new(isa_call_conv(&module));
-    cont_load_closure_sig.params.push(AbiParam::new(pointer_ty));
-    cont_load_closure_sig.returns.push(AbiParam::new(pointer_ty));
-    let cont_load_closure = module
-        .declare_function(
-            "sigil_continuation_load_closure",
-            Linkage::Import,
-            &cont_load_closure_sig,
-        )
-        .map_err(|e| format!("declare sigil_continuation_load_closure: {e}"))?;
-    // sigil_continuation_load_fn(cont) -> *mut u8
-    let mut cont_load_fn_sig = Signature::new(isa_call_conv(&module));
-    cont_load_fn_sig.params.push(AbiParam::new(pointer_ty));
-    cont_load_fn_sig.returns.push(AbiParam::new(pointer_ty));
-    let cont_load_fn = module
-        .declare_function(
-            "sigil_continuation_load_fn",
-            Linkage::Import,
-            &cont_load_fn_sig,
-        )
-        .map_err(|e| format!("declare sigil_continuation_load_fn: {e}"))?;
-    // sigil_continuation_load_return_closure(cont) -> *mut u8
-    let mut cont_load_ret_closure_sig = Signature::new(isa_call_conv(&module));
-    cont_load_ret_closure_sig.params.push(AbiParam::new(pointer_ty));
-    cont_load_ret_closure_sig.returns.push(AbiParam::new(pointer_ty));
-    let cont_load_ret_closure = module
-        .declare_function(
-            "sigil_continuation_load_return_closure",
-            Linkage::Import,
-            &cont_load_ret_closure_sig,
-        )
-        .map_err(|e| format!("declare sigil_continuation_load_return_closure: {e}"))?;
-    // sigil_continuation_load_return_fn(cont) -> *mut u8
-    let mut cont_load_ret_fn_sig = Signature::new(isa_call_conv(&module));
-    cont_load_ret_fn_sig.params.push(AbiParam::new(pointer_ty));
-    cont_load_ret_fn_sig.returns.push(AbiParam::new(pointer_ty));
-    let cont_load_ret_fn = module
-        .declare_function(
-            "sigil_continuation_load_return_fn",
-            Linkage::Import,
-            &cont_load_ret_fn_sig,
-        )
-        .map_err(|e| format!("declare sigil_continuation_load_return_fn: {e}"))?;
+    // (`sigil_continuation_load_*` helpers are called only from
+    // inside `sigil_continuation_invoke`'s Rust body; codegen never
+    // emits direct calls to them, so they don't need FuncId/FuncRef
+    // declarations here. The runtime tests in
+    // `runtime/src/continuation.rs` cover the load helpers
+    // directly.)
     // sigil_continuation_invoke(cont, arg, terminal_out) -> u64
     // Wraps the dispatch + run_loop drive + return-arm wrap +
     // outer_post_arm_k snapshot/restore in a single runtime call.
@@ -8206,10 +8362,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             random_pseudo_int,
             clock_os_now,
             cont_alloc,
-            cont_load_closure,
-            cont_load_fn,
-            cont_load_ret_closure,
-            cont_load_ret_fn,
             cont_invoke,
         },
         handler_frame_new,
@@ -17967,10 +18119,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let Some(return_fn_ref) = return_fn_ref_opt else {
             return (null_ptr_a, null_ptr_b);
         };
-        let return_fn_addr = self
-            .builder
-            .ins()
-            .func_addr(self.pointer_ty, return_fn_ref);
+        let return_fn_addr = self.builder.ins().func_addr(self.pointer_ty, return_fn_ref);
         // Load return_closure from the handler frame at offset
         // HANDLER_FRAME_RETURN_CLOSURE_OFF. arm_frame_ptr_v is set
         // by the synth arm fn ctor when the arm body has any k-pair-
@@ -18021,9 +18170,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             // value object pointer.
             if self.cont_param_names.contains(name) {
                 return *self.env.get(name).unwrap_or_else(|| {
-                    unreachable!(
-                        "codegen: cont fn-param `{name}` missing from env at call site"
-                    )
+                    unreachable!("codegen: cont fn-param `{name}` missing from env at call site")
                 });
             }
             // Arm-bound k: box (arm_k_closure_v, arm_k_fn_v) into a
@@ -18036,9 +18183,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         )
                     });
                     let k_fn = self.arm_k_fn_v.unwrap_or_else(|| {
-                        unreachable!(
-                            "codegen: arm_k_fn_v unset at Continuation arg packing site"
-                        )
+                        unreachable!("codegen: arm_k_fn_v unset at Continuation arg packing site")
                     });
                     // Source the originating handle's return-arm
                     // pair so the boxed continuation, when invoked
@@ -18113,12 +18258,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ///      return_fn, [body_val, null, identity], 3); drives
     ///      `sigil_run_loop` again for the return-arm wrap.
     ///   4. Restores `OUTER_POST_ARM_K_DEPTH`.
+    ///
     /// Returns the wrapped R-typed value.
-    fn lower_continuation_param_call(
-        &mut self,
-        name: &str,
-        args: &[crate::ast::Expr],
-    ) -> Value {
+    fn lower_continuation_param_call(&mut self, name: &str, args: &[crate::ast::Expr]) -> Value {
         debug_assert_eq!(
             args.len(),
             1,
@@ -18251,14 +18393,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         //     `self.cont_param_names`: the value is
                         //     already a Continuation pointer in env;
                         //     forward it directly.
-                        let cont_flags: Option<&Vec<bool>> =
-                            self.cont_param_callees.get(name);
+                        let cont_flags: Option<&Vec<bool>> = self.cont_param_callees.get(name);
                         let arg_vals: Vec<Value> = args
                             .iter()
                             .enumerate()
                             .map(|(i, a)| {
-                                let is_cont_pos = cont_flags
-                                    .map_or(false, |f| f.get(i).copied().unwrap_or(false));
+                                let is_cont_pos =
+                                    cont_flags.is_some_and(|f| f.get(i).copied().unwrap_or(false));
                                 if is_cont_pos {
                                     self.lower_continuation_arg(a)
                                 } else {
@@ -21105,14 +21246,13 @@ struct BuiltinFuncIds {
     /// Plan C Task 76 — OS clock (nanos since epoch). Backs the
     /// `os_clock` handler in `std/clock.sigil`.
     clock_os_now: cranelift_module::FuncId,
-    /// Plan D Task 117 (b) Phase 4 — Continuation value object alloc
-    /// + load helpers. Used at sites that flow a continuation into
-    /// a fn-parameter (alloc) or invoke/forward the parameter (load).
+    /// Plan D Task 117 (b) Phase 4 — Continuation value object
+    /// `alloc` (boxes the (k_closure, k_fn, return_closure,
+    /// return_fn) quadruple at sites that flow a continuation
+    /// into a fn-parameter) and `invoke` (drives dispatch +
+    /// run_loop + return-arm wrap at sites that call a
+    /// continuation held in a fn parameter).
     cont_alloc: cranelift_module::FuncId,
-    cont_load_closure: cranelift_module::FuncId,
-    cont_load_fn: cranelift_module::FuncId,
-    cont_load_ret_closure: cranelift_module::FuncId,
-    cont_load_ret_fn: cranelift_module::FuncId,
     cont_invoke: cranelift_module::FuncId,
 }
 
@@ -21196,12 +21336,11 @@ struct BuiltinFuncRefs {
     /// Plan C Task 76 — OS clock FuncRef.
     clock_os_now_ref: FuncRef,
     /// Plan D Task 117 (b) Phase 4 — Continuation value object
-    /// alloc / load / invoke helpers (FuncRefs).
+    /// alloc + invoke helpers (FuncRefs). The load helpers
+    /// (`sigil_continuation_load_*`) are called only from inside
+    /// `sigil_continuation_invoke`'s Rust body; codegen never
+    /// emits direct calls.
     cont_alloc_ref: FuncRef,
-    cont_load_closure_ref: FuncRef,
-    cont_load_fn_ref: FuncRef,
-    cont_load_ret_closure_ref: FuncRef,
-    cont_load_ret_fn_ref: FuncRef,
     cont_invoke_ref: FuncRef,
 }
 
@@ -21415,11 +21554,6 @@ fn prepare_builtin_func_refs(
         random_pseudo_int_ref: module.declare_func_in_func(ids.random_pseudo_int, builder.func),
         clock_os_now_ref: module.declare_func_in_func(ids.clock_os_now, builder.func),
         cont_alloc_ref: module.declare_func_in_func(ids.cont_alloc, builder.func),
-        cont_load_closure_ref: module.declare_func_in_func(ids.cont_load_closure, builder.func),
-        cont_load_fn_ref: module.declare_func_in_func(ids.cont_load_fn, builder.func),
-        cont_load_ret_closure_ref: module
-            .declare_func_in_func(ids.cont_load_ret_closure, builder.func),
-        cont_load_ret_fn_ref: module.declare_func_in_func(ids.cont_load_ret_fn, builder.func),
         cont_invoke_ref: module.declare_func_in_func(ids.cont_invoke, builder.func),
     }
 }
@@ -25456,7 +25590,13 @@ mod tests {
         let mut effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
         effects_resumes_many.insert("Choose".to_string(), true);
         let ctors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many, &std::collections::BTreeMap::new());
+        let result = arm_body_unsupported_construct(
+            &arm,
+            &globals,
+            &ctors,
+            &effects_resumes_many,
+            &std::collections::BTreeMap::new(),
+        );
         assert!(
             result.is_none(),
             "expected None (accept) for 3-let arm body of resumes:many effect; \
@@ -25513,7 +25653,13 @@ mod tests {
         let globals: BTreeSet<String> = BTreeSet::new();
         let ctors: BTreeSet<String> = BTreeSet::new();
         let effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
-        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many, &std::collections::BTreeMap::new());
+        let result = arm_body_unsupported_construct(
+            &arm,
+            &globals,
+            &ctors,
+            &effects_resumes_many,
+            &std::collections::BTreeMap::new(),
+        );
         assert!(
             result.is_none(),
             "Task 118 post-lift: walker must accept conditional-k-inside-if \
