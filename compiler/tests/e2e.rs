@@ -10640,7 +10640,7 @@ fn task_78_5_g2a_minimal_bracketed_e_alias_typechecks() {
 /// `run_state_poly` shares the State frame across both. Final list =
 /// `[true, false]`; length = 2; stdout = `"2\n"`.
 #[test]
-#[ignore = "G2.a closed (Task 78.5 g2a-bracketed-alias-detection); now blocked on G2.b — lambdas with `![| e]` rows in run_state_poly's arms drop the row var → E0128. Un-ignore once G2.b lands."]
+#[ignore = "Plan D Task 119 audit (2026-05-03): G2.a closed (Task 78.5 g2a-bracketed-alias-detection); G2.b's row-poly lambda gap closed by Plan D Task 116. Now blocks on **E0145** introduced by Plan D Task 117's escape barrier — captured-k inside lambdas is rejected in any program containing a generic fn (run_state_poly[A] is generic; amb_handle[e]'s arm captures k into a lambda passed across the State[Int]/A generic boundary). Mechanical fix path: either move the handler into a non-generic wrapper around the generic body, or rewrite the arm body to call k(arg) directly without intermediate lambda capture. Both rewrites change the test's narrative (Plotkin state(amb)); they're orthogonal closures, not regressions of Plan D's lifts."]
 fn task_78_5_pending_g2a_bracketed_e_alias_unconstrained() {
     // Inline row-poly + body-type-poly run_state (mirrors std/raise.sigil's
     // catch shape). std/state.sigil's run_state is closed-row + Int-only,

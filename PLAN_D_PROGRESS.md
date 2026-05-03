@@ -59,6 +59,8 @@ Plan B' Stage-6.8-followup carryover #2 (Sync shim emission gating) is out of Pl
 
 **Stage 11 review checkpoint** — Task 111 deferred; Task 112 fully shipped (112a + 112b). Plan D proceeds to Stage 12. Defer-checkpoint covers Task 111 only.
 
+**Stage 11 review checkpoint — Task 111 closure update (2026-05-03).** The Task 111 deferral entry's revised closure path (option (C) — thread `*mut TerminalResult` through every fn ABI) shipped via a Brian-authorized 4-PR sequence: 111a (PR #89, runtime + dual-write transitional), 111b (PR #90, Sync ABI threading), 111c (PR #91, Cps + synth fn ABI threading), 111d (PR #92, TLS removal + nested-handle snapshot/restore). `[DEVIATION Task 111]` is now FULLY closed; Plan B' Stage-6.8-followup architectural carryover #1 closes alongside. New e2e test `task_111d_terminal_channel_propagation_through_nested_sync_calls` pins end-to-end propagation; new e2e test `task_111d_nested_handle_inner_discharge_does_not_leak_to_outer` pins the snapshot/restore invariant (caught a pre-existing leak that pre-existed in TLS form too — Brian's PR #92 R1 review surfaced it).
+
 ## Stage 12 — Type-system surface
 
 Internal ordering: 114 must precede 115; 113 and 116 are independent.
@@ -88,10 +90,35 @@ Internal ordering: 114 must precede 115; 113 and 116 are independent.
 
 **Stage 13 review checkpoint** (per the plan body): lifted-lambda closure-record discipline; arena escape rate (Plan B Task 60 baseline = 0%); Step 118 minimality; Sudoku smoke.
 
+**Stage 13 review checkpoint — sign-off (2026-05-03 / Plan D Task 119a).**
+
+- **Lifted-lambda closure-record discipline.** Closure_convert hoists every `Expr::Lambda` to a top-level `$lambda_N` fn + rewrites the original site to `Expr::ClosureRecord { code_fn_name, env_exprs, env_slot_kinds }`. Closure record layout `{header, code_ptr@8, env[i]@16+8*i}` matches `lower_closure_record`'s emit exactly. Plan D Task 117 added the `Ty::Continuation` substrate which extends the discipline to k-pair-bearing lambdas (3 trailing slots: k_closure, k_fn, frame_ptr) without changing the base record shape. Verified by `arm_inside_lambda_captures_outer_via_closure_env_load_returns_value` + the broader `task_78_5_*` lambda corpus.
+- **Arena escape rate.** Task 60's baseline of 0% (no per-dispatch-arena allocation escapes the arena) is preserved. The arena is reset on every trampoline iteration (`sigil_arena_reset` at every `NextStep::Done` / `Discharged` / `Call` boundary); no GC-managed pointer threads through the arena across iterations. Task 117's `RELINK_STACK` and Task 111d's caller-owned `TerminalResult` slot are both stack-allocated, not arena-allocated.
+- **Step 118 minimality.** Task 118 (PR #81 squash `3904a12`) shipped as an architectural slice rather than the minimal-removal hypothesis the plan body framed. Empirical CI on PR #81's first commit confirmed the minimal-removal approach insufficient; the branched-routing path (`lower_arm_body_to_next_step` + `lower_synth_arm_k_call_as_value`) is the load-bearing closure. User authorized bundling the architectural slice into PR #81 instead of multi-PR re-scope. See `[DEVIATION Task 118]`.
+- **Sudoku smoke.** `task_117_smoke_gate_sudoku_solves_4x4` — `examples/sudoku.sigil` compiles and runs end-to-end via the e2e harness on both hosts (per CI). Output asserts `"3\n"` (the unique valid digit at cell 11). Passes deterministically post-Plan-D.
+
+Stage 13 sign-off: COMPLETE. Plan D's core architectural cluster (Tasks 111-118) is shipped + verified.
+
 ## Plan D closeout
 
 - Task 119 — Plan D closeout audit. Walk every `[DEVIATION Task NN]` entry whose v2 closure path points at a Plan D-shipped lift; un-ignore tests; ship Sudoku + JSON parser smoke gates via e2e harness; update spec §14 (v1 limits).
-  - status: todo
+  - status: **done (119a shipped; 119b — JSON parser smoke gate — queued as follow-up)**.
+
+  - **119a (closeout audit + spec + un-ignore review).** Walked Plan C deviations + Plan B' Stage-6.8-followup carryovers; flipped 4 entries from "Open" / "Deferred" to "Closed by Plan D Task NN" with PR refs:
+
+    - `PLAN_C_DEVIATIONS.md` Task 72 constraint #3 (wrapper-fn-frame discharge composition) → Closed by Plan D Task 112 (a + b + c).
+    - `PLAN_C_DEVIATIONS.md` Task 73 constraint #2 (Static-N arm-body chain) → Closed by Plan D Task 117.
+    - `PLAN_C_DEVIATIONS.md` Task 73 constraint #3 (no first-class continuations) → Closed by Plan D Task 117.
+    - `PLAN_C_DEVIATIONS.md` Task 73 constraint #4 (no conditional / branched k-call) → Closed by Plan D Task 118.
+    - `PLAN_B_PRIME_DEVIATIONS.md` Stage-6.8-followup architectural carryover #1 (TLS out-channel → packed multi-return) → Closed by Plan D Task 111 (a + b + c + d).
+
+    Spec `§14 — v1 limits` rewritten to reflect the post-Plan-D state: 6 of 9 listed limits closed (first-class continuations, conditional/branched k-call, wrapper-fn-frame composition, type-parameterized effect rows, tuple types, row-poly fn-typed params); 3 survivors documented as permanent v1 surface decisions or future-plan-tier candidates (`Float`, `Unit` literal, `for` / `while`); 1 new v1 limit added (E0145 captured-k across generic boundaries — introduced by Task 117's escape barrier).
+
+    `#[ignore]` survey: only one closeout-candidate test remained (`task_78_5_pending_g2a_bracketed_e_alias_unconstrained`) — un-ignored briefly to verify it now passes; surface symptom changed (E0128 → E0145), confirming Plan D Task 116 closed the original G2.b row-poly lambda gap but Task 117's escape barrier surfaced the captured-k-across-generic-boundary v1 limit. Test re-ignored with updated rationale and link to E0145. Net effect: zero `#[ignore]`s in the repo's compiler/runtime test surface point at Plan D closure paths today.
+
+    Sudoku smoke gate already in place at `task_117_smoke_gate_sudoku_solves_4x4` (e2e harness; passing post-Plan-D).
+
+  - **119b queued as follow-up.** JSON parser smoke gate. `examples/json.sigil`'s "v1 vs v2" note (lines 168-194) explicitly defers the parser to Task 80 part 2 pending Plan D's wrapper-fn-frame fix (Task 112). Task 112 is now closed, so the parser is implementable. Per Plan D's hard-rule split ("stdlib migrations and demos consuming Plan D's surface belong to Plan C completion, not Plan D itself"), the parser implementation ships as a Plan-C-completion follow-up rather than as a Plan D Task 119 sub-PR. The Sudoku side of the smoke-gate criterion is already met; the JSON pretty-printer side already has e2e coverage at `json_example_pretty_prints_demo_document`.
 
 ## Plan D completion criteria
 
