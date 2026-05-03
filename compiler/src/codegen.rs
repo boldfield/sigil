@@ -4319,6 +4319,16 @@ struct ArmSynthCtx<'a> {
     /// into `handle_body_ty_resolved`. Set in `emit_object`'s
     /// per-fn loop before `collect_handle_arms_in_block(&f.body)`.
     current_fn_name: &'a str,
+    /// Plan D Task 119b R1 — hoisted-lambda → parent-clone chain.
+    /// A `handle ... with { ... }` written inside a lambda body
+    /// (in a generic enclosing fn) lives, post closure_convert, in
+    /// a `$lambda_N` synthetic fn; mono recorded the resolved
+    /// `handle_body_ty` keyed by the parent clone name (mono had no
+    /// awareness of `$lambda_N`). The pre-pass therefore walks
+    /// `current_fn_name → parent_clone → …` until the resolved
+    /// map answers, falling back to the span-keyed source on full
+    /// miss. Mirrors `Lowerer::lookup_call_callee_ty`.
+    hoisted_lambda_parent_clone: &'a BTreeMap<String, String>,
 }
 
 struct CollectMut<'a> {
@@ -4935,10 +4945,25 @@ fn collect_handle_arms_in_expr(
                 // Plan D Task 119b — try the per-clone resolved
                 // map first (post-substitution Ty for generic
                 // clones); fall back to the span-keyed source
-                // side-table for non-generic / no-mono paths.
-                let body_ty_resolved = ctx
-                    .handle_body_ty_resolved
-                    .get(&(ctx.current_fn_name.to_string(), span.clone()));
+                // side-table for non-generic / no-mono paths. R1:
+                // walk `current_fn_name → parent_clone → …` so a
+                // handle inside a hoisted lambda (mono keyed by
+                // the parent clone, not `$lambda_N`) still resolves.
+                let body_ty_resolved = {
+                    let mut fn_name = ctx.current_fn_name.to_string();
+                    loop {
+                        if let Some(t) = ctx
+                            .handle_body_ty_resolved
+                            .get(&(fn_name.clone(), span.clone()))
+                        {
+                            break Some(t);
+                        }
+                        match ctx.hoisted_lambda_parent_clone.get(&fn_name) {
+                            Some(parent) => fn_name = parent.clone(),
+                            None => break None,
+                        }
+                    }
+                };
                 let body_ty = body_ty_resolved
                     .or_else(|| ctx.handle_body_ty.get(span))
                     .unwrap_or_else(|| {
@@ -7872,6 +7897,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handle_body_ty: &checked.handle_body_ty,
                     handle_body_ty_resolved: &cc.colored.mono.handle_body_ty_resolved,
                     current_fn_name: &f.name,
+                    hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
                 };
                 collect_handle_arms_in_block(
                     &f.body,
@@ -8386,11 +8412,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // cont block. Cont's param is `pointer_ty` (the
                     // *mut NextStep produced by each arm).
                     let scrut_v = lowerer.lower_expr(match_scrutinee);
-                    let scrut_ty = lowerer
-                        .match_scrut_tys_resolved
-                        .get(&(lowerer.current_fn_name.clone(), match_span.clone()))
-                        .cloned()
-                        .or_else(|| lowerer.match_scrut_tys.get(&match_span).cloned());
+                    let scrut_ty = lowerer.lookup_match_scrut_ty(&match_span);
                     let cont = lowerer.builder.create_block();
                     lowerer.builder.append_block_param(cont, pointer_ty);
 
@@ -15031,6 +15053,31 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.call_callee_tys.get(span)
     }
 
+    /// Plan D Task 119b R1 — sibling of `lookup_call_callee_ty`
+    /// for `match_scrut_tys`. A `match` written inside a hoisted
+    /// lambda's body (post closure_convert) is keyed in
+    /// `match_scrut_tys_resolved` by the parent clone fn name, not
+    /// `$lambda_N`; walking the parent chain lets generic clones
+    /// resolve their concrete scrutinee `Ty` instead of leaking the
+    /// span-keyed `Ty::Var(_)` through `cranelift_ty_of_ty`. Closes
+    /// the symmetric gap reviewer flagged on PR #94.
+    fn lookup_match_scrut_ty(&self, span: &Span) -> Option<crate::typecheck::Ty> {
+        let mut fn_name = self.current_fn_name.clone();
+        loop {
+            if let Some(ty) = self
+                .match_scrut_tys_resolved
+                .get(&(fn_name.clone(), span.clone()))
+            {
+                return Some(ty.clone());
+            }
+            match self.hoisted_lambda_parent_clone.get(&fn_name) {
+                Some(parent) => fn_name = parent.clone(),
+                None => break,
+            }
+        }
+        self.match_scrut_tys.get(span).cloned()
+    }
+
     /// Lower a `Block`. Returns the tail expression's value if any,
     /// `None` when the block has no tail (statement-only block, value
     /// is `Unit`).
@@ -15608,18 +15655,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // site) — pre-existing, not Task 118 specific. Closing
         // requires threading the synth fn's clone identity into
         // `current_fn_name` at Lowerer construction.
-        let scrut_ty = self
-            .match_scrut_tys_resolved
-            .get(&(self.current_fn_name.clone(), scrut_span.clone()))
-            .cloned()
-            .or_else(|| self.match_scrut_tys.get(scrut_span).cloned())
-            .unwrap_or_else(|| {
-                unreachable!(
-                    "codegen Task 118 k-as-scrutinee: match scrutinee Ty \
-                     missing from match_scrut_tys / _resolved side-tables \
-                     for span {scrut_span:?}"
-                )
-            });
+        let scrut_ty = self.lookup_match_scrut_ty(scrut_span).unwrap_or_else(|| {
+            unreachable!(
+                "codegen Task 118 k-as-scrutinee: match scrutinee Ty \
+                 missing from match_scrut_tys / _resolved side-tables \
+                 for span {scrut_span:?}"
+            )
+        });
         let scrut_cl_ty = cranelift_ty_of_ty(&scrut_ty, pointer_ty);
         if scrut_cl_ty == types::I64 {
             raw_u64
@@ -15653,11 +15695,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         k_fn_v: Value,
         pointer_ty: Type,
     ) -> Value {
-        let scrut_ty = self
-            .match_scrut_tys_resolved
-            .get(&(self.current_fn_name.clone(), match_span.clone()))
-            .cloned()
-            .or_else(|| self.match_scrut_tys.get(match_span).cloned());
+        let scrut_ty = self.lookup_match_scrut_ty(match_span);
 
         let cont = self.builder.create_block();
         self.builder.append_block_param(cont, pointer_ty);
@@ -19333,11 +19371,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // nested Match, …). Span-keyed fallback is correct for
         // non-generic surfaces and synth helper fns whose match
         // scrutinees carry no `Ty::Var(_)`.
-        let scrut_ty = self
-            .match_scrut_tys_resolved
-            .get(&(self.current_fn_name.clone(), match_span.clone()))
-            .cloned()
-            .or_else(|| self.match_scrut_tys.get(match_span).cloned());
+        let scrut_ty = self.lookup_match_scrut_ty(match_span);
 
         // Predict the result type from the first arm's body. Pattern
         // bindings introduced by the first arm are added to a preview
@@ -19845,11 +19879,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // `lower_match`'s per-clone resolved-first lookup so
                 // a tuple-typed scrutinee resolves to its concrete
                 // (post-mono) Ty regardless of scrutinee shape.
-                let inner_scrut_ty = self
-                    .match_scrut_tys_resolved
-                    .get(&(self.current_fn_name.clone(), span.clone()))
-                    .cloned()
-                    .or_else(|| self.match_scrut_tys.get(span).cloned());
+                // R1: `lookup_match_scrut_ty` walks the
+                // hoisted-lambda → parent-clone chain.
+                let inner_scrut_ty = self.lookup_match_scrut_ty(span);
                 let mut inner_preview = preview.clone();
                 self.predict_pattern_bindings(
                     &arms[0].pattern,

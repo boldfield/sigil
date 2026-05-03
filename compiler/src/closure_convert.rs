@@ -107,6 +107,21 @@ pub struct ClosureConvertedProgram {
     /// closure record's `code_ptr` see uniform Sync ABI). Cps fns
     /// never used as values get no shim — closes Plan B'
     /// Stage-6.8-followup architectural carryover #2 / issue #48.
+    ///
+    /// **Hard invariant.** Every `Expr::ClosureRecord` whose
+    /// `code_fn_name` resolves to a Cps-ABI top-level user fn MUST
+    /// have that name pushed into this set. Today the sole producer
+    /// is the `Ident → ClosureRecord` rewrite in `Converter::rewrite_-
+    /// expr` (search for the `top_level_fn_names_seen_as_value
+    /// .insert(...)` call). Any future code path that synthesizes a
+    /// `ClosureRecord` directly — bypassing that rewrite — MUST
+    /// either re-establish this invariant by inserting the name here,
+    /// or document why the synthesized record can never name a Cps
+    /// fn. A miss surfaces as the runtime debug_assert at
+    /// `codegen.rs::lower_closure_record`'s shim-presence check on
+    /// the Cps-fn indirect-call path; not catching it before runtime
+    /// risks a Sync-ABI indirect call hitting raw Cps-ABI machine
+    /// code (UB).
     pub top_level_fn_names_seen_as_value: BTreeSet<String>,
     /// Plan D Task 119b — map from hoisted-lambda fn names
     /// (`$lambda_N`) to the parent clone fn name in whose body the
@@ -531,8 +546,7 @@ impl Converter {
                     // their address); skipping the emit saves
                     // ~100 bytes per never-as-value Cps fn. Plan B'
                     // Stage-6.8-followup carryover #2 / issue #48.
-                    self.top_level_fn_names_seen_as_value
-                        .insert(name.clone());
+                    self.top_level_fn_names_seen_as_value.insert(name.clone());
                     Expr::ClosureRecord {
                         code_fn_name: name,
                         env_exprs: Vec::new(),

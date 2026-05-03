@@ -1028,10 +1028,8 @@ impl<'a> Monomorphizer<'a> {
                 // recover the concrete return Ty for generic
                 // clones. Mirrors `match_scrut_tys_resolved` /
                 // `handle_body_ty_resolved`.
-                let callee_ty_concrete: Option<Ty> = self
-                    .call_callee_tys
-                    .get(span)
-                    .map(|t| subst.apply_to_ty(t));
+                let callee_ty_concrete: Option<Ty> =
+                    self.call_callee_tys.get(span).map(|t| subst.apply_to_ty(t));
                 if let (Some(fn_name), Some(callee_ty)) =
                     (&self.current_clone_fn_name, &callee_ty_concrete)
                 {
@@ -1240,10 +1238,8 @@ impl<'a> Monomorphizer<'a> {
                 // holds outer-fn `Ty::Var`s. Mirrors the
                 // `match_scrut_tys_resolved` discipline introduced
                 // by Plan D Task 113 R1 finding 2.
-                let body_ty_concrete: Option<Ty> = self
-                    .handle_body_ty
-                    .get(span)
-                    .map(|t| subst.apply_to_ty(t));
+                let body_ty_concrete: Option<Ty> =
+                    self.handle_body_ty.get(span).map(|t| subst.apply_to_ty(t));
                 if let (Some(fn_name), Some(body_ty)) =
                     (&self.current_clone_fn_name, &body_ty_concrete)
                 {
@@ -1619,7 +1615,21 @@ impl Substitution {
             // unchanged across instantiations. Runtime ScopeId
             // enforcement (RELINK_STACK + dynamic checks) is the
             // load-bearing soundness path for actual escapes.
+            //
+            // R1 tripwire: the standing invariant is that mono never
+            // sees `ScopeId::Var` (typecheck-side `apply_ty_inner`
+            // already enforces this). If a future region-polymorphic
+            // scheme ever wires `Var` producers without simultaneously
+            // wiring `Subst`-of-`ScopeId`, this arm would silently
+            // keep stale `Var` ids; the debug_assert catches that.
             Ty::Continuation(c) => {
+                debug_assert!(
+                    matches!(c.scope_id, crate::typecheck::ScopeId::Concrete(_)),
+                    "monomorphize::apply_to_ty: Ty::Continuation carries a \
+                     non-Concrete ScopeId ({:?}) — typecheck must have \
+                     resolved it before reaching mono",
+                    c.scope_id,
+                );
                 Ty::Continuation(Box::new(crate::typecheck::ContinuationTy {
                     op_ret: self.apply_to_ty(&c.op_ret),
                     ret: self.apply_to_ty(&c.ret),

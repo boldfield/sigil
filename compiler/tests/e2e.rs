@@ -10380,7 +10380,67 @@ fn task_78_5_g5_lambda_captures_k_with_any_generic_in_program_runs_post_119b() {
         status, 0,
         "post-119b: compile+run must succeed; stderr={stderr}",
     );
-    assert_eq!(stdout, "11\n", "post-119b: expected canonical run_state output");
+    assert_eq!(
+        stdout, "11\n",
+        "post-119b: expected canonical run_state output"
+    );
+}
+
+/// **Plan D Task 119b R1 — handle inside a hoisted lambda body in a
+/// generic enclosing fn.**
+///
+/// Pre-R1 the parallel `handle_body_ty` lookup in codegen's return-arm
+/// pre-pass keyed by bare `current_fn_name` and fell back to the
+/// span-keyed source on miss. Inside a generic clone, that source
+/// holds the pre-mono `Ty::Var(_)` (it's the typecheck-side
+/// side-table; mono had no chance to substitute through it). When the
+/// `handle` lives in a hoisted lambda's body, codegen sets
+/// `current_fn_name = "$lambda_N"`, mono recorded
+/// `handle_body_ty_resolved[(parent_clone, span)]` (mono had no
+/// awareness of `$lambda_N`), so the resolved-map lookup misses, the
+/// fallback fires, and `cranelift_ty_of_ty` panics on the leaked
+/// `Ty::Var`.
+///
+/// Reviewer-flagged on PR #94: `lookup_call_callee_ty` walks the
+/// hoisted-lambda → parent-clone chain but the symmetric handle-body
+/// lookup didn't. R1 adds the same parent-walk to the handle-body
+/// pre-pass and to all `match_scrut_tys_resolved` lookups.
+///
+/// This fixture pins the architectural fix end-to-end. The lambda
+/// `inner` (hoisted to `$lambda_N`) contains a `handle body() with
+/// { ... }`; the handle body type is `A` (the outer fn's generic),
+/// so generic-clone substitution must reach codegen via the resolved
+/// map. Output 5 = `k(0)` resumes the perform with `0`, body computes
+/// `0 + 5`.
+#[test]
+fn task_119b_r1_handle_inside_hoisted_lambda_in_generic_fn_runs_cleanly() {
+    let src = "import std.io\n\
+               \n\
+               effect E { op: () -> Int }\n\
+               \n\
+               fn outer[A](body: () -> A ![E], default_v: A) -> A ![] {\n  \
+                 let inner: () -> A ![] = fn () -> A ![] => handle body() with {\n    \
+                   return(v) => v,\n    \
+                   E.op(k) => k(0),\n  \
+                 };\n  \
+                 inner()\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = outer(fn () -> Int ![E] => perform E.op() + 5, 0);\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, status) = compile_and_run(
+        src,
+        "task_119b_r1_handle_inside_hoisted_lambda_in_generic_fn",
+    );
+    assert_eq!(
+        status, 0,
+        "post-119b R1: handle inside hoisted lambda's body in generic fn must \
+         compile + run cleanly; stderr={stderr}",
+    );
+    assert_eq!(stdout, "5\n", "post-119b R1: expected `5\\n` (k(0) + 5)",);
 }
 
 /// **Task 78.5 G5 (review-2 widening) — `std/state.sigil`'s
