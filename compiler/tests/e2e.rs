@@ -5548,6 +5548,7 @@ fn task_117_let_bound_k_alias_then_match_pattern_shadows_k_rejected_at_walker() 
 // =====================================================================
 
 #[test]
+#[ignore = "pending Plan D Task 118 architectural codegen extension — see PR #81 surface"]
 fn task_118_conditional_k_call_inside_if_drives_both_ways() {
     // (a) Conditional k-call inside `if`. The arm body is
     // `if cond { k(10) } else { k(20) }`. `cond` is the perform's
@@ -5578,6 +5579,7 @@ fn task_118_conditional_k_call_inside_if_drives_both_ways() {
 }
 
 #[test]
+#[ignore = "pending Plan D Task 118 architectural codegen extension — see PR #81 surface"]
 fn task_118_conditional_k_call_inside_match_drives_both_ways() {
     // (b) Conditional k-call inside `match`. The arm body matches
     // an op-arg tag and calls `k` with different ints per variant.
@@ -5609,6 +5611,7 @@ fn task_118_conditional_k_call_inside_match_drives_both_ways() {
 }
 
 #[test]
+#[ignore = "pending Plan D Task 118 architectural codegen extension — see PR #81 surface"]
 fn task_118_k_call_in_one_branch_else_discharges() {
     // (c) k-call in one branch and a non-k constant in the other.
     // When cond=true → `k(0)` → body returns 0 (perform resumes
@@ -5640,6 +5643,7 @@ fn task_118_k_call_in_one_branch_else_discharges() {
 }
 
 #[test]
+#[ignore = "pending Plan D Task 118 architectural codegen extension — see PR #81 surface"]
 fn task_118_recursive_choose_first_choice_three_candidates() {
     // (d) Sudoku-canonical "for each candidate { try k(c); on fail
     // try next }" recursive shape. Smaller fixture: 3 candidates,

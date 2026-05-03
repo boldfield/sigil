@@ -1747,19 +1747,32 @@ fn arm_body_walk(
             else_block,
             ..
         } => arm_body_walk(cond, scopes, k_name, globals, false)
-            // Plan D Task 118 — propagate `tail` into If branches'
-            // tail position so `if cond { k(x) } else { k(y) }` in
-            // tail position of the arm body lets through (the
-            // Expr::Call walker arm sees tail=true at the k-call
-            // site and skips the non-tail rejection). The
-            // detector + lowering side must mirror this; without
-            // matched changes, the synth-pass will route into the
-            // discharged path and `lower_expr` will hit
-            // `unreachable!` when it walks the k-call. This change
-            // alone is structurally insufficient — see the Stage
-            // 13 review checkpoint surfacing.
-            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, tail))
-            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, tail)),
+            // `If` then/else branches are NOT propagated as tail
+            // for `k`-call detection: `arm_body_tail_is_k_call`
+            // (which the synth pass uses to route tail-k vs done)
+            // only recurses through `Expr::Block` tails. If we
+            // accept `if c { k(x) } else { k(y) }` as tail-k here,
+            // the detector returns `None` and the synth-pass falls
+            // into the non-tail path; `lower_expr` then tries to
+            // resolve `k` as an indirect callee and panics with
+            // `unreachable!("indirect call …")`. The walker stays
+            // strictly aligned with the detector's recursion shape;
+            // multi-branch tail-`k` lowerings (join-block returning
+            // `*NextStep`) are deferred to a future phase.
+            //
+            // Plan D Task 118 — minimal-removal hypothesis tested
+            // empirically on PR #81's first commit (walker propagated
+            // `tail` here): 4 e2e tests panicked at codegen.rs:16070
+            // `unreachable!("codegen invariant: walker accepted callee
+            // shape but no signature source registered")` because
+            // synth arm-fn Lowerers have `arm_k_pair_self = None`
+            // and `lower_call`'s k-pair dispatch (line 15120) only
+            // fires for lifted-lambda Lowerers. Walker change
+            // reverted; lift re-scoped as architectural work. The
+            // task_118_* e2e tests are kept as red-state TDD
+            // scaffolding for the follow-up.
+            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, false))
+            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, false)),
         Expr::Block(b) => arm_body_walk_block(b, scopes, k_name, globals, tail),
         Expr::Match {
             scrutinee, arms, ..
@@ -1772,14 +1785,19 @@ fn arm_body_walk(
                     std::collections::BTreeSet::new();
                 collect_pattern_bindings(&a.pattern, &mut pat_scope);
                 scopes.push(pat_scope);
-                // Plan D Task 118 — propagate `tail` into Match arm
-                // bodies so `match s { A => k(x), B => k(y) }` in
-                // tail position lets through the Expr::Call walker.
-                // Same caveat as the Expr::If site above: the
-                // detector + lowering side need matched changes for
-                // codegen to actually handle this; the lift is
-                // currently incomplete (Stage 13 surfacing).
-                let r = arm_body_walk(&a.body, scopes, k_name, globals, tail);
+                // Match arm bodies are NOT in tail position for
+                // `k`-call detection — same rationale as `Expr::If`
+                // above (the synth-pass detector
+                // `arm_body_tail_is_k_call` recurses only through
+                // `Expr::Block` tails). Multi-branch tail-`k` shapes
+                // (`match s { Variant1 => k(x), Variant2 => k(y) }`)
+                // are walker-rejected as non-tail; lifting requires
+                // a join-block lowering deferred to a future phase.
+                //
+                // Plan D Task 118 — see the Expr::If site comment
+                // above for the empirical evidence the minimal
+                // walker-removal fails at codegen; reverted.
+                let r = arm_body_walk(&a.body, scopes, k_name, globals, false);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -21565,14 +21583,17 @@ mod tests {
         );
     }
 
-    /// Plan D Task 118 — post-lift acceptance check. Constructs the
-    /// AST for `Eff.op(k) => if cond { k(10) } else { k(20) }` and
-    /// asserts `arm_body_unsupported_construct` returns None
-    /// (walker accepts the shape because the post-lift `Expr::If`
-    /// arm propagates `tail=true` into branch tails). Pre-lift this
-    /// returned Some with the "non-tail position" wording.
+    /// Plan D Task 118 — pre-lift walker rejection pin. Constructs
+    /// the AST for `Eff.op(k) => if cond { k(10) } else { k(20) }`
+    /// and asserts `arm_body_unsupported_construct` returns Some
+    /// with the canonical "non-tail position" wording. Pre-lift
+    /// this fires from `arm_body_walk`'s `Expr::Call` arm (the
+    /// if-branch walks pass `tail=false`, then the k-call site
+    /// hits the `!tail` reject). Post-lift this assertion flips to
+    /// `is_none()` plus codegen-side acceptance — see PR #81
+    /// surface for the architectural work needed.
     #[test]
-    fn task_118_walker_accepts_conditional_k_call_inside_if() {
+    fn task_118_walker_rejects_conditional_k_call_inside_if_pre_lift() {
         use crate::ast::{Block, Expr, HandleOpArm};
         use crate::errors::Span;
         use std::collections::{BTreeMap, BTreeSet};
@@ -21615,10 +21636,16 @@ mod tests {
         let effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
         let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many);
         assert!(
-            result.is_none(),
-            "Task 118 post-lift: walker must accept conditional-k-inside-if \
-             arm body shape (tail=true propagates into If branches). Got \
-             rejection: {result:?}"
+            result.is_some(),
+            "Task 118 pre-lift: walker must reject conditional-k-inside-if \
+             arm body shape. Post-lift this assertion flips to is_none() \
+             alongside the codegen extension."
+        );
+        let msg = result.unwrap();
+        assert!(
+            msg.contains("non-tail position"),
+            "walker rejection must use canonical 'non-tail position' wording; \
+             got {msg:?}"
         );
     }
 
