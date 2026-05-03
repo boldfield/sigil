@@ -12565,22 +12565,31 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 //   (`compiler/src/codegen.rs:15600+`)
                                 //   does not write — it widens a
                                 //   pre-existing `raw_u64`.
-                                // - The above-this-block
-                                //   `caller_dispatch_block`
-                                //   (Task 112b) writes
+                                // - The below-this-block
+                                //   `top_caller_dispatch_block`
+                                //   (Task 112b, in this file) writes
                                 //   `identity_fn_addr` at
                                 //   POST_ARM_K_FN_OFF as the new
                                 //   trailing pair when forwarding
-                                //   into caller_k_pair — the
-                                //   downstream synth-cont (caller's
-                                //   chain step) sees identity in its
-                                //   own POST_ARM_K_FN_OFF and the
-                                //   gate routes it correctly via
-                                //   caller_k_pair AGAIN. (Recursive;
-                                //   terminates at the top-level
-                                //   handle's caller_k_pair = (null,
-                                //   identity_k_fn) where dispatching
-                                //   identity returns Done.)
+                                //   into caller_k_pair at top-level
+                                //   — the dispatched identity ignores
+                                //   the trailing pair and returns
+                                //   Done(tail).
+                                // - The below-this-block
+                                //   `wrapper_forward_block`
+                                //   (Task 112c Case D fix) FORWARDS
+                                //   the loaded `post_arm_k_fn` (which
+                                //   may be identity OR a Slice B
+                                //   synth fn) into the new args_ptr
+                                //   trailing pair when dispatching
+                                //   via caller_k_pair in the
+                                //   wrapper-in-chain case. Forwarding
+                                //   preserves the singular-meaning
+                                //   invariant: the value is the same
+                                //   pointer that was originally
+                                //   written by lower_k_pair_call's
+                                //   tail-k path or by Slice B's lift,
+                                //   never synthesized fresh.
                                 // - Slice B's `let r = k(arg);
                                 //   pure_tail` arm body (codegen.rs
                                 //   ~10380-10470) writes a DISTINCT
@@ -12604,28 +12613,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // semantics, introduce a new sentinel
                                 // (or a runtime tag) and discriminate
                                 // explicitly.
-                                let is_post_arm_k_identity = lowerer.builder.ins().icmp(
-                                    IntCC::Equal,
-                                    post_arm_k_fn,
-                                    identity_fn_addr,
-                                );
-                                let caller_dispatch_block = lowerer.builder.create_block();
-                                let post_arm_k_dispatch_block = lowerer.builder.create_block();
-                                let merge_block = lowerer.builder.create_block();
-                                lowerer.builder.append_block_param(merge_block, pointer_ty);
-                                lowerer.builder.ins().brif(
-                                    is_post_arm_k_identity,
-                                    caller_dispatch_block,
-                                    &[],
-                                    post_arm_k_dispatch_block,
-                                    &[],
-                                );
-
-                                // -- caller_dispatch_block: route
-                                //    via helper's caller_k_pair (top-
-                                //    level OR wrapper-in-chain).
-                                lowerer.builder.switch_to_block(caller_dispatch_block);
-                                lowerer.builder.seal_block(caller_dispatch_block);
+                                // Plan D Task 112b Case D fix —
+                                // load caller_k_pair UPFRONT (was:
+                                // loaded only inside caller_dispatch
+                                // block) so we can discriminate
+                                // top-level vs wrapper-in-chain
+                                // FIRST, before the post_arm_k
+                                // identity check.
                                 let caller_k_closure_off: i32 =
                                     16 + 8 * (captures.len() + prior_bindings.len()) as i32;
                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
@@ -12641,116 +12635,256 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     synth_closure_ptr,
                                     caller_k_fn_off,
                                 );
-                                let three_v = lowerer.builder.ins().iconst(types::I32, 3);
-                                let call_ns_caller = lowerer.builder.ins().call(
+
+                                // **Case D fix.** The pre-Case-D gate
+                                // discriminated solely on
+                                // post_arm_k_fn. That mis-routed the
+                                // wrapper-in-chain + Slice B
+                                // outer-arm intersection: helper's
+                                // Final fired Slice B with helper's
+                                // tail (e.g. 99) instead of routing
+                                // helper's tail through caller's
+                                // chain → eventually firing Slice B
+                                // with the OUTERMOST body's tail.
+                                //
+                                // Correct discrimination is
+                                // **caller_k_fn first** (are we at
+                                // the outermost wrapper, where
+                                // caller_k_fn = identity_k_fn from
+                                // `lower_handle_body_direct_cps_call`'s
+                                // pack, vs in a wrapper-in-chain
+                                // where caller_k_fn = a chain-step
+                                // synth-cont's func_addr).
+                                //
+                                // - **Top-level (caller_k_fn ==
+                                //   identity)**: existing two-branch
+                                //   logic. post_arm_k_fn == identity
+                                //   → caller_dispatch (preserves the
+                                //   PR #80 identity-routes-to-Done
+                                //   path). post_arm_k_fn != identity
+                                //   → post_arm_k_dispatch (Slice B
+                                //   fires directly with body's tail).
+                                //
+                                // - **Wrapper-in-chain (caller_k_fn
+                                //   != identity)**: caller_dispatch
+                                //   with **post_arm_k FORWARDED** as
+                                //   the new args_ptr trailing pair
+                                //   (instead of the (null, identity)
+                                //   the top-level path uses).
+                                //   Forwarding propagates the lifted
+                                //   lambda's post_arm_k_synth_fn
+                                //   pointer through the chain. When
+                                //   the OUTERMOST body's chain step's
+                                //   Final eventually fires, ITS
+                                //   gate's caller_k_fn = identity AND
+                                //   ITS post_arm_k_fn = the forwarded
+                                //   slice_b_synth_fn → Slice B fires
+                                //   with the outermost body's tail.
+                                let is_caller_identity = lowerer.builder.ins().icmp(
+                                    IntCC::Equal,
+                                    caller_k_fn_loaded,
+                                    identity_fn_addr,
+                                );
+                                let top_level_block = lowerer.builder.create_block();
+                                let wrapper_forward_block = lowerer.builder.create_block();
+                                let merge_block = lowerer.builder.create_block();
+                                lowerer.builder.append_block_param(merge_block, pointer_ty);
+                                lowerer.builder.ins().brif(
+                                    is_caller_identity,
+                                    top_level_block,
+                                    &[],
+                                    wrapper_forward_block,
+                                    &[],
+                                );
+
+                                // -- top_level_block: caller is
+                                //    `lower_handle_body_direct_cps_call`'s
+                                //    (null, identity_k_fn) pack.
+                                //    Existing two-branch logic on
+                                //    post_arm_k_fn.
+                                lowerer.builder.switch_to_block(top_level_block);
+                                lowerer.builder.seal_block(top_level_block);
+                                let is_post_arm_k_identity = lowerer.builder.ins().icmp(
+                                    IntCC::Equal,
+                                    post_arm_k_fn,
+                                    identity_fn_addr,
+                                );
+                                let top_caller_dispatch_block = lowerer.builder.create_block();
+                                let top_post_arm_k_dispatch_block = lowerer.builder.create_block();
+                                lowerer.builder.ins().brif(
+                                    is_post_arm_k_identity,
+                                    top_caller_dispatch_block,
+                                    &[],
+                                    top_post_arm_k_dispatch_block,
+                                    &[],
+                                );
+
+                                // top_caller_dispatch_block: post_arm_k
+                                // is also identity (canonical tail-k
+                                // pattern). Dispatch via caller_k_pair
+                                // = (null, identity) → identity
+                                // returns Done(tail). Trailing pair
+                                // (null, identity) is irrelevant (id
+                                // reads only *args_ptr).
+                                lowerer.builder.switch_to_block(top_caller_dispatch_block);
+                                lowerer.builder.seal_block(top_caller_dispatch_block);
+                                let three_v_top_caller =
+                                    lowerer.builder.ins().iconst(types::I32, 3);
+                                let call_ns_top_caller = lowerer.builder.ins().call(
                                     lowerer.next_step_call_ref,
-                                    &[caller_k_closure_loaded, caller_k_fn_loaded, three_v],
+                                    &[
+                                        caller_k_closure_loaded,
+                                        caller_k_fn_loaded,
+                                        three_v_top_caller,
+                                    ],
                                 );
                                 lowerer.stackmap.push_placeholder(function_code_offset(
                                     &lowerer.builder,
-                                    call_ns_caller,
+                                    call_ns_top_caller,
                                 ));
-                                let ns_ptr_caller = lowerer.builder.inst_results(call_ns_caller)[0];
-                                let argp_call_caller = lowerer
+                                let ns_ptr_top_caller =
+                                    lowerer.builder.inst_results(call_ns_top_caller)[0];
+                                let argp_call_top_caller = lowerer
                                     .builder
                                     .ins()
-                                    .call(lowerer.next_step_args_ptr_ref, &[ns_ptr_caller]);
+                                    .call(lowerer.next_step_args_ptr_ref, &[ns_ptr_top_caller]);
                                 lowerer.stackmap.push_placeholder(function_code_offset(
                                     &lowerer.builder,
-                                    argp_call_caller,
+                                    argp_call_top_caller,
                                 ));
-                                let argp_v_caller =
-                                    lowerer.builder.inst_results(argp_call_caller)[0];
-                                // Trailing-pair writes are
-                                // unconditional (PR #85 review 2
-                                // smaller). Top-level case
-                                // (caller_k_fn = identity_k_fn from
-                                // PR #80's pack) ignores
-                                // POST_ARM_K_CLOSURE_OFF /
-                                // POST_ARM_K_FN_OFF — identity reads
-                                // only `*args_ptr`. Wrapper-in-chain
-                                // case (caller_k_fn = a synth-cont
-                                // addr) consumes the POST_ARM_K
-                                // pair to drive its own gate
-                                // recursively (the downstream synth-
-                                // cont's POST_ARM_K is identity, so
-                                // its gate routes via ITS
-                                // caller_k_pair, etc., terminating
-                                // at the top-level handle).
-                                // Specializing the trailing writes
-                                // when caller_k_fn is statically
-                                // known to equal identity at
-                                // dispatch time would require a
-                                // 4-block branch (top-level / non-
-                                // top-level) above this 2-block
-                                // gate, which is more emit code for
-                                // a 2-store savings on a path that
-                                // typically allocates a fresh args
-                                // buffer anyway. Not worth it.
+                                let argp_v_top_caller =
+                                    lowerer.builder.inst_results(argp_call_top_caller)[0];
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
                                     widened_tail,
-                                    argp_v_caller,
+                                    argp_v_top_caller,
                                     POST_ARM_K_ARG_OFF,
                                 );
-                                let null_post_arm_k_closure =
-                                    lowerer.builder.ins().iconst(pointer_ty, 0);
+                                let null_top_caller = lowerer.builder.ins().iconst(pointer_ty, 0);
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
-                                    null_post_arm_k_closure,
-                                    argp_v_caller,
+                                    null_top_caller,
+                                    argp_v_top_caller,
                                     POST_ARM_K_CLOSURE_OFF,
                                 );
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
                                     identity_fn_addr,
-                                    argp_v_caller,
+                                    argp_v_top_caller,
                                     POST_ARM_K_FN_OFF,
                                 );
                                 lowerer
                                     .builder
                                     .ins()
-                                    .jump(merge_block, &[ns_ptr_caller.into()]);
+                                    .jump(merge_block, &[ns_ptr_top_caller.into()]);
 
-                                // -- post_arm_k_dispatch_block: route
-                                //    via the post-arm-k synth fn
-                                //    written by the lifted lambda's
-                                //    Slice B path (`let r = k(arg);
-                                //    pure_tail`). 1-slot args_buf
-                                //    [tail]. Mirrors the original
-                                //    `emit_dispatch_to_post_arm_k`
-                                //    helper.
-                                lowerer.builder.switch_to_block(post_arm_k_dispatch_block);
-                                lowerer.builder.seal_block(post_arm_k_dispatch_block);
-                                let one_v = lowerer.builder.ins().iconst(types::I32, 1);
-                                let call_ns_post = lowerer.builder.ins().call(
+                                // top_post_arm_k_dispatch_block: top-
+                                // level + Slice B arm body. Dispatch
+                                // post_arm_k synth fn directly with
+                                // 1-slot [tail] (Slice B reads
+                                // args_ptr[0] = r). Original
+                                // emit_dispatch_to_post_arm_k shape.
+                                lowerer
+                                    .builder
+                                    .switch_to_block(top_post_arm_k_dispatch_block);
+                                lowerer.builder.seal_block(top_post_arm_k_dispatch_block);
+                                let one_v_top_post = lowerer.builder.ins().iconst(types::I32, 1);
+                                let call_ns_top_post = lowerer.builder.ins().call(
                                     lowerer.next_step_call_ref,
-                                    &[post_arm_k_closure, post_arm_k_fn, one_v],
+                                    &[post_arm_k_closure, post_arm_k_fn, one_v_top_post],
                                 );
                                 lowerer.stackmap.push_placeholder(function_code_offset(
                                     &lowerer.builder,
-                                    call_ns_post,
+                                    call_ns_top_post,
                                 ));
-                                let ns_ptr_post = lowerer.builder.inst_results(call_ns_post)[0];
-                                let argp_call_post = lowerer
+                                let ns_ptr_top_post =
+                                    lowerer.builder.inst_results(call_ns_top_post)[0];
+                                let argp_call_top_post = lowerer
                                     .builder
                                     .ins()
-                                    .call(lowerer.next_step_args_ptr_ref, &[ns_ptr_post]);
+                                    .call(lowerer.next_step_args_ptr_ref, &[ns_ptr_top_post]);
                                 lowerer.stackmap.push_placeholder(function_code_offset(
                                     &lowerer.builder,
-                                    argp_call_post,
+                                    argp_call_top_post,
                                 ));
-                                let argp_v_post = lowerer.builder.inst_results(argp_call_post)[0];
+                                let argp_v_top_post =
+                                    lowerer.builder.inst_results(argp_call_top_post)[0];
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
                                     widened_tail,
-                                    argp_v_post,
+                                    argp_v_top_post,
                                     0,
                                 );
                                 lowerer
                                     .builder
                                     .ins()
-                                    .jump(merge_block, &[ns_ptr_post.into()]);
+                                    .jump(merge_block, &[ns_ptr_top_post.into()]);
+
+                                // -- wrapper_forward_block: caller is
+                                //    wrapper-in-chain. Dispatch via
+                                //    caller_k_pair (= caller's chain-
+                                //    step synth-cont) with post_arm_k
+                                //    FORWARDED as the new args_ptr
+                                //    trailing pair. The caller's
+                                //    chain step ignores its incoming
+                                //    post_arm_k (Middle convention)
+                                //    OR consumes it at its own Final
+                                //    gate (recursive case). When the
+                                //    chain ultimately reaches the
+                                //    outermost level
+                                //    (caller_k_fn = identity), the
+                                //    forwarded post_arm_k drives
+                                //    top_post_arm_k_dispatch_block
+                                //    above with the outermost body's
+                                //    tail.
+                                //
+                                //    Closes Case D: wrapper-in-chain
+                                //    + Slice B outer arm now produces
+                                //    Slice B(outermost_tail) instead
+                                //    of Slice B(wrapper_tail).
+                                lowerer.builder.switch_to_block(wrapper_forward_block);
+                                lowerer.builder.seal_block(wrapper_forward_block);
+                                let three_v_wrap = lowerer.builder.ins().iconst(types::I32, 3);
+                                let call_ns_wrap = lowerer.builder.ins().call(
+                                    lowerer.next_step_call_ref,
+                                    &[caller_k_closure_loaded, caller_k_fn_loaded, three_v_wrap],
+                                );
+                                lowerer.stackmap.push_placeholder(function_code_offset(
+                                    &lowerer.builder,
+                                    call_ns_wrap,
+                                ));
+                                let ns_ptr_wrap = lowerer.builder.inst_results(call_ns_wrap)[0];
+                                let argp_call_wrap = lowerer
+                                    .builder
+                                    .ins()
+                                    .call(lowerer.next_step_args_ptr_ref, &[ns_ptr_wrap]);
+                                lowerer.stackmap.push_placeholder(function_code_offset(
+                                    &lowerer.builder,
+                                    argp_call_wrap,
+                                ));
+                                let argp_v_wrap = lowerer.builder.inst_results(argp_call_wrap)[0];
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    widened_tail,
+                                    argp_v_wrap,
+                                    POST_ARM_K_ARG_OFF,
+                                );
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    post_arm_k_closure,
+                                    argp_v_wrap,
+                                    POST_ARM_K_CLOSURE_OFF,
+                                );
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    post_arm_k_fn,
+                                    argp_v_wrap,
+                                    POST_ARM_K_FN_OFF,
+                                );
+                                lowerer
+                                    .builder
+                                    .ins()
+                                    .jump(merge_block, &[ns_ptr_wrap.into()]);
 
                                 // -- merge_block: yield the chosen
                                 //    NextStep ptr.

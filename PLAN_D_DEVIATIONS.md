@@ -150,13 +150,59 @@ Pre-fix, this case was masked: classifier rejected chained-let-yield Cps wrapper
 
 **Implementation iteration.** Initial commit (`162c2f8`) applied (2a) — unconditional caller_k_pair substitution at Final's emit. CI flagged ~12 regressions in Slice B, slice_c_*, task_117_*, choose_*, multishot_stress_* tests because (2a) bypassed the `post_arm_k_synth_fn` that those tests rely on. Pivoted to (2c) runtime gate (commit `aee3226`) which discriminates the two cases. CI re-run with the gate + a test-source `_`-rename fix (`fdf52da`) was fully green across all 4 lanes.
 
-**Open question / Case D.** Wrapper-in-chain WITH a Slice B arm body in the OUTER handle. The runtime gate routes via post_arm_k (Slice B synth fn fires; outer chain step does not fire) — the correct semantic when Slice B's `pure_tail` IS the discharge value, but worth a sister test to confirm. The current test corpus doesn't exercise Case D.
+**Open question / Case D — RESOLVED 2026-05-03 by Task 112c.** The PR #85 gate's "post_arm_k routes via post_arm_k when != identity" disposition turned out to be WRONG for the wrapper-in-chain + Slice B outer arm intersection. Empirical test (un-ignored sister test reproducing the shape) produced `100` instead of expected `1` — the gate fired Slice B at the WRAPPER's Final with the wrapper's tail (99) instead of routing helper's tail through caller's chain → eventually firing Slice B with the OUTERMOST body's tail (0). Closure path: change the gate to discriminate on `caller_k_fn` FIRST (top-level = identity vs wrapper-in-chain). When wrapper-in-chain, dispatch via caller_k_pair AND forward post_arm_k as the new args_ptr trailing pair. See `[DEVIATION Task 112c]` below for the full closure record.
 
-**Owner.** Task 112b — closed by PR #85.
+**Owner.** Task 112b — closed by PR #85. Task 112c — closes the Case D follow-up.
 
 **Gate.** `[DEVIATION Task 72]` constraint #3 (wrapper-fn-frame discharge composition) is now FULLY closed: tail-perform wrappers via Task 112a, chained-let-yield wrappers via Task 112b. Plan D Task 119 closeout is unblocked from constraint #3.
 
 **Implementing commits.** PR #85: `162c2f8` (initial (2a) impl), `aee3226` ((2c) gate refactor), `fdf52da` (test-source rename). Plus follow-up sister tests + this deviation rewrite.
+
+## 2026-05-03 — [DEVIATION Task 112c] Case D fix: wrapper-in-chain + Slice B outer arm — CLOSED
+
+**Context.** PR #85 (Task 112b) shipped the chained-let-yield Cps wrapper composition fix with a runtime gate at the chain Final's emit that discriminated on `post_arm_k_fn` only. The gate's docstring conjectured that "when `post_arm_k_fn != identity`, route via post_arm_k_dispatch (Slice B fires; outer chain step does not fire) is the correct semantic when Slice B's `pure_tail` IS the discharge value." The conjecture was filed as Case D and tracked via an `#[ignore]`'d sister test pending semantic resolution.
+
+**Empirical resolution.** Un-ignoring the sister test (`task_112b_case_d_wrapper_in_chain_with_slice_b_outer_arm_pending_semantic`) and running it produced `"100\n"` instead of the source-semantic-correct `"1\n"`. Trace:
+
+```
+effect Eff { fail: () -> Int }
+fn helper() -> Int ![Eff] { let _a = perform Eff.fail(); 99 }
+fn comp() -> Int ![Eff]   { let _x = helper(); 0 }
+fn main() -> Int ![IO] {
+  let n = handle comp() with {
+    Eff.fail(k) => { let r = k(7); r + 1 }
+  };
+  perform IO.println(int_to_string(n));
+  0
+}
+```
+
+By substitute-then-wrap semantics: `k(7)` resumes the body at the perform site with `7`, so helper continues (`_a=7`, returns 99), comp continues (`_x=99`, returns 0). `k(7) = 0`. Slice B's `r = 0`. `r + 1 = 1`. Pre-fix actual was `100` because helper's Final's gate fired Slice B with `r = helper's tail = 99` instead of forwarding helper's tail through comp's chain step.
+
+**Failure mode.** The pre-fix gate discriminated solely on `post_arm_k_fn`. For wrapper-in-chain + Slice B outer arm: `post_arm_k_fn` was loaded from helper's `args_ptr` trailing pair, which was set by the lifted lambda's `lower_k_pair_call` Slice B path = `slice_b_synth_fn` (non-identity). Gate routed via `post_arm_k_dispatch_block` and fired Slice B at helper's Final with helper's tail. comp's chain step never fired; the "chain continues" invariant broken.
+
+**Closure path.** Restructure the gate to discriminate on `caller_k_fn` FIRST, then on `post_arm_k_fn` only at the top-level branch. Three blocks instead of two:
+
+1. **`top_caller_dispatch_block`** (`caller_k_fn == identity` AND `post_arm_k_fn == identity`): outermost wrapper + tail-k arm. Dispatch via `caller_k_pair` = (null, identity). Identity returns Done(tail). Existing semantic preserved.
+
+2. **`top_post_arm_k_dispatch_block`** (`caller_k_fn == identity` AND `post_arm_k_fn != identity`): outermost wrapper + Slice B arm. Dispatch Slice B synth fn directly with 1-slot `[tail]`. Slice B fires with body's natural-exit tail. Existing semantic preserved (and now CORRECTLY fires only at top-level).
+
+3. **`wrapper_forward_block`** (`caller_k_fn != identity`): wrapper-in-chain. Dispatch via `caller_k_pair` (caller's chain-step synth-cont) with 3-slot args buffer `[tail, post_arm_k_closure, post_arm_k_fn]` — the post_arm_k pair is FORWARDED as the new args_ptr trailing pair. The caller's chain step ignores its incoming post_arm_k (Middle convention) OR consumes it at its own Final's gate (recursive). When the chain ultimately reaches the outermost level (`caller_k_fn = identity`), the forwarded `post_arm_k_fn` drives `top_post_arm_k_dispatch_block` with the OUTERMOST body's tail. Closes Case D.
+
+**Identity-sentinel invariant preserved.** `wrapper_forward_block` writes the FORWARDED `post_arm_k_fn` (loaded from args_ptr) — the value is whatever was originally written by `lower_k_pair_call`'s tail-k path or by Slice B's lift, never synthesized fresh. The "only canonical tail-k pattern writes identity to POST_ARM_K_FN_OFF" invariant the gate's correctness depends on still holds.
+
+**Tests.**
+
+- `task_112c_case_d_wrapper_in_chain_with_slice_b_outer_arm_returns_1` — un-ignored from PR #85's `_pending_semantic`. Canonical Case D shape; expected `"1\n"`.
+- `task_112c_case_d_two_layer_wrapper_chain_with_slice_b_outer_arm_returns_60` — sister test pinning post_arm_k forwarding through TWO wrapper-in-chain layers (`comp → outer_helper → inner_helper`).
+
+Full regression suite green (all 267 non-perf tests pass; the 3 perf failures are pre-existing debug-build walltime issues unrelated to this work).
+
+**Owner.** Task 112c — closed by this commit.
+
+**Gate.** Plan D Task 119 closeout's "Case D semantic resolution" item is now resolved — the semantic is "chain continues" (wrapper's tail flows through caller's chain; Slice B fires once at the outermost body's tail), and the gate now produces this semantic correctly.
+
+**Implementing commits.** This PR.
 
 ## 2026-04-30 — [DEVIATION Stage 10.5.5] `#[ignore]` survey count diverges from plan estimate (3 actual vs ~12 expected)
 
