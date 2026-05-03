@@ -587,3 +587,61 @@ Per Brian's 2026-05-01 reversal of the substrate-only-close framing, the positiv
 
 Three review rounds (boldfield as reviewer): substrate-quality issues, ty_to_type_expr panic surface (closed), and bind_ty_var bypass blocker (closed via check_call precision fix).
 
+## 2026-05-03 — [DEVIATION Task 118] Architectural slice for branched-routing path; not minimal removal
+
+**Context.** Plan D Task 118's plan body framed the lift as "primarily a removal of walker rejections + verification that step 117's machinery generalizes." Static analysis surfaced the hypothesis as suspect (synth arm-fn Lowerers have `arm_k_pair_self = None`; `lower_call`'s k-pair dispatch at codegen.rs:15120 fires only for lifted-lambda Lowerers). PR #81's first commit empirically confirmed: minimal walker removal (propagate `tail` into If/Match branch tails) caused 4 task_118_* e2e tests to panic at codegen.rs:16070 `unreachable!("codegen invariant: walker accepted callee shape but no signature source registered — callee = Ident(\"k\", ...)")`.
+
+PR #81's second commit reverted the walker change and re-framed the PR as a surface artifact for re-scope decision; user authorized (this session, 2026-05-03) bundling the architectural slice into PR #81 instead of multi-PR re-scope.
+
+**Mechanism (PR #81 third commit).** New "branched-routing" path in the synth arm-fn body emit:
+
+- New detector `arm_body_needs_branched_routing` gates entry; mutually exclusive with Slice C / Slice B / tail-k / discharged paths. Placed BEFORE the existing routing's other branches.
+- New Lowerer method `lower_arm_body_to_next_step` recursively descends body's tail through `Expr::Block` (lower stmts, recurse tail), `Expr::If` (lower cond, branch + recurse + merge), `Expr::Match` (lower scrutinee — special-cased for k-as-scrutinee — then per-arm recurse + merge). Leaves: tail-`k(arg)` → `NextStep::Call` with Slice A trailing-pair convention `(null, identity)`; non-k value → `NextStep::Discharged`. If/Match join at a Cranelift block with a `pointer_ty` block param.
+- New helper `lower_synth_arm_k_call_as_value` drives a nested `sigil_run_loop` for k-as-scrutinee shapes; narrows the u64 result to the match scrutinee's Cranelift type via `match_scrut_tys_resolved` / `match_scrut_tys` side-tables.
+- Walker (`arm_body_walk`) updates: `Expr::If` propagates `tail` into branch tails (was always false); `Expr::Match` propagates `tail` into arm bodies (was always false); `Expr::Match` scrutinee in tail context special-cases k-as-scrutinee (walks k(arg)'s arg in non-tail, skipping the regular Expr::Call walker which would reject k-as-callee in non-tail).
+- New free helper `match_k_call_arg(e, k_name) -> Option<&Expr>` returns Some(arg) iff e is exactly `Expr::Call { callee: Expr::Ident(k_name), args: [arg] }`.
+
+**Differences from `lower_k_pair_call`** (Stage 6.8 lifted-lambda dispatch). `lower_synth_arm_k_call_as_value` differs in three ways:
+1. Sources `k_closure_v` / `k_fn_v` directly from the synth arm-fn's loaded args_ptr trailing slots (no closure-record indirection).
+2. Does NOT re-push the originating handler frame (synth arm-fn executes within the trampoline that's processing the perform; the handler frame is on the stack already).
+3. Does NOT apply the return-arm wrap (value consumed at source-language level — match scrutinee or branch leaf — handler-overall wrapping is unnecessary).
+
+**Test coverage.** Four e2e tests in `compiler/tests/e2e.rs`:
+- `task_118_conditional_k_call_inside_if_drives_both_ways` — `Pick.pick(cond, k) => if cond { k(10) } else { k(20) }`; drives both ways via op-arg.
+- `task_118_conditional_k_call_inside_match_drives_both_ways` — `Pick.pick(tag, k) => match tag { TagA => k(10), TagB => k(20) }`.
+- `task_118_k_call_in_one_branch_else_discharges` — `Pick.pick(cond, k) => if cond { k(0) } else { 42 }`; tests discharge path coexists with resume path.
+- `task_118_recursive_choose_first_choice_three_candidates` — Sudoku-canonical recursive Choose first_choice 3-candidate shape with k-as-scrutinee in nested matches.
+
+Plus one pod-safe lib unit test `task_118_walker_accepts_conditional_k_call_inside_if` pinning walker acceptance.
+
+Removed (superseded): pre-existing Phase-4d-era rejection-pin tests `arm_uses_k_inside_if_branch_is_rejected_pointing_at_phase_4e` and `arm_uses_k_inside_match_arm_is_rejected_pointing_at_phase_4e`.
+
+**Closure points closed.** `PLAN_C_DEVIATIONS.md` `[DEVIATION Task 73]` codegen-side gap (c) — conditional/branched k-call rejection at `arm_body_walk`. Sudoku already passing via Task 117 binary-choose 2-let chain (smoke gate unchanged); Task 118 closes the recursive Choose first_choice shape that Sudoku didn't need.
+
+**Performance note.** The branched-routing path emits the same heap-allocated NextStep records as Slice A / Slice B / Slice C — constant per-dispatch cost (1 NextStep alloc per leaf). The k-as-scrutinee path drives a NESTED `sigil_run_loop` per dispatch and the nested run_loop frame stays on the host stack until the scrutinee resolves. Cumulative cost is per-recursion-depth: a recursive Choose `first_choice` over N candidates allocates O(N) NextStep records and consumes O(N) host stack frames. Acceptable for the 3-candidate test (d) — Sudoku-scale recursive Choose (~9-cell × ~9-candidate fanout = ~729 nested drives per partial traversal) is not on the Task 118 / Stage 13 acceptance gate (the Sudoku smoke gate uses Task 117's binary-choose 2-let chain, which doesn't traverse this path). Unbounded recursive Choose dischargers would need additional work — recommend tracking as a v3 perf item alongside the indefinite-extent continuation work.
+
+**Implementing commits.** All on PR #81 branch `task-118-conditional-branched-k-call`:
+- `19e47f4` — initial walker-only minimal-removal attempt (reverted by next commit; preserved for empirical evidence in commit history).
+- `f24293d` — revert walker change; mark e2e tests `#[ignore]`; restore green CI as surface artifact.
+- `29147b6` — architectural slice (branched-routing path + walker updates + un-ignore tests + remove obsolete rejection-pin tests).
+- `4abee10` — PROGRESS / DEVIATIONS / RECENT_ACTIVITY updates.
+- Review-pass-1 fixes (this commit): tighten detector to mirror lowering capability; add invariant doc to `lower_arm_body_to_next_step`; sync "two/three ways" doc; promote `next_step_discharged_ref` to Lowerer field; FIXME for `current_fn_name` resolved-Ty miss; performance note accuracy correction; inner-handle pre-existing-gap note.
+
+## Pre-existing v1 limitations surfaced by Task 118 review
+
+These are NOT introduced by Task 118; review of PR #81 surfaced them.
+
+**Outer-`k` reference inside nested-handle inner-arm body.** Walker (`arm_body_walk`) accepts shapes like:
+```sigil
+Eff.op(k) => if cond { handle inner_eff with { Inner.foo(ki) => k(99) } } else { 0 }
+```
+The walker's `Expr::Handle` arm recurses inner arm bodies with `k_name = inner_arm.k_name`, so an outer-`k` ident inside the inner arm body is treated as a regular outer-scope capture (`Ident` arm's check on `name == k_name` fails for the inner k_name; falls through to "outer-scope capture allowed"). Codegen's inner arm fn synth Lowerer has `arm_k_pair_self = None`, so `lower_call`'s k-pair dispatch doesn't fire when the inner arm body's `Expr::Call { callee: Ident("k"), ... }` lowers — it falls through to the "indirect call" wildcard which hits `unreachable!` at the "no signature source registered" site.
+
+This is pre-existing (predates Task 118). Stage 6.8 Task 107's `arm_k_pair_captures` handles k-capture-by-lifted-LAMBDA, not k-capture-by-nested-handle-inner-arm. The new branched-routing detector intentionally does NOT scan inner handle op_arms (a transitive scan would over-route for shapes where the inner arm body's outer-k usage isn't in a position the new path handles).
+
+Closure path: separate task. Either narrow the walker to reject this shape with a Task-118-pointing diagnostic, or extend the lifted-lambda mechanism to nested-handle inner arms.
+
+**Generic dischargers with k-as-scrutinee untested.** `lower_synth_arm_k_call_as_value`'s scrutinee-type lookup uses `(self.current_fn_name, scrut_span)` as the per-clone key; synth arm-fn Lowerers set `current_fn_name = String::new()` (codegen.rs:9700-ish), so the per-clone resolved table essentially never hits and the span-only fallback fires. For non-generic dischargers (the 4 task_118_* e2e tests), the span-only table holds the concrete `Ty` and narrowing is correct. For GENERIC dischargers (no test coverage), the span-only table holds pre-mono `Ty::Var(_)` and `cranelift_ty_of_ty` rejects with `unreachable!`. Same fragility exists in `lower_match` — pre-existing pattern, not Task 118 specific. FIXME comment added at the lookup site (`lower_synth_arm_k_call_as_value` body).
+
+Closure path: thread the synth fn's clone identity into `current_fn_name` at Lowerer construction (touches every Lowerer construction site for synth fns; out of Task 118 scope).
+

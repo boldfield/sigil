@@ -1747,25 +1747,35 @@ fn arm_body_walk(
             else_block,
             ..
         } => arm_body_walk(cond, scopes, k_name, globals, false)
-            // `If` then/else branches are NOT propagated as tail
-            // for `k`-call detection: `arm_body_tail_is_k_call`
-            // (which the synth pass uses to route tail-k vs done)
-            // only recurses through `Expr::Block` tails. If we
-            // accept `if c { k(x) } else { k(y) }` as tail-k here,
-            // the detector returns `None` and the synth-pass falls
-            // into the non-tail path; `lower_expr` then tries to
-            // resolve `k` as an indirect callee and panics with
-            // `unreachable!("indirect call …")`. The walker stays
-            // strictly aligned with the detector's recursion shape;
-            // multi-branch tail-`k` lowerings (join-block returning
-            // `*NextStep`) are deferred to a future phase.
-            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, false))
-            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, false)),
+            // Plan D Task 118 — `If` then/else branches propagate
+            // `tail` into branch tails so the branched-routing path
+            // (`lower_arm_body_to_next_step`) handles k-calls inside
+            // each branch. Pre-Task-118 these branches walked with
+            // `tail=false` and the Expr::Call k-reject fired; the
+            // synth-pass detector `arm_body_tail_is_k_call` only
+            // recurses through `Expr::Block` tails, so the rejection
+            // was load-bearing pre-Task-118 (codegen had no path
+            // for branched-k). Post-Task-118 codegen routes through
+            // `lower_arm_body_to_next_step` when
+            // `arm_body_needs_branched_routing` fires.
+            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, tail))
+            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, tail)),
         Expr::Block(b) => arm_body_walk_block(b, scopes, k_name, globals, tail),
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            if let Some(r) = arm_body_walk(scrutinee, scopes, k_name, globals, false) {
+            // Plan D Task 118 — when in tail context, `match k(arg) {
+            // ... }` is supported via `lower_synth_arm_k_call_as_value`'s
+            // nested run_loop drive. Walk the scrutinee specially: if
+            // it's `k(arg)` and we're in tail context, recurse into the
+            // arg in non-tail position (skipping the regular Expr::Call
+            // walker which would reject k-as-callee in non-tail). Other
+            // scrutinee shapes walk in non-tail context as before.
+            let scrut_diag = match (tail, match_k_call_arg(scrutinee, k_name)) {
+                (true, Some(arg_expr)) => arm_body_walk(arg_expr, scopes, k_name, globals, false),
+                _ => arm_body_walk(scrutinee, scopes, k_name, globals, false),
+            };
+            if let Some(r) = scrut_diag {
                 return Some(r);
             }
             for a in arms {
@@ -1773,15 +1783,10 @@ fn arm_body_walk(
                     std::collections::BTreeSet::new();
                 collect_pattern_bindings(&a.pattern, &mut pat_scope);
                 scopes.push(pat_scope);
-                // Match arm bodies are NOT in tail position for
-                // `k`-call detection — same rationale as `Expr::If`
-                // above (the synth-pass detector
-                // `arm_body_tail_is_k_call` recurses only through
-                // `Expr::Block` tails). Multi-branch tail-`k` shapes
-                // (`match s { Variant1 => k(x), Variant2 => k(y) }`)
-                // are walker-rejected as non-tail; lifting requires
-                // a join-block lowering deferred to a future phase.
-                let r = arm_body_walk(&a.body, scopes, k_name, globals, false);
+                // Plan D Task 118 — Match arm bodies propagate `tail`
+                // so the branched-routing path handles k-calls in
+                // each arm. See the Expr::If site for the rationale.
+                let r = arm_body_walk(&a.body, scopes, k_name, globals, tail);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -4783,12 +4788,11 @@ fn collect_handle_arms_in_expr(
 /// `tail` parameter aligns with this detection: only positions reached
 /// here would have been allowed as tail-`k` callees by the walker.
 ///
-/// `If`/`Match` branch tails are deliberately NOT propagated through —
-/// Phase 4d MVP doesn't support multi-branch tail-`k` shapes (e.g.,
-/// `if c { k(x) } else { k(y) }`); those would need a join-block
-/// lowering with both branches producing `*NextStep` values, deferred
-/// to a later phase. The walker rejects k-calls inside If/Match
-/// branches as non-tail.
+/// `If`/`Match` branch tails are deliberately NOT propagated through
+/// here — they're handled by [`Lowerer::lower_arm_body_to_next_step`]'s
+/// recursive descent (Plan D Task 118). This detector's role is only
+/// "is the body's tail a single `k(arg)` call?"; branched-tail-k and
+/// k-as-scrutinee route through the new path before reaching here.
 fn arm_body_tail_is_k_call<'a>(
     body: &'a crate::ast::Expr,
     k_name: &str,
@@ -4809,6 +4813,114 @@ fn arm_body_tail_is_k_call<'a>(
             .and_then(|t| arm_body_tail_is_k_call(t, k_name)),
         _ => None,
     }
+}
+
+/// Plan D Task 118 — return `Some(arg_expr)` iff `e` is exactly
+/// `Expr::Call { callee: Expr::Ident(k_name), args: [arg_expr] }`.
+/// Used at `match` scrutinee position to detect k-as-scrutinee
+/// shape for [`Lowerer::lower_synth_arm_k_call_as_value`].
+fn match_k_call_arg<'a>(e: &'a crate::ast::Expr, k_name: &str) -> Option<&'a crate::ast::Expr> {
+    use crate::ast::Expr;
+    if let Expr::Call { callee, args, .. } = e {
+        if args.len() == 1 {
+            if let Expr::Ident(n, _) = callee.as_ref() {
+                if n == k_name {
+                    return Some(&args[0]);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Plan D Task 118 — recognise arm-body shapes that need the
+/// branched-routing lowering path (recursive descent through
+/// `Expr::Block` / `Expr::If` / `Expr::Match` with k-call leaves
+/// emitting `NextStep::Call` and non-k leaves emitting
+/// `NextStep::Discharged`). Returns true iff the body's tail position
+/// is an `Expr::If` or `Expr::Match` whose recursive descent will
+/// reach a k-call at a position the lowering actually handles —
+/// branch tail or match scrutinee. Returns false for shapes already
+/// handled by the existing routing (Slice C chain, Slice B
+/// single-let, Slice A tail-k, plain discharged).
+///
+/// **Detector ⇔ lowering capability mirror.** Earlier versions of
+/// this detector used a transitive `expr_has_k_call` scan that
+/// returned true for k-calls anywhere in a sub-tree (let-RHS,
+/// binary operands, perform args, etc.). That was correct-but-
+/// fragile: the lowering path [`Lowerer::lower_arm_body_to_next_step`]
+/// only handles k at branch-tail / scrutinee / Block-tail positions,
+/// so the wider detector was relying on the walker's non-tail-k
+/// rejection to catch the unsupported shapes before codegen ran.
+/// A future walker relaxation would silently expose `unreachable!`
+/// panics at `lower_call`'s "no signature source registered" site.
+/// The current implementation's recursion shape mirrors
+/// [`Lowerer::lower_arm_body_to_next_step`]'s exactly: only
+/// positions reached by that recursion count as "needs branched
+/// routing".
+fn arm_body_needs_branched_routing(body: &crate::ast::Expr, k_name: &str) -> bool {
+    use crate::ast::Expr;
+    match body {
+        Expr::Block(b) => b
+            .tail
+            .as_ref()
+            .is_some_and(|t| arm_body_needs_branched_routing(t, k_name)),
+        // The OUTER body being a direct k-call routes through Slice A
+        // (existing tail-k path). Only If/Match at the outer level
+        // need the new branched-routing path.
+        Expr::If { .. } | Expr::Match { .. } => expr_has_branchable_k(body, k_name),
+        _ => false,
+    }
+}
+
+/// Plan D Task 118 — `true` iff `e` contains a k-call (i.e., a
+/// single-arg `Expr::Call` whose callee is `Expr::Ident(k_name)`)
+/// at a position the branched-routing lowering path actually
+/// handles: direct k-call, Block-tail, If-branch tail, Match
+/// scrutinee, or Match arm body.
+///
+/// Mirrors [`Lowerer::lower_arm_body_to_next_step`]'s recursion
+/// shape exactly. NOT a transitive sub-tree scan — k-calls inside
+/// let-RHS, binary operands, perform args, lambdas, tuples, record
+/// fields, etc. are walker-rejected as non-tail and don't reach
+/// the new path. The detector deliberately ignores them so it
+/// can't fire for shapes the lowering can't lower.
+fn expr_has_branchable_k(e: &crate::ast::Expr, k_name: &str) -> bool {
+    use crate::ast::Expr;
+    if match_k_call_arg(e, k_name).is_some() {
+        return true;
+    }
+    match e {
+        Expr::Block(b) => b
+            .tail
+            .as_ref()
+            .is_some_and(|t| expr_has_branchable_k(t, k_name)),
+        Expr::If {
+            then_block,
+            else_block,
+            ..
+        } => {
+            block_tail_has_branchable_k(then_block, k_name)
+                || block_tail_has_branchable_k(else_block, k_name)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            match_k_call_arg(scrutinee, k_name).is_some()
+                || arms.iter().any(|a| expr_has_branchable_k(&a.body, k_name))
+        }
+        _ => false,
+    }
+}
+
+/// Plan D Task 118 — `true` iff `b`'s tail is a k-call OR an
+/// If/Match/Block whose recursion reaches a k-call at a lowerable
+/// position. Companion to [`expr_has_branchable_k`] for branch-block
+/// recursion.
+fn block_tail_has_branchable_k(b: &crate::ast::Block, k_name: &str) -> bool {
+    b.tail
+        .as_ref()
+        .is_some_and(|t| expr_has_branchable_k(t, k_name))
 }
 
 /// Plan B Task 55, Phase 4e captures+ Slice B — recognise the
@@ -7698,7 +7810,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 perform_ref,
                 outer_post_arm_k_push_ref: _,
                 run_loop_ref,
-                next_step_discharged_ref: _,
+                next_step_discharged_ref,
                 last_terminal_tag_ref,
                 reset_last_terminal_tag_ref,
                 last_terminal_value_ref,
@@ -7971,6 +8083,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
+                        next_step_discharged_ref,
                         handler_arm_refs_per_handle,
                         handler_arm_synth: &handler_arm_synth,
                         handler_arm_indices: &handler_arm_indices,
@@ -8873,6 +8986,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
+                    next_step_discharged_ref,
                     handler_arm_refs_per_handle,
                     handler_arm_synth: &handler_arm_synth,
                     handler_arm_indices: &handler_arm_indices,
@@ -9018,6 +9132,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
+                next_step_discharged_ref,
                 handler_arm_refs_per_handle,
                 handler_arm_synth: &handler_arm_synth,
                 handler_arm_indices: &handler_arm_indices,
@@ -9522,6 +9637,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
+                    next_step_discharged_ref,
                     handler_arm_refs_per_handle,
                     handler_arm_synth: &handler_arm_synth,
                     handler_arm_indices: &handler_arm_indices,
@@ -9585,7 +9701,23 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // the tail position recognised by
                 // `arm_body_tail_is_k_call`; non-tail `k` use is
                 // rejected with a Phase-4e-pointing diagnostic.
-                let next_step_ptr = if let Some(chain) = &synth.post_arm_k_chain {
+                // Plan D Task 118 — branched-routing path: arm body
+                // contains If/Match in tail position with k-bearing
+                // branches OR a Match scrutinee that is `k(arg)`.
+                // Routes through `lower_arm_body_to_next_step`'s
+                // recursive descent. Mutually exclusive with the
+                // Slice C / Slice B / tail-k / discharged paths
+                // below — the detector
+                // [`arm_body_needs_branched_routing`] gates entry.
+                let next_step_ptr = if arm_body_needs_branched_routing(&synth.body, &synth.k_name) {
+                    lowerer.lower_arm_body_to_next_step(
+                        &synth.body,
+                        &synth.k_name,
+                        k_closure_v,
+                        k_fn_v,
+                        pointer_ty,
+                    )
+                } else if let Some(chain) = &synth.post_arm_k_chain {
                     // --- Slice C: multi-let `{ let r1 = k(arg1); ...;
                     //     let rN = k(argN); pure_tail }` path ---
                     //
@@ -10325,7 +10457,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     perform_ref,
                     outer_post_arm_k_push_ref: _,
                     run_loop_ref,
-                    next_step_discharged_ref: _,
+                    next_step_discharged_ref,
                     last_terminal_tag_ref,
                     reset_last_terminal_tag_ref,
                     last_terminal_value_ref,
@@ -10454,6 +10586,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     reset_last_terminal_value_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
+                    next_step_discharged_ref,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
                     handler_arm_synth: &handler_arm_synth,
@@ -10695,7 +10828,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 perform_ref,
                 outer_post_arm_k_push_ref: _,
                 run_loop_ref,
-                next_step_discharged_ref: _,
+                next_step_discharged_ref,
                 last_terminal_tag_ref,
                 reset_last_terminal_tag_ref,
                 last_terminal_value_ref,
@@ -10735,6 +10868,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 reset_last_terminal_value_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
+                next_step_discharged_ref,
                 handler_arm_refs_per_handle,
                 handler_arm_synth: &handler_arm_synth,
                 handler_arm_indices: &handler_arm_indices,
@@ -10989,7 +11123,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         perform_ref,
                         outer_post_arm_k_push_ref: _,
                         run_loop_ref,
-                        next_step_discharged_ref: _,
+                        next_step_discharged_ref,
                         last_terminal_tag_ref,
                         reset_last_terminal_tag_ref,
                         last_terminal_value_ref,
@@ -11028,6 +11162,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         reset_last_terminal_value_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
+                        next_step_discharged_ref,
                         handler_arm_refs_per_handle,
                         handler_arm_synth: &handler_arm_synth,
                         handler_arm_indices: &handler_arm_indices,
@@ -11664,7 +11799,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             perform_ref,
                             outer_post_arm_k_push_ref,
                             run_loop_ref,
-                            next_step_discharged_ref: _,
+                            next_step_discharged_ref,
                             last_terminal_tag_ref,
                             reset_last_terminal_tag_ref,
                             last_terminal_value_ref,
@@ -11704,6 +11839,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
+                            next_step_discharged_ref,
                             handler_arm_refs_per_handle,
                             handler_arm_synth: &handler_arm_synth,
                             handler_arm_indices: &handler_arm_indices,
@@ -12175,7 +12311,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             perform_ref,
                             outer_post_arm_k_push_ref,
                             run_loop_ref,
-                            next_step_discharged_ref: _,
+                            next_step_discharged_ref,
                             last_terminal_tag_ref,
                             reset_last_terminal_tag_ref,
                             last_terminal_value_ref,
@@ -12215,6 +12351,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             reset_last_terminal_value_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
+                            next_step_discharged_ref,
                             handler_arm_refs_per_handle,
                             handler_arm_synth: &handler_arm_synth,
                             handler_arm_indices: &handler_arm_indices,
@@ -12891,6 +13028,18 @@ struct Lowerer<'a, 'b> {
     /// `body_val` and the trailing-pair `(null, identity)` slots
     /// can be written before driving the trampoline.
     next_step_args_ptr_ref: FuncRef,
+    /// Plan D Task 118 — `sigil_next_step_discharged` runtime ref.
+    /// Wraps a non-k arm-body tail value in `NextStep::Discharged`
+    /// so the trampoline records DISCHARGED in `LAST_TERMINAL_TAG`
+    /// and the handle expression's outer codegen skips return-arm
+    /// dispatch (the discharged value IS the handle's overall).
+    /// Used by [`Lowerer::emit_discharged_next_step`] (the leaf
+    /// emit helper for the branched-routing path) and
+    /// [`Lowerer::lower_arm_body_to_next_step`]'s catch-all arm.
+    /// Promoted to a Lowerer field for symmetry with the sibling
+    /// FuncRef fields (`next_step_call_ref`, `next_step_args_ptr_ref`,
+    /// `continuation_identity_ref`, `run_loop_ref`).
+    next_step_discharged_ref: FuncRef,
     /// Plan B Task 55 (Phase 4g) — global `HandlerReturnArmSynth`
     /// slice from the codegen pre-pass. Used by `Expr::Handle`
     /// codegen to look up the return arm's `captures` list and
@@ -13320,6 +13469,486 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.lower_arm_body_pre_tail_k_stmts(t);
             }
         }
+    }
+
+    /// Plan D Task 118 — lower an arm body containing branched k-call
+    /// (if/match in tail position) or k-as-scrutinee (`match k(arg)
+    /// { ... }`) to a single `*NextStep` Value the surrounding synth
+    /// arm-fn returns.
+    ///
+    /// Recursive descent through `Expr::Block` (lower stmts, recurse
+    /// into tail), `Expr::If` (branch + recurse + merge), `Expr::Match`
+    /// (lower scrutinee — possibly via `lower_synth_arm_k_call_as_value`
+    /// when the scrutinee is `k(arg)` — then per-arm recurse + merge).
+    /// Leaves: `k(arg)` tail call → `NextStep::Call` with trailing-pair
+    /// `(null, identity)`; any other expression → `NextStep::Discharged`
+    /// of the lowered value.
+    ///
+    /// `k_closure_v` and `k_fn_v` are the synth arm-fn's loaded
+    /// continuation pair (from args_ptr trailing slots). They flow
+    /// through every recursive call so leaves can dispatch consistently.
+    ///
+    /// **Invariant (load-bearing).** The caller has run
+    /// [`arm_body_unsupported_construct`] / [`arm_body_walk`] on this
+    /// body and the walker accepted. The discharged-leaf catch-all
+    /// (`_ =>` arm) calls `self.lower_expr(body)` for any non-Block /
+    /// non-If / non-Match leaf — that path assumes `k_name` does NOT
+    /// appear as a callee anywhere in the lowered subexpression. The
+    /// walker enforces this: `Expr::Call`'s k-name match in
+    /// non-tail position fires the "non-tail k" rejection
+    /// (codegen.rs around the Expr::Call walker arm). A future walker
+    /// relaxation that lets a k-call slip through (e.g., k-in-Binary,
+    /// k-in-Tuple-elem, k-in-RecordLit-field) would surface here as a
+    /// hard `unreachable!` panic at `lower_call`'s "no signature
+    /// source registered" site (codegen.rs:16070+) — synth arm-fn
+    /// Lowerers have `arm_k_pair_self = None`, so the k-pair dispatch
+    /// path doesn't fire.
+    ///
+    /// **k-as-scrutinee multi-shot dependency.**
+    /// `match k(arg) { A => k(x), B => k(y) }` invokes k via the
+    /// scrutinee's nested `sigil_run_loop` (1st resume), then the arm
+    /// body emits `NextStep::Call(k, ...)` for a 2nd resume. The
+    /// design ASSUMES Task 117 RELINK_STACK substrate handles
+    /// repeated resumes from the same captured k. Single-shot effects
+    /// only see one of the two paths fire per dispatch (the typecheck
+    /// linearity check enforces this); the design is correct for
+    /// both single-shot and multi-shot effects.
+    fn lower_arm_body_to_next_step(
+        &mut self,
+        body: &crate::ast::Expr,
+        k_name: &str,
+        k_closure_v: Value,
+        k_fn_v: Value,
+        pointer_ty: Type,
+    ) -> Value {
+        use crate::ast::Expr;
+
+        // Tail-`k(arg)` shape (covers Block-wrapped tail-k too via
+        // `arm_body_tail_is_k_call`'s recursion). Mirrors the existing
+        // Slice A tail-k path at the synth-arm-fn body emit site.
+        if let Some(arg_expr) = arm_body_tail_is_k_call(body, k_name) {
+            self.lower_arm_body_pre_tail_k_stmts(body);
+            return self.emit_tail_k_next_step_call(arg_expr, k_closure_v, k_fn_v, pointer_ty);
+        }
+
+        match body {
+            Expr::Block(b) => {
+                for s in &b.stmts {
+                    self.lower_stmt(s);
+                }
+                if let Some(t) = &b.tail {
+                    self.lower_arm_body_to_next_step(t, k_name, k_closure_v, k_fn_v, pointer_ty)
+                } else {
+                    let unit = self.builder.ins().iconst(types::I64, 0);
+                    self.emit_discharged_next_step(unit)
+                }
+            }
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+                ..
+            } => {
+                let cond_v = self.lower_expr(cond);
+                let then_blk = self.builder.create_block();
+                let else_blk = self.builder.create_block();
+                let merge = self.builder.create_block();
+                self.builder.append_block_param(merge, pointer_ty);
+                self.builder
+                    .ins()
+                    .brif(cond_v, then_blk, &[], else_blk, &[]);
+
+                self.builder.switch_to_block(then_blk);
+                self.builder.seal_block(then_blk);
+                let then_body = Expr::Block(then_block.clone());
+                let then_ns = self.lower_arm_body_to_next_step(
+                    &then_body,
+                    k_name,
+                    k_closure_v,
+                    k_fn_v,
+                    pointer_ty,
+                );
+                self.builder.ins().jump(merge, &[then_ns.into()]);
+
+                self.builder.switch_to_block(else_blk);
+                self.builder.seal_block(else_blk);
+                let else_body = Expr::Block(else_block.clone());
+                let else_ns = self.lower_arm_body_to_next_step(
+                    &else_body,
+                    k_name,
+                    k_closure_v,
+                    k_fn_v,
+                    pointer_ty,
+                );
+                self.builder.ins().jump(merge, &[else_ns.into()]);
+
+                self.builder.switch_to_block(merge);
+                self.builder.seal_block(merge);
+                self.builder.block_params(merge)[0]
+            }
+            Expr::Match {
+                scrutinee,
+                arms,
+                span,
+            } => {
+                // k-as-scrutinee: `match k(arg) { ... }`. Drive a
+                // nested `run_loop` on `k(arg)` to obtain the body's
+                // overall value (the perform's continuation result),
+                // then branch per arm body — each recursing back
+                // through this helper so its tail still produces a
+                // `*NextStep`.
+                let scrut_value = if let Some(arg_expr) = match_k_call_arg(scrutinee, k_name) {
+                    self.lower_synth_arm_k_call_as_value(
+                        arg_expr,
+                        k_closure_v,
+                        k_fn_v,
+                        span,
+                        pointer_ty,
+                    )
+                } else {
+                    self.lower_expr(scrutinee)
+                };
+                self.lower_match_arms_to_next_step(
+                    scrut_value,
+                    arms,
+                    span,
+                    k_name,
+                    k_closure_v,
+                    k_fn_v,
+                    pointer_ty,
+                )
+            }
+            // Discharged leaf: any other expression in tail position.
+            // Lower as a value, widen to I64, wrap in `NextStep::Discharged`.
+            _ => {
+                let body_val = self.lower_expr(body);
+                self.emit_discharged_next_step(body_val)
+            }
+        }
+    }
+
+    /// Plan D Task 118 — emit `NextStep::Call(k_closure, k_fn, 3)`
+    /// with trailing-pair convention `[arg, null, identity]`.
+    /// Identical to the existing tail-k path at the synth-arm-fn body
+    /// emit site, lifted into a helper for reuse from
+    /// [`lower_arm_body_to_next_step`].
+    fn emit_tail_k_next_step_call(
+        &mut self,
+        arg_expr: &crate::ast::Expr,
+        k_closure_v: Value,
+        k_fn_v: Value,
+        pointer_ty: Type,
+    ) -> Value {
+        let arg_value = self.lower_expr(arg_expr);
+        let arg_ty = self.builder.func.dfg.value_type(arg_value);
+        let widened_arg = if arg_ty == types::I64 {
+            arg_value
+        } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+            self.builder.ins().uextend(types::I64, arg_value)
+        } else {
+            assert_eq!(
+                arg_ty, pointer_ty,
+                "codegen Task 118: unexpected k-arg Cranelift type \
+                 {arg_ty:?} for sigil_next_step_call slot widen"
+            );
+            arg_value
+        };
+        let three_v = self.builder.ins().iconst(types::I32, 3);
+        let call_ns = self
+            .builder
+            .ins()
+            .call(self.next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, call_ns));
+        let ns_ptr = self.builder.inst_results(call_ns)[0];
+        let argp_call = self
+            .builder
+            .ins()
+            .call(self.next_step_args_ptr_ref, &[ns_ptr]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, argp_call));
+        let argp_v = self.builder.inst_results(argp_call)[0];
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), widened_arg, argp_v, POST_ARM_K_ARG_OFF);
+        let null_post_arm_k_closure = self.builder.ins().iconst(pointer_ty, 0);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            null_post_arm_k_closure,
+            argp_v,
+            POST_ARM_K_CLOSURE_OFF,
+        );
+        let identity_fn_addr = self
+            .builder
+            .ins()
+            .func_addr(pointer_ty, self.continuation_identity_ref);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            identity_fn_addr,
+            argp_v,
+            POST_ARM_K_FN_OFF,
+        );
+        ns_ptr
+    }
+
+    /// Plan D Task 118 — wrap a discharged-leaf value (any non-`k`
+    /// tail expression) in `NextStep::Discharged`. The trampoline
+    /// records DISCHARGED in `LAST_TERMINAL_TAG`; the handle's outer
+    /// codegen queries the tag and skips the return arm dispatch
+    /// (the discharged value IS the handle's overall).
+    fn emit_discharged_next_step(&mut self, body_value: Value) -> Value {
+        let body_actual_ty = self.builder.func.dfg.value_type(body_value);
+        let widened_body = if body_actual_ty == types::I64 {
+            body_value
+        } else if body_actual_ty.is_int() && body_actual_ty.bits() < 64 {
+            self.builder.ins().uextend(types::I64, body_value)
+        } else {
+            assert_eq!(
+                body_actual_ty, self.pointer_ty,
+                "codegen Task 118: unexpected arm-body Cranelift type \
+                 {body_actual_ty:?} for sigil_next_step_discharged wrap"
+            );
+            body_value
+        };
+        let done_call = self
+            .builder
+            .ins()
+            .call(self.next_step_discharged_ref, &[widened_body]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, done_call));
+        self.builder.inst_results(done_call)[0]
+    }
+
+    /// Plan D Task 118 — drive a nested `sigil_run_loop` on `k(arg)`
+    /// from inside the synth arm-fn body, producing the body's natural
+    /// return value as a Cranelift Value (narrowed to the match
+    /// scrutinee's Cranelift type). Used when the user wrote
+    /// `match k(arg) { ... }` — the scrutinee `k(arg)` must be
+    /// evaluated to dispatch the match.
+    ///
+    /// Differs from `lower_k_pair_call` (Stage 6.8 lifted-lambda
+    /// dispatch) in three ways: (a) sources `k_closure_v` / `k_fn_v`
+    /// directly from the synth arm-fn's loaded args_ptr trailing
+    /// slots (no closure record indirection), (b) does NOT re-push
+    /// the originating handler frame (the synth arm-fn executes
+    /// WITHIN the trampoline that's processing the perform, so the
+    /// handler frame is already on the stack), and (c) does NOT
+    /// apply the return-arm wrap (the value is consumed as a match
+    /// scrutinee at the source-language level — type is the handler-
+    /// overall, no further wrapping needed).
+    fn lower_synth_arm_k_call_as_value(
+        &mut self,
+        arg_expr: &crate::ast::Expr,
+        k_closure_v: Value,
+        k_fn_v: Value,
+        scrut_span: &Span,
+        pointer_ty: Type,
+    ) -> Value {
+        // Lower + widen arg.
+        let arg_v = self.lower_expr(arg_expr);
+        let arg_ty = self.builder.func.dfg.value_type(arg_v);
+        let widened_arg = if arg_ty == types::I64 {
+            arg_v
+        } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+            self.builder.ins().uextend(types::I64, arg_v)
+        } else {
+            assert_eq!(
+                arg_ty, pointer_ty,
+                "codegen Task 118 k-as-scrutinee: unexpected k-arg \
+                 Cranelift type {arg_ty:?}"
+            );
+            arg_v
+        };
+
+        // Build NextStep::Call(k_closure, k_fn, 3) with trailing-pair
+        // = (null, identity). Same convention as `emit_tail_k_next_step_call`.
+        let three_v = self.builder.ins().iconst(types::I32, 3);
+        let call_ns = self
+            .builder
+            .ins()
+            .call(self.next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, call_ns));
+        let ns = self.builder.inst_results(call_ns)[0];
+        let argp_call = self.builder.ins().call(self.next_step_args_ptr_ref, &[ns]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, argp_call));
+        let argp = self.builder.inst_results(argp_call)[0];
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), widened_arg, argp, POST_ARM_K_ARG_OFF);
+        let null_post = self.builder.ins().iconst(pointer_ty, 0);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), null_post, argp, POST_ARM_K_CLOSURE_OFF);
+        let identity_addr = self
+            .builder
+            .ins()
+            .func_addr(pointer_ty, self.continuation_identity_ref);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), identity_addr, argp, POST_ARM_K_FN_OFF);
+
+        // Drive the nested run_loop. Returns u64 (raw bits).
+        let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
+        let raw_u64 = self.builder.inst_results(run_loop_call)[0];
+
+        // Narrow to the match scrutinee's Cranelift type. Look up via
+        // `match_scrut_tys_resolved` (per-clone, post-mono) with
+        // span-keyed fallback to `match_scrut_tys` for non-generic
+        // surfaces. Mirrors `lower_match`'s scrutinee Ty resolution.
+        //
+        // FIXME(plan-d-task-118 generic dischargers): inside a synth
+        // arm-fn, `self.current_fn_name` is `String::new()` (set at
+        // synth-arm-fn Lowerer construction, codegen.rs:9700-ish), so
+        // the per-clone resolved-table key
+        // `(current_fn_name, scrut_span)` essentially never hits and
+        // the span-only `match_scrut_tys` fallback always fires. For
+        // non-generic dischargers (the 4 task_118_* e2e tests), the
+        // span-only table holds the concrete `Ty` and narrowing is
+        // correct. For GENERIC dischargers with `match k(arg) { ... }`
+        // (no test coverage yet), the span-only table holds the
+        // pre-mono `Ty::Var(_)` which `cranelift_ty_of_ty` rejects
+        // with `unreachable!`. Same fragility exists in `lower_match`
+        // (codegen.rs around the lower_match scrutinee Ty resolution
+        // site) — pre-existing, not Task 118 specific. Closing
+        // requires threading the synth fn's clone identity into
+        // `current_fn_name` at Lowerer construction.
+        let scrut_ty = self
+            .match_scrut_tys_resolved
+            .get(&(self.current_fn_name.clone(), scrut_span.clone()))
+            .cloned()
+            .or_else(|| self.match_scrut_tys.get(scrut_span).cloned())
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "codegen Task 118 k-as-scrutinee: match scrutinee Ty \
+                     missing from match_scrut_tys / _resolved side-tables \
+                     for span {scrut_span:?}"
+                )
+            });
+        let scrut_cl_ty = cranelift_ty_of_ty(&scrut_ty, pointer_ty);
+        if scrut_cl_ty == types::I64 {
+            raw_u64
+        } else if scrut_cl_ty.is_int() && scrut_cl_ty.bits() < 64 {
+            self.builder.ins().ireduce(scrut_cl_ty, raw_u64)
+        } else {
+            // pointer_ty: bit-identical to u64 on supported targets.
+            debug_assert_eq!(
+                scrut_cl_ty, pointer_ty,
+                "codegen Task 118 k-as-scrutinee: unexpected scrut Cranelift \
+                 type {scrut_cl_ty:?}"
+            );
+            raw_u64
+        }
+    }
+
+    /// Plan D Task 118 — Match arm dispatch that recursively lowers
+    /// each arm body via [`lower_arm_body_to_next_step`] (returning a
+    /// `*NextStep` ptr). Mirrors `lower_match`'s pattern-test +
+    /// catch-all + defensive-trap structure but the continuation
+    /// block carries a `pointer_ty` (NextStep ptr) rather than the
+    /// arm body's source-level Cranelift type.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_match_arms_to_next_step(
+        &mut self,
+        scrut: Value,
+        arms: &[crate::ast::MatchArm],
+        match_span: &Span,
+        k_name: &str,
+        k_closure_v: Value,
+        k_fn_v: Value,
+        pointer_ty: Type,
+    ) -> Value {
+        let scrut_ty = self
+            .match_scrut_tys_resolved
+            .get(&(self.current_fn_name.clone(), match_span.clone()))
+            .cloned()
+            .or_else(|| self.match_scrut_tys.get(match_span).cloned());
+
+        let cont = self.builder.create_block();
+        self.builder.append_block_param(cont, pointer_ty);
+
+        let mut chain_terminated = false;
+        for arm in arms.iter() {
+            if self.is_catchall_pattern(&arm.pattern, scrut_ty.as_ref()) {
+                let saved = match &arm.pattern {
+                    crate::ast::Pattern::Var(name, _) => {
+                        let prev = self.env.insert(name.clone(), scrut);
+                        Some((name.clone(), prev))
+                    }
+                    _ => None,
+                };
+                let v = self.lower_arm_body_to_next_step(
+                    &arm.body,
+                    k_name,
+                    k_closure_v,
+                    k_fn_v,
+                    pointer_ty,
+                );
+                if let Some((name, prev)) = saved {
+                    match prev {
+                        Some(p) => {
+                            self.env.insert(name, p);
+                        }
+                        None => {
+                            self.env.remove(&name);
+                        }
+                    }
+                }
+                self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
+                chain_terminated = true;
+                break;
+            }
+
+            let body_blk = self.builder.create_block();
+            let next = self.builder.create_block();
+            let mut bindings: Vec<(String, Value)> = Vec::new();
+            self.emit_pattern_test(&arm.pattern, scrut, scrut_ty.as_ref(), next, &mut bindings);
+            self.builder.ins().jump(body_blk, &[]);
+
+            self.builder.switch_to_block(body_blk);
+            self.builder.seal_block(body_blk);
+            let saved: Vec<(String, Option<Value>)> = bindings
+                .into_iter()
+                .map(|(name, val)| {
+                    let prev = self.env.insert(name.clone(), val);
+                    (name, prev)
+                })
+                .collect();
+            let v = self.lower_arm_body_to_next_step(
+                &arm.body,
+                k_name,
+                k_closure_v,
+                k_fn_v,
+                pointer_ty,
+            );
+            for (name, prev) in saved {
+                match prev {
+                    Some(p) => {
+                        self.env.insert(name, p);
+                    }
+                    None => {
+                        self.env.remove(&name);
+                    }
+                }
+            }
+            self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
+
+            self.builder.switch_to_block(next);
+            self.builder.seal_block(next);
+        }
+
+        if !chain_terminated {
+            self.builder
+                .ins()
+                .trap(TrapCode::unwrap_user(TRAP_NONEXHAUSTIVE_MATCH));
+        }
+
+        self.builder.switch_to_block(cont);
+        self.builder.seal_block(cont);
+        self.builder.block_params(cont)[0]
     }
 
     fn lower_stmt(&mut self, s: &crate::ast::Stmt) {
@@ -21564,6 +22193,65 @@ mod tests {
             result.is_none(),
             "expected None (accept) for 3-let arm body of resumes:many effect; \
              got {result:?}"
+        );
+    }
+
+    /// Plan D Task 118 — post-lift walker acceptance. Constructs the
+    /// AST for `Eff.op(k) => if cond { k(10) } else { k(20) }` and
+    /// asserts `arm_body_unsupported_construct` returns None (walker
+    /// accepts the shape because the post-lift `Expr::If` arm
+    /// propagates `tail=true` into branch tails so the branched-
+    /// routing path handles the k-calls). Pre-lift this returned
+    /// Some with the "non-tail position" wording.
+    #[test]
+    fn task_118_walker_accepts_conditional_k_call_inside_if() {
+        use crate::ast::{Block, Expr, HandleOpArm};
+        use crate::errors::Span;
+        use std::collections::{BTreeMap, BTreeSet};
+        let span = Span::synthetic("x.sigil");
+        let make_k_call = |arg: i64| Expr::Call {
+            callee: Box::new(Expr::Ident("k".to_string(), span.clone())),
+            args: vec![Expr::IntLit(arg, span.clone())],
+            span: span.clone(),
+        };
+        let body = Expr::If {
+            cond: Box::new(Expr::Ident("cond".to_string(), span.clone())),
+            then_block: Box::new(Block {
+                stmts: vec![],
+                tail: Some(make_k_call(10)),
+                span: span.clone(),
+            }),
+            else_block: Box::new(Block {
+                stmts: vec![],
+                tail: Some(make_k_call(20)),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let arm = HandleOpArm {
+            effect: "Pick".to_string(),
+            effect_span: span.clone(),
+            op: "pick".to_string(),
+            op_span: span.clone(),
+            params: vec![crate::ast::HandleArmParam {
+                name: "cond".to_string(),
+                span: span.clone(),
+            }],
+            k_name: "k".to_string(),
+            k_span: span.clone(),
+            body,
+            span: span.clone(),
+        };
+        let globals: BTreeSet<String> = BTreeSet::new();
+        let ctors: BTreeSet<String> = BTreeSet::new();
+        let effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
+        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many);
+        assert!(
+            result.is_none(),
+            "Task 118 post-lift: walker must accept conditional-k-inside-if \
+             arm body shape (tail=true propagates into If branches; \
+             branched-routing path handles the k-calls). Got rejection: \
+             {result:?}"
         );
     }
 
