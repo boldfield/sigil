@@ -9725,6 +9725,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // closure_ptr; user params follow; the trailing block param
             // is `terminal_out: *mut TerminalResult` (Plan D Task 111b).
             let block_params: Vec<Value> = builder.block_params(block).to_vec();
+            // PR #90 R1 issue 2 — Sync ABI signature emit guarantees
+            // block_params.len() == f.params.len() + 2 (closure_ptr +
+            // user params + terminal_out). Assert in debug builds so a
+            // future signature-emit refactor that drops the trailing
+            // terminal_out trips here instead of producing OOB indexing.
+            debug_assert_eq!(
+                block_params.len(),
+                f.params.len() + 2,
+                "codegen Sync user fn `{}`: block_params has {} entries (expected {})",
+                f.name,
+                block_params.len(),
+                f.params.len() + 2,
+            );
             let closure_ptr = block_params[0];
             let mut env = BTreeMap::new();
             for (i, p) in f.params.iter().enumerate() {
@@ -10015,6 +10028,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         // will tighten into the load-bearing path. TLS dual-write
         // remains in place at runtime; pointer-side becomes
         // authoritative for Sync ABI propagation in 111b.
+        //
+        // **Slot is write-only from main()'s perspective.** The shim
+        // never reads back from this slot. `sigil_run_loop` writes
+        // the full 16 bytes at every terminal step before any read;
+        // initialization is therefore unnecessary. A future
+        // maintainer adding a read-back path here (e.g., to forward
+        // the terminal up to the C ABI exit code) MUST initialize
+        // the slot first or it will pick up stack garbage on the
+        // pre-first-terminal codepath.
         let null_closure = builder.ins().iconst(pointer_ty, 0);
         let terminal_slot =
             builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3));
@@ -14522,9 +14544,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         builder.seal_block(entry_block);
 
         let block_params: Vec<Value> = builder.block_params(entry_block).to_vec();
-        let closure_ptr_v = block_params[0];
         // block_params layout: [closure_ptr, user_params..., terminal_out].
-        // The Sync ABI signature emit guarantees length >= 2.
+        // The Sync ABI signature emit guarantees length >= 2 (closure_ptr +
+        // terminal_out always present, user_params optional). PR #90 R1
+        // issue 2 — assert in debug builds so a future signature-emit
+        // refactor that drops the trailing terminal_out trips here
+        // instead of producing OOB indexing later in this fn.
+        debug_assert!(
+            block_params.len() >= 2,
+            "codegen Layer 3b sync_shim: block_params has {} entries (expected >= 2 \
+             for [closure_ptr, ..., terminal_out])",
+            block_params.len(),
+        );
+        let closure_ptr_v = block_params[0];
         let terminal_out_idx = block_params.len() - 1;
         let terminal_out_v = block_params[terminal_out_idx];
         let user_args: Vec<Value> = block_params[1..terminal_out_idx].to_vec();
@@ -15038,6 +15070,24 @@ fn body_as_direct_cps_call_with_lookup(
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
+    /// Plan D Task 111b — yield `terminal_out` for forwarding into a
+    /// Sync-ABI call or `sigil_run_loop`. Returns the threaded pointer
+    /// when the surrounding fn is a Sync user fn (`terminal_out_param`
+    /// was bound from the trailing block param at fn entry); otherwise
+    /// emits a fresh null `iconst`. Cps and synth-cont contexts hit
+    /// the null branch until 111c threads `terminal_out` through the
+    /// Cps + synth fn ABIs.
+    ///
+    /// When 111c lands and every Lowerer construction site sets
+    /// `terminal_out_param: Some(...)`, this method's `unwrap_or_else`
+    /// branch becomes dead code and the method collapses to a single
+    /// `unwrap()` (or the field type relaxes from `Option<Value>` to
+    /// `Value` and call sites read it directly).
+    fn terminal_out_or_null(&mut self) -> Value {
+        self.terminal_out_param
+            .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0))
+    }
+
     /// Lower a `Block`. Returns the tail expression's value if any,
     /// `None` when the block has no tail (statement-only block, value
     /// is `Unit`).
@@ -15211,11 +15261,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         );
 
         // Drive the trampoline. Returns u64.
-        // Plan D Task 111b — forward caller's terminal_out (Sync) or
-        // null (Cps/synth, until 111c).
-        let terminal_out = self
-            .terminal_out_param
-            .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0));
+        let terminal_out = self.terminal_out_or_null();
         let run_loop_call = self
             .builder
             .ins()
@@ -15585,11 +15631,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .store(MemFlags::trusted(), identity_addr, argp, POST_ARM_K_FN_OFF);
 
         // Drive the nested run_loop. Returns u64 (raw bits).
-        // Plan D Task 111b — forward caller's terminal_out (Sync) or
-        // null (Cps/synth, until 111c).
-        let terminal_out = self
-            .terminal_out_param
-            .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0));
+        let terminal_out = self.terminal_out_or_null();
         let run_loop_call = self
             .builder
             .ins()
@@ -15986,11 +16028,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // dispatches the Call (invokes the arm), then any further
         // Calls the arm returns, until a terminal `Done(value)`.
         // Returns u64.
-        // Plan D Task 111b — forward caller's terminal_out (Sync) or
-        // null (Cps/synth, until 111c).
-        let terminal_out = self
-            .terminal_out_param
-            .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0));
+        let terminal_out = self.terminal_out_or_null();
         let run_loop_call = self
             .builder
             .ins()
@@ -16954,11 +16992,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // the trampoline calls identity which returns
                     // Done(tail_widened); run_loop returns the value
                     // as u64.
-                    // Plan D Task 111b — forward caller's terminal_out
-                    // (Sync) or null (Cps/synth, until 111c).
-                    let terminal_out = self
-                        .terminal_out_param
-                        .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0));
+                    let terminal_out = self.terminal_out_or_null();
                     let run_loop_call = self
                         .builder
                         .ins()
@@ -17330,11 +17364,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         );
 
         // sigil_run_loop(ns) → u64
-        // Plan D Task 111b — forward caller's terminal_out (Sync) or
-        // null (Cps/synth, until 111c).
-        let terminal_out = self
-            .terminal_out_param
-            .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0));
+        let terminal_out = self.terminal_out_or_null();
         let run_loop_call = self
             .builder
             .ins()
@@ -17518,11 +17548,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     POST_ARM_K_FN_OFF,
                 );
 
-                // Plan D Task 111b — forward caller's terminal_out
-                // (Sync) or null (Cps/synth, until 111c).
-                let terminal_out_2 = self
-                    .terminal_out_param
-                    .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0));
+                let terminal_out_2 = self.terminal_out_or_null();
                 let run_loop_call_2 = self
                     .builder
                     .ins()
@@ -17625,15 +17651,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
                         // Plan D Task 111b — Sync→Sync: forward the
                         // current fn's `terminal_out` to the callee.
-                        // When the caller is itself a Sync user fn,
-                        // its body Lowerer's `terminal_out_param` is
-                        // `Some(value)` (block-param-bound at fn
-                        // entry). When the caller is a Cps/synth
-                        // context (`None`), we pass null until 111c
-                        // threads terminal_out into Cps + synth ABIs.
-                        let terminal_out = self
-                            .terminal_out_param
-                            .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0));
+                        let terminal_out = self.terminal_out_or_null();
                         let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
                         all_args.push(null_closure);
                         all_args.extend(arg_vals);
@@ -17751,17 +17769,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             .ins()
                             .call(self.body_return_arm_push_ref, &[null_closure, null_fn]);
 
-                        // Drive the trampoline. Returns u64.
-                        // Plan D Task 111b — when the caller is a
-                        // Sync user fn, forward its caller-owned
-                        // `terminal_out` so handle-exit terminal
-                        // writes inside the Cps callee propagate
-                        // back through the caller's terminal channel.
-                        // Cps/synth contexts (`None`) still pass
-                        // null until 111c.
-                        let terminal_out = self
-                            .terminal_out_param
-                            .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0));
+                        // Drive the trampoline. Plan D Task 111b —
+                        // forward the caller's `terminal_out` so
+                        // handle-exit terminal writes inside the Cps
+                        // callee propagate back through the caller's
+                        // terminal channel.
+                        let terminal_out = self.terminal_out_or_null();
                         let run_loop_call = self
                             .builder
                             .ins()
@@ -18499,18 +18512,28 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // the 3-arg shape and 111c will plumb terminal_out
                 // for those too. The callee's `UserFnEntry` is
                 // looked up by the unmangled `code_fn_name`.
-                let callee_abi = self
-                    .user_fns
-                    .get(code_fn_name)
-                    .map(|e| e.abi)
-                    .unwrap_or(UserFnAbi::Sync);
+                //
+                // PR #90 R1 issue 1 — `user_fn_refs` and `user_fns`
+                // share keys (both populated from the same `Item::Fn`
+                // pre-pass; see codegen.rs invariant near `user_fn_refs`
+                // construction). The miss arm mirrors the
+                // `unreachable!()` discipline at 17615 (direct-Sync
+                // branch) and 14245 (IIFE call path) so a future
+                // refactor that diverges the two maps trips a panic
+                // instead of silently emitting a Sync-ABI call against
+                // a Cps callee (stack-corrupting ABI mismatch).
+                let callee_abi = match self.user_fns.get(code_fn_name) {
+                    Some(e) => e.abi,
+                    None => unreachable!(
+                        "codegen: ClosureRecord code_fn_name `{code_fn_name}` registered in \
+                         user_fn_refs but missing from user_fns — pre-pass invariant violated"
+                    ),
+                };
                 let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
                 all_args.push(closure_value);
                 all_args.extend(arg_vals);
                 if callee_abi == UserFnAbi::Sync {
-                    let terminal_out = self
-                        .terminal_out_param
-                        .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0));
+                    let terminal_out = self.terminal_out_or_null();
                     all_args.push(terminal_out);
                 }
                 let call = self.builder.ins().call(func_ref, &all_args);
@@ -18627,9 +18650,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
                 // Lower args; prepend closure_ptr; append terminal_out.
                 let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-                let terminal_out = self
-                    .terminal_out_param
-                    .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0));
+                let terminal_out = self.terminal_out_or_null();
                 let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
                 all_args.push(closure_value);
                 all_args.extend(arg_vals);
@@ -18890,17 +18911,39 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Stage-6.8-followup Layer 3b — for fn-as-value materialization
         // of a Cps-ABI top-level fn, write the Sync shim's func_addr
         // instead of the underlying Cps fn's. The shim has the
-        // standard Sync calling convention `(closure_ptr, params...)
-        // -> ret_ty`; an indirect call through this closure record's
-        // code_ptr therefore sees a uniform Sync convention regardless
-        // of the underlying fn's actual ABI. The shim internally drives
-        // sigil_run_loop to dispatch the Cps fn's NextStep result.
-        // For Sync-ABI fns and synth lambdas (`$lambda_N`), the
-        // sync_shim_refs map has no entry and this falls through to
-        // the original user_fn_refs lookup.
+        // standard Sync calling convention `(closure_ptr, params...,
+        // terminal_out) -> ret_ty` (Plan D Task 111b); an indirect
+        // call through this closure record's code_ptr therefore sees
+        // a uniform Sync convention regardless of the underlying fn's
+        // actual ABI. The shim internally drives sigil_run_loop to
+        // dispatch the Cps fn's NextStep result. For Sync-ABI fns and
+        // synth lambdas (`$lambda_N`), the sync_shim_refs map has no
+        // entry and this falls through to the original user_fn_refs
+        // lookup.
+        //
+        // PR #90 R1 issue 4 — `lower_call`'s indirect-call branch
+        // (codegen.rs:`Expr::Call` _ arm) builds its `call_indirect`
+        // signature unconditionally as Sync ABI (with the trailing
+        // `terminal_out` pointer). Correctness depends on every
+        // closure-record `code_ptr` slot pointing at a Sync ABI fn —
+        // either a Sync user fn or a Sync shim wrapping a Cps user
+        // fn. Assert in debug builds so a future change that stores
+        // a raw Cps-ABI func_addr here trips a panic instead of
+        // silently mis-typing every indirect call site.
         let code_fn_ref = if let Some(shim_ref) = self.sync_shim_refs.get(code_fn_name) {
             *shim_ref
         } else {
+            debug_assert!(
+                matches!(
+                    self.user_fns.get(code_fn_name).map(|e| e.abi),
+                    Some(UserFnAbi::Sync)
+                ),
+                "codegen lower_closure_record: code_fn_name `{code_fn_name}` resolved \
+                 directly via user_fn_refs (no Sync shim) but its UserFnEntry abi is not Sync \
+                 — every closure-record code_ptr slot must point at a Sync ABI fn (the \
+                 indirect-call signature builder assumes this); add a Sync shim or fix the \
+                 ABI selection"
+            );
             *self.user_fn_refs.get(code_fn_name).unwrap_or_else(|| {
                 unreachable!("codegen: ClosureRecord code_fn_name `{code_fn_name}` not registered")
             })

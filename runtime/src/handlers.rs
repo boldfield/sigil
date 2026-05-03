@@ -1895,6 +1895,27 @@ pub unsafe extern "C" fn sigil_run_loop(
                                 tag: tag as u64,
                             },
                         );
+                        // PR #90 R1 issue 3 — TLS-vs-pointer agreement.
+                        // Read both back and assert they hold the same
+                        // (tag, v). Tautological under single-threaded
+                        // sequential execution today but documents the
+                        // load-bearing invariant during the 111a→111d
+                        // transition: dual-write must converge. Catches
+                        // any future reordering, aliasing, or write
+                        // failure that desyncs the two channels before
+                        // 111d removes TLS.
+                        debug_assert_eq!(
+                            ptr::read(out).value,
+                            LAST_TERMINAL_VALUE.with(|c| c.get()),
+                            "sigil_run_loop DISCHARGED: *out.value disagrees with \
+                             LAST_TERMINAL_VALUE TLS — dual-write desync"
+                        );
+                        debug_assert_eq!(
+                            ptr::read(out).tag,
+                            LAST_TERMINAL_TAG.with(|c| c.get()) as u64,
+                            "sigil_run_loop DISCHARGED: *out.tag disagrees with \
+                             LAST_TERMINAL_TAG TLS — dual-write desync"
+                        );
                     }
                     // Drain outer_post_arm_k stack back to entry-time
                     // depth. Entries pushed by synth-cont Middle steps
@@ -2006,6 +2027,20 @@ pub unsafe extern "C" fn sigil_run_loop(
                             value: v,
                             tag: tag as u64,
                         },
+                    );
+                    // PR #90 R1 issue 3 — TLS-vs-pointer agreement.
+                    // See DISCHARGED bypass site above for full note.
+                    debug_assert_eq!(
+                        ptr::read(out).value,
+                        LAST_TERMINAL_VALUE.with(|c| c.get()),
+                        "sigil_run_loop DONE: *out.value disagrees with \
+                         LAST_TERMINAL_VALUE TLS — dual-write desync"
+                    );
+                    debug_assert_eq!(
+                        ptr::read(out).tag,
+                        LAST_TERMINAL_TAG.with(|c| c.get()) as u64,
+                        "sigil_run_loop DONE: *out.tag disagrees with \
+                         LAST_TERMINAL_TAG TLS — dual-write desync"
                     );
                 }
                 // Reset the arena before returning so the next
