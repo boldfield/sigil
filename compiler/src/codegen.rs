@@ -191,6 +191,7 @@ fn compute_user_fn_abi(
     body: &crate::ast::Block,
     helper_params: &[crate::ast::Param],
     colored: &ColoredProgram,
+    fns_by_name: &std::collections::BTreeMap<&str, &crate::ast::FnDecl>,
 ) -> UserFnAbi {
     // Plan B Stage 6 cleanup — `main` is structurally the entry
     // point and is always emitted with `UserFnAbi::Sync`. The shim
@@ -262,56 +263,57 @@ fn compute_user_fn_abi(
     // helper the pre-pass uses, so the ABI selection sees the real
     // K + N combination instead of the conservative `N >=
     // MAX_CLOSURE_ENV_SLOTS` that the classifier alone enforces.
-    // Plan D Task 112 — callee lookup for the wrapper-Call let-RHS
-    // shape. Accept only TAIL-PERFORM Cps user fns (those whose
-    // body matches `is_simple_tail_perform_with_pure_args_body`).
-    // Build a fns_by_name map upfront so the closure can look up
-    // each callee's body without walking the program per call site.
-    let fns_by_name: std::collections::BTreeMap<&str, &crate::ast::FnDecl> = colored
-        .mono
-        .anf
-        .checked
-        .program
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            crate::ast::Item::Fn(f) => Some((f.name.as_str(), f.as_ref())),
-            _ => None,
-        })
-        .collect();
-    let is_tail_perform_cps_user_fn = |callee_name: &str| {
-        if !colored.needs_cps_transform(callee_name) {
-            return false;
-        }
-        match fns_by_name.get(callee_name) {
-            Some(f) => is_simple_tail_perform_with_pure_args_body(&f.body, &ctors),
-            None => false,
-        }
-    };
+    // Plan D Task 112a — callee lookup for the wrapper-Call let-RHS
+    // shape. Accept only TAIL-PERFORM Cps user fns (callee body
+    // matches `is_simple_tail_perform_with_pure_args_body`). The
+    // `fns_by_name` map is built once at `emit_object` entry and
+    // threaded through (PR #83 review #2 — was rebuilt per outer-
+    // fn iteration → O(n²) over program items).
+    let lookup =
+        |callee_name: &str| is_tail_perform_cps_user_fn(callee_name, fns_by_name, colored, &ctors);
     if let Some(chain_length) =
-        is_simple_chained_let_yield_then_pure_tail_body(body, &ctors, &is_tail_perform_cps_user_fn)
+        is_simple_chained_let_yield_then_pure_tail_body(body, &ctors, &lookup)
     {
         let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
         let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
         for stmt in &body.stmts {
-            if let crate::ast::Stmt::Let(l) = stmt {
-                match &l.value {
-                    crate::ast::Expr::Perform(p) => {
-                        steps.push(ChainedNextStep::Perform(p.clone()));
-                        binding_names.push(l.name.clone());
-                    }
-                    // Plan D Task 112 — wrapper-Call let-RHS.
-                    crate::ast::Expr::Call { callee, args, .. } => {
-                        if let crate::ast::Expr::Ident(callee_name, _) = callee.as_ref() {
-                            steps.push(ChainedNextStep::CallCps {
-                                callee_name: callee_name.clone(),
-                                args: args.clone(),
-                            });
-                            binding_names.push(l.name.clone());
-                        }
-                    }
-                    _ => {}
+            // Classifier guarantees every stmt is `Stmt::Let` whose
+            // value is `Expr::Perform` OR `Expr::Call` with an Ident
+            // callee (Plan D Task 112a). Mirror the pre-pass site's
+            // `unreachable!()` discipline (PR #83 review #5 —
+            // previously the silent fall-through on non-Ident callee
+            // dropped the binding).
+            let let_stmt = match stmt {
+                crate::ast::Stmt::Let(l) => l,
+                _ => unreachable!(
+                    "is_simple_chained_let_yield_then_pure_tail_body \
+                     classifier guarantees every stmt is Stmt::Let"
+                ),
+            };
+            match &let_stmt.value {
+                crate::ast::Expr::Perform(p) => {
+                    steps.push(ChainedNextStep::Perform(p.clone()));
+                    binding_names.push(let_stmt.name.clone());
                 }
+                crate::ast::Expr::Call { callee, args, .. } => {
+                    let callee_name = match callee.as_ref() {
+                        crate::ast::Expr::Ident(n, _) => n.clone(),
+                        _ => unreachable!(
+                            "is_simple_chained_let_yield_then_pure_tail_body \
+                             classifier guarantees Call callee is Expr::Ident"
+                        ),
+                    };
+                    steps.push(ChainedNextStep::CallCps {
+                        callee_name,
+                        args: args.clone(),
+                    });
+                    binding_names.push(let_stmt.name.clone());
+                }
+                _ => unreachable!(
+                    "is_simple_chained_let_yield_then_pure_tail_body \
+                     classifier guarantees Let value is Expr::Perform \
+                     or Expr::Call (Plan D Task 112a)"
+                ),
             }
         }
         let tail_expr = match body.tail.as_ref() {
@@ -7449,6 +7451,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // the Cps fn through the inlined CPS interop wrapper.
     let mut sync_shim_fn_ids: BTreeMap<String, cranelift_module::FuncId> = BTreeMap::new();
 
+    // Plan D Task 112a — `fns_by_name` for the wrapper-Call let-RHS
+    // classifier (passed to `compute_user_fn_abi` and used again at
+    // the synth-cont allocation site below). Hoisted from the per-fn
+    // loops where two separate sites used to rebuild it (PR #83
+    // review #2 — O(n²) over program items per outer-fn iteration).
+    let fns_by_name = build_fns_by_name(&cc.colored);
+
     let mut user_fns: BTreeMap<String, UserFnEntry> = BTreeMap::new();
     for item in &checked.program.items {
         if let crate::ast::Item::Fn(f) = item {
@@ -7461,7 +7470,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // field; this commit consumes it for signature selection.
             // The transitional `#[allow(dead_code)]` on
             // `UserFnEntry::abi` is removed at the same time.
-            let abi = compute_user_fn_abi(&f.name, &f.body, &f.params, &cc.colored);
+            let abi = compute_user_fn_abi(&f.name, &f.body, &f.params, &cc.colored, &fns_by_name);
             let (sig, param_tys, ret_ty) = match abi {
                 UserFnAbi::Sync => {
                     let mut sig = Signature::new(isa_call_conv(&module));
@@ -7577,36 +7586,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     });
                     cps_continuation_synth_indices.insert(f.name.clone(), synth_cont_idx);
                 } else if let Some(chain_length) = {
-                    // Plan D Task 112 — same callee restriction as
-                    // `compute_user_fn_abi`'s call site: only accept
-                    // tail-perform Cps user fns.
-                    let fns_by_name: std::collections::BTreeMap<&str, &crate::ast::FnDecl> = cc
-                        .colored
-                        .mono
-                        .anf
-                        .checked
-                        .program
-                        .items
-                        .iter()
-                        .filter_map(|item| match item {
-                            crate::ast::Item::Fn(f) => Some((f.name.as_str(), f.as_ref())),
-                            _ => None,
-                        })
-                        .collect();
-                    let is_tail_perform_cps_user_fn = |callee_name: &str| {
-                        if !cc.colored.needs_cps_transform(callee_name) {
-                            return false;
-                        }
-                        match fns_by_name.get(callee_name) {
-                            Some(f) => is_simple_tail_perform_with_pure_args_body(&f.body, &ctors),
-                            None => false,
-                        }
+                    // Plan D Task 112a — reuse hoisted `fns_by_name`
+                    // (built once at emit_object entry above) and
+                    // the shared `is_tail_perform_cps_user_fn` helper.
+                    let lookup = |callee_name: &str| {
+                        is_tail_perform_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     };
-                    is_simple_chained_let_yield_then_pure_tail_body(
-                        &f.body,
-                        &ctors,
-                        &is_tail_perform_cps_user_fn,
-                    )
+                    is_simple_chained_let_yield_then_pure_tail_body(&f.body, &ctors, &lookup)
                 } {
                     // Extract per-step let-binding info (name +
                     // declared type + slot kind) and the yield-bearing
@@ -7718,25 +7704,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             }
                         };
                         // Plan D Task 112 — `prior_was_call_cps` flag
-                        // tells the synth-cont body whether to POP
+                        // `prior_was_call_cps` for step_i is true iff
+                        // `steps[i]` is `CallCps` — step_i's synth-cont
+                        // fires after `steps[i]`'s dispatch (helper-body
+                        // for i=0; step_{i-1}'s Middle for i>0). When
+                        // true, the synth-cont body POPs
                         // BODY_RETURN_ARM_STACK at entry (Risk 3
                         // protection for the preceding CallCps emit's
                         // PUSH).
-                        // - step_0's prior is the helper body's first
-                        //   step kind (steps[0] itself, since the
-                        //   helper body emits the dispatch to step_0).
-                        // - step_i's (i>0) prior is steps[i] itself —
-                        //   the step we're currently building handles
-                        //   the result of dispatching steps[i]'s
-                        //   predecessor in the chain. Wait, this is
-                        //   off-by-one. step_0 fires AFTER the helper
-                        //   body's first step (steps[0]). step_i (i>0)
-                        //   fires AFTER steps[i-1]'s dispatch... hmm
-                        //   actually step_i fires AFTER step_{i-1}'s
-                        //   Middle next_step dispatches to step_i. So
-                        //   step_i's prior dispatch is step_{i-1}'s
-                        //   next_step (which is steps[i]). So:
-                        //   prior_step_kind for step_i = steps[i].
                         let prior_was_call_cps =
                             matches!(steps[step], ChainedNextStep::CallCps { .. });
                         cps_continuation_synth.push(CpsContinuationSynth {
@@ -9381,6 +9356,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // check. Mirrors the synth-arm-fn tail-k path
                         // (codegen.rs:10180-ish), which also passes
                         // `total slots = user_arg_count + 2`.
+                        //
+                        // PR #83 review #1 — defense-in-depth bound
+                        // check in dev builds before the runtime's
+                        // `sigil_next_step_call` MAX_INLINE_ARGS abort
+                        // fires. Mirrors the perform-site debug_assert
+                        // at `lower_perform_to_value` (codegen.rs:14586).
+                        debug_assert!(
+                            (user_arg_count_call as u32).saturating_add(2)
+                                <= sigil_abi::effect::MAX_INLINE_ARGS,
+                            "codegen Plan D Task 112a: wrapper-Call to `{}` has {} \
+                             user args, exceeding MAX_INLINE_ARGS - 2 = {}",
+                            callee_name,
+                            user_arg_count_call,
+                            sigil_abi::effect::MAX_INLINE_ARGS - 2
+                        );
                         let total_arg_count = user_arg_count_call + 2;
                         let arg_count_v = lowerer
                             .builder
@@ -9407,26 +9397,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             .stackmap
                             .push_placeholder(function_code_offset(&lowerer.builder, push_call));
 
-                        // Plan D Task 112 followup-deferred —
-                        // chain-routing OUTER_POST_ARM_K_STACK push
-                        // for chained-let-yield Cps wrappers
-                        // (Risk 3 shape) was attempted in commit
-                        // 7b56eec and reverted: the unconditional
-                        // push caused re-dispatch abort for tail-
-                        // perform wrappers (the routing pop
-                        // re-invokes the chain step that already
-                        // fired via the perform's k_pair). A
-                        // wrapper-shape-conditional push is needed
-                        // (only push when callee is chained-let-
-                        // yield Cps, not tail-perform Cps); deferred
-                        // to a follow-up. For now: tail-perform
-                        // wrapper tests pass (state, std/state,
-                        // random, clock); chained-let-yield Cps
-                        // wrapper tests (task_78_5_g4_approach6_-
-                        // risk3_*) produce 1099 / 1108 instead of
-                        // 1100 / 1105 (Risk 3 protection partially
-                        // works via BODY_RETURN_ARM push but
-                        // routing back to chain step doesn't fire).
+                        // Plan D Task 112b — chained-let-yield Cps
+                        // wrapper composition (where the wrapper
+                        // itself uses the chain shape rather than a
+                        // tail-perform) is NOT supported here. The
+                        // classifier rejects them (per
+                        // `is_tail_perform_cps_user_fn`); body falls
+                        // back to Sync ABI and `lower_call`'s Cps
+                        // branch handles via SAVE+CLEAR+RESTORE
+                        // BODY_RETURN_ARM_STACK. Lifting that
+                        // restriction needs a wrapper-shape-
+                        // conditional OUTER_POST_ARM_K_STACK push at
+                        // this site (and the Middle-step CallCps
+                        // emit) — deferred to Task 112b. See
+                        // [DEVIATION Task 112b] in PLAN_D_DEVIATIONS.md.
 
                         let call_ns = lowerer.builder.ins().call(
                             lowerer.next_step_call_ref,
@@ -12103,7 +12087,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
 
-                        // Plan D Task 112 — Risk 3 protection POP.
+                        // Plan D Task 112a — Risk 3 protection POP.
                         // If this step's predecessor in the chain was
                         // a wrapper-Call (`prior_was_call_cps`), the
                         // emit-side pushed (null, null) onto
@@ -12116,6 +12100,25 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // CallCps emit. Discards the popped fired
                         // flag (chain-pushed entries are always (null,
                         // null) so the flag is irrelevant).
+                        //
+                        // **Leak-on-arm-abandon assumption (PR #83
+                        // review #7).** POP relies on chain
+                        // progression — the chain step body MUST be
+                        // entered after a wrapper-Call PUSH for the
+                        // POP to fire. If a handler arm captures the
+                        // chain's k-pair into a lambda but never
+                        // invokes it (e.g. `S.set(arg, k) => fn (s)
+                        // => 999` shape that drops `k`), the entry
+                        // stays on BODY_RETURN_ARM_STACK. Phase 4g's
+                        // outer body's natural-exit reads the leaked
+                        // (null, null) entry and treats it as plain
+                        // Done (no return-arm wrap fires) — a
+                        // correct-by-coincidence outcome rather than
+                        // correct-by-construction. The discharge-
+                        // with-lambda handlers in std/state +
+                        // std/random + std/clock all invoke `k`
+                        // (see arm bodies); this assumption holds
+                        // for the test corpus today.
                         if *prior_was_call_cps {
                             let pop_call = builder.ins().call(body_return_arm_pop_ref, &[]);
                             stackmap.push_placeholder(function_code_offset(&builder, pop_call));
@@ -12661,6 +12664,22 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         // branch comment for the
                                         // rationale; same allocation +
                                         // OOB-on-undersize discipline.
+                                        //
+                                        // PR #83 review #1 — defense-
+                                        // in-depth bound check;
+                                        // mirrors the perform-site
+                                        // debug_assert at
+                                        // `lower_perform_to_value`.
+                                        debug_assert!(
+                                            (user_arg_count as u32).saturating_add(2)
+                                                <= sigil_abi::effect::MAX_INLINE_ARGS,
+                                            "codegen Plan D Task 112a: wrapper-Call to \
+                                             `{}` has {} user args, exceeding \
+                                             MAX_INLINE_ARGS - 2 = {}",
+                                            callee_name,
+                                            user_arg_count,
+                                            sigil_abi::effect::MAX_INLINE_ARGS - 2
+                                        );
                                         let total_arg_count = user_arg_count + 2;
                                         let arg_count_v = lowerer
                                             .builder
@@ -12687,16 +12706,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             push_call,
                                         ));
 
-                                        // Plan D Task 112 followup-
-                                        // deferred — chain-routing
-                                        // OUTER_POST_ARM_K_STACK push
-                                        // for chained-let-yield Cps
-                                        // wrappers (Risk 3 shape) was
-                                        // attempted and reverted; see
+                                        // Plan D Task 112b — chained-
+                                        // let-yield Cps wrapper
+                                        // composition deferred. See
                                         // helper-body Phase 6 CallCps
-                                        // emit for the disposition
-                                        // (wrapper-shape-conditional
-                                        // push needed; deferred).
+                                        // emit for the disposition;
+                                        // [DEVIATION Task 112b] for
+                                        // the named closure path.
 
                                         let call_ns = lowerer.builder.ins().call(
                                             lowerer.next_step_call_ref,
@@ -19593,6 +19609,67 @@ fn is_simple_tail_perform_with_pure_args_body(
     }
 }
 
+/// Plan D Task 112a — `true` iff `callee_name` resolves to a
+/// top-level Cps user fn whose body is a tail-perform with pure
+/// args. Used by the chained-let-yield classifier to decide whether
+/// `let _ = wrapper_call(args)` shapes are accepted.
+///
+/// Tail-perform Cps wrappers FORWARD the trailing-pair k_pair to
+/// their inner perform site (Phase 6 helper-body emit's
+/// `synth_cont_func_id_opt = None` branch loads from `args_ptr`
+/// trailing slots). This makes them transparent to the chain's
+/// k-pair propagation — the wrapper composes uniformly with
+/// inline-perform let-RHS via the existing trailing-pair convention.
+///
+/// **Wrapper-of-wrapper note (PR #83 review #9).** Tail-perform
+/// bodies (`{ perform E.op(args) }`) cannot themselves be wrappers
+/// (they don't contain `Expr::Call`); `expr_is_pure` rejects non-
+/// ctor calls in args, so a wrapper of a wrapper would not match
+/// `is_simple_tail_perform_with_pure_args_body`. The single-hop
+/// lookup here is total — no recursion-termination concern.
+///
+/// Chained-let-yield Cps wrappers (callee body has chain length
+/// `>= 1`) IGNORE the trailing-pair k_pair (use their own internal
+/// chain pair); they need a wrapper-shape-conditional
+/// `OUTER_POST_ARM_K_STACK` push, deferred to Task 112b. This
+/// helper rejects them.
+fn is_tail_perform_cps_user_fn(
+    callee_name: &str,
+    fns_by_name: &std::collections::BTreeMap<&str, &crate::ast::FnDecl>,
+    colored: &crate::color::ColoredProgram,
+    ctors: &std::collections::BTreeSet<String>,
+) -> bool {
+    if !colored.needs_cps_transform(callee_name) {
+        return false;
+    }
+    match fns_by_name.get(callee_name) {
+        Some(f) => is_simple_tail_perform_with_pure_args_body(&f.body, ctors),
+        None => false,
+    }
+}
+
+/// Plan D Task 112a — build the `name -> &FnDecl` lookup table
+/// from a `ColoredProgram`'s monomorphized AST. Hoisted from
+/// per-fn loop sites (PR #83 review #2 — was rebuilt per
+/// outer-fn iteration → O(n²)). Names are unique post-mono so a
+/// `BTreeMap` is sufficient (no duplicate handling needed).
+fn build_fns_by_name(
+    colored: &crate::color::ColoredProgram,
+) -> std::collections::BTreeMap<&str, &crate::ast::FnDecl> {
+    colored
+        .mono
+        .anf
+        .checked
+        .program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            crate::ast::Item::Fn(f) => Some((f.name.as_str(), f.as_ref())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Plan B Task 55, Phase 4e — is this expression pure for the
 /// purposes of [`is_simple_tail_perform_with_pure_args_body`]'s
 /// arg-purity check?
@@ -21442,7 +21519,13 @@ mod tests {
         let (prog, colored) = colored_from_src(src);
         let body = body_of(&prog, "main");
         assert_eq!(
-            compute_user_fn_abi("main", &body, &params_of(&prog, "main"), &colored),
+            compute_user_fn_abi(
+                "main",
+                &body,
+                &params_of(&prog, "main"),
+                &colored,
+                &build_fns_by_name(&colored)
+            ),
             UserFnAbi::Sync
         );
     }
@@ -21466,7 +21549,8 @@ mod tests {
                 "helper",
                 &helper_body,
                 &params_of(&prog, "helper"),
-                &colored
+                &colored,
+                &build_fns_by_name(&colored),
             ),
             UserFnAbi::Cps,
             "helper has CPS color + simple-tail-perform body + arity-0"
@@ -21497,7 +21581,13 @@ mod tests {
         // ABI selection still picks Sync because main's body shape
         // isn't supported by the simple-tail-perform classifier.
         assert_eq!(
-            compute_user_fn_abi("main", &main_body, &params_of(&prog, "main"), &colored),
+            compute_user_fn_abi(
+                "main",
+                &main_body,
+                &params_of(&prog, "main"),
+                &colored,
+                &build_fns_by_name(&colored)
+            ),
             UserFnAbi::Sync,
             "main is CPS-color but has complex body → Sync ABI"
         );
@@ -21579,7 +21669,7 @@ mod tests {
         };
         let colored = crate::color::infer_colors(mono);
         assert_eq!(
-            compute_user_fn_abi("f", &body, &[], &colored),
+            compute_user_fn_abi("f", &body, &[], &colored, &build_fns_by_name(&colored)),
             UserFnAbi::Cps,
             "intrinsic perform of non-IO effect taints the fn as CPS via \
              find_non_io_perform_in_block; combined with the simple-tail-\
@@ -21675,7 +21765,7 @@ mod tests {
         ));
         // The actual assertion: Sync, because color short-circuits.
         assert_eq!(
-            compute_user_fn_abi("f", &body, &[], &colored),
+            compute_user_fn_abi("f", &body, &[], &colored, &build_fns_by_name(&colored)),
             UserFnAbi::Sync,
             "Color::Native must short-circuit `compute_user_fn_abi` \
              regardless of body shape eligibility"
@@ -21730,7 +21820,8 @@ mod tests {
                 "helper",
                 &helper_body,
                 &params_of(&prog, "helper"),
-                &colored
+                &colored,
+                &build_fns_by_name(&colored),
             ),
             UserFnAbi::Cps,
             "arity-N intrinsic-CPS helper now classifies Cps after the \
@@ -21766,7 +21857,8 @@ mod tests {
                 "helper",
                 &helper_body,
                 &params_of(&prog, "helper"),
-                &colored
+                &colored,
+                &build_fns_by_name(&colored),
             ),
             UserFnAbi::Cps,
             "arity-0 helper with arity-N perform now classifies Cps after \
@@ -21824,7 +21916,8 @@ mod tests {
                 "helper",
                 &helper_body,
                 &params_of(&prog, "helper"),
-                &colored
+                &colored,
+                &build_fns_by_name(&colored),
             ),
             UserFnAbi::Cps,
             "arity-N let-yield-helper with capture classifies Cps via the \
@@ -21958,7 +22051,13 @@ mod tests {
         let body_under_cap = make_body(28);
         let colored_under = make_colored(body_under_cap.clone());
         assert_eq!(
-            compute_user_fn_abi("helper", &body_under_cap, &helper_params, &colored_under),
+            compute_user_fn_abi(
+                "helper",
+                &body_under_cap,
+                &helper_params,
+                &colored_under,
+                &build_fns_by_name(&colored_under),
+            ),
             UserFnAbi::Cps,
             "K+N below MAX_CLOSURE_ENV_SLOTS: classifier accepts; abi is Cps"
         );
@@ -21967,7 +22066,13 @@ mod tests {
         let body_at_cap = make_body(30);
         let colored_at = make_colored(body_at_cap.clone());
         assert_eq!(
-            compute_user_fn_abi("helper", &body_at_cap, &helper_params, &colored_at),
+            compute_user_fn_abi(
+                "helper",
+                &body_at_cap,
+                &helper_params,
+                &colored_at,
+                &build_fns_by_name(&colored_at),
+            ),
             UserFnAbi::Sync,
             "K+N >= MAX_CLOSURE_ENV_SLOTS: cap-check converts to Sync fall-through"
         );
@@ -22040,7 +22145,8 @@ mod tests {
                 "iterate",
                 &iterate_body,
                 &params_of(&prog, "iterate"),
-                &colored
+                &colored,
+                &build_fns_by_name(&colored),
             ),
             UserFnAbi::Cps,
             "B.1 wires compound-match-with-arm-perform shape into ABI \
