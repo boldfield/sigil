@@ -7835,6 +7835,64 @@ fn task_112c_case_d_two_layer_wrapper_chain_with_slice_b_outer_arm_returns_60() 
     );
 }
 
+/// Plan D Task 112c sister test (PR #86 review nit) — Case D with
+/// 3-deep wrapper nesting. Mirrors Task 112b's
+/// `task_112b_chained_wrapper_3_deep_nested_via_visited_set_returns_1`
+/// in nesting depth, but with a Slice B outer arm to exercise
+/// post_arm_k forwarding through THREE wrapper-in-chain layers.
+///
+/// **Trace** (handler arm body = `{ let r = k(0); r + 7 }`):
+/// - level_1's Final fires after `perform Eff.fail()` resumes with 0.
+///   level_1 returns 1. caller_k_fn = level_2's chain-step fn (non-
+///   identity → wrapper-forward). Forward post_arm_k.
+/// - level_2_step_0 (Final) binds _a=1. level_2 returns 2.
+///   caller_k_fn = level_3's chain-step fn → wrapper-forward.
+/// - level_3_step_0 (Final) binds _b=2. level_3 returns 3. caller_k_fn
+///   = comp's chain-step fn → wrapper-forward.
+/// - comp_step_0 (Final) binds _c=3. comp returns 4. caller_k_fn =
+///   identity (top-level). post_arm_k_fn = slice_b_synth_fn → top_post
+///   _arm_k_dispatch.
+/// - Slice B fires with r=4. r+7 = 11.
+#[test]
+fn task_112c_case_d_three_layer_wrapper_chain_with_slice_b_outer_arm_returns_11() {
+    let src = "effect Eff { fail: () -> Int }\n\
+               fn level_1() -> Int ![Eff] {\n  \
+                 let _x: Int = perform Eff.fail();\n  \
+                 1\n\
+               }\n\
+               fn level_2() -> Int ![Eff] {\n  \
+                 let _a: Int = level_1();\n  \
+                 2\n\
+               }\n\
+               fn level_3() -> Int ![Eff] {\n  \
+                 let _b: Int = level_2();\n  \
+                 3\n\
+               }\n\
+               fn comp() -> Int ![Eff] {\n  \
+                 let _c: Int = level_3();\n  \
+                 4\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle comp() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r + 7\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112c_case_d_three_layer");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "11\n",
+        "Task 112c Case D 3-layer: post_arm_k forwarding propagates \
+         through level_1 → level_2 → level_3 → comp (3 wrapper-forward \
+         hops). Slice B fires with comp's tail=4, r+7=11. Hardens the \
+         arbitrary-depth recursion claim from PR #86. stderr={stderr:?}"
+    );
+}
+
 /// Plan D Task 112 sister test — multi-let chain with wrappers.
 /// Three sequential `set_state` calls thread 1, 2, 3 in turn; final
 /// `get_state` reads back 3. Pins the chain-length-3+ branch of

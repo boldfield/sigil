@@ -12440,95 +12440,88 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     tail_value
                                 };
 
-                                // Plan D Task 112b — runtime-gate the
-                                // Final step's terminal dispatch on
-                                // whether `post_arm_k_fn` (loaded at
-                                // the top of the chain step body
-                                // from `synth_cont_args_ptr` at
-                                // POST_ARM_K_FN_OFF) equals
-                                // `identity_fn_addr`. The gate
-                                // discriminates four cases that
-                                // semantically need different
-                                // terminal dispatch:
+                                // Plan D Task 112b/c — runtime-gate
+                                // the Final step's terminal dispatch.
+                                // 3-branch gate discriminating on
+                                // `caller_k_fn` (this synth-cont's
+                                // closure record's trailing slots,
+                                // which holds the helper's caller's
+                                // continuation pair) FIRST, then on
+                                // `post_arm_k_fn` (this synth-cont's
+                                // args_ptr trailing slots, which
+                                // holds the lifted lambda's k(arg)
+                                // dispatch target) for the top-level
+                                // sub-case.
                                 //
-                                // - **post_arm_k_fn == identity**:
-                                //   the lifted lambda's `k(arg)`
-                                //   wrote (null, identity) into this
-                                //   chain step's args_ptr trailing
-                                //   slots (the canonical tail-k
-                                //   pattern via `lower_k_pair_call`).
-                                //   - At top-level (helper called
-                                //     directly from a handle), the
-                                //     helper's caller_k_pair is also
-                                //     (null, identity_k_fn) (PR #80's
-                                //     `lower_handle_body_direct_cps
-                                //     _call` pack). Either dispatch
-                                //     route lands in `identity` →
-                                //     `Done(tail)`. Equivalent.
-                                //   - Inside a wrapper-in-chain
-                                //     caller (helper called from
-                                //     another chain's CallCps), the
-                                //     args_ptr post_arm_k is still
-                                //     (null, identity), but the
-                                //     helper's caller_k_pair is the
-                                //     calling chain step's synth-cont
-                                //     pair — `tail` MUST flow into
-                                //     that synth-cont's binding,
-                                //     not be Done'd. Use caller_k
-                                //     _pair dispatch with [tail, null,
-                                //     identity] (3-slot trailing-pair
-                                //     convention).
+                                // **Why caller_k_fn first** (Task 112c
+                                // Case D fix). The pre-Case-D PR #85
+                                // gate discriminated solely on
+                                // post_arm_k_fn. That mis-routed the
+                                // wrapper-in-chain + Slice B outer
+                                // arm intersection: helper's Final
+                                // saw post_arm_k_fn = slice_b_synth_fn
+                                // (non-identity, since the lifted
+                                // lambda's k(arg) emit wrote it into
+                                // helper's args_ptr trailing) and
+                                // routed via post_arm_k_dispatch,
+                                // firing Slice B at the WRAPPER's
+                                // Final with the wrapper's tail
+                                // instead of routing through caller's
+                                // chain. caller_k_fn-first
+                                // discrimination distinguishes "I am
+                                // the outermost wrapper" (caller_k_fn
+                                // = identity from
+                                // `lower_handle_body_direct_cps_call`'s
+                                // pack) from "I am a wrapper-in-chain"
+                                // (caller_k_fn = a chain-step synth-
+                                // cont addr).
                                 //
-                                //   The two sub-cases are unified by
-                                //   ALWAYS using caller_k_pair when
-                                //   post_arm_k_fn == identity. At
-                                //   top-level, caller_k_fn ==
-                                //   identity_k_fn so the dispatch
-                                //   goes through `identity` directly,
-                                //   matching the prior behavior.
+                                // **Three branches.**
                                 //
-                                // - **post_arm_k_fn != identity**:
-                                //   the lifted lambda's arm body has
-                                //   the Slice B `let r = k(arg);
-                                //   pure_tail` shape (codegen.rs
-                                //   ~10388-10470). The lifted lambda
-                                //   wrote post_arm_k_fn =
-                                //   post_arm_k_synth_fn_addr into
-                                //   the args_ptr trailing slots. The
-                                //   post-arm-k synth fn lowers
-                                //   `pure_tail` taking `r` from
-                                //   args_ptr[0]. Use the original
-                                //   post_arm_k dispatch (1-slot
-                                //   args_buf [tail]) so the synth fn
-                                //   fires after the chain Final's
-                                //   tail value. Plan D Task 112b's
-                                //   caller_k_pair routing does NOT
-                                //   apply here — Slice B is handled
-                                //   by the existing post_arm_k path,
-                                //   which correctly composes with
-                                //   the outer fn-frame for top-level
-                                //   handle bodies.
+                                // - **`top_caller_dispatch_block`**
+                                //   (caller_k_fn == identity AND
+                                //   post_arm_k_fn == identity):
+                                //   outermost wrapper + canonical
+                                //   tail-k arm body. Dispatch via
+                                //   caller_k_pair = (null, identity)
+                                //   → identity returns Done(tail).
+                                //   Trailing pair (null, identity) is
+                                //   irrelevant; identity reads only
+                                //   *args_ptr.
                                 //
-                                // **Open question (Case D):** wrapper-
-                                // in-chain WITH a Slice B arm body in
-                                // the OUTER handle. post_arm_k_fn
-                                // would be a Slice B synth fn; the
-                                // gate would route via post_arm_k
-                                // (skipping caller_k_pair). The Slice
-                                // B synth fn computes its tail in the
-                                // outer arm's context, returning Done
-                                // — which terminates the run_loop
-                                // driving the wrapper. The OUTER
-                                // chain step (caller_k_pair) does not
-                                // fire. This is the correct semantic
-                                // for "wrapper's perform yields and
-                                // outer arm captures the wrapper's
-                                // continuation in a `let r = k(...)`,
-                                // then computes pure_tail" — pure_tail
-                                // IS the discharge value, the chain
-                                // doesn't continue. Test corpus
-                                // doesn't exercise Case D today;
-                                // worth a follow-up sister test.
+                                // - **`top_post_arm_k_dispatch_block`**
+                                //   (caller_k_fn == identity AND
+                                //   post_arm_k_fn != identity):
+                                //   outermost wrapper + Slice B arm
+                                //   body (`let r = k(arg);
+                                //   pure_tail`). Lifted lambda wrote
+                                //   post_arm_k_fn =
+                                //   post_arm_k_synth_fn_addr into the
+                                //   args_ptr trailing slots. Use
+                                //   1-slot dispatch [tail]; Slice B
+                                //   synth fn fires with r=tail and
+                                //   computes pure_tail.
+                                //
+                                // - **`wrapper_forward_block`**
+                                //   (caller_k_fn != identity, NEW in
+                                //   Task 112c): wrapper-in-chain.
+                                //   Dispatch via caller_k_pair (= the
+                                //   calling chain step's synth-cont
+                                //   pair) with the FORWARDED
+                                //   post_arm_k pair as the new
+                                //   args_ptr trailing pair (instead
+                                //   of (null, identity) the top-level
+                                //   path uses). The caller's chain
+                                //   step ignores its incoming
+                                //   post_arm_k (Middle convention) OR
+                                //   consumes it at its own Final's
+                                //   gate (recursive). When the chain
+                                //   ultimately reaches the outermost
+                                //   level (caller_k_fn = identity),
+                                //   the forwarded post_arm_k_fn
+                                //   drives top_post_arm_k_dispatch_block
+                                //   above with the OUTERMOST body's
+                                //   tail. Closes Case D.
                                 let identity_fn_addr = lowerer
                                     .builder
                                     .ins()
@@ -12567,7 +12560,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 //   pre-existing `raw_u64`.
                                 // - The below-this-block
                                 //   `top_caller_dispatch_block`
-                                //   (Task 112b, in this file) writes
+                                //   (Task 112b, renamed in 112c) writes
                                 //   `identity_fn_addr` at
                                 //   POST_ARM_K_FN_OFF as the new
                                 //   trailing pair when forwarding
@@ -12613,13 +12606,87 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // semantics, introduce a new sentinel
                                 // (or a runtime tag) and discriminate
                                 // explicitly.
-                                // Plan D Task 112b Case D fix —
-                                // load caller_k_pair UPFRONT (was:
-                                // loaded only inside caller_dispatch
-                                // block) so we can discriminate
-                                // top-level vs wrapper-in-chain
-                                // FIRST, before the post_arm_k
-                                // identity check.
+                                //
+                                // **Parallel identity-sentinel
+                                // invariant on `caller_k_fn` (Task 112c
+                                // PR #86 review 🟡).** The Task 112c
+                                // Case D fix introduces a SECOND
+                                // pointer-equality-as-tag check:
+                                // `caller_k_fn == identity_fn_addr`
+                                // means "this synth-cont's helper was
+                                // called at top-level (directly from a
+                                // handle expression, not from another
+                                // chain's CallCps emit)". The same
+                                // hazard the post_arm_k invariant
+                                // guards against now applies to
+                                // synth-cont closure record slots
+                                // holding caller_k_fn — any future
+                                // writer that places `identity_fn_addr`
+                                // there for a non-top-level reason
+                                // would silently mis-route into
+                                // `top_level_block` and break Case
+                                // D-class composition again.
+                                //
+                                // Today, every writer of
+                                // `caller_k_fn` slots in synth-cont
+                                // closure records is one of:
+                                //
+                                // - `lower_handle_body_direct_cps_call`
+                                //   (`compiler/src/codegen.rs:14781+`)
+                                //   packs `(null, identity_k_fn)` as
+                                //   the trailing pair on the body
+                                //   call's args buffer. The Cps body's
+                                //   helper-body Phase 6 alloc reads
+                                //   those slots and stores them as
+                                //   `caller_k_pair` in step_0's
+                                //   closure record (codegen.rs:8980+
+                                //   in this file). This is the SOLE
+                                //   producer of `caller_k_fn =
+                                //   identity_fn_addr`.
+                                // - Helper-body Phase 6 alloc
+                                //   (codegen.rs:8980+ — the
+                                //   `is_chained_kind` branch) loads
+                                //   `caller_k_pair` from the helper's
+                                //   `args_ptr` trailing slots and
+                                //   stores into step_0's closure
+                                //   record. This FORWARDS whatever
+                                //   was passed in — at top-level, the
+                                //   forwarded value is identity
+                                //   (per the bullet above); inside a
+                                //   wrapper-in-chain caller, the
+                                //   forwarded value is the calling
+                                //   chain step's synth-cont pair.
+                                //   Forwarding-only; never synthesizes
+                                //   identity fresh.
+                                // - Middle-step emit (codegen.rs:
+                                //   12790+ in this file) copies
+                                //   `caller_k_pair` from this synth-
+                                //   cont's closure record into the
+                                //   next step's record. Forwarding-
+                                //   only.
+                                //
+                                // Any FUTURE emit path that writes
+                                // identity to a synth-cont closure
+                                // record's `caller_k_fn` slot must be
+                                // designed for the same canonical
+                                // top-level semantic. Adding a new
+                                // writer that uses identity for some
+                                // other purpose would silently mis-
+                                // route through `top_level_block` —
+                                // same mechanism-by-coincidence
+                                // hazard as the post_arm_k_fn
+                                // invariant. Keep it that way; if a
+                                // new shape needs identity-as-
+                                // caller_k_fn with different routing
+                                // semantics, introduce a new sentinel
+                                // (or a runtime tag) and discriminate
+                                // explicitly.
+                                //
+                                // Plan D Task 112c Case D fix —
+                                // load caller_k_pair UPFRONT so we
+                                // can discriminate top-level vs
+                                // wrapper-in-chain FIRST, before the
+                                // post_arm_k identity check.
                                 let caller_k_closure_off: i32 =
                                     16 + 8 * (captures.len() + prior_bindings.len()) as i32;
                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
