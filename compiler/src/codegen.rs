@@ -8263,13 +8263,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let block_params: Vec<Value> = builder.block_params(block).to_vec();
                     // PR #90 R1 issue 2 carryover — assert the new
                     // 4-positional Cps signature shape.
-                    debug_assert_eq!(
-                        block_params.len(),
-                        4,
-                        "codegen Phase B.2: Cps fn `{}` block_params has {} entries (expected 4 for [closure_ptr, args_ptr, args_len, terminal_out])",
-                        f.name,
-                        block_params.len(),
-                    );
+                    assert_cps_arity(&block_params, &format!("Phase B.2 Cps fn `{}`", f.name));
                     let closure_ptr = block_params[0];
                     let args_ptr = block_params[1];
                     // block_params[2] = args_len (statically known
@@ -9020,13 +9014,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         (ChainedNextStep::Perform(p), None)
                     };
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
-                debug_assert_eq!(
-                    block_params.len(),
-                    4,
-                    "codegen Cps body emit: fn `{}` block_params has {} entries (expected 4 for [closure_ptr, args_ptr, args_len, terminal_out])",
-                    f.name,
-                    block_params.len(),
-                );
+                assert_cps_arity(&block_params, &format!("Cps body emit fn `{}`", f.name));
                 let closure_ptr = block_params[0];
                 let args_ptr = block_params[1];
                 // block_params[2] = args_len; per `cps_signature`'s
@@ -10183,12 +10171,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // enforces arity through typecheck E0141), 3 =
                 // terminal_out (Plan D Task 111c).
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
-                debug_assert_eq!(
-                    block_params.len(),
-                    4,
-                    "codegen synth-arm-fn: block_params has {} entries (expected 4)",
-                    block_params.len(),
-                );
+                assert_cps_arity(&block_params, "synth-arm-fn");
                 let closure_ptr = block_params[0];
                 let args_ptr = block_params[1];
                 let _args_len = block_params[2];
@@ -11156,12 +11139,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // alloc'd closure record otherwise (Phase 4d's
                 // `alloc_arm_closure_record` shape).
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
-                debug_assert_eq!(
-                    block_params.len(),
-                    4,
-                    "codegen synth-return-arm-fn: block_params has {} entries (expected 4)",
-                    block_params.len(),
-                );
+                assert_cps_arity(&block_params, "synth-return-arm-fn");
                 let closure_ptr = block_params[0];
                 let args_ptr = block_params[1];
                 let args_len = block_params[2];
@@ -11442,12 +11420,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // documented and enforced at the synth-cont's dispatch
             // site, not re-checked here);
             // block_params[3] = terminal_out (Plan D Task 111c).
-            debug_assert_eq!(
-                block_params.len(),
-                4,
-                "codegen post-arm-k synth fn: block_params has {} entries (expected 4)",
-                block_params.len(),
-            );
+            assert_cps_arity(&block_params, "post-arm-k synth fn");
 
             let args_ptr = block_params[1];
             let terminal_out = block_params[3];
@@ -11694,12 +11667,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     builder.seal_block(block);
 
                     let block_params: Vec<Value> = builder.block_params(block).to_vec();
-                    debug_assert_eq!(
-                        block_params.len(),
-                        4,
-                        "codegen synth-cont body emit: block_params has {} entries (expected 4)",
-                        block_params.len(),
-                    );
+                    assert_cps_arity(&block_params, "synth-cont body emit");
                     let synth_closure_ptr = block_params[0];
                     let args_ptr = block_params[1];
                     // Plan D Task 111c — block_params[3] = terminal_out.
@@ -12421,12 +12389,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // post_arm_k pair (which for tail-`k` arms is
                         // `(null, identity)` — the chain terminates
                         // with `Done(tail_value)`).
-                        debug_assert_eq!(
-                            block_params.len(),
-                            4,
-                            "codegen chained-let-bind synth-cont: block_params has {} entries (expected 4)",
-                            block_params.len(),
-                        );
+                        assert_cps_arity(&block_params, "chained-let-bind synth-cont");
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
                         // Plan D Task 111c — block_params[3] = terminal_out.
@@ -14017,12 +13980,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // a typecheck-derived prediction was dropped
                         // per PR #76 review — actual widen logic uses
                         // `dfg.value_type(tail_value)` directly).
-                        debug_assert_eq!(
-                            block_params.len(),
-                            4,
-                            "codegen Final synth-cont: block_params has {} entries (expected 4)",
-                            block_params.len(),
-                        );
+                        assert_cps_arity(&block_params, "Final synth-cont");
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
                         // Plan D Task 111c — block_params[3] = terminal_out.
@@ -14773,19 +14731,32 @@ struct Lowerer<'a, 'b> {
     /// 8-byte header and the 8-byte code_ptr word).
     closure_ptr: Value,
 
-    /// Plan D Task 111b — Last arg of the current Sync user fn's entry
-    /// block: the caller-passed `*mut TerminalResult` pointer for the
-    /// terminal channel (`out` parameter of `sigil_run_loop`). Threaded
-    /// through every Sync ABI call site (`lower_call`'s Sync branch
-    /// passes this to Sync callees) and through every Sync→Cps interop
-    /// wrapper that drives `sigil_run_loop` (the run_loop call passes
-    /// this as `out` instead of null).
+    /// Plan D Task 111b/c — the surrounding fn's caller-passed
+    /// `*mut TerminalResult` pointer for the terminal channel (`out`
+    /// parameter of `sigil_run_loop`). Bound from the trailing block
+    /// param of the surrounding fn at fn entry; threaded through every
+    /// call site that needs to forward the terminal slot:
     ///
-    /// `None` for Lowerers constructed for non-user-Sync-fn contexts
-    /// (e.g., synth-cont fn body emit, lifted-lambda emit). Those
-    /// contexts are addressed by 111c (Cps + synth fn ABI threading).
-    /// Until 111c lands, sigil_run_loop call sites in those contexts
-    /// still pass null.
+    /// - **Sync ABI calls** (`lower_call`'s Sync branch + IIFE direct-
+    ///   call + `call_indirect` via closure record): passed as the
+    ///   trailing positional arg.
+    /// - **Direct Cps fn calls** (`lower_call`'s Cps branch +
+    ///   `lower_handle_body_direct_cps_call` + Sync shim's underlying
+    ///   Cps call): passed as the 4th positional arg per `cps_signature`.
+    /// - **`sigil_run_loop` invocations** (handle body's nested
+    ///   run_loop, perform-side run_loop drive, branched k-call
+    ///   dispatch, Slice B fallback, return-arm dispatch): passed as
+    ///   the `out` argument so handle-exit terminal writes inside the
+    ///   driven trampoline land in the caller's slot.
+    ///
+    /// **Post-111c invariant:** every Lowerer construction site
+    /// populates `Some(...)` from the surrounding fn's trailing ABI
+    /// block param (Sync user fn body emit, all Cps body emit shapes,
+    /// synth-arm fn, synth return-arm fn, post-arm-k synth fn,
+    /// chained-let-bind synth-cont, Final synth-cont). The `Option`
+    /// type and the helper's null-fallback branch (`terminal_out_or_-
+    /// null`) persist for one PR — 111d removes the TLS path and
+    /// relaxes this to plain `Value` alongside the cleanup.
     terminal_out_param: Option<Value>,
 
     /// Per-string-literal `(span, GV, byte-length)` tuples declared at
@@ -18559,25 +18530,39 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         "codegen: closure-record code_fn_name `{code_fn_name}` not registered"
                     )
                 });
-                // Plan D Task 111b — the hoisted closure-converted fn
-                // is registered through the same Sync/Cps ABI pre-pass
-                // as user-declared fns. For Sync ABI callees (the
-                // common IIFE / lambda-as-value path), the trailing
-                // `terminal_out` param must be threaded; Cps-ABI
-                // callees (`compute_user_fn_abi` returns Cps) keep
-                // the 3-arg shape and 111c will plumb terminal_out
-                // for those too. The callee's `UserFnEntry` is
-                // looked up by the unmangled `code_fn_name`.
-                //
                 // PR #90 R1 issue 1 — `user_fn_refs` and `user_fns`
                 // share keys (both populated from the same `Item::Fn`
-                // pre-pass; see codegen.rs invariant near `user_fn_refs`
-                // construction). The miss arm mirrors the
-                // `unreachable!()` discipline at 17615 (direct-Sync
-                // branch) and 14245 (IIFE call path) so a future
-                // refactor that diverges the two maps trips a panic
-                // instead of silently emitting a Sync-ABI call against
-                // a Cps callee (stack-corrupting ABI mismatch).
+                // pre-pass). The miss arm mirrors the `unreachable!()`
+                // discipline at the direct-Sync branch and the IIFE
+                // call path so a future refactor that diverges the
+                // two maps trips a panic instead of silently emitting
+                // a Sync-ABI call against a Cps callee.
+                //
+                // PR #91 R1 issue 1 — this branch fires only on
+                // `Call(ClosureRecord, args)` (IIFE / lambda-as-value
+                // direct call). closure_convert produces ClosureRecord
+                // for both top-level fn references (`let f = fn_name`
+                // → ClosureRecord{code_fn_name: name, env_exprs: []})
+                // and Lambda IIFE (`(\x -> body)(arg)` → Call{callee:
+                // ClosureRecord{...}, args}). The latter's
+                // ClosureRecord names a hoisted `$lambda_N` whose ABI
+                // is determined by `compute_user_fn_abi` against its
+                // body shape. The call shape emitted here is
+                // Sync-style (`closure_ptr + positional user args +
+                // terminal_out`); a Cps callee (signature `(closure,
+                // args_ptr, args_len, terminal_out) -> *NextStep`)
+                // would mismatch this shape and Cranelift's verifier
+                // would reject the IR. Therefore the Cps branch is
+                // structurally unreachable on this path. If a future
+                // closure-conversion change ever produces an IIFE
+                // against a Cps-ABI hoisted lambda, this assert
+                // surfaces the ABI gap concretely instead of relying
+                // on Cranelift's rejection downstream — at which
+                // point the right fix is to ship Cps lowering here
+                // (mirroring `lower_call`'s named-Cps direct-call
+                // branch's packed-args + identity-k pair shape) AND
+                // route through the Sync shim from `sync_shim_refs`
+                // rather than the underlying Cps `user_fn_refs` entry.
                 let callee_abi = match self.user_fns.get(code_fn_name) {
                     Some(e) => e.abi,
                     None => unreachable!(
@@ -18585,13 +18570,23 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                          user_fn_refs but missing from user_fns — pre-pass invariant violated"
                     ),
                 };
+                if callee_abi != UserFnAbi::Sync {
+                    unreachable!(
+                        "codegen ClosureRecord direct-call: callee `{code_fn_name}` has \
+                         non-Sync ABI ({callee_abi:?}) — this branch's call shape is \
+                         Sync-style (closure_ptr + positional args + terminal_out); a Cps \
+                         callee would require packed-args + (k_closure, k_fn) trailing pair \
+                         + Sync shim routing. closure_convert is not expected to produce \
+                         a ClosureRecord-as-callee against a Cps-ABI hoisted lambda; if \
+                         this fires, ship the Cps lowering here mirroring `lower_call`'s \
+                         named-Cps direct-call branch."
+                    );
+                }
+                let terminal_out = self.terminal_out_or_null();
                 let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
                 all_args.push(closure_value);
                 all_args.extend(arg_vals);
-                if callee_abi == UserFnAbi::Sync {
-                    let terminal_out = self.terminal_out_or_null();
-                    all_args.push(terminal_out);
-                }
+                all_args.push(terminal_out);
                 let call = self.builder.ins().call(func_ref, &all_args);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
@@ -20189,6 +20184,22 @@ fn cps_signature(pointer_ty: Type, module: &ObjectModule) -> Signature {
     sig.params.push(AbiParam::new(pointer_ty)); // terminal_out (Plan D Task 111c)
     sig.returns.push(AbiParam::new(pointer_ty)); // *mut NextStep
     sig
+}
+
+/// Plan D Task 111c — debug-only arity check for every Cps body emit
+/// site (Cps user fns + synth-arm + synth return-arm + post-arm-k +
+/// synth-cont + Final synth-cont). Asserts `block_params.len() == 4`
+/// matching `cps_signature`'s shape: `[closure_ptr, args_ptr,
+/// args_len, terminal_out]`. `site` names the emit context for the
+/// failure message so the reader knows which body emit drifted.
+fn assert_cps_arity(block_params: &[Value], site: &str) {
+    debug_assert_eq!(
+        block_params.len(),
+        4,
+        "codegen {site}: block_params has {} entries (expected 4 for \
+         [closure_ptr, args_ptr, args_len, terminal_out])",
+        block_params.len(),
+    );
 }
 
 /// Plan B Task 55, Phase 4d/4e — `args_len` convention for the CPS

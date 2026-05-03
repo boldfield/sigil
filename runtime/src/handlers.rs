@@ -2407,8 +2407,8 @@ mod tests {
         let known: u64 = 0xFEEDFACE_DEADBEEF;
         let args: [u64; 1] = [known];
         // SAFETY: gc-heap-ptr arithmetic (stack array, non-GC, outlives the call).
-        let ns =
-            unsafe { sigil_continuation_identity(ptr::null(), args.as_ptr(), 1, ptr::null_mut()) };
+        let args_ptr = args.as_ptr();
+        let ns = unsafe { sigil_continuation_identity(ptr::null(), args_ptr, 1, ptr::null_mut()) };
         unsafe {
             assert_eq!((*ns).tag, NEXT_STEP_TAG_DONE);
             assert_eq!((*ns).value, known);
@@ -2476,8 +2476,8 @@ mod tests {
         // [arg, post_arm_k_closure (null), post_arm_k_fn (irrelevant)]
         let args: [u64; 3] = [known, 0xCAFE, 0xBABE];
         // SAFETY: gc-heap-ptr arithmetic (stack array, non-GC, outlives the call).
-        let ns =
-            unsafe { sigil_continuation_identity(ptr::null(), args.as_ptr(), 3, ptr::null_mut()) };
+        let args_ptr = args.as_ptr();
+        let ns = unsafe { sigil_continuation_identity(ptr::null(), args_ptr, 3, ptr::null_mut()) };
         unsafe {
             assert_eq!((*ns).tag, NEXT_STEP_TAG_DONE);
             assert_eq!((*ns).value, known);
