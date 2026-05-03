@@ -201,6 +201,43 @@ thread_local! {
     /// for future expansion; today's `sigil_run_loop` runs on a single
     /// thread, but the per-thread design avoids globally-mutable state.
     static LAST_TERMINAL_TAG: Cell<u32> = const { Cell::new(NEXT_STEP_TAG_DONE) };
+}
+
+/// Plan D Task 111 — caller-owned terminal channel for `sigil_run_loop`.
+///
+/// **Layout** (`#[repr(C)]`, 16 bytes):
+/// - `value: u64` at offset 0 — the terminal value (DONE's payload OR
+///   DISCHARGED's payload).
+/// - `tag: u64` at offset 8 — `NEXT_STEP_TAG_DONE` (= 0) or
+///   `NEXT_STEP_TAG_DISCHARGED` (= 2). Stored as `u64` (not `u32`) for
+///   simpler stack-slot offset arithmetic on the compiler side; the
+///   high 32 bits are unused.
+///
+/// **Threading discipline (post-111d).** Caller-owned: the top-level
+/// shim allocates a `TerminalResult` on the C stack and passes its
+/// pointer to `user_main` via a `+1` ABI param. Every Sigil user fn
+/// (Sync OR Cps) propagates the pointer to its callees. Every
+/// `sigil_run_loop` invocation receives the pointer from its caller
+/// (Sync→Cps interop wrapper, custom handle body-call wrapper, Phase
+/// 4g return-arm dispatch). The trampoline writes to `*out` at terminal
+/// time. Cross-fn discharge propagation works because all writes/reads
+/// reference the SAME memory location threaded through the call chain.
+///
+/// **Threading discipline (this PR — 111a, transitional).** Each
+/// codegen call site of `sigil_run_loop` allocates a per-fn 16-byte
+/// stack slot and passes its address as `out`. The trampoline writes
+/// to `*out` (per the new contract) AND to the TLS (per the old
+/// contract). TLS is still authoritative for handle-exit reads. Per-fn
+/// slots are written but unread; cross-fn discharge propagation still
+/// works via TLS. PR 111b shifts threading to caller-owned; 111c
+/// extends to Cps ABI; 111d removes TLS.
+#[repr(C)]
+pub struct TerminalResult {
+    pub value: u64,
+    pub tag: u64,
+}
+
+thread_local! {
 
     /// Per-thread last-terminal value: records the u64 value the most
     /// recent `sigil_run_loop` invocation returned at terminal time
@@ -1767,7 +1804,10 @@ pub unsafe extern "C" fn sigil_perform(
 /// `sigil_next_step_done` or `sigil_next_step_call`. The fns referenced
 /// by any `CALL` step must satisfy the CPS calling convention.
 #[no_mangle]
-pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
+pub unsafe extern "C" fn sigil_run_loop(
+    initial_step: *mut NextStep,
+    out: *mut TerminalResult,
+) -> u64 {
     let mut current = initial_step;
     // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
     // run_loop entry. On the DISCHARGED bypass terminal (introduced by
@@ -1814,6 +1854,21 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                 if tag == NEXT_STEP_TAG_DISCHARGED {
                     LAST_TERMINAL_TAG.with(|c| c.set(tag));
                     LAST_TERMINAL_VALUE.with(|c| c.set(v));
+                    // Plan D Task 111 (transitional 111a) — also write
+                    // to caller-owned `*out`. PRs 111b/c will switch
+                    // codegen reads from TLS to this slot; 111d will
+                    // remove TLS. Null check guards against test
+                    // callers that pass null while iterating to the
+                    // new contract.
+                    if !out.is_null() {
+                        ptr::write(
+                            out,
+                            TerminalResult {
+                                value: v,
+                                tag: tag as u64,
+                            },
+                        );
+                    }
                     // Drain outer_post_arm_k stack back to entry-time
                     // depth. Entries pushed by synth-cont Middle steps
                     // during this run_loop's chain stay leaked across
@@ -1915,6 +1970,17 @@ pub unsafe extern "C" fn sigil_run_loop(initial_step: *mut NextStep) -> u64 {
                 );
                 LAST_TERMINAL_TAG.with(|c| c.set(tag));
                 LAST_TERMINAL_VALUE.with(|c| c.set(v));
+                // Plan D Task 111 (transitional 111a) — see DISCHARGED
+                // bypass site above for the full mechanism note.
+                if !out.is_null() {
+                    ptr::write(
+                        out,
+                        TerminalResult {
+                            value: v,
+                            tag: tag as u64,
+                        },
+                    );
+                }
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
@@ -2113,7 +2179,7 @@ mod tests {
         reset_state();
         let ns = unsafe { sigil_next_step_done(99) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns, std::ptr::null_mut()) };
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 99);
         assert_eq!(dispatches_after - dispatches_before, 1);
@@ -2129,7 +2195,7 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(41) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns, std::ptr::null_mut()) };
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 42);
         assert_eq!(dispatches_after - dispatches_before, 2);
@@ -2146,7 +2212,7 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(5) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns, std::ptr::null_mut()) };
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         // 5 -> Call(cps_call_then_plus_one, 5)
         // -> Call(cps_done_plus_one, 5+10=15)
@@ -2201,7 +2267,7 @@ mod tests {
         let args = unsafe { sigil_next_step_args_ptr(ns) };
         unsafe { args.write(42) };
         let dispatches_before = counters::read(CounterId::TrampolineDispatchCount);
-        let v = unsafe { sigil_run_loop(ns) };
+        let v = unsafe { sigil_run_loop(ns, std::ptr::null_mut()) };
         let dispatches_after = counters::read(CounterId::TrampolineDispatchCount);
         assert_eq!(v, 42);
         // 2 dispatches: one for the Call (loop dispatches identity,
@@ -2405,7 +2471,7 @@ mod tests {
             assert_eq!(depth_sum_after - depth_sum_before, 1);
 
             // Dispatch the resulting NextStep through the trampoline.
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 700);
 
             // Pop the frame to leave a clean handler stack.
@@ -2438,7 +2504,7 @@ mod tests {
             let depth_after = counters::read(CounterId::HandlerWalkDepthSum);
             // Outer is on top, target is one below; walk depth = 2.
             assert_eq!(depth_after - depth_before, 2);
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 300);
             let _ = sigil_handle_pop();
             let _ = sigil_handle_pop();
@@ -2481,7 +2547,7 @@ mod tests {
             // SAFETY: gc-heap-ptr arithmetic (user_args is a stack local).
             let user_args_ptr = user_args.as_ptr();
             let ns = sigil_perform(7, 0, user_args_ptr, 2, 0xCC as *mut u8, 0xDD as *mut u8);
-            let _ = sigil_run_loop(ns);
+            let _ = sigil_run_loop(ns, std::ptr::null_mut());
             let _ = sigil_handle_pop();
         }
         reset_state();
@@ -2571,7 +2637,7 @@ mod tests {
                 3,
                 "expected walk depth 3 (outer + middle + target)"
             );
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 400);
             let _ = sigil_handle_pop();
             let _ = sigil_handle_pop();
@@ -2619,7 +2685,7 @@ mod tests {
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 1100);
             let _ = sigil_handle_pop();
         }
@@ -2725,7 +2791,7 @@ mod tests {
             let arg = 9u64;
             let arg_ptr = &arg as *const u64;
             let ns = sigil_perform(4242, 0, arg_ptr, 1, ptr::null_mut(), ptr::null_mut());
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 900);
             let _ = sigil_handle_pop();
         }
@@ -2785,7 +2851,7 @@ mod tests {
             // arm_read_closure_sentinel with closure_ptr = the original
             // closure; it reads the sentinel and returns it.
             let ns = sigil_perform(7777, 0, ptr::null(), 0, ptr::null_mut(), ptr::null_mut());
-            let result = sigil_run_loop(ns);
+            let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
             let _ = sigil_handle_pop();
         }
@@ -2835,7 +2901,7 @@ mod tests {
             // would read freed bytes (could be anything; sentinel
             // mismatch would fire the assert).
             let initial = sigil_next_step_call(ptr::null_mut(), cps_alloc_then_gc as *mut u8, 0);
-            let result = sigil_run_loop(initial);
+            let result = sigil_run_loop(initial, std::ptr::null_mut());
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
         }
         reset_state();
@@ -3044,7 +3110,7 @@ mod tests {
 
         unsafe {
             let initial = sigil_next_step_call(ptr::null_mut(), cps_push_then_done as *mut u8, 0);
-            let result = sigil_run_loop(initial);
+            let result = sigil_run_loop(initial, std::ptr::null_mut());
             // 42 + 1 = 43; cps_done_with_arg adds 1 to its arg.
             assert_eq!(result, 43);
         }

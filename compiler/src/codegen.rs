@@ -7341,7 +7341,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // — it builds a Call to the matching arm + (k_closure, k_fn);
     // the arm runs and returns Done(value). `sigil_run_loop` does
     // the dispatch and returns the final Done's value as u64.
+    // Plan D Task 111 (111a) — `sigil_run_loop` ABI extended with a
+    // second `*mut TerminalResult` param `out`. The trampoline writes
+    // (value, tag) to `*out` at terminal time. In 111a, codegen
+    // allocates a per-fn 16-byte stack slot at each call site and
+    // passes its address — the slot is written but unread; TLS
+    // remains authoritative for handle-exit reads. PRs 111b/c shift
+    // threading to caller-owned propagation through fn ABIs; 111d
+    // removes TLS.
     let mut run_loop_sig = Signature::new(isa_call_conv(&module));
+    run_loop_sig.params.push(AbiParam::new(pointer_ty));
     run_loop_sig.params.push(AbiParam::new(pointer_ty));
     run_loop_sig.returns.push(AbiParam::new(types::I64));
     let run_loop = module
@@ -14516,9 +14525,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let null_fn = builder.ins().iconst(pointer_ty, 0);
         builder.ins().call(push_ref, &[null_closure, null_fn]);
 
-        // Drive the trampoline.
+        // Drive the trampoline. Plan D Task 111 (111a) — pass null
+        // for `terminal_out`; runtime's null-guard skips the *out
+        // write. TLS remains authoritative for handle-exit reads in
+        // 111a. PR 111b switches to caller-owned threading.
         let run_loop_ref = module.declare_func_in_func(run_loop, builder.func);
-        let run_loop_call = builder.ins().call(run_loop_ref, &[next_step]);
+        let null_term_out = builder.ins().iconst(pointer_ty, 0);
+        let run_loop_call = builder
+            .ins()
+            .call(run_loop_ref, &[next_step, null_term_out]);
         let raw_u64 = builder.inst_results(run_loop_call)[0];
 
         // POP after run_loop — symmetric to push above.
@@ -15116,7 +15131,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         );
 
         // Drive the trampoline. Returns u64.
-        let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[next_step]);
+        let null_term_out = self.builder.ins().iconst(self.pointer_ty, 0);
+        let run_loop_call = self
+            .builder
+            .ins()
+            .call(self.run_loop_ref, &[next_step, null_term_out]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let raw_u64 = self.builder.inst_results(run_loop_call)[0];
@@ -15482,7 +15501,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .store(MemFlags::trusted(), identity_addr, argp, POST_ARM_K_FN_OFF);
 
         // Drive the nested run_loop. Returns u64 (raw bits).
-        let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns]);
+        let null_term_out = self.builder.ins().iconst(self.pointer_ty, 0);
+        let run_loop_call = self
+            .builder
+            .ins()
+            .call(self.run_loop_ref, &[ns, null_term_out]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let raw_u64 = self.builder.inst_results(run_loop_call)[0];
@@ -15875,10 +15898,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // dispatches the Call (invokes the arm), then any further
         // Calls the arm returns, until a terminal `Done(value)`.
         // Returns u64.
+        let null_term_out = self.builder.ins().iconst(self.pointer_ty, 0);
         let run_loop_call = self
             .builder
             .ins()
-            .call(self.run_loop_ref, &[call_next_step]);
+            .call(self.run_loop_ref, &[call_next_step, null_term_out]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let widened = self.builder.inst_results(run_loop_call)[0];
@@ -16838,7 +16862,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // the trampoline calls identity which returns
                     // Done(tail_widened); run_loop returns the value
                     // as u64.
-                    let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns_ptr]);
+                    let null_term_out = self.builder.ins().iconst(self.pointer_ty, 0);
+                    let run_loop_call = self
+                        .builder
+                        .ins()
+                        .call(self.run_loop_ref, &[ns_ptr, null_term_out]);
                     self.stackmap
                         .push_placeholder(function_code_offset(&self.builder, run_loop_call));
                     let widened_handle_val = self.builder.inst_results(run_loop_call)[0];
@@ -17206,7 +17234,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         );
 
         // sigil_run_loop(ns) → u64
-        let run_loop_call = self.builder.ins().call(self.run_loop_ref, &[ns]);
+        let null_term_out = self.builder.ins().iconst(self.pointer_ty, 0);
+        let run_loop_call = self
+            .builder
+            .ins()
+            .call(self.run_loop_ref, &[ns, null_term_out]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let widened_result = self.builder.inst_results(run_loop_call)[0];
@@ -17386,7 +17418,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     POST_ARM_K_FN_OFF,
                 );
 
-                let run_loop_call_2 = self.builder.ins().call(self.run_loop_ref, &[ns_ptr]);
+                let null_term_out_2 = self.builder.ins().iconst(self.pointer_ty, 0);
+                let run_loop_call_2 = self
+                    .builder
+                    .ins()
+                    .call(self.run_loop_ref, &[ns_ptr, null_term_out_2]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, run_loop_call_2));
                 let wrapped = self.builder.inst_results(run_loop_call_2)[0];
@@ -17600,8 +17636,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             .call(self.body_return_arm_push_ref, &[null_closure, null_fn]);
 
                         // Drive the trampoline. Returns u64.
-                        let run_loop_call =
-                            self.builder.ins().call(self.run_loop_ref, &[next_step]);
+                        let null_term_out = self.builder.ins().iconst(self.pointer_ty, 0);
+                        let run_loop_call = self
+                            .builder
+                            .ins()
+                            .call(self.run_loop_ref, &[next_step, null_term_out]);
                         self.stackmap
                             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
                         let raw_u64 = self.builder.inst_results(run_loop_call)[0];
