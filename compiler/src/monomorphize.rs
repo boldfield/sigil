@@ -375,30 +375,21 @@ pub fn canon_ty(ty: &Ty) -> String {
             }
             s
         }
-        Ty::Continuation(_) => {
-            // Plan D Task 117 — Continuation values cannot reach
-            // mono. The escape barrier rejects them from any
-            // cross-fn position (return / heap-store / fn-arg via
-            // unify_ty's broad arm; generic-instantiation via
-            // check_call's bind_ty_var bypass closure with
-            // E0145 — see typecheck.rs:4403-4445 for the
-            // precision check). Mono runs only on programs whose
-            // typecheck succeeded, so a Continuation reaching
-            // canon_ty means an escape path slipped through the
-            // typecheck barrier.
-            //
-            // Restored to `unreachable!()` after PR #60 review #3
-            // closed the bind_ty_var bypass; defensive mangling
-            // was the temporary cover for that bypass. Walker
-            // consistency: matches the Var unreachable!()s in
-            // typecheck.rs (`apply_ty_inner`, `rename_ty`,
-            // `unify_ty`) and `Substitution::apply_to_ty` /
-            // `ty_to_type_expr` below.
-            unreachable!(
-                "monomorphize::canon_ty: Ty::Continuation reached the canon-mangler — \
-                 typecheck E0145 should have rejected the cross-fn / cross-storage \
-                 site that allowed a Continuation to escape"
-            )
+        Ty::Continuation(c) => {
+            // Plan D Task 117 (b) — canonicalize Continuation by
+            // mangling op_ret + ret recursively. Used when
+            // `Continuation` appears in a generic fn's signature
+            // and the fn is cloned per type-arg tuple (mono's
+            // canon_ty is the dedup key). scope_id is intentionally
+            // omitted — clones differ on user-type/value
+            // type-args, not on scope_id (which is bound at the
+            // runtime call site, not the mono clone identity).
+            let mut s = String::from("Cont");
+            s.push_str("$$");
+            s.push_str(&canon_ty(&c.op_ret));
+            s.push_str("$$");
+            s.push_str(&canon_ty(&c.ret));
+            s
         }
     }
 }
@@ -876,6 +867,26 @@ impl<'a> Monomorphizer<'a> {
                 TypeExpr::Named(n.clone(), span.clone())
             }
             TypeExpr::Apply { name, args, span } => {
+                // Plan D Task 117 (b) — `Continuation[op_ret, ret]`
+                // is a structural type built into the language, not
+                // a user TypeDecl, so do NOT mangle it into a Named
+                // (mangling would produce "Continuation$$<op_ret>$$<
+                // ret>" which downstream lookups don't resolve).
+                // Keep the Apply structure with rewritten args; the
+                // codegen entry walker treats `Continuation` Apply
+                // nodes specifically and lookup goes through the
+                // resolved Ty side-tables, not the surface name.
+                if name == "Continuation" {
+                    let rewritten_args: Vec<TypeExpr> = args
+                        .iter()
+                        .map(|a| self.rewrite_type_expr(a, subst))
+                        .collect();
+                    return TypeExpr::Apply {
+                        name: name.clone(),
+                        args: rewritten_args,
+                        span: span.clone(),
+                    };
+                }
                 let resolved_args: Vec<Ty> = args
                     .iter()
                     .map(|a| {
@@ -1623,11 +1634,23 @@ impl Substitution {
             // wiring `Subst`-of-`ScopeId`, this arm would silently
             // keep stale `Var` ids; the debug_assert catches that.
             Ty::Continuation(c) => {
+                // Plan D Task 117 (b) — typecheck's `Subst.scopes`
+                // resolves every `ScopeId::Var(N)` to a `Concrete(M)`
+                // by the time mono runs (each call site binds the
+                // scheme's scope_var to the caller's arm-handle's
+                // Concrete via `bind_scope_var`; `apply_ty` then
+                // chases the Var → Concrete on every read). Mono
+                // does not substitute scope_ids itself — it only
+                // substitutes type/row args. So scope_id is
+                // pass-through here. Reaching this arm with a Var
+                // means typecheck failed to bind a scope_var (or a
+                // free Continuation reached mono, which is also a
+                // typecheck bug); the assertion catches both.
                 debug_assert!(
                     matches!(c.scope_id, crate::typecheck::ScopeId::Concrete(_)),
                     "monomorphize::apply_to_ty: Ty::Continuation carries a \
-                     non-Concrete ScopeId ({:?}) — typecheck must have \
-                     resolved it before reaching mono",
+                     non-Concrete ScopeId ({:?}) — typecheck must have resolved \
+                     every scope-var via `Subst.scopes` before reaching mono",
                     c.scope_id,
                 );
                 Ty::Continuation(Box::new(crate::typecheck::ContinuationTy {
@@ -1705,24 +1728,23 @@ pub(crate) fn ty_to_type_expr(ty: &Ty, span: &Span) -> TypeExpr {
             elems: elems.iter().map(|e| ty_to_type_expr(e, span)).collect(),
             span: span.clone(),
         },
-        Ty::Continuation(_) => {
-            // Plan D Task 117 — Continuation has no surface
-            // TypeExpr. PR #60 review #3 closed the bind_ty_var
-            // bypass at check_call (typecheck.rs:4403-4445) via
-            // a precision check that fires E0145 when an arg of
-            // type Ty::Continuation would unify against an
-            // unresolved generic-param Var. With that gate in
-            // place, mono never sees Continuation, so this
-            // unreachable!() is now actually unreachable on user
-            // code. Walker consistency: matches canon_ty +
-            // apply_to_ty above and the Var unreachable!()s in
-            // typecheck.rs walkers.
-            unreachable!(
-                "monomorphize::ty_to_type_expr: Ty::Continuation has no surface TypeExpr — \
-                 typecheck E0145 (escape barrier broad arm + check_call generic-\
-                 instantiation precision check) should have rejected the cross-fn / \
-                 cross-storage / generic-instantiation site upstream"
-            )
+        Ty::Continuation(c) => {
+            // Plan D Task 117 (b) — Continuation now reaches mono
+            // legitimately when a fn declares a `Continuation[op_ret,
+            // ret]` parameter. Render as `TypeExpr::Apply { name:
+            // "Continuation", args: [op_ret, ret] }`. Codegen treats
+            // the Apply name "Continuation" specially (the type is
+            // not a user TypeDecl); downstream walkers consult the
+            // resolved Ty via `call_callee_tys_resolved` rather than
+            // the surface TypeExpr, so the rendering only needs to
+            // round-trip through `type_expr_to_ty` for symmetry.
+            let op_ret_te = ty_to_type_expr(&c.op_ret, span);
+            let ret_te = ty_to_type_expr(&c.ret, span);
+            TypeExpr::Apply {
+                name: "Continuation".to_string(),
+                args: vec![op_ret_te, ret_te],
+                span: span.clone(),
+            }
         }
     }
 }

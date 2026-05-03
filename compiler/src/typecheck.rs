@@ -75,6 +75,35 @@ fn effective_fn_generic_params(f: &FnDecl) -> Vec<GenericParam> {
         .collect()
 }
 
+/// Plan D Task 117 (b) — scan a `TypeExpr` for any `Continuation[
+/// op_ret, ret]` reference. Used by the fn-decl pre-pass to decide
+/// whether to allocate a scope_var for the fn's signature; if no
+/// param/return TypeExpr mentions Continuation, the scope_var slot
+/// stays empty and `Scheme.scope_vars` is `Vec::new()`.
+fn type_expr_has_continuation(t: &TypeExpr) -> bool {
+    match t {
+        TypeExpr::Named(..) => false,
+        TypeExpr::Apply { name, args, .. } => {
+            name == "Continuation" || args.iter().any(type_expr_has_continuation)
+        }
+        TypeExpr::Fn(fty) => {
+            fty.params.iter().any(type_expr_has_continuation)
+                || type_expr_has_continuation(&fty.ret)
+        }
+        TypeExpr::Tuple { elems, .. } => elems.iter().any(type_expr_has_continuation),
+    }
+}
+
+/// Plan D Task 117 (b) — true if any param's TypeExpr or the
+/// return TypeExpr contains a `Continuation` annotation. Drives
+/// the pre-pass scope_var allocation in `typecheck`.
+fn fn_decl_signature_has_continuation(f: &FnDecl) -> bool {
+    f.params
+        .iter()
+        .any(|p| type_expr_has_continuation(&p.ty))
+        || type_expr_has_continuation(&f.return_type)
+}
+
 /// The checker's type lattice. Expanded in plan A2 task 30 to include
 /// `Fn` for user function/lambda values; expanded again in plan B
 /// task 48 to carry HM type variables and generic-applied user types.
@@ -211,6 +240,29 @@ pub enum ScopeId {
     /// Plan B Stage 5). Every reachable `Var` must be resolved by
     /// inference end (codegen-entry guard rejects survivors).
     Var(u32),
+}
+
+/// Plan D Task 117 (b) — context for resolving a `Continuation[
+/// op_ret, ret]` type annotation. Threaded into
+/// `ty_from_type_expr_with_rows` so the resolver picks the right
+/// scope_id binding (Concrete from arm body, Var from fn-sig) or
+/// rejects (None).
+#[derive(Clone, Copy, Debug)]
+pub enum ContScopeCtx {
+    /// Inside a handler arm body. `Continuation[op_ret, ret]`
+    /// resolves to `Ty::Continuation { ..., scope_id:
+    /// Concrete(arm_scope_id) }`.
+    Concrete(u32),
+    /// Inside a fn signature's param/return TypeExpr. Tags with
+    /// `ScopeId::Var(V)` — the V is pre-allocated by the caller
+    /// (Tc's wrapper) and reused for every Continuation annotation
+    /// within the same signature (rank-1-per-fn discipline).
+    FnSigVar(u32),
+    /// Anywhere else (let-binding outside arm, user-type field,
+    /// effect-op signature). `Continuation` is rejected;
+    /// `check_type_expr_known` emits E0145 with the legal-context
+    /// hint.
+    Reject,
 }
 
 /// Structural function signature. Used in `Ty::Fn` and built for
@@ -353,6 +405,15 @@ pub(crate) fn effects_display(es: &[EffectInst]) -> String {
 pub struct Scheme {
     pub type_vars: Vec<u32>,
     pub row_vars: Vec<u32>,
+    /// Plan D Task 117 (b) — scope-id polymorphism. `Continuation`
+    /// parameters in this fn's signature carry `ScopeId::Var(N)`
+    /// tags that bind to a `Concrete(M)` at each call site (the M
+    /// is the scope_id of the arm whose `k` was passed in). One
+    /// scope_var per fn signature is sufficient for v1's discharger
+    /// patterns (`fold_choices`, `first_choice` helpers each see a
+    /// single continuation); the rank-1-per-fn discipline matches
+    /// `effect_row_var`'s single-row-var-per-fn precedent.
+    pub scope_vars: Vec<u32>,
     pub body: Ty,
 }
 
@@ -419,6 +480,14 @@ impl Row {
 pub struct Subst {
     pub tys: BTreeMap<u32, Ty>,
     pub rows: BTreeMap<u32, Row>,
+    /// Plan D Task 117 (b) — scope-id polymorphism. Maps
+    /// `ScopeId::Var(N)` → resolved `ScopeId` (typically a
+    /// `Concrete(M)` from the call-site arm's handle, occasionally
+    /// another `Var` during chained unification). Populated by
+    /// `Tc::bind_scope_var` and consulted by `apply_ty_inner` /
+    /// `unify_ty`'s `Ty::Continuation` arms. Mirrors `tys` and
+    /// `rows`. Empty for fns that have no `Continuation` parameters.
+    pub scopes: BTreeMap<u32, ScopeId>,
 }
 
 impl Subst {
@@ -492,21 +561,20 @@ impl Subst {
                 Ty::Fn(Box::new(resolved))
             }
             Ty::Continuation(c) => {
-                // Plan D Task 117 (a) — only Concrete scope ids
-                // exist today (`check_handle` is the sole producer
-                // and always allocates Concrete). Pass through
-                // unchanged. ScopeId substitution will land
-                // alongside scope-var unification (Task 117
-                // follow-up); assert here so the integration point
-                // surfaces loudly when Var producers are wired.
+                // Plan D Task 117 (b) — substitute scope_id through
+                // `Subst.scopes`. `Var(N)` resolves to whichever
+                // `ScopeId` the substitution holds (typically a
+                // `Concrete(M)` from a call-site bind, occasionally
+                // another `Var` during chained unification); unbound
+                // `Var` passes through unchanged. `Concrete` is
+                // always pass-through. No occurs check — ScopeIds
+                // are flat tags, not recursive.
                 let scope_id = match &c.scope_id {
                     ScopeId::Concrete(n) => ScopeId::Concrete(*n),
-                    ScopeId::Var(_) => unreachable!(
-                        "apply_ty_inner: ScopeId::Var reached substitution — Task 117 (a) \
-                         produces only Concrete scope ids; region-polymorphic schemes are \
-                         deferred to Task 117 follow-up which must wire Subst-of-ScopeId \
-                         before allocating Var"
-                    ),
+                    ScopeId::Var(id) => match self.scopes.get(id) {
+                        Some(resolved) => resolved.clone(),
+                        None => ScopeId::Var(*id),
+                    },
                 };
                 Ty::Continuation(Box::new(ContinuationTy {
                     op_ret: self.apply_ty_inner(&c.op_ret, seen),
@@ -1112,6 +1180,8 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         next_ty_var: 0,
         next_row_var: 0,
         next_scope_id: 0,
+        next_scope_var: 0,
+        current_fn_scope_var: None,
         current_arm_scope_id: None,
         subst: Subst::new(),
         current_generic_subst: BTreeMap::new(),
@@ -1186,6 +1256,20 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             if let (Some(rv), Some(id)) = (f.effect_row_var.as_ref(), row_var_id) {
                 tc.current_row_var_subst.insert(rv.name.clone(), id);
             }
+            // Plan D Task 117 (b) — allocate a scope_var if any
+            // param/return TypeExpr mentions `Continuation`. The
+            // single allocated id is reused across every Continuation
+            // annotation in this signature (rank-1-per-fn discipline).
+            // Pushed into Scheme.scope_vars below; bound at each call
+            // site via `bind_scope_var` (call-site arm's Concrete
+            // becomes the binding target).
+            let scope_var_id = if fn_decl_signature_has_continuation(f) {
+                Some(tc.fresh_scope_var())
+            } else {
+                None
+            };
+            let saved_fn_scope_var = tc.current_fn_scope_var;
+            tc.current_fn_scope_var = scope_var_id;
             let params: Vec<Ty> = f
                 .params
                 .iter()
@@ -1194,6 +1278,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             let ret = tc
                 .ty_from_type_expr_here(&f.return_type)
                 .unwrap_or(Ty::Unit);
+            tc.current_fn_scope_var = saved_fn_scope_var;
             // Plan D Task 116 R1 — `effect_refs_to_insts` for f's
             // own row needs the active generic_subst (so a fn-decl
             // row like `![Raise[A]]` resolves `A` correctly).
@@ -1211,6 +1296,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             let scheme = Scheme {
                 type_vars: ty_var_ids,
                 row_vars: row_var_id.map(|id| vec![id]).unwrap_or_default(),
+                scope_vars: scope_var_id.map(|id| vec![id]).unwrap_or_default(),
                 body: Ty::Fn(Box::new(sig)),
             };
             tc.fn_schemes.insert(f.name.clone(), scheme);
@@ -1250,6 +1336,19 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 let id = tc.fresh_row_var();
                 tc.current_row_var_subst.insert(rv.name.clone(), id);
             }
+            // Plan D Task 117 (b) — set fn-sig scope-var ctx so
+            // `check_type_expr_known`'s Continuation case sees a
+            // valid context (param/return position) instead of
+            // firing E0145. The id is local to the sweep — distinct
+            // from the pre-pass-Scheme id and the check_fn body-walk
+            // id (each phase does its own allocation for its own
+            // subst, mirroring the row-var-allocation pattern).
+            let saved_fn_scope_var = tc.current_fn_scope_var;
+            tc.current_fn_scope_var = if fn_decl_signature_has_continuation(f) {
+                Some(tc.fresh_scope_var())
+            } else {
+                None
+            };
             for p in &f.params {
                 tc.check_type_expr_known(&p.ty);
             }
@@ -1262,6 +1361,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 }
                 tc.check_effect_ref_arity(eref);
             }
+            tc.current_fn_scope_var = saved_fn_scope_var;
             tc.current_generic_subst = saved_generic_subst;
             tc.current_row_var_subst = saved_row_var_subst;
         }
@@ -1737,6 +1837,7 @@ fn register_builtin_array_schemes(tc: &mut Tc) {
     let make_scheme = |params: Vec<Ty>, ret: Ty, type_vars: Vec<u32>| Scheme {
         type_vars,
         row_vars: Vec::new(),
+        scope_vars: Vec::new(),
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
@@ -1800,6 +1901,7 @@ fn register_builtin_mut_array_schemes(tc: &mut Tc) {
     let make_scheme = |params: Vec<Ty>, ret: Ty, type_vars: Vec<u32>| Scheme {
         type_vars,
         row_vars: Vec::new(),
+        scope_vars: Vec::new(),
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
@@ -1868,6 +1970,7 @@ fn register_builtin_byte_array_schemes(tc: &mut Tc) {
     let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
         type_vars: Vec::new(),
         row_vars: Vec::new(),
+        scope_vars: Vec::new(),
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
@@ -1938,6 +2041,7 @@ fn register_builtin_mut_byte_array_schemes(tc: &mut Tc) {
     let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
         type_vars: Vec::new(),
         row_vars: Vec::new(),
+        scope_vars: Vec::new(),
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
@@ -1981,6 +2085,7 @@ fn register_builtin_int64_schemes(tc: &mut Tc) {
     let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
         type_vars: Vec::new(),
         row_vars: Vec::new(),
+        scope_vars: Vec::new(),
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
@@ -2035,6 +2140,7 @@ fn register_builtin_string_builder_schemes(tc: &mut Tc) {
     let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
         type_vars: Vec::new(),
         row_vars: Vec::new(),
+        scope_vars: Vec::new(),
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
@@ -2080,6 +2186,7 @@ fn register_builtin_string_schemes(tc: &mut Tc) {
     let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
         type_vars: Vec::new(),
         row_vars: Vec::new(),
+        scope_vars: Vec::new(),
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
@@ -2146,6 +2253,7 @@ fn register_builtin_random_schemes(tc: &mut Tc) {
     let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
         type_vars: Vec::new(),
         row_vars: Vec::new(),
+        scope_vars: Vec::new(),
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
@@ -2168,6 +2276,7 @@ fn register_builtin_clock_schemes(tc: &mut Tc) {
     let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
         type_vars: Vec::new(),
         row_vars: Vec::new(),
+        scope_vars: Vec::new(),
         body: Ty::Fn(Box::new(FnSig {
             params,
             ret,
@@ -2263,6 +2372,25 @@ struct Tc {
     /// to tag the `Ty::Continuation` bound to each arm's `k` so
     /// continuations from different handles can't unify (E0145).
     next_scope_id: u32,
+    /// Plan D Task 117 (b) — scope-var id supply. One fresh
+    /// `ScopeId::Var(N)` allocated per fn signature that contains a
+    /// `Continuation` parameter, plus per-call-site fresh
+    /// allocations during scheme instantiation (parallel to
+    /// `next_ty_var` / `next_row_var`). Bound to a `Concrete(M)` at
+    /// the call site via `bind_scope_var`.
+    next_scope_var: u32,
+    /// Plan D Task 117 (b) — when walking a fn declaration's
+    /// signature (param + return TypeExprs), this carries the
+    /// signature's single scope_var id, allocated lazily on the
+    /// first `Continuation[op_ret, ret]` annotation encountered.
+    /// All Continuation annotations in the same signature share
+    /// the same Var (rank-1-per-fn discipline; matches
+    /// `effect_row_var`'s single-row-var-per-fn precedent). After
+    /// the signature walk completes, the allocated id (if any) is
+    /// pushed into `Scheme.scope_vars`. `None` outside fn-sig
+    /// walks; reset to `None` before each fn signature walk and
+    /// inspected after.
+    current_fn_scope_var: Option<u32>,
     /// Plan D Task 117 (continuation-surface) — current handler arm
     /// body's scope id, set during arm-body typecheck walks. When
     /// `Some(N)`, user-written `Continuation[op_ret, ret]` type
@@ -2418,12 +2546,22 @@ impl Tc {
     /// to the fn's freshly-allocated `Ty::Var`; outside generic
     /// scope this falls through to the empty-subst behavior.
     fn ty_from_type_expr_here(&self, t: &TypeExpr) -> Option<Ty> {
+        // Plan D Task 117 (b) — pick context: arm body (Concrete)
+        // takes precedence; otherwise fn-signature ctx (Var) when
+        // walking a fn decl's param/return TypeExpr; otherwise
+        // Reject (the user wrote `Continuation` somewhere it isn't
+        // valid; `check_type_expr_known` emits E0145).
+        let cont_ctx = match (self.current_arm_scope_id, self.current_fn_scope_var) {
+            (Some(n), _) => ContScopeCtx::Concrete(n),
+            (None, Some(v)) => ContScopeCtx::FnSigVar(v),
+            (None, None) => ContScopeCtx::Reject,
+        };
         ty_from_type_expr_with_rows(
             t,
             &self.types,
             &self.current_generic_subst,
             &self.current_row_var_subst,
-            self.current_arm_scope_id,
+            cont_ctx,
         )
     }
 
@@ -2452,6 +2590,24 @@ impl Tc {
         );
         let id = self.next_scope_id;
         self.next_scope_id += 1;
+        id
+    }
+
+    /// Plan D Task 117 (b) — allocate a fresh scope-variable id.
+    /// Used at fn-decl pre-pass (one fresh `ScopeId::Var(N)` per
+    /// signature that mentions `Continuation`) and at scheme
+    /// instantiation (call sites bind the scheme's quantified
+    /// `scope_vars` to fresh ids before unifying against the
+    /// caller's actual continuation). Mirrors `fresh_row_var`'s
+    /// allocation discipline.
+    fn fresh_scope_var(&mut self) -> u32 {
+        debug_assert!(
+            self.next_scope_var != u32::MAX,
+            "Tc::fresh_scope_var: u32 overflow — 4 billion scope vars in one typecheck \
+             pass is implausible; check for a leaked allocator loop"
+        );
+        let id = self.next_scope_var;
+        self.next_scope_var += 1;
         id
     }
 
@@ -2563,14 +2719,31 @@ impl Tc {
         for &id in &scheme.row_vars {
             row_map.insert(id, self.fresh_row_var());
         }
-        (Self::rename_ty(&scheme.body, &ty_map, &row_map), fresh_ids)
+        // Plan D Task 117 (b) — allocate fresh `ScopeId::Var(N)` per
+        // scheme.scope_vars entry. The fresh var binds to the
+        // caller's `Concrete(M)` at `check_call`'s arg-unify; the
+        // callee's body sees the `Var` (then `Concrete` after
+        // substitution).
+        let mut scope_map: BTreeMap<u32, u32> = BTreeMap::new();
+        for &id in &scheme.scope_vars {
+            scope_map.insert(id, self.fresh_scope_var());
+        }
+        (
+            Self::rename_ty(&scheme.body, &ty_map, &row_map, &scope_map),
+            fresh_ids,
+        )
     }
 
     /// Rename bound variables in a scheme body during instantiation.
     /// Replaces each bound id with its fresh allocation; free vars
     /// (already substituted-away or appearing through env capture)
     /// pass through unchanged.
-    fn rename_ty(t: &Ty, ty_map: &BTreeMap<u32, Ty>, row_map: &BTreeMap<u32, u32>) -> Ty {
+    fn rename_ty(
+        t: &Ty,
+        ty_map: &BTreeMap<u32, Ty>,
+        row_map: &BTreeMap<u32, u32>,
+        scope_map: &BTreeMap<u32, u32>,
+    ) -> Ty {
         match t {
             Ty::Int | Ty::String | Ty::Unit | Ty::Bool | Ty::Char | Ty::Byte => t.clone(),
             Ty::Var(id) => match ty_map.get(id) {
@@ -2580,13 +2753,13 @@ impl Tc {
             Ty::User(name, args) => Ty::User(
                 name.clone(),
                 args.iter()
-                    .map(|a| Self::rename_ty(a, ty_map, row_map))
+                    .map(|a| Self::rename_ty(a, ty_map, row_map, scope_map))
                     .collect(),
             ),
             Ty::Tuple(elems) => Ty::Tuple(
                 elems
                     .iter()
-                    .map(|e| Self::rename_ty(e, ty_map, row_map))
+                    .map(|e| Self::rename_ty(e, ty_map, row_map, scope_map))
                     .collect(),
             ),
             Ty::Fn(sig) => {
@@ -2594,9 +2767,9 @@ impl Tc {
                     params: sig
                         .params
                         .iter()
-                        .map(|p| Self::rename_ty(p, ty_map, row_map))
+                        .map(|p| Self::rename_ty(p, ty_map, row_map, scope_map))
                         .collect(),
-                    ret: Self::rename_ty(&sig.ret, ty_map, row_map),
+                    ret: Self::rename_ty(&sig.ret, ty_map, row_map, scope_map),
                     // Plan D Stage 12 — rename type-var ids inside
                     // each EffectInst's args. Without this, a
                     // generic fn whose row carries `Raise[E]`
@@ -2612,7 +2785,7 @@ impl Tc {
                             args: ei
                                 .args
                                 .iter()
-                                .map(|a| Self::rename_ty(a, ty_map, row_map))
+                                .map(|a| Self::rename_ty(a, ty_map, row_map, scope_map))
                                 .collect(),
                         })
                         .collect(),
@@ -2623,25 +2796,21 @@ impl Tc {
                 Ty::Fn(Box::new(new_sig))
             }
             Ty::Continuation(c) => {
-                // Plan D Task 117 (a) — only Concrete scope ids
-                // exist today (`check_handle` allocates them; no
-                // scheme stores a Var ScopeId). Pass Concrete
-                // through unchanged. Var would require region-
-                // polymorphism wiring (Task 117 follow-up) — assert
-                // here so the integration point surfaces loudly
-                // when scheme-bearing Var ScopeIds are introduced.
+                // Plan D Task 117 (b) — rename `ScopeId::Var(N)` via
+                // `scope_map`. Unbound Var stays Var (the body
+                // refers to a scope-var allocated outside this
+                // scheme, e.g. an outer fn's scope). Concrete is
+                // pass-through.
                 let scope_id = match &c.scope_id {
                     ScopeId::Concrete(n) => ScopeId::Concrete(*n),
-                    ScopeId::Var(_) => unreachable!(
-                        "rename_ty: ScopeId::Var reached scheme renaming — Task 117 (a) \
-                         produces only Concrete scope ids; region-polymorphic continuation \
-                         schemes are deferred to Task 117 follow-up which must wire ScopeId \
-                         renaming before allocating Var"
-                    ),
+                    ScopeId::Var(id) => match scope_map.get(id) {
+                        Some(fresh) => ScopeId::Var(*fresh),
+                        None => ScopeId::Var(*id),
+                    },
                 };
                 Ty::Continuation(Box::new(ContinuationTy {
-                    op_ret: Self::rename_ty(&c.op_ret, ty_map, row_map),
-                    ret: Self::rename_ty(&c.ret, ty_map, row_map),
+                    op_ret: Self::rename_ty(&c.op_ret, ty_map, row_map, scope_map),
+                    ret: Self::rename_ty(&c.ret, ty_map, row_map, scope_map),
                     scope_id,
                 }))
             }
@@ -2772,6 +2941,64 @@ impl Tc {
         true
     }
 
+    /// Plan D Task 117 (b) — bind a scope variable to a `ScopeId`.
+    /// Resolves `target` through the current substitution first
+    /// (so chained Var → Var → Concrete folds to a single binding).
+    /// Self-bind is no-op. Cross-binding to a different `Concrete`
+    /// is an E0145 (continuation from one handle bound to a
+    /// different handle's scope — should never happen because
+    /// `bind_ty_var` direction guarantees a fresh Var binds first;
+    /// but emit a clean diagnostic instead of panicking if it
+    /// somehow leaks). No occurs check — ScopeIds are flat tags.
+    fn bind_scope_var(&mut self, id: u32, target: ScopeId, span: &Span) -> bool {
+        let resolved = match &target {
+            ScopeId::Var(other) => match self.subst.scopes.get(other) {
+                Some(t) => t.clone(),
+                None => target.clone(),
+            },
+            ScopeId::Concrete(_) => target.clone(),
+        };
+        if let ScopeId::Var(other) = &resolved {
+            if *other == id {
+                return true;
+            }
+        }
+        if let Some(existing) = self.subst.scopes.get(&id).cloned() {
+            // Already bound — re-unify the existing binding against
+            // the new target so chained call-site binds compose.
+            return match (&existing, &resolved) {
+                (ScopeId::Concrete(n), ScopeId::Concrete(m)) if n == m => true,
+                (ScopeId::Concrete(n), ScopeId::Concrete(m)) => {
+                    self.push_error(
+                        "E0145",
+                        span.clone(),
+                        format!(
+                            "continuation scope variable resolves to handle scope {n} on one \
+                             side and {m} on the other — `k` cannot escape its originating \
+                             handle's arm body"
+                        ),
+                    );
+                    false
+                }
+                _ => {
+                    // Var-vs-Concrete or Var-vs-Var on the existing
+                    // binding: recurse via bind_scope_var on the
+                    // existing Var id (lower-id-canonical maintained
+                    // by the caller's higher → lower rule).
+                    if let ScopeId::Var(existing_id) = existing {
+                        self.bind_scope_var(existing_id, resolved, span)
+                    } else if let ScopeId::Var(other) = &resolved {
+                        self.bind_scope_var(*other, existing, span)
+                    } else {
+                        true
+                    }
+                }
+            };
+        }
+        self.subst.scopes.insert(id, resolved);
+        true
+    }
+
     /// Unify two types under the current substitution. Pushes E0044
     /// on shape mismatch. Returns `true` on success; `false` lets
     /// the caller skip downstream cascades while still emitting
@@ -2894,21 +3121,28 @@ impl Tc {
                             false
                         }
                     }
-                    // Plan D Task 117 (a) only produces Concrete
-                    // scope ids (`check_handle` calls
-                    // `Tc::fresh_scope_id()` which always returns
-                    // Concrete; no scheme-instantiation path or
-                    // surface syntax allocates Var). Reaching this
-                    // arm means a Var leaked into typecheck without
-                    // wiring the unification — assert to surface
-                    // the integration point loudly when region-
-                    // polymorphism work begins (Task 117 follow-up).
-                    (ScopeId::Var(_), _) | (_, ScopeId::Var(_)) => unreachable!(
-                        "ScopeId::Var reached unify_ty — Task 117 (a) produces only Concrete \
-                         scope ids; region-polymorphic continuation schemes are deferred to \
-                         Task 117 follow-up which must wire ScopeId unification before \
-                         allocating Var"
-                    ),
+                    // Plan D Task 117 (b) — scope-var unification.
+                    // Bind `Var(N)` to whichever side is more
+                    // resolved. Var-vs-Concrete writes the Concrete
+                    // into Subst.scopes; Var-vs-Var binds the
+                    // higher-id Var to the lower (canonical
+                    // direction, mirrors `bind_ty_var`'s direction
+                    // fix). Self-bind is no-op.
+                    (ScopeId::Var(n), ScopeId::Concrete(_)) => {
+                        self.bind_scope_var(*n, c_b.scope_id.clone(), span)
+                    }
+                    (ScopeId::Concrete(_), ScopeId::Var(m)) => {
+                        self.bind_scope_var(*m, c_a.scope_id.clone(), span)
+                    }
+                    (ScopeId::Var(n), ScopeId::Var(m)) => {
+                        if n == m {
+                            true
+                        } else {
+                            // Lower-id is canonical; bind higher → lower.
+                            let (lo, hi) = if n < m { (*n, *m) } else { (*m, *n) };
+                            self.bind_scope_var(hi, ScopeId::Var(lo), span)
+                        }
+                    }
                 };
                 let op_ret_ok = self.unify_ty(&c_a.op_ret, &c_b.op_ret, span);
                 let ret_ok = self.unify_ty(&c_a.ret, &c_b.ret, span);
@@ -3305,16 +3539,31 @@ impl Tc {
                         );
                         return;
                     }
-                    if self.current_arm_scope_id.is_none() {
+                    // Plan D Task 117 (b) — allowed in arm body
+                    // (resolves to Concrete) OR in fn-signature
+                    // position (resolves to a per-fn scope Var).
+                    // Anywhere else (let-binding outside an arm,
+                    // user-type field, effect-op signature) is
+                    // rejected — those positions would let `k`
+                    // escape its handle's dynamic extent without
+                    // a runtime ScopeId check (storage in heap
+                    // values requires the scope_id be tracked at
+                    // runtime through GC; out of v1 scope).
+                    if self.current_arm_scope_id.is_none()
+                        && self.current_fn_scope_var.is_none()
+                    {
                         self.push_error(
                             "E0145",
                             span.clone(),
                             "Continuation annotations are only valid inside a handler arm \
-                             body — `Continuation[op_ret, ret]` names the type of the \
-                             handler's `k` binding, which exists only within that arm's \
-                             dynamic extent. Move the annotation inside an arm body, or \
-                             remove it (the type isn't user-constructible outside arm \
-                             contexts)"
+                             body or a fn parameter / return type — `Continuation[op_ret, \
+                             ret]` either names the type of the handler's `k` binding \
+                             (arm body, resolves to a concrete handle scope) or describes \
+                             a fn that receives a continuation from its caller (fn \
+                             signature, resolves to a region-polymorphic scope variable \
+                             bound at the call site). Storage in user types / effect-op \
+                             signatures / let-bindings outside an arm is rejected (would \
+                             let `k` escape its handle's dynamic extent)"
                                 .to_string(),
                         );
                         return;
@@ -3867,6 +4116,18 @@ impl Tc {
             row_var_id = Some(id);
             self.current_row_var_subst.insert(rv.name.clone(), id);
         }
+        // Plan D Task 117 (b) — allocate a body-walk scope_var for
+        // any `Continuation` annotation in this fn's signature.
+        // Distinct from the pre-pass's scope_var (the pre-pass id
+        // lives in `Scheme.scope_vars`; recursive calls instantiate
+        // it as a fresh id and unify against this body-walk id).
+        // Mirrors the row-var allocation pattern.
+        let saved_fn_scope_var = self.current_fn_scope_var;
+        if fn_decl_signature_has_continuation(f) {
+            self.current_fn_scope_var = Some(self.fresh_scope_var());
+        } else {
+            self.current_fn_scope_var = None;
+        }
         self.env.clear();
         for p in &f.params {
             if let Some(ty) = self.ty_from_type_expr_here(&p.ty) {
@@ -3945,6 +4206,7 @@ impl Tc {
             let scheme = Scheme {
                 type_vars: ty_var_ids,
                 row_vars: row_var_id.into_iter().collect(),
+                scope_vars: Vec::new(),
                 body: resolved,
             };
             self.fn_schemes.insert(f.name.clone(), scheme);
@@ -3956,6 +4218,7 @@ impl Tc {
         // global counters but each scope binds its own surface names.
         self.current_generic_subst = saved_generic_subst;
         self.current_row_var_subst = saved_row_var_subst;
+        self.current_fn_scope_var = saved_fn_scope_var;
     }
 
     /// Typecheck a block and return its type.
@@ -6551,11 +6814,16 @@ pub(crate) fn ty_from_type_expr(
 ) -> Option<Ty> {
     let empty_rows: BTreeMap<String, u32> = BTreeMap::new();
     // External callers (non-Tc walks like builtin scheme registration)
-    // never appear inside a handler arm body, so `arm_scope_id` is
-    // None — any user `Continuation[op_ret, ret]` annotation reached
-    // via these paths returns None, and `check_type_expr_known`
-    // surfaces E0145 separately at the use site.
-    ty_from_type_expr_with_rows(t, types, generic_subst, &empty_rows, None)
+    // never appear inside a handler arm body or a fn-decl signature
+    // walk, so `Continuation` is rejected here — `check_type_expr_-
+    // known` surfaces E0145 separately at the use site.
+    ty_from_type_expr_with_rows(
+        t,
+        types,
+        generic_subst,
+        &empty_rows,
+        ContScopeCtx::Reject,
+    )
 }
 
 /// Plan D Task 116 — variant of `ty_from_type_expr` that threads a
@@ -6573,17 +6841,15 @@ pub(crate) fn ty_from_type_expr_with_rows(
     types: &BTreeMap<String, TypeDecl>,
     generic_subst: &BTreeMap<String, Ty>,
     row_var_subst: &BTreeMap<String, u32>,
-    // Plan D Task 117 (continuation-surface) — innermost enclosing
-    // handler arm body's scope_id, threaded from
-    // `Tc::ty_from_type_expr_here` via `Tc.current_arm_scope_id`.
-    // When `Some(N)`, user-written `Continuation[op_ret, ret]`
-    // annotations resolve to `Ty::Continuation { ..., scope_id:
-    // Concrete(N) }`. When `None`, returns `None` for the
-    // Continuation case — `check_type_expr_known` is the
-    // authoritative diagnostic site (pushes E0145 with the
-    // "Continuation annotations are only valid inside a handler
-    // arm body" message).
-    arm_scope_id: Option<u32>,
+    // Plan D Task 117 (b) — context for resolving `Continuation[
+    // op_ret, ret]` annotations. `Concrete(N)` (inside arm body)
+    // tags with `ScopeId::Concrete(N)`. `FnSigVar(V)` (inside fn
+    // signature) tags with `ScopeId::Var(V)` — the caller
+    // pre-allocated the Var and shares it across every Continuation
+    // annotation in the same signature (rank-1-per-fn discipline).
+    // `Reject` returns None for the Continuation case;
+    // `check_type_expr_known` is the diagnostic site for the E0145.
+    cont_ctx: ContScopeCtx,
 ) -> Option<Ty> {
     match t {
         TypeExpr::Named(name, _) => match name.as_str() {
@@ -6626,25 +6892,29 @@ pub(crate) fn ty_from_type_expr_with_rows(
                 if args.len() != 2 {
                     return None;
                 }
-                let scope_id = arm_scope_id?;
+                let scope_id = match cont_ctx {
+                    ContScopeCtx::Concrete(n) => ScopeId::Concrete(n),
+                    ContScopeCtx::FnSigVar(v) => ScopeId::Var(v),
+                    ContScopeCtx::Reject => return None,
+                };
                 let op_ret = ty_from_type_expr_with_rows(
                     &args[0],
                     types,
                     generic_subst,
                     row_var_subst,
-                    arm_scope_id,
+                    cont_ctx,
                 )?;
                 let ret = ty_from_type_expr_with_rows(
                     &args[1],
                     types,
                     generic_subst,
                     row_var_subst,
-                    arm_scope_id,
+                    cont_ctx,
                 )?;
                 return Some(Ty::Continuation(Box::new(ContinuationTy {
                     op_ret,
                     ret,
-                    scope_id: ScopeId::Concrete(scope_id),
+                    scope_id,
                 })));
             }
             // Primitives don't accept type arguments.
@@ -6673,7 +6943,7 @@ pub(crate) fn ty_from_type_expr_with_rows(
                     types,
                     generic_subst,
                     row_var_subst,
-                    arm_scope_id,
+                    cont_ctx,
                 )?);
             }
             Some(Ty::User(name.to_string(), resolved_args))
@@ -6701,7 +6971,7 @@ pub(crate) fn ty_from_type_expr_with_rows(
                     types,
                     generic_subst,
                     row_var_subst,
-                    arm_scope_id,
+                    cont_ctx,
                 )?);
             }
             let ret = ty_from_type_expr_with_rows(
@@ -6709,7 +6979,7 @@ pub(crate) fn ty_from_type_expr_with_rows(
                 types,
                 generic_subst,
                 row_var_subst,
-                arm_scope_id,
+                cont_ctx,
             )?;
             // Plan D Task 116 — resolve the inner fn-type's
             // `effect_row_var` (if any) by name through the supplied
@@ -6740,7 +7010,7 @@ pub(crate) fn ty_from_type_expr_with_rows(
                     types,
                     generic_subst,
                     row_var_subst,
-                    arm_scope_id,
+                    cont_ctx,
                 )?);
             }
             Some(Ty::Tuple(elem_tys))
@@ -10480,6 +10750,8 @@ mod tests {
             next_ty_var: 0,
             next_row_var: 0,
             next_scope_id: 0,
+            next_scope_var: 0,
+            current_fn_scope_var: None,
             current_arm_scope_id: None,
             subst: Subst::new(),
             current_generic_subst: BTreeMap::new(),

@@ -623,6 +623,19 @@ fn type_expr_uses_apply_or_param(
     params: &std::collections::BTreeSet<String>,
 ) -> bool {
     match t {
+        // Plan D Task 117 (b) — `Continuation[op_ret, ret]` Apply
+        // legitimately survives mono (it is a structural language
+        // type, not a user TypeDecl, and is not mangled into a
+        // Named); recurse into its args but don't reject the Apply
+        // itself.
+        TypeExpr::Apply { name, args, .. } if name == "Continuation" => {
+            for a in args {
+                if type_expr_uses_apply_or_param(a, params) {
+                    return true;
+                }
+            }
+            false
+        }
         TypeExpr::Apply { args, .. } => {
             // An Apply node is itself a hard reject; we still recurse
             // so a nested Apply or generic-param ref also surfaces in
@@ -896,6 +909,36 @@ pub(crate) fn collect_ctor_names(
     ctors
 }
 
+/// Plan D Task 117 (b) — pre-pass scan: build `callee_name → Vec<bool>`
+/// where the Vec entry at index `i` is `true` iff parameter `i` of the
+/// callee is annotated as `Continuation[op_ret, ret]`. Used by
+/// `arm_body_walk` to allow `helper(k, ...)` shapes where `k` flows
+/// into a fn parameter that explicitly accepts a continuation
+/// (recursive runtime-N dischargers like `fold_choices`); other
+/// k-as-arg sites continue to fire the escape-barrier diagnostic.
+pub(crate) fn collect_cont_param_callees(
+    program: &crate::ast::Program,
+) -> std::collections::BTreeMap<String, Vec<bool>> {
+    use crate::ast::{Item, TypeExpr};
+    fn type_expr_is_continuation(t: &TypeExpr) -> bool {
+        matches!(t, TypeExpr::Apply { name, .. } if name == "Continuation")
+            // Pre-mono surface uses TypeExpr::Apply; post-mono surface
+            // (after `rewrite_type_expr`) preserves Apply for
+            // Continuation specifically, so this single check covers
+            // both.
+    }
+    let mut out: std::collections::BTreeMap<String, Vec<bool>> = std::collections::BTreeMap::new();
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            let flags: Vec<bool> = f.params.iter().map(|p| type_expr_is_continuation(&p.ty)).collect();
+            if flags.iter().any(|&b| b) {
+                out.insert(f.name.clone(), flags);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Option<String> {
     use std::collections::{BTreeMap, BTreeSet};
     // Globals reachable as bare `Expr::Ident` from anywhere — used by
@@ -994,10 +1037,41 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     // Plan C Task 76 — Clock builtin.
     globals.insert("clock_os_now".to_string());
     let ctors: BTreeSet<String> = collect_ctor_names(program);
+    // Plan D Task 117 (b) — pre-pass map of user-fn param-Continuation
+    // flags. Consumed by `arm_body_walk`'s generic-call branch to
+    // allow `helper(k, ...)` shapes when the helper's signature
+    // declares a Continuation param at that arg index.
+    let cont_param_callees = collect_cont_param_callees(program);
+    // Plan D Task 117 (b) Phase 4 pending — typecheck now allows
+    // `Continuation[op_ret, ret]` as a fn parameter type (the lift
+    // makes runtime-N dischargers like `all_choices` /
+    // `first_choice` typecheck cleanly), but the codegen calling
+    // convention for fns receiving a continuation as a parameter
+    // has not yet shipped (the (k_closure, k_fn, frame_ptr) triple
+    // needs to flow through the user-fn ABI as 3 pointer slots
+    // instead of 1, with `lower_k_pair_call` dispatched on the
+    // param's bound triple). Until Phase 4 lands, surface a clean
+    // codegen-pre-pass diagnostic instead of letting the indirect-
+    // call lowering panic with `unreachable!`. Tracked at
+    // `[DEVIATION Task 73]` as the remaining v1 closure path.
+    if !cont_param_callees.is_empty() {
+        let names: Vec<&str> = cont_param_callees.keys().map(String::as_str).collect();
+        return Some(format!(
+            "fn(s) {names:?} declare a `Continuation[op_ret, ret]` parameter — \
+             typecheck accepts this surface (Plan D Task 117 (b) scope-id \
+             polymorphism), but the codegen calling convention for fns receiving \
+             a continuation as a parameter is not yet wired (the (k_closure, k_fn, \
+             frame_ptr) triple needs to flow as 3 pointer slots through the user-fn \
+             ABI instead of 1). Until Phase 4 lands, runtime-N dischargers like \
+             `all_choices` / `first_choice` over `Choose.choose(arg)` for arbitrary \
+             `arg` cannot be expressed via a recursive helper that takes `k` as a \
+             parameter. See `[DEVIATION Task 73]` for the closure path"
+        ));
+    }
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
             if let Some(msg) =
-                block_unsupported_handle(&f.body, &globals, &ctors, &effects_resumes_many)
+                block_unsupported_handle(&f.body, &globals, &ctors, &effects_resumes_many, &cont_param_callees)
             {
                 return Some(format!("in fn `{}`: {}", f.name, msg));
             }
@@ -1229,19 +1303,20 @@ fn block_unsupported_handle(
     globals: &std::collections::BTreeSet<String>,
     ctors: &std::collections::BTreeSet<String>,
     effects_resumes_many: &std::collections::BTreeMap<String, bool>,
+    cont_param_callees: &std::collections::BTreeMap<String, Vec<bool>>,
 ) -> Option<String> {
     use crate::ast::Stmt;
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
                 if let Some(msg) =
-                    expr_unsupported_handle(&l.value, globals, ctors, effects_resumes_many)
+                    expr_unsupported_handle(&l.value, globals, ctors, effects_resumes_many, cont_param_callees)
                 {
                     return Some(msg);
                 }
             }
             Stmt::Expr(e) => {
-                if let Some(msg) = expr_unsupported_handle(e, globals, ctors, effects_resumes_many)
+                if let Some(msg) = expr_unsupported_handle(e, globals, ctors, effects_resumes_many, cont_param_callees)
                 {
                     return Some(msg);
                 }
@@ -1249,7 +1324,7 @@ fn block_unsupported_handle(
             Stmt::Perform(p) => {
                 for a in &p.args {
                     if let Some(msg) =
-                        expr_unsupported_handle(a, globals, ctors, effects_resumes_many)
+                        expr_unsupported_handle(a, globals, ctors, effects_resumes_many, cont_param_callees)
                     {
                         return Some(msg);
                     }
@@ -1258,7 +1333,7 @@ fn block_unsupported_handle(
         }
     }
     if let Some(tail) = &b.tail {
-        if let Some(msg) = expr_unsupported_handle(tail, globals, ctors, effects_resumes_many) {
+        if let Some(msg) = expr_unsupported_handle(tail, globals, ctors, effects_resumes_many, cont_param_callees) {
             return Some(msg);
         }
     }
@@ -1270,6 +1345,7 @@ fn expr_unsupported_handle(
     globals: &std::collections::BTreeSet<String>,
     ctors: &std::collections::BTreeSet<String>,
     effects_resumes_many: &std::collections::BTreeMap<String, bool>,
+    cont_param_callees: &std::collections::BTreeMap<String, Vec<bool>>,
 ) -> Option<String> {
     use crate::ast::Expr;
     match e {
@@ -1280,32 +1356,32 @@ fn expr_unsupported_handle(
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => None,
         Expr::Binary { lhs, rhs, .. } => {
-            expr_unsupported_handle(lhs, globals, ctors, effects_resumes_many)
-                .or_else(|| expr_unsupported_handle(rhs, globals, ctors, effects_resumes_many))
+            expr_unsupported_handle(lhs, globals, ctors, effects_resumes_many, cont_param_callees)
+                .or_else(|| expr_unsupported_handle(rhs, globals, ctors, effects_resumes_many, cont_param_callees))
         }
         Expr::Unary { operand, .. } => {
-            expr_unsupported_handle(operand, globals, ctors, effects_resumes_many)
+            expr_unsupported_handle(operand, globals, ctors, effects_resumes_many, cont_param_callees)
         }
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => expr_unsupported_handle(cond, globals, ctors, effects_resumes_many)
-            .or_else(|| block_unsupported_handle(then_block, globals, ctors, effects_resumes_many))
-            .or_else(|| block_unsupported_handle(else_block, globals, ctors, effects_resumes_many)),
-        Expr::Block(b) => block_unsupported_handle(b, globals, ctors, effects_resumes_many),
+        } => expr_unsupported_handle(cond, globals, ctors, effects_resumes_many, cont_param_callees)
+            .or_else(|| block_unsupported_handle(then_block, globals, ctors, effects_resumes_many, cont_param_callees))
+            .or_else(|| block_unsupported_handle(else_block, globals, ctors, effects_resumes_many, cont_param_callees)),
+        Expr::Block(b) => block_unsupported_handle(b, globals, ctors, effects_resumes_many, cont_param_callees),
         Expr::Match {
             scrutinee, arms, ..
         } => {
             if let Some(msg) =
-                expr_unsupported_handle(scrutinee, globals, ctors, effects_resumes_many)
+                expr_unsupported_handle(scrutinee, globals, ctors, effects_resumes_many, cont_param_callees)
             {
                 return Some(msg);
             }
             for a in arms {
                 if let Some(msg) =
-                    expr_unsupported_handle(&a.body, globals, ctors, effects_resumes_many)
+                    expr_unsupported_handle(&a.body, globals, ctors, effects_resumes_many, cont_param_callees)
                 {
                     return Some(msg);
                 }
@@ -1313,12 +1389,12 @@ fn expr_unsupported_handle(
             None
         }
         Expr::Call { callee, args, .. } => {
-            if let Some(msg) = expr_unsupported_handle(callee, globals, ctors, effects_resumes_many)
+            if let Some(msg) = expr_unsupported_handle(callee, globals, ctors, effects_resumes_many, cont_param_callees)
             {
                 return Some(msg);
             }
             for a in args {
-                if let Some(msg) = expr_unsupported_handle(a, globals, ctors, effects_resumes_many)
+                if let Some(msg) = expr_unsupported_handle(a, globals, ctors, effects_resumes_many, cont_param_callees)
                 {
                     return Some(msg);
                 }
@@ -1327,11 +1403,11 @@ fn expr_unsupported_handle(
         }
         Expr::Perform(_) => None,
         Expr::Lambda { body, .. } => {
-            expr_unsupported_handle(body, globals, ctors, effects_resumes_many)
+            expr_unsupported_handle(body, globals, ctors, effects_resumes_many, cont_param_callees)
         }
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
-                if let Some(msg) = expr_unsupported_handle(ee, globals, ctors, effects_resumes_many)
+                if let Some(msg) = expr_unsupported_handle(ee, globals, ctors, effects_resumes_many, cont_param_callees)
                 {
                     return Some(msg);
                 }
@@ -1341,7 +1417,7 @@ fn expr_unsupported_handle(
         Expr::RecordLit { fields, .. } => {
             for f in fields {
                 if let Some(msg) =
-                    expr_unsupported_handle(&f.value, globals, ctors, effects_resumes_many)
+                    expr_unsupported_handle(&f.value, globals, ctors, effects_resumes_many, cont_param_callees)
                 {
                     return Some(msg);
                 }
@@ -1465,7 +1541,7 @@ fn expr_unsupported_handle(
             // to use any expression over its op-args + globals.
             for arm in op_arms.iter() {
                 if let Some(msg) =
-                    arm_body_unsupported_construct(arm, globals, ctors, effects_resumes_many)
+                    arm_body_unsupported_construct(arm, globals, ctors, effects_resumes_many, cont_param_callees)
                 {
                     return Some(format!(
                         "`handle` expression at {:?} has arm `{}.{}` body that {} \
@@ -1493,6 +1569,7 @@ fn expr_unsupported_handle(
                     &mut return_scopes,
                     "",
                     globals,
+                    cont_param_callees,
                     /* tail = */ false,
                 ) {
                     return Some(format!(
@@ -1509,14 +1586,14 @@ fn expr_unsupported_handle(
             // are never enforced — at runtime that can register arms
             // under the wrong effect_id and crash inside `sigil_perform`'s
             // handler-stack walk.
-            if let Some(msg) = expr_unsupported_handle(body, globals, ctors, effects_resumes_many) {
+            if let Some(msg) = expr_unsupported_handle(body, globals, ctors, effects_resumes_many, cont_param_callees) {
                 return Some(msg);
             }
             // Recurse into arm bodies so nested handles deeper in
             // the AST surface their own diagnostics.
             for arm in op_arms {
                 if let Some(msg) =
-                    expr_unsupported_handle(&arm.body, globals, ctors, effects_resumes_many)
+                    expr_unsupported_handle(&arm.body, globals, ctors, effects_resumes_many, cont_param_callees)
                 {
                     return Some(msg);
                 }
@@ -1527,7 +1604,7 @@ fn expr_unsupported_handle(
             // recursion above).
             if let Some(ra) = return_arm {
                 if let Some(msg) =
-                    expr_unsupported_handle(&ra.body, globals, ctors, effects_resumes_many)
+                    expr_unsupported_handle(&ra.body, globals, ctors, effects_resumes_many, cont_param_callees)
                 {
                     return Some(msg);
                 }
@@ -1536,7 +1613,7 @@ fn expr_unsupported_handle(
         }
         Expr::Tuple { elems, .. } => {
             for e in elems {
-                if let Some(msg) = expr_unsupported_handle(e, globals, ctors, effects_resumes_many)
+                if let Some(msg) = expr_unsupported_handle(e, globals, ctors, effects_resumes_many, cont_param_callees)
                 {
                     return Some(msg);
                 }
@@ -1572,6 +1649,7 @@ fn arm_body_unsupported_construct(
     globals: &std::collections::BTreeSet<String>,
     ctors: &std::collections::BTreeSet<String>,
     effects_resumes_many: &std::collections::BTreeMap<String, bool>,
+    cont_param_callees: &std::collections::BTreeMap<String, Vec<bool>>,
 ) -> Option<String> {
     use std::collections::BTreeSet;
     // Plan B Task 55, Phase 4e captures+ Slice C — multi-let arm
@@ -1759,7 +1837,7 @@ fn arm_body_unsupported_construct(
     // arm body IS the synthetic CPS fn's return value (wrapped in
     // `sigil_next_step_done` or `sigil_next_step_call` depending on
     // whether the tail is a captured-k invocation).
-    arm_body_walk(&arm.body, &mut scopes, &arm.k_name, globals, true)
+    arm_body_walk(&arm.body, &mut scopes, &arm.k_name, globals, cont_param_callees, true)
 }
 
 /// Plan B Task 55 (Phase 4d) — walks an arm body to surface the still-
@@ -1789,6 +1867,7 @@ fn arm_body_walk(
     scopes: &mut Vec<std::collections::BTreeSet<String>>,
     k_name: &str,
     globals: &std::collections::BTreeSet<String>,
+    cont_param_callees: &std::collections::BTreeMap<String, Vec<bool>>,
     tail: bool,
 ) -> Option<String> {
     use crate::ast::Expr;
@@ -1857,15 +1936,15 @@ fn arm_body_walk(
             // Phase 4d (codegen builds a per-arm closure record).
             None
         }
-        Expr::Binary { lhs, rhs, .. } => arm_body_walk(lhs, scopes, k_name, globals, false)
-            .or_else(|| arm_body_walk(rhs, scopes, k_name, globals, false)),
-        Expr::Unary { operand, .. } => arm_body_walk(operand, scopes, k_name, globals, false),
+        Expr::Binary { lhs, rhs, .. } => arm_body_walk(lhs, scopes, k_name, globals, cont_param_callees, false)
+            .or_else(|| arm_body_walk(rhs, scopes, k_name, globals, cont_param_callees, false)),
+        Expr::Unary { operand, .. } => arm_body_walk(operand, scopes, k_name, globals, cont_param_callees, false),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => arm_body_walk(cond, scopes, k_name, globals, false)
+        } => arm_body_walk(cond, scopes, k_name, globals, cont_param_callees, false)
             // Plan D Task 118 — `If` then/else branches propagate
             // `tail` into branch tails so the branched-routing path
             // (`lower_arm_body_to_next_step`) handles k-calls inside
@@ -1877,9 +1956,9 @@ fn arm_body_walk(
             // for branched-k). Post-Task-118 codegen routes through
             // `lower_arm_body_to_next_step` when
             // `arm_body_needs_branched_routing` fires.
-            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, tail))
-            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, tail)),
-        Expr::Block(b) => arm_body_walk_block(b, scopes, k_name, globals, tail),
+            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, cont_param_callees, tail))
+            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, cont_param_callees, tail)),
+        Expr::Block(b) => arm_body_walk_block(b, scopes, k_name, globals, cont_param_callees, tail),
         Expr::Match {
             scrutinee, arms, ..
         } => {
@@ -1891,8 +1970,8 @@ fn arm_body_walk(
             // walker which would reject k-as-callee in non-tail). Other
             // scrutinee shapes walk in non-tail context as before.
             let scrut_diag = match (tail, match_k_call_arg(scrutinee, k_name)) {
-                (true, Some(arg_expr)) => arm_body_walk(arg_expr, scopes, k_name, globals, false),
-                _ => arm_body_walk(scrutinee, scopes, k_name, globals, false),
+                (true, Some(arg_expr)) => arm_body_walk(arg_expr, scopes, k_name, globals, cont_param_callees, false),
+                _ => arm_body_walk(scrutinee, scopes, k_name, globals, cont_param_callees, false),
             };
             if let Some(r) = scrut_diag {
                 return Some(r);
@@ -1905,7 +1984,7 @@ fn arm_body_walk(
                 // Plan D Task 118 — Match arm bodies propagate `tail`
                 // so the branched-routing path handles k-calls in
                 // each arm. See the Expr::If site for the rationale.
-                let r = arm_body_walk(&a.body, scopes, k_name, globals, tail);
+                let r = arm_body_walk(&a.body, scopes, k_name, globals, cont_param_callees, tail);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -1948,15 +2027,34 @@ fn arm_body_walk(
                     // contain disallowed shapes; outer-scope captures
                     // in the arg are allowed under Phase 4d's normal
                     // capture path).
-                    return arm_body_walk(&args[0], scopes, k_name, globals, false);
+                    return arm_body_walk(&args[0], scopes, k_name, globals, cont_param_callees, false);
                 }
             }
             // Generic call. Callee + args are non-tail.
-            if let Some(r) = arm_body_walk(callee, scopes, k_name, globals, false) {
+            //
+            // Plan D Task 117 (b) — when the callee is a known user
+            // fn that declares a `Continuation` parameter at index
+            // i, allow `args[i] == Ident(k_name)` to pass through
+            // without firing the bare-k escape diagnostic. Typecheck
+            // already validated that k's `Ty::Continuation` unifies
+            // with the callee's `Continuation[op_ret, ret]` param;
+            // the runtime ScopeId check on the eventual k-call site
+            // is the load-bearing soundness path. Other arg slots
+            // (and other shapes of the k-flowing arg) walk normally.
+            let cont_flags: Option<&Vec<bool>> = match callee.as_ref() {
+                Expr::Ident(callee_name, _) => cont_param_callees.get(callee_name),
+                _ => None,
+            };
+            if let Some(r) = arm_body_walk(callee, scopes, k_name, globals, cont_param_callees, false) {
                 return Some(r);
             }
-            for a in args {
-                if let Some(r) = arm_body_walk(a, scopes, k_name, globals, false) {
+            for (i, a) in args.iter().enumerate() {
+                let is_k_arg_to_cont_param = matches!(a, Expr::Ident(name, _) if name == k_name)
+                    && cont_flags.map_or(false, |flags| flags.get(i).copied().unwrap_or(false));
+                if is_k_arg_to_cont_param {
+                    continue;
+                }
+                if let Some(r) = arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false) {
                     return Some(r);
                 }
             }
@@ -1964,7 +2062,7 @@ fn arm_body_walk(
         }
         Expr::Perform(p) => {
             for a in &p.args {
-                if let Some(r) = arm_body_walk(a, scopes, k_name, globals, false) {
+                if let Some(r) = arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false) {
                     return Some(r);
                 }
             }
@@ -2002,7 +2100,7 @@ fn arm_body_walk(
             // Recurse into env_exprs so nested-shape violations (e.g.,
             // an Apply inside an env-expr's value) still surface.
             for env_expr in env_exprs {
-                if let Some(r) = arm_body_walk(env_expr, scopes, k_name, globals, false) {
+                if let Some(r) = arm_body_walk(env_expr, scopes, k_name, globals, cont_param_callees, false) {
                     return Some(r);
                 }
             }
@@ -2010,7 +2108,7 @@ fn arm_body_walk(
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                if let Some(r) = arm_body_walk(&f.value, scopes, k_name, globals, false) {
+                if let Some(r) = arm_body_walk(&f.value, scopes, k_name, globals, cont_param_callees, false) {
                     return Some(r);
                 }
             }
@@ -2036,7 +2134,7 @@ fn arm_body_walk(
             // body's value); tail position only re-enters at the
             // nested arm bodies if the nested handle expression is
             // itself in this arm's tail position.
-            if let Some(r) = arm_body_walk(inner_body, scopes, k_name, globals, false) {
+            if let Some(r) = arm_body_walk(inner_body, scopes, k_name, globals, cont_param_callees, false) {
                 return Some(r);
             }
             for inner_arm in inner_op_arms {
@@ -2055,7 +2153,7 @@ fn arm_body_walk(
                 // Inner arm body's tail position is independent of
                 // the outer arm's tail (the inner CPS arm fn wraps
                 // its own tail expression).
-                let r = arm_body_walk(&inner_arm.body, scopes, &inner_arm.k_name, globals, true);
+                let r = arm_body_walk(&inner_arm.body, scopes, &inner_arm.k_name, globals, cont_param_callees, true);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -2066,7 +2164,7 @@ fn arm_body_walk(
                     std::collections::BTreeSet::new();
                 ra_scope.insert(ra.binding.clone());
                 scopes.push(ra_scope);
-                let r = arm_body_walk(&ra.body, scopes, k_name, globals, false);
+                let r = arm_body_walk(&ra.body, scopes, k_name, globals, cont_param_callees, false);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -2076,7 +2174,7 @@ fn arm_body_walk(
         }
         Expr::Tuple { elems, .. } => {
             for el in elems {
-                if let Some(r) = arm_body_walk(el, scopes, k_name, globals, false) {
+                if let Some(r) = arm_body_walk(el, scopes, k_name, globals, cont_param_callees, false) {
                     return Some(r);
                 }
             }
@@ -2090,6 +2188,7 @@ fn arm_body_walk_block(
     scopes: &mut Vec<std::collections::BTreeSet<String>>,
     k_name: &str,
     globals: &std::collections::BTreeSet<String>,
+    cont_param_callees: &std::collections::BTreeMap<String, Vec<bool>>,
     tail: bool,
 ) -> Option<String> {
     use crate::ast::Stmt;
@@ -2108,7 +2207,7 @@ fn arm_body_walk_block(
         match s {
             Stmt::Let(l) => {
                 scopes.push(local.clone());
-                let r = arm_body_walk(&l.value, scopes, k_name, globals, false);
+                let r = arm_body_walk(&l.value, scopes, k_name, globals, cont_param_callees, false);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -2117,7 +2216,7 @@ fn arm_body_walk_block(
             }
             Stmt::Expr(e) => {
                 scopes.push(local.clone());
-                let r = arm_body_walk(e, scopes, k_name, globals, false);
+                let r = arm_body_walk(e, scopes, k_name, globals, cont_param_callees, false);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -2127,7 +2226,7 @@ fn arm_body_walk_block(
                 scopes.push(local.clone());
                 let mut found = None;
                 for a in &p.args {
-                    if let Some(r) = arm_body_walk(a, scopes, k_name, globals, false) {
+                    if let Some(r) = arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false) {
                         found = Some(r);
                         break;
                     }
@@ -2141,7 +2240,7 @@ fn arm_body_walk_block(
     }
     if let Some(tail_expr) = &b.tail {
         scopes.push(local);
-        let r = arm_body_walk(tail_expr, scopes, k_name, globals, tail);
+        let r = arm_body_walk(tail_expr, scopes, k_name, globals, cont_param_callees, tail);
         scopes.pop();
         return r;
     }
@@ -24914,7 +25013,7 @@ mod tests {
         let mut effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
         effects_resumes_many.insert("Choose".to_string(), true);
         let ctors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many);
+        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many, &std::collections::BTreeMap::new());
         assert!(
             result.is_none(),
             "expected None (accept) for 3-let arm body of resumes:many effect; \
@@ -24971,7 +25070,7 @@ mod tests {
         let globals: BTreeSet<String> = BTreeSet::new();
         let ctors: BTreeSet<String> = BTreeSet::new();
         let effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
-        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many);
+        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many, &std::collections::BTreeMap::new());
         assert!(
             result.is_none(),
             "Task 118 post-lift: walker must accept conditional-k-inside-if \
