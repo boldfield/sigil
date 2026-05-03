@@ -130,6 +130,26 @@ closeout (or earlier if scope permits bundling).
   the future-fragility note (unreachability is mechanism-by-coincidence
   on current shape rigidity; relaxing let-RHS shape constraints would
   require re-evaluation).
+- Task 112d — Pattern C: recursive perform-bearing helper with conditional
+  base case under discharge-with-lambda. Status: **DONE** (2026-05-03,
+  shipped in this PR alongside Task 112-mutually-recursive). Closes a
+  silent-garbage failure mode the structural-unreachability analysis
+  surfaced: the chained-let-yield rigidity that ruled out mutual recursion
+  ALSO ruled out idiomatic recursive perform-bearing helpers
+  (`fn helper(n) { let _ = perform; if n == 0 { 0 } else { helper(n-1) } }`).
+  These helpers fell back to Sync ABI; Sync ABI's lower_call Cps branch
+  SAVE+CLEAR+RESTOREs BODY_RETURN_ARM_STACK around its nested run_loop —
+  bypassing the lambda chain. Empirically verified: pre-fix produced
+  initial state instead of last set value; post-fix produces correct
+  state-threading behavior. Mechanism: new classifier
+  `is_let_yield_prefix_then_branched_cps_tail_body` recognises the body
+  shape and routes through the existing chain step machinery; Final
+  synth-cont's tail emit detects branched-cps shape and dispatches per-
+  leaf (pure → gate; Cps-call → NextStep::Call with caller_k_pair
+  forwarded). 3 e2e tests:
+  `task_112d_recursive_perform_helper_state_threading_returns_101`
+  (canonical), `_normal_resume_returns_99` (sanity), and
+  `_called_from_chained_let_yield_body_returns_101` (composition).
 - Task 111 disposition — TLS → packed multi-return for `sigil_run_loop`
   terminal. Status: **next pickup**. Three prior implementation attempts
   (PR #50) failed; either 4th lift attempt OR explicit close as v1-known-

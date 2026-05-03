@@ -7893,6 +7893,201 @@ fn task_112c_case_d_three_layer_wrapper_chain_with_slice_b_outer_arm_returns_11(
     );
 }
 
+/// Plan D Task 112d — Pattern C: recursive perform-bearing helper
+/// with conditional base case under discharge-with-lambda handler.
+///
+/// **Pre-fix (this PR's anchor case).** Body shape
+///   `{ let _ = perform; if cond { pure } else { helper(...) } }`
+/// fails the chained-let-yield classifier (recursive call non-pure →
+/// If tail non-pure → reject) and falls back to Sync ABI. Under
+/// discharge-with-lambda handlers, Sync ABI's `lower_call` Cps branch
+/// SAVE+CLEAR+RESTOREs `BODY_RETURN_ARM_STACK` around its nested
+/// run_loop — bypassing the lambda chain. State threading silently
+/// breaks: the program produces the INITIAL state instead of the last
+/// set value. Empirically verified before the fix: this exact source
+/// produced `"0\n"` instead of `"101\n"`.
+///
+/// **Post-fix.** New classifier
+/// `is_let_yield_prefix_then_branched_cps_tail_body` recognises the
+/// shape; helper is now Cps ABI. Final synth-cont's tail emit detects
+/// branched-cps tail (Expr::If OR if-desugared Expr::Match with
+/// BoolLit patterns) and emits per-branch dispatch:
+/// - Pure leaf: jumps to `gate_entry_block` with widened tail value;
+///   the existing 3-branch gate dispatches via caller_k_pair (top-
+///   level identity → Done; wrapper-in-chain → caller chain step).
+/// - Cps-call leaf: emits `NextStep::Call(callee, args +
+///   caller_k_pair_forwarded, N+2)` and `return_`. Recursion threads
+///   caller_k_pair through every level → chain composes through the
+///   recursion → state-threading works.
+///
+/// **Trace** (helper(3) under run_state(0, comp)):
+/// - helper(3) called by comp's chain step. caller_k_pair =
+///   comp_step_0_pair.
+/// - helper's chain step 0 (Final) post-perform: tail is If/Match
+///   with cond `n == 1`. n=3 → cond false → recurse helper(2).
+///   Emits NextStep::Call(helper, [2, comp_step_0_pair], 3).
+/// - helper(2) called with caller_k_pair = comp_step_0_pair.
+///   ... recurses helper(1).
+/// - helper(1) Final: cond true → pure leaf 99. Jumps to
+///   gate_entry with widened_tail=99. Gate sees caller_k_fn !=
+///   identity → wrapper_forward → dispatches comp_step_0 with [99,
+///   post_arm_k_pair_forwarded].
+/// - State after helper recursion: S.set(103), S.set(102), S.set(101).
+///   Last state = 101.
+/// - comp_step_0 binds _y=99. comp's next step (perform S.get).
+///   Returns 101 (last state).
+/// - comp's tail = v = 101. comp's Final → top_level → Done(101) →
+///   return arm wraps with state-fn lambda → state_fn(0)=101.
+#[test]
+fn task_112d_recursive_perform_helper_state_threading_returns_101() {
+    let src = "import std.io\n\
+               \n\
+               effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               \n\
+               fn helper(n: Int) -> Int ![S] {\n  \
+                 let _x: Int = perform S.set(n + 100);\n  \
+                 if n == 1 { 99 } else { helper(n - 1) }\n\
+               }\n\
+               \n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               fn comp() -> Int ![S] {\n  \
+                 let _y: Int = helper(3);\n  \
+                 let v: Int = perform S.get();\n  \
+                 v\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112d_recursive_helper");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "101\n",
+        "Task 112d Pattern C: recursive perform-bearing helper with \
+         conditional base case under discharge-with-lambda. helper(3) \
+         → S.set(103) → recurse helper(2) → S.set(102) → recurse \
+         helper(1) → S.set(101), pure leaf 99. State threads correctly \
+         to 101 (last set). Wrong outputs (e.g., 0) surface a Pattern C \
+         classifier or Final emit regression. stderr={stderr:?}"
+    );
+}
+
+/// Plan D Task 112d sister test — Pattern C under normal-resume handler.
+/// Sanity check that the recursion works correctly under simple
+/// `Eff.op(k) => k(arg)` handlers (no state-threading lambda chain).
+/// The recursive helper returns its base-case value via the chain.
+///
+/// Trace: helper(3) → trace(103), recurse helper(2), trace(102),
+/// recurse helper(1), trace(101), pure leaf 99. helper returns 99.
+#[test]
+fn task_112d_recursive_perform_helper_normal_resume_returns_99() {
+    let src = "import std.io\n\
+               \n\
+               effect E { trace: (Int) -> Int }\n\
+               \n\
+               fn helper(n: Int) -> Int ![E] {\n  \
+                 let _x: Int = perform E.trace(n + 100);\n  \
+                 if n == 1 { 99 } else { helper(n - 1) }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle helper(3) with {\n    \
+                   E.trace(arg, k) => k(arg),\n    \
+                   return(v) => v,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112d_recursive_helper_normal_resume");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n",
+        "Task 112d Pattern C under normal-resume: helper(3) recurses \
+         through trace effect to base case helper(1) which returns 99. \
+         Pure leaf flows back through the chain via caller_k_pair. \
+         stderr={stderr:?}"
+    );
+}
+
+/// Plan D Task 112d sister test — Pattern C as a wrapper called from
+/// another chained-let-yield body. Verifies the composition path:
+/// caller_k_pair forwards from the OUTER chain (comp's chain step) into
+/// the recursive helper, threads through every recursion level, and
+/// returns to comp's chain step at the base case.
+///
+/// Trace: comp's body `let _y = helper(3); let v = perform S.get; v`.
+/// helper(3) called as a wrapper-Call let-RHS. helper's chain forwards
+/// caller_k_pair = comp_step_0_pair through helper(3), helper(2),
+/// helper(1). At helper(1) base case (pure leaf 99), gate fires
+/// wrapper_forward → dispatches comp_step_0 with helper's tail=99.
+/// comp_step_0 binds _y=99, runs comp's next step (perform S.get),
+/// returns last state = 101. comp's tail = v = 101.
+#[test]
+fn task_112d_recursive_helper_called_from_chained_let_yield_body_returns_101() {
+    // Same expected behavior as `task_112d_recursive_perform_helper_state_threading_returns_101`
+    // but pinned as a separate test because the COMPOSITION path is
+    // what's being exercised: comp is chained-let-yield with helper as
+    // a wrapper-Call let-RHS. Without the new classifier accepting
+    // helper as a supported wrapper, comp would fall back to Sync ABI
+    // and the whole thing would silently break.
+    let src = "import std.io\n\
+               \n\
+               effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               \n\
+               fn helper(n: Int) -> Int ![S] {\n  \
+                 let _x: Int = perform S.set(n + 100);\n  \
+                 if n == 1 { 99 } else { helper(n - 1) }\n\
+               }\n\
+               \n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               fn comp() -> Int ![S] {\n  \
+                 let _a: Int = perform S.set(50);\n  \
+                 let _b: Int = helper(3);\n  \
+                 let v: Int = perform S.get();\n  \
+                 v\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112d_recursive_helper_in_chained_body");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "101\n",
+        "Task 112d Pattern C composition: comp's chain calls helper as \
+         wrapper-Call let-RHS. caller_k_pair forwards from comp's chain \
+         through helper's recursion. Last state = 101 (helper's S.set(101) \
+         at base case). Wrong outputs surface composition path \
+         regressions. stderr={stderr:?}"
+    );
+}
+
 /// Plan D Task 112-mutually-recursive — empirical demonstration of
 /// structural unreachability.
 ///
