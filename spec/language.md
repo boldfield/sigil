@@ -797,12 +797,13 @@ documented here as a closure log for the v1 → v2 transition:
   enclosing fn's `effect_row_var`; E0137 narrowed to fire only on
   unbound row vars.
 
-Each limit's Plan-D-shipped closure links to its corresponding
-`[DEVIATION Task NN]` entry in
-[`PLAN_D_DEVIATIONS.md`](../PLAN_D_DEVIATIONS.md). The remaining
-non-Plan-D survivors link to entries in
-[`PLAN_C_DEVIATIONS.md`](../PLAN_C_DEVIATIONS.md) with their
-respective closure scheduling.
+Each Plan-D-shipped closure cross-references its `[DEVIATION
+Task NN]` entry by task number in
+[`PLAN_D_DEVIATIONS.md`](../PLAN_D_DEVIATIONS.md); the non-Plan-D
+survivors live as named entries in
+[`PLAN_C_DEVIATIONS.md`](../PLAN_C_DEVIATIONS.md). Reader's grep
+target: search by `[DEVIATION Task <N>]` for any task number cited
+above.
 
 ### §15 — Build and run
 
