@@ -7531,6 +7531,108 @@ fn task_112b_chained_let_yield_wrapper_state_threading_returns_21() {
     );
 }
 
+/// Plan D Task 112b sister test — chained-let-yield Cps wrapper
+/// returning a NON-UNIT value used as the binding in a downstream
+/// outer chain step. Pins that the (2c) runtime gate's caller_k_pair
+/// dispatch correctly threads the wrapper's tail value through the
+/// caller's binding; the value MUST NOT be discarded.
+///
+/// `double_set_returning(10, 20)` returns `30` (= 10 + 20). The
+/// wrapper's tail `30` is dispatched via caller_k_pair to comp's
+/// step_0 synth-cont, which binds `r = 30`. Then `perform S.get`
+/// yields `20` (last-set state). Tail `v + r = 20 + 30 = 50`.
+#[test]
+fn task_112b_chained_let_yield_wrapper_binding_uses_returned_value_returns_50() {
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               fn double_set_returning(a: Int, b: Int) -> Int ![S] {\n  \
+                 let _a: Int = perform S.set(a);\n  \
+                 let _b: Int = perform S.set(b);\n  \
+                 a + b\n\
+               }\n\
+               fn comp() -> Int ![S] {\n  \
+                 let r: Int = double_set_returning(10, 20);\n  \
+                 let v: Int = perform S.get();\n  \
+                 v + r\n\
+               }\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112b_chained_wrapper_binding_uses_r");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "50\n",
+        "Task 112b binding-uses-r: chained-let-yield Cps wrapper's tail \
+         value (a+b=30) routed via caller_k_pair to comp's step_0 \
+         synth-cont as `r=30`; comp continues with perform S.get → \
+         20 (last-set state); tail v+r = 50. stderr={stderr:?}"
+    );
+}
+
+/// Plan D Task 112b sister test — chain length 3 in the chained-let-
+/// yield wrapper. Pins that caller_k_pair propagates correctly
+/// through MULTIPLE Middle-step closure-record copies (a 3-step
+/// chain has 2 Middle steps each copying caller_k_pair from this
+/// synth-cont's record into the next).
+///
+/// `triple_set(1, 2, 3)` performs three S.set calls in sequence.
+/// Wrapper tail = 0, dispatched via caller_k_pair to comp's
+/// step_0 (binds `_x = 0`); then comp's `perform S.get` yields the
+/// last-set state (3). Tail = 3.
+#[test]
+fn task_112b_chained_let_yield_wrapper_chain_length_3_returns_3() {
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               fn triple_set(a: Int, b: Int, c: Int) -> Int ![S] {\n  \
+                 let _a: Int = perform S.set(a);\n  \
+                 let _b: Int = perform S.set(b);\n  \
+                 let _c: Int = perform S.set(c);\n  \
+                 0\n\
+               }\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _x: Int = triple_set(1, 2, 3);\n  \
+                 let v: Int = perform S.get();\n  \
+                 v\n\
+               }\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "task_112b_chained_wrapper_chain_3");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3\n",
+        "Task 112b chain-length-3: triple_set's chain has 2 Middle \
+         steps (each copying caller_k_pair into the next step's \
+         closure record) + 1 Final dispatching via caller_k_pair. \
+         Last S.set value (3) becomes state; comp's perform S.get \
+         returns 3; tail = v = 3. stderr={stderr:?}"
+    );
+}
+
 /// Plan D Task 112 sister test — multi-let chain with wrappers.
 /// Three sequential `set_state` calls thread 1, 2, 3 in turn; final
 /// `get_state` reads back 3. Pins the chain-length-3+ branch of
