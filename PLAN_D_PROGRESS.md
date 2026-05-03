@@ -113,18 +113,47 @@ closeout (or earlier if scope permits bundling).
 **Active sequence (in flight):**
 
 - Task 112c — Case D fix (caller_k_fn-first gate + post_arm_k forwarding).
-  Status: **PR #86 in flight**. Closes the wrapper-in-chain + Slice B outer
-  arm intersection that PR #85 tracked via `#[ignore]`'d sister test.
+  Status: **DONE** — PR #86 merged at sigil/main `bc12950`. Closes the
+  wrapper-in-chain + Slice B outer arm intersection that PR #85 tracked
+  via `#[ignore]`'d sister test.
 - Task 112-mutually-recursive — Cps cycle handling under discharge-with-
-  lambda. Status: **next pickup after PR #86 merges**. Visited-set bails to
-  false on cycles → Sync ABI fallback re-exhibits original Task 112 silent-
-  garbage failure for state-threading handlers calling mutually-recursive
-  Cps fns. Architectural read needed: runtime depth-tracking vs different
-  cycle disposition vs ship-as-v1-limit-with-clear-error-message.
+  lambda. Status: **CLOSED BY ANALYSIS** (2026-05-03). Architectural read
+  established the cycle case is structurally unreachable in any terminating
+  Sigil program: chained-let-yield body shape forbids let-RHS conditionals,
+  mutual recursion via unconditional let-RHS Calls is structurally non-
+  terminating regardless of classifier output. Empirical confirmation via
+  `task_112_mutually_recursive_chained_wrappers_stack_overflow_not_silent_garbage`:
+  compiles successfully, runs to SIGSEGV before reaching any state where
+  discharge-with-lambda lambda chain matters. No silent-garbage failure
+  mode is reachable. Visited-set's bail-to-false is correct as-is. See
+  `is_supported_cps_user_fn`'s docstring for the structural argument and
+  the future-fragility note (unreachability is mechanism-by-coincidence
+  on current shape rigidity; relaxing let-RHS shape constraints would
+  require re-evaluation).
+- Task 112d — Pattern C: recursive perform-bearing helper with conditional
+  base case under discharge-with-lambda. Status: **DONE** (2026-05-03,
+  shipped in this PR alongside Task 112-mutually-recursive). Closes a
+  silent-garbage failure mode the structural-unreachability analysis
+  surfaced: the chained-let-yield rigidity that ruled out mutual recursion
+  ALSO ruled out idiomatic recursive perform-bearing helpers
+  (`fn helper(n) { let _ = perform; if n == 0 { 0 } else { helper(n-1) } }`).
+  These helpers fell back to Sync ABI; Sync ABI's lower_call Cps branch
+  SAVE+CLEAR+RESTOREs BODY_RETURN_ARM_STACK around its nested run_loop —
+  bypassing the lambda chain. Empirically verified: pre-fix produced
+  initial state instead of last set value; post-fix produces correct
+  state-threading behavior. Mechanism: new classifier
+  `is_let_yield_prefix_then_branched_cps_tail_body` recognises the body
+  shape and routes through the existing chain step machinery; Final
+  synth-cont's tail emit detects branched-cps shape and dispatches per-
+  leaf (pure → gate; Cps-call → NextStep::Call with caller_k_pair
+  forwarded). 3 e2e tests:
+  `task_112d_recursive_perform_helper_state_threading_returns_101`
+  (canonical), `_normal_resume_returns_99` (sanity), and
+  `_called_from_chained_let_yield_body_returns_101` (composition).
 - Task 111 disposition — TLS → packed multi-return for `sigil_run_loop`
-  terminal. Status: **third in active sequence**. Three prior implementation
-  attempts (PR #50) failed; either 4th lift attempt OR explicit close as
-  v1-known-limit with successor plan named in spec §14.
+  terminal. Status: **next pickup**. Three prior implementation attempts
+  (PR #50) failed; either 4th lift attempt OR explicit close as v1-known-
+  limit with successor plan named in spec §14.
 
 **Post-Plan-D-closeout follow-ups (named, not floating):**
 

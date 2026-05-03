@@ -343,6 +343,69 @@ fn compute_user_fn_abi(
         }
         // K + N + 1 >= MAX_CLOSURE_ENV_SLOTS — fall through to Sync.
     }
+    // Plan D Task 112d — Pattern C: let-yield-prefix + If-tail with
+    // pure-or-Cps-call branches (recursive perform-bearing helper).
+    // Reuses the same chain step machinery as chained-let-yield; the
+    // only difference is the Final synth-cont's tail emit (branched
+    // routing per leaf instead of `lower_expr + gate`). See
+    // `is_let_yield_prefix_then_branched_cps_tail_body`'s docstring for
+    // the architectural argument.
+    let is_cps_user_fn_lookup = |name: &str| colored.needs_cps_transform(name);
+    if let Some(chain_length) = is_let_yield_prefix_then_branched_cps_tail_body(
+        body,
+        &ctors,
+        &lookup,
+        &is_cps_user_fn_lookup,
+    ) {
+        let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
+        let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
+        for stmt in &body.stmts {
+            let let_stmt = match stmt {
+                crate::ast::Stmt::Let(l) => l,
+                _ => unreachable!(
+                    "is_let_yield_prefix_then_branched_cps_tail_body classifier \
+                     guarantees every stmt is Stmt::Let"
+                ),
+            };
+            match &let_stmt.value {
+                crate::ast::Expr::Perform(p) => {
+                    steps.push(ChainedNextStep::Perform(p.clone()));
+                    binding_names.push(let_stmt.name.clone());
+                }
+                crate::ast::Expr::Call { callee, args, .. } => {
+                    let callee_name = match callee.as_ref() {
+                        crate::ast::Expr::Ident(n, _) => n.clone(),
+                        _ => unreachable!(
+                            "is_let_yield_prefix_then_branched_cps_tail_body classifier \
+                             guarantees Call callee is Expr::Ident"
+                        ),
+                    };
+                    steps.push(ChainedNextStep::CallCps {
+                        callee_name,
+                        args: args.clone(),
+                    });
+                    binding_names.push(let_stmt.name.clone());
+                }
+                _ => unreachable!(
+                    "is_let_yield_prefix_then_branched_cps_tail_body classifier \
+                     guarantees Let value is Expr::Perform or Expr::Call"
+                ),
+            }
+        }
+        let tail_expr = match body.tail.as_ref() {
+            Some(t) => t,
+            None => unreachable!(
+                "is_let_yield_prefix_then_branched_cps_tail_body classifier \
+                 guarantees tail is Some"
+            ),
+        };
+        let captures =
+            collect_chained_synth_cont_captures(&steps, tail_expr, &binding_names, helper_params);
+        if captures.len() + chain_length + 1 < MAX_CLOSURE_ENV_SLOTS {
+            return UserFnAbi::Cps;
+        }
+        // Cap exceeded — fall through to Sync.
+    }
     // Plan B Task 78.5 G4 Phase B.1 — compound `Expr::Match`-as-body-tail
     // shape. Body is `match scrut { ... }` where at least one arm body has
     // a `let _ = perform p; tail_expr` (or bare `Stmt::Perform; tail_expr`)
@@ -7605,10 +7668,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // above) and the shared `is_supported_cps_user_fn`
                     // helper (accepts both tail-perform and chained-
                     // let-yield Cps wrappers).
+                    //
+                    // Plan D Task 112d — ALSO accept Pattern C bodies
+                    // (let-yield-prefix + If-tail with pure-or-Cps-call
+                    // branches) per `is_let_yield_prefix_then_branched
+                    // _cps_tail_body`. Pattern C reuses the same chain
+                    // step machinery; only the Final synth-cont's tail
+                    // emit differs (branched routing vs lower_expr+gate).
                     let lookup = |callee_name: &str| {
                         is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     };
+                    let is_cps_user_fn_lookup = |name: &str| cc.colored.needs_cps_transform(name);
                     is_simple_chained_let_yield_then_pure_tail_body(&f.body, &ctors, &lookup)
+                        .or_else(|| {
+                            is_let_yield_prefix_then_branched_cps_tail_body(
+                                &f.body,
+                                &ctors,
+                                &lookup,
+                                &is_cps_user_fn_lookup,
+                            )
+                        })
                 } {
                     // Extract per-step let-binding info (name +
                     // declared type + slot kind) and the yield-bearing
@@ -12424,21 +12503,318 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                         match role {
                             ChainStepRole::Final { tail_expr, tail_ty } => {
-                                let tail_value = lowerer.lower_expr(tail_expr.as_ref());
-                                let widened_tail = if *tail_ty == types::I64 {
-                                    tail_value
-                                } else if tail_ty.is_int() && tail_ty.bits() < 64 {
-                                    lowerer.builder.ins().uextend(types::I64, tail_value)
-                                } else {
-                                    assert_eq!(
-                                        *tail_ty, pointer_ty,
-                                        "codegen Plan B' Stage 6.7: unexpected \
-                                         ChainedLetBindStep Final tail type {tail_ty:?} \
-                                         for fn `{}`",
-                                        synth.parent_fn_name
+                                // Plan D Task 112d — Pattern C detection.
+                                // If `tail_expr` is `Expr::If` where each
+                                // branch is pure OR a single Cps user fn
+                                // call, dispatch per-branch instead of
+                                // calling `lower_expr(tail)` (which
+                                // would synchronously lower the recursive
+                                // Cps call via `lower_call`'s Cps branch
+                                // SAVE+CLEAR+RESTORE — silent garbage
+                                // under discharge-with-lambda).
+                                //
+                                // Mechanism: a `gate_entry_block` carries
+                                // `widened_tail` as a block param. Both
+                                // paths (Pattern C pure leaves AND non-
+                                // Pattern-C standard tail) jump to it
+                                // with their widened value. Cps-call
+                                // leaves emit `NextStep::Call(callee,
+                                // args + caller_k_pair_forwarded)` and
+                                // `return_` directly — they never reach
+                                // the gate. From `gate_entry_block`, the
+                                // existing 3-branch gate runs on
+                                // widened_tail.
+                                let gate_entry_block = lowerer.builder.create_block();
+                                lowerer
+                                    .builder
+                                    .append_block_param(gate_entry_block, types::I64);
+
+                                // Pattern C dispatch detection.
+                                //
+                                // Sigil's `if cond { then } else { else }`
+                                // is desugared to `match cond { true =>
+                                // then, false => else }` by elaboration,
+                                // so the codegen sees Expr::Match for
+                                // most Pattern C source shapes. Detect
+                                // BOTH:
+                                // - Expr::If directly (rare, but kept
+                                //   for forward-compat).
+                                // - Expr::Match with exactly 2 arms whose
+                                //   patterns are BoolLit(true) and
+                                //   BoolLit(false) (the if-desugar
+                                //   shape).
+                                //
+                                // Arbitrary Match shapes (sum-type
+                                // patterns, etc.) are NOT handled here;
+                                // those would need a richer per-arm
+                                // dispatch (mirror PR #81's
+                                // lower_match_arms_to_next_step). Out of
+                                // scope for this Pattern C fix.
+                                let cps_lookup = |name: &str| cc.colored.needs_cps_transform(name);
+                                let pattern_c_dispatch = detect_pattern_c_dispatch(
+                                    tail_expr.as_ref(),
+                                    &ctors,
+                                    &cps_lookup,
+                                );
+
+                                if let Some((cond, then_leaf, else_leaf, then_kind, else_kind)) =
+                                    pattern_c_dispatch
+                                {
+                                    // Pattern C path: emit per-branch
+                                    // routing. Pure leaves jump to
+                                    // `gate_entry_block`; Cps-call
+                                    // leaves emit `NextStep::Call` and
+                                    // `return_` directly.
+                                    let cond_v = lowerer.lower_expr(cond);
+                                    let then_block_cl = lowerer.builder.create_block();
+                                    let else_block_cl = lowerer.builder.create_block();
+                                    lowerer.builder.ins().brif(
+                                        cond_v,
+                                        then_block_cl,
+                                        &[],
+                                        else_block_cl,
+                                        &[],
                                     );
-                                    tail_value
-                                };
+
+                                    for (block_cl, block_tail, leaf_kind) in [
+                                        (then_block_cl, then_leaf, then_kind),
+                                        (else_block_cl, else_leaf, else_kind),
+                                    ] {
+                                        lowerer.builder.switch_to_block(block_cl);
+                                        lowerer.builder.seal_block(block_cl);
+                                        match leaf_kind {
+                                            BranchedCpsLeaf::Pure => {
+                                                let v = lowerer.lower_expr(block_tail);
+                                                let widened = if *tail_ty == types::I64 {
+                                                    v
+                                                } else if tail_ty.is_int() && tail_ty.bits() < 64 {
+                                                    lowerer.builder.ins().uextend(types::I64, v)
+                                                } else {
+                                                    assert_eq!(
+                                                        *tail_ty, pointer_ty,
+                                                        "Pattern C pure leaf: unexpected \
+                                                         tail type {tail_ty:?}"
+                                                    );
+                                                    v
+                                                };
+                                                lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .jump(gate_entry_block, &[widened.into()]);
+                                            }
+                                            BranchedCpsLeaf::CpsCall => {
+                                                // Emit NextStep::Call(
+                                                // callee, args +
+                                                // caller_k_pair_forwarded,
+                                                // N+2). caller_k_pair is
+                                                // loaded from this synth-
+                                                // cont's closure record's
+                                                // trailing slots — same
+                                                // source the gate's
+                                                // wrapper_forward branch
+                                                // uses. Forwarding
+                                                // threads caller_k_pair
+                                                // through the recursion;
+                                                // the recursive callee's
+                                                // helper-body Phase 6
+                                                // alloc will load it from
+                                                // its own args_ptr
+                                                // trailing slots and
+                                                // store into its step_0
+                                                // closure as caller_k_pair.
+                                                let (callee_name, call_args) = match block_tail {
+                                                    crate::ast::Expr::Call {
+                                                        callee, args, ..
+                                                    } => match callee.as_ref() {
+                                                        crate::ast::Expr::Ident(n, _) => {
+                                                            (n.clone(), args)
+                                                        }
+                                                        _ => unreachable!(
+                                                            "Pattern C cps-call leaf: classifier \
+                                                             ensures callee is Ident"
+                                                        ),
+                                                    },
+                                                    _ => unreachable!(
+                                                        "Pattern C cps-call leaf: classifier \
+                                                         ensures branch tail is Expr::Call"
+                                                    ),
+                                                };
+
+                                                // Look up callee's FuncRef
+                                                // from the synth-cont's
+                                                // local user_fn_refs map
+                                                // (mirrors the B.3 dispatch
+                                                // pattern at codegen.rs
+                                                // ~14214 — same lookup
+                                                // discipline).
+                                                let callee_func_ref =
+                                                    match lowerer.user_fn_refs.get(&callee_name) {
+                                                        Some(r) => *r,
+                                                        None => unreachable!(
+                                                            "Pattern C cps-call leaf: callee \
+                                                         `{callee_name}` not in user_fn_refs \
+                                                         (codegen invariant violation: \
+                                                         classifier accepted a callee not \
+                                                         registered as a user fn)"
+                                                        ),
+                                                    };
+                                                let callee_addr = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .func_addr(pointer_ty, callee_func_ref);
+
+                                                // Lower call args (pure).
+                                                let user_arg_count = call_args.len();
+                                                let mut lowered_args: Vec<Value> =
+                                                    Vec::with_capacity(user_arg_count);
+                                                for a in call_args {
+                                                    let v = lowerer.lower_expr(a);
+                                                    lowered_args.push(v);
+                                                }
+
+                                                // Load caller_k_pair from
+                                                // this synth-cont's
+                                                // closure record's
+                                                // trailing slots.
+                                                let caller_k_closure_off: i32 = 16
+                                                    + 8 * (captures.len() + prior_bindings.len())
+                                                        as i32;
+                                                let caller_k_fn_off: i32 = caller_k_closure_off + 8;
+                                                let caller_k_closure = lowerer.builder.ins().load(
+                                                    pointer_ty,
+                                                    MemFlags::trusted(),
+                                                    synth_closure_ptr,
+                                                    caller_k_closure_off,
+                                                );
+                                                let caller_k_fn = lowerer.builder.ins().load(
+                                                    pointer_ty,
+                                                    MemFlags::trusted(),
+                                                    synth_closure_ptr,
+                                                    caller_k_fn_off,
+                                                );
+
+                                                // Build NextStep::Call(
+                                                // callee, ..., N+2).
+                                                let arg_count_total = (user_arg_count + 2) as i64;
+                                                let arg_count_v = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(types::I32, arg_count_total);
+                                                // Use null closure_ptr
+                                                // for the Cps call —
+                                                // recursive top-level
+                                                // user fn (matches
+                                                // existing CallCps
+                                                // emit's null closure).
+                                                let null_closure =
+                                                    lowerer.builder.ins().iconst(pointer_ty, 0);
+                                                let call_ns = lowerer.builder.ins().call(
+                                                    lowerer.next_step_call_ref,
+                                                    &[null_closure, callee_addr, arg_count_v],
+                                                );
+                                                lowerer.stackmap.push_placeholder(
+                                                    function_code_offset(&lowerer.builder, call_ns),
+                                                );
+                                                let ns_ptr =
+                                                    lowerer.builder.inst_results(call_ns)[0];
+                                                let argp_call = lowerer.builder.ins().call(
+                                                    lowerer.next_step_args_ptr_ref,
+                                                    &[ns_ptr],
+                                                );
+                                                lowerer.stackmap.push_placeholder(
+                                                    function_code_offset(
+                                                        &lowerer.builder,
+                                                        argp_call,
+                                                    ),
+                                                );
+                                                let argp_v =
+                                                    lowerer.builder.inst_results(argp_call)[0];
+
+                                                // Store user args at
+                                                // slots 0..N. Widen each
+                                                // to I64 per the chain
+                                                // emit convention.
+                                                for (i, arg_v) in lowered_args.iter().enumerate() {
+                                                    let arg_ty =
+                                                        lowerer.builder.func.dfg.value_type(*arg_v);
+                                                    let widened = if arg_ty == types::I64 {
+                                                        *arg_v
+                                                    } else if arg_ty.is_int() && arg_ty.bits() < 64
+                                                    {
+                                                        lowerer
+                                                            .builder
+                                                            .ins()
+                                                            .uextend(types::I64, *arg_v)
+                                                    } else {
+                                                        *arg_v
+                                                    };
+                                                    lowerer.builder.ins().store(
+                                                        MemFlags::trusted(),
+                                                        widened,
+                                                        argp_v,
+                                                        (i * 8) as i32,
+                                                    );
+                                                }
+                                                // Store caller_k_pair at
+                                                // slots N, N+1 (the
+                                                // callee's args_ptr
+                                                // trailing pair). The
+                                                // callee's helper-body
+                                                // Phase 6 alloc reads
+                                                // from these offsets.
+                                                lowerer.builder.ins().store(
+                                                    MemFlags::trusted(),
+                                                    caller_k_closure,
+                                                    argp_v,
+                                                    k_closure_offset(user_arg_count),
+                                                );
+                                                lowerer.builder.ins().store(
+                                                    MemFlags::trusted(),
+                                                    caller_k_fn,
+                                                    argp_v,
+                                                    k_fn_offset(user_arg_count),
+                                                );
+
+                                                // return ns_ptr (this
+                                                // branch terminates
+                                                // here — never reaches
+                                                // the gate).
+                                                lowerer.builder.ins().return_(&[ns_ptr]);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Non-Pattern-C path: standard
+                                    // tail lowering. Jumps to
+                                    // gate_entry_block with widened_tail.
+                                    let tail_value = lowerer.lower_expr(tail_expr.as_ref());
+                                    let widened = if *tail_ty == types::I64 {
+                                        tail_value
+                                    } else if tail_ty.is_int() && tail_ty.bits() < 64 {
+                                        lowerer.builder.ins().uextend(types::I64, tail_value)
+                                    } else {
+                                        assert_eq!(
+                                            *tail_ty, pointer_ty,
+                                            "codegen Plan B' Stage 6.7: unexpected \
+                                             ChainedLetBindStep Final tail type {tail_ty:?} \
+                                             for fn `{}`",
+                                            synth.parent_fn_name
+                                        );
+                                        tail_value
+                                    };
+                                    lowerer
+                                        .builder
+                                        .ins()
+                                        .jump(gate_entry_block, &[widened.into()]);
+                                }
+
+                                // Switch to gate_entry_block. The gate
+                                // emit below operates on this block's
+                                // widened_tail param.
+                                lowerer.builder.switch_to_block(gate_entry_block);
+                                lowerer.builder.seal_block(gate_entry_block);
+                                let widened_tail =
+                                    lowerer.builder.block_params(gate_entry_block)[0];
 
                                 // Plan D Task 112b/c — runtime-gate
                                 // the Final step's terminal dispatch.
@@ -20365,6 +20741,48 @@ fn is_simple_tail_perform_with_pure_args_body(
 /// "wrapper-of-chained shape under discharge-with-lambda still
 /// produces silent garbage" hazard. The visited-set extension here
 /// closes that gap.
+///
+/// **Cycle handling — structural unreachability** (Task 112-mutually-
+/// recursive resolution, 2026-05-03). The visited-set bails to `false`
+/// on cycles (mutually-recursive Cps fns). PR #85 review prose flagged
+/// this as a potential silent-garbage failure mode under discharge-
+/// with-lambda handlers — the fallback Sync ABI path could re-exhibit
+/// the original Task 112 chain breakage. Empirical analysis closed
+/// that worry by showing the cycle case is unreachable in any
+/// terminating Sigil program:
+///
+/// 1. The chained-let-yield body shape (`is_simple_chained_let_yield_
+///    then_pure_tail_body`) requires every let-RHS to be `Expr::Perform`
+///    OR `Expr::Call` — no `If`, `Match`, or `Block` shapes are
+///    permitted as let-RHS.
+/// 2. Mutual recursion via let-RHS (the only path that trips the
+///    visited-set) requires a base case to terminate. A base case
+///    requires a runtime conditional gating whether the recursive
+///    call happens. But chained-let-yield let-RHS evaluates
+///    unconditionally; the body shape disallows `if`-around-Call.
+/// 3. The if-in-tail (permitted under `expr_is_pure`) can be conditional
+///    but doesn't gate the let-RHS calls — those evaluate before tail.
+///
+/// So any program that would trip the visited-set bail is
+/// structurally non-terminating — the recursion runs unbounded and
+/// stack-overflows at runtime regardless of classifier output. The
+/// visited-set's bail is correct: rejecting these as "unsupported
+/// chained-let-yield wrappers" doesn't produce silent garbage because
+/// the program never reaches a state where the discharge-with-lambda
+/// lambda chain matters.
+///
+/// `compiler/tests/e2e.rs::task_112_mutually_recursive_chained_wrappers
+/// _stack_overflow_not_silent_garbage` pins this empirically: compiles
+/// successfully, runs to SIGSEGV (exit 139 on macOS, similar on
+/// Linux), stdout empty.
+///
+/// Future-fragility note: if a future change relaxes constraint #1
+/// or #2 (e.g., permits `If`-as-let-RHS, or some shape that gates
+/// let-RHS calls conditionally), terminating mutually-recursive
+/// chained-let-yield programs become possible, and the visited-set
+/// bail's correctness needs re-evaluation. The unreachability
+/// argument is mechanism-by-coincidence on the current shape's
+/// rigidity.
 fn is_supported_cps_user_fn(
     callee_name: &str,
     fns_by_name: &std::collections::BTreeMap<&str, &crate::ast::FnDecl>,
@@ -20412,7 +20830,26 @@ fn is_supported_cps_user_fn_inner(
         let inner_lookup = |inner_name: &str| {
             is_supported_cps_user_fn_inner(inner_name, fns_by_name, colored, ctors, visited)
         };
-        is_simple_chained_let_yield_then_pure_tail_body(&f.body, ctors, &inner_lookup).is_some()
+        if is_simple_chained_let_yield_then_pure_tail_body(&f.body, ctors, &inner_lookup).is_some()
+        {
+            return true;
+        }
+        // Plan D Task 112d — Pattern C bodies (let-yield-prefix +
+        // If-tail with pure-or-Cps-call branches) are also supported as
+        // chained-let-yield wrapper-Call let-RHS callees. Pattern C
+        // bodies use the SAME chain machinery as chained-let-yield —
+        // caller_k_pair forwards through the chain step closure
+        // records (Task 112b) and the Final's tail emit branches per-
+        // leaf (gate for pure leaves; NextStep::Call for Cps-call
+        // leaves). Both leaf paths forward caller_k_pair correctly.
+        let is_cps_user_fn_lookup = |name: &str| colored.needs_cps_transform(name);
+        is_let_yield_prefix_then_branched_cps_tail_body(
+            &f.body,
+            ctors,
+            &inner_lookup,
+            &is_cps_user_fn_lookup,
+        )
+        .is_some()
     })();
     visited.borrow_mut().remove(callee_name);
     result
@@ -20774,6 +21211,323 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
         Some(t) if expr_is_pure(t, ctors) => Some(body.stmts.len()),
         _ => None,
     }
+}
+
+/// Plan D Task 112d — Pattern C body shape: let-yield-prefix +
+/// If-tail with pure-or-Cps-call branches (recursive perform-bearing
+/// helper).
+///
+/// **Shape:**
+///   `{ let _ = perform/wrapper; ...; if cond { branch_a } else { branch_b } }`
+///
+/// where each branch's body is either:
+/// - A pure expression (`expr_is_pure`), OR
+/// - A single direct call to a Cps user fn with pure args.
+///
+/// At least ONE branch must be a Cps-call leaf — otherwise the body has
+/// a pure If-tail and matches `is_simple_chained_let_yield_then_pure_tail_body`
+/// via that classifier's pure-tail acceptance (`expr_is_pure` permits
+/// If with pure branches). Mutual exclusivity.
+///
+/// **Why Pattern C needs a separate classifier.** The chained-let-yield
+/// classifier requires `expr_is_pure(tail)`, which excludes non-ctor
+/// calls. A recursive perform-bearing helper like
+///
+///   fn helper(n: Int) -> Int ![S] {
+///     let _ = perform S.set(n);
+///     if n == 0 { 0 } else { helper(n - 1) }
+///   }
+///
+/// fails the classifier (recursive `helper(n-1)` is non-pure → If tail
+/// non-pure → reject) and falls back to Sync ABI. Under discharge-with-
+/// lambda handlers, Sync ABI's `lower_call` Cps branch SAVE+CLEAR+RESTOREs
+/// `BODY_RETURN_ARM_STACK` around its nested run_loop — bypassing the
+/// lambda chain. State threading silently breaks. (Empirically verified
+/// 2026-05-03: simple Pattern C with state-threading produces the
+/// initial state instead of the last set value.)
+///
+/// **Pattern C is the SAME failure class** as the original Task 112
+/// silent-garbage problem — just for a different body shape. Task
+/// 112a/b/c closed chained-let-yield wrapper composition. Pattern C is
+/// the recursive-helper-with-conditional shape that wasn't covered.
+///
+/// **Closure mechanism.** Helper must be Cps ABI to thread `caller_k_pair`
+/// through the recursion. Sync ABI fns receive args directly with no
+/// trailing-pair convention; they have no mechanism to forward a chain
+/// pair. Recognising Pattern C as Cps gives helper a Cps body that
+/// participates in the chain machinery:
+///
+/// 1. The let-prefix uses the existing chained-let-yield chain step
+///    machinery (`ChainedLetBindStep` synth-conts; `caller_k_pair`
+///    plumbed through every step's closure record per Task 112b).
+/// 2. The Final synth-cont's tail emit detects the branched-cps shape
+///    and emits per-branch dispatch instead of `lower_expr(tail) + gate`:
+///    - **Pure leaf**: lower the value and run the existing 3-branch
+///      gate (top_caller_dispatch / top_post_arm_k_dispatch /
+///      wrapper_forward). Same routing as a non-conditional pure tail.
+///    - **Cps-call leaf**: emit `NextStep::Call(callee, args +
+///      caller_k_pair_forwarded, N+2)`. caller_k_pair is loaded from
+///      `synth_closure_ptr`'s trailing slots (same source the existing
+///      gate uses). Recursion threads caller_k_pair through every
+///      level → chain composes through the recursion → state-threading
+///      works.
+///
+/// **Initial scope (this commit).** If-tail with two branches only.
+/// Match-tail support deferred until a Match-shaped Pattern C surfaces
+/// in the test corpus or planned demos.
+fn is_let_yield_prefix_then_branched_cps_tail_body(
+    body: &crate::ast::Block,
+    ctors: &std::collections::BTreeSet<String>,
+    is_supported: &impl Fn(&str) -> bool,
+    is_cps_user_fn: &impl Fn(&str) -> bool,
+) -> Option<usize> {
+    use crate::ast::{Expr, Stmt};
+    if body.stmts.is_empty() {
+        return None;
+    }
+    if body.stmts.len() >= MAX_CLOSURE_ENV_SLOTS {
+        return None;
+    }
+    for stmt in &body.stmts {
+        let let_stmt = match stmt {
+            Stmt::Let(l) => l,
+            _ => return None,
+        };
+        match &let_stmt.value {
+            Expr::Perform(p) => {
+                if !p.args.iter().all(|a| expr_is_pure(a, ctors)) {
+                    return None;
+                }
+            }
+            Expr::Call { callee, args, .. } => {
+                let callee_name = match callee.as_ref() {
+                    Expr::Ident(n, _) => n,
+                    _ => return None,
+                };
+                if !is_supported(callee_name) {
+                    return None;
+                }
+                if !args.iter().all(|a| expr_is_pure(a, ctors)) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let tail = body.tail.as_ref()?;
+    // Accept either Expr::If or Expr::Match. Sigil's elaboration pass
+    // desugars `if cond { ... } else { ... }` into `Expr::Match { ... }`
+    // so by codegen time the body's tail in Pattern C source comes
+    // through as Match.
+    let mut has_cps_call = false;
+    match tail {
+        Expr::If {
+            then_block,
+            else_block,
+            ..
+        } => {
+            let then_kind = classify_branched_cps_tail_branch(then_block, ctors, is_cps_user_fn)?;
+            let else_kind = classify_branched_cps_tail_branch(else_block, ctors, is_cps_user_fn)?;
+            if matches!(then_kind, BranchedCpsLeaf::CpsCall)
+                || matches!(else_kind, BranchedCpsLeaf::CpsCall)
+            {
+                has_cps_call = true;
+            }
+        }
+        Expr::Match { arms, .. } => {
+            // Each arm body must be classifiable. We accept arm bodies
+            // as the same shape as If branches: `Expr::Block { stmts: [],
+            // tail: pure_or_cps_call }` OR a bare expression directly
+            // (some elaborated arms have their tail expression at top
+            // level instead of wrapped in a Block). Normalize via a
+            // helper that accepts either.
+            for arm in arms {
+                let kind =
+                    classify_branched_cps_tail_branch_expr(&arm.body, ctors, is_cps_user_fn)?;
+                if matches!(kind, BranchedCpsLeaf::CpsCall) {
+                    has_cps_call = true;
+                }
+            }
+        }
+        _ => return None,
+    }
+    if !has_cps_call {
+        return None;
+    }
+    Some(body.stmts.len())
+}
+
+/// Plan D Task 112d — accept a bare `Expr` (an `Expr::Block` or any
+/// expression directly) as a branched-cps tail leaf. Sigil's
+/// elaboration sometimes leaves `match` arm bodies as bare expressions
+/// rather than wrapping them in a `Block`. This helper bridges both
+/// shapes for [`classify_branched_cps_tail_branch`]'s leaf-shape rules.
+fn classify_branched_cps_tail_branch_expr(
+    e: &crate::ast::Expr,
+    ctors: &std::collections::BTreeSet<String>,
+    is_cps_user_fn: &impl Fn(&str) -> bool,
+) -> Option<BranchedCpsLeaf> {
+    use crate::ast::Expr;
+    if let Expr::Block(b) = e {
+        return classify_branched_cps_tail_branch(b, ctors, is_cps_user_fn);
+    }
+    if expr_is_pure(e, ctors) {
+        return Some(BranchedCpsLeaf::Pure);
+    }
+    if let Expr::Call { callee, args, .. } = e {
+        if let Expr::Ident(name, _) = callee.as_ref() {
+            if is_cps_user_fn(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
+                return Some(BranchedCpsLeaf::CpsCall);
+            }
+        }
+    }
+    None
+}
+
+/// Plan D Task 112d — Pattern C dispatch detection at codegen time.
+///
+/// Returns `Some((cond, then_leaf, else_leaf, then_kind, else_kind))`
+/// when the tail expression is either:
+///
+/// - `Expr::If { cond, then_block, else_block }` where each branch
+///   classifies as Pure or CpsCall (and at least one is CpsCall).
+/// - `Expr::Match { scrutinee, arms }` matching the if-desugar shape:
+///   exactly 2 arms with `Pattern::BoolLit(true)` and
+///   `Pattern::BoolLit(false)` patterns (in either order). The scrutinee
+///   becomes `cond`.
+///
+/// `then_leaf` and `else_leaf` are the branch tail expressions (block
+/// tail OR bare arm body expression).
+///
+/// Arbitrary Match shapes (sum-type patterns, etc.) return `None` —
+/// supporting them would require richer per-arm dispatch (mirror PR #81's
+/// `lower_match_arms_to_next_step`); deferred.
+#[allow(clippy::type_complexity)]
+fn detect_pattern_c_dispatch<'a>(
+    tail: &'a crate::ast::Expr,
+    ctors: &std::collections::BTreeSet<String>,
+    is_cps_user_fn: &impl Fn(&str) -> bool,
+) -> Option<(
+    &'a crate::ast::Expr,
+    &'a crate::ast::Expr,
+    &'a crate::ast::Expr,
+    BranchedCpsLeaf,
+    BranchedCpsLeaf,
+)> {
+    use crate::ast::{Expr, Pattern};
+    match tail {
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            let then_kind =
+                classify_branched_cps_tail_branch(then_block.as_ref(), ctors, is_cps_user_fn)?;
+            let else_kind =
+                classify_branched_cps_tail_branch(else_block.as_ref(), ctors, is_cps_user_fn)?;
+            if !matches!(then_kind, BranchedCpsLeaf::CpsCall)
+                && !matches!(else_kind, BranchedCpsLeaf::CpsCall)
+            {
+                return None;
+            }
+            let then_leaf = then_block.tail.as_ref()?;
+            let else_leaf = else_block.tail.as_ref()?;
+            Some((cond.as_ref(), then_leaf, else_leaf, then_kind, else_kind))
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            // If-desugar shape: exactly 2 arms with BoolLit patterns.
+            if arms.len() != 2 {
+                return None;
+            }
+            let extract_bool = |p: &Pattern| -> Option<bool> {
+                if let Pattern::BoolLit(b, _) = p {
+                    Some(*b)
+                } else {
+                    None
+                }
+            };
+            let arm0_b = extract_bool(&arms[0].pattern)?;
+            let arm1_b = extract_bool(&arms[1].pattern)?;
+            if arm0_b == arm1_b {
+                return None;
+            }
+            let (then_arm, else_arm) = if arm0_b {
+                (&arms[0], &arms[1])
+            } else {
+                (&arms[1], &arms[0])
+            };
+            // Each arm body must classify as Pure or CpsCall.
+            let then_kind =
+                classify_branched_cps_tail_branch_expr(&then_arm.body, ctors, is_cps_user_fn)?;
+            let else_kind =
+                classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_cps_user_fn)?;
+            if !matches!(then_kind, BranchedCpsLeaf::CpsCall)
+                && !matches!(else_kind, BranchedCpsLeaf::CpsCall)
+            {
+                return None;
+            }
+            // For arm bodies that are Expr::Block, extract the tail;
+            // for bare expressions, use the body directly.
+            let extract_leaf = |body: &'a Expr| -> Option<&'a Expr> {
+                if let Expr::Block(b) = body {
+                    b.tail.as_ref()
+                } else {
+                    Some(body)
+                }
+            };
+            let then_leaf = extract_leaf(&then_arm.body)?;
+            let else_leaf = extract_leaf(&else_arm.body)?;
+            Some((
+                scrutinee.as_ref(),
+                then_leaf,
+                else_leaf,
+                then_kind,
+                else_kind,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Plan D Task 112d — branch-leaf classifier for
+/// [`is_let_yield_prefix_then_branched_cps_tail_body`].
+fn classify_branched_cps_tail_branch(
+    block: &crate::ast::Block,
+    ctors: &std::collections::BTreeSet<String>,
+    is_cps_user_fn: &impl Fn(&str) -> bool,
+) -> Option<BranchedCpsLeaf> {
+    use crate::ast::Expr;
+    if !block.stmts.is_empty() {
+        return None;
+    }
+    let tail = block.tail.as_ref()?;
+    if expr_is_pure(tail, ctors) {
+        return Some(BranchedCpsLeaf::Pure);
+    }
+    if let Expr::Call { callee, args, .. } = tail {
+        if let Expr::Ident(name, _) = callee.as_ref() {
+            if is_cps_user_fn(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
+                return Some(BranchedCpsLeaf::CpsCall);
+            }
+        }
+    }
+    None
+}
+
+/// Plan D Task 112d — branch-leaf classification result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchedCpsLeaf {
+    /// Branch tail is `expr_is_pure` — lower as value, dispatch via the
+    /// chain Final's 3-branch gate (top_caller_dispatch /
+    /// top_post_arm_k_dispatch / wrapper_forward).
+    Pure,
+    /// Branch tail is a single direct call to a Cps user fn — emit
+    /// `NextStep::Call(callee, args + caller_k_pair_forwarded)`. The
+    /// recursion threads caller_k_pair through every level.
+    CpsCall,
 }
 
 /// Plan B Task 78.5 G4 (Phase A — shape detector only) — does this fn
