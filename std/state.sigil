@@ -1,14 +1,15 @@
 // sigil: 0.1
 //
-// std/state.sigil — Plan C Task 72.
+// std/state.sigil — Plan C Task 72 + Plan D Task 119b migration.
 //
-// `State` is the canonical mutable-state-via-effect surface: a
-// computation accesses an `Int`-typed state slot via `perform
-// State.get()` / `perform State.set(...)`, and `run_state(initial,
-// body)` discharges the effect by threading state through the
-// body's perform sites, returning the body's final value.
+// `State[S]` is the canonical mutable-state-via-effect surface,
+// parametric over the state type `S`. A computation accesses an
+// `S`-typed state slot via `perform State.get()` / `perform
+// State.set(...)`, and `run_state[A, S](initial, body)` discharges the
+// effect by threading state through the body's perform sites,
+// returning the body's final value.
 //
-// Compare to Koka / Effekt's `state` / `runState` and OCaml's
+// Compare to Koka / Effekt's `state[S]` / `runState` and OCaml's
 // `State` monad.
 //
 // ## Usage
@@ -16,7 +17,7 @@
 // ```sigil
 // import std.state
 //
-// fn comp() -> Int ![State] {
+// fn comp() -> Int ![State[Int]] {
 //   let _: Int = perform State.set(10);
 //   let v: Int = perform State.get();
 //   v + 1
@@ -29,21 +30,24 @@
 // }
 // ```
 //
-// ## v1 design choices
+// ## Design (post Plan D Task 119b)
 //
-// 1. **`State` is non-generic; state type is fixed at `Int`.**
-//    Plan body specifies `State[S]`. Sigil v1's parser rejects
-//    type-parameterized effect references in rows (`![State[S]]`
-//    doesn't parse) — same constraint as `[DEVIATION Task 71]`'s
-//    `Raise` simplification. v2 generalises to `State[S]` when
-//    the parser surface lands.
+// 1. **`State[S]` is parametric over the state type.** Closed by
+//    Plan D Task 119b (E0145 lifted). Pre-119b, the broad
+//    `program_has_generics` gate rejected lambda-captures-k inside
+//    any program containing generics — including `run_state[A, S]`
+//    itself. The lift makes the discharge-with-lambda pattern (the
+//    state-bearing-lambda chain) work uniformly under
+//    monomorphization. Soundness is enforced at runtime via ScopeId
+//    checks on captured continuations.
 //
 // 2. **`run_state` returns just `A` (body's final value), not
-//    `(A, S)`.** Plan body specifies `(A, S) !e`. Sigil v1 lacks
-//    a tuple type and no `Pair[A, B]` is in the stdlib (would
-//    need its own task). v1 ships A-only return; users wanting
-//    final state capture it explicitly via the body's return
-//    value.
+//    `(A, S)`.** Plan body specifies `(A, S) !e`. Sigil v1's tuple
+//    surface is shipped (Plan D Task 113), but `(A, S)` would
+//    require a second walk over the state-bearing-lambda chain to
+//    surface the final S — orthogonal to Task 119b's E0145 closure.
+//    v1 ships A-only return; users wanting final state capture it
+//    explicitly via the body's return value.
 //
 // 3. **No `get_state` / `set_state` wrapper functions in v1.**
 //    Plan B' Stage 6.8's run_state landing (PR #39) verified the
@@ -57,17 +61,13 @@
 //    threaded result. Users do `perform State.get()` /
 //    `perform State.set(s)` directly until v2 closes this gap.
 //    See `[DEVIATION Task 72]`.
-//
-// 4. **Closed effect row on `run_state`.** Same row-poly Fn
-//    deferral as Task 71's `catch`. The `!e` passthrough lands
-//    when row-poly Fn parameters ship in v2.
 
-// `State` is the v1 mutable-state effect with `Int`-typed state.
-// `run_state` discharges single-shot (`k` is invoked exactly once
-// per arm activation); the `resumes: many` annotation matches
-// `examples/state.sigil` and keeps the surface open for future
-// multi-shot handlers (e.g., backtracking-with-state) to consume
-// the same effect declaration without a breaking change.
+// `State[S]` is the v1 mutable-state effect, parametric over the
+// state type `S`. `run_state` discharges single-shot (`k` is invoked
+// exactly once per arm activation); the `resumes: many` annotation
+// matches `examples/state.sigil` and keeps the surface open for
+// future multi-shot handlers (e.g., backtracking-with-state) to
+// consume the same effect declaration without a breaking change.
 //
 // **`State.set`'s return value contract.** Under `run_state`, the
 // `set` arm body is `fn (s) => k(arg)(arg)` — `k` is invoked with
@@ -79,38 +79,38 @@
 // then perform set:
 //
 //   ```sigil
-//   let prev: Int = perform State.get();
-//   let _: Int = perform State.set(new_value);
+//   let prev: S = perform State.get();
+//   let _: S = perform State.set(new_value);
 //   // `prev` holds the old state.
 //   ```
 //
-// (v2 may add a dedicated `swap: (Int) -> Int` op that returns
+// (v2 may add a dedicated `swap: (S) -> S` op that returns
 // previous-state directly without the get-set sequence.)
-effect State resumes: many {
-  get: () -> Int,
-  // `set(new): Int` evaluates to `new` at the perform site (NOT
+effect State[S] resumes: many {
+  get: () -> S,
+  // `set(new): S` evaluates to `new` at the perform site (NOT
   // the previous state). See doc note above.
-  set: (Int) -> Int,
+  set: (S) -> S,
 }
 
-// `run_state(initial, body)` discharges the State effect by
+// `run_state[A, S](initial, body)` discharges the State[S] effect by
 // threading state through every `State.get` / `State.set` perform
 // in `body`. Returns the body's final value.
 //
 // **Implementation shape.** Each handler arm returns a state-
-// bearing lambda `(Int) -> Int ![]`; the handle expression's
-// overall is the lambda chain that, when applied to `initial`,
+// bearing lambda `(S) -> A ![]`; the handle expression's overall
+// value is the lambda chain that, when applied to `initial`,
 // drives the state through the body. The return arm wraps the
 // body's final value in a no-op state-bearing lambda; the get
 // arm threads the current state into k twice (once as the
 // resume value, once as the next state); the set arm threads
 // `arg` similarly. See `examples/state.sigil` for the detailed
 // trace; `[DEVIATION Task 72]` documents v1 constraints.
-fn run_state(initial: Int, body: () -> Int ![State]) -> Int ![] {
-  let state_fn: (Int) -> Int ![] = handle body() with {
-    return(v) => fn (s: Int) -> Int ![] => v,
-    State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),
-    State.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),
+fn run_state[A, S](initial: S, body: () -> A ![State[S]]) -> A ![] {
+  let state_fn: (S) -> A ![] = handle body() with {
+    return(v) => fn (s: S) -> A ![] => v,
+    State.get(k) => fn (s: S) -> A ![] => k(s)(s),
+    State.set(arg, k) => fn (s: S) -> A ![] => k(arg)(arg),
   };
   state_fn(initial)
 }

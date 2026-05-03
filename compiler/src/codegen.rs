@@ -4305,6 +4305,30 @@ struct ArmSynthCtx<'a> {
     /// `handle_with_bool_body_and_return_arm_uses_v_pending_proper_-
     /// binding_ty`.
     handle_body_ty: &'a BTreeMap<Span, crate::typecheck::Ty>,
+    /// Plan D Task 119b — per-clone resolved `handle_body_ty`. The
+    /// span-keyed `handle_body_ty` field above leaks `Ty::Var(_)`
+    /// for handles inside generic clones (the source side-table is
+    /// shared across every clone of a generic fn). The resolved map
+    /// keys by `(clone_fn_name, handle_span)` and holds the post-
+    /// substitution body Ty. Lookup discipline: try the resolved
+    /// map first with the current fn name; fall back to the span-
+    /// keyed source for non-generic / no-mono paths.
+    handle_body_ty_resolved: &'a crate::monomorphize::HandleBodyTyResolved,
+    /// Plan D Task 119b — name of the user fn whose pre-pass is
+    /// currently iterating handle expressions. Used as the key
+    /// into `handle_body_ty_resolved`. Set in `emit_object`'s
+    /// per-fn loop before `collect_handle_arms_in_block(&f.body)`.
+    current_fn_name: &'a str,
+    /// Plan D Task 119b R1 — hoisted-lambda → parent-clone chain.
+    /// A `handle ... with { ... }` written inside a lambda body
+    /// (in a generic enclosing fn) lives, post closure_convert, in
+    /// a `$lambda_N` synthetic fn; mono recorded the resolved
+    /// `handle_body_ty` keyed by the parent clone name (mono had no
+    /// awareness of `$lambda_N`). The pre-pass therefore walks
+    /// `current_fn_name → parent_clone → …` until the resolved
+    /// map answers, falling back to the span-keyed source on full
+    /// miss. Mirrors `Lowerer::lookup_call_callee_ty`.
+    hoisted_lambda_parent_clone: &'a BTreeMap<String, String>,
 }
 
 struct CollectMut<'a> {
@@ -4918,10 +4942,30 @@ fn collect_handle_arms_in_expr(
                 // I64 hardcode this cleanup is removing — `expect` so
                 // the invariant is load-bearing rather than papered
                 // over.
-                let binding_ty = ctx
-                    .handle_body_ty
-                    .get(span)
-                    .map(|ty| cranelift_ty_of_ty(ty, ctx.pointer_ty))
+                // Plan D Task 119b — try the per-clone resolved
+                // map first (post-substitution Ty for generic
+                // clones); fall back to the span-keyed source
+                // side-table for non-generic / no-mono paths. R1:
+                // walk `current_fn_name → parent_clone → …` so a
+                // handle inside a hoisted lambda (mono keyed by
+                // the parent clone, not `$lambda_N`) still resolves.
+                let body_ty_resolved = {
+                    let mut fn_name = ctx.current_fn_name.to_string();
+                    loop {
+                        if let Some(t) = ctx
+                            .handle_body_ty_resolved
+                            .get(&(fn_name.clone(), span.clone()))
+                        {
+                            break Some(t);
+                        }
+                        match ctx.hoisted_lambda_parent_clone.get(&fn_name) {
+                            Some(parent) => fn_name = parent.clone(),
+                            None => break None,
+                        }
+                    }
+                };
+                let body_ty = body_ty_resolved
+                    .or_else(|| ctx.handle_body_ty.get(span))
                     .unwrap_or_else(|| {
                         unreachable!(
                             "codegen: handle_body_ty missing for Expr::Handle at {span:?} — \
@@ -4929,6 +4973,7 @@ fn collect_handle_arms_in_expr(
                              handle expression that reaches codegen"
                         )
                     });
+                let binding_ty = cranelift_ty_of_ty(body_ty, ctx.pointer_ty);
                 out.return_synth.push(HandlerReturnArmSynth {
                     func_id,
                     body: rewritten_body,
@@ -7548,7 +7593,25 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // `terminal_out: *mut TerminalResult` to match the Sync
             // ABI; body emit (bottom of `emit_object`) reads that
             // block param and forwards it to `sigil_run_loop`.
-            if abi == UserFnAbi::Cps {
+            //
+            // Plan D Task 119b — gate emission on
+            // `top_level_fn_names_seen_as_value`. Closes Plan B'
+            // Stage-6.8-followup architectural carryover #2 /
+            // issue #48. The Sync shim is consumed exclusively by
+            // `lower_closure_record`'s `code_ptr` slot when a Cps
+            // fn is materialized as a value (the shim wraps the
+            // Cps ABI in the Sync closure-convention shape so
+            // indirect calls through the closure record's
+            // `code_ptr` see uniform Sync ABI). A Cps fn never
+            // referenced bare-as-value gets no `Expr::ClosureRecord`
+            // rewrite from `closure_convert`, so no closure record's
+            // `code_ptr` ever points at its address — emitting the
+            // shim wastes ~100 bytes of object code per Cps fn.
+            // closure_convert tracks the witnessed-as-value set;
+            // skip emission for fns not in it.
+            let shim_needed =
+                abi == UserFnAbi::Cps && cc.top_level_fn_names_seen_as_value.contains(&f.name);
+            if shim_needed {
                 let mut shim_sig = Signature::new(isa_call_conv(&module));
                 shim_sig.params.push(AbiParam::new(pointer_ty));
                 for p in &f.params {
@@ -7810,15 +7873,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     let mut handler_return_arm_indices: BTreeMap<Span, usize> = BTreeMap::new();
     {
         let cps_arm_sig = cps_signature(pointer_ty, &module);
-        let arm_synth_ctx = ArmSynthCtx {
-            cps_arm_sig: &cps_arm_sig,
-            op_ids: &checked.op_ids,
-            effects: &checked.effects,
-            pointer_ty,
-            handle_arm_captures: &checked.handle_arm_captures,
-            handle_return_arm_captures: &checked.handle_return_arm_captures,
-            handle_body_ty: &checked.handle_body_ty,
-        };
         let mut arm_synth_mut = CollectMut {
             synth: &mut handler_arm_synth,
             indices: &mut handler_arm_indices,
@@ -7827,6 +7881,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         };
         for item in &checked.program.items {
             if let crate::ast::Item::Fn(f) = item {
+                // Plan D Task 119b — `current_fn_name` is set per-fn
+                // so the per-clone resolved-handle-body-ty lookup
+                // can key by the active clone's mangled name. Built
+                // here per-iteration rather than at outer scope to
+                // avoid re-borrow contention with the cps_arm_sig
+                // immutable borrow.
+                let arm_synth_ctx = ArmSynthCtx {
+                    cps_arm_sig: &cps_arm_sig,
+                    op_ids: &checked.op_ids,
+                    effects: &checked.effects,
+                    pointer_ty,
+                    handle_arm_captures: &checked.handle_arm_captures,
+                    handle_return_arm_captures: &checked.handle_return_arm_captures,
+                    handle_body_ty: &checked.handle_body_ty,
+                    handle_body_ty_resolved: &cc.colored.mono.handle_body_ty_resolved,
+                    current_fn_name: &f.name,
+                    hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
+                };
                 collect_handle_arms_in_block(
                     &f.body,
                     &mut module,
@@ -8309,6 +8381,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         current_fn_name: f.name.clone(),
                         local_fn_types: BTreeMap::new(),
                         call_callee_tys: &checked.call_callee_tys,
+                        call_callee_tys_resolved: &cc.colored.mono.call_callee_tys_resolved,
+                        hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
                         captured_fn_sigs: BTreeMap::new(),
                         arm_k_closure_v: None,
                         arm_k_fn_v: None,
@@ -8338,11 +8412,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // cont block. Cont's param is `pointer_ty` (the
                     // *mut NextStep produced by each arm).
                     let scrut_v = lowerer.lower_expr(match_scrutinee);
-                    let scrut_ty = lowerer
-                        .match_scrut_tys_resolved
-                        .get(&(lowerer.current_fn_name.clone(), match_span.clone()))
-                        .cloned()
-                        .or_else(|| lowerer.match_scrut_tys.get(&match_span).cloned());
+                    let scrut_ty = lowerer.lookup_match_scrut_ty(&match_span);
                     let cont = lowerer.builder.create_block();
                     lowerer.builder.append_block_param(cont, pointer_ty);
 
@@ -9342,6 +9412,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     current_fn_name: f.name.clone(),
                     local_fn_types: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
+                    call_callee_tys_resolved: &cc.colored.mono.call_callee_tys_resolved,
+                    hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
                     captured_fn_sigs: BTreeMap::new(),
                     arm_k_closure_v: None,
                     arm_k_fn_v: None,
@@ -9710,6 +9782,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     m
                 },
                 call_callee_tys: &checked.call_callee_tys,
+                call_callee_tys_resolved: &cc.colored.mono.call_callee_tys_resolved,
+                hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
                 captured_fn_sigs: {
                     // Plan B' Stage 6.8 Phase C+ Part 2 — for synth
                     // lambda fns (`$lambda_N`), seed with fn-typed
@@ -10222,6 +10296,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     current_fn_name: String::new(),
                     local_fn_types: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
+                    call_callee_tys_resolved: &cc.colored.mono.call_callee_tys_resolved,
+                    hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
                     captured_fn_sigs: BTreeMap::new(),
                     // Plan B' Stage 6.8 Task 107 Phase B — expose
                     // the arm fn's k_closure_v / k_fn_v as Lowerer
@@ -11169,6 +11245,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     current_fn_name: String::new(),
                     local_fn_types: BTreeMap::new(),
                     call_callee_tys: &checked.call_callee_tys,
+                    call_callee_tys_resolved: &cc.colored.mono.call_callee_tys_resolved,
+                    hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
                     captured_fn_sigs: BTreeMap::new(),
                     arm_k_closure_v: None,
                     arm_k_fn_v: None,
@@ -11447,6 +11525,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 current_fn_name: String::new(),
                 local_fn_types: BTreeMap::new(),
                 call_callee_tys: &checked.call_callee_tys,
+                call_callee_tys_resolved: &cc.colored.mono.call_callee_tys_resolved,
+                hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
                 captured_fn_sigs: BTreeMap::new(),
                 arm_k_closure_v: None,
                 arm_k_fn_v: None,
@@ -11737,6 +11817,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         current_fn_name: String::new(),
                         local_fn_types: BTreeMap::new(),
                         call_callee_tys: &checked.call_callee_tys,
+                        call_callee_tys_resolved: &cc.colored.mono.call_callee_tys_resolved,
+                        hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
                         captured_fn_sigs: BTreeMap::new(),
                         arm_k_closure_v: None,
                         arm_k_fn_v: None,
@@ -12456,6 +12538,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             current_fn_name: String::new(),
                             local_fn_types: BTreeMap::new(),
                             call_callee_tys: &checked.call_callee_tys,
+                            call_callee_tys_resolved: &cc.colored.mono.call_callee_tys_resolved,
+                            hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
                             captured_fn_sigs: BTreeMap::new(),
                             arm_k_closure_v: None,
                             arm_k_fn_v: None,
@@ -14020,6 +14104,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             current_fn_name: synth.parent_fn_name.clone(),
                             local_fn_types: BTreeMap::new(),
                             call_callee_tys: &checked.call_callee_tys,
+                            call_callee_tys_resolved: &cc.colored.mono.call_callee_tys_resolved,
+                            hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
                             captured_fn_sigs: BTreeMap::new(),
                             arm_k_closure_v: None,
                             arm_k_fn_v: None,
@@ -14844,8 +14930,26 @@ struct Lowerer<'a, 'b> {
     /// (7)`). The `Ty::Fn` here is fully deref'd through typecheck's
     /// substitution and post-monomorphize-resolved (no `Ty::Var`
     /// survivors), so `cranelift_ty_of_ty` produces the right
-    /// Cranelift types directly.
+    /// Cranelift types directly. For generic clones, see
+    /// `call_callee_tys_resolved` (Plan D Task 119b) — the
+    /// per-clone resolved map preferred over this span-keyed
+    /// source.
     call_callee_tys: &'b BTreeMap<Span, Ty>,
+    /// Plan D Task 119b — per-clone resolved `call_callee_tys`
+    /// keyed by `(clone_fn_name, call_span)`. `lower_call`'s
+    /// indirect path consults this first, then falls back to the
+    /// span-keyed `call_callee_tys` source side-table.
+    call_callee_tys_resolved: &'b crate::monomorphize::CallCalleeTysResolved,
+    /// Plan D Task 119b — map from hoisted-lambda fn names
+    /// (`$lambda_N`) to their parent clone fn name. Used by
+    /// `lookup_call_callee_ty` to chain through mono's per-clone
+    /// resolved maps when a span lives inside a hoisted lambda's
+    /// body. Codegen keys mono's resolved-Ty maps by the parent
+    /// clone name (mono had no awareness of post-CC `$lambda_N`
+    /// fns), so the lookup walks `current_fn_name → parent_clone →
+    /// (recurse if parent is itself a hoisted lambda)` until it
+    /// finds an entry or hits a non-hoisted fn.
+    hoisted_lambda_parent_clone: &'b BTreeMap<String, String>,
 
     /// Plan B' Stage 6.8 Phase C+ Part 2 — fn-typed captures of the
     /// current synth lambda fn, keyed by capture name. When a Call's
@@ -14925,6 +15029,55 @@ fn body_as_direct_cps_call_with_lookup(
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
+    /// Plan D Task 119b — look up a call's resolved callee `Ty`
+    /// for the span. Walks from `current_fn_name` up the
+    /// hoisted-lambda → parent-clone chain (via `hoisted_lambda_-
+    /// parent_clone`) so a call site inside a hoisted lambda's
+    /// body resolves through mono's `(parent_clone_fn_name, span)`
+    /// keying. Falls back to the span-keyed `call_callee_tys`
+    /// source side-table for non-generic / no-mono paths.
+    fn lookup_call_callee_ty(&self, span: &Span) -> Option<&'b crate::typecheck::Ty> {
+        let mut fn_name = self.current_fn_name.clone();
+        loop {
+            if let Some(ty) = self
+                .call_callee_tys_resolved
+                .get(&(fn_name.clone(), span.clone()))
+            {
+                return Some(ty);
+            }
+            match self.hoisted_lambda_parent_clone.get(&fn_name) {
+                Some(parent) => fn_name = parent.clone(),
+                None => break,
+            }
+        }
+        self.call_callee_tys.get(span)
+    }
+
+    /// Plan D Task 119b R1 — sibling of `lookup_call_callee_ty`
+    /// for `match_scrut_tys`. A `match` written inside a hoisted
+    /// lambda's body (post closure_convert) is keyed in
+    /// `match_scrut_tys_resolved` by the parent clone fn name, not
+    /// `$lambda_N`; walking the parent chain lets generic clones
+    /// resolve their concrete scrutinee `Ty` instead of leaking the
+    /// span-keyed `Ty::Var(_)` through `cranelift_ty_of_ty`. Closes
+    /// the symmetric gap reviewer flagged on PR #94.
+    fn lookup_match_scrut_ty(&self, span: &Span) -> Option<crate::typecheck::Ty> {
+        let mut fn_name = self.current_fn_name.clone();
+        loop {
+            if let Some(ty) = self
+                .match_scrut_tys_resolved
+                .get(&(fn_name.clone(), span.clone()))
+            {
+                return Some(ty.clone());
+            }
+            match self.hoisted_lambda_parent_clone.get(&fn_name) {
+                Some(parent) => fn_name = parent.clone(),
+                None => break,
+            }
+        }
+        self.match_scrut_tys.get(span).cloned()
+    }
+
     /// Lower a `Block`. Returns the tail expression's value if any,
     /// `None` when the block has no tail (statement-only block, value
     /// is `Unit`).
@@ -15502,18 +15655,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // site) — pre-existing, not Task 118 specific. Closing
         // requires threading the synth fn's clone identity into
         // `current_fn_name` at Lowerer construction.
-        let scrut_ty = self
-            .match_scrut_tys_resolved
-            .get(&(self.current_fn_name.clone(), scrut_span.clone()))
-            .cloned()
-            .or_else(|| self.match_scrut_tys.get(scrut_span).cloned())
-            .unwrap_or_else(|| {
-                unreachable!(
-                    "codegen Task 118 k-as-scrutinee: match scrutinee Ty \
-                     missing from match_scrut_tys / _resolved side-tables \
-                     for span {scrut_span:?}"
-                )
-            });
+        let scrut_ty = self.lookup_match_scrut_ty(scrut_span).unwrap_or_else(|| {
+            unreachable!(
+                "codegen Task 118 k-as-scrutinee: match scrutinee Ty \
+                 missing from match_scrut_tys / _resolved side-tables \
+                 for span {scrut_span:?}"
+            )
+        });
         let scrut_cl_ty = cranelift_ty_of_ty(&scrut_ty, pointer_ty);
         if scrut_cl_ty == types::I64 {
             raw_u64
@@ -15547,11 +15695,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         k_fn_v: Value,
         pointer_ty: Type,
     ) -> Value {
-        let scrut_ty = self
-            .match_scrut_tys_resolved
-            .get(&(self.current_fn_name.clone(), match_span.clone()))
-            .cloned()
-            .or_else(|| self.match_scrut_tys.get(match_span).cloned());
+        let scrut_ty = self.lookup_match_scrut_ty(match_span);
 
         let cont = self.builder.create_block();
         self.builder.append_block_param(cont, pointer_ty);
@@ -18561,7 +18705,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         .get(name)
                         .cloned()
                         .map(|fty| CalleeSig::Surface(Box::new(fty))),
-                    Expr::Call { .. } => match self.call_callee_tys.get(call_span) {
+                    Expr::Call { .. } => match self.lookup_call_callee_ty(call_span) {
                         Some(crate::typecheck::Ty::Fn(sig)) => {
                             Some(CalleeSig::Resolved(sig.clone()))
                         }
@@ -19227,11 +19371,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // nested Match, …). Span-keyed fallback is correct for
         // non-generic surfaces and synth helper fns whose match
         // scrutinees carry no `Ty::Var(_)`.
-        let scrut_ty = self
-            .match_scrut_tys_resolved
-            .get(&(self.current_fn_name.clone(), match_span.clone()))
-            .cloned()
-            .or_else(|| self.match_scrut_tys.get(match_span).cloned());
+        let scrut_ty = self.lookup_match_scrut_ty(match_span);
 
         // Predict the result type from the first arm's body. Pattern
         // bindings introduced by the first arm are added to a preview
@@ -19739,11 +19879,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // `lower_match`'s per-clone resolved-first lookup so
                 // a tuple-typed scrutinee resolves to its concrete
                 // (post-mono) Ty regardless of scrutinee shape.
-                let inner_scrut_ty = self
-                    .match_scrut_tys_resolved
-                    .get(&(self.current_fn_name.clone(), span.clone()))
-                    .cloned()
-                    .or_else(|| self.match_scrut_tys.get(span).cloned());
+                // R1: `lookup_match_scrut_ty` walks the
+                // hoisted-lambda → parent-clone chain.
+                let inner_scrut_ty = self.lookup_match_scrut_ty(span);
                 let mut inner_preview = preview.clone();
                 self.predict_pattern_bindings(
                     &arms[0].pattern,
@@ -19752,14 +19890,36 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 );
                 self.type_of_expr(&arms[0].body, &inner_preview)
             }
-            Expr::If { then_block, .. } => match &then_block.tail {
-                Some(t) => self.type_of_expr(t, preview),
-                None => types::I8,
-            },
-            Expr::Block(b) => match &b.tail {
-                Some(t) => self.type_of_expr(t, preview),
-                None => types::I8,
-            },
+            Expr::If { then_block, .. } => {
+                let mut inner = preview.clone();
+                for stmt in &then_block.stmts {
+                    if let crate::ast::Stmt::Let(l) = stmt {
+                        inner.insert(
+                            l.name.clone(),
+                            cranelift_ty_for_type_expr(&l.ty, self.pointer_ty),
+                        );
+                    }
+                }
+                match &then_block.tail {
+                    Some(t) => self.type_of_expr(t, &inner),
+                    None => types::I8,
+                }
+            }
+            Expr::Block(b) => {
+                let mut inner = preview.clone();
+                for stmt in &b.stmts {
+                    if let crate::ast::Stmt::Let(l) = stmt {
+                        inner.insert(
+                            l.name.clone(),
+                            cranelift_ty_for_type_expr(&l.ty, self.pointer_ty),
+                        );
+                    }
+                }
+                match &b.tail {
+                    Some(t) => self.type_of_expr(t, &inner),
+                    None => types::I8,
+                }
+            }
             Expr::Call { callee, span, .. } => match callee.as_ref() {
                 // Plan A3 task 41.1: constructor application returns a
                 // heap pointer to the newly-allocated user-type record.
@@ -23481,6 +23641,10 @@ mod tests {
             anf,
             lambda_captures_resolved: std::collections::BTreeMap::new(),
             match_scrut_tys_resolved: std::collections::BTreeMap::new(),
+
+            handle_body_ty_resolved: std::collections::BTreeMap::new(),
+
+            call_callee_tys_resolved: std::collections::BTreeMap::new(),
         };
         let colored = crate::color::infer_colors(mono);
         assert_eq!(
@@ -23561,6 +23725,10 @@ mod tests {
             anf,
             lambda_captures_resolved: std::collections::BTreeMap::new(),
             match_scrut_tys_resolved: std::collections::BTreeMap::new(),
+
+            handle_body_ty_resolved: std::collections::BTreeMap::new(),
+
+            call_callee_tys_resolved: std::collections::BTreeMap::new(),
         };
         // Build ColoredProgram manually with `colors[("f")] = Native`,
         // overriding what `infer_colors` would have returned. This is
@@ -23858,6 +24026,10 @@ mod tests {
                 anf,
                 lambda_captures_resolved: std::collections::BTreeMap::new(),
                 match_scrut_tys_resolved: std::collections::BTreeMap::new(),
+
+                handle_body_ty_resolved: std::collections::BTreeMap::new(),
+
+                call_callee_tys_resolved: std::collections::BTreeMap::new(),
             };
             crate::color::infer_colors(mono)
         };

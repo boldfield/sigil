@@ -226,12 +226,12 @@ discharging handler, the call short-circuits to an `Err` result.
 The `Int` return is a v1 placeholder (no `Never` type yet); the
 perform never actually returns under `catch`.
 
-### E9 — Effects: `State` for threaded state
+### E9 — Effects: `State[S]` for threaded state
 
 ```sigil
 import std.state
 
-fn comp() -> Int ![State] {
+fn comp() -> Int ![State[Int]] {
   let _: Int = perform State.set(10);
   let v: Int = perform State.get();
   v + 1
@@ -244,14 +244,13 @@ fn main() -> Int ![IO] {
 }
 ```
 
-`run_state(initial, body)` discharges the `State` effect by
-threading `initial` through every `perform State.get/set` site in
-`body`'s call tree. The discharger is a higher-order function
-defined in pure Sigil (see [`std/state.sigil`](../std/state.sigil)).
-
-In v1, **inline** `perform State.get/set` invocations work; wrapping
-them in helper functions hits the documented wrapper-fn-frame
-composition gap (`[DEVIATION Task 72]` in `PLAN_C_DEVIATIONS.md`).
+`State[S]` is parametric over the state type `S`. `run_state[A, S]
+(initial, body)` discharges the `State[S]` effect by threading
+`initial` through every `perform State.get/set` site in `body`'s call
+tree. The discharger is a higher-order function defined in pure Sigil
+(see [`std/state.sigil`](../std/state.sigil)). Both type parameters
+are inferred from the call site (e.g. `run_state(5, comp)` instantiates
+`A = Int`, `S = Int`).
 
 ### E10 — Multi-effect rows
 
@@ -739,8 +738,8 @@ files are the authoritative API reference.
 | `std.mem` | `Mem` marker effect. |
 | `std.random` | `Random` effect + `run_pseudo_random` (xorshift64; **not** cryptographic). |
 | `std.clock` | `Clock` effect + `run_os_clock` (wall-clock nanos). |
-| `std.raise` | `Raise` effect + `raise(s)` + `catch[A]`. |
-| `std.state` | `State` effect + `run_state(initial, body)`. |
+| `std.raise` | `Raise[E]` effect (generic over error type, Plan D Task 114) + `raise[A, E](e: E) -> A ![Raise[E]]` + `catch[A, E](body) -> Result[A, E] ![| e]` (row-poly residual, Plan D Task 116). |
+| `std.state` | `State[S]` effect (generic over state type, Plan D Task 119b) + `run_state[A, S](initial, body) -> A ![]`. |
 | `std.choose` | `Choose resumes: many` effect declaration; dischargers (`all_choices`, `first_choice`) deferred to v2. |
 
 ### §14 — v1 limits (deferred to v2)
@@ -758,15 +757,6 @@ for a future plan-tier slice.
   surface decision (no `()` literal).
 - **`for` / `while`:** no looping syntax; recursion is the only
   iteration mechanism. Permanent v1 surface decision.
-- **Captured-k inside lambdas across generic-fn boundaries
-  (E0145):** `Plan D Task 117`'s `Ty::Continuation` escape barrier
-  rejects captured-k inside any lambda when the program contains a
-  generic fn (monomorphization walks every reachable fn once any
-  generic exists, and continuation values cannot cross generic-
-  instantiation boundaries). Mechanical fix path: move the handler
-  into a non-generic wrapper around the generic body, or rewrite
-  the arm body to call `k(arg)` directly without intermediate
-  lambda capture. Plan-C-completion or future-PR territory.
 
 The following limits ship as **closed in v1** by Plan D and remain
 documented here as a closure log for the v1 → v2 transition:
@@ -796,6 +786,20 @@ documented here as a closure log for the v1 → v2 transition:
   (PR #56). Row vars in inner `FnTypeExpr`s resolve through the
   enclosing fn's `effect_row_var`; E0137 narrowed to fire only on
   unbound row vars.
+- **Captured-k inside lambdas across generic-fn boundaries
+  (E0145):** Closed by Plan D Task 119b. The pre-119b
+  `program_has_generics` typecheck gate was a workaround for a
+  `Substitution::apply_to_ty(Ty::Continuation)` panic in
+  monomorphization. Post-119b: mono substitutes through
+  `Ty::Continuation` (recursive op_ret/ret + preserved scope_id),
+  and per-clone resolved-Ty maps (`call_callee_tys_resolved`,
+  `handle_body_ty_resolved`) plus hoisted-lambda parent-clone
+  lookup deliver fully-substituted Tys to codegen. Soundness for
+  captured-k that escapes its handle's dynamic extent is enforced
+  at runtime via ScopeId checks (RELINK_STACK + dynamic-extent
+  dispatch). The narrower E0145 emit sites (cross-fn /
+  generic-instantiation arg-unify mismatch, cross-handle
+  scope-mismatch in `unify_ty`) remain.
 
 Each Plan-D-shipped closure cross-references its `[DEVIATION
 Task NN]` entry by task number in
