@@ -97,11 +97,16 @@ use sigil_abi::effect::{NEXT_STEP_TAG_CALL, NEXT_STEP_TAG_DISCHARGED, NEXT_STEP_
 use crate::counters::{self, CounterId};
 use crate::header::{Header, TAG_CLOSURE};
 
-/// CPS-color calling convention (see module-level docs).
+/// CPS-color calling convention (see module-level docs). Plan D Task
+/// 111c added the trailing `terminal_out: *mut TerminalResult` arg so
+/// handle-exit terminal writes from inside Cps callees propagate up
+/// the call chain via the caller-owned channel (replacing the TLS
+/// path that 111d removes).
 type CpsFn = unsafe extern "C" fn(
     closure_ptr: *mut u8,
     args_ptr: *const u64,
     args_len: u32,
+    terminal_out: *mut TerminalResult,
 ) -> *mut NextStep;
 
 /// Maximum op-arms a single handler frame can carry. Re-exported from
@@ -1339,6 +1344,7 @@ pub unsafe extern "C" fn sigil_continuation_identity(
     _closure_ptr: *const u8,
     args_ptr: *const u64,
     args_len: u32,
+    _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     // Plan B Task 55, Phase 4e captures+ Slice A — identity has
     // exactly two legitimate calling sources, both pinned by unit
@@ -1421,6 +1427,7 @@ pub unsafe extern "C" fn sigil_io_println_arm(
     _closure_ptr: *const u8,
     in_args: *const u64,
     args_len: u32,
+    _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     debug_assert!(
         args_len == 3,
@@ -1469,6 +1476,7 @@ pub unsafe extern "C" fn sigil_io_print_arm(
     _closure_ptr: *const u8,
     in_args: *const u64,
     args_len: u32,
+    _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     debug_assert!(args_len == 3);
     debug_assert!(!in_args.is_null());
@@ -1496,6 +1504,7 @@ pub unsafe extern "C" fn sigil_io_read_line_arm(
     _closure_ptr: *const u8,
     in_args: *const u64,
     args_len: u32,
+    _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     debug_assert!(args_len == 2);
     debug_assert!(!in_args.is_null());
@@ -1520,6 +1529,7 @@ pub unsafe extern "C" fn sigil_io_read_file_arm(
     _closure_ptr: *const u8,
     in_args: *const u64,
     args_len: u32,
+    _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     debug_assert!(args_len == 3);
     debug_assert!(!in_args.is_null());
@@ -1546,6 +1556,7 @@ pub unsafe extern "C" fn sigil_io_write_file_arm(
     _closure_ptr: *const u8,
     in_args: *const u64,
     args_len: u32,
+    _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     debug_assert!(args_len == 4);
     debug_assert!(!in_args.is_null());
@@ -1593,6 +1604,7 @@ pub unsafe extern "C" fn sigil_arith_error_div_by_zero_arm(
     _closure_ptr: *const u8,
     _in_args: *const u64,
     args_len: u32,
+    _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     // `arith_error_default_arm` is `-> !` (`process::exit(2)`); the
     // never-type unifies with the `*mut NextStep` return type. No
@@ -1616,6 +1628,7 @@ pub unsafe extern "C" fn sigil_arith_error_mod_by_zero_arm(
     _closure_ptr: *const u8,
     _in_args: *const u64,
     args_len: u32,
+    _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     arith_error_default_arm("remainder by zero", args_len)
 }
@@ -2085,10 +2098,13 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // SAFETY: fn_ptr came from a NextStep::Call constructed
                 // by `sigil_next_step_call` and thus reflects a CPS-color
                 // fn pointer per the documented calling convention.
+                // Plan D Task 111c — forward `out` as the 4th positional
+                // arg so handle-exit terminal writes from inside the
+                // dispatched Cps callee land in the caller-owned slot.
                 let f: CpsFn = core::mem::transmute(fn_ptr);
                 // args_buf is a stack local; the callee reads value-bytes from the pointer.
                 // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack local, no GC retention).
-                current = f(closure_ptr, args_buf.as_ptr(), arg_count);
+                current = f(closure_ptr, args_buf.as_ptr(), arg_count, out);
             }
             _ => {
                 eprintln!("sigil_run_loop: unknown NextStep tag {tag}");
@@ -2391,7 +2407,8 @@ mod tests {
         let known: u64 = 0xFEEDFACE_DEADBEEF;
         let args: [u64; 1] = [known];
         // SAFETY: gc-heap-ptr arithmetic (stack array, non-GC, outlives the call).
-        let ns = unsafe { sigil_continuation_identity(ptr::null(), args.as_ptr(), 1) };
+        let args_ptr = args.as_ptr();
+        let ns = unsafe { sigil_continuation_identity(ptr::null(), args_ptr, 1, ptr::null_mut()) };
         unsafe {
             assert_eq!((*ns).tag, NEXT_STEP_TAG_DONE);
             assert_eq!((*ns).value, known);
@@ -2459,7 +2476,8 @@ mod tests {
         // [arg, post_arm_k_closure (null), post_arm_k_fn (irrelevant)]
         let args: [u64; 3] = [known, 0xCAFE, 0xBABE];
         // SAFETY: gc-heap-ptr arithmetic (stack array, non-GC, outlives the call).
-        let ns = unsafe { sigil_continuation_identity(ptr::null(), args.as_ptr(), 3) };
+        let args_ptr = args.as_ptr();
+        let ns = unsafe { sigil_continuation_identity(ptr::null(), args_ptr, 3, ptr::null_mut()) };
         unsafe {
             assert_eq!((*ns).tag, NEXT_STEP_TAG_DONE);
             assert_eq!((*ns).value, known);

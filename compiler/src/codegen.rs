@@ -7398,19 +7398,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // sigil_run_loop, returns Done(args_ptr[0]). Rationale + hardening
     // notes: see runtime/src/handlers.rs and the
     // `[DEVIATION Task 55] Phase 4d` entry in PLAN_B_DEVIATIONS.md.
-    let mut continuation_identity_sig = Signature::new(isa_call_conv(&module));
-    continuation_identity_sig
-        .params
-        .push(AbiParam::new(pointer_ty)); // closure_ptr
-    continuation_identity_sig
-        .params
-        .push(AbiParam::new(pointer_ty)); // args_ptr
-    continuation_identity_sig
-        .params
-        .push(AbiParam::new(types::I32)); // args_len
-    continuation_identity_sig
-        .returns
-        .push(AbiParam::new(pointer_ty));
+    // Plan D Task 111c — uses the shared `cps_signature` helper so
+    // the +1 trailing terminal_out param lands here automatically.
+    let continuation_identity_sig = cps_signature(pointer_ty, &module);
     let continuation_identity = module
         .declare_function(
             "sigil_continuation_identity",
@@ -7426,11 +7416,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // then dispatches to the trailing-pair k. See `[DEVIATION Task 57]
     // Top-level handler installation in main shim` in
     // PLAN_B_DEVIATIONS.md.
-    let mut io_println_arm_sig = Signature::new(isa_call_conv(&module));
-    io_println_arm_sig.params.push(AbiParam::new(pointer_ty)); // closure_ptr
-    io_println_arm_sig.params.push(AbiParam::new(pointer_ty)); // in_args
-    io_println_arm_sig.params.push(AbiParam::new(types::I32)); // args_len
-    io_println_arm_sig.returns.push(AbiParam::new(pointer_ty));
+    // Plan D Task 111c — IO arm fns share the cps_signature shape
+    // (now (closure_ptr, args_ptr, args_len, terminal_out) -> *mut NextStep).
+    let io_println_arm_sig = cps_signature(pointer_ty, &module);
     let io_println_arm = module
         .declare_function("sigil_io_println_arm", Linkage::Import, &io_println_arm_sig)
         .map_err(|e| format!("declare sigil_io_println_arm: {e}"))?;
@@ -7472,11 +7460,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // signature shape as the IO arm. See `[DEVIATION Task 57] Top-
     // level handler installation in main shim` in
     // PLAN_B_DEVIATIONS.md.
-    let mut arith_error_arm_sig = Signature::new(isa_call_conv(&module));
-    arith_error_arm_sig.params.push(AbiParam::new(pointer_ty)); // closure_ptr
-    arith_error_arm_sig.params.push(AbiParam::new(pointer_ty)); // in_args
-    arith_error_arm_sig.params.push(AbiParam::new(types::I32)); // args_len
-    arith_error_arm_sig.returns.push(AbiParam::new(pointer_ty));
+    // Plan D Task 111c — arith error arm fns share the cps_signature
+    // shape (now 4-arg).
+    let arith_error_arm_sig = cps_signature(pointer_ty, &module);
     let arith_error_div_arm = module
         .declare_function(
             "sigil_arith_error_div_by_zero_arm",
@@ -7589,17 +7575,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 }
                 UserFnAbi::Cps => {
                     // Uniform CPS calling convention: (closure_ptr,
-                    // args_ptr, args_len) -> *mut NextStep. Matches
-                    // the synthetic-arm-fn ABI from Phase 4d and the
-                    // `cps_signature` helper. User args are unpacked
+                    // args_ptr, args_len, terminal_out) -> *mut NextStep.
+                    // Matches the synthetic-arm-fn ABI from Phase 4d and
+                    // the `cps_signature` helper. User args are unpacked
                     // from `args_ptr` at fn entry; the trailing two
-                    // slots carry (k_closure, k_fn). The fn's
-                    // declared return type is preserved as `ret_ty`
-                    // here so the native-of-CPS wrapper at call
-                    // sites knows how to narrow the trampoline's
-                    // u64 result back to the user-visible type.
+                    // slots carry (k_closure, k_fn). The fn's declared
+                    // return type is preserved as `ret_ty` here so the
+                    // native-of-CPS wrapper at call sites knows how to
+                    // narrow the trampoline's u64 result back to the
+                    // user-visible type. Plan D Task 111c added the
+                    // trailing `terminal_out: *mut TerminalResult`
+                    // positional param.
                     let sig = cps_signature(pointer_ty, &module);
-                    let param_tys = vec![pointer_ty, pointer_ty, types::I32];
+                    let param_tys = vec![pointer_ty, pointer_ty, types::I32, pointer_ty];
                     let ret_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
                     (sig, param_tys, ret_ty)
                 }
@@ -8273,12 +8261,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // load directly (pointer_ty == I64 on supported
                     // targets).
                     let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                    // PR #90 R1 issue 2 carryover — assert the new
+                    // 4-positional Cps signature shape.
+                    assert_cps_arity(&block_params, &format!("Phase B.2 Cps fn `{}`", f.name));
                     let closure_ptr = block_params[0];
                     let args_ptr = block_params[1];
                     // block_params[2] = args_len (statically known
                     // from `f.params.len()`; same redundancy as the
                     // tail-perform path).
                     let _args_len = block_params[2];
+                    // Plan D Task 111c — block_params[3] = terminal_out
+                    // (caller-passed *mut TerminalResult). Threaded into
+                    // the Lowerer below for forwarding to nested calls.
+                    let terminal_out = block_params[3];
                     let mut env: BTreeMap<String, Value> = BTreeMap::new();
                     for (i, p) in f.params.iter().enumerate() {
                         let declared_ty = cranelift_ty_for_type_expr(&p.ty, pointer_ty);
@@ -8353,9 +8348,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         env,
                         pointer_ty,
                         closure_ptr,
-                        // Plan D Task 111b — Cps body emit: terminal_out
-                        // threading lands in 111c (Cps + synth fn ABI).
-                        terminal_out_param: None,
+                        terminal_out_param: Some(terminal_out),
                         lit_gvs,
                         builtins,
                         handler_frame_new_ref,
@@ -9021,6 +9014,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         (ChainedNextStep::Perform(p), None)
                     };
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                assert_cps_arity(&block_params, &format!("Cps body emit fn `{}`", f.name));
                 let closure_ptr = block_params[0];
                 let args_ptr = block_params[1];
                 // block_params[2] = args_len; per `cps_signature`'s
@@ -9032,6 +9026,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // (e.g., a runtime-checked arity assertion in
                 // `--debug-counters` builds).
                 let _args_len = block_params[2];
+                // Plan D Task 111c — block_params[3] = terminal_out.
+                let terminal_out = block_params[3];
                 let user_arg_count = f.params.len();
 
                 // Phase 1 — unpack user args from `args_ptr` at
@@ -9389,9 +9385,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env,
                     pointer_ty,
                     closure_ptr,
-                    // Plan D Task 111b — Cps synth-cont emit: terminal_out
-                    // threading lands in 111c (Cps + synth fn ABI).
-                    terminal_out_param: None,
+                    terminal_out_param: Some(terminal_out),
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -10126,14 +10120,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // `type_of_expr` (the op's declared return type) and the actual
     // lowered Cranelift `Value` agree.
     {
-        let cps_arm_sig = {
-            let mut s = Signature::new(isa_call_conv(&module));
-            s.params.push(AbiParam::new(pointer_ty)); // closure_ptr
-            s.params.push(AbiParam::new(pointer_ty)); // args_ptr
-            s.params.push(AbiParam::new(types::I32)); // args_len
-            s.returns.push(AbiParam::new(pointer_ty)); // *mut NextStep
-            s
-        };
+        // Plan D Task 111c — use the shared `cps_signature` so the
+        // trailing terminal_out param lands here too.
+        let cps_arm_sig = cps_signature(pointer_ty, &module);
         for synth in &handler_arm_synth {
             ctx.func.signature = cps_arm_sig.clone();
             ctx.func.name = UserFuncName::user(0, synth.func_id.as_u32());
@@ -10179,11 +10168,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 // Block params: 0 = closure_ptr (null in Phase 4c),
                 // 1 = args_ptr, 2 = args_len (unused — walker
-                // enforces arity through typecheck E0141).
+                // enforces arity through typecheck E0141), 3 =
+                // terminal_out (Plan D Task 111c).
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                assert_cps_arity(&block_params, "synth-arm-fn");
                 let closure_ptr = block_params[0];
                 let args_ptr = block_params[1];
                 let _args_len = block_params[2];
+                let terminal_out = block_params[3];
 
                 // Unpack op-args from `args_ptr` and bind them in
                 // the env. Each slot is a u64; narrower declared
@@ -10285,9 +10277,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env,
                     pointer_ty,
                     closure_ptr,
-                    // Plan D Task 111b — synth-arm-fn emit: terminal_out
-                    // threading lands in 111c (Cps + synth fn ABI).
-                    terminal_out_param: None,
+                    terminal_out_param: Some(terminal_out),
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -11143,14 +11133,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 // Block params: 0 = closure_ptr, 1 = args_ptr,
                 // 2 = args_len (unused — arity fixed at 3 by the
-                // surrounding fn's dispatch). The closure_ptr is
-                // null when the return arm has no captures, or
-                // points at the alloc'd closure record otherwise
-                // (Phase 4d's `alloc_arm_closure_record` shape).
+                // surrounding fn's dispatch), 3 = terminal_out
+                // (Plan D Task 111c). The closure_ptr is null when
+                // the return arm has no captures, or points at the
+                // alloc'd closure record otherwise (Phase 4d's
+                // `alloc_arm_closure_record` shape).
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                assert_cps_arity(&block_params, "synth-return-arm-fn");
                 let closure_ptr = block_params[0];
                 let args_ptr = block_params[1];
                 let args_len = block_params[2];
+                let terminal_out = block_params[3];
 
                 // Plan B Task 55 (Phase 4g) review-fix #9: defensive
                 // arity check. The handle-exit dispatch always
@@ -11237,9 +11230,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env,
                     pointer_ty,
                     closure_ptr,
-                    // Plan D Task 111b — synth return-arm fn emit:
-                    // terminal_out threading lands in 111c.
-                    terminal_out_param: None,
+                    terminal_out_param: Some(terminal_out),
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -11427,9 +11418,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // synth-cont's `Call(post_arm_k_*, [...])` which always
             // emits arg_count=1; not bound here — the invariant is
             // documented and enforced at the synth-cont's dispatch
-            // site, not re-checked here).
+            // site, not re-checked here);
+            // block_params[3] = terminal_out (Plan D Task 111c).
+            assert_cps_arity(&block_params, "post-arm-k synth fn");
 
             let args_ptr = block_params[1];
+            let terminal_out = block_params[3];
             let r_widened = builder
                 .ins()
                 .load(types::I64, MemFlags::trusted(), args_ptr, 0);
@@ -11522,9 +11516,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 env,
                 pointer_ty,
                 closure_ptr,
-                // Plan D Task 111b — post-arm-k synth fn emit: terminal_out
-                // threading lands in 111c (Cps + synth fn ABI).
-                terminal_out_param: None,
+                terminal_out_param: Some(terminal_out),
                 lit_gvs,
                 builtins,
                 handler_frame_new_ref,
@@ -11675,8 +11667,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     builder.seal_block(block);
 
                     let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                    assert_cps_arity(&block_params, "synth-cont body emit");
                     let synth_closure_ptr = block_params[0];
                     let args_ptr = block_params[1];
+                    // Plan D Task 111c — block_params[3] = terminal_out.
+                    let terminal_out = block_params[3];
 
                     // Read this step's bound arg from args_ptr[0],
                     // narrow per binding_ty.
@@ -11819,9 +11814,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         env,
                         pointer_ty,
                         closure_ptr: synth_closure_ptr,
-                        // Plan D Task 111b — synth-cont body emit:
-                        // terminal_out threading lands in 111c.
-                        terminal_out_param: None,
+                        terminal_out_param: Some(terminal_out),
                         lit_gvs,
                         builtins,
                         handler_frame_new_ref,
@@ -12396,8 +12389,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // post_arm_k pair (which for tail-`k` arms is
                         // `(null, identity)` — the chain terminates
                         // with `Done(tail_value)`).
+                        assert_cps_arity(&block_params, "chained-let-bind synth-cont");
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
+                        // Plan D Task 111c — block_params[3] = terminal_out.
+                        let terminal_out = block_params[3];
 
                         // Plan D Task 112a — Risk 3 protection POP.
                         // If this step's predecessor in the chain was
@@ -12545,9 +12541,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             env,
                             pointer_ty,
                             closure_ptr,
-                            // Plan D Task 111b — synth-cont body emit:
-                            // terminal_out threading lands in 111c.
-                            terminal_out_param: None,
+                            terminal_out_param: Some(terminal_out),
                             lit_gvs,
                             builtins,
                             handler_frame_new_ref,
@@ -13986,8 +13980,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // a typecheck-derived prediction was dropped
                         // per PR #76 review — actual widen logic uses
                         // `dfg.value_type(tail_value)` directly).
+                        assert_cps_arity(&block_params, "Final synth-cont");
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
+                        // Plan D Task 111c — block_params[3] = terminal_out.
+                        let terminal_out = block_params[3];
 
                         let mut env: BTreeMap<String, Value> = BTreeMap::new();
 
@@ -14116,9 +14113,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             env,
                             pointer_ty,
                             closure_ptr,
-                            // Plan D Task 111b — synth-cont body emit:
-                            // terminal_out threading lands in 111c.
-                            terminal_out_param: None,
+                            terminal_out_param: Some(terminal_out),
                             lit_gvs,
                             builtins,
                             handler_frame_new_ref,
@@ -14600,11 +14595,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let args_ptr = builder.ins().stack_addr(pointer_ty, slot, 0);
         let args_len_v = builder.ins().iconst(types::I32, user_arg_count as i64);
 
-        // Call the underlying Cps fn.
+        // Call the underlying Cps fn. Plan D Task 111c — forward
+        // the Sync shim's `terminal_out` (block-param-bound at fn
+        // entry) as the trailing 4th arg, matching the new
+        // cps_signature shape.
         let cps_fn_ref = module.declare_func_in_func(entry.func_id, builder.func);
-        let cps_call = builder
-            .ins()
-            .call(cps_fn_ref, &[closure_ptr_v, args_ptr, args_len_v]);
+        let cps_call = builder.ins().call(
+            cps_fn_ref,
+            &[closure_ptr_v, args_ptr, args_len_v, terminal_out_v],
+        );
         let next_step = builder.inst_results(cps_call)[0];
 
         // Task 78.5 G4 Approach 6 deep-redo (PR #80 review §1) —
@@ -14732,19 +14731,32 @@ struct Lowerer<'a, 'b> {
     /// 8-byte header and the 8-byte code_ptr word).
     closure_ptr: Value,
 
-    /// Plan D Task 111b — Last arg of the current Sync user fn's entry
-    /// block: the caller-passed `*mut TerminalResult` pointer for the
-    /// terminal channel (`out` parameter of `sigil_run_loop`). Threaded
-    /// through every Sync ABI call site (`lower_call`'s Sync branch
-    /// passes this to Sync callees) and through every Sync→Cps interop
-    /// wrapper that drives `sigil_run_loop` (the run_loop call passes
-    /// this as `out` instead of null).
+    /// Plan D Task 111b/c — the surrounding fn's caller-passed
+    /// `*mut TerminalResult` pointer for the terminal channel (`out`
+    /// parameter of `sigil_run_loop`). Bound from the trailing block
+    /// param of the surrounding fn at fn entry; threaded through every
+    /// call site that needs to forward the terminal slot:
     ///
-    /// `None` for Lowerers constructed for non-user-Sync-fn contexts
-    /// (e.g., synth-cont fn body emit, lifted-lambda emit). Those
-    /// contexts are addressed by 111c (Cps + synth fn ABI threading).
-    /// Until 111c lands, sigil_run_loop call sites in those contexts
-    /// still pass null.
+    /// - **Sync ABI calls** (`lower_call`'s Sync branch + IIFE direct-
+    ///   call + `call_indirect` via closure record): passed as the
+    ///   trailing positional arg.
+    /// - **Direct Cps fn calls** (`lower_call`'s Cps branch +
+    ///   `lower_handle_body_direct_cps_call` + Sync shim's underlying
+    ///   Cps call): passed as the 4th positional arg per `cps_signature`.
+    /// - **`sigil_run_loop` invocations** (handle body's nested
+    ///   run_loop, perform-side run_loop drive, branched k-call
+    ///   dispatch, Slice B fallback, return-arm dispatch): passed as
+    ///   the `out` argument so handle-exit terminal writes inside the
+    ///   driven trampoline land in the caller's slot.
+    ///
+    /// **Post-111c invariant:** every Lowerer construction site
+    /// populates `Some(...)` from the surrounding fn's trailing ABI
+    /// block param (Sync user fn body emit, all Cps body emit shapes,
+    /// synth-arm fn, synth return-arm fn, post-arm-k synth fn,
+    /// chained-let-bind synth-cont, Final synth-cont). The `Option`
+    /// type and the helper's null-fallback branch (`terminal_out_or_-
+    /// null`) persist for one PR — 111d removes the TLS path and
+    /// relaxes this to plain `Value` alongside the cleanup.
     terminal_out_param: Option<Value>,
 
     /// Per-string-literal `(span, GV, byte-length)` tuples declared at
@@ -15071,19 +15083,28 @@ fn body_as_direct_cps_call_with_lookup(
 
 impl<'a, 'b> Lowerer<'a, 'b> {
     /// Plan D Task 111b — yield `terminal_out` for forwarding into a
-    /// Sync-ABI call or `sigil_run_loop`. Returns the threaded pointer
-    /// when the surrounding fn is a Sync user fn (`terminal_out_param`
-    /// was bound from the trailing block param at fn entry); otherwise
-    /// emits a fresh null `iconst`. Cps and synth-cont contexts hit
-    /// the null branch until 111c threads `terminal_out` through the
-    /// Cps + synth fn ABIs.
+    /// Sync-ABI call or `sigil_run_loop`.
     ///
-    /// When 111c lands and every Lowerer construction site sets
-    /// `terminal_out_param: Some(...)`, this method's `unwrap_or_else`
-    /// branch becomes dead code and the method collapses to a single
-    /// `unwrap()` (or the field type relaxes from `Option<Value>` to
-    /// `Value` and call sites read it directly).
+    /// **Plan D Task 111c update.** Every Lowerer construction site
+    /// now populates `terminal_out_param` from the surrounding fn's
+    /// trailing ABI block param (Sync user fn, Cps user fn body emit,
+    /// synth-arm fn, synth return-arm fn, post-arm-k synth fn,
+    /// chained-let-bind synth-cont, Final synth-cont) — the field is
+    /// `Some(...)` everywhere a Lowerer is constructed. The helper
+    /// retains the `Option<Value>` field type for one more PR (111d
+    /// removes the TLS path and is the natural place to relax the
+    /// type) and asserts the invariant in debug builds; the
+    /// `unwrap_or_else` null-fallback branch shipped in 111b is
+    /// dead but kept defensive against any future construction site
+    /// added without populating the field.
     fn terminal_out_or_null(&mut self) -> Value {
+        debug_assert!(
+            self.terminal_out_param.is_some(),
+            "Plan D Task 111c invariant: every Lowerer construction site \
+             must populate terminal_out_param from the surrounding fn's \
+             trailing ABI block param. None reached the call sites — a \
+             new Lowerer site likely shipped without wiring the field."
+        );
         self.terminal_out_param
             .unwrap_or_else(|| self.builder.ins().iconst(self.pointer_ty, 0))
     }
@@ -15240,12 +15261,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let args_ptr = self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
         let args_len = self.builder.ins().iconst(types::I32, user_arg_count as i64);
 
+        // Plan D Task 111c — forward caller's terminal_out as the
+        // 4th positional arg per the new cps_signature shape.
         let func_ref = self.user_fn_refs[name];
         let null_closure_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
-        let cps_call = self
-            .builder
-            .ins()
-            .call(func_ref, &[null_closure_ptr, args_ptr, args_len]);
+        let terminal_out = self.terminal_out_or_null();
+        let cps_call = self.builder.ins().call(
+            func_ref,
+            &[null_closure_ptr, args_ptr, args_len, terminal_out],
+        );
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, cps_call));
         let next_step = self.builder.inst_results(cps_call)[0];
@@ -17742,12 +17766,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         // args_len=0` contract.
                         let args_len = self.builder.ins().iconst(types::I32, user_arg_count as i64);
 
+                        // Plan D Task 111c — forward caller's
+                        // terminal_out as the 4th positional arg.
                         let func_ref = self.user_fn_refs[name];
                         let null_closure_ptr = self.builder.ins().iconst(self.pointer_ty, 0);
-                        let cps_call = self
-                            .builder
-                            .ins()
-                            .call(func_ref, &[null_closure_ptr, args_ptr, args_len]);
+                        let terminal_out = self.terminal_out_or_null();
+                        let cps_call = self.builder.ins().call(
+                            func_ref,
+                            &[null_closure_ptr, args_ptr, args_len, terminal_out],
+                        );
                         self.stackmap
                             .push_placeholder(function_code_offset(&self.builder, cps_call));
                         let next_step = self.builder.inst_results(cps_call)[0];
@@ -18503,25 +18530,39 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         "codegen: closure-record code_fn_name `{code_fn_name}` not registered"
                     )
                 });
-                // Plan D Task 111b — the hoisted closure-converted fn
-                // is registered through the same Sync/Cps ABI pre-pass
-                // as user-declared fns. For Sync ABI callees (the
-                // common IIFE / lambda-as-value path), the trailing
-                // `terminal_out` param must be threaded; Cps-ABI
-                // callees (`compute_user_fn_abi` returns Cps) keep
-                // the 3-arg shape and 111c will plumb terminal_out
-                // for those too. The callee's `UserFnEntry` is
-                // looked up by the unmangled `code_fn_name`.
-                //
                 // PR #90 R1 issue 1 — `user_fn_refs` and `user_fns`
                 // share keys (both populated from the same `Item::Fn`
-                // pre-pass; see codegen.rs invariant near `user_fn_refs`
-                // construction). The miss arm mirrors the
-                // `unreachable!()` discipline at 17615 (direct-Sync
-                // branch) and 14245 (IIFE call path) so a future
-                // refactor that diverges the two maps trips a panic
-                // instead of silently emitting a Sync-ABI call against
-                // a Cps callee (stack-corrupting ABI mismatch).
+                // pre-pass). The miss arm mirrors the `unreachable!()`
+                // discipline at the direct-Sync branch and the IIFE
+                // call path so a future refactor that diverges the
+                // two maps trips a panic instead of silently emitting
+                // a Sync-ABI call against a Cps callee.
+                //
+                // PR #91 R1 issue 1 — this branch fires only on
+                // `Call(ClosureRecord, args)` (IIFE / lambda-as-value
+                // direct call). closure_convert produces ClosureRecord
+                // for both top-level fn references (`let f = fn_name`
+                // → ClosureRecord{code_fn_name: name, env_exprs: []})
+                // and Lambda IIFE (`(\x -> body)(arg)` → Call{callee:
+                // ClosureRecord{...}, args}). The latter's
+                // ClosureRecord names a hoisted `$lambda_N` whose ABI
+                // is determined by `compute_user_fn_abi` against its
+                // body shape. The call shape emitted here is
+                // Sync-style (`closure_ptr + positional user args +
+                // terminal_out`); a Cps callee (signature `(closure,
+                // args_ptr, args_len, terminal_out) -> *NextStep`)
+                // would mismatch this shape and Cranelift's verifier
+                // would reject the IR. Therefore the Cps branch is
+                // structurally unreachable on this path. If a future
+                // closure-conversion change ever produces an IIFE
+                // against a Cps-ABI hoisted lambda, this assert
+                // surfaces the ABI gap concretely instead of relying
+                // on Cranelift's rejection downstream — at which
+                // point the right fix is to ship Cps lowering here
+                // (mirroring `lower_call`'s named-Cps direct-call
+                // branch's packed-args + identity-k pair shape) AND
+                // route through the Sync shim from `sync_shim_refs`
+                // rather than the underlying Cps `user_fn_refs` entry.
                 let callee_abi = match self.user_fns.get(code_fn_name) {
                     Some(e) => e.abi,
                     None => unreachable!(
@@ -18529,13 +18570,23 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                          user_fn_refs but missing from user_fns — pre-pass invariant violated"
                     ),
                 };
+                if callee_abi != UserFnAbi::Sync {
+                    unreachable!(
+                        "codegen ClosureRecord direct-call: callee `{code_fn_name}` has \
+                         non-Sync ABI ({callee_abi:?}) — this branch's call shape is \
+                         Sync-style (closure_ptr + positional args + terminal_out); a Cps \
+                         callee would require packed-args + (k_closure, k_fn) trailing pair \
+                         + Sync shim routing. closure_convert is not expected to produce \
+                         a ClosureRecord-as-callee against a Cps-ABI hoisted lambda; if \
+                         this fires, ship the Cps lowering here mirroring `lower_call`'s \
+                         named-Cps direct-call branch."
+                    );
+                }
+                let terminal_out = self.terminal_out_or_null();
                 let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
                 all_args.push(closure_value);
                 all_args.extend(arg_vals);
-                if callee_abi == UserFnAbi::Sync {
-                    let terminal_out = self.terminal_out_or_null();
-                    all_args.push(terminal_out);
-                }
+                all_args.push(terminal_out);
                 let call = self.builder.ins().call(func_ref, &all_args);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
@@ -20084,10 +20135,19 @@ fn isa_call_conv(_m: &ObjectModule) -> isa::CallConv {
 }
 
 /// Plan B Task 55, Phase 4d / 4e — uniform CPS calling convention used
-/// by every CPS-form fn callable from the trampoline:
+/// by every CPS-form fn callable from the trampoline. Plan D Task 111c
+/// adds the trailing `terminal_out: *mut TerminalResult` arg so handle-
+/// exit terminal writes from inside Cps callees propagate up the call
+/// chain via the caller-owned channel (replacing the TLS path that
+/// 111d removes).
 ///
 /// ```text
-/// extern "C" fn(closure_ptr: *const u8, args_ptr: *const u64, args_len: u32) -> *mut NextStep
+/// extern "C" fn(
+///     closure_ptr: *const u8,
+///     args_ptr: *const u64,
+///     args_len: u32,
+///     terminal_out: *mut TerminalResult,
+/// ) -> *mut NextStep
 /// ```
 ///
 /// At HEAD this signature is shared by:
@@ -20121,8 +20181,25 @@ fn cps_signature(pointer_ty: Type, module: &ObjectModule) -> Signature {
     sig.params.push(AbiParam::new(pointer_ty)); // closure_ptr
     sig.params.push(AbiParam::new(pointer_ty)); // args_ptr
     sig.params.push(AbiParam::new(types::I32)); // args_len
+    sig.params.push(AbiParam::new(pointer_ty)); // terminal_out (Plan D Task 111c)
     sig.returns.push(AbiParam::new(pointer_ty)); // *mut NextStep
     sig
+}
+
+/// Plan D Task 111c — debug-only arity check for every Cps body emit
+/// site (Cps user fns + synth-arm + synth return-arm + post-arm-k +
+/// synth-cont + Final synth-cont). Asserts `block_params.len() == 4`
+/// matching `cps_signature`'s shape: `[closure_ptr, args_ptr,
+/// args_len, terminal_out]`. `site` names the emit context for the
+/// failure message so the reader knows which body emit drifted.
+fn assert_cps_arity(block_params: &[Value], site: &str) {
+    debug_assert_eq!(
+        block_params.len(),
+        4,
+        "codegen {site}: block_params has {} entries (expected 4 for \
+         [closure_ptr, args_ptr, args_len, terminal_out])",
+        block_params.len(),
+    );
 }
 
 /// Plan B Task 55, Phase 4d/4e — `args_len` convention for the CPS
