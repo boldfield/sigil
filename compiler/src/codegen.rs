@@ -3417,12 +3417,9 @@ fn collect_branch_chain_allocs(
                             crate::ast::Expr::Perform(p) => {
                                 branch_steps.push(ChainedNextStep::Perform(p.clone()));
                                 branch_binding_names.push(l.name.clone());
-                                branch_binding_tys.push(
-                                    cranelift_ty_for_type_expr(&l.ty, pointer_ty),
-                                );
-                                branch_binding_kinds.push(
-                                    slot_kind_for_type_expr_post_mono(&l.ty),
-                                );
+                                branch_binding_tys
+                                    .push(cranelift_ty_for_type_expr(&l.ty, pointer_ty));
+                                branch_binding_kinds.push(slot_kind_for_type_expr_post_mono(&l.ty));
                                 seen_yield = true;
                             }
                             _ => {
@@ -3488,9 +3485,9 @@ fn collect_branch_chain_allocs(
 
                 // Classify the inner tail to determine the last
                 // step's dispatch kind.
-                let inner_leaf_kind = classify_branched_cps_tail_branch_expr(
-                    tail, ctors, is_supported,
-                ).unwrap_or(BranchedCpsLeaf::Pure);
+                let inner_leaf_kind =
+                    classify_branched_cps_tail_branch_expr(tail, ctors, is_supported)
+                        .unwrap_or(BranchedCpsLeaf::Pure);
 
                 let inner_tail_ty = cranelift_ty_for_type_expr(return_type, pointer_ty);
 
@@ -3554,7 +3551,11 @@ fn seed_branch_work<'a>(
     tail: &'a crate::ast::Expr,
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
-    work: &mut Vec<(&'a [crate::ast::Stmt], &'a crate::ast::Expr, BranchedCpsLeaf)>,
+    work: &mut Vec<(
+        &'a [crate::ast::Stmt],
+        &'a crate::ast::Expr,
+        BranchedCpsLeaf,
+    )>,
 ) {
     use crate::ast::{Expr, Pattern};
     match tail {
@@ -3575,12 +3576,14 @@ fn seed_branch_work<'a>(
                 }
             }
         }
-        Expr::Match {
-            arms, ..
-        } => {
+        Expr::Match { arms, .. } => {
             if arms.len() == 2 {
                 let extract_bool = |p: &Pattern| -> Option<bool> {
-                    if let Pattern::BoolLit(b, _) = p { Some(*b) } else { None }
+                    if let Pattern::BoolLit(b, _) = p {
+                        Some(*b)
+                    } else {
+                        None
+                    }
                 };
                 if let (Some(a0), Some(a1)) = (
                     extract_bool(&arms[0].pattern),
@@ -3592,18 +3595,23 @@ fn seed_branch_work<'a>(
                         } else {
                             (&arms[1], &arms[0])
                         };
-                        let extract_arm = |body: &'a Expr| -> Option<(&'a [crate::ast::Stmt], &'a Expr)> {
-                            if let Expr::Block(b) = body {
-                                Some((b.stmts.as_slice(), b.tail.as_ref()?))
-                            } else {
-                                Some((&[], body))
-                            }
-                        };
+                        let extract_arm =
+                            |body: &'a Expr| -> Option<(&'a [crate::ast::Stmt], &'a Expr)> {
+                                if let Expr::Block(b) = body {
+                                    Some((b.stmts.as_slice(), b.tail.as_ref()?))
+                                } else {
+                                    Some((&[], body))
+                                }
+                            };
                         let then_kind = classify_branched_cps_tail_branch_expr(
-                            &then_arm.body, ctors, is_supported,
+                            &then_arm.body,
+                            ctors,
+                            is_supported,
                         );
                         let else_kind = classify_branched_cps_tail_branch_expr(
-                            &else_arm.body, ctors, is_supported,
+                            &else_arm.body,
+                            ctors,
+                            is_supported,
                         );
                         if let (Some(tk), Some(ek)) = (then_kind, else_kind) {
                             if let Some((es, et)) = extract_arm(&else_arm.body) {
@@ -5456,17 +5464,13 @@ fn collect_handle_arms_in_expr(
                     None
                 };
 
-                let arm_effect_id = ctx
-                    .effect_ids
-                    .get(&arm.effect)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "codegen pre-pass: effect `{}` missing from effect_ids \
+                let arm_effect_id = ctx.effect_ids.get(&arm.effect).copied().unwrap_or_else(|| {
+                    panic!(
+                        "codegen pre-pass: effect `{}` missing from effect_ids \
                              — typecheck should have caught this",
-                            arm.effect
-                        )
-                    });
+                        arm.effect
+                    )
+                });
                 out.synth.push(HandlerArmSynth {
                     func_id,
                     body: rewritten_body,
@@ -7861,9 +7865,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // sigil_repush_crossed_frames(target_frame: *mut HandlerFrame) -> u32
     let mut repush_crossed_sig = Signature::new(isa_call_conv(&module));
     repush_crossed_sig.params.push(AbiParam::new(pointer_ty));
-    repush_crossed_sig
-        .returns
-        .push(AbiParam::new(types::I32));
+    repush_crossed_sig.returns.push(AbiParam::new(types::I32));
     let repush_crossed_frames = module
         .declare_function(
             "sigil_repush_crossed_frames",
@@ -8674,14 +8676,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         &f.name,
                         pointer_ty,
                         &ctors,
-                        &|n: &str| {
-                            is_supported_cps_user_fn(
-                                n,
-                                &fns_by_name,
-                                &cc.colored,
-                                &ctors,
-                            )
-                        },
+                        &|n: &str| is_supported_cps_user_fn(n, &fns_by_name, &cc.colored, &ctors),
                         &synth_cont_sig,
                         &mut module,
                         &mut cps_continuation_synth,
@@ -9332,9 +9327,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         effect_ids: &checked.effect_ids,
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
-                    arm_effect_id: None,
-                    repush_crossed_frames_ref,
-                    pop_crossed_frames_ref,
+                        arm_effect_id: None,
+                        repush_crossed_frames_ref,
+                        pop_crossed_frames_ref,
                         user_fn_refs,
                         sync_shim_refs,
                         user_fns: &user_fns,
@@ -10826,9 +10821,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
-                    arm_effect_id: None,
-                    repush_crossed_frames_ref,
-                    pop_crossed_frames_ref,
+                arm_effect_id: None,
+                repush_crossed_frames_ref,
+                pop_crossed_frames_ref,
                 user_fn_refs,
                 sync_shim_refs,
                 user_fns: &user_fns,
@@ -12628,9 +12623,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
-                    arm_effect_id: None,
-                    repush_crossed_frames_ref,
-                    pop_crossed_frames_ref,
+                arm_effect_id: None,
+                repush_crossed_frames_ref,
+                pop_crossed_frames_ref,
                 user_fn_refs,
                 sync_shim_refs,
                 user_fns: &user_fns,
@@ -12933,9 +12928,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         effect_ids: &checked.effect_ids,
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
-                    arm_effect_id: None,
-                    repush_crossed_frames_ref,
-                    pop_crossed_frames_ref,
+                        arm_effect_id: None,
+                        repush_crossed_frames_ref,
+                        pop_crossed_frames_ref,
                         user_fn_refs,
                         sync_shim_refs,
                         user_fns: &user_fns,
@@ -13667,9 +13662,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
-                    arm_effect_id: None,
-                    repush_crossed_frames_ref,
-                    pop_crossed_frames_ref,
+                            arm_effect_id: None,
+                            repush_crossed_frames_ref,
+                            pop_crossed_frames_ref,
                             user_fn_refs,
                             sync_shim_refs,
                             user_fns: &user_fns,
@@ -14393,7 +14388,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 // by the branch chain.
                                                 for stmt in leaf_stmts {
                                                     if let crate::ast::Stmt::Let(l) = stmt {
-                                                        if matches!(&l.value, crate::ast::Expr::Perform(_)) {
+                                                        if matches!(
+                                                            &l.value,
+                                                            crate::ast::Expr::Perform(_)
+                                                        ) {
                                                             break;
                                                         }
                                                         let v = lowerer.lower_expr(&l.value);
@@ -14442,10 +14440,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     .builder
                                                     .ins()
                                                     .iconst(pointer_ty, branch_payload);
-                                                let balloc = lowerer
-                                                    .builder
-                                                    .ins()
-                                                    .call(lowerer.builtins.alloc_ref, &[bh_v, bp_v]);
+                                                let balloc = lowerer.builder.ins().call(
+                                                    lowerer.builtins.alloc_ref,
+                                                    &[bh_v, bp_v],
+                                                );
                                                 lowerer.stackmap.push_placeholder(
                                                     function_code_offset(&lowerer.builder, balloc),
                                                 );
@@ -14510,16 +14508,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 // trailing slots.
                                                 let branch_k_closure_off: i32 =
                                                     16 + 8 * branch_cap_count as i32;
-                                                let branch_k_fn_off: i32 =
-                                                    branch_k_closure_off + 8;
+                                                let branch_k_fn_off: i32 = branch_k_closure_off + 8;
                                                 // Load caller_k_pair from
                                                 // the FINAL step's closure
                                                 // record's trailing slots.
                                                 let caller_k_closure_off: i32 = 16
                                                     + 8 * (captures.len() + prior_bindings.len())
                                                         as i32;
-                                                let caller_k_fn_off: i32 =
-                                                    caller_k_closure_off + 8;
+                                                let caller_k_fn_off: i32 = caller_k_closure_off + 8;
                                                 let ck_closure = lowerer.builder.ins().load(
                                                     pointer_ty,
                                                     MemFlags::trusted(),
@@ -14571,72 +14567,59 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                                                 // Pack perform args.
                                                 let user_arg_count = first_perform.args.len();
-                                                let (args_ptr_v, args_len_v) =
-                                                    if first_perform.args.is_empty() {
-                                                        (
-                                                            lowerer
-                                                                .builder
-                                                                .ins()
-                                                                .iconst(pointer_ty, 0),
-                                                            lowerer
-                                                                .builder
-                                                                .ins()
-                                                                .iconst(types::I32, 0),
-                                                        )
-                                                    } else {
-                                                        let arg_values: Vec<Value> = first_perform
-                                                            .args
-                                                            .iter()
-                                                            .map(|a| lowerer.lower_expr(a))
-                                                            .collect();
-                                                        let slot_bytes =
-                                                            (user_arg_count * 8) as u32;
-                                                        let slot = lowerer
-                                                            .builder
-                                                            .create_sized_stack_slot(
-                                                                StackSlotData::new(
-                                                                    StackSlotKind::ExplicitSlot,
-                                                                    slot_bytes,
-                                                                    3,
-                                                                ),
-                                                            );
-                                                        for (i, v) in
-                                                            arg_values.iter().enumerate()
-                                                        {
-                                                            let at = lowerer
-                                                                .builder
-                                                                .func
-                                                                .dfg
-                                                                .value_type(*v);
-                                                            let w = if at == types::I64 {
-                                                                *v
-                                                            } else if at.is_int()
-                                                                && at.bits() < 64
-                                                            {
-                                                                lowerer
-                                                                    .builder
-                                                                    .ins()
-                                                                    .uextend(types::I64, *v)
-                                                            } else {
-                                                                *v
-                                                            };
-                                                            lowerer.builder.ins().stack_store(
-                                                                w,
-                                                                slot,
-                                                                (i * 8) as i32,
-                                                            );
-                                                        }
-                                                        (
-                                                            lowerer
-                                                                .builder
-                                                                .ins()
-                                                                .stack_addr(pointer_ty, slot, 0),
-                                                            lowerer.builder.ins().iconst(
-                                                                types::I32,
-                                                                user_arg_count as i64,
+                                                let (args_ptr_v, args_len_v) = if first_perform
+                                                    .args
+                                                    .is_empty()
+                                                {
+                                                    (
+                                                        lowerer.builder.ins().iconst(pointer_ty, 0),
+                                                        lowerer.builder.ins().iconst(types::I32, 0),
+                                                    )
+                                                } else {
+                                                    let arg_values: Vec<Value> = first_perform
+                                                        .args
+                                                        .iter()
+                                                        .map(|a| lowerer.lower_expr(a))
+                                                        .collect();
+                                                    let slot_bytes = (user_arg_count * 8) as u32;
+                                                    let slot =
+                                                        lowerer.builder.create_sized_stack_slot(
+                                                            StackSlotData::new(
+                                                                StackSlotKind::ExplicitSlot,
+                                                                slot_bytes,
+                                                                3,
                                                             ),
-                                                        )
-                                                    };
+                                                        );
+                                                    for (i, v) in arg_values.iter().enumerate() {
+                                                        let at =
+                                                            lowerer.builder.func.dfg.value_type(*v);
+                                                        let w = if at == types::I64 {
+                                                            *v
+                                                        } else if at.is_int() && at.bits() < 64 {
+                                                            lowerer
+                                                                .builder
+                                                                .ins()
+                                                                .uextend(types::I64, *v)
+                                                        } else {
+                                                            *v
+                                                        };
+                                                        lowerer.builder.ins().stack_store(
+                                                            w,
+                                                            slot,
+                                                            (i * 8) as i32,
+                                                        );
+                                                    }
+                                                    (
+                                                        lowerer
+                                                            .builder
+                                                            .ins()
+                                                            .stack_addr(pointer_ty, slot, 0),
+                                                        lowerer.builder.ins().iconst(
+                                                            types::I32,
+                                                            user_arg_count as i64,
+                                                        ),
+                                                    )
+                                                };
 
                                                 // Declare branch step_0
                                                 // func ref.
@@ -15780,12 +15763,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                                 // Load caller_k_pair from this synth-
                                 // cont's closure record's trailing slots.
-                                let branch_cap_count =
-                                    captures.len() + prior_bindings.len();
-                                let caller_k_closure_off: i32 =
-                                    16 + 8 * branch_cap_count as i32;
-                                let caller_k_fn_off: i32 =
-                                    caller_k_closure_off + 8;
+                                let branch_cap_count = captures.len() + prior_bindings.len();
+                                let caller_k_closure_off: i32 = 16 + 8 * branch_cap_count as i32;
+                                let caller_k_fn_off: i32 = caller_k_closure_off + 8;
                                 let caller_k_closure = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -15800,8 +15780,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 );
 
                                 match inner_leaf_kind {
-                                    BranchedCpsLeaf::Pure
-                                    | BranchedCpsLeaf::Nested => {
+                                    BranchedCpsLeaf::Pure | BranchedCpsLeaf::Nested => {
                                         // Standard tail lowering:
                                         // lower_expr + gate dispatch.
                                         lowerer.emit_terminal_out_reset_to_done();
@@ -15810,13 +15789,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                                         let widened = if *tail_ty == types::I64 {
                                             v
-                                        } else if tail_ty.is_int()
-                                            && tail_ty.bits() < 64
-                                        {
-                                            lowerer
-                                                .builder
-                                                .ins()
-                                                .uextend(types::I64, v)
+                                        } else if tail_ty.is_int() && tail_ty.bits() < 64 {
+                                            lowerer.builder.ins().uextend(types::I64, v)
                                         } else {
                                             v
                                         };
@@ -15829,14 +15803,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         // [widened, null, null], 3)
                                         // if caller_k_fn != null;
                                         // else Done(widened).
-                                        let null_v = lowerer
-                                            .builder
-                                            .ins()
-                                            .iconst(pointer_ty, 0);
-                                        let is_null = lowerer
-                                            .builder
-                                            .ins()
-                                            .icmp(IntCC::Equal, caller_k_fn, null_v);
+                                        let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                                        let is_null = lowerer.builder.ins().icmp(
+                                            IntCC::Equal,
+                                            caller_k_fn,
+                                            null_v,
+                                        );
                                         let done_blk = lowerer.builder.create_block();
                                         let call_blk = lowerer.builder.create_block();
                                         lowerer.builder.ins().brif(
@@ -15850,56 +15822,41 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         // Done path.
                                         lowerer.builder.switch_to_block(done_blk);
                                         lowerer.builder.seal_block(done_blk);
-                                        let done_call = lowerer.builder.ins().call(
-                                            lowerer.next_step_discharged_ref,
-                                            &[widened],
-                                        );
-                                        lowerer.stackmap.push_placeholder(
-                                            function_code_offset(
-                                                &lowerer.builder,
-                                                done_call,
-                                            ),
-                                        );
-                                        let done_ns =
-                                            lowerer.builder.inst_results(done_call)[0];
+                                        let done_call = lowerer
+                                            .builder
+                                            .ins()
+                                            .call(lowerer.next_step_discharged_ref, &[widened]);
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            done_call,
+                                        ));
+                                        let done_ns = lowerer.builder.inst_results(done_call)[0];
                                         lowerer.builder.ins().return_(&[done_ns]);
 
                                         // Call-k path: NextStep::Call(
                                         // caller_k_fn, [widened], 3).
                                         lowerer.builder.switch_to_block(call_blk);
                                         lowerer.builder.seal_block(call_blk);
-                                        let arg_count_v = lowerer
-                                            .builder
-                                            .ins()
-                                            .iconst(types::I32, 3i64);
+                                        let arg_count_v =
+                                            lowerer.builder.ins().iconst(types::I32, 3i64);
                                         let call_ns = lowerer.builder.ins().call(
                                             lowerer.next_step_call_ref,
-                                            &[
-                                                caller_k_closure,
-                                                caller_k_fn,
-                                                arg_count_v,
-                                            ],
+                                            &[caller_k_closure, caller_k_fn, arg_count_v],
                                         );
-                                        lowerer.stackmap.push_placeholder(
-                                            function_code_offset(
-                                                &lowerer.builder,
-                                                call_ns,
-                                            ),
-                                        );
-                                        let call_ns_ptr =
-                                            lowerer.builder.inst_results(call_ns)[0];
-                                        let argp_call = lowerer.builder.ins().call(
-                                            lowerer.next_step_args_ptr_ref,
-                                            &[call_ns_ptr],
-                                        );
-                                        lowerer.stackmap.push_placeholder(
-                                            function_code_offset(
-                                                &lowerer.builder,
-                                                argp_call,
-                                            ),
-                                        );
-                                        let argp =
-                                            lowerer.builder.inst_results(argp_call)[0];
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            call_ns,
+                                        ));
+                                        let call_ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                                        let argp_call = lowerer
+                                            .builder
+                                            .ins()
+                                            .call(lowerer.next_step_args_ptr_ref, &[call_ns_ptr]);
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            argp_call,
+                                        ));
+                                        let argp = lowerer.builder.inst_results(argp_call)[0];
                                         lowerer.builder.ins().store(
                                             MemFlags::trusted(),
                                             widened,
@@ -15919,30 +15876,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             argp,
                                             16,
                                         );
-                                        lowerer
-                                            .builder
-                                            .ins()
-                                            .return_(&[call_ns_ptr]);
+                                        lowerer.builder.ins().return_(&[call_ns_ptr]);
                                     }
                                     BranchedCpsLeaf::CpsCall => {
                                         // Emit NextStep::Call with
                                         // caller_k_pair forwarded.
-                                        let (callee_name, call_args) =
-                                            match tail_expr.as_ref() {
-                                                crate::ast::Expr::Call {
-                                                    callee, args, ..
-                                                } => match callee.as_ref() {
-                                                    crate::ast::Expr::Ident(
-                                                        n, _,
-                                                    ) => (n.clone(), args),
+                                        let (callee_name, call_args) = match tail_expr.as_ref() {
+                                            crate::ast::Expr::Call { callee, args, .. } => {
+                                                match callee.as_ref() {
+                                                    crate::ast::Expr::Ident(n, _) => {
+                                                        (n.clone(), args)
+                                                    }
                                                     _ => unreachable!(
                                                         "BranchLeafFinal CpsCall: callee is Ident"
                                                     ),
-                                                },
-                                                _ => unreachable!(
-                                                    "BranchLeafFinal CpsCall: tail is Call"
-                                                ),
-                                            };
+                                                }
+                                            }
+                                            _ => unreachable!(
+                                                "BranchLeafFinal CpsCall: tail is Call"
+                                            ),
+                                        };
                                         let callee_func_ref = match lowerer
                                             .user_fn_refs
                                             .get(&callee_name)
@@ -15962,61 +15915,37 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         for a in call_args {
                                             lowered_args.push(lowerer.lower_expr(a));
                                         }
-                                        let arg_count_total =
-                                            (user_arg_count + 2) as i64;
+                                        let arg_count_total = (user_arg_count + 2) as i64;
                                         let arg_count_v = lowerer
                                             .builder
                                             .ins()
                                             .iconst(types::I32, arg_count_total);
-                                        let null_closure = lowerer
-                                            .builder
-                                            .ins()
-                                            .iconst(pointer_ty, 0);
+                                        let null_closure =
+                                            lowerer.builder.ins().iconst(pointer_ty, 0);
                                         let call_ns = lowerer.builder.ins().call(
                                             lowerer.next_step_call_ref,
-                                            &[
-                                                null_closure,
-                                                callee_addr,
-                                                arg_count_v,
-                                            ],
+                                            &[null_closure, callee_addr, arg_count_v],
                                         );
-                                        lowerer.stackmap.push_placeholder(
-                                            function_code_offset(
-                                                &lowerer.builder,
-                                                call_ns,
-                                            ),
-                                        );
-                                        let ns_ptr =
-                                            lowerer.builder.inst_results(call_ns)[0];
-                                        let argp_call = lowerer.builder.ins().call(
-                                            lowerer.next_step_args_ptr_ref,
-                                            &[ns_ptr],
-                                        );
-                                        lowerer.stackmap.push_placeholder(
-                                            function_code_offset(
-                                                &lowerer.builder,
-                                                argp_call,
-                                            ),
-                                        );
-                                        let argp =
-                                            lowerer.builder.inst_results(argp_call)[0];
-                                        for (i, arg_v) in
-                                            lowered_args.iter().enumerate()
-                                        {
-                                            let at = lowerer
-                                                .builder
-                                                .func
-                                                .dfg
-                                                .value_type(*arg_v);
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            call_ns,
+                                        ));
+                                        let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                                        let argp_call = lowerer
+                                            .builder
+                                            .ins()
+                                            .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            argp_call,
+                                        ));
+                                        let argp = lowerer.builder.inst_results(argp_call)[0];
+                                        for (i, arg_v) in lowered_args.iter().enumerate() {
+                                            let at = lowerer.builder.func.dfg.value_type(*arg_v);
                                             let w = if at == types::I64 {
                                                 *arg_v
-                                            } else if at.is_int()
-                                                && at.bits() < 64
-                                            {
-                                                lowerer
-                                                    .builder
-                                                    .ins()
-                                                    .uextend(types::I64, *arg_v)
+                                            } else if at.is_int() && at.bits() < 64 {
+                                                lowerer.builder.ins().uextend(types::I64, *arg_v)
                                             } else {
                                                 *arg_v
                                             };
@@ -16039,10 +15968,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             argp,
                                             k_fn_offset(user_arg_count),
                                         );
-                                        lowerer
-                                            .builder
-                                            .ins()
-                                            .return_(&[ns_ptr]);
+                                        lowerer.builder.ins().return_(&[ns_ptr]);
                                     }
                                     BranchedCpsLeaf::Perform => {
                                         // Emit sigil_perform with
@@ -16053,124 +15979,80 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 "BranchLeafFinal Perform: tail is Perform"
                                             ),
                                         };
-                                        let effect_id = *lowerer
-                                            .effect_ids
-                                            .get(&p.effect)
-                                            .unwrap();
+                                        let effect_id = *lowerer.effect_ids.get(&p.effect).unwrap();
                                         let op_id = *lowerer
                                             .op_ids
-                                            .get(&(
-                                                p.effect.clone(),
-                                                p.op.clone(),
-                                            ))
+                                            .get(&(p.effect.clone(), p.op.clone()))
                                             .unwrap();
                                         let eid_v = lowerer
                                             .builder
                                             .ins()
                                             .iconst(types::I32, effect_id as i64);
-                                        let oid_v = lowerer
-                                            .builder
-                                            .ins()
-                                            .iconst(types::I32, op_id as i64);
+                                        let oid_v =
+                                            lowerer.builder.ins().iconst(types::I32, op_id as i64);
                                         let user_arg_count = p.args.len();
-                                        let (args_ptr_v, args_len_v) =
-                                            if p.args.is_empty() {
-                                                (
-                                                    lowerer
-                                                        .builder
-                                                        .ins()
-                                                        .iconst(pointer_ty, 0),
-                                                    lowerer
-                                                        .builder
-                                                        .ins()
-                                                        .iconst(types::I32, 0),
-                                                )
-                                            } else {
-                                                let arg_values: Vec<Value> = p
-                                                    .args
-                                                    .iter()
-                                                    .map(|a| lowerer.lower_expr(a))
-                                                    .collect();
-                                                let slot_bytes =
-                                                    (user_arg_count * 8) as u32;
-                                                let slot = lowerer
-                                                    .builder
-                                                    .create_sized_stack_slot(
-                                                        StackSlotData::new(
-                                                            StackSlotKind::ExplicitSlot,
-                                                            slot_bytes,
-                                                            3,
-                                                        ),
-                                                    );
-                                                for (i, v) in
-                                                    arg_values.iter().enumerate()
-                                                {
-                                                    let at = lowerer
-                                                        .builder
-                                                        .func
-                                                        .dfg
-                                                        .value_type(*v);
-                                                    let w = if at == types::I64 {
-                                                        *v
-                                                    } else if at.is_int()
-                                                        && at.bits() < 64
-                                                    {
-                                                        lowerer
-                                                            .builder
-                                                            .ins()
-                                                            .uextend(types::I64, *v)
-                                                    } else {
-                                                        *v
-                                                    };
-                                                    lowerer
-                                                        .builder
-                                                        .ins()
-                                                        .stack_store(
-                                                            w,
-                                                            slot,
-                                                            (i * 8) as i32,
-                                                        );
-                                                }
-                                                (
-                                                    lowerer
-                                                        .builder
-                                                        .ins()
-                                                        .stack_addr(
-                                                            pointer_ty,
-                                                            slot,
-                                                            0,
-                                                        ),
-                                                    lowerer.builder.ins().iconst(
-                                                        types::I32,
-                                                        user_arg_count as i64,
-                                                    ),
-                                                )
-                                            };
-                                        let perf_call =
-                                            lowerer.builder.ins().call(
-                                                lowerer.perform_ref,
-                                                &[
-                                                    eid_v,
-                                                    oid_v,
-                                                    args_ptr_v,
-                                                    args_len_v,
-                                                    caller_k_closure,
-                                                    caller_k_fn,
-                                                ],
+                                        let (args_ptr_v, args_len_v) = if p.args.is_empty() {
+                                            (
+                                                lowerer.builder.ins().iconst(pointer_ty, 0),
+                                                lowerer.builder.ins().iconst(types::I32, 0),
+                                            )
+                                        } else {
+                                            let arg_values: Vec<Value> = p
+                                                .args
+                                                .iter()
+                                                .map(|a| lowerer.lower_expr(a))
+                                                .collect();
+                                            let slot_bytes = (user_arg_count * 8) as u32;
+                                            let slot = lowerer.builder.create_sized_stack_slot(
+                                                StackSlotData::new(
+                                                    StackSlotKind::ExplicitSlot,
+                                                    slot_bytes,
+                                                    3,
+                                                ),
                                             );
-                                        lowerer.stackmap.push_placeholder(
-                                            function_code_offset(
-                                                &lowerer.builder,
-                                                perf_call,
-                                            ),
+                                            for (i, v) in arg_values.iter().enumerate() {
+                                                let at = lowerer.builder.func.dfg.value_type(*v);
+                                                let w = if at == types::I64 {
+                                                    *v
+                                                } else if at.is_int() && at.bits() < 64 {
+                                                    lowerer.builder.ins().uextend(types::I64, *v)
+                                                } else {
+                                                    *v
+                                                };
+                                                lowerer.builder.ins().stack_store(
+                                                    w,
+                                                    slot,
+                                                    (i * 8) as i32,
+                                                );
+                                            }
+                                            (
+                                                lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .stack_addr(pointer_ty, slot, 0),
+                                                lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(types::I32, user_arg_count as i64),
+                                            )
+                                        };
+                                        let perf_call = lowerer.builder.ins().call(
+                                            lowerer.perform_ref,
+                                            &[
+                                                eid_v,
+                                                oid_v,
+                                                args_ptr_v,
+                                                args_len_v,
+                                                caller_k_closure,
+                                                caller_k_fn,
+                                            ],
                                         );
-                                        let ns_ptr = lowerer
-                                            .builder
-                                            .inst_results(perf_call)[0];
-                                        lowerer
-                                            .builder
-                                            .ins()
-                                            .return_(&[ns_ptr]);
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            perf_call,
+                                        ));
+                                        let ns_ptr = lowerer.builder.inst_results(perf_call)[0];
+                                        lowerer.builder.ins().return_(&[ns_ptr]);
                                     }
                                     BranchedCpsLeaf::PerformChain => {
                                         unreachable!(
@@ -16376,9 +16258,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
-                    arm_effect_id: None,
-                    repush_crossed_frames_ref,
-                    pop_crossed_frames_ref,
+                            arm_effect_id: None,
+                            repush_crossed_frames_ref,
+                            pop_crossed_frames_ref,
                             user_fn_refs,
                             sync_shim_refs,
                             user_fns: &user_fns,
@@ -19466,21 +19348,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     let mut is_own = self.builder.ins().iconst(types::I8, 0);
                     for &eid in &handle_effect_ids {
                         let eid_const = self.builder.ins().iconst(types::I64, eid as i64);
-                        let matches = self.builder.ins().icmp(
-                            IntCC::Equal,
-                            discharged_eid,
-                            eid_const,
-                        );
+                        let matches =
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::Equal, discharged_eid, eid_const);
                         is_own = self.builder.ins().bor(is_own, matches);
                     }
                     let own_discharge_block = self.builder.create_block();
                     let foreign_discharge_block = self.builder.create_block();
                     let zero_i8_check = self.builder.ins().iconst(types::I8, 0);
-                    let is_own_flag = self.builder.ins().icmp(
-                        IntCC::NotEqual,
-                        is_own,
-                        zero_i8_check,
-                    );
+                    let is_own_flag =
+                        self.builder
+                            .ins()
+                            .icmp(IntCC::NotEqual, is_own, zero_i8_check);
                     self.builder.ins().brif(
                         is_own_flag,
                         own_discharge_block,
@@ -19804,21 +19684,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let mut is_own_nra = self.builder.ins().iconst(types::I8, 0);
                 for &eid in &handle_effect_ids_nra {
                     let eid_const = self.builder.ins().iconst(types::I64, eid as i64);
-                    let matches = self.builder.ins().icmp(
-                        IntCC::Equal,
-                        discharged_eid_nra,
-                        eid_const,
-                    );
+                    let matches =
+                        self.builder
+                            .ins()
+                            .icmp(IntCC::Equal, discharged_eid_nra, eid_const);
                     is_own_nra = self.builder.ins().bor(is_own_nra, matches);
                 }
                 let own_discharge_nra = self.builder.create_block();
                 let foreign_discharge_nra = self.builder.create_block();
                 let zero_check_nra = self.builder.ins().iconst(types::I8, 0);
-                let is_own_flag_nra = self.builder.ins().icmp(
-                    IntCC::NotEqual,
-                    is_own_nra,
-                    zero_check_nra,
-                );
+                let is_own_flag_nra =
+                    self.builder
+                        .ins()
+                        .icmp(IntCC::NotEqual, is_own_nra, zero_check_nra);
                 self.builder.ins().brif(
                     is_own_flag_nra,
                     own_discharge_nra,
@@ -23891,8 +23769,7 @@ fn prepare_per_fn_refs(
         module.declare_func_in_func(ctx.done_or_dispatch_return_arm, builder.func);
     let repush_crossed_frames_ref =
         module.declare_func_in_func(ctx.repush_crossed_frames, builder.func);
-    let pop_crossed_frames_ref =
-        module.declare_func_in_func(ctx.pop_crossed_frames, builder.func);
+    let pop_crossed_frames_ref = module.declare_func_in_func(ctx.pop_crossed_frames, builder.func);
 
     // Per-handle synth-arm-fn FuncRefs, keyed by handle span. Built
     // from the `handler_arm_indices` side-table (one entry per

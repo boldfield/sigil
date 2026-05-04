@@ -2400,7 +2400,11 @@ mod tests {
         let _guard = crate::test_support::gc_test_lock();
         ensure_gc();
         reset_state();
-        let mut term = TerminalResult { value: 0, tag: 0, effect_id: 0 };
+        let mut term = TerminalResult {
+            value: 0,
+            tag: 0,
+            effect_id: 0,
+        };
         let ns = unsafe { sigil_next_step_done(0xDEAD_BEEF_u64) };
         let v = unsafe { sigil_run_loop(ns, &mut term as *mut _) };
         assert_eq!(v, 0xDEAD_BEEF_u64);
@@ -2422,7 +2426,11 @@ mod tests {
         let _guard = crate::test_support::gc_test_lock();
         ensure_gc();
         reset_state();
-        let mut term = TerminalResult { value: 0, tag: 0, effect_id: 0 };
+        let mut term = TerminalResult {
+            value: 0,
+            tag: 0,
+            effect_id: 0,
+        };
         let ns = unsafe { sigil_next_step_discharged(0xCAFE_BABE_u64) };
         let v = unsafe { sigil_run_loop(ns, &mut term as *mut _) };
         assert_eq!(v, 0xCAFE_BABE_u64);

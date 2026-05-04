@@ -307,7 +307,9 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
     let mut new_reason_entries: Vec<(String, String)> = Vec::new();
     for (n, c) in &new_color_entries {
         let reason = match c {
-            crate::color::Color::Cps => format!("cps: lifted lambda `{n}` (effects in row or body)"),
+            crate::color::Color::Cps => {
+                format!("cps: lifted lambda `{n}` (effects in row or body)")
+            }
             crate::color::Color::Native => "native: lifted lambda — pure body".to_string(),
         };
         new_reason_entries.push((n.clone(), reason));
