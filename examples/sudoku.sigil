@@ -136,9 +136,11 @@ fn try_at_cell(grid: Array[Int], idx: Int) -> Int ![Choose, IO, ArithError] {
 
 // Recursive grid walker. At idx==81 prints the solved grid and
 // returns 1 (success sentinel). At each cell: skip if filled,
-// otherwise dispatch to try_at_cell.
+// otherwise dispatch to try_at_cell. No native perform — the body
+// is transitively Cps-colored via the recursive `solve(...)` and
+// `try_at_cell(...)` tail Cps-call leaves; the chain classifier's
+// chain_length=0 path (Plan C Task 81) accepts this shape.
 fn solve(grid: Array[Int], idx: Int) -> Int ![Choose, IO, ArithError] {
-  let _solve_dummy: Int = perform Choose.choose(1);
   if idx == 81 {
     print_grid(grid, 0)
   } else {

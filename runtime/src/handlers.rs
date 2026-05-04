@@ -404,20 +404,22 @@ pub fn outer_post_arm_k_depth_restore(target: usize) {
 // slot's pointers so a stale entry doesn't outlive its useful
 // lifetime in the rooted range.
 //
-// **Cap = 32** is shared with `OUTER_POST_ARM_K_STACK_SIZE` and
-// reflects the same depth ceiling: at most one entry per nested
-// `sigil_run_loop` invocation on the calling thread (handle-body
-// wrapper or sub-Cps-call wrapper), so it bounds **handle-body
-// nesting + sub-Cps-call nesting**, not user-fn recursion depth in
-// general. Typical Sigil programs nest 1-3 deep; the worst-case
-// program that would hit the cap is one whose call chain
-// alternates Sync→Cps wrappers at each frame (32+ levels). Overflow
-// aborts via `eprintln!` + `abort()` in `sigil_body_return_arm_push`
-// rather than dynamic resize — codegen invariant violations should
-// surface loudly. v2 follow-up: revisit if profiles show the cap
-// is binding for any real workload.
+// **Cap = 4096** bounds **handle-body nesting + sub-Cps-call
+// nesting**, not user-fn recursion depth in general — at most one
+// entry per nested `sigil_run_loop` invocation on the calling
+// thread (handle-body wrapper or sub-Cps-call wrapper). Originally
+// 32 (matching `OUTER_POST_ARM_K_STACK_SIZE`); raised to 4096 in
+// Plan C Task 81 because Sudoku 9×9 with `cell_valid (Sync) →
+// check_conflict (Cps via lower_call shim)` recursion at
+// 81-deep × multi-shot Choose retries × chain_length=0 acceptance
+// for sync-recursive helpers hits the cap. Overflow aborts via
+// `eprintln!` + `abort()` in `sigil_body_return_arm_push` rather
+// than dynamic resize — codegen invariant violations should
+// surface loudly. v2 follow-up: dynamic resize OR an alternative
+// Sync→Cps interop discipline that doesn't push per nested
+// invocation.
 
-const BODY_RETURN_ARM_STACK_SIZE: usize = 32;
+const BODY_RETURN_ARM_STACK_SIZE: usize = 4096;
 
 #[repr(C)]
 #[derive(Copy, Clone)]

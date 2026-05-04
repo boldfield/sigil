@@ -8216,15 +8216,49 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // fns or other synth-conts.
                     let synth_cont_sig = cps_signature(pointer_ty, &module);
                     let starting_idx = cps_continuation_synth.len();
+                    // Plan C Task 81 — chain_length=0 case: 0-stmt body
+                    // with branched-cps tail. Allocate ONE synth-cont
+                    // (Final role). Body emit dispatches it directly
+                    // with a dummy arg + caller_k_pair forwarded via
+                    // the closure record. Synth-cont's FINAL emit
+                    // binds the dummy under `__zero_chain_dummy__`
+                    // (which the tail won't reference) and emits the
+                    // branched-tail dispatch as usual.
+                    let effective_step_count = if chain_length == 0 { 1 } else { chain_length };
                     let mut step_func_ids: Vec<cranelift_module::FuncId> =
-                        Vec::with_capacity(chain_length);
-                    for step in 0..chain_length {
+                        Vec::with_capacity(effective_step_count);
+                    for step in 0..effective_step_count {
                         let global_idx = starting_idx + step;
                         let synth_cont_name = format!("sigil_post_yield_cont_{global_idx}");
                         let synth_cont_func_id = module
                             .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
                             .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
                         step_func_ids.push(synth_cont_func_id);
+                    }
+
+                    // Plan C Task 81 — chain_length=0 special case:
+                    // emit ONE FINAL synth-cont with synthetic dummy
+                    // binding. Body emit will dispatch with args[0]=0.
+                    if chain_length == 0 {
+                        cps_continuation_synth.push(CpsContinuationSynth {
+                            func_id: step_func_ids[0],
+                            parent_fn_name: f.name.clone(),
+                            kind: CpsContinuationKind::ChainedLetBindStep {
+                                binding_name: "__zero_chain_dummy__".to_string(),
+                                binding_ty: types::I64,
+                                binding_kind: EnvSlotKind::Int,
+                                captures: captures.clone(),
+                                prior_bindings: vec![],
+                                role: ChainStepRole::Final {
+                                    tail_expr: Box::new(tail_expr.clone()),
+                                    tail_ty,
+                                    tail_prefix_lets: tail_prefix_lets.clone(),
+                                },
+                                prior_was_call_cps: false,
+                            },
+                        });
+                        cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
+                        continue;
                     }
 
                     // Pass 2: build N CpsContinuationSynth entries.
@@ -9403,8 +9437,34 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // fn. Tail-perform shape (synth_cont_idx_opt =
                 // None) is always Perform — `is_simple_tail_perform
                 // _with_pure_args_body` doesn't accept Call tails.
+                // Plan C Task 81 — chain_length=0 case: body has 0
+                // perform/call yields in stmts; tail is a branched-
+                // cps-tail. The pre-pass registered ONE synth-cont
+                // (Final). The body emit's Phase 5 chain-body alloc
+                // (further below) builds the closure record correctly
+                // (captures + caller_k_pair). Phase 6 below detects
+                // this case and dispatches NextStep::Call directly to
+                // the synth-cont with a dummy arg, skipping the
+                // body_first_step Perform/CallCps emit. We synthesize
+                // a sentinel `body_first_step` value here that isn't
+                // actually used at Phase 6 in this case.
+                let is_zero_chain = synth_cont_idx_opt.is_some() && f.body.stmts.is_empty();
                 let (body_first_step, synth_cont_func_id_opt) =
-                    if let Some(idx) = synth_cont_idx_opt {
+                    if is_zero_chain {
+                        let synth_cont_func_id =
+                            cps_continuation_synth[synth_cont_idx_opt.unwrap()].func_id;
+                        // Sentinel — Phase 6 detects is_zero_chain
+                        // and bypasses this value.
+                        (
+                            ChainedNextStep::Perform(crate::ast::PerformExpr {
+                                effect: String::new(),
+                                op: String::new(),
+                                args: vec![],
+                                span: crate::errors::Span::synthetic("__zero_chain__"),
+                            }),
+                            Some(synth_cont_func_id),
+                        )
+                    } else if let Some(idx) = synth_cont_idx_opt {
                         let step = match &f.body.stmts[0] {
                             crate::ast::Stmt::Perform(p) => ChainedNextStep::Perform(p.clone()),
                             crate::ast::Stmt::Let(l) => match &l.value {
@@ -9876,7 +9936,61 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // OR CallCps (Plan D Task 112: NextStep::Call to
                 // wrapper Cps fn with k-pair packed into trailing
                 // args slots).
-                let next_step = match &body_first_step {
+                // Plan C Task 81 — chain_length=0 case: skip the
+                // body_first_step Perform/CallCps dispatch and emit
+                // a direct NextStep::Call to the synth-cont with a
+                // dummy arg (synth-cont binds `__zero_chain_dummy__`
+                // which the tail doesn't reference). The closure
+                // record (k_closure_loaded) was allocated by Phase 5
+                // above with captures + caller_k_pair from body's
+                // args_ptr trailing slots; the synth-cont's FINAL
+                // emit reads caller_k_pair from there to dispatch
+                // the branched-tail leaves.
+                let next_step = if is_zero_chain {
+                    let synth_cont_addr_v = k_fn_loaded;
+                    let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                    let call_ns = lowerer.builder.ins().call(
+                        lowerer.next_step_call_ref,
+                        &[k_closure_loaded, synth_cont_addr_v, three_v],
+                    );
+                    lowerer.stackmap.push_placeholder(function_code_offset(
+                        &lowerer.builder,
+                        call_ns,
+                    ));
+                    let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                    let argp_call = lowerer
+                        .builder
+                        .ins()
+                        .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
+                    lowerer.stackmap.push_placeholder(function_code_offset(
+                        &lowerer.builder,
+                        argp_call,
+                    ));
+                    let argp_v = lowerer.builder.inst_results(argp_call)[0];
+
+                    let zero = lowerer.builder.ins().iconst(types::I64, 0);
+                    let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                    let identity_addr = lowerer
+                        .builder
+                        .ins()
+                        .func_addr(pointer_ty, lowerer.continuation_identity_ref);
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        zero,
+                        argp_v,
+                        0,
+                    );
+                    lowerer
+                        .builder
+                        .ins()
+                        .store(MemFlags::trusted(), null_v, argp_v, 8);
+                    lowerer
+                        .builder
+                        .ins()
+                        .store(MemFlags::trusted(), identity_addr, argp_v, 16);
+                    ns_ptr
+                } else {
+                    match &body_first_step {
                     ChainedNextStep::Perform(body_perform) => {
                         // Resolve effect_id + op_id at fn entry.
                         let effect_id = match checked.effect_ids.get(&body_perform.effect) {
@@ -10139,6 +10253,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             k_fn_offset(user_arg_count_call),
                         );
                         ns_ptr
+                    }
                     }
                 };
                 lowerer.builder.ins().return_(&[next_step]);
@@ -23002,9 +23117,15 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
     is_supported_for_branch_leaf: &impl Fn(&str) -> bool,
 ) -> Option<usize> {
     use crate::ast::{Expr, Stmt};
-    if body.stmts.is_empty() {
-        return None;
-    }
+    // Plan C Task 81 — `body.stmts.is_empty()` is ACCEPTED. Bodies
+    // shaped `if cond { ...cps... } else { ...cps... }` (no prefix
+    // stmts) classify as chain_length=0; the pre-pass registers a
+    // single Final synth-cont and the body-emit Phase 6 dispatches
+    // it with a dummy arg + caller_k_pair forwarded via the closure
+    // record. The downstream `has_cps_call` check still enforces
+    // Cps-eligibility on at least one branched-tail leaf, so a
+    // wholly-pure body falls through to the standard pure-tail
+    // emission path (not this classifier).
     if body.stmts.len() >= MAX_CLOSURE_ENV_SLOTS {
         return None;
     }
@@ -23073,9 +23194,18 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
             _ => return None,
         }
     }
-    if yield_count == 0 {
-        return None;
-    }
+    // Plan C Task 81 — yield_count == 0 is now ACCEPTED iff the
+    // body's tail is a branched-cps-tail with at least one Cps-
+    // eligible leaf (CpsCall / Perform / Nested). The body is
+    // transitively Cps-colored via tail-position user-fn calls;
+    // it doesn't natively perform but needs Cps ABI to compose
+    // with callees. The chain machinery treats this as a "0-step
+    // chain": one synth-cont registered as Final, the body emit
+    // dispatches it directly with a dummy arg + caller_k_pair
+    // forwarded via the closure record. The downstream
+    // `has_cps_call` check below enforces the Cps-eligibility
+    // requirement; without it a wholly-pure tail body would also
+    // pass and incorrectly use the chain machinery.
     let tail = body.tail.as_ref()?;
     // Accept either Expr::If or Expr::Match. Sigil's elaboration pass
     // desugars `if cond { ... } else { ... }` into `Expr::Match { ... }`
@@ -23110,6 +23240,37 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
             }
         }
         Expr::Match { arms, .. } => {
+            // Plan C Task 81 — match-tail acceptance must mirror the
+            // emit-side restriction in `detect_pattern_c_dispatch`:
+            // exactly 2 arms whose patterns are `BoolLit(true)` and
+            // `BoolLit(false)` (the if-desugar shape). Match-on-Int
+            // / Match-on-sum-type bodies fall through to the standard
+            // tail emit, which lowers the entire match via
+            // `lower_expr` → `lower_match` → per-arm `lower_call` for
+            // CpsCall arms. That synchronous Sync→Cps shim drops the
+            // DISCHARGED tag in `terminal_out` because the OUTER
+            // run_loop (driving the synth-cont itself) terminates with
+            // DONE wrapping the discharged value, overwriting the
+            // INNER run_loop's DISCHARGED write. Classifier and
+            // emitter must agree on the shape.
+            if arms.len() != 2 {
+                return None;
+            }
+            let extract_bool = |p: &crate::ast::Pattern| -> Option<bool> {
+                if let crate::ast::Pattern::BoolLit(b, _) = p {
+                    Some(*b)
+                } else {
+                    None
+                }
+            };
+            let (a0, a1) = (
+                extract_bool(&arms[0].pattern),
+                extract_bool(&arms[1].pattern),
+            );
+            match (a0, a1) {
+                (Some(b0), Some(b1)) if b0 != b1 => {}
+                _ => return None,
+            }
             for arm in arms {
                 let kind = classify_branched_cps_tail_branch_expr(
                     &arm.body,
