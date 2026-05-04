@@ -1866,20 +1866,35 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // expression's outer codegen logic loads the tag from
                 // the caller-owned `TerminalResult.tag` slot to
                 // decide return-arm dispatch (Plan D Task 111d).
-                if let Some(entry) = outer_post_arm_k_try_pop() {
-                    // Reset the arena before allocating the new Call.
-                    crate::arena::sigil_arena_reset();
-                    // Build Call(popped_closure, popped_fn_ptr,
-                    // [terminal_value]) with args_len=1 — same shape
-                    // that helper Final's `emit_dispatch_to_post_arm_k`
-                    // builds for terminal post_arm_k dispatch.
-                    let ns = sigil_next_step_call(entry.closure_ptr, entry.fn_ptr, 1);
-                    let ns_args = sigil_next_step_args_ptr(ns);
-                    // SAFETY: gc-heap-ptr arithmetic; ns_args is
-                    // arena-owned and only written here.
-                    ns_args.write(v);
-                    current = ns;
-                    continue;
+                // Plan C Task 81 — respect entry_depth on DONE-path
+                // pop. Without the entry_depth gate, a nested
+                // `sigil_run_loop` (e.g., the inner invoke driving
+                // synth-step-2 inside `sigil_continuation_invoke`'s
+                // Phase 1 when an outer chain step pushed an entry)
+                // would consume entries pushed by the OUTER run_loop's
+                // chain steps. The first inner DONE pop succeeds (pops
+                // the outer's entry, leaving the slot null and depth
+                // below entry_depth); the next inner invoke's DONE pop
+                // then dereferences a null fn_ptr and segfaults. Cap
+                // try_pop at entry_depth so each run_loop only consumes
+                // entries it owns.
+                let current_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+                if current_depth > outer_post_arm_k_entry_depth {
+                    if let Some(entry) = outer_post_arm_k_try_pop() {
+                        // Reset the arena before allocating the new Call.
+                        crate::arena::sigil_arena_reset();
+                        // Build Call(popped_closure, popped_fn_ptr,
+                        // [terminal_value]) with args_len=1 — same shape
+                        // that helper Final's `emit_dispatch_to_post_arm_k`
+                        // builds for terminal post_arm_k dispatch.
+                        let ns = sigil_next_step_call(entry.closure_ptr, entry.fn_ptr, 1);
+                        let ns_args = sigil_next_step_args_ptr(ns);
+                        // SAFETY: gc-heap-ptr arithmetic; ns_args is
+                        // arena-owned and only written here.
+                        ns_args.write(v);
+                        current = ns;
+                        continue;
+                    }
                 }
                 // Top-level terminal: record the source tag AND the
                 // value so the handle expression's outer codegen logic

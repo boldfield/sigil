@@ -8737,6 +8737,66 @@ fn std_choose_first_choice_skips_failures_then_finds_success() {
     assert_eq!(stdout, "3\n", "stderr={stderr:?}");
 }
 
+/// Plan C Task 81 prerequisite (diagnostic 0a) — Two chained let-yields
+/// with PURE tail under INLINE single-shot handler (k(0) only).
+/// Body is the same as the Sudoku-shape failure case but discharged
+/// inline with single-shot k(0). Tests if 2-chained-let-yield
+/// composes with chained-synth-cont machinery REGARDLESS of
+/// runtime-N discharger involvement. Expected: a=0, b=0, a+b=0.
+#[test]
+fn std_choose_two_chained_let_yields_pure_tail_inline_single_shot() {
+    let src = "import std.choose\n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(2);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 a + b\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = handle body() with {\n    \
+                   Choose.choose(arg, k) => k(0),\n    \
+                   Choose.fail(k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_two_chain_inline_single");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "Two chained let-yields under inline single-shot k(0) handler must \
+         produce a=0, b=0, a+b=0. stderr={stderr:?}"
+    );
+}
+
+/// Plan C Task 81 prerequisite (diagnostic 0) — `all_choices` over a
+/// body with **two sequential perform sites in one fn**, NO fail
+/// branch, just `a + b` tail. Pure cross product. If this fails,
+/// chained-let-yield + runtime-N discharger composition is broken
+/// (regardless of the BranchedCpsLeaf::Perform R2 fix).
+/// Body picks `a, b ∈ 0..1`; tail = `a + b`. all_choices should
+/// enumerate [0+0, 0+1, 1+0, 1+1] = [0, 1, 1, 2], length 4.
+#[test]
+fn std_choose_all_choices_two_sequential_performs_pure_tail() {
+    let src = "import std.choose\n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(2);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 a + b\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let results: List[Int] = all_choices(body);\n  \
+                 perform IO.println(int_to_string(length(results)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_two_seq_performs_pure_tail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "4\n",
+        "Two chained let-yield performs + pure tail must compose under \
+         all_choices: 2*2 = 4 branches. stderr={stderr:?}"
+    );
+}
+
 // ===== Plan C Task 69 — boxed Int64 run-and-check-output =====
 
 /// Construct two Int64s, add them, stringify and print. Pins the
