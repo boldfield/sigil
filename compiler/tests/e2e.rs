@@ -8737,6 +8737,249 @@ fn std_choose_first_choice_skips_failures_then_finds_success() {
     assert_eq!(stdout, "3\n", "stderr={stderr:?}");
 }
 
+/// Plan C Task 81 prerequisite (diagnostic 0a) — Two chained let-yields
+/// with PURE tail under INLINE single-shot handler (k(0) only).
+/// Body is the same as the Sudoku-shape failure case but discharged
+/// inline with single-shot k(0). Tests if 2-chained-let-yield
+/// composes with chained-synth-cont machinery REGARDLESS of
+/// runtime-N discharger involvement. Expected: a=0, b=0, a+b=0.
+#[test]
+fn std_choose_two_chained_let_yields_pure_tail_inline_single_shot() {
+    let src = "import std.choose\n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(2);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 a + b\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Int = handle body() with {\n    \
+                   Choose.choose(arg, k) => k(0),\n    \
+                   Choose.fail(k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_two_chain_inline_single");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "Two chained let-yields under inline single-shot k(0) handler must \
+         produce a=0, b=0, a+b=0. stderr={stderr:?}"
+    );
+}
+
+/// Plan C Task 81 prerequisite (diagnostic 0) — `all_choices` over a
+/// body with **two sequential perform sites in one fn**, NO fail
+/// branch, just `a + b` tail. Pure cross product. If this fails,
+/// chained-let-yield + runtime-N discharger composition is broken
+/// (regardless of the BranchedCpsLeaf::Perform R2 fix).
+/// Body picks `a, b ∈ 0..1`; tail = `a + b`. all_choices should
+/// enumerate [0+0, 0+1, 1+0, 1+1] = [0, 1, 1, 2], length 4.
+#[test]
+fn std_choose_all_choices_two_sequential_performs_pure_tail() {
+    let src = "import std.choose\n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(2);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 a + b\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let results: List[Int] = all_choices(body);\n  \
+                 perform IO.println(int_to_string(length(results)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_two_seq_performs_pure_tail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "4\n",
+        "Two chained let-yield performs + pure tail must compose under \
+         all_choices: 2*2 = 4 branches. stderr={stderr:?}"
+    );
+}
+
+/// Plan C Task 81 — `all_choices` over a body that exercises the
+/// **pure-tail variant's tail-prefix-let path** with hand-written
+/// pure intermediates between the last yield and the pure tail.
+/// Forces `is_simple_chained_let_yield_then_pure_tail_body`'s
+/// `seen_pure_after_yield` acceptance (independent of whether ANF
+/// would have lifted `a + b + 1` itself; the explicit lets here
+/// pin the multi-prefix-let path that the symmetric branched-tail
+/// tests don't exercise via the pure-tail variant). Each branch
+/// returns `s2 = a + b + 1`; for `a, b ∈ 0..1` the four outputs are
+/// [1, 2, 2, 3] (length 4).
+#[test]
+fn std_choose_all_choices_two_perform_then_two_pure_lets_pure_tail() {
+    let src = "import std.choose\n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(2);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 let s: Int = a + b;\n  \
+                 let s2: Int = s + 1;\n  \
+                 s2\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let results: List[Int] = all_choices(body);\n  \
+                 perform IO.println(int_to_string(length(results)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "std_choose_all_choices_two_perform_two_pure_lets");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "4\n",
+        "Pure-tail variant must accept multi-prefix-let after the last yield: \
+         a, b ∈ 0..1 → 4 branches; tail s2 = a + b + 1 = [1, 2, 2, 3]. stderr={stderr:?}"
+    );
+}
+
+/// Plan C Task 81 — `first_choice` over a body with **two
+/// sequential perform sites + ANF-lifted pure intermediates between
+/// the last yield and a flat branched tail**. Body picks `a, b ∈ 0..1`;
+/// succeeds only when `a == 1 && b == 1`, returning 99. Otherwise
+/// `Choose.fail()`. ANF lifts `a == 1` and `b == 1` into separate
+/// `let _0 = ...; let _1 = ...;` stmts between the second perform
+/// and the tail If. The chain classifier extension accepts these as
+/// tail-prefix pure intermediates; the FINAL synth-cont's emit
+/// lowers them in order before lowering the branched tail. Captures
+/// collection walks tail-prefix lets so helper params referenced
+/// only in the lifted intermediates (e.g., `threshold` in
+/// `let _0 = x + threshold`) flow through the closure record.
+#[test]
+fn std_choose_first_choice_two_sequential_performs_anf_intermediates() {
+    let src = "import std.choose\n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(2);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 if a == 1 && b == 1 {\n    \
+                   99\n  \
+                 } else {\n    \
+                   perform Choose.fail()\n  \
+                 }\n\
+               }\n\
+               fn unwrap_or_int(o: Option[Int], dflt: Int) -> Int ![] {\n  \
+                 match o {\n    \
+                   Some(x) => x,\n    \
+                   None => dflt,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Option[Int] = first_choice(body);\n  \
+                 let v: Int = unwrap_or_int(r, 0 - 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_two_seq_anf_intermediates");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n",
+        "Two sequential performs with ANF-lifted intermediates must compose. \
+         Expected: explores (a=0/b=0/1 fail), (a=1/b=0 fail), (a=1/b=1 → 99). \
+         stderr={stderr:?}"
+    );
+}
+
+/// Plan C Task 81 — `first_choice` over a body with **two
+/// sequential perform sites + NESTED-If branched tail with
+/// conditional `Choose.fail()`**. Body shape:
+///   `if a == 1 { if b == 1 { 99 } else { perform fail } } else { perform fail }`
+/// Closes the nested-If branched-tail classifier+emit gap. The chain
+/// classifier accepts via `BranchedCpsLeaf::Nested`; the FINAL synth-
+/// cont's branched-tail emit handles Nested via a work-stack
+/// dispatch over `detect_pattern_c_dispatch` (recursive cond + brif
+/// + sub-branch enqueue).
+#[test]
+fn std_choose_first_choice_two_sequential_performs_nested_if_tail() {
+    let src = "import std.choose\n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(2);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 if a == 1 {\n    \
+                   if b == 1 {\n      \
+                     99\n    \
+                   } else {\n      \
+                     perform Choose.fail()\n    \
+                   }\n  \
+                 } else {\n    \
+                   perform Choose.fail()\n  \
+                 }\n\
+               }\n\
+               fn unwrap_or_int(o: Option[Int], dflt: Int) -> Int ![] {\n  \
+                 match o {\n    \
+                   Some(x) => x,\n    \
+                   None => dflt,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Option[Int] = first_choice(body);\n  \
+                 let v: Int = unwrap_or_int(r, 0 - 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_two_seq_nested_if");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n",
+        "Two sequential performs with nested-If branched tail must compose. \
+         Expected: explores (a=0/b=0/1 fail), (a=1/b=0 fail), (a=1/b=1 → 99). \
+         stderr={stderr:?}"
+    );
+}
+
+/// Plan C Task 81 — `first_choice` over a body with **multiple
+/// recursive perform sites across helper-fn boundaries** via a
+/// branched-tail dispatching to either a Cps-call leaf (recursing
+/// into the helper) or a Perform-fail leaf. Mirrors Sudoku's
+/// natural body shape: `let d = perform Choose.choose(N); if
+/// cell_valid(...) { solve(set(...), cell+1) } else { perform fail }`.
+/// Body `pick_outer` performs `Choose.choose(2)`, then for `p == 1`
+/// calls `pick_inner(p)` (recursive Cps call leaf), for `p == 0`
+/// performs `Choose.fail()`. `pick_inner(p)` performs
+/// `Choose.choose(3)` and succeeds only at `x == 2` returning
+/// `p + x*10 = 21`. The arm body's compound expression `p + x*10`
+/// gets ANF-lifted into a pure-let stmt inside the arm Block;
+/// the work-stack emit lowers it via the arm-body-stmts threading
+/// before the leaf-emit dispatch.
+#[test]
+fn std_choose_first_choice_multi_perform_site_recursive_branched() {
+    let src = "import std.choose\n\
+               fn pick_inner(p: Int) -> Int ![Choose] {\n  \
+                 let x: Int = perform Choose.choose(3);\n  \
+                 if x == 2 {\n    \
+                   p + x * 10\n  \
+                 } else {\n    \
+                   perform Choose.fail()\n  \
+                 }\n\
+               }\n\
+               fn pick_outer() -> Int ![Choose] {\n  \
+                 let p: Int = perform Choose.choose(2);\n  \
+                 if p == 1 {\n    \
+                   pick_inner(p)\n  \
+                 } else {\n    \
+                   perform Choose.fail()\n  \
+                 }\n\
+               }\n\
+               fn unwrap_or_int(o: Option[Int], dflt: Int) -> Int ![] {\n  \
+                 match o {\n    \
+                   Some(x) => x,\n    \
+                   None => dflt,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Option[Int] = first_choice(pick_outer);\n  \
+                 let v: Int = unwrap_or_int(r, 0 - 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_multi_perform_branched");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "21\n",
+        "Multi-perform recursive body must compose under first_choice. \
+         Expected: (p=0 fail), (p=1 → pick_inner: x=0/1 fail, x=2 → 1 + 2*10 = 21). \
+         stderr={stderr:?}"
+    );
+}
+
 // ===== Plan C Task 69 — boxed Int64 run-and-check-output =====
 
 /// Construct two Int64s, add them, stringify and print. Pins the
