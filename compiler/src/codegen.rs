@@ -13012,16 +13012,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // lowers via `lower_expr` (env has
                                 // captures + prior chain bindings +
                                 // current binding), then binds the
-                                // result into env under `name`,
-                                // narrowed for the slot kind. This
-                                // lets the tail expression (or its
-                                // branched-cps-tail emit) reference
-                                // these idents directly.
+                                // result into env under `name`. For
+                                // Int slots whose `lower_expr` produced
+                                // a sub-I64 width, widen to I64 to
+                                // match the env slot convention; other
+                                // kinds bind raw (the env slot kind is
+                                // tracked separately, and lower_expr
+                                // is contracted to return the kind's
+                                // natural width — debug_assert below
+                                // catches a future contract regression).
                                 for tpl in tail_prefix_lets {
                                     let raw_v = lowerer.lower_expr(&tpl.value);
-                                    let widened = match tpl.kind {
+                                    let env_value = match tpl.kind {
                                         EnvSlotKind::Int => {
-                                            // I64 already.
                                             let arg_ty = lowerer.builder.func.dfg.value_type(raw_v);
                                             if arg_ty == types::I64 {
                                                 raw_v
@@ -13033,22 +13036,44 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         }
                                         EnvSlotKind::Bool
                                         | EnvSlotKind::Byte
-                                        | EnvSlotKind::Unit
-                                        | EnvSlotKind::Char => {
-                                            // Narrow target type but
-                                            // keep raw_v as-is for env
-                                            // (the env's slot kind is
-                                            // tracked separately).
-                                            // Sigil's lower_expr returns
-                                            // I8 for Bool/Byte/Unit/Char,
-                                            // matching the slot kind.
+                                        | EnvSlotKind::Unit => {
+                                            debug_assert_eq!(
+                                                lowerer.builder.func.dfg.value_type(raw_v),
+                                                types::I8,
+                                                "Plan C Task 81 tail-prefix-let: lower_expr \
+                                                 contract — Bool/Byte/Unit must produce I8 (got \
+                                                 {:?}); fix lower_expr or update this dispatch",
+                                                lowerer.builder.func.dfg.value_type(raw_v)
+                                            );
+                                            raw_v
+                                        }
+                                        EnvSlotKind::Char => {
+                                            debug_assert_eq!(
+                                                lowerer.builder.func.dfg.value_type(raw_v),
+                                                types::I32,
+                                                "Plan C Task 81 tail-prefix-let: lower_expr \
+                                                 contract — Char must produce I32 (got {:?}); \
+                                                 fix lower_expr or update this dispatch",
+                                                lowerer.builder.func.dfg.value_type(raw_v)
+                                            );
                                             raw_v
                                         }
                                         EnvSlotKind::String
                                         | EnvSlotKind::Closure
-                                        | EnvSlotKind::User => raw_v,
+                                        | EnvSlotKind::User => {
+                                            debug_assert_eq!(
+                                                lowerer.builder.func.dfg.value_type(raw_v),
+                                                pointer_ty,
+                                                "Plan C Task 81 tail-prefix-let: lower_expr \
+                                                 contract — String/Closure/User must produce \
+                                                 pointer_ty (got {:?}); fix lower_expr or \
+                                                 update this dispatch",
+                                                lowerer.builder.func.dfg.value_type(raw_v)
+                                            );
+                                            raw_v
+                                        }
                                     };
-                                    lowerer.env.insert(tpl.name.clone(), widened);
+                                    lowerer.env.insert(tpl.name.clone(), env_value);
                                 }
                                 // Continue with existing tail emit.
                                 // Plan D Task 112d — Pattern C detection.
@@ -22855,6 +22880,13 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                 // FINAL step's emit before the tail.
                 seen_pure_after_yield = true;
             }
+            // Pure lets BEFORE the first yield rejected here; would
+            // need a pre-yield env-prep emit phase (helper-body's
+            // first synth-cont alloc would have to lower these and
+            // include them in the closure record OR thread them as
+            // synthetic captures). Out of scope for the current Plan
+            // C Task 81 extension; revisit when natural body shapes
+            // surface the pattern.
             _ => return None,
         }
     }
@@ -23015,17 +23047,26 @@ fn leaf_is_cps_eligible(k: BranchedCpsLeaf) -> bool {
 
 /// Plan D Task 112d — Pattern C dispatch detection at codegen time.
 ///
-/// Returns `Some((cond, then_leaf, else_leaf, then_kind, else_kind))`
-/// when the tail expression is either:
+/// Returns `Some((cond, then_stmts, then_leaf, else_stmts, else_leaf,
+/// then_kind, else_kind))` when the tail expression is either:
 ///
 /// - `Expr::If { cond, then_block, else_block }` where each branch
-///   classifies as Pure or CpsCall (and at least one is CpsCall).
+///   classifies as Pure / CpsCall / Perform / Nested (and at least
+///   one is Cps-eligible per `leaf_is_cps_eligible`).
 /// - `Expr::Match { scrutinee, arms }` matching the if-desugar shape:
 ///   exactly 2 arms with `Pattern::BoolLit(true)` and
-///   `Pattern::BoolLit(false)` patterns (in either order). The scrutinee
-///   becomes `cond`.
+///   `Pattern::BoolLit(false)` patterns (in either order). The
+///   scrutinee becomes `cond`.
 ///
-/// `then_leaf` and `else_leaf` are the branch tail expressions (block
+/// `then_stmts` / `else_stmts` are the branch's arm-body Block stmts
+/// (each `Stmt::Let` with pure RHS per
+/// `classify_branched_cps_tail_branch`'s gate; ANF-lifted compound
+/// subexpressions land here). Empty `&[]` for bare-Expr arm bodies
+/// or for `Expr::If` branches whose `then_block` / `else_block` has
+/// no stmts. The work-stack emit lowers each stmt via `lower_expr`
+/// and binds the result into env before dispatching the leaf.
+///
+/// `then_leaf` / `else_leaf` are the branch leaf expressions (block
 /// tail OR bare arm body expression).
 ///
 /// Arbitrary Match shapes (sum-type patterns, etc.) return `None` —

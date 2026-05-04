@@ -8797,6 +8797,41 @@ fn std_choose_all_choices_two_sequential_performs_pure_tail() {
     );
 }
 
+/// Plan C Task 81 — `all_choices` over a body that exercises the
+/// **pure-tail variant's tail-prefix-let path** with hand-written
+/// pure intermediates between the last yield and the pure tail.
+/// Forces `is_simple_chained_let_yield_then_pure_tail_body`'s
+/// `seen_pure_after_yield` acceptance (independent of whether ANF
+/// would have lifted `a + b + 1` itself; the explicit lets here
+/// pin the multi-prefix-let path that the symmetric branched-tail
+/// tests don't exercise via the pure-tail variant). Each branch
+/// returns `s2 = a + b + 1`; for `a, b ∈ 0..1` the four outputs are
+/// [1, 2, 2, 3] (length 4).
+#[test]
+fn std_choose_all_choices_two_perform_then_two_pure_lets_pure_tail() {
+    let src = "import std.choose\n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(2);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 let s: Int = a + b;\n  \
+                 let s2: Int = s + 1;\n  \
+                 s2\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let results: List[Int] = all_choices(body);\n  \
+                 perform IO.println(int_to_string(length(results)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "std_choose_all_choices_two_perform_two_pure_lets");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "4\n",
+        "Pure-tail variant must accept multi-prefix-let after the last yield: \
+         a, b ∈ 0..1 → 4 branches; tail s2 = a + b + 1 = [1, 2, 2, 3]. stderr={stderr:?}"
+    );
+}
+
 /// Plan C Task 81 — `first_choice` over a body with **two
 /// sequential perform sites + ANF-lifted pure intermediates between
 /// the last yield and a flat branched tail**. Body picks `a, b ∈ 0..1`;
