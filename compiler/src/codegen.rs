@@ -623,6 +623,19 @@ fn type_expr_uses_apply_or_param(
     params: &std::collections::BTreeSet<String>,
 ) -> bool {
     match t {
+        // Plan D Task 117 (b) — `Continuation[op_ret, ret]` Apply
+        // legitimately survives mono (it is a structural language
+        // type, not a user TypeDecl, and is not mangled into a
+        // Named); recurse into its args but don't reject the Apply
+        // itself.
+        TypeExpr::Apply { name, args, .. } if name == "Continuation" => {
+            for a in args {
+                if type_expr_uses_apply_or_param(a, params) {
+                    return true;
+                }
+            }
+            false
+        }
         TypeExpr::Apply { args, .. } => {
             // An Apply node is itself a hard reject; we still recurse
             // so a nested Apply or generic-param ref also surfaces in
@@ -896,6 +909,59 @@ pub(crate) fn collect_ctor_names(
     ctors
 }
 
+/// Plan D Task 117 (b) Phase 4 — for a user FnDecl, collect the
+/// names of parameters whose declared type is `Continuation[op_ret,
+/// ret]`. Consumed by the Lowerer at user-fn body codegen to populate
+/// `Lowerer::cont_param_names`, driving `lower_call`'s continuation-
+/// param dispatch for `Ident(name)` callees and Continuation-typed
+/// arg packing.
+pub(crate) fn collect_user_fn_cont_param_names(
+    f: &crate::ast::FnDecl,
+) -> std::collections::BTreeSet<String> {
+    use crate::ast::TypeExpr;
+    let mut out = std::collections::BTreeSet::new();
+    for p in &f.params {
+        if matches!(&p.ty, TypeExpr::Apply { name, .. } if name == "Continuation") {
+            out.insert(p.name.clone());
+        }
+    }
+    out
+}
+
+/// Plan D Task 117 (b) — pre-pass scan: build `callee_name → Vec<bool>`
+/// where the Vec entry at index `i` is `true` iff parameter `i` of the
+/// callee is annotated as `Continuation[op_ret, ret]`. Used by
+/// `arm_body_walk` to allow `helper(k, ...)` shapes where `k` flows
+/// into a fn parameter that explicitly accepts a continuation
+/// (recursive runtime-N dischargers like `fold_choices`); other
+/// k-as-arg sites continue to fire the escape-barrier diagnostic.
+pub(crate) fn collect_cont_param_callees(
+    program: &crate::ast::Program,
+) -> std::collections::BTreeMap<String, Vec<bool>> {
+    use crate::ast::{Item, TypeExpr};
+    fn type_expr_is_continuation(t: &TypeExpr) -> bool {
+        matches!(t, TypeExpr::Apply { name, .. } if name == "Continuation")
+        // Pre-mono surface uses TypeExpr::Apply; post-mono surface
+        // (after `rewrite_type_expr`) preserves Apply for
+        // Continuation specifically, so this single check covers
+        // both.
+    }
+    let mut out: std::collections::BTreeMap<String, Vec<bool>> = std::collections::BTreeMap::new();
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            let flags: Vec<bool> = f
+                .params
+                .iter()
+                .map(|p| type_expr_is_continuation(&p.ty))
+                .collect();
+            if flags.iter().any(|&b| b) {
+                out.insert(f.name.clone(), flags);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Option<String> {
     use std::collections::{BTreeMap, BTreeSet};
     // Globals reachable as bare `Expr::Ident` from anywhere — used by
@@ -994,11 +1060,20 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     // Plan C Task 76 — Clock builtin.
     globals.insert("clock_os_now".to_string());
     let ctors: BTreeSet<String> = collect_ctor_names(program);
+    // Plan D Task 117 (b) — pre-pass map of user-fn param-Continuation
+    // flags. Consumed by `arm_body_walk`'s generic-call branch to
+    // allow `helper(k, ...)` shapes when the helper's signature
+    // declares a Continuation param at that arg index.
+    let cont_param_callees = collect_cont_param_callees(program);
     for item in &program.items {
         if let crate::ast::Item::Fn(f) = item {
-            if let Some(msg) =
-                block_unsupported_handle(&f.body, &globals, &ctors, &effects_resumes_many)
-            {
+            if let Some(msg) = block_unsupported_handle(
+                &f.body,
+                &globals,
+                &ctors,
+                &effects_resumes_many,
+                &cont_param_callees,
+            ) {
                 return Some(format!("in fn `{}`: {}", f.name, msg));
             }
         }
@@ -1229,28 +1304,42 @@ fn block_unsupported_handle(
     globals: &std::collections::BTreeSet<String>,
     ctors: &std::collections::BTreeSet<String>,
     effects_resumes_many: &std::collections::BTreeMap<String, bool>,
+    cont_param_callees: &std::collections::BTreeMap<String, Vec<bool>>,
 ) -> Option<String> {
     use crate::ast::Stmt;
     for s in &b.stmts {
         match s {
             Stmt::Let(l) => {
-                if let Some(msg) =
-                    expr_unsupported_handle(&l.value, globals, ctors, effects_resumes_many)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    &l.value,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
             Stmt::Expr(e) => {
-                if let Some(msg) = expr_unsupported_handle(e, globals, ctors, effects_resumes_many)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    e,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    if let Some(msg) =
-                        expr_unsupported_handle(a, globals, ctors, effects_resumes_many)
-                    {
+                    if let Some(msg) = expr_unsupported_handle(
+                        a,
+                        globals,
+                        ctors,
+                        effects_resumes_many,
+                        cont_param_callees,
+                    ) {
                         return Some(msg);
                     }
                 }
@@ -1258,7 +1347,13 @@ fn block_unsupported_handle(
         }
     }
     if let Some(tail) = &b.tail {
-        if let Some(msg) = expr_unsupported_handle(tail, globals, ctors, effects_resumes_many) {
+        if let Some(msg) = expr_unsupported_handle(
+            tail,
+            globals,
+            ctors,
+            effects_resumes_many,
+            cont_param_callees,
+        ) {
             return Some(msg);
         }
     }
@@ -1270,6 +1365,7 @@ fn expr_unsupported_handle(
     globals: &std::collections::BTreeSet<String>,
     ctors: &std::collections::BTreeSet<String>,
     effects_resumes_many: &std::collections::BTreeMap<String, bool>,
+    cont_param_callees: &std::collections::BTreeMap<String, Vec<bool>>,
 ) -> Option<String> {
     use crate::ast::Expr;
     match e {
@@ -1279,60 +1375,127 @@ fn expr_unsupported_handle(
         | Expr::CharLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => None,
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_unsupported_handle(lhs, globals, ctors, effects_resumes_many)
-                .or_else(|| expr_unsupported_handle(rhs, globals, ctors, effects_resumes_many))
-        }
-        Expr::Unary { operand, .. } => {
-            expr_unsupported_handle(operand, globals, ctors, effects_resumes_many)
-        }
+        Expr::Binary { lhs, rhs, .. } => expr_unsupported_handle(
+            lhs,
+            globals,
+            ctors,
+            effects_resumes_many,
+            cont_param_callees,
+        )
+        .or_else(|| {
+            expr_unsupported_handle(
+                rhs,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            )
+        }),
+        Expr::Unary { operand, .. } => expr_unsupported_handle(
+            operand,
+            globals,
+            ctors,
+            effects_resumes_many,
+            cont_param_callees,
+        ),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => expr_unsupported_handle(cond, globals, ctors, effects_resumes_many)
-            .or_else(|| block_unsupported_handle(then_block, globals, ctors, effects_resumes_many))
-            .or_else(|| block_unsupported_handle(else_block, globals, ctors, effects_resumes_many)),
-        Expr::Block(b) => block_unsupported_handle(b, globals, ctors, effects_resumes_many),
+        } => expr_unsupported_handle(
+            cond,
+            globals,
+            ctors,
+            effects_resumes_many,
+            cont_param_callees,
+        )
+        .or_else(|| {
+            block_unsupported_handle(
+                then_block,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            )
+        })
+        .or_else(|| {
+            block_unsupported_handle(
+                else_block,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            )
+        }),
+        Expr::Block(b) => {
+            block_unsupported_handle(b, globals, ctors, effects_resumes_many, cont_param_callees)
+        }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            if let Some(msg) =
-                expr_unsupported_handle(scrutinee, globals, ctors, effects_resumes_many)
-            {
+            if let Some(msg) = expr_unsupported_handle(
+                scrutinee,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            ) {
                 return Some(msg);
             }
             for a in arms {
-                if let Some(msg) =
-                    expr_unsupported_handle(&a.body, globals, ctors, effects_resumes_many)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    &a.body,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
             None
         }
         Expr::Call { callee, args, .. } => {
-            if let Some(msg) = expr_unsupported_handle(callee, globals, ctors, effects_resumes_many)
-            {
+            if let Some(msg) = expr_unsupported_handle(
+                callee,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            ) {
                 return Some(msg);
             }
             for a in args {
-                if let Some(msg) = expr_unsupported_handle(a, globals, ctors, effects_resumes_many)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    a,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
             None
         }
         Expr::Perform(_) => None,
-        Expr::Lambda { body, .. } => {
-            expr_unsupported_handle(body, globals, ctors, effects_resumes_many)
-        }
+        Expr::Lambda { body, .. } => expr_unsupported_handle(
+            body,
+            globals,
+            ctors,
+            effects_resumes_many,
+            cont_param_callees,
+        ),
         Expr::ClosureRecord { env_exprs, .. } => {
             for ee in env_exprs {
-                if let Some(msg) = expr_unsupported_handle(ee, globals, ctors, effects_resumes_many)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    ee,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
@@ -1340,9 +1503,13 @@ fn expr_unsupported_handle(
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                if let Some(msg) =
-                    expr_unsupported_handle(&f.value, globals, ctors, effects_resumes_many)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    &f.value,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
@@ -1464,9 +1631,13 @@ fn expr_unsupported_handle(
             // `ClosureRecord` shapes. The arm body is otherwise free
             // to use any expression over its op-args + globals.
             for arm in op_arms.iter() {
-                if let Some(msg) =
-                    arm_body_unsupported_construct(arm, globals, ctors, effects_resumes_many)
-                {
+                if let Some(msg) = arm_body_unsupported_construct(
+                    arm,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(format!(
                         "`handle` expression at {:?} has arm `{}.{}` body that {} \
                          (Plan B Task 55, in progress)",
@@ -1493,6 +1664,7 @@ fn expr_unsupported_handle(
                     &mut return_scopes,
                     "",
                     globals,
+                    cont_param_callees,
                     /* tail = */ false,
                 ) {
                     return Some(format!(
@@ -1509,15 +1681,25 @@ fn expr_unsupported_handle(
             // are never enforced — at runtime that can register arms
             // under the wrong effect_id and crash inside `sigil_perform`'s
             // handler-stack walk.
-            if let Some(msg) = expr_unsupported_handle(body, globals, ctors, effects_resumes_many) {
+            if let Some(msg) = expr_unsupported_handle(
+                body,
+                globals,
+                ctors,
+                effects_resumes_many,
+                cont_param_callees,
+            ) {
                 return Some(msg);
             }
             // Recurse into arm bodies so nested handles deeper in
             // the AST surface their own diagnostics.
             for arm in op_arms {
-                if let Some(msg) =
-                    expr_unsupported_handle(&arm.body, globals, ctors, effects_resumes_many)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    &arm.body,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
@@ -1526,9 +1708,13 @@ fn expr_unsupported_handle(
             // their own diagnostics (parallel to op-arm body
             // recursion above).
             if let Some(ra) = return_arm {
-                if let Some(msg) =
-                    expr_unsupported_handle(&ra.body, globals, ctors, effects_resumes_many)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    &ra.body,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
@@ -1536,8 +1722,13 @@ fn expr_unsupported_handle(
         }
         Expr::Tuple { elems, .. } => {
             for e in elems {
-                if let Some(msg) = expr_unsupported_handle(e, globals, ctors, effects_resumes_many)
-                {
+                if let Some(msg) = expr_unsupported_handle(
+                    e,
+                    globals,
+                    ctors,
+                    effects_resumes_many,
+                    cont_param_callees,
+                ) {
                     return Some(msg);
                 }
             }
@@ -1572,6 +1763,7 @@ fn arm_body_unsupported_construct(
     globals: &std::collections::BTreeSet<String>,
     ctors: &std::collections::BTreeSet<String>,
     effects_resumes_many: &std::collections::BTreeMap<String, bool>,
+    cont_param_callees: &std::collections::BTreeMap<String, Vec<bool>>,
 ) -> Option<String> {
     use std::collections::BTreeSet;
     // Plan B Task 55, Phase 4e captures+ Slice C — multi-let arm
@@ -1759,7 +1951,14 @@ fn arm_body_unsupported_construct(
     // arm body IS the synthetic CPS fn's return value (wrapped in
     // `sigil_next_step_done` or `sigil_next_step_call` depending on
     // whether the tail is a captured-k invocation).
-    arm_body_walk(&arm.body, &mut scopes, &arm.k_name, globals, true)
+    arm_body_walk(
+        &arm.body,
+        &mut scopes,
+        &arm.k_name,
+        globals,
+        cont_param_callees,
+        true,
+    )
 }
 
 /// Plan B Task 55 (Phase 4d) — walks an arm body to surface the still-
@@ -1789,6 +1988,7 @@ fn arm_body_walk(
     scopes: &mut Vec<std::collections::BTreeSet<String>>,
     k_name: &str,
     globals: &std::collections::BTreeSet<String>,
+    cont_param_callees: &std::collections::BTreeMap<String, Vec<bool>>,
     tail: bool,
 ) -> Option<String> {
     use crate::ast::Expr;
@@ -1857,15 +2057,19 @@ fn arm_body_walk(
             // Phase 4d (codegen builds a per-arm closure record).
             None
         }
-        Expr::Binary { lhs, rhs, .. } => arm_body_walk(lhs, scopes, k_name, globals, false)
-            .or_else(|| arm_body_walk(rhs, scopes, k_name, globals, false)),
-        Expr::Unary { operand, .. } => arm_body_walk(operand, scopes, k_name, globals, false),
+        Expr::Binary { lhs, rhs, .. } => {
+            arm_body_walk(lhs, scopes, k_name, globals, cont_param_callees, false)
+                .or_else(|| arm_body_walk(rhs, scopes, k_name, globals, cont_param_callees, false))
+        }
+        Expr::Unary { operand, .. } => {
+            arm_body_walk(operand, scopes, k_name, globals, cont_param_callees, false)
+        }
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
-        } => arm_body_walk(cond, scopes, k_name, globals, false)
+        } => arm_body_walk(cond, scopes, k_name, globals, cont_param_callees, false)
             // Plan D Task 118 — `If` then/else branches propagate
             // `tail` into branch tails so the branched-routing path
             // (`lower_arm_body_to_next_step`) handles k-calls inside
@@ -1877,9 +2081,27 @@ fn arm_body_walk(
             // for branched-k). Post-Task-118 codegen routes through
             // `lower_arm_body_to_next_step` when
             // `arm_body_needs_branched_routing` fires.
-            .or_else(|| arm_body_walk_block(then_block, scopes, k_name, globals, tail))
-            .or_else(|| arm_body_walk_block(else_block, scopes, k_name, globals, tail)),
-        Expr::Block(b) => arm_body_walk_block(b, scopes, k_name, globals, tail),
+            .or_else(|| {
+                arm_body_walk_block(
+                    then_block,
+                    scopes,
+                    k_name,
+                    globals,
+                    cont_param_callees,
+                    tail,
+                )
+            })
+            .or_else(|| {
+                arm_body_walk_block(
+                    else_block,
+                    scopes,
+                    k_name,
+                    globals,
+                    cont_param_callees,
+                    tail,
+                )
+            }),
+        Expr::Block(b) => arm_body_walk_block(b, scopes, k_name, globals, cont_param_callees, tail),
         Expr::Match {
             scrutinee, arms, ..
         } => {
@@ -1891,8 +2113,17 @@ fn arm_body_walk(
             // walker which would reject k-as-callee in non-tail). Other
             // scrutinee shapes walk in non-tail context as before.
             let scrut_diag = match (tail, match_k_call_arg(scrutinee, k_name)) {
-                (true, Some(arg_expr)) => arm_body_walk(arg_expr, scopes, k_name, globals, false),
-                _ => arm_body_walk(scrutinee, scopes, k_name, globals, false),
+                (true, Some(arg_expr)) => {
+                    arm_body_walk(arg_expr, scopes, k_name, globals, cont_param_callees, false)
+                }
+                _ => arm_body_walk(
+                    scrutinee,
+                    scopes,
+                    k_name,
+                    globals,
+                    cont_param_callees,
+                    false,
+                ),
             };
             if let Some(r) = scrut_diag {
                 return Some(r);
@@ -1905,7 +2136,7 @@ fn arm_body_walk(
                 // Plan D Task 118 — Match arm bodies propagate `tail`
                 // so the branched-routing path handles k-calls in
                 // each arm. See the Expr::If site for the rationale.
-                let r = arm_body_walk(&a.body, scopes, k_name, globals, tail);
+                let r = arm_body_walk(&a.body, scopes, k_name, globals, cont_param_callees, tail);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -1948,15 +2179,45 @@ fn arm_body_walk(
                     // contain disallowed shapes; outer-scope captures
                     // in the arg are allowed under Phase 4d's normal
                     // capture path).
-                    return arm_body_walk(&args[0], scopes, k_name, globals, false);
+                    return arm_body_walk(
+                        &args[0],
+                        scopes,
+                        k_name,
+                        globals,
+                        cont_param_callees,
+                        false,
+                    );
                 }
             }
             // Generic call. Callee + args are non-tail.
-            if let Some(r) = arm_body_walk(callee, scopes, k_name, globals, false) {
+            //
+            // Plan D Task 117 (b) — when the callee is a known user
+            // fn that declares a `Continuation` parameter at index
+            // i, allow `args[i] == Ident(k_name)` to pass through
+            // without firing the bare-k escape diagnostic. Typecheck
+            // already validated that k's `Ty::Continuation` unifies
+            // with the callee's `Continuation[op_ret, ret]` param;
+            // the runtime ScopeId check on the eventual k-call site
+            // is the load-bearing soundness path. Other arg slots
+            // (and other shapes of the k-flowing arg) walk normally.
+            let cont_flags: Option<&Vec<bool>> = match callee.as_ref() {
+                Expr::Ident(callee_name, _) => cont_param_callees.get(callee_name),
+                _ => None,
+            };
+            if let Some(r) =
+                arm_body_walk(callee, scopes, k_name, globals, cont_param_callees, false)
+            {
                 return Some(r);
             }
-            for a in args {
-                if let Some(r) = arm_body_walk(a, scopes, k_name, globals, false) {
+            for (i, a) in args.iter().enumerate() {
+                let is_k_arg_to_cont_param = matches!(a, Expr::Ident(name, _) if name == k_name)
+                    && cont_flags.is_some_and(|flags| flags.get(i).copied().unwrap_or(false));
+                if is_k_arg_to_cont_param {
+                    continue;
+                }
+                if let Some(r) =
+                    arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false)
+                {
                     return Some(r);
                 }
             }
@@ -1964,7 +2225,9 @@ fn arm_body_walk(
         }
         Expr::Perform(p) => {
             for a in &p.args {
-                if let Some(r) = arm_body_walk(a, scopes, k_name, globals, false) {
+                if let Some(r) =
+                    arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false)
+                {
                     return Some(r);
                 }
             }
@@ -2002,7 +2265,9 @@ fn arm_body_walk(
             // Recurse into env_exprs so nested-shape violations (e.g.,
             // an Apply inside an env-expr's value) still surface.
             for env_expr in env_exprs {
-                if let Some(r) = arm_body_walk(env_expr, scopes, k_name, globals, false) {
+                if let Some(r) =
+                    arm_body_walk(env_expr, scopes, k_name, globals, cont_param_callees, false)
+                {
                     return Some(r);
                 }
             }
@@ -2010,7 +2275,9 @@ fn arm_body_walk(
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                if let Some(r) = arm_body_walk(&f.value, scopes, k_name, globals, false) {
+                if let Some(r) =
+                    arm_body_walk(&f.value, scopes, k_name, globals, cont_param_callees, false)
+                {
                     return Some(r);
                 }
             }
@@ -2036,7 +2303,14 @@ fn arm_body_walk(
             // body's value); tail position only re-enters at the
             // nested arm bodies if the nested handle expression is
             // itself in this arm's tail position.
-            if let Some(r) = arm_body_walk(inner_body, scopes, k_name, globals, false) {
+            if let Some(r) = arm_body_walk(
+                inner_body,
+                scopes,
+                k_name,
+                globals,
+                cont_param_callees,
+                false,
+            ) {
                 return Some(r);
             }
             for inner_arm in inner_op_arms {
@@ -2055,7 +2329,14 @@ fn arm_body_walk(
                 // Inner arm body's tail position is independent of
                 // the outer arm's tail (the inner CPS arm fn wraps
                 // its own tail expression).
-                let r = arm_body_walk(&inner_arm.body, scopes, &inner_arm.k_name, globals, true);
+                let r = arm_body_walk(
+                    &inner_arm.body,
+                    scopes,
+                    &inner_arm.k_name,
+                    globals,
+                    cont_param_callees,
+                    true,
+                );
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -2066,7 +2347,7 @@ fn arm_body_walk(
                     std::collections::BTreeSet::new();
                 ra_scope.insert(ra.binding.clone());
                 scopes.push(ra_scope);
-                let r = arm_body_walk(&ra.body, scopes, k_name, globals, false);
+                let r = arm_body_walk(&ra.body, scopes, k_name, globals, cont_param_callees, false);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -2076,7 +2357,9 @@ fn arm_body_walk(
         }
         Expr::Tuple { elems, .. } => {
             for el in elems {
-                if let Some(r) = arm_body_walk(el, scopes, k_name, globals, false) {
+                if let Some(r) =
+                    arm_body_walk(el, scopes, k_name, globals, cont_param_callees, false)
+                {
                     return Some(r);
                 }
             }
@@ -2090,6 +2373,7 @@ fn arm_body_walk_block(
     scopes: &mut Vec<std::collections::BTreeSet<String>>,
     k_name: &str,
     globals: &std::collections::BTreeSet<String>,
+    cont_param_callees: &std::collections::BTreeMap<String, Vec<bool>>,
     tail: bool,
 ) -> Option<String> {
     use crate::ast::Stmt;
@@ -2108,7 +2392,7 @@ fn arm_body_walk_block(
         match s {
             Stmt::Let(l) => {
                 scopes.push(local.clone());
-                let r = arm_body_walk(&l.value, scopes, k_name, globals, false);
+                let r = arm_body_walk(&l.value, scopes, k_name, globals, cont_param_callees, false);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -2117,7 +2401,7 @@ fn arm_body_walk_block(
             }
             Stmt::Expr(e) => {
                 scopes.push(local.clone());
-                let r = arm_body_walk(e, scopes, k_name, globals, false);
+                let r = arm_body_walk(e, scopes, k_name, globals, cont_param_callees, false);
                 scopes.pop();
                 if r.is_some() {
                     return r;
@@ -2127,7 +2411,9 @@ fn arm_body_walk_block(
                 scopes.push(local.clone());
                 let mut found = None;
                 for a in &p.args {
-                    if let Some(r) = arm_body_walk(a, scopes, k_name, globals, false) {
+                    if let Some(r) =
+                        arm_body_walk(a, scopes, k_name, globals, cont_param_callees, false)
+                    {
                         found = Some(r);
                         break;
                     }
@@ -2141,7 +2427,7 @@ fn arm_body_walk_block(
     }
     if let Some(tail_expr) = &b.tail {
         scopes.push(local);
-        let r = arm_body_walk(tail_expr, scopes, k_name, globals, tail);
+        let r = arm_body_walk(tail_expr, scopes, k_name, globals, cont_param_callees, tail);
         scopes.pop();
         return r;
     }
@@ -2254,6 +2540,14 @@ struct HandlerArmSynth {
     /// `None` for arms whose body doesn't match the multi-let
     /// shape OR whose effect isn't `resumes: many`.
     post_arm_k_chain: Option<PostArmKChain>,
+    /// Plan D Task 117 (b) Phase 4 — span of the enclosing
+    /// `Expr::Handle`, threaded so the synth-pass body emit can
+    /// look up `handler_return_arm_refs_per_handle[handle_span]`
+    /// when packing a Continuation arg (the alloc must wire the
+    /// return-arm pair into the value object so invocations from
+    /// outside the arm body still wrap the body's value via the
+    /// handle's return arm).
+    handle_span: Span,
 }
 
 /// Plan B Task 55 (Phase 4g) — per-`Expr::Handle` return-arm synthetic
@@ -4796,6 +5090,7 @@ fn collect_handle_arms_in_expr(
                     k_name: arm.k_name.clone(),
                     post_arm_k,
                     post_arm_k_chain,
+                    handle_span: span.clone(),
                 });
                 arm_indices.push(global_idx);
             }
@@ -6313,6 +6608,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     if let Some(msg) = unsupported_handle_construct(&checked.program) {
         return Err(msg);
     }
+    // Plan D Task 117 (b) Phase 4 — pre-pass map of user-fn
+    // param-Continuation flags. Computed once here so every Lowerer
+    // ctor site can pass it as a borrowed reference. Keys are
+    // post-mono callee fn names (e.g. `fold_choices$$Int`); each
+    // entry is a Vec<bool> indexed by param position.
+    let cont_param_callees = collect_cont_param_callees(&checked.program);
 
     // Plan B' Stage 6.8 Task 104 (R2 finding 1) — reject indirect-
     // call callee shapes that Phase C v1 doesn't support, with a
@@ -7091,6 +7392,43 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     let clock_os_now = module
         .declare_function("sigil_clock_os_now", Linkage::Import, &clock_os_now_sig)
         .map_err(|e| format!("declare sigil_clock_os_now: {e}"))?;
+
+    // Plan D Task 117 (b) Phase 4 — Continuation value object alloc
+    // + load helpers. Used at sites that flow a continuation into a
+    // fn-parameter (boxing the (k_closure, k_fn, return_closure,
+    // return_fn) quadruple) and at sites inside the receiver that
+    // invoke or forward the parameter.
+    // sigil_continuation_alloc(k_closure, k_fn, return_closure, return_fn) -> *mut u8
+    let mut cont_alloc_sig = Signature::new(isa_call_conv(&module));
+    cont_alloc_sig.params.push(AbiParam::new(pointer_ty));
+    cont_alloc_sig.params.push(AbiParam::new(pointer_ty));
+    cont_alloc_sig.params.push(AbiParam::new(pointer_ty));
+    cont_alloc_sig.params.push(AbiParam::new(pointer_ty));
+    cont_alloc_sig.returns.push(AbiParam::new(pointer_ty));
+    let cont_alloc = module
+        .declare_function("sigil_continuation_alloc", Linkage::Import, &cont_alloc_sig)
+        .map_err(|e| format!("declare sigil_continuation_alloc: {e}"))?;
+    // (`sigil_continuation_load_*` helpers are called only from
+    // inside `sigil_continuation_invoke`'s Rust body; codegen never
+    // emits direct calls to them, so they don't need FuncId/FuncRef
+    // declarations here. The runtime tests in
+    // `runtime/src/continuation.rs` cover the load helpers
+    // directly.)
+    // sigil_continuation_invoke(cont, arg, terminal_out) -> u64
+    // Wraps the dispatch + run_loop drive + return-arm wrap +
+    // outer_post_arm_k snapshot/restore in a single runtime call.
+    let mut cont_invoke_sig = Signature::new(isa_call_conv(&module));
+    cont_invoke_sig.params.push(AbiParam::new(pointer_ty)); // cont
+    cont_invoke_sig.params.push(AbiParam::new(types::I64)); // arg (widened)
+    cont_invoke_sig.params.push(AbiParam::new(pointer_ty)); // terminal_out
+    cont_invoke_sig.returns.push(AbiParam::new(types::I64));
+    let cont_invoke = module
+        .declare_function(
+            "sigil_continuation_invoke",
+            Linkage::Import,
+            &cont_invoke_sig,
+        )
+        .map_err(|e| format!("declare sigil_continuation_invoke: {e}"))?;
 
     // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
     // Phase 3a wires the frame allocation + push/pop ABI from Task
@@ -8023,6 +8361,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             string_length,
             random_pseudo_int,
             clock_os_now,
+            cont_alloc,
+            cont_invoke,
         },
         handler_frame_new,
         handle_push,
@@ -8389,6 +8729,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_frame_ptr_v: None,
                         arm_k_pair_self: None,
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
+                        cont_param_names: collect_user_fn_cont_param_names(f),
+                        cont_param_callees: &cont_param_callees,
+                        arm_handle_span: None,
+                        arm_k_name: None,
                     };
 
                     // Phase 3 — extract scrutinee + arms from the
@@ -9420,6 +9764,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
+                    cont_param_names: collect_user_fn_cont_param_names(f),
+                    cont_param_callees: &cont_param_callees,
+                    arm_handle_span: None,
+                    arm_k_name: None,
                 };
 
                 // Phase 5 + Phase 6 — branch on body's first step
@@ -9807,6 +10155,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_frame_ptr_v: None,
                 arm_k_pair_self: cc.arm_k_pair_captures.get(&f.name).cloned(),
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
+                cont_param_names: collect_user_fn_cont_param_names(f),
+                cont_param_callees: &cont_param_callees,
+                arm_handle_span: None,
+                arm_k_name: None,
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -10310,6 +10662,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: frame_ptr_v,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
+                    cont_param_names: std::collections::BTreeSet::new(),
+                    cont_param_callees: &cont_param_callees,
+                    arm_handle_span: Some(synth.handle_span.clone()),
+                    arm_k_name: Some(synth.k_name.clone()),
                 };
 
                 // Plan B Task 55 (Phase 4d): route between the two
@@ -11253,6 +11609,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     arm_frame_ptr_v: None,
                     arm_k_pair_self: None,
                     arm_k_pair_captures: &cc.arm_k_pair_captures,
+                    cont_param_names: std::collections::BTreeSet::new(),
+                    cont_param_callees: &cont_param_callees,
+                    arm_handle_span: None,
+                    arm_k_name: None,
                 };
 
                 let body_value = lowerer.lower_expr(&synth.body);
@@ -11533,6 +11893,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_frame_ptr_v: None,
                 arm_k_pair_self: None,
                 arm_k_pair_captures: &cc.arm_k_pair_captures,
+                cont_param_names: std::collections::BTreeSet::new(),
+                cont_param_callees: &cont_param_callees,
+                arm_handle_span: None,
+                arm_k_name: None,
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
@@ -11825,6 +12189,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_frame_ptr_v: None,
                         arm_k_pair_self: None,
                         arm_k_pair_captures: &cc.arm_k_pair_captures,
+                        cont_param_names: std::collections::BTreeSet::new(),
+                        cont_param_callees: &cont_param_callees,
+                        arm_handle_span: None,
+                        arm_k_name: None,
                     };
 
                     match &step.role {
@@ -12546,6 +12914,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             arm_frame_ptr_v: None,
                             arm_k_pair_self: None,
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
+                            cont_param_names: std::collections::BTreeSet::new(),
+                            cont_param_callees: &cont_param_callees,
+                            arm_handle_span: None,
+                            arm_k_name: None,
                         };
 
                         match role {
@@ -12834,6 +13206,164 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 // branch terminates
                                                 // here — never reaches
                                                 // the gate).
+                                                lowerer.builder.ins().return_(&[ns_ptr]);
+                                            }
+                                            BranchedCpsLeaf::Perform => {
+                                                // Plan D Task 117 (b)
+                                                // Phase 4 R2 — bare
+                                                // perform leaf. Emit
+                                                // sigil_perform with
+                                                // caller_k_pair forwarded
+                                                // as the perform's
+                                                // continuation. The
+                                                // trampoline dispatches
+                                                // the matching arm; on
+                                                // arm completion (or
+                                                // discharge), control
+                                                // returns via caller_k.
+                                                let p = match block_tail {
+                                                    crate::ast::Expr::Perform(p) => p,
+                                                    _ => unreachable!(
+                                                        "Pattern C perform leaf: classifier \
+                                                         ensures branch tail is Expr::Perform"
+                                                    ),
+                                                };
+                                                let effect_id = match lowerer
+                                                    .effect_ids
+                                                    .get(&p.effect)
+                                                    .copied()
+                                                {
+                                                    Some(id) => id,
+                                                    None => unreachable!(
+                                                        "codegen Pattern C perform leaf: \
+                                                         effect `{}` missing from effect_ids",
+                                                        p.effect
+                                                    ),
+                                                };
+                                                let op_id = match lowerer
+                                                    .op_ids
+                                                    .get(&(p.effect.clone(), p.op.clone()))
+                                                    .copied()
+                                                {
+                                                    Some(id) => id,
+                                                    None => unreachable!(
+                                                        "codegen Pattern C perform leaf: \
+                                                         op `{}.{}` missing from op_ids",
+                                                        p.effect, p.op
+                                                    ),
+                                                };
+                                                let effect_id_v = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(types::I32, effect_id as i64);
+                                                let op_id_v = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(types::I32, op_id as i64);
+
+                                                // Pack the perform's user
+                                                // args into a stack slot.
+                                                let user_arg_count = p.args.len();
+                                                let (args_ptr, args_len_v) = if p.args.is_empty() {
+                                                    (
+                                                        lowerer.builder.ins().iconst(pointer_ty, 0),
+                                                        lowerer.builder.ins().iconst(types::I32, 0),
+                                                    )
+                                                } else {
+                                                    let arg_values: Vec<Value> = p
+                                                        .args
+                                                        .iter()
+                                                        .map(|a| lowerer.lower_expr(a))
+                                                        .collect();
+                                                    let slot_bytes = (user_arg_count * 8) as u32;
+                                                    let slot =
+                                                        lowerer.builder.create_sized_stack_slot(
+                                                            StackSlotData::new(
+                                                                StackSlotKind::ExplicitSlot,
+                                                                slot_bytes,
+                                                                3,
+                                                            ),
+                                                        );
+                                                    for (i, v) in arg_values.iter().enumerate() {
+                                                        let arg_ty =
+                                                            lowerer.builder.func.dfg.value_type(*v);
+                                                        let widened = if arg_ty == types::I64 {
+                                                            *v
+                                                        } else if arg_ty.is_int()
+                                                            && arg_ty.bits() < 64
+                                                        {
+                                                            lowerer
+                                                                .builder
+                                                                .ins()
+                                                                .uextend(types::I64, *v)
+                                                        } else {
+                                                            *v
+                                                        };
+                                                        lowerer.builder.ins().stack_store(
+                                                            widened,
+                                                            slot,
+                                                            (i * 8) as i32,
+                                                        );
+                                                    }
+                                                    (
+                                                        lowerer
+                                                            .builder
+                                                            .ins()
+                                                            .stack_addr(pointer_ty, slot, 0),
+                                                        lowerer.builder.ins().iconst(
+                                                            types::I32,
+                                                            user_arg_count as i64,
+                                                        ),
+                                                    )
+                                                };
+
+                                                // Load caller_k_pair from
+                                                // synth-cont's closure
+                                                // record's trailing slots
+                                                // (mirrors the CpsCall
+                                                // leaf's load above).
+                                                let caller_k_closure_off: i32 = 16
+                                                    + 8 * (captures.len() + prior_bindings.len())
+                                                        as i32;
+                                                let caller_k_fn_off: i32 = caller_k_closure_off + 8;
+                                                let caller_k_closure = lowerer.builder.ins().load(
+                                                    pointer_ty,
+                                                    MemFlags::trusted(),
+                                                    synth_closure_ptr,
+                                                    caller_k_closure_off,
+                                                );
+                                                let caller_k_fn = lowerer.builder.ins().load(
+                                                    pointer_ty,
+                                                    MemFlags::trusted(),
+                                                    synth_closure_ptr,
+                                                    caller_k_fn_off,
+                                                );
+
+                                                // sigil_perform forwards
+                                                // caller_k_pair as the
+                                                // perform's k. Returns
+                                                // *NextStep that we
+                                                // return from this synth
+                                                // fn directly.
+                                                let perform_call = lowerer.builder.ins().call(
+                                                    lowerer.perform_ref,
+                                                    &[
+                                                        effect_id_v,
+                                                        op_id_v,
+                                                        args_ptr,
+                                                        args_len_v,
+                                                        caller_k_closure,
+                                                        caller_k_fn,
+                                                    ],
+                                                );
+                                                lowerer.stackmap.push_placeholder(
+                                                    function_code_offset(
+                                                        &lowerer.builder,
+                                                        perform_call,
+                                                    ),
+                                                );
+                                                let ns_ptr =
+                                                    lowerer.builder.inst_results(perform_call)[0];
                                                 lowerer.builder.ins().return_(&[ns_ptr]);
                                             }
                                         }
@@ -14112,6 +14642,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             arm_frame_ptr_v: None,
                             arm_k_pair_self: None,
                             arm_k_pair_captures: &cc.arm_k_pair_captures,
+                            cont_param_names: std::collections::BTreeSet::new(),
+                            cont_param_callees: &cont_param_callees,
+                            arm_handle_span: None,
+                            arm_k_name: None,
                         };
 
                         // Plan B Task 78.5 G4 Phase B.3 — CPS→CPS direct
@@ -14981,6 +15515,17 @@ struct Lowerer<'a, 'b> {
     /// non-arm-fn Lowerers and arm fns whose body has no k-pair-bearing
     /// children.
     arm_frame_ptr_v: Option<Value>,
+    /// Plan D Task 117 (b) Phase 4 R1 — when this Lowerer is for a
+    /// synth arm fn (Cps), the arm header's continuation binding
+    /// name (`Effect.op(arg1, ..., k) => body` → `"k"`). Used by
+    /// `lower_continuation_arg` to precisely identify the arm-bound
+    /// `k` Ident in arg-packing for a Continuation-typed callee
+    /// param. Without this, `lower_continuation_arg` fell back to a
+    /// "name not in env or user_fn_refs" heuristic that would
+    /// silently misroute any future ambient binding through the
+    /// arm-k alloc path with stale (k_closure, k_fn) values.
+    /// `None` for non-arm Lowerers (the heuristic naturally bails).
+    arm_k_name: Option<String>,
 
     /// Plan B' Stage 6.8 Task 107 Phase B — when this Lowerer is for
     /// a k-pair-bearing synth lambda fn (lifted from an arm body that
@@ -15000,6 +15545,43 @@ struct Lowerer<'a, 'b> {
     /// trailing 2 slots get k_closure / k_fn from the surrounding
     /// arm fn's `arm_k_closure_v` / `arm_k_fn_v`.
     arm_k_pair_captures: &'b BTreeMap<String, crate::closure_convert::ArmKPairCapture>,
+    /// Plan D Task 117 (b) Phase 4 — set of names of fn parameters
+    /// whose declared type is `Continuation[op_ret, ret]`. Populated
+    /// at user-fn Lowerer construction by scanning the fn's params
+    /// for `Ty::Continuation` (or post-mono `TypeExpr::Apply { name:
+    /// "Continuation", .. }`). Empty for synth fns / arm fns / lifted
+    /// lambdas — they don't have continuation-typed user params (they
+    /// receive `k` via the trailing-pair convention on args_ptr or
+    /// via `arm_k_pair_captures` on the lifted lambda's closure
+    /// record).
+    ///
+    /// Consumed by `lower_call`:
+    ///   - When the callee is `Ident(name)` AND name is in this set,
+    ///     dispatch as a continuation invocation: load the
+    ///     `(k_closure, k_fn)` pair from the Continuation value
+    ///     object held in `env[name]`, build a `NextStep::Call`,
+    ///     drive `sigil_run_loop` to the terminal value.
+    ///   - When generic-call args contain `Ident(arm_k_name)` at a
+    ///     position whose callee param is Continuation-typed, alloc
+    ///     a Continuation value via `sigil_continuation_alloc(arm_-
+    ///     k_closure_v, arm_k_fn_v)` and pass the resulting pointer
+    ///     as the actual fn argument.
+    cont_param_names: std::collections::BTreeSet<String>,
+    /// Plan D Task 117 (b) Phase 4 — global map of user-fn names to
+    /// their per-param Continuation flags. Borrowed reference (lives
+    /// for `'b` alongside the other side-tables). Used by `lower_call`
+    /// to determine which arg positions need Continuation-value-object
+    /// allocation when packing arguments for a Sync user fn that
+    /// declares Continuation params.
+    cont_param_callees: &'b std::collections::BTreeMap<String, Vec<bool>>,
+    /// Plan D Task 117 (b) Phase 4 — when this Lowerer is for a
+    /// synth arm fn, the span of the enclosing `Expr::Handle`. Used
+    /// at Continuation arg-packing sites to look up the handle's
+    /// return-arm fn pointer (via
+    /// `handler_return_arm_refs_per_handle`) and frame-resident
+    /// return_closure (via `arm_frame_ptr_v` + frame offset). None
+    /// for non-arm Lowerers.
+    arm_handle_span: Option<Span>,
 }
 
 /// Task 78.5 G4 Approach 6 deep-redo (PR #80 review §7) — free-fn
@@ -17687,6 +18269,216 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         }
     }
 
+    /// Plan D Task 117 (b) Phase 4 — for an alloc site inside an
+    /// arm body, source the (return_closure, return_fn) pair to
+    /// embed in a fresh Continuation value object so post-invoke
+    /// the captured continuation's body value wraps via the
+    /// handle's `return(v) => ...` arm. Sources:
+    ///
+    ///   - return_fn: `handler_return_arm_refs_per_handle[span]` if
+    ///     the handle has a return arm; otherwise null.
+    ///   - return_closure: loaded from the arm fn's `arm_frame_ptr_v`
+    ///     at offset `HANDLER_FRAME_RETURN_CLOSURE_OFF` (the same
+    ///     slot `sigil_handler_frame_set_return` writes at handle
+    ///     setup time). Null when the return arm has no captures or
+    ///     no return arm.
+    ///
+    /// Both null when this Lowerer isn't an arm fn (no
+    /// `arm_handle_span`) — the caller's site-shape walker should
+    /// have prevented this path, but defensively returns nulls.
+    fn source_arm_return_pair_for_continuation_arg(&mut self) -> (Value, Value) {
+        let null_ptr_a = self.builder.ins().iconst(self.pointer_ty, 0);
+        let null_ptr_b = self.builder.ins().iconst(self.pointer_ty, 0);
+        let span = match &self.arm_handle_span {
+            Some(s) => s.clone(),
+            None => return (null_ptr_a, null_ptr_b),
+        };
+        let return_fn_ref_opt = self.handler_return_arm_refs_per_handle.get(&span).copied();
+        let Some(return_fn_ref) = return_fn_ref_opt else {
+            return (null_ptr_a, null_ptr_b);
+        };
+        let return_fn_addr = self.builder.ins().func_addr(self.pointer_ty, return_fn_ref);
+        // Load return_closure from the handler frame at offset
+        // HANDLER_FRAME_RETURN_CLOSURE_OFF. arm_frame_ptr_v is set
+        // by the synth arm fn ctor when the arm body has any k-pair-
+        // bearing nested ClosureRecord; for our case (the arm body
+        // is `helper(k, ...)`, not a lifted lambda), arm_frame_ptr_v
+        // may be None. Use null_closure in that case — the runtime
+        // tolerates null return_closure (per
+        // `sigil_handler_frame_set_return`'s null-for-empty
+        // discipline).
+        let return_closure = if let Some(frame_ptr) = self.arm_frame_ptr_v {
+            self.builder.ins().load(
+                self.pointer_ty,
+                MemFlags::trusted(),
+                frame_ptr,
+                sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
+            )
+        } else {
+            null_ptr_a
+        };
+        (return_closure, return_fn_addr)
+    }
+
+    /// Plan D Task 117 (b) Phase 4 — produce a Cranelift Value
+    /// representing a Continuation argument flowing into a callee's
+    /// `Continuation[op_ret, ret]` parameter slot. Two source shapes
+    /// are supported in v1:
+    ///
+    ///   - Arm-bound `k`: the call site is inside an arm body whose
+    ///     synth fn has `arm_k_pair_self` set. Box the
+    ///     `(arm_k_closure_v, arm_k_fn_v)` pair into a fresh
+    ///     Continuation value object via `sigil_continuation_alloc`.
+    ///
+    ///   - Forwarded fn-param `k`: the call site is inside a fn
+    ///     whose own param `k` is Continuation-typed (forwarding to
+    ///     a recursive helper). The value is already a pointer in
+    ///     `env[name]`; pass through.
+    ///
+    /// Other shapes (let-bound continuation aliases, captured
+    /// continuations from lifted lambdas, etc.) are not yet
+    /// supported in this slice and trip an `unreachable!` — the
+    /// codegen pre-pass walker (`arm_body_walk`'s generic-call
+    /// branch) only allows the two shapes above for k-as-arg flowing
+    /// into a Cont-typed param.
+    fn lower_continuation_arg(&mut self, arg: &crate::ast::Expr) -> Value {
+        use crate::ast::Expr;
+        if let Expr::Ident(name, _) = arg {
+            // Forwarded fn-param: env[name] is already a Continuation
+            // value object pointer.
+            if self.cont_param_names.contains(name) {
+                return *self.env.get(name).unwrap_or_else(|| {
+                    unreachable!("codegen: cont fn-param `{name}` missing from env at call site")
+                });
+            }
+            // Arm-bound k: box (arm_k_closure_v, arm_k_fn_v) into a
+            // fresh Continuation value object.
+            if let Some(info) = self.arm_k_pair_self.clone() {
+                if name == &info.k_name {
+                    let k_closure = self.arm_k_closure_v.unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen: arm_k_closure_v unset at Continuation arg packing site"
+                        )
+                    });
+                    let k_fn = self.arm_k_fn_v.unwrap_or_else(|| {
+                        unreachable!("codegen: arm_k_fn_v unset at Continuation arg packing site")
+                    });
+                    // Source the originating handle's return-arm
+                    // pair so the boxed continuation, when invoked
+                    // from outside the arm body (e.g. in a recursive
+                    // helper), still wraps the body's value via
+                    // `return(v) => ...`.
+                    let (return_closure, return_fn) =
+                        self.source_arm_return_pair_for_continuation_arg();
+                    let alloc_call = self.builder.ins().call(
+                        self.builtins.cont_alloc_ref,
+                        &[k_closure, k_fn, return_closure, return_fn],
+                    );
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, alloc_call));
+                    return self.builder.inst_results(alloc_call)[0];
+                }
+            }
+            // Synth-arm fn (not k-pair-bearing) where k is the arm's
+            // own k_name — sourced from the arm fn's args buffer
+            // (loaded into arm_k_closure_v / arm_k_fn_v at the synth
+            // fn's entry block). This is the `Choose.choose(arg, k)
+            // => helper(k, ...)` arm-body site.
+            //
+            // Plan D Task 117 (b) Phase 4 R1 — precise check on
+            // `arm_k_name`. Pre-R1 this branched on "name not in env
+            // or user_fn_refs" as a heuristic; that would silently
+            // misroute any future ambient binding through this path
+            // with stale (k_closure, k_fn). The arm fn's k_name is
+            // now tracked on the Lowerer at synth-arm-fn ctor time.
+            if let (Some(k_closure), Some(k_fn), Some(arm_k_name)) = (
+                self.arm_k_closure_v,
+                self.arm_k_fn_v,
+                self.arm_k_name.as_ref(),
+            ) {
+                if name == arm_k_name {
+                    let (return_closure, return_fn) =
+                        self.source_arm_return_pair_for_continuation_arg();
+                    let alloc_call = self.builder.ins().call(
+                        self.builtins.cont_alloc_ref,
+                        &[k_closure, k_fn, return_closure, return_fn],
+                    );
+                    self.stackmap
+                        .push_placeholder(function_code_offset(&self.builder, alloc_call));
+                    return self.builder.inst_results(alloc_call)[0];
+                }
+            }
+        }
+        unreachable!(
+            "lower_continuation_arg: unsupported Continuation-arg shape {arg:?}; \
+             v1 supports `Ident(arm_k_name)` (boxes arm-fn k-pair) and \
+             `Ident(cont_param_name)` (forwards env value); other shapes are \
+             not yet implemented"
+        )
+    }
+
+    /// Plan D Task 117 (b) Phase 4 — invoke a continuation held in a
+    /// fn parameter (a boxed Continuation value object pointer).
+    /// Delegates the dispatch to the runtime helper
+    /// `sigil_continuation_invoke`, which:
+    ///   1. Snapshots `OUTER_POST_ARM_K_DEPTH` so any pushes the
+    ///      captured continuation's internal synth-conts perform
+    ///      get drained before returning (otherwise post-arm-k
+    ///      stack entries leak across the Sync→Cps→Sync invoke
+    ///      boundary).
+    ///   2. Builds NextStep::Call(k_closure, k_fn, [arg, null,
+    ///      identity], 3); drives `sigil_run_loop` to the body's
+    ///      natural value.
+    ///   3. If the boxed Continuation carries a non-null return_fn,
+    ///      builds a SECOND NextStep::Call(return_closure,
+    ///      return_fn, [body_val, null, identity], 3); drives
+    ///      `sigil_run_loop` again for the return-arm wrap.
+    ///   4. Restores `OUTER_POST_ARM_K_DEPTH`.
+    ///
+    /// Returns the wrapped R-typed value.
+    fn lower_continuation_param_call(&mut self, name: &str, args: &[crate::ast::Expr]) -> Value {
+        debug_assert_eq!(
+            args.len(),
+            1,
+            "lower_continuation_param_call: continuation arity is fixed at 1, got {}",
+            args.len()
+        );
+
+        // Load Continuation value object pointer from env.
+        let cont_ptr = *self.env.get(name).unwrap_or_else(|| {
+            unreachable!(
+                "codegen: cont param `{name}` missing from env — fn-entry param \
+                 binding should have populated it"
+            )
+        });
+
+        // Lower the resume arg, widen to I64.
+        let arg_v = self.lower_expr(&args[0]);
+        let arg_ty = self.builder.func.dfg.value_type(arg_v);
+        let widened_arg = if arg_ty == types::I64 {
+            arg_v
+        } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+            self.builder.ins().uextend(types::I64, arg_v)
+        } else {
+            assert_eq!(
+                arg_ty, self.pointer_ty,
+                "lower_continuation_param_call: unexpected arg Cranelift type {arg_ty:?}"
+            );
+            arg_v
+        };
+
+        // Single runtime helper call wraps everything: dispatch +
+        // run_loop + return-arm wrap + outer_post_arm_k snapshot.
+        let terminal_out = self.terminal_out_param;
+        let invoke_call = self.builder.ins().call(
+            self.builtins.cont_invoke_ref,
+            &[cont_ptr, widened_arg, terminal_out],
+        );
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, invoke_call));
+        self.builder.inst_results(invoke_call)[0]
+    }
+
     fn lower_call(
         &mut self,
         callee: &crate::ast::Expr,
@@ -17708,6 +18500,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         if let (Expr::Ident(name, _), Some(info)) = (callee, self.arm_k_pair_self.clone()) {
             if name == &info.k_name {
                 return self.lower_k_pair_call(args, &info);
+            }
+        }
+
+        // Plan D Task 117 (b) Phase 4 — Continuation-as-fn-param
+        // dispatch. When the surrounding fn declares a parameter of
+        // type `Continuation[op_ret, ret]` and the call's callee is
+        // an `Ident` matching that parameter's name, dispatch via
+        // the boxed-Continuation invocation shape: load (k_closure,
+        // k_fn) from the value object held in `env[name]`, build a
+        // `NextStep::Call(k_closure, k_fn, 1)`, write the resume arg
+        // into the args buffer, and drive `sigil_run_loop` to the
+        // terminal value.
+        if let Expr::Ident(name, _) = callee {
+            if self.cont_param_names.contains(name) {
+                return self.lower_continuation_param_call(name, args);
             }
         }
 
@@ -17746,8 +18553,36 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 };
                 match callee_entry.abi {
                     UserFnAbi::Sync => {
-                        let arg_vals: Vec<Value> =
-                            args.iter().map(|a| self.lower_expr(a)).collect();
+                        // Plan D Task 117 (b) Phase 4 — Continuation
+                        // arg packing. For each param position the
+                        // callee declares as `Continuation[op_ret,
+                        // ret]`, materialize a Continuation value
+                        // object pointer instead of dispatching
+                        // `lower_expr` (which would fail to resolve
+                        // `Ident(arm_k_name)` since arm-bound `k` is
+                        // not in `env`). Two source shapes:
+                        //   - `Ident(arm_k_name)` with this Lowerer's
+                        //     `arm_k_pair_self` set: alloc a fresh
+                        //     value object boxing `(arm_k_closure_v,
+                        //     arm_k_fn_v)`.
+                        //   - `Ident(name)` where name is in
+                        //     `self.cont_param_names`: the value is
+                        //     already a Continuation pointer in env;
+                        //     forward it directly.
+                        let cont_flags: Option<&Vec<bool>> = self.cont_param_callees.get(name);
+                        let arg_vals: Vec<Value> = args
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| {
+                                let is_cont_pos =
+                                    cont_flags.is_some_and(|f| f.get(i).copied().unwrap_or(false));
+                                if is_cont_pos {
+                                    self.lower_continuation_arg(a)
+                                } else {
+                                    self.lower_expr(a)
+                                }
+                            })
+                            .collect();
                         let func_ref = self.user_fn_refs[name];
                         let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
                         // Plan D Task 111b — Sync→Sync: forward the
@@ -20587,6 +21422,14 @@ struct BuiltinFuncIds {
     /// Plan C Task 76 — OS clock (nanos since epoch). Backs the
     /// `os_clock` handler in `std/clock.sigil`.
     clock_os_now: cranelift_module::FuncId,
+    /// Plan D Task 117 (b) Phase 4 — Continuation value object
+    /// `alloc` (boxes the (k_closure, k_fn, return_closure,
+    /// return_fn) quadruple at sites that flow a continuation
+    /// into a fn-parameter) and `invoke` (drives dispatch +
+    /// run_loop + return-arm wrap at sites that call a
+    /// continuation held in a fn parameter).
+    cont_alloc: cranelift_module::FuncId,
+    cont_invoke: cranelift_module::FuncId,
 }
 
 /// Per-fn FuncRefs for the builtin runtime primitives. Sibling of
@@ -20668,6 +21511,13 @@ struct BuiltinFuncRefs {
     random_pseudo_int_ref: FuncRef,
     /// Plan C Task 76 — OS clock FuncRef.
     clock_os_now_ref: FuncRef,
+    /// Plan D Task 117 (b) Phase 4 — Continuation value object
+    /// alloc + invoke helpers (FuncRefs). The load helpers
+    /// (`sigil_continuation_load_*`) are called only from inside
+    /// `sigil_continuation_invoke`'s Rust body; codegen never
+    /// emits direct calls.
+    cont_alloc_ref: FuncRef,
+    cont_invoke_ref: FuncRef,
 }
 
 /// Plan B Task 55, Phase 4e — input context for [`prepare_per_fn_refs`].
@@ -20879,6 +21729,8 @@ fn prepare_builtin_func_refs(
         string_length_ref: module.declare_func_in_func(ids.string_length, builder.func),
         random_pseudo_int_ref: module.declare_func_in_func(ids.random_pseudo_int, builder.func),
         clock_os_now_ref: module.declare_func_in_func(ids.clock_os_now, builder.func),
+        cont_alloc_ref: module.declare_func_in_func(ids.cont_alloc, builder.func),
+        cont_invoke_ref: module.declare_func_in_func(ids.cont_invoke, builder.func),
     }
 }
 
@@ -21763,9 +22615,17 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                 classify_branched_cps_tail_branch(then_block, ctors, is_supported_for_branch_leaf)?;
             let else_kind =
                 classify_branched_cps_tail_branch(else_block, ctors, is_supported_for_branch_leaf)?;
-            if matches!(then_kind, BranchedCpsLeaf::CpsCall)
-                || matches!(else_kind, BranchedCpsLeaf::CpsCall)
-            {
+            // Plan D Task 117 (b) Phase 4 R2 — Perform leaves count as
+            // "Cps-eligible" alongside CpsCall (both produce
+            // NextStep::Call into the trampoline; the synth-cont's
+            // body emit threads caller_k_pair as the perform's k).
+            if matches!(
+                then_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) || matches!(
+                else_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) {
                 has_cps_call = true;
             }
         }
@@ -21776,7 +22636,7 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                     ctors,
                     is_supported_for_branch_leaf,
                 )?;
-                if matches!(kind, BranchedCpsLeaf::CpsCall) {
+                if matches!(kind, BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform) {
                     has_cps_call = true;
                 }
             }
@@ -21811,6 +22671,12 @@ fn classify_branched_cps_tail_branch_expr(
             if is_supported(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
                 return Some(BranchedCpsLeaf::CpsCall);
             }
+        }
+    }
+    // Plan D Task 117 (b) Phase 4 R2 — bare Perform with pure args.
+    if let Expr::Perform(p) = e {
+        if p.args.iter().all(|a| expr_is_pure(a, ctors)) {
+            return Some(BranchedCpsLeaf::Perform);
         }
     }
     None
@@ -21858,9 +22724,15 @@ fn detect_pattern_c_dispatch<'a>(
                 classify_branched_cps_tail_branch(then_block.as_ref(), ctors, is_supported)?;
             let else_kind =
                 classify_branched_cps_tail_branch(else_block.as_ref(), ctors, is_supported)?;
-            if !matches!(then_kind, BranchedCpsLeaf::CpsCall)
-                && !matches!(else_kind, BranchedCpsLeaf::CpsCall)
-            {
+            // Plan D Task 117 (b) Phase 4 R2 — Perform leaves count
+            // alongside CpsCall (both produce NextStep::Call).
+            if !matches!(
+                then_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) && !matches!(
+                else_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) {
                 return None;
             }
             let then_leaf = then_block.tail.as_ref()?;
@@ -21896,9 +22768,15 @@ fn detect_pattern_c_dispatch<'a>(
                 classify_branched_cps_tail_branch_expr(&then_arm.body, ctors, is_supported)?;
             let else_kind =
                 classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_supported)?;
-            if !matches!(then_kind, BranchedCpsLeaf::CpsCall)
-                && !matches!(else_kind, BranchedCpsLeaf::CpsCall)
-            {
+            // Plan D Task 117 (b) Phase 4 R2 — Perform leaves count
+            // alongside CpsCall (both produce NextStep::Call).
+            if !matches!(
+                then_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) && !matches!(
+                else_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) {
                 return None;
             }
             // For arm bodies that are Expr::Block, extract the tail;
@@ -21957,6 +22835,12 @@ fn classify_branched_cps_tail_branch(
             }
         }
     }
+    // Plan D Task 117 (b) Phase 4 R2 — bare Perform with pure args.
+    if let Expr::Perform(p) = tail {
+        if p.args.iter().all(|a| expr_is_pure(a, ctors)) {
+            return Some(BranchedCpsLeaf::Perform);
+        }
+    }
     None
 }
 
@@ -21971,6 +22855,20 @@ enum BranchedCpsLeaf {
     /// `NextStep::Call(callee, args + caller_k_pair_forwarded)`. The
     /// recursion threads caller_k_pair through every level.
     CpsCall,
+    /// Plan D Task 117 (b) Phase 4 R2 — branch tail is a bare
+    /// `Expr::Perform` with pure args. Emit
+    /// `sigil_perform(effect_id, op_id, args, args_len, caller_k_*)`
+    /// — the perform's continuation is the synth-cont's own caller_k
+    /// pair (forwarded from the synth-cont's closure record's
+    /// trailing slots). Multi-shot dispatchers (`std/choose.sigil`'s
+    /// `all_choices` / `first_choice` over runtime-N
+    /// `Choose.choose(arg)`) need this leaf shape so a body like
+    /// `let x = perform Choose.choose(N); if cond { perform
+    /// Choose.fail() } else { x }` matches the
+    /// `is_let_yield_prefix_then_branched_cps_tail_body` classifier
+    /// (without requiring users to wrap the in-branch perform in a
+    /// fn call).
+    Perform,
 }
 
 /// Plan B Task 78.5 G4 (Phase A — shape detector only) — does this fn
@@ -24914,7 +25812,13 @@ mod tests {
         let mut effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
         effects_resumes_many.insert("Choose".to_string(), true);
         let ctors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many);
+        let result = arm_body_unsupported_construct(
+            &arm,
+            &globals,
+            &ctors,
+            &effects_resumes_many,
+            &std::collections::BTreeMap::new(),
+        );
         assert!(
             result.is_none(),
             "expected None (accept) for 3-let arm body of resumes:many effect; \
@@ -24971,7 +25875,13 @@ mod tests {
         let globals: BTreeSet<String> = BTreeSet::new();
         let ctors: BTreeSet<String> = BTreeSet::new();
         let effects_resumes_many: BTreeMap<String, bool> = BTreeMap::new();
-        let result = arm_body_unsupported_construct(&arm, &globals, &ctors, &effects_resumes_many);
+        let result = arm_body_unsupported_construct(
+            &arm,
+            &globals,
+            &ctors,
+            &effects_resumes_many,
+            &std::collections::BTreeMap::new(),
+        );
         assert!(
             result.is_none(),
             "Task 118 post-lift: walker must accept conditional-k-inside-if \

@@ -345,6 +345,31 @@ thread_local! {
     static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Plan D Task 117 (b) Phase 4 — snapshot the current
+/// OUTER_POST_ARM_K depth so a caller (e.g.
+/// `sigil_continuation_invoke`) can drain any pushes the captured
+/// continuation performs during its run_loop drive. Mirror of the
+/// snapshot `sigil_run_loop` does at entry; exposed as a free
+/// function so the continuation-invoke helper can use the same
+/// discipline without needing to drive run_loop transitively.
+#[inline]
+pub fn outer_post_arm_k_depth_snapshot() -> usize {
+    OUTER_POST_ARM_K_DEPTH.with(|c| c.get())
+}
+
+/// Plan D Task 117 (b) Phase 4 — restore OUTER_POST_ARM_K depth to
+/// a previous snapshot. Used by `sigil_continuation_invoke` after
+/// driving the captured continuation's run_loop to drain any
+/// post-arm-k entries that the continuation's internal synth-conts
+/// pushed but the trampoline's routing didn't pop (e.g., when our
+/// codegen wraps the body value via a SECOND run_loop, the first
+/// run_loop's DONE handler doesn't pop the entry because the
+/// trampoline routes through the outer chain instead).
+#[inline]
+pub fn outer_post_arm_k_depth_restore(target: usize) {
+    OUTER_POST_ARM_K_DEPTH.with(|c| c.set(target));
+}
+
 // ---------------------------------------------------------------------
 // Task 78.5 G4 Approach 6 deep-redo — body-return-arm stack
 // (replaces the iter-2 single-cell triplet TLS per PR #80 review §1)

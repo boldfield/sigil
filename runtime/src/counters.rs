@@ -68,14 +68,26 @@ pub enum CounterId {
     /// `sigil_string_builder_*` (record + segments + finalized
     /// String).
     StringBuilderAllocBytes = 21,
+    /// Plan D Task 117 (b) Phase 4 — count of
+    /// `sigil_continuation_alloc` invocations. One alloc per
+    /// site that flows a continuation into a fn-parameter (e.g.,
+    /// each recursive call in a runtime-N discharger).
+    ContinuationAllocCount = 22,
+    /// Plan D Task 117 (b) Phase 4 — total bytes allocated by
+    /// `sigil_continuation_alloc` (header + 4 ptr fields =
+    /// 40 bytes per record; matches the
+    /// `counters::add(_, 40)` call at the alloc site).
+    ContinuationAllocBytes = 23,
 }
 
-const COUNTER_SLOTS: usize = 22;
+const COUNTER_SLOTS: usize = 24;
 
 /// Static backing storage for all counters. Mutable only via atomic relaxed
 /// operations; never touched by reference. This is the only global atomic
 /// state the runtime owns.
 static COUNTERS: [AtomicU64; COUNTER_SLOTS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -125,6 +137,8 @@ pub const NAMES: [&str; COUNTER_SLOTS] = [
     "SIGIL_COUNTER_INT64_ALLOC_BYTES",
     "SIGIL_COUNTER_STRING_BUILDER_ALLOC_COUNT",
     "SIGIL_COUNTER_STRING_BUILDER_ALLOC_BYTES",
+    "SIGIL_COUNTER_CONTINUATION_ALLOC_COUNT",
+    "SIGIL_COUNTER_CONTINUATION_ALLOC_BYTES",
 ];
 
 #[inline]

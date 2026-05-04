@@ -128,6 +128,52 @@ pub const TAG_TUPLE: u8 = 0x09;
 /// literal `31`. See `TAG_TUPLE` for the rationale.
 pub const MAX_TUPLE_ARITY: usize = 31;
 
+/// Plan D Task 117 (b) — Continuation value object. Boxes the
+/// captured-continuation pair AND the originating handle's
+/// return-arm pair so that a `Continuation[op_ret, ret]` fn-parameter
+/// type fits the 1-pointer-per-param Sync ABI without widening every
+/// call site, AND so that invoking the continuation outside the
+/// originating arm body still wraps the body-returned value via the
+/// handle's `return(v) => ...` arm (necessary for runtime-N
+/// dischargers like `fold_choices`, where each `k(i)` call must
+/// produce the handle's overall value type, not the body's
+/// natural type).
+///
+/// Layout (40 bytes):
+///
+/// ```text
+/// offset 0  : 8-byte header (tag = TAG_CONTINUATION, count=4,
+///                            bitmap=0b0101)
+///                              ^^^^^^^^^^^^
+///                              bit 0: k_closure_ptr     (GC managed)
+///                              bit 1: k_fn_ptr          (code addr)
+///                              bit 2: return_closure_ptr (GC managed)
+///                              bit 3: return_fn_ptr     (code addr)
+/// offset 8  : k_closure_ptr      (resume code's closure record)
+/// offset 16 : k_fn_ptr           (resume code address)
+/// offset 24 : return_closure_ptr (handle's return-arm closure
+///                                 record; null if return arm has
+///                                 no captures or no return arm)
+/// offset 32 : return_fn_ptr      (handle's return-arm fn ptr; null
+///                                 if no return arm — invoke
+///                                 dispatches identity instead)
+/// ```
+///
+/// Allocated by `sigil_continuation_alloc(k_closure, k_fn,
+/// return_closure, return_fn)` at the call site that flows a
+/// continuation into a fn-parameter (e.g., a `Choose.choose(arg, k)
+/// => fold_choices(k, ...)` site passes the alloc'd value as the
+/// `k` arg). Inside the receiving fn, `k(arg)` derefs offsets
+/// 8/16/24/32, builds `NextStep::Call(k_closure, k_fn, [arg,
+/// return_closure, return_fn])`, and drives `sigil_run_loop` to
+/// the wrapped terminal value.
+///
+/// No frame_ptr field — the handler frame is alive for the
+/// duration of the discharger's recursion (the receiving fn was
+/// called from inside an arm body, which means the arm body — and
+/// therefore its frame — is on the call stack above us).
+pub const TAG_CONTINUATION: u8 = 0x0A;
+
 /// Payload-word-count field layout.
 pub const COUNT_BITS: u32 = 6;
 pub const COUNT_SHIFT: u32 = 8;
