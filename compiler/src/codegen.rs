@@ -8732,6 +8732,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         cont_param_names: collect_user_fn_cont_param_names(f),
                         cont_param_callees: &cont_param_callees,
                         arm_handle_span: None,
+                        arm_k_name: None,
                     };
 
                     // Phase 3 — extract scrutinee + arms from the
@@ -9766,6 +9767,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     cont_param_names: collect_user_fn_cont_param_names(f),
                     cont_param_callees: &cont_param_callees,
                     arm_handle_span: None,
+                    arm_k_name: None,
                 };
 
                 // Phase 5 + Phase 6 — branch on body's first step
@@ -10156,6 +10158,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 cont_param_names: collect_user_fn_cont_param_names(f),
                 cont_param_callees: &cont_param_callees,
                 arm_handle_span: None,
+                arm_k_name: None,
             };
 
             let tail_val = lowerer.lower_block(&f.body);
@@ -10662,6 +10665,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     cont_param_names: std::collections::BTreeSet::new(),
                     cont_param_callees: &cont_param_callees,
                     arm_handle_span: Some(synth.handle_span.clone()),
+                    arm_k_name: Some(synth.k_name.clone()),
                 };
 
                 // Plan B Task 55 (Phase 4d): route between the two
@@ -11608,6 +11612,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     cont_param_names: std::collections::BTreeSet::new(),
                     cont_param_callees: &cont_param_callees,
                     arm_handle_span: None,
+                    arm_k_name: None,
                 };
 
                 let body_value = lowerer.lower_expr(&synth.body);
@@ -11891,6 +11896,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 cont_param_names: std::collections::BTreeSet::new(),
                 cont_param_callees: &cont_param_callees,
                 arm_handle_span: None,
+                arm_k_name: None,
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
@@ -12186,6 +12192,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         cont_param_names: std::collections::BTreeSet::new(),
                         cont_param_callees: &cont_param_callees,
                         arm_handle_span: None,
+                        arm_k_name: None,
                     };
 
                     match &step.role {
@@ -12910,6 +12917,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             cont_param_names: std::collections::BTreeSet::new(),
                             cont_param_callees: &cont_param_callees,
                             arm_handle_span: None,
+                            arm_k_name: None,
                         };
 
                         match role {
@@ -14479,6 +14487,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             cont_param_names: std::collections::BTreeSet::new(),
                             cont_param_callees: &cont_param_callees,
                             arm_handle_span: None,
+                            arm_k_name: None,
                         };
 
                         // Plan B Task 78.5 G4 Phase B.3 — CPS→CPS direct
@@ -15348,6 +15357,17 @@ struct Lowerer<'a, 'b> {
     /// non-arm-fn Lowerers and arm fns whose body has no k-pair-bearing
     /// children.
     arm_frame_ptr_v: Option<Value>,
+    /// Plan D Task 117 (b) Phase 4 R1 — when this Lowerer is for a
+    /// synth arm fn (Cps), the arm header's continuation binding
+    /// name (`Effect.op(arg1, ..., k) => body` → `"k"`). Used by
+    /// `lower_continuation_arg` to precisely identify the arm-bound
+    /// `k` Ident in arg-packing for a Continuation-typed callee
+    /// param. Without this, `lower_continuation_arg` fell back to a
+    /// "name not in env or user_fn_refs" heuristic that would
+    /// silently misroute any future ambient binding through the
+    /// arm-k alloc path with stale (k_closure, k_fn) values.
+    /// `None` for non-arm Lowerers (the heuristic naturally bails).
+    arm_k_name: Option<String>,
 
     /// Plan B' Stage 6.8 Task 107 Phase B — when this Lowerer is for
     /// a k-pair-bearing synth lambda fn (lifted from an arm body that
@@ -18206,21 +18226,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             // (loaded into arm_k_closure_v / arm_k_fn_v at the synth
             // fn's entry block). This is the `Choose.choose(arg, k)
             // => helper(k, ...)` arm-body site.
-            if let (Some(k_closure), Some(k_fn)) = (self.arm_k_closure_v, self.arm_k_fn_v) {
-                // Heuristic: if the arm fn's k_name is "k" or matches
-                // by convention any binder shadowed in env, use the
-                // arm-fn-loaded pair. Without an arm.k_name field on
-                // the Lowerer, accept any Ident that isn't a regular
-                // local — falls to the alloc path. Since the walker
-                // already validated this site, the pair is the right
-                // source. (A future polish pass should track arm.k_name
-                // on the Lowerer for a precise check.)
-                if !self.env.contains_key(name) && !self.user_fn_refs.contains_key(name) {
-                    // Source the originating handle's return-arm
-                    // pair so the boxed continuation, when invoked
-                    // from outside the arm body (e.g. in a recursive
-                    // helper), still wraps the body's value via
-                    // `return(v) => ...`.
+            //
+            // Plan D Task 117 (b) Phase 4 R1 — precise check on
+            // `arm_k_name`. Pre-R1 this branched on "name not in env
+            // or user_fn_refs" as a heuristic; that would silently
+            // misroute any future ambient binding through this path
+            // with stale (k_closure, k_fn). The arm fn's k_name is
+            // now tracked on the Lowerer at synth-arm-fn ctor time.
+            if let (Some(k_closure), Some(k_fn), Some(arm_k_name)) = (
+                self.arm_k_closure_v,
+                self.arm_k_fn_v,
+                self.arm_k_name.as_ref(),
+            ) {
+                if name == arm_k_name {
                     let (return_closure, return_fn) =
                         self.source_arm_return_pair_for_continuation_arg();
                     let alloc_call = self.builder.ins().call(

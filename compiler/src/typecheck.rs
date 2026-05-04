@@ -1300,12 +1300,29 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             };
             // Plan D Task 117 (b) Phase 4 — also register a
             // file-qualified alias so a fn body's recursive
-            // self-reference can resolve to ITS OWN module's scheme
+            // self-reference resolves to ITS OWN module's scheme
             // rather than colliding with a same-named fn from a
             // different module (e.g., `map` in `std.list` vs
             // `std.option`). The bare-name entry follows
             // last-wins (compatible with prior behavior); the
             // file-qualified entry is unique per fn.
+            //
+            // **Scope of the fix.** This resolves intra-module
+            // recursive resolution only. Cross-module bare-name
+            // calls from user code still last-wins — a user file
+            // that imports both `std.list` and `std.option` and
+            // writes `map(xs, f)` resolves to whichever was
+            // registered most recently (typically determined by
+            // import order + transitive load order). Properly
+            // closing this requires either (a) type-directed
+            // dispatch on first-arg type at call-site, or (b)
+            // namespace-qualified import syntax (`use std.list::map
+            // as list_map`). Both are v2 / namespace-fix territory;
+            // this PR's scope is the typecheck-side machinery for
+            // Continuation as fn-param, and the bare-name
+            // last-wins behavior is preserved as v1 status quo.
+            // Tracking: `[DEVIATION Task 73]` namespace-qualified
+            // imports follow-up.
             let qualified_key = format!("{}::{}", f.span.file, f.name);
             tc.fn_schemes.insert(qualified_key, scheme.clone());
             tc.fn_schemes.insert(f.name.clone(), scheme);
@@ -2394,11 +2411,34 @@ struct Tc {
     /// first `Continuation[op_ret, ret]` annotation encountered.
     /// All Continuation annotations in the same signature share
     /// the same Var (rank-1-per-fn discipline; matches
-    /// `effect_row_var`'s single-row-var-per-fn precedent). After
-    /// the signature walk completes, the allocated id (if any) is
-    /// pushed into `Scheme.scope_vars`. `None` outside fn-sig
-    /// walks; reset to `None` before each fn signature walk and
-    /// inspected after.
+    /// `effect_row_var`'s single-row-var-per-fn precedent).
+    ///
+    /// **Lifecycle.** Three independent passes each allocate their
+    /// own scope_var for the same fn signature (mirrors the
+    /// row-var allocation discipline; each phase owns its subst):
+    ///
+    ///   1. Pre-pass (~`typecheck.rs:1264-1274`) — id stored in
+    ///      `Scheme.scope_vars`. Used by call-site instantiation:
+    ///      every recursive or cross-fn call to this fn renames
+    ///      the scheme's scope_var to a fresh per-call-site id and
+    ///      unifies against the caller's actual continuation.
+    ///   2. E0112 sweep (~`typecheck.rs:1349-1359`) — id used
+    ///      transiently to resolve Continuation annotations during
+    ///      the type-known walk; dropped after the sweep.
+    ///   3. Body walk in `check_fn` (~`typecheck.rs:4131-4136`) —
+    ///      id used during body typing so references to the fn's
+    ///      Continuation params resolve consistently.
+    ///
+    /// The body-walk id and the scheme-stored id are different
+    /// allocations; they connect at recursive call sites via
+    /// `bind_scope_var` (the recursive call instantiates the
+    /// scheme to a fresh Var, which unifies against the body
+    /// id). The discipline is wasteful but correct, mirroring
+    /// `effect_row_var`'s precedent. Unifying the three
+    /// allocations into one shared id is a follow-up refactor.
+    ///
+    /// `None` outside fn-sig walks; reset to `None` before each
+    /// signature walk and inspected after.
     current_fn_scope_var: Option<u32>,
     /// Plan D Task 117 (b) Phase 4 — source file of the fn whose
     /// body is currently being typechecked. Used by `check_call`'s
@@ -2999,8 +3039,15 @@ impl Tc {
                 _ => {
                     // Var-vs-Concrete or Var-vs-Var on the existing
                     // binding: recurse via bind_scope_var on the
-                    // existing Var id (lower-id-canonical maintained
-                    // by the caller's higher → lower rule).
+                    // existing Var id. The recursion terminates
+                    // because `subst.scopes` is acyclic by
+                    // construction — every insert links id →
+                    // resolved-target without creating a cycle (a
+                    // self-bind short-circuits at the top of this
+                    // method, and the caller's `unify_ty` Var-vs-Var
+                    // arm normalises direction lower → higher before
+                    // calling here so chained binds form a tree, not
+                    // a cycle).
                     if let ScopeId::Var(existing_id) = existing {
                         self.bind_scope_var(existing_id, resolved, span)
                     } else if let ScopeId::Var(other) = &resolved {

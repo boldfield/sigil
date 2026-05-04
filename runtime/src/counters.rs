@@ -74,8 +74,9 @@ pub enum CounterId {
     /// each recursive call in a runtime-N discharger).
     ContinuationAllocCount = 22,
     /// Plan D Task 117 (b) Phase 4 — total bytes allocated by
-    /// `sigil_continuation_alloc` (header + 2 ptr fields = 24
-    /// bytes per record).
+    /// `sigil_continuation_alloc` (header + 4 ptr fields =
+    /// 40 bytes per record; matches the
+    /// `counters::add(_, 40)` call at the alloc site).
     ContinuationAllocBytes = 23,
 }
 

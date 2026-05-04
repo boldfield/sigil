@@ -8626,6 +8626,128 @@ fn std_choose_first_choice_short_circuits_on_zero() {
     assert_eq!(stdout, "0\n", "stderr={stderr:?}");
 }
 
+/// `all_choices` over a body that performs `Choose.fail()`
+/// unconditionally. Verifies the `Nil`-on-fail discipline: every
+/// branch fails → empty list returned.
+#[test]
+fn std_choose_all_choices_all_branches_fail_returns_empty() {
+    let src = "import std.choose\n\
+               fn always_fail() -> Int ![Choose] {\n  \
+                 perform Choose.fail()\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let results: List[Int] = all_choices(always_fail);\n  \
+                 perform IO.println(int_to_string(length(results)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_all_choices_all_fail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// `all_choices` over a body that conditionally fails on some
+/// branches. With `Choose.choose(4)` and `if x == 2 fail else x`,
+/// branches 0/1/3 succeed and branch 2 fails — list of length 3.
+///
+/// Uses a `fail_int()` helper rather than inlining `perform
+/// Choose.fail()` directly in the if-branch. The v1 Cps body
+/// classifier (`compute_user_fn_abi` at `compiler/src/codegen.rs:-
+/// 189`) accepts `let x = perform; if cond { cps_call() } else
+/// { pure }` (the `is_let_yield_prefix_then_branched_cps_tail_-
+/// body` shape: branches must be Pure or CpsCall) but NOT a bare
+/// `perform` in a branch. Wrapping the perform in a fn call
+/// makes the branch a CpsCall and unblocks the multi-shot path.
+/// Documented in `std/choose.sigil` as the user-side workaround
+/// for v1.
+#[test]
+fn std_choose_all_choices_partial_fail_skips_failing_branches() {
+    let src = "import std.choose\n\
+               fn fail_int() -> Int ![Choose] {\n  \
+                 perform Choose.fail()\n\
+               }\n\
+               fn pick_skip_two() -> Int ![Choose] {\n  \
+                 let x: Int = perform Choose.choose(4);\n  \
+                 if x == 2 {\n    \
+                   fail_int()\n  \
+                 } else {\n    \
+                   x\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let results: List[Int] = all_choices(pick_skip_two);\n  \
+                 perform IO.println(int_to_string(length(results)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_all_choices_partial_fail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n", "stderr={stderr:?}");
+}
+
+/// `first_choice` over a body that fails every branch returns
+/// `None`. Locks down the all-fail short-circuit semantics.
+#[test]
+fn std_choose_first_choice_all_branches_fail_returns_none() {
+    let src = "import std.choose\n\
+               fn always_fail() -> Int ![Choose] {\n  \
+                 perform Choose.fail()\n\
+               }\n\
+               fn unwrap_or_int(o: Option[Int], dflt: Int) -> Int ![] {\n  \
+                 match o {\n    \
+                   Some(x) => x,\n    \
+                   None => dflt,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Option[Int] = first_choice(always_fail);\n  \
+                 let v: Int = unwrap_or_int(r, 0 - 99);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_first_choice_all_fail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "-99\n", "stderr={stderr:?}");
+}
+
+/// `first_choice` over a body that fails the first 3 branches and
+/// returns successfully on the 4th. Pins the recursive
+/// `first_choice_helper`'s descent through failing `k(i)` calls
+/// until a non-failing branch is found.
+///
+/// Uses a `fail_int()` helper rather than inlining `perform
+/// Choose.fail()` in the if-branch — same Cps-classifier
+/// constraint as
+/// `std_choose_all_choices_partial_fail_skips_failing_branches`.
+#[test]
+fn std_choose_first_choice_skips_failures_then_finds_success() {
+    let src = "import std.choose\n\
+               fn fail_int() -> Int ![Choose] {\n  \
+                 perform Choose.fail()\n\
+               }\n\
+               fn pick_geq_three() -> Int ![Choose] {\n  \
+                 let x: Int = perform Choose.choose(5);\n  \
+                 if x < 3 {\n    \
+                   fail_int()\n  \
+                 } else {\n    \
+                   x\n  \
+                 }\n\
+               }\n\
+               fn unwrap_or_int(o: Option[Int], dflt: Int) -> Int ![] {\n  \
+                 match o {\n    \
+                   Some(x) => x,\n    \
+                   None => dflt,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Option[Int] = first_choice(pick_geq_three);\n  \
+                 let v: Int = unwrap_or_int(r, 0 - 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_first_choice_skips_failures");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 69 — boxed Int64 run-and-check-output =====
 
 /// Construct two Int64s, add them, stringify and print. Pins the

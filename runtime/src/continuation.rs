@@ -193,9 +193,25 @@ pub unsafe extern "C" fn sigil_continuation_invoke(
     args.add(2).write(identity_addr as u64);
     let body_val = sigil_run_loop(ns, terminal_out);
 
-    // Phase 2: wrap via return arm if present.
+    // Phase 2: wrap via return arm if present AND the body's
+    // run completed normally (DONE). On DISCHARGE the terminal
+    // value is already the handle's R-typed value (an inner arm
+    // discharged with the result; the return arm semantically does
+    // not apply); pass through unchanged. Mirrors the
+    // `lower_k_pair_call`-side tag-conditional wrap at codegen.rs
+    // ~17725 which uses the same TerminalResult.tag check.
+    let terminal_tag = if terminal_out.is_null() {
+        // Runtime tests drive sigil_run_loop directly with null
+        // terminal_out; treat as DONE so the wrap fires (test
+        // fixtures don't exercise the discharge path).
+        sigil_abi::effect::NEXT_STEP_TAG_DONE as u64
+    } else {
+        (*terminal_out).tag
+    };
     let return_fn = sigil_continuation_load_return_fn(cont);
-    let wrapped = if return_fn.is_null() {
+    let wrapped = if return_fn.is_null()
+        || terminal_tag == sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as u64
+    {
         body_val
     } else {
         let return_closure = sigil_continuation_load_return_closure(cont);
@@ -209,6 +225,21 @@ pub unsafe extern "C" fn sigil_continuation_invoke(
 
     // Phase 3: restore outer_post_arm_k depth — drain anything that
     // leaked from the captured continuation's internal pushes.
+    //
+    // Defense-in-depth: assert the trampoline's routing didn't pop
+    // BELOW our snapshot (which would mean we accidentally consumed
+    // entries belonging to an outer run_loop). The trampoline's
+    // DONE handler at handlers.rs:1844 only pops up to the entry-
+    // time snapshot of the run_loop it's currently driving; a
+    // current_depth < snapshot here means a routing regression has
+    // crossed run_loop boundaries.
+    let current_depth = crate::handlers::outer_post_arm_k_depth_snapshot();
+    debug_assert!(
+        current_depth >= snapshot,
+        "sigil_continuation_invoke: OUTER_POST_ARM_K_DEPTH underflowed snapshot \
+         ({current_depth} < {snapshot}) — trampoline routing popped entries \
+         belonging to an outer run_loop"
+    );
     crate::handlers::outer_post_arm_k_depth_restore(snapshot);
 
     wrapped
