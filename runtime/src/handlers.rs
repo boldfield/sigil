@@ -404,20 +404,40 @@ pub fn outer_post_arm_k_depth_restore(target: usize) {
 // slot's pointers so a stale entry doesn't outlive its useful
 // lifetime in the rooted range.
 //
-// **Cap = 32** is shared with `OUTER_POST_ARM_K_STACK_SIZE` and
-// reflects the same depth ceiling: at most one entry per nested
-// `sigil_run_loop` invocation on the calling thread (handle-body
-// wrapper or sub-Cps-call wrapper), so it bounds **handle-body
-// nesting + sub-Cps-call nesting**, not user-fn recursion depth in
-// general. Typical Sigil programs nest 1-3 deep; the worst-case
-// program that would hit the cap is one whose call chain
-// alternates Sync→Cps wrappers at each frame (32+ levels). Overflow
-// aborts via `eprintln!` + `abort()` in `sigil_body_return_arm_push`
-// rather than dynamic resize — codegen invariant violations should
-// surface loudly. v2 follow-up: revisit if profiles show the cap
-// is binding for any real workload.
+// **Cap = 256** bounds **handle-body nesting + sub-Cps-call
+// nesting**, not user-fn recursion depth in general — at most one
+// entry per nested `sigil_run_loop` invocation on the calling
+// thread (handle-body wrapper or sub-Cps-call wrapper).
+//
+// Plan C Task 81 cap-bump-rework reduced this from a temporary
+// 4096 by introducing the conditional null-mask
+// (`sigil_body_return_arm_push_mask_if_needed`) at the
+// `lower_call`'s `UserFnAbi::Cps` shim and `__sync_shim` emit
+// sites: the (null, null) Risk-3 mask is skipped when the top
+// of stack already has a null `fn_ptr`, since the natural-exit
+// helper emits Done either way. The conditional skip eliminated
+// most accumulation (Sudoku 9×9 went from 128 → ~51 deep).
+//
+// 256 covers: Sudoku 9×9 Wikipedia easy (~51 empty cells, one
+// `lower_handle_body_direct_cps_call` non-null push per nested
+// `solve_with_undo` handle), hardest Sudoku puzzles (16-clue
+// puzzles need ~65 nested handles), and generic backtracking
+// demos with ~5x safety margin. Overflow aborts via
+// `eprintln!` + `abort()` in `sigil_body_return_arm_push`
+// rather than dynamic resize — codegen invariant violations
+// should surface loudly.
+//
+// **v2 follow-up.** Genuine non-null handle pushes (return-arm
+// pairs from `lower_handle_body_direct_cps_call`) are load-
+// bearing — the natural-exit helper dispatches via the top
+// entry's `fn_ptr`, and skipping a non-null push would lose
+// the return arm. Eliminating those would require an
+// architectural change: pass the return arm to the body fn via
+// `args_ptr` trailing slots (like `caller_k_pair` for synth-
+// conts) instead of via a thread-local stack. That change is
+// out of scope for v1.
 
-const BODY_RETURN_ARM_STACK_SIZE: usize = 32;
+const BODY_RETURN_ARM_STACK_SIZE: usize = 256;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -963,7 +983,7 @@ pub unsafe extern "C" fn sigil_next_step_done(value: u64) -> *mut NextStep {
 ///    masks the outer pair so sub-Cps-fn calls' natural-exit helpers
 ///    see null and emit `Done(v)` directly (Risk 3 discipline).
 ///
-/// Aborts on stack overflow (cap = `BODY_RETURN_ARM_STACK_SIZE` = 32).
+/// Aborts on stack overflow (cap = `BODY_RETURN_ARM_STACK_SIZE` = 256).
 /// Every push must be paired with one `sigil_body_return_arm_pop` (the
 /// codegen wrapper that pushes also emits the matching pop).
 ///
@@ -1007,6 +1027,64 @@ pub unsafe extern "C" fn sigil_body_return_arm_push(closure_ptr: *mut u8, fn_ptr
         });
         depth_cell.set(depth + 1);
     });
+}
+
+/// Plan C Task 81 cap-bump-rework — conditional null-mask push.
+///
+/// The Risk-3 protection at sub-Cps-call boundaries (lower_call's
+/// UserFnAbi::Cps shim, __sync_shim, and chain step CallCps emit)
+/// pushes `(null, null)` to mask the outer body's return arm so the
+/// sub-call's natural-exit helper (`sigil_done_or_dispatch_return_arm`)
+/// emits `Done(v)` instead of dispatching the outer's return arm.
+///
+/// **The mask is redundant when the top of the stack already has a
+/// null `fn_ptr` OR the stack is empty.** The natural-exit helper
+/// (`sigil_done_or_dispatch_return_arm`) emits Done either way.
+/// Stacking redundant `(null, null)` masks just inflates depth —
+/// for Sudoku 9×9 with `cell_valid (Sync) → check_conflict (Cps)
+/// via shim` recursion, the depth grows past the original 32 cap
+/// purely on these redundant masks.
+///
+/// This helper checks the top before pushing. Returns 1 if pushed,
+/// 0 if skipped. The matching `sigil_body_return_arm_pop_if_flag`
+/// pops only when the flag is 1.
+///
+/// # Safety
+///
+/// Safe to call. Writes thread-local state.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_body_return_arm_push_mask_if_needed() -> u8 {
+    let needs_mask = BODY_RETURN_ARM_DEPTH.with(|depth_cell| {
+        let depth = depth_cell.get();
+        if depth == 0 {
+            return false;
+        }
+        BODY_RETURN_ARM_STACK.with(|stack_cell| {
+            let stack = stack_cell.get();
+            !stack[depth - 1].fn_ptr.is_null()
+        })
+    });
+    if !needs_mask {
+        return 0;
+    }
+    sigil_body_return_arm_push(ptr::null_mut(), ptr::null_mut());
+    1
+}
+
+/// Plan C Task 81 cap-bump-rework — paired conditional pop. Pops
+/// only when the flag is 1 (i.e., the matching
+/// `sigil_body_return_arm_push_mask_if_needed` actually pushed).
+/// Returns the popped entry's `fired` flag (0 if didn't pop).
+///
+/// # Safety
+///
+/// Safe to call. Writes thread-local state.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_body_return_arm_pop_if_flag(flag: u8) -> u8 {
+    if flag == 0 {
+        return 0;
+    }
+    sigil_body_return_arm_pop()
 }
 
 /// Pop the top body-return-arm entry. Returns the popped entry's

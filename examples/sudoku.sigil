@@ -1,86 +1,101 @@
 // examples/sudoku.sigil
 //
-// Plan D Task 117 smoke gate. 4×4 Sudoku via binary-choose +
-// recursive backtracking. Originally Plan D specified runtime-N
-// `Choose.choose(n)` + `all_choices` discharger; that requires
-// indefinite-extent continuations (deferred to v3). Brian
-// (2026-05-01) restructured the smoke gate to binary-choose
-// (resumes: many with `branch: () -> Bool`) + recursive
-// `try_digits` helper — N=2 per choice point, statically-
-// detectable as a 2-let chain by today's Slice C arm-body
-// recognizer.
+// Plan C Task 81 — 9×9 Sudoku via std.choose's `first_choice`
+// discharger + recursive backtracking with `MutArray[Int]` under
+// the `Mem` effect (per Plan C body specification).
 //
-// 4×4 grid layout (digits 1..4, 2×2 subgrids):
+// **Backtracking pattern: per-level first_choice with cell undo.**
+// Multi-shot Choose composed with in-place MutArray needs cell
+// undo on backtrack, but a partial handle that intercepts only
+// `Choose.fail` and forwards `Choose.choose` to the outer handler
+// infinite-recurses (the forwarder's `perform Choose.choose` fires
+// the topmost = same partial handle). We instead make each
+// recursive `solve` call its own first_choice — handle the inner
+// solve with the SAME three arms `first_choice` defines plus a
+// `Choose.fail` interception point that runs the cell undo before
+// returning None. Each empty cell at depth N gets its own multi-
+// shot iteration; failure propagates to depth N-1 as a `None`
+// observation, which depth N-1's `solve_with_undo` converts to
+// `mut_array_set(grid, idx, 0); perform Choose.fail()` — driving
+// depth N-1's iteration to its next digit.
 //
-//   1 2 | 3 4
-//   3 4 | 1 2
-//   ----+----
-//   2 1 | 4 ?
-//   4 3 | 2 1
+// **Discharge propagation gates.** Plan C Task 81 option A wired
+// `terminal_out.tag` checks at the synth-cont's standard-tail /
+// Pattern C Pure-leaf / tail-prefix-let emit sites — without
+// these, `let inner = handle solve(...) with {...}` (the inner
+// handle whose arm body might discharge from a deeper sub-call)
+// would silently miscompile because the OUTER trampoline (driving
+// `solve_with_undo`) processes the gate's `NextStep::Call(post_-
+// arm_k, [garbage])` as DONE, overwriting the inner DISCHARGED
+// tag in the shared `terminal_out`. With the gates in place, the
+// inner handle's terminal Option[Int] reaches the surrounding
+// match correctly.
 //
-// Cell 11 (row 2, col 3) is empty (0). The unique valid digit
-// for cell 11 is 3 (every other digit conflicts with row, col,
-// or box). The solver brute-forces digits 1..4, using binary-
-// choose to "commit this digit" (true) or "try next" (false).
-// Output is the value at cell 11 in the solved grid: "3\n".
+// Puzzle (Wikipedia "easy" 30-clue example, requires real
+// backtracking — many cells have multiple candidates at first
+// visit):
+//
+//   5 3 . | . 7 . | . . .
+//   6 . . | 1 9 5 | . . .
+//   . 9 8 | . . . | . 6 .
+//   ------+-------+------
+//   8 . . | . 6 . | . . 3
+//   4 . . | 8 . 3 | . . 1
+//   7 . . | . 2 . | . . 6
+//   ------+-------+------
+//   . 6 . | . . . | 2 8 .
+//   . . . | 4 1 9 | . . 5
+//   . . . | . 8 . | . 7 9
+//
+// Solution (printed cell-by-cell row-major — 81 single-digit lines):
+//
+//   5 3 4 | 6 7 8 | 9 1 2
+//   6 7 2 | 1 9 5 | 3 4 8
+//   1 9 8 | 3 4 2 | 5 6 7
+//   ------+-------+------
+//   8 5 9 | 7 6 1 | 4 2 3
+//   4 2 6 | 8 5 3 | 7 9 1
+//   7 1 3 | 9 2 4 | 8 5 6
+//   ------+-------+------
+//   9 6 1 | 5 3 7 | 2 8 4
+//   2 8 7 | 4 1 9 | 6 3 5
+//   3 4 5 | 2 8 6 | 1 7 9
 
+import std.choose
 import std.option
 
-effect Branch resumes: many {
-  branch: () -> Bool,
-}
-
-fn find_empty(grid: Array[Int], i: Int) -> Option[Int] ![] {
+fn check_conflict(grid: MutArray[Int], target_idx: Int, i: Int, d: Int) -> Bool ![Mem, ArithError] {
   match i {
-    16 => None,
-    _ => {
-      if array_get(grid, i) == 0 {
-        Some(i)
-      } else {
-        find_empty(grid, i + 1)
-      }
-    },
-  }
-}
-
-// Returns true if placing digit `d` at `target_idx` would
-// conflict with an existing cell in the same row/col/box.
-// Row carries `ArithError` because `/` (integer division) always
-// emits an ArithError row entry per Plan B Task 57; the runtime
-// main shim installs a top-level handler that aborts on actual
-// div-by-zero, but the typecheck row entry must be present.
-fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![ArithError] {
-  match i {
-    16 => false,
+    81 => false,
     _ => {
       if i == target_idx {
         check_conflict(grid, target_idx, i + 1, d)
       } else {
-        let row_i: Int = i / 4;
-        let row_t: Int = target_idx / 4;
-        let col_i: Int = i - row_i * 4;
-        let col_t: Int = target_idx - row_t * 4;
-        let box_i: Int = row_i / 2 * 2 + col_i / 2;
-        let box_t: Int = row_t / 2 * 2 + col_t / 2;
+        let row_i: Int = i / 9;
+        let row_t: Int = target_idx / 9;
+        let col_i: Int = i - row_i * 9;
+        let col_t: Int = target_idx - row_t * 9;
+        let box_i: Int = row_i / 3 * 3 + col_i / 3;
+        let box_t: Int = row_t / 3 * 3 + col_t / 3;
         let same_row: Bool = row_i == row_t;
         let same_col: Bool = col_i == col_t;
         let same_box: Bool = box_i == box_t;
         if same_row {
-          if array_get(grid, i) == d {
+          if mut_array_get(grid, i) == d {
             true
           } else {
             check_conflict(grid, target_idx, i + 1, d)
           }
         } else {
           if same_col {
-            if array_get(grid, i) == d {
+            if mut_array_get(grid, i) == d {
               true
             } else {
               check_conflict(grid, target_idx, i + 1, d)
             }
           } else {
             if same_box {
-              if array_get(grid, i) == d {
+              if mut_array_get(grid, i) == d {
                 true
               } else {
                 check_conflict(grid, target_idx, i + 1, d)
@@ -95,7 +110,7 @@ fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![A
   }
 }
 
-fn cell_valid(grid: Array[Int], idx: Int, d: Int) -> Bool ![ArithError] {
+fn cell_valid(grid: MutArray[Int], idx: Int, d: Int) -> Bool ![Mem, ArithError] {
   if check_conflict(grid, idx, 0, d) {
     false
   } else {
@@ -103,74 +118,125 @@ fn cell_valid(grid: Array[Int], idx: Int, d: Int) -> Bool ![ArithError] {
   }
 }
 
-fn solve(grid: Array[Int]) -> Option[Array[Int]] ![Branch, ArithError] {
-  match find_empty(grid, 0) {
-    None => Some(grid),
-    Some(idx) => try_digits(grid, idx, 1),
+fn print_grid(grid: MutArray[Int], i: Int) -> Int ![Mem, IO] {
+  if i == 81 {
+    0
+  } else {
+    let v: Int = mut_array_get(grid, i);
+    let _print: Unit = perform IO.println(int_to_string(v));
+    print_grid(grid, i + 1)
   }
 }
 
-fn try_digits(grid: Array[Int], idx: Int, d: Int) -> Option[Array[Int]] ![Branch, ArithError] {
-  match d {
-    5 => None,
-    _ => {
-      if cell_valid(grid, idx, d) {
-        let take: Bool = perform Branch.branch();
-        if take {
-          solve(array_set(grid, idx, d))
-        } else {
-          try_digits(grid, idx, d + 1)
-        }
-      } else {
-        try_digits(grid, idx, d + 1)
-      }
-    },
+// At an empty cell: pick a digit 1..9 via `Choose.choose(9)`. On
+// row/col/box conflict perform fail. On success: set cell, recurse
+// via `solve_with_undo`, which wraps the inner `solve` in its own
+// first_choice handle with cell-undo on failure.
+fn try_at_cell(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, IO, ArithError] {
+  let d: Int = perform Choose.choose(9);
+  let digit: Int = d + 1;
+  if cell_valid(grid, idx, digit) {
+    let _set: Unit = mut_array_set(grid, idx, digit);
+    solve_with_undo(grid, idx)
+  } else {
+    perform Choose.fail()
   }
 }
 
-fn main() -> Int ![IO, ArithError] {
-  // Initialize the 4×4 grid with cell 11 empty.
-  let g00: Array[Int] = array_alloc(16, 0);
-  let g01: Array[Int] = array_set(g00, 0, 1);
-  let g02: Array[Int] = array_set(g01, 1, 2);
-  let g03: Array[Int] = array_set(g02, 2, 3);
-  let g04: Array[Int] = array_set(g03, 3, 4);
-  let g05: Array[Int] = array_set(g04, 4, 3);
-  let g06: Array[Int] = array_set(g05, 5, 4);
-  let g07: Array[Int] = array_set(g06, 6, 1);
-  let g08: Array[Int] = array_set(g07, 7, 2);
-  let g09: Array[Int] = array_set(g08, 8, 2);
-  let g10: Array[Int] = array_set(g09, 9, 1);
-  let g11: Array[Int] = array_set(g10, 10, 4);
-  // cell 11 stays 0 (empty)
-  let g12: Array[Int] = array_set(g11, 12, 4);
-  let g13: Array[Int] = array_set(g12, 13, 3);
-  let g14: Array[Int] = array_set(g13, 14, 2);
-  let initial: Array[Int] = array_set(g14, 15, 1);
-
-  // Handler discharges Branch via binary-choose 2-let arm body
-  // (Slice C shape). r1 explores "commit this digit"; r2 explores
-  // "try next digit". match-on-r1 returns the first non-None.
-  // Handler discharges Branch via binary-choose 2-let arm body
-  // (Slice C shape). r1 is the "commit this digit" branch; r2 is
-  // "try next digit". match returns r1's solution if Some,
-  // otherwise r2.
-  let solved: Option[Array[Int]] = handle solve(initial) with {
-    Branch.branch(k) => {
-      let r1: Option[Array[Int]] = k(true);
-      let r2: Option[Array[Int]] = k(false);
-      match r1 {
-        Some(s) => Some(s),
-        None => r2,
-      }
-    },
+// Inline first_choice over the inner `solve(grid, idx + 1)`,
+// converting the inner's None outcome into `undo + perform
+// Choose.fail()` so this idx's `try_at_cell` iteration can advance
+// to its next digit.
+//
+// The inline handle replicates `first_choice`'s three arms (mirrors
+// std/choose.sigil's `first_choice`) — `return(v) => Some(v)`,
+// `Choose.fail(k) => None`, `Choose.choose(arg, k) => first_-
+// choice_helper(k, 0, arg)`. The helper's k(i) drives the inner
+// body forward from each inner perform site with i in 0..arg-1;
+// the body's natural completion at depth N+1 returns Some(v),
+// total-failure returns None.
+fn solve_with_undo(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, IO, ArithError] {
+  let inner: Option[Int] = handle solve(grid, idx + 1) with {
+    return(v) => Some(v),
+    Choose.fail(k) => None,
+    Choose.choose(arg, k) => first_choice_helper(k, 0, arg),
   };
-
-  match solved {
-    Some(grid) => {
-      perform IO.println(int_to_string(array_get(grid, 11)));
-      0
+  match inner {
+    Some(v) => v,
+    None => {
+      let _undo: Unit = mut_array_set(grid, idx, 0);
+      perform Choose.fail()
     },
+  }
+}
+
+// Recursive grid walker. At idx==81 prints the solved grid and
+// returns 1 (success sentinel). At each cell: skip if filled,
+// otherwise dispatch to try_at_cell. No native perform — the body
+// is transitively Cps-colored via the recursive `solve(...)` and
+// `try_at_cell(...)` tail Cps-call leaves; the chain classifier's
+// chain_length=0 path (Plan C Task 81) accepts this shape.
+fn solve(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, IO, ArithError] {
+  if idx == 81 {
+    print_grid(grid, 0)
+  } else {
+    if mut_array_get(grid, idx) != 0 {
+      solve(grid, idx + 1)
+    } else {
+      try_at_cell(grid, idx)
+    }
+  }
+}
+
+fn solve_initial() -> Int ![Choose, Mem, IO, ArithError] {
+  let g: MutArray[Int] = mut_array_new(81, 0);
+  // Wikipedia easy puzzle — 30 clues at the listed positions.
+  // Row 0: clues at cols 0,1,4 (5,3,7)
+  let _s0: Unit = mut_array_set(g, 0, 5);
+  let _s1: Unit = mut_array_set(g, 1, 3);
+  let _s2: Unit = mut_array_set(g, 4, 7);
+  // Row 1: clues at cols 0,3,4,5 (6,1,9,5)
+  let _s3: Unit = mut_array_set(g, 9, 6);
+  let _s4: Unit = mut_array_set(g, 12, 1);
+  let _s5: Unit = mut_array_set(g, 13, 9);
+  let _s6: Unit = mut_array_set(g, 14, 5);
+  // Row 2: clues at cols 1,2,7 (9,8,6)
+  let _s7: Unit = mut_array_set(g, 19, 9);
+  let _s8: Unit = mut_array_set(g, 20, 8);
+  let _s9: Unit = mut_array_set(g, 25, 6);
+  // Row 3: clues at cols 0,4,8 (8,6,3)
+  let _s10: Unit = mut_array_set(g, 27, 8);
+  let _s11: Unit = mut_array_set(g, 31, 6);
+  let _s12: Unit = mut_array_set(g, 35, 3);
+  // Row 4: clues at cols 0,3,5,8 (4,8,3,1)
+  let _s13: Unit = mut_array_set(g, 36, 4);
+  let _s14: Unit = mut_array_set(g, 39, 8);
+  let _s15: Unit = mut_array_set(g, 41, 3);
+  let _s16: Unit = mut_array_set(g, 44, 1);
+  // Row 5: clues at cols 0,4,8 (7,2,6)
+  let _s17: Unit = mut_array_set(g, 45, 7);
+  let _s18: Unit = mut_array_set(g, 49, 2);
+  let _s19: Unit = mut_array_set(g, 53, 6);
+  // Row 6: clues at cols 1,6,7 (6,2,8)
+  let _s20: Unit = mut_array_set(g, 55, 6);
+  let _s21: Unit = mut_array_set(g, 60, 2);
+  let _s22: Unit = mut_array_set(g, 61, 8);
+  // Row 7: clues at cols 3,4,5,8 (4,1,9,5)
+  let _s23: Unit = mut_array_set(g, 66, 4);
+  let _s24: Unit = mut_array_set(g, 67, 1);
+  let _s25: Unit = mut_array_set(g, 68, 9);
+  let _s26: Unit = mut_array_set(g, 71, 5);
+  // Row 8: clues at cols 4,7,8 (8,7,9)
+  let _s27: Unit = mut_array_set(g, 76, 8);
+  let _s28: Unit = mut_array_set(g, 79, 7);
+  let _s29: Unit = mut_array_set(g, 80, 9);
+  solve(g, 0)
+}
+
+fn main() -> Int ![Mem, IO, ArithError] {
+  let solved: Option[Int] = first_choice(solve_initial);
+  match solved {
+    Some(v) => v,
     None => {
       perform IO.println("no solution");
       1

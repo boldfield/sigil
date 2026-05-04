@@ -280,12 +280,6 @@ fn compute_user_fn_abi(
         let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
         let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
         for stmt in &body.stmts {
-            // Classifier guarantees every stmt is `Stmt::Let` whose
-            // value is `Expr::Perform` OR `Expr::Call` with an Ident
-            // callee (Plan D Task 112a). Mirror the pre-pass site's
-            // `unreachable!()` discipline (PR #83 review #5 —
-            // previously the silent fall-through on non-Ident callee
-            // dropped the binding).
             let let_stmt = match stmt {
                 crate::ast::Stmt::Let(l) => l,
                 _ => unreachable!(
@@ -301,16 +295,41 @@ fn compute_user_fn_abi(
                 crate::ast::Expr::Call { callee, args, .. } => {
                     let callee_name = match callee.as_ref() {
                         crate::ast::Expr::Ident(n, _) => n.clone(),
-                        _ => unreachable!(
-                            "is_simple_chained_let_yield_then_pure_tail_body \
-                             classifier guarantees Call callee is Expr::Ident"
-                        ),
+                        // Non-Ident callee → tail-prefix-let. The
+                        // matching `emit_object` site
+                        // (codegen.rs:~8136) materializes the
+                        // binding into `tail_prefix_lets` so the
+                        // FINAL synth-cont's emit lowers it; this
+                        // pass only counts chain_length and
+                        // collects captures, so skipping the stmt
+                        // is correct here. PR #97 review iter 2 #7
+                        // — the asymmetry between this `continue`
+                        // and the emit-pass push to tail_prefix_-
+                        // lets is intentional, not a divergence.
+                        // The classifier accepts non-Ident-callee
+                        // Calls only as tail-prefix lets (per
+                        // `is_simple_chained_let_yield_then_pure_-
+                        // tail_body`'s `yield_count > 0 && !expr_-
+                        // contains_perform` clause), which don't
+                        // contribute a chain step.
+                        _ => continue,
                     };
-                    steps.push(ChainedNextStep::CallCps {
-                        callee_name,
-                        args: args.clone(),
-                    });
-                    binding_names.push(let_stmt.name.clone());
+                    // Plan C Task 81 — only treat Call as a chain
+                    // step (CallCps) when the callee is a supported
+                    // Cps wrapper. Non-yielding Calls (builtins like
+                    // `mut_array_new`, Sync user fns) flow through
+                    // as tail-prefix lets — lowered by the FINAL
+                    // synth-cont's emit via `lower_expr` (which
+                    // routes through `lower_call`'s builtin /
+                    // Sync-user-fn dispatch).
+                    if lookup(&callee_name) {
+                        steps.push(ChainedNextStep::CallCps {
+                            callee_name,
+                            args: args.clone(),
+                        });
+                        binding_names.push(let_stmt.name.clone());
+                    }
+                    // else: non-yielding Call → tail-prefix let.
                 }
                 // Plan C Task 81 — pure trailing let; classifier
                 // accepts these after the last yield. They don't
@@ -7684,6 +7703,46 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_body_return_arm_pop: {e}"))?;
 
+    // Plan C Task 81 cap-bump-rework — conditional null-mask
+    // helpers. The Risk-3 mask at lower_call's UserFnAbi::Cps shim
+    // and __sync_shim is redundant when the top of the body-return-
+    // arm stack already has a null fn_ptr (or is empty); the
+    // natural-exit helper emits Done either way. Skipping the
+    // redundant push prevents the body-return-arm stack from
+    // ballooning past the original 32 cap on workloads like
+    // Sudoku 9×9 (cell_valid → check_conflict via shim).
+    //
+    // sigil_body_return_arm_push_mask_if_needed() -> u8
+    //   Returns 1 if pushed, 0 if skipped.
+    let mut body_return_arm_push_mask_if_needed_sig = Signature::new(isa_call_conv(&module));
+    body_return_arm_push_mask_if_needed_sig
+        .returns
+        .push(AbiParam::new(types::I8));
+    let body_return_arm_push_mask_if_needed = module
+        .declare_function(
+            "sigil_body_return_arm_push_mask_if_needed",
+            Linkage::Import,
+            &body_return_arm_push_mask_if_needed_sig,
+        )
+        .map_err(|e| format!("declare sigil_body_return_arm_push_mask_if_needed: {e}"))?;
+
+    // sigil_body_return_arm_pop_if_flag(flag: u8) -> u8
+    //   Pops only when flag != 0. Returns popped fired flag (0 if no pop).
+    let mut body_return_arm_pop_if_flag_sig = Signature::new(isa_call_conv(&module));
+    body_return_arm_pop_if_flag_sig
+        .params
+        .push(AbiParam::new(types::I8));
+    body_return_arm_pop_if_flag_sig
+        .returns
+        .push(AbiParam::new(types::I8));
+    let body_return_arm_pop_if_flag = module
+        .declare_function(
+            "sigil_body_return_arm_pop_if_flag",
+            Linkage::Import,
+            &body_return_arm_pop_if_flag_sig,
+        )
+        .map_err(|e| format!("declare sigil_body_return_arm_pop_if_flag: {e}"))?;
+
     // sigil_done_or_dispatch_return_arm(v: u64) -> *mut NextStep
     let mut done_or_dispatch_return_arm_sig = Signature::new(isa_call_conv(&module));
     done_or_dispatch_return_arm_sig
@@ -8132,21 +8191,67 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
                             }
                             crate::ast::Expr::Call { callee, args, .. } => {
-                                let callee_name = match callee.as_ref() {
-                                    crate::ast::Expr::Ident(n, _) => n.clone(),
-                                    _ => unreachable!(
-                                        "is_simple_chained_let_yield_then_pure_tail_body \
-                                         classifier guarantees Call callee is Expr::Ident"
-                                    ),
+                                // PR #97 review #1: classifier accepts
+                                // non-Ident callees as tail-prefix lets
+                                // when `yield_count > 0 && !expr_-
+                                // contains_perform`. Drop-via-`continue`
+                                // would silently lose the binding here
+                                // (re-introducing the silent-drop
+                                // pattern PR #83 review #5 closed).
+                                // Treat non-Ident callee as a tail-
+                                // prefix let, mirroring the `other =>`
+                                // arm below.
+                                let callee_name_opt = match callee.as_ref() {
+                                    crate::ast::Expr::Ident(n, _) => Some(n.clone()),
+                                    _ => None,
                                 };
-                                steps.push(ChainedNextStep::CallCps {
-                                    callee_name,
-                                    args: args.clone(),
-                                });
-                                binding_names.push(let_stmt.name.clone());
-                                binding_tys
-                                    .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
-                                binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                                // Plan C Task 81 — Cps wrapper Call →
+                                // chain step; non-yielding Call
+                                // (builtin / Sync user fn / non-Ident
+                                // callee) → tail-prefix let. The
+                                // classifier accepts both shapes; the
+                                // pre-pass dispatches based on callee
+                                // Cps-color via the same
+                                // `is_supported_cps_user_fn` predicate
+                                // the classifier used.
+                                let is_cps_wrapper = callee_name_opt
+                                    .as_ref()
+                                    .map(|n| {
+                                        is_supported_cps_user_fn(
+                                            n,
+                                            &fns_by_name,
+                                            &cc.colored,
+                                            &ctors,
+                                        )
+                                    })
+                                    .unwrap_or(false);
+                                if is_cps_wrapper {
+                                    let callee_name = match callee_name_opt {
+                                        Some(n) => n,
+                                        None => unreachable!(
+                                            "is_cps_wrapper implies callee_name_opt is Some — \
+                                             is_cps_wrapper short-circuited via the \
+                                             callee_name_opt.as_ref().map(...).unwrap_or(false) \
+                                             chain that returns false on None"
+                                        ),
+                                    };
+                                    steps.push(ChainedNextStep::CallCps {
+                                        callee_name,
+                                        args: args.clone(),
+                                    });
+                                    binding_names.push(let_stmt.name.clone());
+                                    binding_tys
+                                        .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
+                                    binding_kinds
+                                        .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                                } else {
+                                    tail_prefix_lets.push(TailPrefixLet {
+                                        name: let_stmt.name.clone(),
+                                        ty: cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty),
+                                        kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
+                                        value: let_stmt.value.clone(),
+                                    });
+                                }
                             }
                             other => {
                                 // Plan C Task 81 — pure trailing
@@ -8194,15 +8299,58 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // fns or other synth-conts.
                     let synth_cont_sig = cps_signature(pointer_ty, &module);
                     let starting_idx = cps_continuation_synth.len();
+                    // Plan C Task 81 — chain_length=0 case: 0-stmt body
+                    // with branched-cps tail. Allocate ONE synth-cont
+                    // (Final role). Body emit dispatches it directly
+                    // with a dummy arg + caller_k_pair forwarded via
+                    // the closure record. Synth-cont's FINAL emit
+                    // binds the dummy under `$zero_chain_dummy`
+                    // (which the tail won't reference) and emits the
+                    // branched-tail dispatch as usual.
+                    let effective_step_count = if chain_length == 0 { 1 } else { chain_length };
                     let mut step_func_ids: Vec<cranelift_module::FuncId> =
-                        Vec::with_capacity(chain_length);
-                    for step in 0..chain_length {
+                        Vec::with_capacity(effective_step_count);
+                    for step in 0..effective_step_count {
                         let global_idx = starting_idx + step;
                         let synth_cont_name = format!("sigil_post_yield_cont_{global_idx}");
                         let synth_cont_func_id = module
                             .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
                             .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
                         step_func_ids.push(synth_cont_func_id);
+                    }
+
+                    // Plan C Task 81 — chain_length=0 special case:
+                    // emit ONE FINAL synth-cont with synthetic dummy
+                    // binding. Body emit will dispatch with args[0]=0.
+                    //
+                    // The synth binding name `$zero_chain_dummy`
+                    // begins with `$`, which the lexer rejects as
+                    // an identifier-start character (lexer.rs:126
+                    // requires `is_ascii_alphabetic() || c == '_'`),
+                    // so the name cannot collide with any user-
+                    // declared parameter or local. Mirrors the
+                    // existing `$lambda_N` naming convention for
+                    // synthetic top-level fns.
+                    if chain_length == 0 {
+                        cps_continuation_synth.push(CpsContinuationSynth {
+                            func_id: step_func_ids[0],
+                            parent_fn_name: f.name.clone(),
+                            kind: CpsContinuationKind::ChainedLetBindStep {
+                                binding_name: "$zero_chain_dummy".to_string(),
+                                binding_ty: types::I64,
+                                binding_kind: EnvSlotKind::Int,
+                                captures: captures.clone(),
+                                prior_bindings: vec![],
+                                role: ChainStepRole::Final {
+                                    tail_expr: Box::new(tail_expr.clone()),
+                                    tail_ty,
+                                    tail_prefix_lets: tail_prefix_lets.clone(),
+                                },
+                                prior_was_call_cps: false,
+                            },
+                        });
+                        cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
+                        continue;
                     }
 
                     // Pass 2: build N CpsContinuationSynth entries.
@@ -8457,6 +8605,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         continuation_identity,
         body_return_arm_push,
         body_return_arm_pop,
+        body_return_arm_push_mask_if_needed,
+        body_return_arm_pop_if_flag,
         done_or_dispatch_return_arm,
         handler_arm_indices: &handler_arm_indices,
         handler_arm_synth: &handler_arm_synth,
@@ -8510,6 +8660,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 continuation_identity_ref,
                 body_return_arm_push_ref,
                 body_return_arm_pop_ref,
+                body_return_arm_push_mask_if_needed_ref,
+                body_return_arm_pop_if_flag_ref,
                 done_or_dispatch_return_arm_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
@@ -8787,6 +8939,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         continuation_identity_ref,
                         body_return_arm_push_ref,
                         body_return_arm_pop_ref,
+                        body_return_arm_push_mask_if_needed_ref,
+                        body_return_arm_pop_if_flag_ref,
                         effect_ids: &checked.effect_ids,
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
@@ -9381,53 +9535,75 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // fn. Tail-perform shape (synth_cont_idx_opt =
                 // None) is always Perform — `is_simple_tail_perform
                 // _with_pure_args_body` doesn't accept Call tails.
-                let (body_first_step, synth_cont_func_id_opt) =
-                    if let Some(idx) = synth_cont_idx_opt {
-                        let step = match &f.body.stmts[0] {
-                            crate::ast::Stmt::Perform(p) => ChainedNextStep::Perform(p.clone()),
-                            crate::ast::Stmt::Let(l) => match &l.value {
-                                crate::ast::Expr::Perform(p) => ChainedNextStep::Perform(p.clone()),
-                                crate::ast::Expr::Call { callee, args, .. } => {
-                                    let callee_name = match callee.as_ref() {
-                                        crate::ast::Expr::Ident(n, _) => n.clone(),
-                                        _ => unreachable!(
-                                            "is_simple_chained_let_yield_then_pure_tail_body \
+                // Plan C Task 81 — chain_length=0 case: body has 0
+                // perform/call yields in stmts; tail is a branched-
+                // cps-tail. The pre-pass registered ONE synth-cont
+                // (Final). The body emit's Phase 5 chain-body alloc
+                // (further below) builds the closure record correctly
+                // (captures + caller_k_pair). Phase 6 below detects
+                // this case (`body_first_step.is_none()`) and
+                // dispatches NextStep::Call directly to the synth-
+                // cont with a dummy arg, skipping the
+                // body_first_step Perform/CallCps emit. PR #97
+                // review nit: prefer `None` over a synthetic
+                // empty-effect sentinel `ChainedNextStep::Perform`,
+                // which would silently misbehave if any code path
+                // between Phase 4 and Phase 6 inspected the
+                // would-be-Perform's effect/op fields.
+                let is_zero_chain = synth_cont_idx_opt.is_some() && f.body.stmts.is_empty();
+                let (body_first_step, synth_cont_func_id_opt): (
+                    Option<ChainedNextStep>,
+                    Option<cranelift_module::FuncId>,
+                ) = if let Some(idx) = synth_cont_idx_opt.filter(|_| is_zero_chain) {
+                    let synth_cont_func_id = cps_continuation_synth[idx].func_id;
+                    (None, Some(synth_cont_func_id))
+                } else if let Some(idx) = synth_cont_idx_opt {
+                    let step = match &f.body.stmts[0] {
+                        crate::ast::Stmt::Perform(p) => ChainedNextStep::Perform(p.clone()),
+                        crate::ast::Stmt::Let(l) => match &l.value {
+                            crate::ast::Expr::Perform(p) => ChainedNextStep::Perform(p.clone()),
+                            crate::ast::Expr::Call { callee, args, .. } => {
+                                let callee_name = match callee.as_ref() {
+                                    crate::ast::Expr::Ident(n, _) => n.clone(),
+                                    _ => unreachable!(
+                                        "is_simple_chained_let_yield_then_pure_tail_body \
                                              classifier guarantees Call callee is Expr::Ident"
-                                        ),
-                                    };
-                                    ChainedNextStep::CallCps {
-                                        callee_name,
-                                        args: args.clone(),
-                                    }
+                                    ),
+                                };
+                                ChainedNextStep::CallCps {
+                                    callee_name,
+                                    args: args.clone(),
                                 }
-                                _ => unreachable!(
-                                    "is_simple_chained_let_yield_then_pure_tail_body \
+                            }
+                            _ => unreachable!(
+                                "is_simple_chained_let_yield_then_pure_tail_body \
                                      classifier guarantees Let value is Expr::Perform or \
                                      Expr::Call (Plan D Task 112)"
-                                ),
-                            },
-                            _ => unreachable!(
-                                "synth-cont allocated for fn `{}` but stmts[0] \
+                            ),
+                        },
+                        _ => unreachable!(
+                            "synth-cont allocated for fn `{}` but stmts[0] \
                                  is neither Stmt::Perform nor Stmt::Let — pre-pass \
                                  invariant broken",
-                                f.name
-                            ),
-                        };
-                        let synth_cont_func_id = cps_continuation_synth[idx].func_id;
-                        (step, Some(synth_cont_func_id))
-                    } else {
-                        let p = match &f.body.tail {
-                            Some(crate::ast::Expr::Perform(p)) => p.clone(),
-                            _ => unreachable!(
-                                "codegen Phase 4e: CPS-ABI fn `{}` body is not a \
-                                 simple tail perform nor a yield-then-(constant|\
-                                 let-pure-tail) — `compute_user_fn_abi` invariant \
-                                 broken",
-                                f.name
-                            ),
-                        };
-                        (ChainedNextStep::Perform(p), None)
+                            f.name
+                        ),
                     };
+                    let synth_cont_func_id = cps_continuation_synth[idx].func_id;
+                    (Some(step), Some(synth_cont_func_id))
+                } else {
+                    let p = match &f.body.tail {
+                        Some(crate::ast::Expr::Perform(p)) => p.clone(),
+                        _ => unreachable!(
+                            "codegen Phase 4e: CPS-ABI fn `{}` body is not a \
+                                 simple tail perform nor a yield-then-(constant|\
+                                 let-pure-tail) nor a chain_length=0 branched-cps-\
+                                 tail (Plan C Task 81) — `compute_user_fn_abi` \
+                                 invariant broken",
+                            f.name
+                        ),
+                    };
+                    (Some(ChainedNextStep::Perform(p)), None)
+                };
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 assert_cps_arity(&block_params, &format!("Cps body emit fn `{}`", f.name));
                 let closure_ptr = block_params[0];
@@ -9822,6 +9998,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     continuation_identity_ref,
                     body_return_arm_push_ref,
                     body_return_arm_pop_ref,
+                    body_return_arm_push_mask_if_needed_ref,
+                    body_return_arm_pop_if_flag_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
@@ -9854,269 +10032,333 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // OR CallCps (Plan D Task 112: NextStep::Call to
                 // wrapper Cps fn with k-pair packed into trailing
                 // args slots).
-                let next_step = match &body_first_step {
-                    ChainedNextStep::Perform(body_perform) => {
-                        // Resolve effect_id + op_id at fn entry.
-                        let effect_id = match checked.effect_ids.get(&body_perform.effect) {
-                            Some(id) => *id,
-                            None => unreachable!(
-                                "codegen Phase 4e: effect `{}` missing from effect_ids \
-                                 map; typecheck E0042 should have caught this",
-                                body_perform.effect
-                            ),
-                        };
-                        let op_id = match checked
-                            .op_ids
-                            .get(&(body_perform.effect.clone(), body_perform.op.clone()))
-                        {
-                            Some(id) => *id,
-                            None => unreachable!(
-                                "codegen Phase 4e: op_id missing for `{}.{}`; \
-                                 typecheck E0043 should have caught this",
-                                body_perform.effect, body_perform.op
-                            ),
-                        };
-                        let effect_id_v =
-                            lowerer.builder.ins().iconst(types::I32, effect_id as i64);
-                        let op_id_v = lowerer.builder.ins().iconst(types::I32, op_id as i64);
+                // Plan C Task 81 — chain_length=0 case: skip the
+                // body_first_step Perform/CallCps dispatch and emit
+                // a direct NextStep::Call to the synth-cont with a
+                // dummy arg (synth-cont binds `$zero_chain_dummy`
+                // which the tail doesn't reference). The closure
+                // record (k_closure_loaded) was allocated by Phase 5
+                // above with captures + caller_k_pair from body's
+                // args_ptr trailing slots; the synth-cont's FINAL
+                // emit reads caller_k_pair from there to dispatch
+                // the branched-tail leaves.
+                let next_step = if is_zero_chain {
+                    let synth_cont_addr_v = k_fn_loaded;
+                    let three_v = lowerer.builder.ins().iconst(types::I32, 3);
+                    let call_ns = lowerer.builder.ins().call(
+                        lowerer.next_step_call_ref,
+                        &[k_closure_loaded, synth_cont_addr_v, three_v],
+                    );
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                    let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                    let argp_call = lowerer
+                        .builder
+                        .ins()
+                        .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
+                    lowerer
+                        .stackmap
+                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
+                    let argp_v = lowerer.builder.inst_results(argp_call)[0];
 
-                        // Lower perform args via Lowerer; pack into
-                        // a stack slot. Mirrors the Phase 4b
-                        // machinery from `lower_perform_to_value`.
-                        // Empty-args case keeps the null `args_ptr`
-                        // + `args_len = 0` shape (per
-                        // `sigil_perform`'s safety contract).
-                        let (perform_args_ptr, perform_args_len) = if body_perform.args.is_empty() {
-                            (
-                                lowerer.builder.ins().iconst(pointer_ty, 0),
-                                lowerer.builder.ins().iconst(types::I32, 0),
-                            )
-                        } else {
-                            let arg_values: Vec<Value> = body_perform
+                    let zero = lowerer.builder.ins().iconst(types::I64, 0);
+                    let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                    let identity_addr = lowerer
+                        .builder
+                        .ins()
+                        .func_addr(pointer_ty, lowerer.continuation_identity_ref);
+                    lowerer
+                        .builder
+                        .ins()
+                        .store(MemFlags::trusted(), zero, argp_v, 0);
+                    lowerer
+                        .builder
+                        .ins()
+                        .store(MemFlags::trusted(), null_v, argp_v, 8);
+                    lowerer
+                        .builder
+                        .ins()
+                        .store(MemFlags::trusted(), identity_addr, argp_v, 16);
+                    ns_ptr
+                } else {
+                    let body_first_step = body_first_step.as_ref().unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen Phase 6: body_first_step is None outside of \
+                             chain_length=0 (is_zero_chain) path — internal invariant \
+                             broken; the is_zero_chain branch above should have \
+                             returned ns_ptr already"
+                        )
+                    });
+                    match body_first_step {
+                        ChainedNextStep::Perform(body_perform) => {
+                            // Resolve effect_id + op_id at fn entry.
+                            let effect_id = match checked.effect_ids.get(&body_perform.effect) {
+                                Some(id) => *id,
+                                None => unreachable!(
+                                    "codegen Phase 4e: effect `{}` missing from effect_ids \
+                                 map; typecheck E0042 should have caught this",
+                                    body_perform.effect
+                                ),
+                            };
+                            let op_id = match checked
+                                .op_ids
+                                .get(&(body_perform.effect.clone(), body_perform.op.clone()))
+                            {
+                                Some(id) => *id,
+                                None => unreachable!(
+                                    "codegen Phase 4e: op_id missing for `{}.{}`; \
+                                 typecheck E0043 should have caught this",
+                                    body_perform.effect, body_perform.op
+                                ),
+                            };
+                            let effect_id_v =
+                                lowerer.builder.ins().iconst(types::I32, effect_id as i64);
+                            let op_id_v = lowerer.builder.ins().iconst(types::I32, op_id as i64);
+
+                            // Lower perform args via Lowerer; pack into
+                            // a stack slot. Mirrors the Phase 4b
+                            // machinery from `lower_perform_to_value`.
+                            // Empty-args case keeps the null `args_ptr`
+                            // + `args_len = 0` shape (per
+                            // `sigil_perform`'s safety contract).
+                            let (perform_args_ptr, perform_args_len) = if body_perform
                                 .args
-                                .iter()
-                                .map(|a| lowerer.lower_expr(a))
-                                .collect();
-                            let slot_bytes = (body_perform.args.len() * 8) as u32;
-                            let slot = lowerer.builder.create_sized_stack_slot(StackSlotData::new(
-                                StackSlotKind::ExplicitSlot,
-                                slot_bytes,
-                                3,
-                            ));
-                            for (i, arg_v) in arg_values.into_iter().enumerate() {
-                                let arg_ty = lowerer.builder.func.dfg.value_type(arg_v);
-                                let widened = if arg_ty == types::I64 {
-                                    arg_v
-                                } else if arg_ty.is_int() && arg_ty.bits() < 64 {
-                                    lowerer.builder.ins().uextend(types::I64, arg_v)
-                                } else {
-                                    assert_eq!(
-                                        arg_ty, pointer_ty,
-                                        "codegen Phase 4e: unexpected perform-arg \
+                                .is_empty()
+                            {
+                                (
+                                    lowerer.builder.ins().iconst(pointer_ty, 0),
+                                    lowerer.builder.ins().iconst(types::I32, 0),
+                                )
+                            } else {
+                                let arg_values: Vec<Value> = body_perform
+                                    .args
+                                    .iter()
+                                    .map(|a| lowerer.lower_expr(a))
+                                    .collect();
+                                let slot_bytes = (body_perform.args.len() * 8) as u32;
+                                let slot = lowerer.builder.create_sized_stack_slot(
+                                    StackSlotData::new(StackSlotKind::ExplicitSlot, slot_bytes, 3),
+                                );
+                                for (i, arg_v) in arg_values.into_iter().enumerate() {
+                                    let arg_ty = lowerer.builder.func.dfg.value_type(arg_v);
+                                    let widened = if arg_ty == types::I64 {
+                                        arg_v
+                                    } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                                        lowerer.builder.ins().uextend(types::I64, arg_v)
+                                    } else {
+                                        assert_eq!(
+                                            arg_ty, pointer_ty,
+                                            "codegen Phase 4e: unexpected perform-arg \
                                          Cranelift type {arg_ty:?} packing into args \
                                          buffer in CPS-ABI fn `{}`",
-                                        f.name
+                                            f.name
+                                        );
+                                        arg_v
+                                    };
+                                    lowerer.builder.ins().stack_store(
+                                        widened,
+                                        slot,
+                                        (i * 8) as i32,
                                     );
-                                    arg_v
-                                };
-                                lowerer
-                                    .builder
-                                    .ins()
-                                    .stack_store(widened, slot, (i * 8) as i32);
-                            }
-                            (
-                                lowerer.builder.ins().stack_addr(pointer_ty, slot, 0),
-                                lowerer
-                                    .builder
-                                    .ins()
-                                    .iconst(types::I32, body_perform.args.len() as i64),
-                            )
-                        };
+                                }
+                                (
+                                    lowerer.builder.ins().stack_addr(pointer_ty, slot, 0),
+                                    lowerer
+                                        .builder
+                                        .ins()
+                                        .iconst(types::I32, body_perform.args.len() as i64),
+                                )
+                            };
 
-                        // sigil_perform call. The fn's
-                        // `perform_ref` is used (declared earlier
-                        // in the user-fn body emit setup);
-                        // `lowerer.perform_ref` shadows it but
-                        // they're the same FuncRef.
-                        let perform_call = lowerer.builder.ins().call(
-                            lowerer.perform_ref,
-                            &[
-                                effect_id_v,
-                                op_id_v,
-                                perform_args_ptr,
-                                perform_args_len,
-                                k_closure_loaded,
-                                k_fn_loaded,
-                            ],
-                        );
-                        lowerer
-                            .stackmap
-                            .push_placeholder(function_code_offset(&lowerer.builder, perform_call));
-                        lowerer.builder.inst_results(perform_call)[0]
-                    }
-                    // Plan D Task 112 — body's first step is a
-                    // wrapper-Call to a Cps user fn. Build
-                    // NextStep::Call(callee_addr, args + (k_closure,
-                    // k_fn), user_arg_count) where (k_closure, k_fn)
-                    // is the chain's k-pair (step_1's synth-cont for
-                    // chain_length > 1, OR the helper's caller-
-                    // continuation for chain_length == 1's tail-
-                    // wrapped-Call shape — currently classifier
-                    // requires chain_length >= 1 with a pure tail,
-                    // so chain_length == 1 produces a single Final
-                    // step and the helper-body emit's k-pair is
-                    // step_0's Final-synth-cont closure_ptr/fn_id).
-                    //
-                    // The wrapper Cps fn loads its k-pair from
-                    // args_ptr trailing slots and forwards to its
-                    // own perform site, transparently threading the
-                    // chain's continuation through the wrapper
-                    // boundary.
-                    ChainedNextStep::CallCps {
-                        callee_name,
-                        args: call_args,
-                    } => {
-                        let callee_func_id = match user_fns.get(callee_name) {
-                            Some(uf) => uf.func_id,
-                            None => unreachable!(
-                                "codegen Plan D Task 112: wrapper-Call callee `{}` \
+                            // sigil_perform call. The fn's
+                            // `perform_ref` is used (declared earlier
+                            // in the user-fn body emit setup);
+                            // `lowerer.perform_ref` shadows it but
+                            // they're the same FuncRef.
+                            let perform_call = lowerer.builder.ins().call(
+                                lowerer.perform_ref,
+                                &[
+                                    effect_id_v,
+                                    op_id_v,
+                                    perform_args_ptr,
+                                    perform_args_len,
+                                    k_closure_loaded,
+                                    k_fn_loaded,
+                                ],
+                            );
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                perform_call,
+                            ));
+                            lowerer.builder.inst_results(perform_call)[0]
+                        }
+                        // Plan D Task 112 — body's first step is a
+                        // wrapper-Call to a Cps user fn. Build
+                        // NextStep::Call(callee_addr, args + (k_closure,
+                        // k_fn), user_arg_count) where (k_closure, k_fn)
+                        // is the chain's k-pair (step_1's synth-cont for
+                        // chain_length > 1, OR the helper's caller-
+                        // continuation for chain_length == 1's tail-
+                        // wrapped-Call shape — currently classifier
+                        // requires chain_length >= 1 with a pure tail,
+                        // so chain_length == 1 produces a single Final
+                        // step and the helper-body emit's k-pair is
+                        // step_0's Final-synth-cont closure_ptr/fn_id).
+                        //
+                        // The wrapper Cps fn loads its k-pair from
+                        // args_ptr trailing slots and forwards to its
+                        // own perform site, transparently threading the
+                        // chain's continuation through the wrapper
+                        // boundary.
+                        ChainedNextStep::CallCps {
+                            callee_name,
+                            args: call_args,
+                        } => {
+                            let callee_func_id = match user_fns.get(callee_name) {
+                                Some(uf) => uf.func_id,
+                                None => unreachable!(
+                                    "codegen Plan D Task 112: wrapper-Call callee `{}` \
                                  missing from user_fns map; classifier guarantees \
                                  Cps-color top-level fn",
-                                callee_name
-                            ),
-                        };
-                        let callee_fn_ref =
-                            module.declare_func_in_func(callee_func_id, lowerer.builder.func);
-                        let callee_fn_addr =
-                            lowerer.builder.ins().func_addr(pointer_ty, callee_fn_ref);
-                        let user_arg_count_call = call_args.len();
-                        let arg_values: Vec<Value> =
-                            call_args.iter().map(|a| lowerer.lower_expr(a)).collect();
-                        let widened_args: Vec<Value> = arg_values
-                            .into_iter()
-                            .map(|arg_v| {
-                                let arg_ty = lowerer.builder.func.dfg.value_type(arg_v);
-                                if arg_ty == types::I64 {
-                                    arg_v
-                                } else if arg_ty.is_int() && arg_ty.bits() < 64 {
-                                    lowerer.builder.ins().uextend(types::I64, arg_v)
-                                } else {
-                                    assert_eq!(
-                                        arg_ty, pointer_ty,
-                                        "codegen Plan D Task 112: unexpected wrapper-Call \
+                                    callee_name
+                                ),
+                            };
+                            let callee_fn_ref =
+                                module.declare_func_in_func(callee_func_id, lowerer.builder.func);
+                            let callee_fn_addr =
+                                lowerer.builder.ins().func_addr(pointer_ty, callee_fn_ref);
+                            let user_arg_count_call = call_args.len();
+                            let arg_values: Vec<Value> =
+                                call_args.iter().map(|a| lowerer.lower_expr(a)).collect();
+                            let widened_args: Vec<Value> = arg_values
+                                .into_iter()
+                                .map(|arg_v| {
+                                    let arg_ty = lowerer.builder.func.dfg.value_type(arg_v);
+                                    if arg_ty == types::I64 {
+                                        arg_v
+                                    } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                                        lowerer.builder.ins().uextend(types::I64, arg_v)
+                                    } else {
+                                        assert_eq!(
+                                            arg_ty, pointer_ty,
+                                            "codegen Plan D Task 112: unexpected wrapper-Call \
                                          arg type {arg_ty:?} for callee `{}` in fn `{}`",
-                                        callee_name, f.name
-                                    );
-                                    arg_v
-                                }
-                            })
-                            .collect();
-                        let null_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
-                        // arg_count = user_arg_count + 2 (the trailing
-                        // (k_closure, k_fn) pair). `sigil_next_step_call`
-                        // allocates `arg_count * 8` bytes for the args
-                        // buffer; we need room for both user args AND
-                        // the trailing pair. The Cps callee's body
-                        // ignores args_len at runtime (uses the static
-                        // user_arg_count from f.params.len()), so this
-                        // count is only consumed by the runtime arena
-                        // allocator and the trampoline's MAX_INLINE_ARGS
-                        // check. Mirrors the synth-arm-fn tail-k path
-                        // (codegen.rs:10180-ish), which also passes
-                        // `total slots = user_arg_count + 2`.
-                        //
-                        // PR #83 review #1 — defense-in-depth bound
-                        // check in dev builds before the runtime's
-                        // `sigil_next_step_call` MAX_INLINE_ARGS abort
-                        // fires. Mirrors the perform-site debug_assert
-                        // at `lower_perform_to_value` (codegen.rs:14586).
-                        debug_assert!(
-                            (user_arg_count_call as u32).saturating_add(2)
-                                <= sigil_abi::effect::MAX_INLINE_ARGS,
-                            "codegen Plan D Task 112a: wrapper-Call to `{}` has {} \
+                                            callee_name, f.name
+                                        );
+                                        arg_v
+                                    }
+                                })
+                                .collect();
+                            let null_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
+                            // arg_count = user_arg_count + 2 (the trailing
+                            // (k_closure, k_fn) pair). `sigil_next_step_call`
+                            // allocates `arg_count * 8` bytes for the args
+                            // buffer; we need room for both user args AND
+                            // the trailing pair. The Cps callee's body
+                            // ignores args_len at runtime (uses the static
+                            // user_arg_count from f.params.len()), so this
+                            // count is only consumed by the runtime arena
+                            // allocator and the trampoline's MAX_INLINE_ARGS
+                            // check. Mirrors the synth-arm-fn tail-k path
+                            // (codegen.rs:10180-ish), which also passes
+                            // `total slots = user_arg_count + 2`.
+                            //
+                            // PR #83 review #1 — defense-in-depth bound
+                            // check in dev builds before the runtime's
+                            // `sigil_next_step_call` MAX_INLINE_ARGS abort
+                            // fires. Mirrors the perform-site debug_assert
+                            // at `lower_perform_to_value` (codegen.rs:14586).
+                            debug_assert!(
+                                (user_arg_count_call as u32).saturating_add(2)
+                                    <= sigil_abi::effect::MAX_INLINE_ARGS,
+                                "codegen Plan D Task 112a: wrapper-Call to `{}` has {} \
                              user args, exceeding MAX_INLINE_ARGS - 2 = {}",
-                            callee_name,
-                            user_arg_count_call,
-                            sigil_abi::effect::MAX_INLINE_ARGS - 2
-                        );
-                        let total_arg_count = user_arg_count_call + 2;
-                        let arg_count_v = lowerer
-                            .builder
-                            .ins()
-                            .iconst(types::I32, total_arg_count as i64);
+                                callee_name,
+                                user_arg_count_call,
+                                sigil_abi::effect::MAX_INLINE_ARGS - 2
+                            );
+                            let total_arg_count = user_arg_count_call + 2;
+                            let arg_count_v = lowerer
+                                .builder
+                                .ins()
+                                .iconst(types::I32, total_arg_count as i64);
 
-                        // Plan D Task 112 — Risk 3 protection PUSH.
-                        // PUSH (null, null) onto BODY_RETURN_ARM_STACK
-                        // before the wrapper-Call NextStep so the
-                        // callee's natural-exit emit reads (null,
-                        // null) and falls through to plain Done
-                        // (avoiding the outer body's return-arm wrap
-                        // firing on the sub-Cps-call's exit). The
-                        // POP happens at the next chain step's body
-                        // entry, gated on `prior_was_call_cps` (set
-                        // by pre-pass).
-                        let null_brk_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
-                        let null_brk_fn = lowerer.builder.ins().iconst(pointer_ty, 0);
-                        let push_call = lowerer
-                            .builder
-                            .ins()
-                            .call(body_return_arm_push_ref, &[null_brk_closure, null_brk_fn]);
-                        lowerer
-                            .stackmap
-                            .push_placeholder(function_code_offset(&lowerer.builder, push_call));
+                            // Plan D Task 112 — Risk 3 protection PUSH.
+                            // PUSH (null, null) onto BODY_RETURN_ARM_STACK
+                            // before the wrapper-Call NextStep so the
+                            // callee's natural-exit emit reads (null,
+                            // null) and falls through to plain Done
+                            // (avoiding the outer body's return-arm wrap
+                            // firing on the sub-Cps-call's exit). The
+                            // POP happens at the next chain step's body
+                            // entry, gated on `prior_was_call_cps` (set
+                            // by pre-pass).
+                            let null_brk_closure = lowerer.builder.ins().iconst(pointer_ty, 0);
+                            let null_brk_fn = lowerer.builder.ins().iconst(pointer_ty, 0);
+                            let push_call = lowerer
+                                .builder
+                                .ins()
+                                .call(body_return_arm_push_ref, &[null_brk_closure, null_brk_fn]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                push_call,
+                            ));
 
-                        // Plan D Task 112b — chained-let-yield Cps
-                        // wrapper composition (where the callee
-                        // itself uses the chain shape rather than a
-                        // tail-perform) is now supported via the
-                        // callee's caller-k_pair plumbing. The
-                        // trailing-pair convention at THIS emit site
-                        // is unchanged: writing
-                        // (k_closure_loaded, k_fn_loaded) at the
-                        // trailing offsets passes the chain's k-pair
-                        // (= step_0 synth-cont) as the callee's
-                        // caller_k_pair, which the callee's Final
-                        // step then dispatches with its tail value.
-                        // See `is_supported_cps_user_fn`'s docstring
-                        // for the composition mechanism.
+                            // Plan D Task 112b — chained-let-yield Cps
+                            // wrapper composition (where the callee
+                            // itself uses the chain shape rather than a
+                            // tail-perform) is now supported via the
+                            // callee's caller-k_pair plumbing. The
+                            // trailing-pair convention at THIS emit site
+                            // is unchanged: writing
+                            // (k_closure_loaded, k_fn_loaded) at the
+                            // trailing offsets passes the chain's k-pair
+                            // (= step_0 synth-cont) as the callee's
+                            // caller_k_pair, which the callee's Final
+                            // step then dispatches with its tail value.
+                            // See `is_supported_cps_user_fn`'s docstring
+                            // for the composition mechanism.
 
-                        let call_ns = lowerer.builder.ins().call(
-                            lowerer.next_step_call_ref,
-                            &[null_closure, callee_fn_addr, arg_count_v],
-                        );
-                        lowerer
-                            .stackmap
-                            .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
-                        let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
-                        let argp_call = lowerer
-                            .builder
-                            .ins()
-                            .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
-                        lowerer
-                            .stackmap
-                            .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
-                        let argp_v = lowerer.builder.inst_results(argp_call)[0];
-                        for (i, w) in widened_args.iter().enumerate() {
+                            let call_ns = lowerer.builder.ins().call(
+                                lowerer.next_step_call_ref,
+                                &[null_closure, callee_fn_addr, arg_count_v],
+                            );
+                            lowerer
+                                .stackmap
+                                .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
+                            let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                            let argp_call = lowerer
+                                .builder
+                                .ins()
+                                .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
+                            lowerer.stackmap.push_placeholder(function_code_offset(
+                                &lowerer.builder,
+                                argp_call,
+                            ));
+                            let argp_v = lowerer.builder.inst_results(argp_call)[0];
+                            for (i, w) in widened_args.iter().enumerate() {
+                                lowerer.builder.ins().store(
+                                    MemFlags::trusted(),
+                                    *w,
+                                    argp_v,
+                                    (i * 8) as i32,
+                                );
+                            }
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
-                                *w,
+                                k_closure_loaded,
                                 argp_v,
-                                (i * 8) as i32,
+                                k_closure_offset(user_arg_count_call),
                             );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                k_fn_loaded,
+                                argp_v,
+                                k_fn_offset(user_arg_count_call),
+                            );
+                            ns_ptr
                         }
-                        lowerer.builder.ins().store(
-                            MemFlags::trusted(),
-                            k_closure_loaded,
-                            argp_v,
-                            k_closure_offset(user_arg_count_call),
-                        );
-                        lowerer.builder.ins().store(
-                            MemFlags::trusted(),
-                            k_fn_loaded,
-                            argp_v,
-                            k_fn_offset(user_arg_count_call),
-                        );
-                        ns_ptr
                     }
                 };
                 lowerer.builder.ins().return_(&[next_step]);
@@ -10185,6 +10427,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 continuation_identity_ref,
                 body_return_arm_push_ref,
                 body_return_arm_pop_ref,
+                body_return_arm_push_mask_if_needed_ref,
+                body_return_arm_pop_if_flag_ref,
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
@@ -10573,6 +10817,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     continuation_identity_ref,
                     body_return_arm_push_ref,
                     body_return_arm_pop_ref,
+                    body_return_arm_push_mask_if_needed_ref,
+                    body_return_arm_pop_if_flag_ref,
                     done_or_dispatch_return_arm_ref: _,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
@@ -10714,6 +10960,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     continuation_identity_ref,
                     body_return_arm_push_ref,
                     body_return_arm_pop_ref,
+                    body_return_arm_push_mask_if_needed_ref,
+                    body_return_arm_pop_if_flag_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
@@ -11538,6 +11786,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     continuation_identity_ref,
                     body_return_arm_push_ref,
                     body_return_arm_pop_ref,
+                    body_return_arm_push_mask_if_needed_ref,
+                    body_return_arm_pop_if_flag_ref,
                     done_or_dispatch_return_arm_ref: _,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
@@ -11667,6 +11917,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     continuation_identity_ref,
                     body_return_arm_push_ref,
                     body_return_arm_pop_ref,
+                    body_return_arm_push_mask_if_needed_ref,
+                    body_return_arm_pop_if_flag_ref,
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
@@ -11914,6 +12166,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 continuation_identity_ref,
                 body_return_arm_push_ref,
                 body_return_arm_pop_ref,
+                body_return_arm_push_mask_if_needed_ref,
+                body_return_arm_pop_if_flag_ref,
                 done_or_dispatch_return_arm_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
@@ -11951,6 +12205,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 continuation_identity_ref,
                 body_return_arm_push_ref,
                 body_return_arm_pop_ref,
+                body_return_arm_push_mask_if_needed_ref,
+                body_return_arm_pop_if_flag_ref,
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
@@ -12211,6 +12467,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         continuation_identity_ref,
                         body_return_arm_push_ref,
                         body_return_arm_pop_ref,
+                        body_return_arm_push_mask_if_needed_ref,
+                        body_return_arm_pop_if_flag_ref,
                         done_or_dispatch_return_arm_ref,
                         handler_arm_refs_per_handle,
                         handler_return_arm_refs_per_handle,
@@ -12247,6 +12505,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         continuation_identity_ref,
                         body_return_arm_push_ref,
                         body_return_arm_pop_ref,
+                        body_return_arm_push_mask_if_needed_ref,
+                        body_return_arm_pop_if_flag_ref,
                         effect_ids: &checked.effect_ids,
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
@@ -12935,6 +13195,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             continuation_identity_ref,
                             body_return_arm_push_ref,
                             body_return_arm_pop_ref,
+                            body_return_arm_push_mask_if_needed_ref,
+                            body_return_arm_pop_if_flag_ref,
                             done_or_dispatch_return_arm_ref: _,
                             handler_arm_refs_per_handle,
                             handler_return_arm_refs_per_handle,
@@ -12972,6 +13234,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             continuation_identity_ref,
                             body_return_arm_push_ref,
                             body_return_arm_pop_ref,
+                            body_return_arm_push_mask_if_needed_ref,
+                            body_return_arm_pop_if_flag_ref,
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
@@ -13022,7 +13286,27 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // natural width — debug_assert below
                                 // catches a future contract regression).
                                 for tpl in tail_prefix_lets {
+                                    // Plan C Task 81 option A —
+                                    // discharge propagation. Reset
+                                    // `terminal_out` to (0, DONE)
+                                    // before lower_expr so any
+                                    // DISCHARGED tag observed
+                                    // afterward is from THIS let's
+                                    // RHS, not stale state. After
+                                    // lower_expr returns, check the
+                                    // tag — if DISCHARGED, return
+                                    // `NextStep::Discharged` so the
+                                    // outer trampoline doesn't
+                                    // overwrite the tag. Tail-prefix-
+                                    // lets accept Sync user fn / non-
+                                    // Ident-callee Calls; if such a
+                                    // Call internally drives a Cps
+                                    // sub-call that discharges, the
+                                    // tag propagates here.
+                                    lowerer.emit_terminal_out_reset_to_done();
                                     let raw_v = lowerer.lower_expr(&tpl.value);
+                                    lowerer.emit_discharge_propagation_check();
+
                                     let env_value = match tpl.kind {
                                         EnvSlotKind::Int => {
                                             let arg_ty = lowerer.builder.func.dfg.value_type(raw_v);
@@ -13217,7 +13501,32 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         // the new name.
                                         for stmt in leaf_stmts {
                                             if let crate::ast::Stmt::Let(l) = stmt {
+                                                let is_cps_call_rhs = match &l.value {
+                                                    crate::ast::Expr::Call { callee, .. } => {
+                                                        if let crate::ast::Expr::Ident(n, _) =
+                                                            callee.as_ref()
+                                                        {
+                                                            cc.colored.needs_cps_transform(n)
+                                                        } else {
+                                                            false
+                                                        }
+                                                    }
+                                                    _ => false,
+                                                };
+                                                // PR #97 review iter 2 #1-#4: use
+                                                // the unified discharge-gate
+                                                // helpers so this site stays in
+                                                // lockstep with the other three
+                                                // (tail-prefix-let, Pure leaf,
+                                                // standard tail). Reset BEFORE
+                                                // lower_expr; check AFTER.
+                                                if is_cps_call_rhs {
+                                                    lowerer.emit_terminal_out_reset_to_done();
+                                                }
                                                 let v = lowerer.lower_expr(&l.value);
+                                                if is_cps_call_rhs {
+                                                    lowerer.emit_discharge_propagation_check();
+                                                }
                                                 lowerer.env.insert(l.name.clone(), v);
                                             }
                                         }
@@ -13272,7 +13581,23 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 "handled above by work-stack recursion"
                                             ),
                                             BranchedCpsLeaf::Pure => {
+                                                // Plan C Task 81 option A —
+                                                // discharge propagation
+                                                // (mirrors the standard-tail
+                                                // path below). Reset
+                                                // `terminal_out` before
+                                                // lower_expr, check tag
+                                                // after; if DISCHARGED,
+                                                // return NextStep::-
+                                                // Discharged so the OUTER
+                                                // trampoline doesn't
+                                                // overwrite the tag with
+                                                // its DONE-after-gate-
+                                                // dispatch terminal.
+                                                lowerer.emit_terminal_out_reset_to_done();
                                                 let v = lowerer.lower_expr(block_tail);
+                                                lowerer.emit_discharge_propagation_check();
+
                                                 let widened = if *tail_ty == types::I64 {
                                                     v
                                                 } else if tail_ty.is_int() && tail_ty.bits() < 64 {
@@ -13619,7 +13944,32 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     // Non-Pattern-C path: standard
                                     // tail lowering. Jumps to
                                     // gate_entry_block with widened_tail.
+                                    //
+                                    // Plan C Task 81 option A —
+                                    // discharge propagation. Reset
+                                    // `terminal_out` to (0, DONE)
+                                    // BEFORE lower_expr so any
+                                    // DISCHARGED tag observed
+                                    // afterwards is from the tail's
+                                    // own evaluation, not stale state
+                                    // from a prior synth-cont
+                                    // iteration. After lower_expr
+                                    // returns, check the tag — if
+                                    // DISCHARGED, return
+                                    // `NextStep::Discharged(value)`
+                                    // directly so the OUTER trampoline
+                                    // sees DISCHARGED instead of the
+                                    // gate's `NextStep::Call(post_arm
+                                    // _k, [garbage])` shape (which
+                                    // would terminate the outer
+                                    // run_loop with DONE and overwrite
+                                    // `terminal_out.tag`, masking the
+                                    // discharge from the surrounding
+                                    // handle's tag check).
+                                    lowerer.emit_terminal_out_reset_to_done();
                                     let tail_value = lowerer.lower_expr(tail_expr.as_ref());
+                                    lowerer.emit_discharge_propagation_check();
+
                                     let widened = if *tail_ty == types::I64 {
                                         tail_value
                                     } else if tail_ty.is_int() && tail_ty.bits() < 64 {
@@ -14831,6 +15181,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             continuation_identity_ref,
                             body_return_arm_push_ref,
                             body_return_arm_pop_ref,
+                            body_return_arm_push_mask_if_needed_ref,
+                            body_return_arm_pop_if_flag_ref,
                             done_or_dispatch_return_arm_ref: _,
                             handler_arm_refs_per_handle,
                             handler_return_arm_refs_per_handle,
@@ -14868,6 +15220,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             continuation_identity_ref,
                             body_return_arm_push_ref,
                             body_return_arm_pop_ref,
+                            body_return_arm_push_mask_if_needed_ref,
+                            body_return_arm_pop_if_flag_ref,
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
@@ -15351,11 +15705,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         // with a null pair, run the trampoline, then pop. Pop's
         // return value (the fired flag of the popped entry) is
         // ignored — this site never has a return arm to dispatch.
-        let push_ref = module.declare_func_in_func(body_return_arm_push, builder.func);
-        let pop_ref = module.declare_func_in_func(body_return_arm_pop, builder.func);
-        let null_closure = builder.ins().iconst(pointer_ty, 0);
-        let null_fn = builder.ins().iconst(pointer_ty, 0);
-        builder.ins().call(push_ref, &[null_closure, null_fn]);
+        //
+        // Plan C Task 81 cap-bump-rework — use the conditional
+        // `push_mask_if_needed` / `pop_if_flag` helpers. The mask
+        // is redundant when the top of stack already has a null
+        // fn_ptr (the natural-exit helper sees null in either
+        // case → emits Done). Skipping redundant pushes prevents
+        // unbounded depth growth on workloads with deep Sync→Cps
+        // call chains.
+        let push_mask_ref =
+            module.declare_func_in_func(body_return_arm_push_mask_if_needed, builder.func);
+        let pop_if_flag_ref =
+            module.declare_func_in_func(body_return_arm_pop_if_flag, builder.func);
+        let push_call = builder.ins().call(push_mask_ref, &[]);
+        let push_flag = builder.inst_results(push_call)[0];
 
         // Drive the trampoline. Plan D Task 111b — forward the
         // shim's `terminal_out` block param so handle-exit terminal
@@ -15368,7 +15731,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let raw_u64 = builder.inst_results(run_loop_call)[0];
 
         // POP after run_loop — symmetric to push above.
-        builder.ins().call(pop_ref, &[]);
+        builder.ins().call(pop_if_flag_ref, &[push_flag]);
 
         // Narrow to ret_ty.
         let ret_v = if ret_ty == types::I64 {
@@ -15614,6 +15977,13 @@ struct Lowerer<'a, 'b> {
     ///   (Risk 3 discipline).
     body_return_arm_push_ref: FuncRef,
     body_return_arm_pop_ref: FuncRef,
+    /// Plan C Task 81 cap-bump-rework — conditional null-mask
+    /// helpers used at lower_call's UserFnAbi::Cps shim. Skips
+    /// the (null, null) push when the top of stack already has
+    /// a null fn_ptr (mask redundant); paired pop-if-flag does
+    /// the matching pop iff the push wasn't skipped.
+    body_return_arm_push_mask_if_needed_ref: FuncRef,
+    body_return_arm_pop_if_flag_ref: FuncRef,
     /// Plan B Task 55 (Phase 3a) — effect-name → effect_id (u32) map
     /// from typecheck. `Expr::Handle` codegen looks up the handle's
     /// declared effect (the unique effect name in its arms; Phase 3a
@@ -16903,6 +17273,106 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             );
             widened
         }
+    }
+
+    /// Plan C Task 81 option A — Step 1 of the discharge-propagation
+    /// gate (PR #97 review iter 2 #1-#4 dedup). Reset
+    /// `terminal_out` to `(value=0, tag=DONE)` BEFORE lowering an
+    /// expression that might discharge. The reset clears any stale
+    /// DISCHARGED tag from a prior synth-cont iteration so the
+    /// post-lower check is reliable: the synth-cont may be invoked
+    /// multiple times by multi-shot composition, and without the
+    /// reset a stale tag could spuriously trigger discharge
+    /// propagation.
+    ///
+    /// Mirrors the handle expression's pre-body slot reset
+    /// (Stage-6.8-followup Bug 1) at `Expr::Handle` codegen entry.
+    fn emit_terminal_out_reset_to_done(&mut self) {
+        let zero_v = self.builder.ins().iconst(types::I64, 0);
+        let done_v = self
+            .builder
+            .ins()
+            .iconst(types::I64, sigil_abi::effect::NEXT_STEP_TAG_DONE as i64);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            zero_v,
+            self.terminal_out_param,
+            TERMINAL_RESULT_VALUE_OFF,
+        );
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            done_v,
+            self.terminal_out_param,
+            TERMINAL_RESULT_TAG_OFF,
+        );
+    }
+
+    /// Plan C Task 81 option A — Step 2 of the discharge-propagation
+    /// gate (PR #97 review iter 2 #1-#4 dedup). After lowering an
+    /// expression that might have driven an inner `sigil_run_loop`
+    /// (Cps callee via `lower_call`'s `UserFnAbi::Cps` shim,
+    /// `__sync_shim`, or any other Sync→Cps boundary): check
+    /// `terminal_out.tag`. If `DISCHARGED`, return `NextStep::-
+    /// Discharged(terminal_out.value)` from the surrounding synth-
+    /// cont fn — preventing the outer trampoline from overwriting
+    /// the DISCHARGED tag with DONE via the gate's
+    /// `NextStep::Call(post_arm_k, [garbage])` shape.
+    ///
+    /// **Caller contract.** The caller must have called
+    /// [`Self::emit_terminal_out_reset_to_done`] BEFORE the
+    /// `lower_expr` whose discharge potential this gate covers.
+    /// Without the reset a stale DISCHARGED from a prior synth-
+    /// cont iteration produces a false positive.
+    ///
+    /// **On return.** The Cranelift builder is positioned at the
+    /// non-discharge continuation block. Caller continues codegen
+    /// from there (typically: bind the lowered value into env, or
+    /// jump to the chain machinery's gate).
+    ///
+    /// Used by all four discharge-gate sites:
+    /// - tail-prefix-let lowering (chain Final emit).
+    /// - Pattern C Pure leaf emit.
+    /// - standard tail emit.
+    /// - arm-body Cps Call let-RHS.
+    fn emit_discharge_propagation_check(&mut self) {
+        let term_tag = self.builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.terminal_out_param,
+            TERMINAL_RESULT_TAG_OFF,
+        );
+        let disch_const = self.builder.ins().iconst(
+            types::I64,
+            sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
+        );
+        let is_disch = self.builder.ins().icmp(IntCC::Equal, term_tag, disch_const);
+        let propagate_blk = self.builder.create_block();
+        let continue_blk = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_disch, propagate_blk, &[], continue_blk, &[]);
+
+        // DISCHARGE: return NextStep::Discharged(terminal_out.value).
+        self.builder.switch_to_block(propagate_blk);
+        self.builder.seal_block(propagate_blk);
+        let v_disch = self.builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.terminal_out_param,
+            TERMINAL_RESULT_VALUE_OFF,
+        );
+        let disch_call = self
+            .builder
+            .ins()
+            .call(self.next_step_discharged_ref, &[v_disch]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, disch_call));
+        let ns_disch = self.builder.inst_results(disch_call)[0];
+        self.builder.ins().return_(&[ns_disch]);
+
+        // CONTINUE: caller resumes here.
+        self.builder.switch_to_block(continue_blk);
+        self.builder.seal_block(continue_blk);
     }
 
     /// Lower an expression to an SSA value. The value's Cranelift
@@ -18949,11 +19419,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         // (Risk 3 discipline). Pop's return value
                         // (popped fired flag) is ignored — sub-calls
                         // never have their own return arm.
-                        let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
-                        let null_fn = self.builder.ins().iconst(self.pointer_ty, 0);
-                        self.builder
+                        //
+                        // Plan C Task 81 cap-bump-rework — use the
+                        // conditional `push_mask_if_needed` helper:
+                        // skip the push when the top of stack already
+                        // has a null fn_ptr (the natural-exit helper
+                        // sees null in either case → emits Done). The
+                        // skip prevents the body-return-arm stack
+                        // from ballooning under deep `Sync → Cps`
+                        // call chains (Sudoku's `cell_valid →
+                        // check_conflict` recursion was the original
+                        // forcing function). The matching
+                        // `pop_if_flag` pops only when the push
+                        // wasn't skipped.
+                        let push_call = self
+                            .builder
                             .ins()
-                            .call(self.body_return_arm_push_ref, &[null_closure, null_fn]);
+                            .call(self.body_return_arm_push_mask_if_needed_ref, &[]);
+                        let push_flag = self.builder.inst_results(push_call)[0];
 
                         // Drive the trampoline. Plan D Task 111b —
                         // forward the caller's `terminal_out` so
@@ -18969,8 +19452,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
                         let raw_u64 = self.builder.inst_results(run_loop_call)[0];
 
-                        // POP — symmetric with the PUSH above.
-                        self.builder.ins().call(self.body_return_arm_pop_ref, &[]);
+                        // POP — symmetric with the PUSH above; pops
+                        // only when the conditional push actually
+                        // happened (push_flag == 1).
+                        self.builder
+                            .ins()
+                            .call(self.body_return_arm_pop_if_flag_ref, &[push_flag]);
 
                         // Narrow `raw_u64` back to the callee's
                         // declared return type. Mirrors the
@@ -21816,6 +22303,10 @@ struct PerFnRefsCtx<'a> {
     /// `runtime/src/handlers.rs::BODY_RETURN_ARM_STACK`.
     body_return_arm_push: cranelift_module::FuncId,
     body_return_arm_pop: cranelift_module::FuncId,
+    /// Plan C Task 81 cap-bump-rework — conditional null-mask
+    /// helpers. See `runtime/src/handlers.rs` for rationale.
+    body_return_arm_push_mask_if_needed: cranelift_module::FuncId,
+    body_return_arm_pop_if_flag: cranelift_module::FuncId,
     done_or_dispatch_return_arm: cranelift_module::FuncId,
     handler_arm_indices: &'a BTreeMap<Span, Vec<usize>>,
     handler_arm_synth: &'a [HandlerArmSynth],
@@ -21878,6 +22369,12 @@ struct PerFnRefs {
     /// body-return-arm stack helpers.
     body_return_arm_push_ref: FuncRef,
     body_return_arm_pop_ref: FuncRef,
+    /// Plan C Task 81 cap-bump-rework — conditional null-mask
+    /// helpers used at lower_call's UserFnAbi::Cps shim and
+    /// __sync_shim emit. See `runtime/src/handlers.rs` for
+    /// rationale.
+    body_return_arm_push_mask_if_needed_ref: FuncRef,
+    body_return_arm_pop_if_flag_ref: FuncRef,
     done_or_dispatch_return_arm_ref: FuncRef,
     handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>>,
     /// Plan B Task 55 (Phase 4g) — per-handle return-arm `FuncRef` if
@@ -22008,6 +22505,10 @@ fn prepare_per_fn_refs(
         module.declare_func_in_func(ctx.body_return_arm_push, builder.func);
     let body_return_arm_pop_ref =
         module.declare_func_in_func(ctx.body_return_arm_pop, builder.func);
+    let body_return_arm_push_mask_if_needed_ref =
+        module.declare_func_in_func(ctx.body_return_arm_push_mask_if_needed, builder.func);
+    let body_return_arm_pop_if_flag_ref =
+        module.declare_func_in_func(ctx.body_return_arm_pop_if_flag, builder.func);
     let done_or_dispatch_return_arm_ref =
         module.declare_func_in_func(ctx.done_or_dispatch_return_arm, builder.func);
 
@@ -22097,6 +22598,8 @@ fn prepare_per_fn_refs(
         continuation_identity_ref,
         body_return_arm_push_ref,
         body_return_arm_pop_ref,
+        body_return_arm_push_mask_if_needed_ref,
+        body_return_arm_pop_if_flag_ref,
         done_or_dispatch_return_arm_ref,
         handler_arm_refs_per_handle,
         handler_return_arm_refs_per_handle,
@@ -22434,6 +22937,83 @@ fn build_fns_by_name(
 /// perform's args means the surrounding fn falls through to the
 /// native-ABI path, which lowers correctly via the existing
 /// synchronous shape.
+/// Plan C Task 81 — `true` iff `e` contains an `Expr::Perform`
+/// anywhere in its sub-expressions. Used by branched-tail CpsCall
+/// leaf classification to admit non-yielding-but-non-pure call
+/// args (e.g., `solve(array_set(grid, idx, digit), idx + 1)` —
+/// the inner `array_set` Call is impure per `expr_is_pure` but
+/// non-yielding, so the CpsCall leaf emit can lower it via
+/// `lower_expr` without chain-step machinery).
+fn expr_contains_perform(e: &crate::ast::Expr) -> bool {
+    use crate::ast::Expr;
+    match e {
+        Expr::Perform(_) => true,
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::Ident(..)
+        | Expr::ClosureEnvLoad { .. } => false,
+        Expr::Binary { lhs, rhs, .. } => expr_contains_perform(lhs) || expr_contains_perform(rhs),
+        Expr::Unary { operand, .. } => expr_contains_perform(operand),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            expr_contains_perform(cond)
+                || block_contains_perform(then_block)
+                || block_contains_perform(else_block)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            expr_contains_perform(scrutinee) || arms.iter().any(|a| expr_contains_perform(&a.body))
+        }
+        Expr::Block(b) => block_contains_perform(b),
+        Expr::RecordLit { fields, .. } => fields.iter().any(|f| expr_contains_perform(&f.value)),
+        Expr::Call { callee, args, .. } => {
+            expr_contains_perform(callee) || args.iter().any(expr_contains_perform)
+        }
+        Expr::Tuple { elems, .. } => elems.iter().any(expr_contains_perform),
+        Expr::Handle { .. } | Expr::Lambda { .. } | Expr::ClosureRecord { .. } => {
+            // Conservative: handles / lambdas / closure records that
+            // contain performs are still classified as containing
+            // perform (the perform isn't lifted out of the lambda
+            // body, but the syntactic check errs on the side of
+            // rejecting). Refine if a real-world body needs
+            // lambdas-without-perform to pass.
+            true
+        }
+    }
+}
+
+fn block_contains_perform(b: &crate::ast::Block) -> bool {
+    use crate::ast::Stmt;
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                if expr_contains_perform(&l.value) {
+                    return true;
+                }
+            }
+            Stmt::Expr(e) => {
+                if expr_contains_perform(e) {
+                    return true;
+                }
+            }
+            Stmt::Perform(_) => return true,
+        }
+    }
+    if let Some(t) = &b.tail {
+        if expr_contains_perform(t) {
+            return true;
+        }
+    }
+    false
+}
+
 fn expr_is_pure(e: &crate::ast::Expr, ctors: &std::collections::BTreeSet<String>) -> bool {
     use crate::ast::Expr;
     match e {
@@ -22720,22 +23300,31 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
             // (not nested wrapper-Calls). Wrapper-of-chained shapes
             // fall back to Sync ABI here.
             Expr::Call { callee, args, .. } => {
-                if seen_pure_after_yield {
-                    return None;
-                }
                 let callee_name = match callee.as_ref() {
-                    Expr::Ident(n, _) => n,
-                    _ => return None,
+                    Expr::Ident(n, _) => Some(n),
+                    _ => None,
                 };
-                if !is_supported(callee_name) {
+                let is_cps_wrapper = callee_name
+                    .as_ref()
+                    .map(|n| is_supported(n))
+                    .unwrap_or(false);
+                let args_pure = args.iter().all(|a| expr_is_pure(a, ctors));
+                if is_cps_wrapper && args_pure {
+                    if seen_pure_after_yield {
+                        return None;
+                    }
+                    yield_count += 1;
+                } else if yield_count > 0 && !expr_contains_perform(&let_stmt.value) {
+                    // Plan C Task 81 — non-yielding Call (builtin /
+                    // Sync user fn) AFTER the last yield: tail-prefix
+                    // intermediate. Lowered by the FINAL step's emit
+                    // before the tail.
+                    seen_pure_after_yield = true;
+                } else {
                     return None;
                 }
-                if !args.iter().all(|a| expr_is_pure(a, ctors)) {
-                    return None;
-                }
-                yield_count += 1;
             }
-            other if yield_count > 0 && expr_is_pure(other, ctors) => {
+            other if yield_count > 0 && !expr_contains_perform(other) => {
                 // Pure trailing intermediate; lowered by the FINAL
                 // step's emit before the tail.
                 seen_pure_after_yield = true;
@@ -22821,9 +23410,15 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
     is_supported_for_branch_leaf: &impl Fn(&str) -> bool,
 ) -> Option<usize> {
     use crate::ast::{Expr, Stmt};
-    if body.stmts.is_empty() {
-        return None;
-    }
+    // Plan C Task 81 — `body.stmts.is_empty()` is ACCEPTED. Bodies
+    // shaped `if cond { ...cps... } else { ...cps... }` (no prefix
+    // stmts) classify as chain_length=0; the pre-pass registers a
+    // single Final synth-cont and the body-emit Phase 6 dispatches
+    // it with a dummy arg + caller_k_pair forwarded via the closure
+    // record. The downstream `has_cps_call` check still enforces
+    // Cps-eligibility on at least one branched-tail leaf, so a
+    // wholly-pure body falls through to the standard pure-tail
+    // emission path (not this classifier).
     if body.stmts.len() >= MAX_CLOSURE_ENV_SLOTS {
         return None;
     }
@@ -22853,28 +23448,30 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                 yield_count += 1;
             }
             Expr::Call { callee, args, .. } => {
-                if seen_pure_after_yield {
-                    return None;
-                }
                 let callee_name = match callee.as_ref() {
-                    Expr::Ident(n, _) => n,
-                    _ => return None,
+                    Expr::Ident(n, _) => Some(n),
+                    _ => None,
                 };
-                // Let-RHS uses STRICT check: callee must satisfy
-                // `is_supported_cps_user_fn` (visited-bail-to-false on
-                // cycles). Cycle-via-let-RHS in chained-let-yield is
-                // structurally non-terminating per Task
-                // 112-mutually-recursive's analysis; rejecting is
-                // correct.
-                if !is_supported_strict(callee_name) {
+                let is_cps_wrapper = callee_name
+                    .as_ref()
+                    .map(|n| is_supported_strict(n))
+                    .unwrap_or(false);
+                let args_pure = args.iter().all(|a| expr_is_pure(a, ctors));
+                if is_cps_wrapper && args_pure {
+                    if seen_pure_after_yield {
+                        return None;
+                    }
+                    yield_count += 1;
+                } else if yield_count > 0 && !expr_contains_perform(&let_stmt.value) {
+                    // Plan C Task 81 — non-yielding Call (builtin /
+                    // Sync user fn) AFTER the last yield: tail-prefix
+                    // intermediate.
+                    seen_pure_after_yield = true;
+                } else {
                     return None;
                 }
-                if !args.iter().all(|a| expr_is_pure(a, ctors)) {
-                    return None;
-                }
-                yield_count += 1;
             }
-            other if yield_count > 0 && expr_is_pure(other, ctors) => {
+            other if yield_count > 0 && !expr_contains_perform(other) => {
                 // Pure let-RHS after at least one yield — accept as
                 // a tail-prefix pure intermediate. Lowered by the
                 // FINAL step's emit before the tail.
@@ -22890,9 +23487,18 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
             _ => return None,
         }
     }
-    if yield_count == 0 {
-        return None;
-    }
+    // Plan C Task 81 — yield_count == 0 is now ACCEPTED iff the
+    // body's tail is a branched-cps-tail with at least one Cps-
+    // eligible leaf (CpsCall / Perform / Nested). The body is
+    // transitively Cps-colored via tail-position user-fn calls;
+    // it doesn't natively perform but needs Cps ABI to compose
+    // with callees. The chain machinery treats this as a "0-step
+    // chain": one synth-cont registered as Final, the body emit
+    // dispatches it directly with a dummy arg + caller_k_pair
+    // forwarded via the closure record. The downstream
+    // `has_cps_call` check below enforces the Cps-eligibility
+    // requirement; without it a wholly-pure tail body would also
+    // pass and incorrectly use the chain machinery.
     let tail = body.tail.as_ref()?;
     // Accept either Expr::If or Expr::Match. Sigil's elaboration pass
     // desugars `if cond { ... } else { ... }` into `Expr::Match { ... }`
@@ -22927,6 +23533,15 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
             }
         }
         Expr::Match { arms, .. } => {
+            // Plan C Task 81 option A — the BoolLit-only gate
+            // previously here blocked Match-on-Int / Match-on-sum-type
+            // tails from reaching the standard-tail emit (which would
+            // discharge-propagate incorrectly through the gate's
+            // `NextStep::Call(post_arm_k, [value])` shape). Option A
+            // closes the underlying discharge seam at the standard-
+            // tail and Pattern C Pure-leaf emit sites; once those
+            // propagate `terminal_out.tag` correctly, arbitrary
+            // match-arm shapes are safe to admit here.
             for arm in arms {
                 let kind = classify_branched_cps_tail_branch_expr(
                     &arm.body,
@@ -22965,9 +23580,26 @@ fn classify_branched_cps_tail_branch_expr(
     }
     if let Expr::Call { callee, args, .. } = e {
         if let Expr::Ident(name, _) = callee.as_ref() {
-            if is_supported(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
+            // Plan C Task 81 — args must be NON-YIELDING (no perform
+            // anywhere). Pre-Task-81 the check was `expr_is_pure`
+            // which rejected nested Calls (e.g., `solve(array_set(
+            // grid, idx, digit), idx + 1)`); the CpsCall leaf emit
+            // calls `lower_expr` on each arg which handles nested
+            // builtin / Sync user fn Calls correctly via lower_call.
+            // Pure-args rejection was overly strict.
+            if is_supported(name) && args.iter().all(|a| !expr_contains_perform(a)) {
                 return Some(BranchedCpsLeaf::CpsCall);
             }
+        }
+    }
+    // Plan C Task 81 — non-yielding Call as a Pure-equivalent leaf.
+    // Builtins like `mut_array_get` and Sync user fn calls lower
+    // synchronously via lower_expr / lower_call. The Pure leaf emit
+    // path handles them: lower_expr produces a Value, gate dispatch
+    // routes the value via caller_k_pair → Done(value).
+    if let Expr::Call { args, .. } = e {
+        if args.iter().all(|a| !expr_contains_perform(a)) && !expr_contains_perform(e) {
+            return Some(BranchedCpsLeaf::Pure);
         }
     }
     // Plan D Task 117 (b) Phase 4 R2 — bare Perform with pure args.
@@ -23192,20 +23824,33 @@ fn classify_branched_cps_tail_branch(
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
 ) -> Option<BranchedCpsLeaf> {
-    use crate::ast::Stmt;
-    // Plan C Task 81 — accept arm-body Blocks with pure `Stmt::Let`
-    // intermediates (ANF-lifted from compound subexpressions). Each
-    // stmt must be a `Stmt::Let` whose value is pure; the tail is
-    // then classified as a leaf via the bare-expr classifier.
-    // Blocks with non-pure stmts (e.g., `Stmt::Perform` or a let
-    // whose value is a Cps Call) are rejected — those would need
-    // separate chain-step machinery beyond a leaf classification.
-    // The work-stack emit lowers each pure stmt via `lower_expr` +
-    // `env.insert` before lowering the leaf.
+    use crate::ast::{Expr, Stmt};
+    // Plan C Task 81 — accept arm-body Blocks with `Stmt::Let`
+    // intermediates whose RHS is either pure OR a non-yielding
+    // Call (builtin or non-perform-bearing user fn). ANF lifts
+    // compound subexpressions like `solve(array_set(grid, idx,
+    // digit), idx + 1)` into:
+    //   { let _0 = array_set(grid, idx, digit);
+    //     let _1 = idx + 1;
+    //     solve(_0, _1) }
+    // The `array_set` Call isn't `expr_is_pure` (only ctor Calls
+    // are pure) but it's non-yielding (a Sync builtin). The work-
+    // stack emit lowers each Let RHS via `lower_expr` before
+    // dispatching the leaf; `lower_expr` routes Calls through
+    // `lower_call`, which handles builtin / Sync-user-fn / Sync-
+    // to-Cps-interop dispatch transparently. `Stmt::Perform` is
+    // rejected — that would need chain-step machinery; ditto for
+    // Let with Perform RHS.
     for stmt in &block.stmts {
         match stmt {
-            Stmt::Let(l) if expr_is_pure(&l.value, ctors) => {
-                // Pure let intermediate; emit handles these inline.
+            Stmt::Let(l) => {
+                if matches!(&l.value, Expr::Perform(_)) {
+                    return None;
+                }
+                // Pure values + Call RHS accepted; emit handles
+                // both via lower_expr (which routes Calls through
+                // lower_call's builtin / Sync-user-fn / Sync-to-Cps-
+                // interop dispatch).
             }
             _ => return None,
         }

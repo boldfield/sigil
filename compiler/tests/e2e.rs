@@ -1244,32 +1244,101 @@ fn task_117_layout_skip_generic_templates_pointer_payload_in_some() {
     );
 }
 
-/// Plan D Task 117 smoke gate. 4×4 Sudoku via binary-choose +
-/// recursive backtracking. Verifies the binary-choose 2-let
-/// arm-body shape compiles end-to-end through Slice C machinery
-/// WITHOUT requiring Task 117's k-as-value capability — proves the
-/// smoke gate is reachable under today's Slice C.
+/// Plan C Task 81 — 9×9 Sudoku end-to-end via std.choose's
+/// `first_choice` discharger + recursive backtracking with
+/// immutable `Array[Int]` (each candidate try threads its own
+/// grid via parameter passing; multi-shot retries get clean state
+/// by construction).
 ///
-/// Grid: cell 11 is the only empty cell; valid digit is 3 (every
-/// other digit conflicts with row, col, or box). Output is
-/// `array_get(solved, 11)` = "3\n".
-///
-/// **Note (Plan C completion).** Runtime-N `all_choices` /
-/// `first_choice` over `Choose.choose(arg)` for arbitrary `arg`
-/// requires lifting the typecheck barrier on `Continuation` as a
-/// fn parameter type (currently rejected by E0145 at
-/// `check_type_expr_known`). That lift is in scope for Plan C
-/// completion — `[DEVIATION Task 73]` tracks the closure path.
+/// Puzzle: Wikipedia "easy" 30-clue sudoku. 51 empty cells
+/// requiring real backtracking. Output is the full solved grid
+/// printed cell-by-cell row-major (81 single-digit lines).
 #[test]
-fn task_117_smoke_gate_sudoku_solves_4x4() {
+fn task_81_sudoku_solves_9x9() {
     let root = workspace_root();
     let source = root.join("examples/sudoku.sigil");
     let (stdout, stderr, code) = compile_file_and_run(&source, "sudoku_example");
     assert_eq!(code, 0, "sudoku.sigil exit code; stderr={stderr:?}");
+    let expected = "5\n3\n4\n6\n7\n8\n9\n1\n2\n\
+                    6\n7\n2\n1\n9\n5\n3\n4\n8\n\
+                    1\n9\n8\n3\n4\n2\n5\n6\n7\n\
+                    8\n5\n9\n7\n6\n1\n4\n2\n3\n\
+                    4\n2\n6\n8\n5\n3\n7\n9\n1\n\
+                    7\n1\n3\n9\n2\n4\n8\n5\n6\n\
+                    9\n6\n1\n5\n3\n7\n2\n8\n4\n\
+                    2\n8\n7\n4\n1\n9\n6\n3\n5\n\
+                    3\n4\n5\n2\n8\n6\n1\n7\n9\n";
     assert_eq!(
-        stdout, "3\n",
-        "sudoku.sigil must produce \"3\\n\" — the unique valid digit at cell 11. \
-         stderr={stderr:?}"
+        stdout, expected,
+        "sudoku.sigil must produce the full solved grid (81 single-digit lines) \
+         for the Wikipedia easy puzzle. stderr={stderr:?}"
+    );
+}
+
+/// Plan C Task 81 — negative regression for the 9×9 Sudoku
+/// solver's discharge-propagation path (PR #97 review iter 2 #8).
+/// Unsolvable puzzle: two `5`s in row 0 (cells `[0,0] = 5` AND
+/// `[0,1] = 5`) — `cell_valid` rejects every digit at the first
+/// empty cell, every Choose.choose level exhausts via Choose.fail,
+/// and `first_choice` returns `None` at the top.
+///
+/// The success-path test above (`task_81_sudoku_solves_9x9`)
+/// exercises Choose.fail propagation DURING the search (intermediate
+/// k(i) iterations of nested first_choice handles return None),
+/// but the OUTERMOST first_choice's None branch is only hit when
+/// every digit at every empty cell fails — i.e., on an unsolvable
+/// puzzle. This test ensures the top-level discharge handle's
+/// `None => "no solution"; 1` arm fires correctly: discharge
+/// propagation through ~50 nested `solve_with_undo` handles
+/// (each catching inner `Choose.fail` to run `mut_array_set(g, idx,
+/// 0)` undo before re-raising) terminates cleanly at the
+/// outermost `first_choice` with the None outcome, and main exits
+/// with code 1 + stdout `"no solution\n"`.
+#[test]
+fn task_81_sudoku_unsolvable_puzzle_returns_no_solution() {
+    let root = workspace_root();
+    // Read the canonical Sudoku source, then patch a single line
+    // to introduce a contradictory clue. We replace `array_set(g, 1, 3)`
+    // (the `5,3,7` row 0 clue at col 1) with `mut_array_set(g, 1, 5)`
+    // — wait, the file uses immutable Array, so the corresponding
+    // line is `let g1: Array[Int] = array_set(g, 1, 3);`. Replace
+    // the digit `3` with `5` to give row 0 two `5`s (cells 0 and 1).
+    let original_path = root.join("examples/sudoku.sigil");
+    let original = std::fs::read_to_string(&original_path).expect("read sudoku.sigil");
+
+    // Sentinel-line replacement: convert `mut_array_set(g, 1, 3)`
+    // (row 0 col 1 clue) to `mut_array_set(g, 1, 5)` (collision
+    // with col 0's `5`). Use a fully-qualified pattern so a future
+    // edit to the example doesn't accidentally match the wrong
+    // line.
+    let pattern = "let _s1: Unit = mut_array_set(g, 1, 3);";
+    let replacement = "let _s1: Unit = mut_array_set(g, 1, 5);";
+    assert!(
+        original.contains(pattern),
+        "expected sudoku.sigil to contain `{pattern}` for unsolvable-puzzle \
+         test patch — if the example's clue scaffolding shape changed, \
+         update this test's pattern accordingly"
+    );
+    let patched = original.replace(pattern, replacement);
+
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_sudoku_unsolvable_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&src_path, patched).expect("write patched sudoku");
+
+    let (stdout, stderr, code) = compile_file_and_run(&src_path, "sudoku_unsolvable");
+    let _ = std::fs::remove_file(&src_path);
+
+    assert_eq!(
+        code, 1,
+        "unsolvable-puzzle sudoku must exit 1 via `None => 1` arm; \
+         stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout, "no solution\n",
+        "unsolvable-puzzle sudoku must print `no solution` via the \
+         outermost first_choice's None branch; stderr={stderr:?}"
     );
 }
 
