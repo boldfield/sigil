@@ -312,11 +312,10 @@ fn compute_user_fn_abi(
                     });
                     binding_names.push(let_stmt.name.clone());
                 }
-                _ => unreachable!(
-                    "is_simple_chained_let_yield_then_pure_tail_body \
-                     classifier guarantees Let value is Expr::Perform \
-                     or Expr::Call (Plan D Task 112a)"
-                ),
+                // Plan C Task 81 — pure trailing let; classifier
+                // accepts these after the last yield. They don't
+                // contribute a chain step.
+                _ => {}
             }
         }
         let tail_expr = match body.tail.as_ref() {
@@ -326,7 +325,7 @@ fn compute_user_fn_abi(
             ),
         };
         let captures =
-            collect_chained_synth_cont_captures(&steps, tail_expr, &binding_names, helper_params);
+            collect_chained_synth_cont_captures(&steps, tail_expr, &[], &binding_names, helper_params);
         // Plan D Task 112b — bound tightened by 1 to account for the
         // 2 caller_k_pair slots appended to every chained-let-yield
         // closure record. Old bound `K + N < MAX` ignored the +2,
@@ -389,10 +388,12 @@ fn compute_user_fn_abi(
                     });
                     binding_names.push(let_stmt.name.clone());
                 }
-                _ => unreachable!(
-                    "is_let_yield_prefix_then_branched_cps_tail_body classifier \
-                     guarantees Let value is Expr::Perform or Expr::Call"
-                ),
+                // Plan C Task 81 — pure trailing let; classifier
+                // accepts these after the last yield. They don't
+                // contribute a chain step (chain_length is YIELD
+                // count, not stmts.len()), so the cap check below
+                // remains correct against `chain_length`.
+                _ => {}
             }
         }
         let tail_expr = match body.tail.as_ref() {
@@ -403,7 +404,7 @@ fn compute_user_fn_abi(
             ),
         };
         let captures =
-            collect_chained_synth_cont_captures(&steps, tail_expr, &binding_names, helper_params);
+            collect_chained_synth_cont_captures(&steps, tail_expr, &[], &binding_names, helper_params);
         if captures.len() + chain_length + 1 < MAX_CLOSURE_ENV_SLOTS {
             return UserFnAbi::Cps;
         }
@@ -3286,7 +3287,44 @@ enum ChainStepRole {
         /// Cranelift type of `tail_expr`'s value. Used to widen to
         /// I64 before wrapping in `Done(...)`.
         tail_ty: Type,
+        /// Plan C Task 81 — pure `Stmt::Let` intermediates that
+        /// appear in source between the last yield and `tail_expr`.
+        /// Lowered in order at the FINAL step's emit (after binding
+        /// the last yield's value into env, before lowering
+        /// `tail_expr`). Each entry's RHS is a pure expression that
+        /// may reference captures, prior chain bindings, and earlier
+        /// tail-prefix lets.
+        tail_prefix_lets: Vec<TailPrefixLet>,
     },
+}
+
+/// Plan C Task 81 — one pure `Stmt::Let` intermediate that appears
+/// between the last chain yield and the FINAL step's tail expression.
+/// ANF-lifted intermediates (e.g., `let _0 = a == 1` between yields
+/// and the if-tail using `_0`) typically populate this list; chain
+/// classifier `is_let_yield_prefix_then_branched_cps_tail_body`
+/// (and the pure-tail variant) walk source stmts and append
+/// post-yield pure lets here.
+#[derive(Debug, Clone)]
+struct TailPrefixLet {
+    /// Source-level name bound by this let.
+    name: String,
+    /// Cranelift type the let-binding declares. Reserved for future
+    /// use when the FINAL emit needs to widen/narrow against the
+    /// declared type before binding into env (today the emit narrows
+    /// per `kind` since pure-let RHS lowers to a Cranelift value of
+    /// the slot-kind's natural width).
+    #[allow(dead_code)]
+    ty: Type,
+    /// `EnvSlotKind` for the let-binding's env slot (drives narrow-
+    /// from-I64 at bind time + pointer-bitmap derivation if this
+    /// binding is captured into a closure record by a downstream
+    /// emit; for tail-prefix lets the binding lives only in env so
+    /// pointer-bitmap doesn't apply).
+    kind: EnvSlotKind,
+    /// The pure expression to lower. Must be pure per `expr_is_pure`
+    /// (the classifier enforces this).
+    value: crate::ast::Expr,
 }
 
 /// Plan B' Stage 6.7 (B.2) — one prior chain binding threaded forward
@@ -3388,6 +3426,7 @@ fn slot_kind_for_type_expr_post_mono(te: &crate::ast::TypeExpr) -> EnvSlotKind {
 fn collect_chained_synth_cont_captures(
     steps: &[ChainedNextStep],
     tail_expr: &crate::ast::Expr,
+    tail_prefix_lets: &[TailPrefixLet],
     binding_names: &[String],
     helper_params: &[crate::ast::Param],
 ) -> Vec<SynthContCapture> {
@@ -3414,6 +3453,15 @@ fn collect_chained_synth_cont_captures(
                 }
             }
         }
+    }
+    // Plan C Task 81 — pure trailing intermediates can reference
+    // helper params (e.g., `let _0 = x + threshold` where `threshold`
+    // is a helper param). Walk their values BEFORE adding their names
+    // to `bound` (so a later tail-prefix let can reference an
+    // earlier one without double-capturing).
+    for tpl in tail_prefix_lets {
+        walk_collect_captures(&tpl.value, &mut bound, helper_params, &mut out);
+        bound.insert(tpl.name.clone());
     }
     walk_collect_captures(tail_expr, &mut bound, helper_params, &mut out);
     out
@@ -8053,6 +8101,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
                     let mut binding_tys: Vec<Type> = Vec::with_capacity(chain_length);
                     let mut binding_kinds: Vec<EnvSlotKind> = Vec::with_capacity(chain_length);
+                    // Plan C Task 81 — pure trailing intermediates
+                    // (after the last yield, before the tail). Lowered
+                    // by the FINAL step's emit before tail_expr.
+                    let mut tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
                     for stmt in &f.body.stmts {
                         let let_stmt = match stmt {
                             crate::ast::Stmt::Let(l) => l,
@@ -8061,8 +8113,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                  classifier guarantees every stmt is Stmt::Let"
                             ),
                         };
-                        let step = match &let_stmt.value {
-                            crate::ast::Expr::Perform(p) => ChainedNextStep::Perform(p.clone()),
+                        match &let_stmt.value {
+                            crate::ast::Expr::Perform(p) => {
+                                steps.push(ChainedNextStep::Perform(p.clone()));
+                                binding_names.push(let_stmt.name.clone());
+                                binding_tys
+                                    .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
+                                binding_kinds
+                                    .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                            }
                             crate::ast::Expr::Call { callee, args, .. } => {
                                 let callee_name = match callee.as_ref() {
                                     crate::ast::Expr::Ident(n, _) => n.clone(),
@@ -8071,21 +8130,31 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                          classifier guarantees Call callee is Expr::Ident"
                                     ),
                                 };
-                                ChainedNextStep::CallCps {
+                                steps.push(ChainedNextStep::CallCps {
                                     callee_name,
                                     args: args.clone(),
-                                }
+                                });
+                                binding_names.push(let_stmt.name.clone());
+                                binding_tys
+                                    .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
+                                binding_kinds
+                                    .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
                             }
-                            _ => unreachable!(
-                                "is_simple_chained_let_yield_then_pure_tail_body \
-                                 classifier guarantees Let value is Expr::Perform or \
-                                 Expr::Call (Plan D Task 112)"
-                            ),
-                        };
-                        steps.push(step);
-                        binding_names.push(let_stmt.name.clone());
-                        binding_tys.push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
-                        binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                            other => {
+                                // Plan C Task 81 — pure trailing
+                                // intermediate (classifier accepted
+                                // it after at least one yield was
+                                // seen). Append to tail_prefix_lets;
+                                // FINAL step's emit lowers them in
+                                // order before lowering tail_expr.
+                                tail_prefix_lets.push(TailPrefixLet {
+                                    name: let_stmt.name.clone(),
+                                    ty: cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty),
+                                    kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
+                                    value: other.clone(),
+                                });
+                            }
+                        }
                     }
                     let tail_expr = match &f.body.tail {
                         Some(t) => t.clone(),
@@ -8104,6 +8173,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let captures = collect_chained_synth_cont_captures(
                         &steps,
                         &tail_expr,
+                        &tail_prefix_lets,
                         &binding_names,
                         &f.params,
                     );
@@ -8148,6 +8218,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             ChainStepRole::Final {
                                 tail_expr: Box::new(tail_expr.clone()),
                                 tail_ty,
+                                tail_prefix_lets: tail_prefix_lets.clone(),
                             }
                         };
                         // Plan D Task 112 — `prior_was_call_cps` flag
@@ -12921,7 +12992,61 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         };
 
                         match role {
-                            ChainStepRole::Final { tail_expr, tail_ty } => {
+                            ChainStepRole::Final {
+                                tail_expr,
+                                tail_ty,
+                                tail_prefix_lets,
+                            } => {
+                                // Plan C Task 81 — lower tail-prefix
+                                // pure intermediates BEFORE the tail
+                                // pattern-c-detect / standard-tail
+                                // path. Each `let name = pure_expr`
+                                // lowers via `lower_expr` (env has
+                                // captures + prior chain bindings +
+                                // current binding), then binds the
+                                // result into env under `name`,
+                                // narrowed for the slot kind. This
+                                // lets the tail expression (or its
+                                // branched-cps-tail emit) reference
+                                // these idents directly.
+                                for tpl in tail_prefix_lets {
+                                    let raw_v = lowerer.lower_expr(&tpl.value);
+                                    let widened = match tpl.kind {
+                                        EnvSlotKind::Int => {
+                                            // I64 already.
+                                            let arg_ty =
+                                                lowerer.builder.func.dfg.value_type(raw_v);
+                                            if arg_ty == types::I64 {
+                                                raw_v
+                                            } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                                                lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .uextend(types::I64, raw_v)
+                                            } else {
+                                                raw_v
+                                            }
+                                        }
+                                        EnvSlotKind::Bool
+                                        | EnvSlotKind::Byte
+                                        | EnvSlotKind::Unit
+                                        | EnvSlotKind::Char => {
+                                            // Narrow target type but
+                                            // keep raw_v as-is for env
+                                            // (the env's slot kind is
+                                            // tracked separately).
+                                            // Sigil's lower_expr returns
+                                            // I8 for Bool/Byte/Unit/Char,
+                                            // matching the slot kind.
+                                            raw_v
+                                        }
+                                        EnvSlotKind::String
+                                        | EnvSlotKind::Closure
+                                        | EnvSlotKind::User => raw_v,
+                                    };
+                                    lowerer.env.insert(tpl.name.clone(), widened);
+                                }
+                                // Continue with existing tail emit.
                                 // Plan D Task 112d — Pattern C detection.
                                 // If `tail_expr` is `Expr::If` where each
                                 // branch is pure OR a single Cps user fn
@@ -22412,6 +22537,12 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
     if body.stmts.len() >= MAX_CLOSURE_ENV_SLOTS {
         return None;
     }
+    // Plan C Task 81 — accept pure `Stmt::Let` interspersed AFTER the
+    // last perform/call yield (ANF-lifted intermediates between the
+    // last yield and the pure tail). Symmetric extension to
+    // `is_let_yield_prefix_then_branched_cps_tail_body`.
+    let mut yield_count: usize = 0;
+    let mut seen_pure_after_yield = false;
     for stmt in &body.stmts {
         let let_stmt = match stmt {
             Stmt::Let(l) => l,
@@ -22420,9 +22551,13 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
         match &let_stmt.value {
             // Direct perform — original Plan B' Stage 6.7 shape.
             Expr::Perform(p) => {
+                if seen_pure_after_yield {
+                    return None;
+                }
                 if !p.args.iter().all(|a| expr_is_pure(a, ctors)) {
                     return None;
                 }
+                yield_count += 1;
             }
             // Plan D Task 112a/112b — wrapper-Call let-RHS. Accept
             // iff:
@@ -22463,6 +22598,9 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
             // (not nested wrapper-Calls). Wrapper-of-chained shapes
             // fall back to Sync ABI here.
             Expr::Call { callee, args, .. } => {
+                if seen_pure_after_yield {
+                    return None;
+                }
                 let callee_name = match callee.as_ref() {
                     Expr::Ident(n, _) => n,
                     _ => return None,
@@ -22473,12 +22611,21 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
                 if !args.iter().all(|a| expr_is_pure(a, ctors)) {
                     return None;
                 }
+                yield_count += 1;
+            }
+            other if yield_count > 0 && expr_is_pure(other, ctors) => {
+                // Pure trailing intermediate; lowered by the FINAL
+                // step's emit before the tail.
+                seen_pure_after_yield = true;
             }
             _ => return None,
         }
     }
+    if yield_count == 0 {
+        return None;
+    }
     match &body.tail {
-        Some(t) if expr_is_pure(t, ctors) => Some(body.stmts.len()),
+        Some(t) if expr_is_pure(t, ctors) => Some(yield_count),
         _ => None,
     }
 }
@@ -22558,6 +22705,14 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
     if body.stmts.len() >= MAX_CLOSURE_ENV_SLOTS {
         return None;
     }
+    // Plan C Task 81 — accept pure `Stmt::Let` interspersed AFTER the
+    // last perform/call yield (ANF-lifted intermediates between the
+    // last yield and the branched tail). Pure lets BEFORE the first
+    // yield, or BETWEEN two yields, are not yet supported. Yield
+    // count is returned (= chain_length); the FINAL step's emit
+    // evaluates tail-prefix pure lets before lowering the tail.
+    let mut yield_count: usize = 0;
+    let mut seen_pure_after_yield = false;
     for stmt in &body.stmts {
         let let_stmt = match stmt {
             Stmt::Let(l) => l,
@@ -22565,11 +22720,20 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
         };
         match &let_stmt.value {
             Expr::Perform(p) => {
+                if seen_pure_after_yield {
+                    // Pure-then-yield (a pure let between two yields)
+                    // not supported in this minimal extension.
+                    return None;
+                }
                 if !p.args.iter().all(|a| expr_is_pure(a, ctors)) {
                     return None;
                 }
+                yield_count += 1;
             }
             Expr::Call { callee, args, .. } => {
+                if seen_pure_after_yield {
+                    return None;
+                }
                 let callee_name = match callee.as_ref() {
                     Expr::Ident(n, _) => n,
                     _ => return None,
@@ -22586,9 +22750,19 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                 if !args.iter().all(|a| expr_is_pure(a, ctors)) {
                     return None;
                 }
+                yield_count += 1;
+            }
+            other if yield_count > 0 && expr_is_pure(other, ctors) => {
+                // Pure let-RHS after at least one yield — accept as
+                // a tail-prefix pure intermediate. Lowered by the
+                // FINAL step's emit before the tail.
+                seen_pure_after_yield = true;
             }
             _ => return None,
         }
+    }
+    if yield_count == 0 {
+        return None;
     }
     let tail = body.tail.as_ref()?;
     // Accept either Expr::If or Expr::Match. Sigil's elaboration pass
@@ -22646,7 +22820,7 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
     if !has_cps_call {
         return None;
     }
-    Some(body.stmts.len())
+    Some(yield_count)
 }
 
 /// Plan D Task 112d — accept a bare `Expr` (an `Expr::Block` or any
@@ -25062,7 +25236,7 @@ mod tests {
         }];
         let binding_names = vec!["x".to_string()];
         let captures =
-            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
+            collect_chained_synth_cont_captures(&[], &tail, &[], &binding_names, &helper_params);
         assert_eq!(captures.len(), 1);
         assert_eq!(captures[0].name, "threshold");
         assert_eq!(captures[0].kind, EnvSlotKind::Int);
@@ -25090,7 +25264,7 @@ mod tests {
         }];
         let binding_names = vec!["x".to_string()];
         let captures =
-            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
+            collect_chained_synth_cont_captures(&[], &tail, &[], &binding_names, &helper_params);
         assert_eq!(captures.len(), 0);
     }
 
@@ -25140,7 +25314,7 @@ mod tests {
         }];
         let binding_names = vec!["x".to_string()];
         let captures =
-            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
+            collect_chained_synth_cont_captures(&[], &tail, &[], &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -25191,7 +25365,7 @@ mod tests {
         }];
         let binding_names = vec!["x".to_string()];
         let captures =
-            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
+            collect_chained_synth_cont_captures(&[], &tail, &[], &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -25249,7 +25423,7 @@ mod tests {
         }];
         let binding_names = vec!["x".to_string()];
         let captures =
-            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
+            collect_chained_synth_cont_captures(&[], &tail, &[], &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -25305,7 +25479,7 @@ mod tests {
         }];
         let binding_names = vec!["x".to_string()];
         let captures =
-            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
+            collect_chained_synth_cont_captures(&[], &tail, &[], &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             0,
@@ -25342,7 +25516,7 @@ mod tests {
         }];
         let binding_names = vec!["x".to_string()];
         let captures =
-            collect_chained_synth_cont_captures(&[], &tail, &binding_names, &helper_params);
+            collect_chained_synth_cont_captures(&[], &tail, &[], &binding_names, &helper_params);
         assert_eq!(
             captures.len(),
             1,

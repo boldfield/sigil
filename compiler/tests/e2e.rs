@@ -8797,6 +8797,52 @@ fn std_choose_all_choices_two_sequential_performs_pure_tail() {
     );
 }
 
+/// Plan C Task 81 — `first_choice` over a body with **two
+/// sequential perform sites + ANF-lifted pure intermediates between
+/// the last yield and a flat branched tail**. Body picks `a, b ∈ 0..1`;
+/// succeeds only when `a == 1 && b == 1`, returning 99. Otherwise
+/// `Choose.fail()`. ANF lifts `a == 1` and `b == 1` into separate
+/// `let _0 = ...; let _1 = ...;` stmts between the second perform
+/// and the tail If. The chain classifier extension accepts these as
+/// tail-prefix pure intermediates; the FINAL synth-cont's emit
+/// lowers them in order before lowering the branched tail. Captures
+/// collection walks tail-prefix lets so helper params referenced
+/// only in the lifted intermediates (e.g., `threshold` in
+/// `let _0 = x + threshold`) flow through the closure record.
+#[test]
+fn std_choose_first_choice_two_sequential_performs_anf_intermediates() {
+    let src = "import std.choose\n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(2);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 if a == 1 && b == 1 {\n    \
+                   99\n  \
+                 } else {\n    \
+                   perform Choose.fail()\n  \
+                 }\n\
+               }\n\
+               fn unwrap_or_int(o: Option[Int], dflt: Int) -> Int ![] {\n  \
+                 match o {\n    \
+                   Some(x) => x,\n    \
+                   None => dflt,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Option[Int] = first_choice(body);\n  \
+                 let v: Int = unwrap_or_int(r, 0 - 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_two_seq_anf_intermediates");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n",
+        "Two sequential performs with ANF-lifted intermediates must compose. \
+         Expected: explores (a=0/b=0/1 fail), (a=1/b=0 fail), (a=1/b=1 → 99). \
+         stderr={stderr:?}"
+    );
+}
+
 // ===== Plan C Task 69 — boxed Int64 run-and-check-output =====
 
 /// Construct two Int64s, add them, stringify and print. Pins the
