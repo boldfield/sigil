@@ -1,7 +1,60 @@
+// examples/sudoku.sigil
+//
+// Plan C Task 81 — 9×9 Sudoku via std.choose's `first_choice`
+// discharger + recursive backtracking with immutable `Array[Int]`.
+// Each candidate try threads its own grid via parameter passing;
+// multi-shot `first_choice` retries get clean state by construction
+// (no mutation, no manual snapshot/restore). On the success path
+// the solver `perform IO.println`s the solved grid cell-by-cell
+// (81 lines of one digit each) before returning.
+//
+// **Why Array (immutable) instead of MutArray.** The Plan C body
+// specifies `MutArray[Int]` under `Mem`. With multi-shot Choose,
+// MutArray + manual snapshot/restore (cell ← 0 before perform fail
+// in user code) requires the user to observe inner discharge values
+// in `let result = solve(...)` Let-RHS position — a pattern that
+// doesn't compose cleanly: Sync→Cps interop returns the discharger's
+// R-typed value (Some/None Option pointer) treated as Int, the
+// `if result == 0 { undo+fail }` check never fires correctly, and
+// deeper recursion's mutations leak into outer cells on backtrack.
+// Immutable Array sidesteps the footgun: each `array_set` returns
+// a fresh array, multi-shot retries get the parent's grid
+// unchanged, no manual snapshot needed.
+//
+// Puzzle (Wikipedia "easy" 30-clue example, requires real
+// backtracking — many cells have multiple candidates at first
+// visit):
+//
+//   5 3 . | . 7 . | . . .
+//   6 . . | 1 9 5 | . . .
+//   . 9 8 | . . . | . 6 .
+//   ------+-------+------
+//   8 . . | . 6 . | . . 3
+//   4 . . | 8 . 3 | . . 1
+//   7 . . | . 2 . | . . 6
+//   ------+-------+------
+//   . 6 . | . . . | 2 8 .
+//   . . . | 4 1 9 | . . 5
+//   . . . | . 8 . | . 7 9
+//
+// Solution (printed cell-by-cell row-major — 81 single-digit lines):
+//
+//   5 3 4 | 6 7 8 | 9 1 2
+//   6 7 2 | 1 9 5 | 3 4 8
+//   1 9 8 | 3 4 2 | 5 6 7
+//   ------+-------+------
+//   8 5 9 | 7 6 1 | 4 2 3
+//   4 2 6 | 8 5 3 | 7 9 1
+//   7 1 3 | 9 2 4 | 8 5 6
+//   ------+-------+------
+//   9 6 1 | 5 3 7 | 2 8 4
+//   2 8 7 | 4 1 9 | 6 3 5
+//   3 4 5 | 2 8 6 | 1 7 9
+
 import std.choose
 import std.option
 
-fn check_conflict(grid: MutArray[Int], target_idx: Int, i: Int, d: Int) -> Bool ![Mem, ArithError] {
+fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![ArithError] {
   match i {
     81 => false,
     _ => {
@@ -12,15 +65,34 @@ fn check_conflict(grid: MutArray[Int], target_idx: Int, i: Int, d: Int) -> Bool 
         let row_t: Int = target_idx / 9;
         let col_i: Int = i - row_i * 9;
         let col_t: Int = target_idx - row_t * 9;
+        let box_i: Int = row_i / 3 * 3 + col_i / 3;
+        let box_t: Int = row_t / 3 * 3 + col_t / 3;
         let same_row: Bool = row_i == row_t;
         let same_col: Bool = col_i == col_t;
+        let same_box: Bool = box_i == box_t;
         if same_row {
-          if mut_array_get(grid, i) == d { true } else { check_conflict(grid, target_idx, i + 1, d) }
-        } else {
-          if same_col {
-            if mut_array_get(grid, i) == d { true } else { check_conflict(grid, target_idx, i + 1, d) }
+          if array_get(grid, i) == d {
+            true
           } else {
             check_conflict(grid, target_idx, i + 1, d)
+          }
+        } else {
+          if same_col {
+            if array_get(grid, i) == d {
+              true
+            } else {
+              check_conflict(grid, target_idx, i + 1, d)
+            }
+          } else {
+            if same_box {
+              if array_get(grid, i) == d {
+                true
+              } else {
+                check_conflict(grid, target_idx, i + 1, d)
+              }
+            } else {
+              check_conflict(grid, target_idx, i + 1, d)
+            }
           }
         }
       }
@@ -28,29 +100,49 @@ fn check_conflict(grid: MutArray[Int], target_idx: Int, i: Int, d: Int) -> Bool 
   }
 }
 
-fn try_at_cell(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, ArithError] {
-  let d: Int = perform Choose.choose(9);
-  let digit: Int = d + 1;
-  if check_conflict(grid, idx, 0, digit) {
-    perform Choose.fail()
+fn cell_valid(grid: Array[Int], idx: Int, d: Int) -> Bool ![ArithError] {
+  if check_conflict(grid, idx, 0, d) {
+    false
   } else {
-    let _set: Unit = mut_array_set(grid, idx, digit);
-    let result: Int = solve(grid, idx + 1);
-    if result == 0 {
-      let _undo: Unit = mut_array_set(grid, idx, 0);
-      perform Choose.fail()
-    } else {
-      result
-    }
+    true
   }
 }
 
-fn solve(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, ArithError] {
+fn print_grid(grid: Array[Int], i: Int) -> Int ![IO] {
+  if i == 81 {
+    0
+  } else {
+    let v: Int = array_get(grid, i);
+    let _print: Unit = perform IO.println(int_to_string(v));
+    print_grid(grid, i + 1)
+  }
+}
+
+// At an empty cell: pick a digit 1..9 via `Choose.choose(9)`. On
+// row/col/box conflict perform fail. On success: tail-call solve
+// with the new grid (immutable threading). Multi-shot retries get
+// the PARENT's grid (this fn's `grid` parameter is unchanged when
+// k(d+1) re-runs the body — only the per-try `array_set` allocates
+// a fresh array, which is discarded if that try's recursion fails).
+fn try_at_cell(grid: Array[Int], idx: Int) -> Int ![Choose, IO, ArithError] {
+  let d: Int = perform Choose.choose(9);
+  let digit: Int = d + 1;
+  if cell_valid(grid, idx, digit) {
+    solve(array_set(grid, idx, digit), idx + 1)
+  } else {
+    perform Choose.fail()
+  }
+}
+
+// Recursive grid walker. At idx==81 prints the solved grid and
+// returns 1 (success sentinel). At each cell: skip if filled,
+// otherwise dispatch to try_at_cell.
+fn solve(grid: Array[Int], idx: Int) -> Int ![Choose, IO, ArithError] {
   let _solve_dummy: Int = perform Choose.choose(1);
   if idx == 81 {
-    mut_array_get(grid, 8)
+    print_grid(grid, 0)
   } else {
-    if mut_array_get(grid, idx) != 0 {
+    if array_get(grid, idx) != 0 {
       solve(grid, idx + 1)
     } else {
       try_at_cell(grid, idx)
@@ -58,96 +150,58 @@ fn solve(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, ArithError] {
   }
 }
 
-fn solve_initial() -> Int ![Choose, Mem, ArithError] {
-  let grid: MutArray[Int] = mut_array_new(81, 0);
-  // Row 0: cols 0-7 filled, cell 8 empty
-  let _: Unit = mut_array_set(grid, 0, 5);
-  let _a: Unit = mut_array_set(grid, 1, 3);
-  let _b: Unit = mut_array_set(grid, 2, 4);
-  let _c: Unit = mut_array_set(grid, 3, 6);
-  let _d: Unit = mut_array_set(grid, 4, 7);
-  let _e: Unit = mut_array_set(grid, 5, 8);
-  let _f: Unit = mut_array_set(grid, 6, 9);
-  let _g: Unit = mut_array_set(grid, 7, 1);
-  // Row 1: cols 0-7 filled, cell 17 empty
-  let _h: Unit = mut_array_set(grid, 9, 6);
-  let _i: Unit = mut_array_set(grid, 10, 7);
-  let _j: Unit = mut_array_set(grid, 11, 2);
-  let _k: Unit = mut_array_set(grid, 12, 1);
-  let _l: Unit = mut_array_set(grid, 13, 9);
-  let _m: Unit = mut_array_set(grid, 14, 5);
-  let _n: Unit = mut_array_set(grid, 15, 3);
-  let _o: Unit = mut_array_set(grid, 16, 4);
-  // Row 2: cols 0-7 filled, cell 26 empty
-  let _q: Unit = mut_array_set(grid, 18, 1);
-  let _r: Unit = mut_array_set(grid, 19, 9);
-  let _s: Unit = mut_array_set(grid, 20, 8);
-  let _t: Unit = mut_array_set(grid, 21, 3);
-  let _u: Unit = mut_array_set(grid, 22, 4);
-  let _v: Unit = mut_array_set(grid, 23, 2);
-  let _w: Unit = mut_array_set(grid, 24, 5);
-  let _x: Unit = mut_array_set(grid, 25, 6);
-  // Row 3
-  let _aa: Unit = mut_array_set(grid, 27, 8);
-  let _ab: Unit = mut_array_set(grid, 28, 5);
-  let _ac: Unit = mut_array_set(grid, 29, 9);
-  let _ad: Unit = mut_array_set(grid, 30, 7);
-  let _ae: Unit = mut_array_set(grid, 31, 6);
-  let _af: Unit = mut_array_set(grid, 32, 1);
-  let _ag: Unit = mut_array_set(grid, 33, 4);
-  let _ah: Unit = mut_array_set(grid, 34, 2);
-  // Row 4
-  let _aj: Unit = mut_array_set(grid, 36, 4);
-  let _ak: Unit = mut_array_set(grid, 37, 2);
-  let _al: Unit = mut_array_set(grid, 38, 6);
-  let _am: Unit = mut_array_set(grid, 39, 8);
-  let _an: Unit = mut_array_set(grid, 40, 5);
-  let _ao: Unit = mut_array_set(grid, 41, 3);
-  let _ap: Unit = mut_array_set(grid, 42, 7);
-  let _aq: Unit = mut_array_set(grid, 43, 9);
-  // Row 5
-  let _as: Unit = mut_array_set(grid, 45, 7);
-  let _at: Unit = mut_array_set(grid, 46, 1);
-  let _au: Unit = mut_array_set(grid, 47, 3);
-  let _av: Unit = mut_array_set(grid, 48, 9);
-  let _aw: Unit = mut_array_set(grid, 49, 2);
-  let _ax: Unit = mut_array_set(grid, 50, 4);
-  let _ay: Unit = mut_array_set(grid, 51, 8);
-  let _az: Unit = mut_array_set(grid, 52, 5);
-  // Row 6
-  let _bb: Unit = mut_array_set(grid, 54, 9);
-  let _bc: Unit = mut_array_set(grid, 55, 6);
-  let _bd: Unit = mut_array_set(grid, 56, 1);
-  let _be: Unit = mut_array_set(grid, 57, 5);
-  let _bf: Unit = mut_array_set(grid, 58, 3);
-  let _bg: Unit = mut_array_set(grid, 59, 7);
-  let _bh: Unit = mut_array_set(grid, 60, 2);
-  let _bi: Unit = mut_array_set(grid, 61, 8);
-  // Row 7
-  let _bk: Unit = mut_array_set(grid, 63, 2);
-  let _bl: Unit = mut_array_set(grid, 64, 8);
-  let _bm: Unit = mut_array_set(grid, 65, 7);
-  let _bn: Unit = mut_array_set(grid, 66, 4);
-  let _bo: Unit = mut_array_set(grid, 67, 1);
-  let _bp: Unit = mut_array_set(grid, 68, 9);
-  let _bq: Unit = mut_array_set(grid, 69, 6);
-  let _br: Unit = mut_array_set(grid, 70, 3);
-  // Row 8
-  let _bt: Unit = mut_array_set(grid, 72, 3);
-  let _bu: Unit = mut_array_set(grid, 73, 4);
-  let _bv: Unit = mut_array_set(grid, 74, 5);
-  let _bw: Unit = mut_array_set(grid, 75, 2);
-  let _bx: Unit = mut_array_set(grid, 76, 8);
-  let _by: Unit = mut_array_set(grid, 77, 6);
-  let _bz: Unit = mut_array_set(grid, 78, 1);
-  let _ca: Unit = mut_array_set(grid, 79, 7);
-  solve(grid, 0)
+fn solve_initial() -> Int ![Choose, IO, ArithError] {
+  let g: Array[Int] = array_alloc(81, 0);
+  // Wikipedia easy puzzle — 30 clues at the listed positions.
+  // Row 0: clues at cols 0,1,4 (5,3,7)
+  let g0: Array[Int] = array_set(g, 0, 5);
+  let g1: Array[Int] = array_set(g0, 1, 3);
+  let g2: Array[Int] = array_set(g1, 4, 7);
+  // Row 1: clues at cols 0,3,4,5 (6,1,9,5)
+  let g3: Array[Int] = array_set(g2, 9, 6);
+  let g4: Array[Int] = array_set(g3, 12, 1);
+  let g5: Array[Int] = array_set(g4, 13, 9);
+  let g6: Array[Int] = array_set(g5, 14, 5);
+  // Row 2: clues at cols 1,2,7 (9,8,6)
+  let g7: Array[Int] = array_set(g6, 19, 9);
+  let g8: Array[Int] = array_set(g7, 20, 8);
+  let g9: Array[Int] = array_set(g8, 25, 6);
+  // Row 3: clues at cols 0,4,8 (8,6,3)
+  let g10: Array[Int] = array_set(g9, 27, 8);
+  let g11: Array[Int] = array_set(g10, 31, 6);
+  let g12: Array[Int] = array_set(g11, 35, 3);
+  // Row 4: clues at cols 0,3,5,8 (4,8,3,1)
+  let g13: Array[Int] = array_set(g12, 36, 4);
+  let g14: Array[Int] = array_set(g13, 39, 8);
+  let g15: Array[Int] = array_set(g14, 41, 3);
+  let g16: Array[Int] = array_set(g15, 44, 1);
+  // Row 5: clues at cols 0,4,8 (7,2,6)
+  let g17: Array[Int] = array_set(g16, 45, 7);
+  let g18: Array[Int] = array_set(g17, 49, 2);
+  let g19: Array[Int] = array_set(g18, 53, 6);
+  // Row 6: clues at cols 1,6,7 (6,2,8)
+  let g20: Array[Int] = array_set(g19, 55, 6);
+  let g21: Array[Int] = array_set(g20, 60, 2);
+  let g22: Array[Int] = array_set(g21, 61, 8);
+  // Row 7: clues at cols 3,4,5,8 (4,1,9,5)
+  let g23: Array[Int] = array_set(g22, 66, 4);
+  let g24: Array[Int] = array_set(g23, 67, 1);
+  let g25: Array[Int] = array_set(g24, 68, 9);
+  let g26: Array[Int] = array_set(g25, 71, 5);
+  // Row 8: clues at cols 4,7,8 (8,7,9)
+  let g27: Array[Int] = array_set(g26, 76, 8);
+  let g28: Array[Int] = array_set(g27, 79, 7);
+  let g_final: Array[Int] = array_set(g28, 80, 9);
+  solve(g_final, 0)
 }
 
-fn main() -> Int ![IO, Mem, ArithError] {
+fn main() -> Int ![IO, ArithError] {
   let solved: Option[Int] = first_choice(solve_initial);
   match solved {
-    Some(v) => { perform IO.println(int_to_string(v)); 0 },
-    None => { perform IO.println("none"); 1 },
+    Some(v) => v,
+    None => {
+      perform IO.println("no solution");
+      1
+    },
   }
 }

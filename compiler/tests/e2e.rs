@@ -1246,30 +1246,32 @@ fn task_117_layout_skip_generic_templates_pointer_payload_in_some() {
 
 /// Plan C Task 81 — 9×9 Sudoku end-to-end via std.choose's
 /// `first_choice` discharger + recursive backtracking with
-/// `MutArray[Int]` under `Mem`. The puzzle has all of column 8
-/// empty (9 empty cells); the solver picks digits 1..9 via
-/// `Choose.choose(9)`, on conflict performs `Choose.fail()`, and
-/// on the success branch sets the cell, recurses through `solve`,
-/// and on failure backtracks by restoring the cell to 0 (multi-
-/// shot snapshot discipline) before failing.
+/// immutable `Array[Int]` (each candidate try threads its own
+/// grid via parameter passing; multi-shot retries get clean state
+/// by construction).
 ///
-/// Output is the digit at cell 8 (row 0, col 8) in the solved
-/// grid: "2\n". This exercises the full architectural cluster
-/// shipped through PR #96 + Plan C Task 81 follow-ups: chained-
-/// let-yield + branched-cps-tail + nested-If + arm-body Block
-/// stmts + ANF-tolerant chain classifier + non-yielding Calls
-/// in tail-prefix and as Pure leaves + arm-body Cps Call let-RHS
-/// discharge propagation.
+/// Puzzle: Wikipedia "easy" 30-clue sudoku. 51 empty cells
+/// requiring real backtracking. Output is the full solved grid
+/// printed cell-by-cell row-major (81 single-digit lines).
 #[test]
 fn task_81_sudoku_solves_9x9() {
     let root = workspace_root();
     let source = root.join("examples/sudoku.sigil");
     let (stdout, stderr, code) = compile_file_and_run(&source, "sudoku_example");
     assert_eq!(code, 0, "sudoku.sigil exit code; stderr={stderr:?}");
+    let expected = "5\n3\n4\n6\n7\n8\n9\n1\n2\n\
+                    6\n7\n2\n1\n9\n5\n3\n4\n8\n\
+                    1\n9\n8\n3\n4\n2\n5\n6\n7\n\
+                    8\n5\n9\n7\n6\n1\n4\n2\n3\n\
+                    4\n2\n6\n8\n5\n3\n7\n9\n1\n\
+                    7\n1\n3\n9\n2\n4\n8\n5\n6\n\
+                    9\n6\n1\n5\n3\n7\n2\n8\n4\n\
+                    2\n8\n7\n4\n1\n9\n6\n3\n5\n\
+                    3\n4\n5\n2\n8\n6\n1\n7\n9\n";
     assert_eq!(
-        stdout, "2\n",
-        "sudoku.sigil must produce \"2\\n\" — the digit at cell 8 (row 0, col 8) \
-         in the solved column-8-empty puzzle. stderr={stderr:?}"
+        stdout, expected,
+        "sudoku.sigil must produce the full solved grid (81 single-digit lines) \
+         for the Wikipedia easy puzzle. stderr={stderr:?}"
     );
 }
 
