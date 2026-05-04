@@ -8890,7 +8890,6 @@ fn std_choose_first_choice_two_sequential_performs_nested_if_tail() {
     );
 }
 
-
 /// Plan C Task 81 — `first_choice` over a body with **multiple
 /// recursive perform sites across helper-fn boundaries** via a
 /// branched-tail dispatching to either a Cps-call leaf (recursing

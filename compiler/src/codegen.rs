@@ -324,8 +324,13 @@ fn compute_user_fn_abi(
                 "is_simple_chained_let_yield_then_pure_tail_body classifier guarantees tail is Some"
             ),
         };
-        let captures =
-            collect_chained_synth_cont_captures(&steps, tail_expr, &[], &binding_names, helper_params);
+        let captures = collect_chained_synth_cont_captures(
+            &steps,
+            tail_expr,
+            &[],
+            &binding_names,
+            helper_params,
+        );
         // Plan D Task 112b — bound tightened by 1 to account for the
         // 2 caller_k_pair slots appended to every chained-let-yield
         // closure record. Old bound `K + N < MAX` ignored the +2,
@@ -403,8 +408,13 @@ fn compute_user_fn_abi(
                  guarantees tail is Some"
             ),
         };
-        let captures =
-            collect_chained_synth_cont_captures(&steps, tail_expr, &[], &binding_names, helper_params);
+        let captures = collect_chained_synth_cont_captures(
+            &steps,
+            tail_expr,
+            &[],
+            &binding_names,
+            helper_params,
+        );
         if captures.len() + chain_length + 1 < MAX_CLOSURE_ENV_SLOTS {
             return UserFnAbi::Cps;
         }
@@ -8119,8 +8129,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 binding_names.push(let_stmt.name.clone());
                                 binding_tys
                                     .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
-                                binding_kinds
-                                    .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                                binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
                             }
                             crate::ast::Expr::Call { callee, args, .. } => {
                                 let callee_name = match callee.as_ref() {
@@ -8137,8 +8146,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 binding_names.push(let_stmt.name.clone());
                                 binding_tys
                                     .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
-                                binding_kinds
-                                    .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                                binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
                             }
                             other => {
                                 // Plan C Task 81 — pure trailing
@@ -13014,15 +13022,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     let widened = match tpl.kind {
                                         EnvSlotKind::Int => {
                                             // I64 already.
-                                            let arg_ty =
-                                                lowerer.builder.func.dfg.value_type(raw_v);
+                                            let arg_ty = lowerer.builder.func.dfg.value_type(raw_v);
                                             if arg_ty == types::I64 {
                                                 raw_v
                                             } else if arg_ty.is_int() && arg_ty.bits() < 64 {
-                                                lowerer
-                                                    .builder
-                                                    .ins()
-                                                    .uextend(types::I64, raw_v)
+                                                lowerer.builder.ins().uextend(types::I64, raw_v)
                                             } else {
                                                 raw_v
                                             }
@@ -22977,19 +22981,15 @@ fn classify_branched_cps_tail_branch_expr(
                     None
                 }
             };
-            if let (Some(a0), Some(a1)) = (extract_bool(&arms[0].pattern), extract_bool(&arms[1].pattern))
-            {
+            if let (Some(a0), Some(a1)) = (
+                extract_bool(&arms[0].pattern),
+                extract_bool(&arms[1].pattern),
+            ) {
                 if a0 != a1 {
-                    let arm0_kind = classify_branched_cps_tail_branch_expr(
-                        &arms[0].body,
-                        ctors,
-                        is_supported,
-                    )?;
-                    let arm1_kind = classify_branched_cps_tail_branch_expr(
-                        &arms[1].body,
-                        ctors,
-                        is_supported,
-                    )?;
+                    let arm0_kind =
+                        classify_branched_cps_tail_branch_expr(&arms[0].body, ctors, is_supported)?;
+                    let arm1_kind =
+                        classify_branched_cps_tail_branch_expr(&arms[1].body, ctors, is_supported)?;
                     if leaf_is_cps_eligible(arm0_kind) || leaf_is_cps_eligible(arm1_kind) {
                         return Some(BranchedCpsLeaf::Nested);
                     }
