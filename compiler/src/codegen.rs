@@ -13123,8 +13123,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     &supported_lookup,
                                 );
 
-                                if let Some((cond, then_leaf, else_leaf, then_kind, else_kind)) =
-                                    pattern_c_dispatch
+                                if let Some((
+                                    cond,
+                                    then_stmts,
+                                    then_leaf,
+                                    else_stmts,
+                                    else_leaf,
+                                    then_kind,
+                                    else_kind,
+                                )) = pattern_c_dispatch
                                 {
                                     // Pattern C path: emit per-branch
                                     // routing. Pure leaves jump to
@@ -13144,31 +13151,48 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                                     // Plan C Task 81 — work-stack
                                     // dispatch over branched-cps tail.
-                                    // Supports nested If/Match leaves
-                                    // by re-entering this loop with
-                                    // each sub-branch pushed onto
-                                    // `work`. Termination: each
-                                    // iteration either emits a leaf
-                                    // (return_/jump terminates the
-                                    // block) or pushes 2 strictly-
-                                    // smaller sub-trees; finite tail
-                                    // expression bounds the iteration.
+                                    // Each item carries:
+                                    //   - the dispatch block to switch to
+                                    //   - the arm-body's pure-let stmts
+                                    //     (lowered before the leaf)
+                                    //   - the leaf expression
+                                    //   - the leaf kind
+                                    // Nested leaves re-enter the loop
+                                    // by pushing 2 sub-branches.
+                                    // Termination: each iteration either
+                                    // emits a leaf (return_/jump
+                                    // terminates the block) or pushes 2
+                                    // strictly-smaller sub-trees.
                                     let mut work: Vec<(
                                         cranelift::codegen::ir::Block,
+                                        &[crate::ast::Stmt],
                                         &crate::ast::Expr,
                                         BranchedCpsLeaf,
                                     )> = vec![
-                                        (else_block_cl, else_leaf, else_kind),
-                                        (then_block_cl, then_leaf, then_kind),
+                                        (else_block_cl, else_stmts, else_leaf, else_kind),
+                                        (then_block_cl, then_stmts, then_leaf, then_kind),
                                     ];
-                                    while let Some((block_cl, block_tail, leaf_kind)) = work.pop() {
+                                    while let Some((block_cl, leaf_stmts, block_tail, leaf_kind)) =
+                                        work.pop()
+                                    {
                                         lowerer.builder.switch_to_block(block_cl);
                                         lowerer.builder.seal_block(block_cl);
+                                        // Plan C Task 81 — lower arm-
+                                        // body pure-let stmts BEFORE
+                                        // dispatching the leaf. Each
+                                        // stmt's RHS is pure (per
+                                        // classify_branched_cps_tail_-
+                                        // branch's gate); lower via
+                                        // `lower_expr` and bind into
+                                        // env so the leaf can reference
+                                        // the new name.
+                                        for stmt in leaf_stmts {
+                                            if let crate::ast::Stmt::Let(l) = stmt {
+                                                let v = lowerer.lower_expr(&l.value);
+                                                lowerer.env.insert(l.name.clone(), v);
+                                            }
+                                        }
                                         if matches!(leaf_kind, BranchedCpsLeaf::Nested) {
-                                            // Recurse: detect pattern-c
-                                            // on the nested tail, lower
-                                            // cond, brif, push 2 sub-
-                                            // branches onto `work`.
                                             let nested = detect_pattern_c_dispatch(
                                                 block_tail,
                                                 &ctors,
@@ -13176,7 +13200,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             );
                                             let (
                                                 n_cond,
+                                                n_then_stmts,
                                                 n_then_leaf,
+                                                n_else_stmts,
                                                 n_else_leaf,
                                                 n_then_kind,
                                                 n_else_kind,
@@ -13198,8 +13224,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 n_else_blk,
                                                 &[],
                                             );
-                                            work.push((n_else_blk, n_else_leaf, n_else_kind));
-                                            work.push((n_then_blk, n_then_leaf, n_then_kind));
+                                            work.push((
+                                                n_else_blk,
+                                                n_else_stmts,
+                                                n_else_leaf,
+                                                n_else_kind,
+                                            ));
+                                            work.push((
+                                                n_then_blk,
+                                                n_then_stmts,
+                                                n_then_leaf,
+                                                n_then_kind,
+                                            ));
                                             continue;
                                         }
                                         match leaf_kind {
@@ -23002,7 +23038,9 @@ fn detect_pattern_c_dispatch<'a>(
     is_supported: &impl Fn(&str) -> bool,
 ) -> Option<(
     &'a crate::ast::Expr,
+    &'a [crate::ast::Stmt],
     &'a crate::ast::Expr,
+    &'a [crate::ast::Stmt],
     &'a crate::ast::Expr,
     BranchedCpsLeaf,
     BranchedCpsLeaf,
@@ -23019,20 +23057,20 @@ fn detect_pattern_c_dispatch<'a>(
                 classify_branched_cps_tail_branch(then_block.as_ref(), ctors, is_supported)?;
             let else_kind =
                 classify_branched_cps_tail_branch(else_block.as_ref(), ctors, is_supported)?;
-            // Plan D Task 117 (b) Phase 4 R2 — Perform leaves count
-            // alongside CpsCall (both produce NextStep::Call).
-            if !matches!(
-                then_kind,
-                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
-            ) && !matches!(
-                else_kind,
-                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
-            ) {
+            if !leaf_is_cps_eligible(then_kind) && !leaf_is_cps_eligible(else_kind) {
                 return None;
             }
             let then_leaf = then_block.tail.as_ref()?;
             let else_leaf = else_block.tail.as_ref()?;
-            Some((cond.as_ref(), then_leaf, else_leaf, then_kind, else_kind))
+            Some((
+                cond.as_ref(),
+                then_block.stmts.as_slice(),
+                then_leaf,
+                else_block.stmts.as_slice(),
+                else_leaf,
+                then_kind,
+                else_kind,
+            ))
         }
         Expr::Match {
             scrutinee, arms, ..
@@ -23058,36 +23096,34 @@ fn detect_pattern_c_dispatch<'a>(
             } else {
                 (&arms[1], &arms[0])
             };
-            // Each arm body must classify as Pure or CpsCall.
             let then_kind =
                 classify_branched_cps_tail_branch_expr(&then_arm.body, ctors, is_supported)?;
             let else_kind =
                 classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_supported)?;
-            // Plan D Task 117 (b) Phase 4 R2 — Perform leaves count
-            // alongside CpsCall (both produce NextStep::Call).
-            if !matches!(
-                then_kind,
-                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
-            ) && !matches!(
-                else_kind,
-                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
-            ) {
+            if !leaf_is_cps_eligible(then_kind) && !leaf_is_cps_eligible(else_kind) {
                 return None;
             }
-            // For arm bodies that are Expr::Block, extract the tail;
-            // for bare expressions, use the body directly.
-            let extract_leaf = |body: &'a Expr| -> Option<&'a Expr> {
+            // Plan C Task 81 — extract both arm-body stmts AND leaf.
+            // Bare Expr arm bodies → empty stmts. Block arm bodies →
+            // stmts + tail (must be Some). The work-stack emit lowers
+            // the stmts (each must be Stmt::Let with pure RHS, per
+            // classify_branched_cps_tail_branch's gate) before the
+            // leaf-emit dispatch.
+            let extract_leaf = |body: &'a Expr| -> Option<(&'a [crate::ast::Stmt], &'a Expr)> {
                 if let Expr::Block(b) = body {
-                    b.tail.as_ref()
+                    let t = b.tail.as_ref()?;
+                    Some((b.stmts.as_slice(), t))
                 } else {
-                    Some(body)
+                    Some((&[], body))
                 }
             };
-            let then_leaf = extract_leaf(&then_arm.body)?;
-            let else_leaf = extract_leaf(&else_arm.body)?;
+            let (then_stmts, then_leaf) = extract_leaf(&then_arm.body)?;
+            let (else_stmts, else_leaf) = extract_leaf(&else_arm.body)?;
             Some((
                 scrutinee.as_ref(),
+                then_stmts,
                 then_leaf,
+                else_stmts,
                 else_leaf,
                 then_kind,
                 else_kind,
@@ -23115,14 +23151,25 @@ fn classify_branched_cps_tail_branch(
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
 ) -> Option<BranchedCpsLeaf> {
-    if !block.stmts.is_empty() {
-        return None;
+    use crate::ast::Stmt;
+    // Plan C Task 81 — accept arm-body Blocks with pure `Stmt::Let`
+    // intermediates (ANF-lifted from compound subexpressions). Each
+    // stmt must be a `Stmt::Let` whose value is pure; the tail is
+    // then classified as a leaf via the bare-expr classifier.
+    // Blocks with non-pure stmts (e.g., `Stmt::Perform` or a let
+    // whose value is a Cps Call) are rejected — those would need
+    // separate chain-step machinery beyond a leaf classification.
+    // The work-stack emit lowers each pure stmt via `lower_expr` +
+    // `env.insert` before lowering the leaf.
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Let(l) if expr_is_pure(&l.value, ctors) => {
+                // Pure let intermediate; emit handles these inline.
+            }
+            _ => return None,
+        }
     }
     let tail = block.tail.as_ref()?;
-    // Delegate to the bare-expression classifier (handles Pure /
-    // CpsCall / Perform / Nested). The Block classifier was a
-    // narrower subset before Plan C Task 81; the nested-If / nested-
-    // Match recognition is shared via the bare-expr path.
     classify_branched_cps_tail_branch_expr(tail, ctors, is_supported)
 }
 

@@ -8891,6 +8891,61 @@ fn std_choose_first_choice_two_sequential_performs_nested_if_tail() {
 }
 
 
+/// Plan C Task 81 — `first_choice` over a body with **multiple
+/// recursive perform sites across helper-fn boundaries** via a
+/// branched-tail dispatching to either a Cps-call leaf (recursing
+/// into the helper) or a Perform-fail leaf. Mirrors Sudoku's
+/// natural body shape: `let d = perform Choose.choose(N); if
+/// cell_valid(...) { solve(set(...), cell+1) } else { perform fail }`.
+/// Body `pick_outer` performs `Choose.choose(2)`, then for `p == 1`
+/// calls `pick_inner(p)` (recursive Cps call leaf), for `p == 0`
+/// performs `Choose.fail()`. `pick_inner(p)` performs
+/// `Choose.choose(3)` and succeeds only at `x == 2` returning
+/// `p + x*10 = 21`. The arm body's compound expression `p + x*10`
+/// gets ANF-lifted into a pure-let stmt inside the arm Block;
+/// the work-stack emit lowers it via the arm-body-stmts threading
+/// before the leaf-emit dispatch.
+#[test]
+fn std_choose_first_choice_multi_perform_site_recursive_branched() {
+    let src = "import std.choose\n\
+               fn pick_inner(p: Int) -> Int ![Choose] {\n  \
+                 let x: Int = perform Choose.choose(3);\n  \
+                 if x == 2 {\n    \
+                   p + x * 10\n  \
+                 } else {\n    \
+                   perform Choose.fail()\n  \
+                 }\n\
+               }\n\
+               fn pick_outer() -> Int ![Choose] {\n  \
+                 let p: Int = perform Choose.choose(2);\n  \
+                 if p == 1 {\n    \
+                   pick_inner(p)\n  \
+                 } else {\n    \
+                   perform Choose.fail()\n  \
+                 }\n\
+               }\n\
+               fn unwrap_or_int(o: Option[Int], dflt: Int) -> Int ![] {\n  \
+                 match o {\n    \
+                   Some(x) => x,\n    \
+                   None => dflt,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Option[Int] = first_choice(pick_outer);\n  \
+                 let v: Int = unwrap_or_int(r, 0 - 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_multi_perform_branched");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "21\n",
+        "Multi-perform recursive body must compose under first_choice. \
+         Expected: (p=0 fail), (p=1 → pick_inner: x=0/1 fail, x=2 → 1 + 2*10 = 21). \
+         stderr={stderr:?}"
+    );
+}
+
 // ===== Plan C Task 69 — boxed Int64 run-and-check-output =====
 
 /// Construct two Int64s, add them, stringify and print. Pins the
