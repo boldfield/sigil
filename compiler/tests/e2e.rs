@@ -8649,26 +8649,20 @@ fn std_choose_all_choices_all_branches_fail_returns_empty() {
 /// branches. With `Choose.choose(4)` and `if x == 2 fail else x`,
 /// branches 0/1/3 succeed and branch 2 fails — list of length 3.
 ///
-/// Uses a `fail_int()` helper rather than inlining `perform
-/// Choose.fail()` directly in the if-branch. The v1 Cps body
-/// classifier (`compute_user_fn_abi` at `compiler/src/codegen.rs:-
-/// 189`) accepts `let x = perform; if cond { cps_call() } else
-/// { pure }` (the `is_let_yield_prefix_then_branched_cps_tail_-
-/// body` shape: branches must be Pure or CpsCall) but NOT a bare
-/// `perform` in a branch. Wrapping the perform in a fn call
-/// makes the branch a CpsCall and unblocks the multi-shot path.
-/// Documented in `std/choose.sigil` as the user-side workaround
-/// for v1.
+/// Pins the `BranchedCpsLeaf::Perform` classifier extension
+/// (Plan D Task 117 (b) Phase 4 R2): a bare `perform Choose.fail()`
+/// in an if-branch is now an accepted Cps body shape. The synth-
+/// cont's Perform-leaf codegen forwards `caller_k_pair` as the
+/// in-branch perform's continuation, so multi-shot dispatchers
+/// see the body's failing branch produce a real discharge instead
+/// of falling through to identity.
 #[test]
 fn std_choose_all_choices_partial_fail_skips_failing_branches() {
     let src = "import std.choose\n\
-               fn fail_int() -> Int ![Choose] {\n  \
-                 perform Choose.fail()\n\
-               }\n\
                fn pick_skip_two() -> Int ![Choose] {\n  \
                  let x: Int = perform Choose.choose(4);\n  \
                  if x == 2 {\n    \
-                   fail_int()\n  \
+                   perform Choose.fail()\n  \
                  } else {\n    \
                    x\n  \
                  }\n\
@@ -8711,22 +8705,17 @@ fn std_choose_first_choice_all_branches_fail_returns_none() {
 /// `first_choice` over a body that fails the first 3 branches and
 /// returns successfully on the 4th. Pins the recursive
 /// `first_choice_helper`'s descent through failing `k(i)` calls
-/// until a non-failing branch is found.
-///
-/// Uses a `fail_int()` helper rather than inlining `perform
-/// Choose.fail()` in the if-branch — same Cps-classifier
-/// constraint as
-/// `std_choose_all_choices_partial_fail_skips_failing_branches`.
+/// until a non-failing branch is found, with the bare
+/// `perform Choose.fail()` in the failing if-branch lowered via
+/// the Plan D Task 117 (b) Phase 4 R2 `BranchedCpsLeaf::Perform`
+/// path (no fn-wrapper required).
 #[test]
 fn std_choose_first_choice_skips_failures_then_finds_success() {
     let src = "import std.choose\n\
-               fn fail_int() -> Int ![Choose] {\n  \
-                 perform Choose.fail()\n\
-               }\n\
                fn pick_geq_three() -> Int ![Choose] {\n  \
                  let x: Int = perform Choose.choose(5);\n  \
                  if x < 3 {\n    \
-                   fail_int()\n  \
+                   perform Choose.fail()\n  \
                  } else {\n    \
                    x\n  \
                  }\n\

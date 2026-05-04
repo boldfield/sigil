@@ -13208,6 +13208,164 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 // the gate).
                                                 lowerer.builder.ins().return_(&[ns_ptr]);
                                             }
+                                            BranchedCpsLeaf::Perform => {
+                                                // Plan D Task 117 (b)
+                                                // Phase 4 R2 — bare
+                                                // perform leaf. Emit
+                                                // sigil_perform with
+                                                // caller_k_pair forwarded
+                                                // as the perform's
+                                                // continuation. The
+                                                // trampoline dispatches
+                                                // the matching arm; on
+                                                // arm completion (or
+                                                // discharge), control
+                                                // returns via caller_k.
+                                                let p = match block_tail {
+                                                    crate::ast::Expr::Perform(p) => p,
+                                                    _ => unreachable!(
+                                                        "Pattern C perform leaf: classifier \
+                                                         ensures branch tail is Expr::Perform"
+                                                    ),
+                                                };
+                                                let effect_id = match lowerer
+                                                    .effect_ids
+                                                    .get(&p.effect)
+                                                    .copied()
+                                                {
+                                                    Some(id) => id,
+                                                    None => unreachable!(
+                                                        "codegen Pattern C perform leaf: \
+                                                         effect `{}` missing from effect_ids",
+                                                        p.effect
+                                                    ),
+                                                };
+                                                let op_id = match lowerer
+                                                    .op_ids
+                                                    .get(&(p.effect.clone(), p.op.clone()))
+                                                    .copied()
+                                                {
+                                                    Some(id) => id,
+                                                    None => unreachable!(
+                                                        "codegen Pattern C perform leaf: \
+                                                         op `{}.{}` missing from op_ids",
+                                                        p.effect, p.op
+                                                    ),
+                                                };
+                                                let effect_id_v = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(types::I32, effect_id as i64);
+                                                let op_id_v = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(types::I32, op_id as i64);
+
+                                                // Pack the perform's user
+                                                // args into a stack slot.
+                                                let user_arg_count = p.args.len();
+                                                let (args_ptr, args_len_v) = if p.args.is_empty() {
+                                                    (
+                                                        lowerer.builder.ins().iconst(pointer_ty, 0),
+                                                        lowerer.builder.ins().iconst(types::I32, 0),
+                                                    )
+                                                } else {
+                                                    let arg_values: Vec<Value> = p
+                                                        .args
+                                                        .iter()
+                                                        .map(|a| lowerer.lower_expr(a))
+                                                        .collect();
+                                                    let slot_bytes = (user_arg_count * 8) as u32;
+                                                    let slot =
+                                                        lowerer.builder.create_sized_stack_slot(
+                                                            StackSlotData::new(
+                                                                StackSlotKind::ExplicitSlot,
+                                                                slot_bytes,
+                                                                3,
+                                                            ),
+                                                        );
+                                                    for (i, v) in arg_values.iter().enumerate() {
+                                                        let arg_ty =
+                                                            lowerer.builder.func.dfg.value_type(*v);
+                                                        let widened = if arg_ty == types::I64 {
+                                                            *v
+                                                        } else if arg_ty.is_int()
+                                                            && arg_ty.bits() < 64
+                                                        {
+                                                            lowerer
+                                                                .builder
+                                                                .ins()
+                                                                .uextend(types::I64, *v)
+                                                        } else {
+                                                            *v
+                                                        };
+                                                        lowerer.builder.ins().stack_store(
+                                                            widened,
+                                                            slot,
+                                                            (i * 8) as i32,
+                                                        );
+                                                    }
+                                                    (
+                                                        lowerer
+                                                            .builder
+                                                            .ins()
+                                                            .stack_addr(pointer_ty, slot, 0),
+                                                        lowerer.builder.ins().iconst(
+                                                            types::I32,
+                                                            user_arg_count as i64,
+                                                        ),
+                                                    )
+                                                };
+
+                                                // Load caller_k_pair from
+                                                // synth-cont's closure
+                                                // record's trailing slots
+                                                // (mirrors the CpsCall
+                                                // leaf's load above).
+                                                let caller_k_closure_off: i32 = 16
+                                                    + 8 * (captures.len() + prior_bindings.len())
+                                                        as i32;
+                                                let caller_k_fn_off: i32 = caller_k_closure_off + 8;
+                                                let caller_k_closure = lowerer.builder.ins().load(
+                                                    pointer_ty,
+                                                    MemFlags::trusted(),
+                                                    synth_closure_ptr,
+                                                    caller_k_closure_off,
+                                                );
+                                                let caller_k_fn = lowerer.builder.ins().load(
+                                                    pointer_ty,
+                                                    MemFlags::trusted(),
+                                                    synth_closure_ptr,
+                                                    caller_k_fn_off,
+                                                );
+
+                                                // sigil_perform forwards
+                                                // caller_k_pair as the
+                                                // perform's k. Returns
+                                                // *NextStep that we
+                                                // return from this synth
+                                                // fn directly.
+                                                let perform_call = lowerer.builder.ins().call(
+                                                    lowerer.perform_ref,
+                                                    &[
+                                                        effect_id_v,
+                                                        op_id_v,
+                                                        args_ptr,
+                                                        args_len_v,
+                                                        caller_k_closure,
+                                                        caller_k_fn,
+                                                    ],
+                                                );
+                                                lowerer.stackmap.push_placeholder(
+                                                    function_code_offset(
+                                                        &lowerer.builder,
+                                                        perform_call,
+                                                    ),
+                                                );
+                                                let ns_ptr =
+                                                    lowerer.builder.inst_results(perform_call)[0];
+                                                lowerer.builder.ins().return_(&[ns_ptr]);
+                                            }
                                         }
                                     }
                                 } else {
@@ -22457,9 +22615,17 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                 classify_branched_cps_tail_branch(then_block, ctors, is_supported_for_branch_leaf)?;
             let else_kind =
                 classify_branched_cps_tail_branch(else_block, ctors, is_supported_for_branch_leaf)?;
-            if matches!(then_kind, BranchedCpsLeaf::CpsCall)
-                || matches!(else_kind, BranchedCpsLeaf::CpsCall)
-            {
+            // Plan D Task 117 (b) Phase 4 R2 — Perform leaves count as
+            // "Cps-eligible" alongside CpsCall (both produce
+            // NextStep::Call into the trampoline; the synth-cont's
+            // body emit threads caller_k_pair as the perform's k).
+            if matches!(
+                then_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) || matches!(
+                else_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) {
                 has_cps_call = true;
             }
         }
@@ -22470,7 +22636,7 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                     ctors,
                     is_supported_for_branch_leaf,
                 )?;
-                if matches!(kind, BranchedCpsLeaf::CpsCall) {
+                if matches!(kind, BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform) {
                     has_cps_call = true;
                 }
             }
@@ -22505,6 +22671,12 @@ fn classify_branched_cps_tail_branch_expr(
             if is_supported(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
                 return Some(BranchedCpsLeaf::CpsCall);
             }
+        }
+    }
+    // Plan D Task 117 (b) Phase 4 R2 — bare Perform with pure args.
+    if let Expr::Perform(p) = e {
+        if p.args.iter().all(|a| expr_is_pure(a, ctors)) {
+            return Some(BranchedCpsLeaf::Perform);
         }
     }
     None
@@ -22552,9 +22724,15 @@ fn detect_pattern_c_dispatch<'a>(
                 classify_branched_cps_tail_branch(then_block.as_ref(), ctors, is_supported)?;
             let else_kind =
                 classify_branched_cps_tail_branch(else_block.as_ref(), ctors, is_supported)?;
-            if !matches!(then_kind, BranchedCpsLeaf::CpsCall)
-                && !matches!(else_kind, BranchedCpsLeaf::CpsCall)
-            {
+            // Plan D Task 117 (b) Phase 4 R2 — Perform leaves count
+            // alongside CpsCall (both produce NextStep::Call).
+            if !matches!(
+                then_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) && !matches!(
+                else_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) {
                 return None;
             }
             let then_leaf = then_block.tail.as_ref()?;
@@ -22590,9 +22768,15 @@ fn detect_pattern_c_dispatch<'a>(
                 classify_branched_cps_tail_branch_expr(&then_arm.body, ctors, is_supported)?;
             let else_kind =
                 classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_supported)?;
-            if !matches!(then_kind, BranchedCpsLeaf::CpsCall)
-                && !matches!(else_kind, BranchedCpsLeaf::CpsCall)
-            {
+            // Plan D Task 117 (b) Phase 4 R2 — Perform leaves count
+            // alongside CpsCall (both produce NextStep::Call).
+            if !matches!(
+                then_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) && !matches!(
+                else_kind,
+                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
+            ) {
                 return None;
             }
             // For arm bodies that are Expr::Block, extract the tail;
@@ -22651,6 +22835,12 @@ fn classify_branched_cps_tail_branch(
             }
         }
     }
+    // Plan D Task 117 (b) Phase 4 R2 — bare Perform with pure args.
+    if let Expr::Perform(p) = tail {
+        if p.args.iter().all(|a| expr_is_pure(a, ctors)) {
+            return Some(BranchedCpsLeaf::Perform);
+        }
+    }
     None
 }
 
@@ -22665,6 +22855,20 @@ enum BranchedCpsLeaf {
     /// `NextStep::Call(callee, args + caller_k_pair_forwarded)`. The
     /// recursion threads caller_k_pair through every level.
     CpsCall,
+    /// Plan D Task 117 (b) Phase 4 R2 — branch tail is a bare
+    /// `Expr::Perform` with pure args. Emit
+    /// `sigil_perform(effect_id, op_id, args, args_len, caller_k_*)`
+    /// — the perform's continuation is the synth-cont's own caller_k
+    /// pair (forwarded from the synth-cont's closure record's
+    /// trailing slots). Multi-shot dispatchers (`std/choose.sigil`'s
+    /// `all_choices` / `first_choice` over runtime-N
+    /// `Choose.choose(arg)`) need this leaf shape so a body like
+    /// `let x = perform Choose.choose(N); if cond { perform
+    /// Choose.fail() } else { x }` matches the
+    /// `is_let_yield_prefix_then_branched_cps_tail_body` classifier
+    /// (without requiring users to wrap the in-branch perform in a
+    /// fn call).
+    Perform,
 }
 
 /// Plan B Task 78.5 G4 (Phase A — shape detector only) — does this fn

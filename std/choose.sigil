@@ -43,23 +43,16 @@
 //    fns introduce a function-call frame that breaks the
 //    discharge-with-lambda pattern multi-shot handlers depend on.
 //
-// 3. **Body-fn `perform`-in-branch limitation (v1).** A body fn
-//    whose post-perform code includes `perform` inside an `if`
-//    or `match` branch (e.g.
+// 3. **In-branch `perform` is supported.** Body fns may write
 //    `let x = perform Choose.choose(n); if cond { perform
-//    Choose.fail() } else { x }`) doesn't match the v1 Cps body
-//    classifier. The body falls through to `UserFnAbi::Sync` and
-//    the perform's continuation captures `identity` rather than a
-//    real synth-cont — so multi-shot `k(i)` returns the resume
-//    value unchanged instead of re-running the if-branch logic.
-//    User-side workaround: wrap the in-branch perform in a fn
-//    call (`fn fail_int() -> Int ![Choose] { perform Choose.-
-//    fail() }` then `if cond { fail_int() } else { x }`). The
-//    wrapped `fail_int` is a Cps user fn and the branch
-//    becomes a `CpsCall` leaf which the `is_let_yield_prefix_-
-//    then_branched_cps_tail_body` classifier accepts. Closure
-//    point: classifier extension to accept bare `Perform` leaves
-//    is a follow-up multi-day codegen lift.
+//    Choose.fail() } else { x }` directly — the bare `perform
+//    Choose.fail()` in the if-branch is a `BranchedCpsLeaf::-
+//    Perform` shape (Plan D Task 117 (b) Phase 4 R2). The Cps
+//    body classifier `is_let_yield_prefix_then_branched_cps_-
+//    tail_body` accepts it, and the synth-cont's branch emit
+//    forwards `caller_k_pair` as the in-branch perform's
+//    continuation. Multi-shot dispatchers see the failing branch
+//    produce a real discharge (no fn-wrapper workaround required).
 //
 // 3. **Dischargers receive a fresh per-call Continuation value
 //    object.** `all_choices` / `first_choice` arm bodies pass the
