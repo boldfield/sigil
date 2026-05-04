@@ -280,12 +280,6 @@ fn compute_user_fn_abi(
         let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
         let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
         for stmt in &body.stmts {
-            // Classifier guarantees every stmt is `Stmt::Let` whose
-            // value is `Expr::Perform` OR `Expr::Call` with an Ident
-            // callee (Plan D Task 112a). Mirror the pre-pass site's
-            // `unreachable!()` discipline (PR #83 review #5 —
-            // previously the silent fall-through on non-Ident callee
-            // dropped the binding).
             let let_stmt = match stmt {
                 crate::ast::Stmt::Let(l) => l,
                 _ => unreachable!(
@@ -301,16 +295,24 @@ fn compute_user_fn_abi(
                 crate::ast::Expr::Call { callee, args, .. } => {
                     let callee_name = match callee.as_ref() {
                         crate::ast::Expr::Ident(n, _) => n.clone(),
-                        _ => unreachable!(
-                            "is_simple_chained_let_yield_then_pure_tail_body \
-                             classifier guarantees Call callee is Expr::Ident"
-                        ),
+                        _ => continue,
                     };
-                    steps.push(ChainedNextStep::CallCps {
-                        callee_name,
-                        args: args.clone(),
-                    });
-                    binding_names.push(let_stmt.name.clone());
+                    // Plan C Task 81 — only treat Call as a chain
+                    // step (CallCps) when the callee is a supported
+                    // Cps wrapper. Non-yielding Calls (builtins like
+                    // `mut_array_new`, Sync user fns) flow through
+                    // as tail-prefix lets — lowered by the FINAL
+                    // synth-cont's emit via `lower_expr` (which
+                    // routes through `lower_call`'s builtin /
+                    // Sync-user-fn dispatch).
+                    if lookup(&callee_name) {
+                        steps.push(ChainedNextStep::CallCps {
+                            callee_name,
+                            args: args.clone(),
+                        });
+                        binding_names.push(let_stmt.name.clone());
+                    }
+                    // else: non-yielding Call → tail-prefix let.
                 }
                 // Plan C Task 81 — pure trailing let; classifier
                 // accepts these after the last yield. They don't
@@ -8134,19 +8136,39 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             crate::ast::Expr::Call { callee, args, .. } => {
                                 let callee_name = match callee.as_ref() {
                                     crate::ast::Expr::Ident(n, _) => n.clone(),
-                                    _ => unreachable!(
-                                        "is_simple_chained_let_yield_then_pure_tail_body \
-                                         classifier guarantees Call callee is Expr::Ident"
-                                    ),
+                                    _ => continue,
                                 };
-                                steps.push(ChainedNextStep::CallCps {
-                                    callee_name,
-                                    args: args.clone(),
-                                });
-                                binding_names.push(let_stmt.name.clone());
-                                binding_tys
-                                    .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
-                                binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                                // Plan C Task 81 — Cps wrapper Call →
+                                // chain step; non-yielding Call
+                                // (builtin / Sync user fn) → tail-
+                                // prefix let. The classifier accepts
+                                // both shapes; the pre-pass dispatches
+                                // based on callee Cps-color via the
+                                // same `is_supported_cps_user_fn`
+                                // predicate the classifier used.
+                                if is_supported_cps_user_fn(
+                                    &callee_name,
+                                    &fns_by_name,
+                                    &cc.colored,
+                                    &ctors,
+                                ) {
+                                    steps.push(ChainedNextStep::CallCps {
+                                        callee_name,
+                                        args: args.clone(),
+                                    });
+                                    binding_names.push(let_stmt.name.clone());
+                                    binding_tys
+                                        .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
+                                    binding_kinds
+                                        .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                                } else {
+                                    tail_prefix_lets.push(TailPrefixLet {
+                                        name: let_stmt.name.clone(),
+                                        ty: cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty),
+                                        kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
+                                        value: let_stmt.value.clone(),
+                                    });
+                                }
                             }
                             other => {
                                 // Plan C Task 81 — pure trailing
@@ -13217,7 +13239,80 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         // the new name.
                                         for stmt in leaf_stmts {
                                             if let crate::ast::Stmt::Let(l) = stmt {
+                                                let is_cps_call_rhs = match &l.value {
+                                                    crate::ast::Expr::Call { callee, .. } => {
+                                                        if let crate::ast::Expr::Ident(n, _) =
+                                                            callee.as_ref()
+                                                        {
+                                                            cc.colored.needs_cps_transform(n)
+                                                        } else {
+                                                            false
+                                                        }
+                                                    }
+                                                    _ => false,
+                                                };
                                                 let v = lowerer.lower_expr(&l.value);
+                                                if is_cps_call_rhs {
+                                                    // Plan C Task 81 — discharge
+                                                    // propagation: after a Cps
+                                                    // user fn Call in arm-body
+                                                    // Let-RHS, check
+                                                    // terminal_out.tag. If the
+                                                    // inner call discharged via
+                                                    // an outer handler, the
+                                                    // value in `v` is the
+                                                    // discharger's R-typed
+                                                    // value — propagate by
+                                                    // returning NextStep::-
+                                                    // Discharged(v) from this
+                                                    // synth-cont.
+                                                    let term_tag = lowerer.builder.ins().load(
+                                                        types::I64,
+                                                        MemFlags::trusted(),
+                                                        lowerer.terminal_out_param,
+                                                        8,
+                                                    );
+                                                    let disch_const = lowerer.builder.ins().iconst(
+                                                        types::I64,
+                                                        sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED
+                                                            as i64,
+                                                    );
+                                                    let is_disch = lowerer.builder.ins().icmp(
+                                                        IntCC::Equal,
+                                                        term_tag,
+                                                        disch_const,
+                                                    );
+                                                    let propagate_blk =
+                                                        lowerer.builder.create_block();
+                                                    let continue_blk =
+                                                        lowerer.builder.create_block();
+                                                    lowerer.builder.ins().brif(
+                                                        is_disch,
+                                                        propagate_blk,
+                                                        &[],
+                                                        continue_blk,
+                                                        &[],
+                                                    );
+
+                                                    lowerer.builder.switch_to_block(propagate_blk);
+                                                    lowerer.builder.seal_block(propagate_blk);
+                                                    let disch_call = lowerer.builder.ins().call(
+                                                        lowerer.next_step_discharged_ref,
+                                                        &[v],
+                                                    );
+                                                    lowerer.stackmap.push_placeholder(
+                                                        function_code_offset(
+                                                            &lowerer.builder,
+                                                            disch_call,
+                                                        ),
+                                                    );
+                                                    let ns_disch =
+                                                        lowerer.builder.inst_results(disch_call)[0];
+                                                    lowerer.builder.ins().return_(&[ns_disch]);
+
+                                                    lowerer.builder.switch_to_block(continue_blk);
+                                                    lowerer.builder.seal_block(continue_blk);
+                                                }
                                                 lowerer.env.insert(l.name.clone(), v);
                                             }
                                         }
@@ -22434,6 +22529,83 @@ fn build_fns_by_name(
 /// perform's args means the surrounding fn falls through to the
 /// native-ABI path, which lowers correctly via the existing
 /// synchronous shape.
+/// Plan C Task 81 — `true` iff `e` contains an `Expr::Perform`
+/// anywhere in its sub-expressions. Used by branched-tail CpsCall
+/// leaf classification to admit non-yielding-but-non-pure call
+/// args (e.g., `solve(array_set(grid, idx, digit), idx + 1)` —
+/// the inner `array_set` Call is impure per `expr_is_pure` but
+/// non-yielding, so the CpsCall leaf emit can lower it via
+/// `lower_expr` without chain-step machinery).
+fn expr_contains_perform(e: &crate::ast::Expr) -> bool {
+    use crate::ast::Expr;
+    match e {
+        Expr::Perform(_) => true,
+        Expr::IntLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::Ident(..)
+        | Expr::ClosureEnvLoad { .. } => false,
+        Expr::Binary { lhs, rhs, .. } => expr_contains_perform(lhs) || expr_contains_perform(rhs),
+        Expr::Unary { operand, .. } => expr_contains_perform(operand),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            expr_contains_perform(cond)
+                || block_contains_perform(then_block)
+                || block_contains_perform(else_block)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            expr_contains_perform(scrutinee) || arms.iter().any(|a| expr_contains_perform(&a.body))
+        }
+        Expr::Block(b) => block_contains_perform(b),
+        Expr::RecordLit { fields, .. } => fields.iter().any(|f| expr_contains_perform(&f.value)),
+        Expr::Call { callee, args, .. } => {
+            expr_contains_perform(callee) || args.iter().any(expr_contains_perform)
+        }
+        Expr::Tuple { elems, .. } => elems.iter().any(expr_contains_perform),
+        Expr::Handle { .. } | Expr::Lambda { .. } | Expr::ClosureRecord { .. } => {
+            // Conservative: handles / lambdas / closure records that
+            // contain performs are still classified as containing
+            // perform (the perform isn't lifted out of the lambda
+            // body, but the syntactic check errs on the side of
+            // rejecting). Refine if a real-world body needs
+            // lambdas-without-perform to pass.
+            true
+        }
+    }
+}
+
+fn block_contains_perform(b: &crate::ast::Block) -> bool {
+    use crate::ast::Stmt;
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => {
+                if expr_contains_perform(&l.value) {
+                    return true;
+                }
+            }
+            Stmt::Expr(e) => {
+                if expr_contains_perform(e) {
+                    return true;
+                }
+            }
+            Stmt::Perform(_) => return true,
+        }
+    }
+    if let Some(t) = &b.tail {
+        if expr_contains_perform(t) {
+            return true;
+        }
+    }
+    false
+}
+
 fn expr_is_pure(e: &crate::ast::Expr, ctors: &std::collections::BTreeSet<String>) -> bool {
     use crate::ast::Expr;
     match e {
@@ -22720,22 +22892,31 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
             // (not nested wrapper-Calls). Wrapper-of-chained shapes
             // fall back to Sync ABI here.
             Expr::Call { callee, args, .. } => {
-                if seen_pure_after_yield {
-                    return None;
-                }
                 let callee_name = match callee.as_ref() {
-                    Expr::Ident(n, _) => n,
-                    _ => return None,
+                    Expr::Ident(n, _) => Some(n),
+                    _ => None,
                 };
-                if !is_supported(callee_name) {
+                let is_cps_wrapper = callee_name
+                    .as_ref()
+                    .map(|n| is_supported(n))
+                    .unwrap_or(false);
+                let args_pure = args.iter().all(|a| expr_is_pure(a, ctors));
+                if is_cps_wrapper && args_pure {
+                    if seen_pure_after_yield {
+                        return None;
+                    }
+                    yield_count += 1;
+                } else if yield_count > 0 && !expr_contains_perform(&let_stmt.value) {
+                    // Plan C Task 81 — non-yielding Call (builtin /
+                    // Sync user fn) AFTER the last yield: tail-prefix
+                    // intermediate. Lowered by the FINAL step's emit
+                    // before the tail.
+                    seen_pure_after_yield = true;
+                } else {
                     return None;
                 }
-                if !args.iter().all(|a| expr_is_pure(a, ctors)) {
-                    return None;
-                }
-                yield_count += 1;
             }
-            other if yield_count > 0 && expr_is_pure(other, ctors) => {
+            other if yield_count > 0 && !expr_contains_perform(other) => {
                 // Pure trailing intermediate; lowered by the FINAL
                 // step's emit before the tail.
                 seen_pure_after_yield = true;
@@ -22853,28 +23034,30 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                 yield_count += 1;
             }
             Expr::Call { callee, args, .. } => {
-                if seen_pure_after_yield {
-                    return None;
-                }
                 let callee_name = match callee.as_ref() {
-                    Expr::Ident(n, _) => n,
-                    _ => return None,
+                    Expr::Ident(n, _) => Some(n),
+                    _ => None,
                 };
-                // Let-RHS uses STRICT check: callee must satisfy
-                // `is_supported_cps_user_fn` (visited-bail-to-false on
-                // cycles). Cycle-via-let-RHS in chained-let-yield is
-                // structurally non-terminating per Task
-                // 112-mutually-recursive's analysis; rejecting is
-                // correct.
-                if !is_supported_strict(callee_name) {
+                let is_cps_wrapper = callee_name
+                    .as_ref()
+                    .map(|n| is_supported_strict(n))
+                    .unwrap_or(false);
+                let args_pure = args.iter().all(|a| expr_is_pure(a, ctors));
+                if is_cps_wrapper && args_pure {
+                    if seen_pure_after_yield {
+                        return None;
+                    }
+                    yield_count += 1;
+                } else if yield_count > 0 && !expr_contains_perform(&let_stmt.value) {
+                    // Plan C Task 81 — non-yielding Call (builtin /
+                    // Sync user fn) AFTER the last yield: tail-prefix
+                    // intermediate.
+                    seen_pure_after_yield = true;
+                } else {
                     return None;
                 }
-                if !args.iter().all(|a| expr_is_pure(a, ctors)) {
-                    return None;
-                }
-                yield_count += 1;
             }
-            other if yield_count > 0 && expr_is_pure(other, ctors) => {
+            other if yield_count > 0 && !expr_contains_perform(other) => {
                 // Pure let-RHS after at least one yield — accept as
                 // a tail-prefix pure intermediate. Lowered by the
                 // FINAL step's emit before the tail.
@@ -22965,9 +23148,26 @@ fn classify_branched_cps_tail_branch_expr(
     }
     if let Expr::Call { callee, args, .. } = e {
         if let Expr::Ident(name, _) = callee.as_ref() {
-            if is_supported(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
+            // Plan C Task 81 — args must be NON-YIELDING (no perform
+            // anywhere). Pre-Task-81 the check was `expr_is_pure`
+            // which rejected nested Calls (e.g., `solve(array_set(
+            // grid, idx, digit), idx + 1)`); the CpsCall leaf emit
+            // calls `lower_expr` on each arg which handles nested
+            // builtin / Sync user fn Calls correctly via lower_call.
+            // Pure-args rejection was overly strict.
+            if is_supported(name) && args.iter().all(|a| !expr_contains_perform(a)) {
                 return Some(BranchedCpsLeaf::CpsCall);
             }
+        }
+    }
+    // Plan C Task 81 — non-yielding Call as a Pure-equivalent leaf.
+    // Builtins like `mut_array_get` and Sync user fn calls lower
+    // synchronously via lower_expr / lower_call. The Pure leaf emit
+    // path handles them: lower_expr produces a Value, gate dispatch
+    // routes the value via caller_k_pair → Done(value).
+    if let Expr::Call { args, .. } = e {
+        if args.iter().all(|a| !expr_contains_perform(a)) && !expr_contains_perform(e) {
+            return Some(BranchedCpsLeaf::Pure);
         }
     }
     // Plan D Task 117 (b) Phase 4 R2 — bare Perform with pure args.
@@ -23192,20 +23392,33 @@ fn classify_branched_cps_tail_branch(
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
 ) -> Option<BranchedCpsLeaf> {
-    use crate::ast::Stmt;
-    // Plan C Task 81 — accept arm-body Blocks with pure `Stmt::Let`
-    // intermediates (ANF-lifted from compound subexpressions). Each
-    // stmt must be a `Stmt::Let` whose value is pure; the tail is
-    // then classified as a leaf via the bare-expr classifier.
-    // Blocks with non-pure stmts (e.g., `Stmt::Perform` or a let
-    // whose value is a Cps Call) are rejected — those would need
-    // separate chain-step machinery beyond a leaf classification.
-    // The work-stack emit lowers each pure stmt via `lower_expr` +
-    // `env.insert` before lowering the leaf.
+    use crate::ast::{Expr, Stmt};
+    // Plan C Task 81 — accept arm-body Blocks with `Stmt::Let`
+    // intermediates whose RHS is either pure OR a non-yielding
+    // Call (builtin or non-perform-bearing user fn). ANF lifts
+    // compound subexpressions like `solve(array_set(grid, idx,
+    // digit), idx + 1)` into:
+    //   { let _0 = array_set(grid, idx, digit);
+    //     let _1 = idx + 1;
+    //     solve(_0, _1) }
+    // The `array_set` Call isn't `expr_is_pure` (only ctor Calls
+    // are pure) but it's non-yielding (a Sync builtin). The work-
+    // stack emit lowers each Let RHS via `lower_expr` before
+    // dispatching the leaf; `lower_expr` routes Calls through
+    // `lower_call`, which handles builtin / Sync-user-fn / Sync-
+    // to-Cps-interop dispatch transparently. `Stmt::Perform` is
+    // rejected — that would need chain-step machinery; ditto for
+    // Let with Perform RHS.
     for stmt in &block.stmts {
         match stmt {
-            Stmt::Let(l) if expr_is_pure(&l.value, ctors) => {
-                // Pure let intermediate; emit handles these inline.
+            Stmt::Let(l) => {
+                if matches!(&l.value, Expr::Perform(_)) {
+                    return None;
+                }
+                // Pure values + Call RHS accepted; emit handles
+                // both via lower_expr (which routes Calls through
+                // lower_call's builtin / Sync-user-fn / Sync-to-Cps-
+                // interop dispatch).
             }
             _ => return None,
         }

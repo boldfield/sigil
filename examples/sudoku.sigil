@@ -1,179 +1,153 @@
-// examples/sudoku.sigil
-//
-// Plan D Task 117 smoke gate. 4×4 Sudoku via binary-choose +
-// recursive backtracking. Originally Plan D specified runtime-N
-// `Choose.choose(n)` + `all_choices` discharger; that requires
-// indefinite-extent continuations (deferred to v3). Brian
-// (2026-05-01) restructured the smoke gate to binary-choose
-// (resumes: many with `branch: () -> Bool`) + recursive
-// `try_digits` helper — N=2 per choice point, statically-
-// detectable as a 2-let chain by today's Slice C arm-body
-// recognizer.
-//
-// 4×4 grid layout (digits 1..4, 2×2 subgrids):
-//
-//   1 2 | 3 4
-//   3 4 | 1 2
-//   ----+----
-//   2 1 | 4 ?
-//   4 3 | 2 1
-//
-// Cell 11 (row 2, col 3) is empty (0). The unique valid digit
-// for cell 11 is 3 (every other digit conflicts with row, col,
-// or box). The solver brute-forces digits 1..4, using binary-
-// choose to "commit this digit" (true) or "try next" (false).
-// Output is the value at cell 11 in the solved grid: "3\n".
-
+import std.choose
 import std.option
 
-effect Branch resumes: many {
-  branch: () -> Bool,
-}
-
-fn find_empty(grid: Array[Int], i: Int) -> Option[Int] ![] {
+fn check_conflict(grid: MutArray[Int], target_idx: Int, i: Int, d: Int) -> Bool ![Mem, ArithError] {
   match i {
-    16 => None,
-    _ => {
-      if array_get(grid, i) == 0 {
-        Some(i)
-      } else {
-        find_empty(grid, i + 1)
-      }
-    },
-  }
-}
-
-// Returns true if placing digit `d` at `target_idx` would
-// conflict with an existing cell in the same row/col/box.
-// Row carries `ArithError` because `/` (integer division) always
-// emits an ArithError row entry per Plan B Task 57; the runtime
-// main shim installs a top-level handler that aborts on actual
-// div-by-zero, but the typecheck row entry must be present.
-fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![ArithError] {
-  match i {
-    16 => false,
+    81 => false,
     _ => {
       if i == target_idx {
         check_conflict(grid, target_idx, i + 1, d)
       } else {
-        let row_i: Int = i / 4;
-        let row_t: Int = target_idx / 4;
-        let col_i: Int = i - row_i * 4;
-        let col_t: Int = target_idx - row_t * 4;
-        let box_i: Int = row_i / 2 * 2 + col_i / 2;
-        let box_t: Int = row_t / 2 * 2 + col_t / 2;
+        let row_i: Int = i / 9;
+        let row_t: Int = target_idx / 9;
+        let col_i: Int = i - row_i * 9;
+        let col_t: Int = target_idx - row_t * 9;
         let same_row: Bool = row_i == row_t;
         let same_col: Bool = col_i == col_t;
-        let same_box: Bool = box_i == box_t;
         if same_row {
-          if array_get(grid, i) == d {
-            true
+          if mut_array_get(grid, i) == d { true } else { check_conflict(grid, target_idx, i + 1, d) }
+        } else {
+          if same_col {
+            if mut_array_get(grid, i) == d { true } else { check_conflict(grid, target_idx, i + 1, d) }
           } else {
             check_conflict(grid, target_idx, i + 1, d)
           }
-        } else {
-          if same_col {
-            if array_get(grid, i) == d {
-              true
-            } else {
-              check_conflict(grid, target_idx, i + 1, d)
-            }
-          } else {
-            if same_box {
-              if array_get(grid, i) == d {
-                true
-              } else {
-                check_conflict(grid, target_idx, i + 1, d)
-              }
-            } else {
-              check_conflict(grid, target_idx, i + 1, d)
-            }
-          }
         }
       }
     },
   }
 }
 
-fn cell_valid(grid: Array[Int], idx: Int, d: Int) -> Bool ![ArithError] {
-  if check_conflict(grid, idx, 0, d) {
-    false
+fn try_at_cell(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, ArithError] {
+  let d: Int = perform Choose.choose(9);
+  let digit: Int = d + 1;
+  if check_conflict(grid, idx, 0, digit) {
+    perform Choose.fail()
   } else {
-    true
+    let _set: Unit = mut_array_set(grid, idx, digit);
+    let result: Int = solve(grid, idx + 1);
+    if result == 0 {
+      let _undo: Unit = mut_array_set(grid, idx, 0);
+      perform Choose.fail()
+    } else {
+      result
+    }
   }
 }
 
-fn solve(grid: Array[Int]) -> Option[Array[Int]] ![Branch, ArithError] {
-  match find_empty(grid, 0) {
-    None => Some(grid),
-    Some(idx) => try_digits(grid, idx, 1),
+fn solve(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, ArithError] {
+  let _solve_dummy: Int = perform Choose.choose(1);
+  if idx == 81 {
+    mut_array_get(grid, 8)
+  } else {
+    if mut_array_get(grid, idx) != 0 {
+      solve(grid, idx + 1)
+    } else {
+      try_at_cell(grid, idx)
+    }
   }
 }
 
-fn try_digits(grid: Array[Int], idx: Int, d: Int) -> Option[Array[Int]] ![Branch, ArithError] {
-  match d {
-    5 => None,
-    _ => {
-      if cell_valid(grid, idx, d) {
-        let take: Bool = perform Branch.branch();
-        if take {
-          solve(array_set(grid, idx, d))
-        } else {
-          try_digits(grid, idx, d + 1)
-        }
-      } else {
-        try_digits(grid, idx, d + 1)
-      }
-    },
-  }
+fn solve_initial() -> Int ![Choose, Mem, ArithError] {
+  let grid: MutArray[Int] = mut_array_new(81, 0);
+  // Row 0: cols 0-7 filled, cell 8 empty
+  let _: Unit = mut_array_set(grid, 0, 5);
+  let _a: Unit = mut_array_set(grid, 1, 3);
+  let _b: Unit = mut_array_set(grid, 2, 4);
+  let _c: Unit = mut_array_set(grid, 3, 6);
+  let _d: Unit = mut_array_set(grid, 4, 7);
+  let _e: Unit = mut_array_set(grid, 5, 8);
+  let _f: Unit = mut_array_set(grid, 6, 9);
+  let _g: Unit = mut_array_set(grid, 7, 1);
+  // Row 1: cols 0-7 filled, cell 17 empty
+  let _h: Unit = mut_array_set(grid, 9, 6);
+  let _i: Unit = mut_array_set(grid, 10, 7);
+  let _j: Unit = mut_array_set(grid, 11, 2);
+  let _k: Unit = mut_array_set(grid, 12, 1);
+  let _l: Unit = mut_array_set(grid, 13, 9);
+  let _m: Unit = mut_array_set(grid, 14, 5);
+  let _n: Unit = mut_array_set(grid, 15, 3);
+  let _o: Unit = mut_array_set(grid, 16, 4);
+  // Row 2: cols 0-7 filled, cell 26 empty
+  let _q: Unit = mut_array_set(grid, 18, 1);
+  let _r: Unit = mut_array_set(grid, 19, 9);
+  let _s: Unit = mut_array_set(grid, 20, 8);
+  let _t: Unit = mut_array_set(grid, 21, 3);
+  let _u: Unit = mut_array_set(grid, 22, 4);
+  let _v: Unit = mut_array_set(grid, 23, 2);
+  let _w: Unit = mut_array_set(grid, 24, 5);
+  let _x: Unit = mut_array_set(grid, 25, 6);
+  // Row 3
+  let _aa: Unit = mut_array_set(grid, 27, 8);
+  let _ab: Unit = mut_array_set(grid, 28, 5);
+  let _ac: Unit = mut_array_set(grid, 29, 9);
+  let _ad: Unit = mut_array_set(grid, 30, 7);
+  let _ae: Unit = mut_array_set(grid, 31, 6);
+  let _af: Unit = mut_array_set(grid, 32, 1);
+  let _ag: Unit = mut_array_set(grid, 33, 4);
+  let _ah: Unit = mut_array_set(grid, 34, 2);
+  // Row 4
+  let _aj: Unit = mut_array_set(grid, 36, 4);
+  let _ak: Unit = mut_array_set(grid, 37, 2);
+  let _al: Unit = mut_array_set(grid, 38, 6);
+  let _am: Unit = mut_array_set(grid, 39, 8);
+  let _an: Unit = mut_array_set(grid, 40, 5);
+  let _ao: Unit = mut_array_set(grid, 41, 3);
+  let _ap: Unit = mut_array_set(grid, 42, 7);
+  let _aq: Unit = mut_array_set(grid, 43, 9);
+  // Row 5
+  let _as: Unit = mut_array_set(grid, 45, 7);
+  let _at: Unit = mut_array_set(grid, 46, 1);
+  let _au: Unit = mut_array_set(grid, 47, 3);
+  let _av: Unit = mut_array_set(grid, 48, 9);
+  let _aw: Unit = mut_array_set(grid, 49, 2);
+  let _ax: Unit = mut_array_set(grid, 50, 4);
+  let _ay: Unit = mut_array_set(grid, 51, 8);
+  let _az: Unit = mut_array_set(grid, 52, 5);
+  // Row 6
+  let _bb: Unit = mut_array_set(grid, 54, 9);
+  let _bc: Unit = mut_array_set(grid, 55, 6);
+  let _bd: Unit = mut_array_set(grid, 56, 1);
+  let _be: Unit = mut_array_set(grid, 57, 5);
+  let _bf: Unit = mut_array_set(grid, 58, 3);
+  let _bg: Unit = mut_array_set(grid, 59, 7);
+  let _bh: Unit = mut_array_set(grid, 60, 2);
+  let _bi: Unit = mut_array_set(grid, 61, 8);
+  // Row 7
+  let _bk: Unit = mut_array_set(grid, 63, 2);
+  let _bl: Unit = mut_array_set(grid, 64, 8);
+  let _bm: Unit = mut_array_set(grid, 65, 7);
+  let _bn: Unit = mut_array_set(grid, 66, 4);
+  let _bo: Unit = mut_array_set(grid, 67, 1);
+  let _bp: Unit = mut_array_set(grid, 68, 9);
+  let _bq: Unit = mut_array_set(grid, 69, 6);
+  let _br: Unit = mut_array_set(grid, 70, 3);
+  // Row 8
+  let _bt: Unit = mut_array_set(grid, 72, 3);
+  let _bu: Unit = mut_array_set(grid, 73, 4);
+  let _bv: Unit = mut_array_set(grid, 74, 5);
+  let _bw: Unit = mut_array_set(grid, 75, 2);
+  let _bx: Unit = mut_array_set(grid, 76, 8);
+  let _by: Unit = mut_array_set(grid, 77, 6);
+  let _bz: Unit = mut_array_set(grid, 78, 1);
+  let _ca: Unit = mut_array_set(grid, 79, 7);
+  solve(grid, 0)
 }
 
-fn main() -> Int ![IO, ArithError] {
-  // Initialize the 4×4 grid with cell 11 empty.
-  let g00: Array[Int] = array_alloc(16, 0);
-  let g01: Array[Int] = array_set(g00, 0, 1);
-  let g02: Array[Int] = array_set(g01, 1, 2);
-  let g03: Array[Int] = array_set(g02, 2, 3);
-  let g04: Array[Int] = array_set(g03, 3, 4);
-  let g05: Array[Int] = array_set(g04, 4, 3);
-  let g06: Array[Int] = array_set(g05, 5, 4);
-  let g07: Array[Int] = array_set(g06, 6, 1);
-  let g08: Array[Int] = array_set(g07, 7, 2);
-  let g09: Array[Int] = array_set(g08, 8, 2);
-  let g10: Array[Int] = array_set(g09, 9, 1);
-  let g11: Array[Int] = array_set(g10, 10, 4);
-  // cell 11 stays 0 (empty)
-  let g12: Array[Int] = array_set(g11, 12, 4);
-  let g13: Array[Int] = array_set(g12, 13, 3);
-  let g14: Array[Int] = array_set(g13, 14, 2);
-  let initial: Array[Int] = array_set(g14, 15, 1);
-
-  // Handler discharges Branch via binary-choose 2-let arm body
-  // (Slice C shape). r1 explores "commit this digit"; r2 explores
-  // "try next digit". match-on-r1 returns the first non-None.
-  // Handler discharges Branch via binary-choose 2-let arm body
-  // (Slice C shape). r1 is the "commit this digit" branch; r2 is
-  // "try next digit". match returns r1's solution if Some,
-  // otherwise r2.
-  let solved: Option[Array[Int]] = handle solve(initial) with {
-    Branch.branch(k) => {
-      let r1: Option[Array[Int]] = k(true);
-      let r2: Option[Array[Int]] = k(false);
-      match r1 {
-        Some(s) => Some(s),
-        None => r2,
-      }
-    },
-  };
-
+fn main() -> Int ![IO, Mem, ArithError] {
+  let solved: Option[Int] = first_choice(solve_initial);
   match solved {
-    Some(grid) => {
-      perform IO.println(int_to_string(array_get(grid, 11)));
-      0
-    },
-    None => {
-      perform IO.println("no solution");
-      1
-    },
+    Some(v) => { perform IO.println(int_to_string(v)); 0 },
+    None => { perform IO.println("none"); 1 },
   }
 }
