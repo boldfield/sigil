@@ -13142,13 +13142,70 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         &[],
                                     );
 
-                                    for (block_cl, block_tail, leaf_kind) in [
-                                        (then_block_cl, then_leaf, then_kind),
+                                    // Plan C Task 81 — work-stack
+                                    // dispatch over branched-cps tail.
+                                    // Supports nested If/Match leaves
+                                    // by re-entering this loop with
+                                    // each sub-branch pushed onto
+                                    // `work`. Termination: each
+                                    // iteration either emits a leaf
+                                    // (return_/jump terminates the
+                                    // block) or pushes 2 strictly-
+                                    // smaller sub-trees; finite tail
+                                    // expression bounds the iteration.
+                                    let mut work: Vec<(
+                                        cranelift::codegen::ir::Block,
+                                        &crate::ast::Expr,
+                                        BranchedCpsLeaf,
+                                    )> = vec![
                                         (else_block_cl, else_leaf, else_kind),
-                                    ] {
+                                        (then_block_cl, then_leaf, then_kind),
+                                    ];
+                                    while let Some((block_cl, block_tail, leaf_kind)) = work.pop() {
                                         lowerer.builder.switch_to_block(block_cl);
                                         lowerer.builder.seal_block(block_cl);
+                                        if matches!(leaf_kind, BranchedCpsLeaf::Nested) {
+                                            // Recurse: detect pattern-c
+                                            // on the nested tail, lower
+                                            // cond, brif, push 2 sub-
+                                            // branches onto `work`.
+                                            let nested = detect_pattern_c_dispatch(
+                                                block_tail,
+                                                &ctors,
+                                                &supported_lookup,
+                                            );
+                                            let (
+                                                n_cond,
+                                                n_then_leaf,
+                                                n_else_leaf,
+                                                n_then_kind,
+                                                n_else_kind,
+                                            ) = match nested {
+                                                Some(t) => t,
+                                                None => unreachable!(
+                                                    "Plan C Task 81: classifier accepted \
+                                                     Nested leaf but detect_pattern_c_dispatch \
+                                                     returned None at emit time"
+                                                ),
+                                            };
+                                            let n_cond_v = lowerer.lower_expr(n_cond);
+                                            let n_then_blk = lowerer.builder.create_block();
+                                            let n_else_blk = lowerer.builder.create_block();
+                                            lowerer.builder.ins().brif(
+                                                n_cond_v,
+                                                n_then_blk,
+                                                &[],
+                                                n_else_blk,
+                                                &[],
+                                            );
+                                            work.push((n_else_blk, n_else_leaf, n_else_kind));
+                                            work.push((n_then_blk, n_then_leaf, n_then_kind));
+                                            continue;
+                                        }
                                         match leaf_kind {
+                                            BranchedCpsLeaf::Nested => unreachable!(
+                                                "handled above by work-stack recursion"
+                                            ),
                                             BranchedCpsLeaf::Pure => {
                                                 let v = lowerer.lower_expr(block_tail);
                                                 let widened = if *tail_ty == types::I64 {
@@ -22793,13 +22850,7 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
             // "Cps-eligible" alongside CpsCall (both produce
             // NextStep::Call into the trampoline; the synth-cont's
             // body emit threads caller_k_pair as the perform's k).
-            if matches!(
-                then_kind,
-                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
-            ) || matches!(
-                else_kind,
-                BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform
-            ) {
+            if leaf_is_cps_eligible(then_kind) || leaf_is_cps_eligible(else_kind) {
                 has_cps_call = true;
             }
         }
@@ -22810,7 +22861,7 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                     ctors,
                     is_supported_for_branch_leaf,
                 )?;
-                if matches!(kind, BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform) {
+                if leaf_is_cps_eligible(kind) {
                     has_cps_call = true;
                 }
             }
@@ -22833,7 +22884,7 @@ fn classify_branched_cps_tail_branch_expr(
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
 ) -> Option<BranchedCpsLeaf> {
-    use crate::ast::Expr;
+    use crate::ast::{Expr, Pattern};
     if let Expr::Block(b) = e {
         return classify_branched_cps_tail_branch(b, ctors, is_supported);
     }
@@ -22853,7 +22904,77 @@ fn classify_branched_cps_tail_branch_expr(
             return Some(BranchedCpsLeaf::Perform);
         }
     }
+    // Plan C Task 81 — nested If with classifiable sub-branches. The
+    // emit dispatches Nested via a work-stack iteration over
+    // `detect_pattern_c_dispatch`. We require BOTH sub-branches to
+    // classify (any leaf shape) so the work-stack doesn't hit a
+    // dead end at emit time.
+    if let Expr::If {
+        then_block,
+        else_block,
+        ..
+    } = e
+    {
+        let then_kind =
+            classify_branched_cps_tail_branch(then_block.as_ref(), ctors, is_supported)?;
+        let else_kind =
+            classify_branched_cps_tail_branch(else_block.as_ref(), ctors, is_supported)?;
+        // At least one sub-branch must produce a Cps-call / Perform /
+        // Nested leaf (transitively containing a Cps/Perform).
+        // Otherwise the tail is wholly pure and `expr_is_pure` would
+        // have accepted it above as `Pure` (lower_expr handles the
+        // nested If as a value with internal phi). The work-stack
+        // emit handles all 4 leaf kinds at any depth.
+        if !leaf_is_cps_eligible(then_kind) && !leaf_is_cps_eligible(else_kind) {
+            return None;
+        }
+        return Some(BranchedCpsLeaf::Nested);
+    }
+    // Plan C Task 81 — nested Match (if-desugar shape: 2 BoolLit arms)
+    // with classifiable sub-branches.
+    if let Expr::Match { arms, .. } = e {
+        if arms.len() == 2 {
+            let extract_bool = |p: &Pattern| -> Option<bool> {
+                if let Pattern::BoolLit(b, _) = p {
+                    Some(*b)
+                } else {
+                    None
+                }
+            };
+            if let (Some(a0), Some(a1)) = (extract_bool(&arms[0].pattern), extract_bool(&arms[1].pattern))
+            {
+                if a0 != a1 {
+                    let arm0_kind = classify_branched_cps_tail_branch_expr(
+                        &arms[0].body,
+                        ctors,
+                        is_supported,
+                    )?;
+                    let arm1_kind = classify_branched_cps_tail_branch_expr(
+                        &arms[1].body,
+                        ctors,
+                        is_supported,
+                    )?;
+                    if leaf_is_cps_eligible(arm0_kind) || leaf_is_cps_eligible(arm1_kind) {
+                        return Some(BranchedCpsLeaf::Nested);
+                    }
+                }
+            }
+        }
+    }
     None
+}
+
+/// Plan C Task 81 — `true` iff the leaf kind is "Cps-eligible", i.e.,
+/// produces a `NextStep` (CpsCall / Perform) directly OR is a nested
+/// dispatch that transitively contains a Cps / Perform leaf
+/// (`Nested`). Used by classifiers to enforce "at least one branch
+/// of the tail must be Cps-eligible" — otherwise the body is wholly
+/// pure-tailed and the pure-tail classifier handles it.
+fn leaf_is_cps_eligible(k: BranchedCpsLeaf) -> bool {
+    matches!(
+        k,
+        BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform | BranchedCpsLeaf::Nested
+    )
 }
 
 /// Plan D Task 112d — Pattern C dispatch detection at codegen time.
@@ -22994,28 +23115,15 @@ fn classify_branched_cps_tail_branch(
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
 ) -> Option<BranchedCpsLeaf> {
-    use crate::ast::Expr;
     if !block.stmts.is_empty() {
         return None;
     }
     let tail = block.tail.as_ref()?;
-    if expr_is_pure(tail, ctors) {
-        return Some(BranchedCpsLeaf::Pure);
-    }
-    if let Expr::Call { callee, args, .. } = tail {
-        if let Expr::Ident(name, _) = callee.as_ref() {
-            if is_supported(name) && args.iter().all(|a| expr_is_pure(a, ctors)) {
-                return Some(BranchedCpsLeaf::CpsCall);
-            }
-        }
-    }
-    // Plan D Task 117 (b) Phase 4 R2 — bare Perform with pure args.
-    if let Expr::Perform(p) = tail {
-        if p.args.iter().all(|a| expr_is_pure(a, ctors)) {
-            return Some(BranchedCpsLeaf::Perform);
-        }
-    }
-    None
+    // Delegate to the bare-expression classifier (handles Pure /
+    // CpsCall / Perform / Nested). The Block classifier was a
+    // narrower subset before Plan C Task 81; the nested-If / nested-
+    // Match recognition is shared via the bare-expr path.
+    classify_branched_cps_tail_branch_expr(tail, ctors, is_supported)
 }
 
 /// Plan D Task 112d — branch-leaf classification result.
@@ -23043,6 +23151,22 @@ enum BranchedCpsLeaf {
     /// (without requiring users to wrap the in-branch perform in a
     /// fn call).
     Perform,
+    /// Plan C Task 81 — branch tail is itself a nested `Expr::If` (or
+    /// the if-desugar `Expr::Match`-on-Bool shape) where each
+    /// sub-branch recursively classifies as a valid leaf
+    /// (Pure / CpsCall / Perform / Nested). Sudoku-shape bodies like
+    /// `if a == 1 { if b == 1 { ... } else { perform fail } } else {
+    /// perform fail }` need this leaf shape so the outer If's then-
+    /// branch (a nested If) is accepted by the classifier without
+    /// requiring source-level flattening (which would force users
+    /// to express `&&` via byte-AND on truth-encoded comparisons or
+    /// hand-roll match shapes that defeat the natural sudoku
+    /// expression). At emit time the FINAL synth-cont's branched-tail
+    /// dispatch detects `Nested` via a work-stack iteration over
+    /// `detect_pattern_c_dispatch`, lowering nested cond + brif and
+    /// re-dispatching each sub-branch's leaf shape until it reaches
+    /// a Pure / CpsCall / Perform leaf at the bottom.
+    Nested,
 }
 
 /// Plan B Task 78.5 G4 (Phase A — shape detector only) — does this fn

@@ -8843,6 +8843,54 @@ fn std_choose_first_choice_two_sequential_performs_anf_intermediates() {
     );
 }
 
+/// Plan C Task 81 — `first_choice` over a body with **two
+/// sequential perform sites + NESTED-If branched tail with
+/// conditional `Choose.fail()`**. Body shape:
+///   `if a == 1 { if b == 1 { 99 } else { perform fail } } else { perform fail }`
+/// Closes the nested-If branched-tail classifier+emit gap. The chain
+/// classifier accepts via `BranchedCpsLeaf::Nested`; the FINAL synth-
+/// cont's branched-tail emit handles Nested via a work-stack
+/// dispatch over `detect_pattern_c_dispatch` (recursive cond + brif
+/// + sub-branch enqueue).
+#[test]
+fn std_choose_first_choice_two_sequential_performs_nested_if_tail() {
+    let src = "import std.choose\n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(2);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 if a == 1 {\n    \
+                   if b == 1 {\n      \
+                     99\n    \
+                   } else {\n      \
+                     perform Choose.fail()\n    \
+                   }\n  \
+                 } else {\n    \
+                   perform Choose.fail()\n  \
+                 }\n\
+               }\n\
+               fn unwrap_or_int(o: Option[Int], dflt: Int) -> Int ![] {\n  \
+                 match o {\n    \
+                   Some(x) => x,\n    \
+                   None => dflt,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Option[Int] = first_choice(body);\n  \
+                 let v: Int = unwrap_or_int(r, 0 - 1);\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_choose_two_seq_nested_if");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "99\n",
+        "Two sequential performs with nested-If branched tail must compose. \
+         Expected: explores (a=0/b=0/1 fail), (a=1/b=0 fail), (a=1/b=1 → 99). \
+         stderr={stderr:?}"
+    );
+}
+
+
 // ===== Plan C Task 69 — boxed Int64 run-and-check-output =====
 
 /// Construct two Int64s, add them, stringify and print. Pins the
