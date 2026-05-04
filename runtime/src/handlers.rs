@@ -488,39 +488,14 @@ pub(crate) fn register_body_return_arm_stack_root_for_calling_thread() -> (*mut 
 
 // Nested-effect-forwarding fix: when sigil_perform crosses intervening
 // handlers, record the crossed frame pointers so lower_k_pair_call can
-// re-push them when resuming the continuation.
-const CROSSED_FRAMES_STACK_SIZE: usize = 32;
-
+// re-push them when resuming the continuation. Uses a dynamic Vec to
+// support arbitrarily deep nesting (e.g., backtracking search over 81
+// cells in the sudoku solver). The frame pointers stored here are
+// already GC-rooted through the handler stack — this is only a record
+// of which frames to re-push.
 thread_local! {
-    static CROSSED_FRAMES_STACK: Cell<[*mut HandlerFrame; CROSSED_FRAMES_STACK_SIZE]> = const {
-        Cell::new([ptr::null_mut(); CROSSED_FRAMES_STACK_SIZE])
-    };
-    static CROSSED_FRAMES_DEPTH: Cell<usize> = const { Cell::new(0) };
-    static CROSSED_FRAMES_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
-}
-
-pub(crate) fn register_crossed_frames_stack_root_for_calling_thread() -> (*mut c_void, *mut c_void)
-{
-    CROSSED_FRAMES_STACK.with(|cell| {
-        let start =
-            cell as *const Cell<[*mut HandlerFrame; CROSSED_FRAMES_STACK_SIZE]> as *mut c_void;
-        let end = unsafe {
-            (start as *mut u8).add(core::mem::size_of::<
-                [*mut HandlerFrame; CROSSED_FRAMES_STACK_SIZE],
-            >()) as *mut c_void
-        };
-        let already_registered = CROSSED_FRAMES_STACK_ROOTED.with(|rooted| {
-            let r = rooted.get();
-            rooted.set(true);
-            r
-        });
-        if !already_registered {
-            unsafe {
-                crate::gc::GC_add_roots(start, end);
-            }
-        }
-        (start, end)
-    })
+    static CROSSED_FRAMES_STACK: RefCell<Vec<*mut HandlerFrame>> =
+        RefCell::new(Vec::new());
 }
 
 /// Push crossed frame pointers recorded by `sigil_perform` for a given
@@ -533,28 +508,39 @@ pub(crate) fn register_crossed_frames_stack_root_for_calling_thread() -> (*mut c
 /// push order. Returns the count N so the caller can pop them after run_loop.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_repush_crossed_frames(_target_frame: *mut HandlerFrame) -> u32 {
-    let depth = CROSSED_FRAMES_DEPTH.with(|c| c.get());
-    if depth == 0 {
-        return 0;
-    }
-    let stack = CROSSED_FRAMES_STACK.with(|cell| cell.get());
-    let mut count = 0u32;
-    let mut i = depth;
-    while i > 0 {
-        i -= 1;
-        if stack[i].is_null() {
-            break;
+    CROSSED_FRAMES_STACK.with(|cell| {
+        let stack = cell.borrow();
+        if stack.is_empty() {
+            return 0;
         }
-        count += 1;
-    }
-    let base = depth - count as usize;
-    for j in base..depth {
-        let frame = stack[j];
-        if !frame.is_null() {
-            sigil_handle_push(frame);
+        let mut count = 0u32;
+        let mut i = stack.len();
+        let mut found_sentinel = false;
+        while i > 0 {
+            i -= 1;
+            if stack[i].is_null() {
+                found_sentinel = true;
+                break;
+            }
+            count += 1;
         }
-    }
-    count
+        if !found_sentinel {
+            eprintln!(
+                "sigil_repush_crossed_frames: no null sentinel found in \
+                 crossed-frames TLS stack (len={}) — stack corruption",
+                stack.len()
+            );
+            std::process::abort();
+        }
+        let base = stack.len() - count as usize;
+        for j in base..stack.len() {
+            let frame = stack[j];
+            if !frame.is_null() {
+                sigil_handle_push(frame);
+            }
+        }
+        count
+    })
 }
 
 /// Pop N crossed frames that were re-pushed by `sigil_repush_crossed_frames`.
@@ -570,22 +556,30 @@ pub unsafe extern "C" fn sigil_pop_crossed_frames(count: u32, terminal_out: *mut
         sigil_handle_pop();
     }
 
-    let depth = CROSSED_FRAMES_DEPTH.with(|c| c.get());
-    let stack = CROSSED_FRAMES_STACK.with(|cell| cell.get());
-
-    let mut n = 0usize;
-    let mut i = depth;
-    while i > 0 {
-        i -= 1;
-        if stack[i].is_null() {
-            break;
-        }
-        n += 1;
+    if count == 0 {
+        return;
     }
-    let base = depth - n;
 
-    for j in (base..depth).rev() {
-        let frame = stack[j];
+    // Snapshot the entries we need before mutating the stack, since
+    // driving run_loop for return arms below may trigger nested
+    // performs that push/pop the same TLS stack.
+    let entries: Vec<*mut HandlerFrame> = CROSSED_FRAMES_STACK.with(|cell| {
+        let stack = cell.borrow();
+        let mut n = 0usize;
+        let mut i = stack.len();
+        while i > 0 {
+            i -= 1;
+            if stack[i].is_null() {
+                break;
+            }
+            n += 1;
+        }
+        let base = stack.len() - n;
+        stack[base..stack.len()].to_vec()
+    });
+
+    // Apply return arms innermost first.
+    for &frame in entries.iter().rev() {
         if frame.is_null() {
             continue;
         }
@@ -608,10 +602,21 @@ pub unsafe extern "C" fn sigil_pop_crossed_frames(count: u32, terminal_out: *mut
         sigil_run_loop(ns, terminal_out);
     }
 
-    let remove = count as usize + 1;
-    if depth >= remove {
-        CROSSED_FRAMES_DEPTH.with(|c| c.set(depth - remove));
-    }
+    // Remove sentinel + entries from TLS stack.
+    CROSSED_FRAMES_STACK.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        let remove = count as usize + 1; // +1 for null sentinel
+        if stack.len() < remove {
+            eprintln!(
+                "sigil_pop_crossed_frames: stack len ({}) < remove ({remove}); \
+                 crossed-frames TLS stack is corrupted — sentinel/entry mismatch",
+                stack.len()
+            );
+            std::process::abort();
+        }
+        let new_len = stack.len() - remove;
+        stack.truncate(new_len);
+    });
 }
 
 /// Inverse of [`register_body_return_arm_stack_root_for_calling_thread`].
@@ -980,7 +985,6 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
 /// chain — keeps it reachable).
 #[no_mangle]
 pub unsafe extern "C" fn sigil_handle_pop() -> *mut HandlerFrame {
-    let _head = HANDLER_STACK.with(|cell| cell.get());
     // Plan D Task 117 — read the matching push's relink-decision
     // off RELINK_STACK. If the push was a no-op (frame was already
     // on top), the matching pop must also no-op. There are no
@@ -1834,25 +1838,13 @@ pub unsafe extern "C" fn sigil_perform(
                 // k-pair dispatch can re-push them. Push a null sentinel
                 // first, then the crossed frames outermost-first.
                 CROSSED_FRAMES_STACK.with(|cell| {
-                    let mut stack = cell.get();
-                    let mut d = CROSSED_FRAMES_DEPTH.with(|c| c.get());
-                    // Sentinel
-                    if d < CROSSED_FRAMES_STACK_SIZE {
-                        stack[d] = ptr::null_mut();
-                        d += 1;
-                    }
-                    // Collect crossed frames: walk from top_frame to
-                    // (but not including) the matching frame.
+                    let mut stack = cell.borrow_mut();
+                    stack.push(ptr::null_mut());
                     let mut cf = top_frame;
                     while cf != frame && !cf.is_null() {
-                        if d < CROSSED_FRAMES_STACK_SIZE {
-                            stack[d] = cf;
-                            d += 1;
-                        }
+                        stack.push(cf);
                         cf = (*cf).prev;
                     }
-                    CROSSED_FRAMES_DEPTH.with(|c| c.set(d));
-                    cell.set(stack);
                 });
             }
             if op_id >= (*frame).arm_count {
@@ -2299,6 +2291,7 @@ mod tests {
             crate::arena::sigil_arena_reset();
         }
         HANDLER_STACK.with(|cell| cell.set(ptr::null_mut()));
+        CROSSED_FRAMES_STACK.with(|cell| cell.borrow_mut().clear());
     }
 
     fn ensure_gc() {
