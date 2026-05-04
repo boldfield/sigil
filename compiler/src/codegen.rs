@@ -13192,7 +13192,92 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // natural width — debug_assert below
                                 // catches a future contract regression).
                                 for tpl in tail_prefix_lets {
+                                    // Plan C Task 81 option A —
+                                    // discharge propagation. Reset
+                                    // `terminal_out` to (0, DONE)
+                                    // before lower_expr so any
+                                    // DISCHARGED tag observed
+                                    // afterward is from THIS let's
+                                    // RHS, not stale state. After
+                                    // lower_expr returns, check the
+                                    // tag — if DISCHARGED, return
+                                    // `NextStep::Discharged` so the
+                                    // outer trampoline doesn't
+                                    // overwrite the tag. Tail-prefix-
+                                    // lets accept Sync user fn / non-
+                                    // Ident-callee Calls; if such a
+                                    // Call internally drives a Cps
+                                    // sub-call that discharges, the
+                                    // tag propagates here.
+                                    let zero_v =
+                                        lowerer.builder.ins().iconst(types::I64, 0);
+                                    let done_v = lowerer.builder.ins().iconst(
+                                        types::I64,
+                                        sigil_abi::effect::NEXT_STEP_TAG_DONE as i64,
+                                    );
+                                    lowerer.builder.ins().store(
+                                        MemFlags::trusted(),
+                                        zero_v,
+                                        lowerer.terminal_out_param,
+                                        TERMINAL_RESULT_VALUE_OFF,
+                                    );
+                                    lowerer.builder.ins().store(
+                                        MemFlags::trusted(),
+                                        done_v,
+                                        lowerer.terminal_out_param,
+                                        TERMINAL_RESULT_TAG_OFF,
+                                    );
+
                                     let raw_v = lowerer.lower_expr(&tpl.value);
+
+                                    let term_tag = lowerer.builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        lowerer.terminal_out_param,
+                                        TERMINAL_RESULT_TAG_OFF,
+                                    );
+                                    let disch_const = lowerer.builder.ins().iconst(
+                                        types::I64,
+                                        sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
+                                    );
+                                    let is_disch = lowerer.builder.ins().icmp(
+                                        IntCC::Equal,
+                                        term_tag,
+                                        disch_const,
+                                    );
+                                    let propagate_blk = lowerer.builder.create_block();
+                                    let continue_blk = lowerer.builder.create_block();
+                                    lowerer.builder.ins().brif(
+                                        is_disch,
+                                        propagate_blk,
+                                        &[],
+                                        continue_blk,
+                                        &[],
+                                    );
+
+                                    lowerer.builder.switch_to_block(propagate_blk);
+                                    lowerer.builder.seal_block(propagate_blk);
+                                    let v_disch = lowerer.builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        lowerer.terminal_out_param,
+                                        TERMINAL_RESULT_VALUE_OFF,
+                                    );
+                                    let disch_call = lowerer.builder.ins().call(
+                                        lowerer.next_step_discharged_ref,
+                                        &[v_disch],
+                                    );
+                                    lowerer.stackmap.push_placeholder(function_code_offset(
+                                        &lowerer.builder,
+                                        disch_call,
+                                    ));
+                                    let ns_disch =
+                                        lowerer.builder.inst_results(disch_call)[0];
+                                    lowerer.builder.ins().return_(&[ns_disch]);
+
+                                    lowerer.builder.switch_to_block(continue_blk);
+                                    lowerer.builder.seal_block(continue_blk);
+
                                     let env_value = match tpl.kind {
                                         EnvSlotKind::Int => {
                                             let arg_ty = lowerer.builder.func.dfg.value_type(raw_v);
@@ -13515,7 +13600,91 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 "handled above by work-stack recursion"
                                             ),
                                             BranchedCpsLeaf::Pure => {
+                                                // Plan C Task 81 option A —
+                                                // discharge propagation
+                                                // (mirrors the standard-tail
+                                                // path below). Reset
+                                                // `terminal_out` before
+                                                // lower_expr, check tag
+                                                // after; if DISCHARGED,
+                                                // return NextStep::-
+                                                // Discharged so the OUTER
+                                                // trampoline doesn't
+                                                // overwrite the tag with
+                                                // its DONE-after-gate-
+                                                // dispatch terminal.
+                                                let zero_v =
+                                                    lowerer.builder.ins().iconst(types::I64, 0);
+                                                let done_v = lowerer.builder.ins().iconst(
+                                                    types::I64,
+                                                    sigil_abi::effect::NEXT_STEP_TAG_DONE as i64,
+                                                );
+                                                lowerer.builder.ins().store(
+                                                    MemFlags::trusted(),
+                                                    zero_v,
+                                                    lowerer.terminal_out_param,
+                                                    TERMINAL_RESULT_VALUE_OFF,
+                                                );
+                                                lowerer.builder.ins().store(
+                                                    MemFlags::trusted(),
+                                                    done_v,
+                                                    lowerer.terminal_out_param,
+                                                    TERMINAL_RESULT_TAG_OFF,
+                                                );
+
                                                 let v = lowerer.lower_expr(block_tail);
+
+                                                let term_tag = lowerer.builder.ins().load(
+                                                    types::I64,
+                                                    MemFlags::trusted(),
+                                                    lowerer.terminal_out_param,
+                                                    TERMINAL_RESULT_TAG_OFF,
+                                                );
+                                                let disch_const = lowerer.builder.ins().iconst(
+                                                    types::I64,
+                                                    sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED
+                                                        as i64,
+                                                );
+                                                let is_disch = lowerer.builder.ins().icmp(
+                                                    IntCC::Equal,
+                                                    term_tag,
+                                                    disch_const,
+                                                );
+                                                let propagate_blk =
+                                                    lowerer.builder.create_block();
+                                                let continue_blk = lowerer.builder.create_block();
+                                                lowerer.builder.ins().brif(
+                                                    is_disch,
+                                                    propagate_blk,
+                                                    &[],
+                                                    continue_blk,
+                                                    &[],
+                                                );
+
+                                                lowerer.builder.switch_to_block(propagate_blk);
+                                                lowerer.builder.seal_block(propagate_blk);
+                                                let v_disch = lowerer.builder.ins().load(
+                                                    types::I64,
+                                                    MemFlags::trusted(),
+                                                    lowerer.terminal_out_param,
+                                                    TERMINAL_RESULT_VALUE_OFF,
+                                                );
+                                                let disch_call = lowerer.builder.ins().call(
+                                                    lowerer.next_step_discharged_ref,
+                                                    &[v_disch],
+                                                );
+                                                lowerer.stackmap.push_placeholder(
+                                                    function_code_offset(
+                                                        &lowerer.builder,
+                                                        disch_call,
+                                                    ),
+                                                );
+                                                let ns_disch =
+                                                    lowerer.builder.inst_results(disch_call)[0];
+                                                lowerer.builder.ins().return_(&[ns_disch]);
+
+                                                lowerer.builder.switch_to_block(continue_blk);
+                                                lowerer.builder.seal_block(continue_blk);
                                                 let widened = if *tail_ty == types::I64 {
                                                     v
                                                 } else if tail_ty.is_int() && tail_ty.bits() < 64 {
@@ -13862,7 +14031,100 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     // Non-Pattern-C path: standard
                                     // tail lowering. Jumps to
                                     // gate_entry_block with widened_tail.
+                                    //
+                                    // Plan C Task 81 option A —
+                                    // discharge propagation. Reset
+                                    // `terminal_out` to (0, DONE)
+                                    // BEFORE lower_expr so any
+                                    // DISCHARGED tag observed
+                                    // afterwards is from the tail's
+                                    // own evaluation, not stale state
+                                    // from a prior synth-cont
+                                    // iteration. After lower_expr
+                                    // returns, check the tag — if
+                                    // DISCHARGED, return
+                                    // `NextStep::Discharged(value)`
+                                    // directly so the OUTER trampoline
+                                    // sees DISCHARGED instead of the
+                                    // gate's `NextStep::Call(post_arm
+                                    // _k, [garbage])` shape (which
+                                    // would terminate the outer
+                                    // run_loop with DONE and overwrite
+                                    // `terminal_out.tag`, masking the
+                                    // discharge from the surrounding
+                                    // handle's tag check).
+                                    let zero_v =
+                                        lowerer.builder.ins().iconst(types::I64, 0);
+                                    let done_v = lowerer.builder.ins().iconst(
+                                        types::I64,
+                                        sigil_abi::effect::NEXT_STEP_TAG_DONE as i64,
+                                    );
+                                    lowerer.builder.ins().store(
+                                        MemFlags::trusted(),
+                                        zero_v,
+                                        lowerer.terminal_out_param,
+                                        TERMINAL_RESULT_VALUE_OFF,
+                                    );
+                                    lowerer.builder.ins().store(
+                                        MemFlags::trusted(),
+                                        done_v,
+                                        lowerer.terminal_out_param,
+                                        TERMINAL_RESULT_TAG_OFF,
+                                    );
+
                                     let tail_value = lowerer.lower_expr(tail_expr.as_ref());
+
+                                    // Tag check.
+                                    let term_tag = lowerer.builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        lowerer.terminal_out_param,
+                                        TERMINAL_RESULT_TAG_OFF,
+                                    );
+                                    let disch_const = lowerer.builder.ins().iconst(
+                                        types::I64,
+                                        sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
+                                    );
+                                    let is_disch = lowerer.builder.ins().icmp(
+                                        IntCC::Equal,
+                                        term_tag,
+                                        disch_const,
+                                    );
+                                    let propagate_blk = lowerer.builder.create_block();
+                                    let continue_blk = lowerer.builder.create_block();
+                                    lowerer.builder.ins().brif(
+                                        is_disch,
+                                        propagate_blk,
+                                        &[],
+                                        continue_blk,
+                                        &[],
+                                    );
+
+                                    // DISCHARGE: return NextStep::-
+                                    // Discharged(terminal_out.value).
+                                    lowerer.builder.switch_to_block(propagate_blk);
+                                    lowerer.builder.seal_block(propagate_blk);
+                                    let v_disch = lowerer.builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        lowerer.terminal_out_param,
+                                        TERMINAL_RESULT_VALUE_OFF,
+                                    );
+                                    let disch_call = lowerer.builder.ins().call(
+                                        lowerer.next_step_discharged_ref,
+                                        &[v_disch],
+                                    );
+                                    lowerer.stackmap.push_placeholder(function_code_offset(
+                                        &lowerer.builder,
+                                        disch_call,
+                                    ));
+                                    let ns_disch =
+                                        lowerer.builder.inst_results(disch_call)[0];
+                                    lowerer.builder.ins().return_(&[ns_disch]);
+
+                                    // CONTINUE: widen and jump to gate.
+                                    lowerer.builder.switch_to_block(continue_blk);
+                                    lowerer.builder.seal_block(continue_blk);
                                     let widened = if *tail_ty == types::I64 {
                                         tail_value
                                     } else if tail_ty.is_int() && tail_ty.bits() < 64 {
@@ -23273,37 +23535,15 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
             }
         }
         Expr::Match { arms, .. } => {
-            // Plan C Task 81 — match-tail acceptance must mirror the
-            // emit-side restriction in `detect_pattern_c_dispatch`:
-            // exactly 2 arms whose patterns are `BoolLit(true)` and
-            // `BoolLit(false)` (the if-desugar shape). Match-on-Int
-            // / Match-on-sum-type bodies fall through to the standard
-            // tail emit, which lowers the entire match via
-            // `lower_expr` → `lower_match` → per-arm `lower_call` for
-            // CpsCall arms. That synchronous Sync→Cps shim drops the
-            // DISCHARGED tag in `terminal_out` because the OUTER
-            // run_loop (driving the synth-cont itself) terminates with
-            // DONE wrapping the discharged value, overwriting the
-            // INNER run_loop's DISCHARGED write. Classifier and
-            // emitter must agree on the shape.
-            if arms.len() != 2 {
-                return None;
-            }
-            let extract_bool = |p: &crate::ast::Pattern| -> Option<bool> {
-                if let crate::ast::Pattern::BoolLit(b, _) = p {
-                    Some(*b)
-                } else {
-                    None
-                }
-            };
-            let (a0, a1) = (
-                extract_bool(&arms[0].pattern),
-                extract_bool(&arms[1].pattern),
-            );
-            match (a0, a1) {
-                (Some(b0), Some(b1)) if b0 != b1 => {}
-                _ => return None,
-            }
+            // Plan C Task 81 option A — the BoolLit-only gate
+            // previously here blocked Match-on-Int / Match-on-sum-type
+            // tails from reaching the standard-tail emit (which would
+            // discharge-propagate incorrectly through the gate's
+            // `NextStep::Call(post_arm_k, [value])` shape). Option A
+            // closes the underlying discharge seam at the standard-
+            // tail and Pattern C Pure-leaf emit sites; once those
+            // propagate `terminal_out.tag` correctly, arbitrary
+            // match-arm shapes are safe to admit here.
             for arm in arms {
                 let kind = classify_branched_cps_tail_branch_expr(
                     &arm.body,

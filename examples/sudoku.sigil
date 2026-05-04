@@ -1,25 +1,35 @@
 // examples/sudoku.sigil
 //
 // Plan C Task 81 — 9×9 Sudoku via std.choose's `first_choice`
-// discharger + recursive backtracking with immutable `Array[Int]`.
-// Each candidate try threads its own grid via parameter passing;
-// multi-shot `first_choice` retries get clean state by construction
-// (no mutation, no manual snapshot/restore). On the success path
-// the solver `perform IO.println`s the solved grid cell-by-cell
-// (81 lines of one digit each) before returning.
+// discharger + recursive backtracking with `MutArray[Int]` under
+// the `Mem` effect (per Plan C body specification).
 //
-// **Why Array (immutable) instead of MutArray.** The Plan C body
-// specifies `MutArray[Int]` under `Mem`. With multi-shot Choose,
-// MutArray + manual snapshot/restore (cell ← 0 before perform fail
-// in user code) requires the user to observe inner discharge values
-// in `let result = solve(...)` Let-RHS position — a pattern that
-// doesn't compose cleanly: Sync→Cps interop returns the discharger's
-// R-typed value (Some/None Option pointer) treated as Int, the
-// `if result == 0 { undo+fail }` check never fires correctly, and
-// deeper recursion's mutations leak into outer cells on backtrack.
-// Immutable Array sidesteps the footgun: each `array_set` returns
-// a fresh array, multi-shot retries get the parent's grid
-// unchanged, no manual snapshot needed.
+// **Backtracking pattern: per-level first_choice with cell undo.**
+// Multi-shot Choose composed with in-place MutArray needs cell
+// undo on backtrack, but a partial handle that intercepts only
+// `Choose.fail` and forwards `Choose.choose` to the outer handler
+// infinite-recurses (the forwarder's `perform Choose.choose` fires
+// the topmost = same partial handle). We instead make each
+// recursive `solve` call its own first_choice — handle the inner
+// solve with the SAME three arms `first_choice` defines plus a
+// `Choose.fail` interception point that runs the cell undo before
+// returning None. Each empty cell at depth N gets its own multi-
+// shot iteration; failure propagates to depth N-1 as a `None`
+// observation, which depth N-1's `solve_with_undo` converts to
+// `mut_array_set(grid, idx, 0); perform Choose.fail()` — driving
+// depth N-1's iteration to its next digit.
+//
+// **Discharge propagation gates.** Plan C Task 81 option A wired
+// `terminal_out.tag` checks at the synth-cont's standard-tail /
+// Pattern C Pure-leaf / tail-prefix-let emit sites — without
+// these, `let inner = handle solve(...) with {...}` (the inner
+// handle whose arm body might discharge from a deeper sub-call)
+// would silently miscompile because the OUTER trampoline (driving
+// `solve_with_undo`) processes the gate's `NextStep::Call(post_-
+// arm_k, [garbage])` as DONE, overwriting the inner DISCHARGED
+// tag in the shared `terminal_out`. With the gates in place, the
+// inner handle's terminal Option[Int] reaches the surrounding
+// match correctly.
 //
 // Puzzle (Wikipedia "easy" 30-clue example, requires real
 // backtracking — many cells have multiple candidates at first
@@ -54,7 +64,7 @@
 import std.choose
 import std.option
 
-fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![ArithError] {
+fn check_conflict(grid: MutArray[Int], target_idx: Int, i: Int, d: Int) -> Bool ![Mem, ArithError] {
   match i {
     81 => false,
     _ => {
@@ -71,21 +81,21 @@ fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![A
         let same_col: Bool = col_i == col_t;
         let same_box: Bool = box_i == box_t;
         if same_row {
-          if array_get(grid, i) == d {
+          if mut_array_get(grid, i) == d {
             true
           } else {
             check_conflict(grid, target_idx, i + 1, d)
           }
         } else {
           if same_col {
-            if array_get(grid, i) == d {
+            if mut_array_get(grid, i) == d {
               true
             } else {
               check_conflict(grid, target_idx, i + 1, d)
             }
           } else {
             if same_box {
-              if array_get(grid, i) == d {
+              if mut_array_get(grid, i) == d {
                 true
               } else {
                 check_conflict(grid, target_idx, i + 1, d)
@@ -100,7 +110,7 @@ fn check_conflict(grid: Array[Int], target_idx: Int, i: Int, d: Int) -> Bool ![A
   }
 }
 
-fn cell_valid(grid: Array[Int], idx: Int, d: Int) -> Bool ![ArithError] {
+fn cell_valid(grid: MutArray[Int], idx: Int, d: Int) -> Bool ![Mem, ArithError] {
   if check_conflict(grid, idx, 0, d) {
     false
   } else {
@@ -108,29 +118,55 @@ fn cell_valid(grid: Array[Int], idx: Int, d: Int) -> Bool ![ArithError] {
   }
 }
 
-fn print_grid(grid: Array[Int], i: Int) -> Int ![IO] {
+fn print_grid(grid: MutArray[Int], i: Int) -> Int ![Mem, IO] {
   if i == 81 {
     0
   } else {
-    let v: Int = array_get(grid, i);
+    let v: Int = mut_array_get(grid, i);
     let _print: Unit = perform IO.println(int_to_string(v));
     print_grid(grid, i + 1)
   }
 }
 
 // At an empty cell: pick a digit 1..9 via `Choose.choose(9)`. On
-// row/col/box conflict perform fail. On success: tail-call solve
-// with the new grid (immutable threading). Multi-shot retries get
-// the PARENT's grid (this fn's `grid` parameter is unchanged when
-// k(d+1) re-runs the body — only the per-try `array_set` allocates
-// a fresh array, which is discarded if that try's recursion fails).
-fn try_at_cell(grid: Array[Int], idx: Int) -> Int ![Choose, IO, ArithError] {
+// row/col/box conflict perform fail. On success: set cell, recurse
+// via `solve_with_undo`, which wraps the inner `solve` in its own
+// first_choice handle with cell-undo on failure.
+fn try_at_cell(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, IO, ArithError] {
   let d: Int = perform Choose.choose(9);
   let digit: Int = d + 1;
   if cell_valid(grid, idx, digit) {
-    solve(array_set(grid, idx, digit), idx + 1)
+    let _set: Unit = mut_array_set(grid, idx, digit);
+    solve_with_undo(grid, idx)
   } else {
     perform Choose.fail()
+  }
+}
+
+// Inline first_choice over the inner `solve(grid, idx + 1)`,
+// converting the inner's None outcome into `undo + perform
+// Choose.fail()` so this idx's `try_at_cell` iteration can advance
+// to its next digit.
+//
+// The inline handle replicates `first_choice`'s three arms (mirrors
+// std/choose.sigil's `first_choice`) — `return(v) => Some(v)`,
+// `Choose.fail(k) => None`, `Choose.choose(arg, k) => first_-
+// choice_helper(k, 0, arg)`. The helper's k(i) drives the inner
+// body forward from each inner perform site with i in 0..arg-1;
+// the body's natural completion at depth N+1 returns Some(v),
+// total-failure returns None.
+fn solve_with_undo(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, IO, ArithError] {
+  let inner: Option[Int] = handle solve(grid, idx + 1) with {
+    return(v) => Some(v),
+    Choose.fail(k) => None,
+    Choose.choose(arg, k) => first_choice_helper(k, 0, arg),
+  };
+  match inner {
+    Some(v) => v,
+    None => {
+      let _undo: Unit = mut_array_set(grid, idx, 0);
+      perform Choose.fail()
+    },
   }
 }
 
@@ -140,11 +176,11 @@ fn try_at_cell(grid: Array[Int], idx: Int) -> Int ![Choose, IO, ArithError] {
 // is transitively Cps-colored via the recursive `solve(...)` and
 // `try_at_cell(...)` tail Cps-call leaves; the chain classifier's
 // chain_length=0 path (Plan C Task 81) accepts this shape.
-fn solve(grid: Array[Int], idx: Int) -> Int ![Choose, IO, ArithError] {
+fn solve(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, IO, ArithError] {
   if idx == 81 {
     print_grid(grid, 0)
   } else {
-    if array_get(grid, idx) != 0 {
+    if mut_array_get(grid, idx) != 0 {
       solve(grid, idx + 1)
     } else {
       try_at_cell(grid, idx)
@@ -152,52 +188,52 @@ fn solve(grid: Array[Int], idx: Int) -> Int ![Choose, IO, ArithError] {
   }
 }
 
-fn solve_initial() -> Int ![Choose, IO, ArithError] {
-  let g: Array[Int] = array_alloc(81, 0);
+fn solve_initial() -> Int ![Choose, Mem, IO, ArithError] {
+  let g: MutArray[Int] = mut_array_new(81, 0);
   // Wikipedia easy puzzle — 30 clues at the listed positions.
   // Row 0: clues at cols 0,1,4 (5,3,7)
-  let g0: Array[Int] = array_set(g, 0, 5);
-  let g1: Array[Int] = array_set(g0, 1, 3);
-  let g2: Array[Int] = array_set(g1, 4, 7);
+  let _s0: Unit = mut_array_set(g, 0, 5);
+  let _s1: Unit = mut_array_set(g, 1, 3);
+  let _s2: Unit = mut_array_set(g, 4, 7);
   // Row 1: clues at cols 0,3,4,5 (6,1,9,5)
-  let g3: Array[Int] = array_set(g2, 9, 6);
-  let g4: Array[Int] = array_set(g3, 12, 1);
-  let g5: Array[Int] = array_set(g4, 13, 9);
-  let g6: Array[Int] = array_set(g5, 14, 5);
+  let _s3: Unit = mut_array_set(g, 9, 6);
+  let _s4: Unit = mut_array_set(g, 12, 1);
+  let _s5: Unit = mut_array_set(g, 13, 9);
+  let _s6: Unit = mut_array_set(g, 14, 5);
   // Row 2: clues at cols 1,2,7 (9,8,6)
-  let g7: Array[Int] = array_set(g6, 19, 9);
-  let g8: Array[Int] = array_set(g7, 20, 8);
-  let g9: Array[Int] = array_set(g8, 25, 6);
+  let _s7: Unit = mut_array_set(g, 19, 9);
+  let _s8: Unit = mut_array_set(g, 20, 8);
+  let _s9: Unit = mut_array_set(g, 25, 6);
   // Row 3: clues at cols 0,4,8 (8,6,3)
-  let g10: Array[Int] = array_set(g9, 27, 8);
-  let g11: Array[Int] = array_set(g10, 31, 6);
-  let g12: Array[Int] = array_set(g11, 35, 3);
+  let _s10: Unit = mut_array_set(g, 27, 8);
+  let _s11: Unit = mut_array_set(g, 31, 6);
+  let _s12: Unit = mut_array_set(g, 35, 3);
   // Row 4: clues at cols 0,3,5,8 (4,8,3,1)
-  let g13: Array[Int] = array_set(g12, 36, 4);
-  let g14: Array[Int] = array_set(g13, 39, 8);
-  let g15: Array[Int] = array_set(g14, 41, 3);
-  let g16: Array[Int] = array_set(g15, 44, 1);
+  let _s13: Unit = mut_array_set(g, 36, 4);
+  let _s14: Unit = mut_array_set(g, 39, 8);
+  let _s15: Unit = mut_array_set(g, 41, 3);
+  let _s16: Unit = mut_array_set(g, 44, 1);
   // Row 5: clues at cols 0,4,8 (7,2,6)
-  let g17: Array[Int] = array_set(g16, 45, 7);
-  let g18: Array[Int] = array_set(g17, 49, 2);
-  let g19: Array[Int] = array_set(g18, 53, 6);
+  let _s17: Unit = mut_array_set(g, 45, 7);
+  let _s18: Unit = mut_array_set(g, 49, 2);
+  let _s19: Unit = mut_array_set(g, 53, 6);
   // Row 6: clues at cols 1,6,7 (6,2,8)
-  let g20: Array[Int] = array_set(g19, 55, 6);
-  let g21: Array[Int] = array_set(g20, 60, 2);
-  let g22: Array[Int] = array_set(g21, 61, 8);
+  let _s20: Unit = mut_array_set(g, 55, 6);
+  let _s21: Unit = mut_array_set(g, 60, 2);
+  let _s22: Unit = mut_array_set(g, 61, 8);
   // Row 7: clues at cols 3,4,5,8 (4,1,9,5)
-  let g23: Array[Int] = array_set(g22, 66, 4);
-  let g24: Array[Int] = array_set(g23, 67, 1);
-  let g25: Array[Int] = array_set(g24, 68, 9);
-  let g26: Array[Int] = array_set(g25, 71, 5);
+  let _s23: Unit = mut_array_set(g, 66, 4);
+  let _s24: Unit = mut_array_set(g, 67, 1);
+  let _s25: Unit = mut_array_set(g, 68, 9);
+  let _s26: Unit = mut_array_set(g, 71, 5);
   // Row 8: clues at cols 4,7,8 (8,7,9)
-  let g27: Array[Int] = array_set(g26, 76, 8);
-  let g28: Array[Int] = array_set(g27, 79, 7);
-  let g_final: Array[Int] = array_set(g28, 80, 9);
-  solve(g_final, 0)
+  let _s27: Unit = mut_array_set(g, 76, 8);
+  let _s28: Unit = mut_array_set(g, 79, 7);
+  let _s29: Unit = mut_array_set(g, 80, 9);
+  solve(g, 0)
 }
 
-fn main() -> Int ![IO, ArithError] {
+fn main() -> Int ![Mem, IO, ArithError] {
   let solved: Option[Int] = first_choice(solve_initial);
   match solved {
     Some(v) => v,
