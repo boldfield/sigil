@@ -495,7 +495,7 @@ pub(crate) fn register_body_return_arm_stack_root_for_calling_thread() -> (*mut 
 // of which frames to re-push.
 thread_local! {
     static CROSSED_FRAMES_STACK: RefCell<Vec<*mut HandlerFrame>> =
-        RefCell::new(Vec::new());
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Push crossed frame pointers recorded by `sigil_perform` for a given
@@ -506,6 +506,11 @@ thread_local! {
 /// stack in the SAME order sigil_perform recorded them (outermost first →
 /// innermost last = on top), so the handler stack matches the original
 /// push order. Returns the count N so the caller can pop them after run_loop.
+///
+/// # Safety
+///
+/// All frame pointers in the TLS stack must be valid, arena-allocated
+/// `HandlerFrame`s that remain live for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_repush_crossed_frames(_target_frame: *mut HandlerFrame) -> u32 {
     CROSSED_FRAMES_STACK.with(|cell| {
@@ -550,6 +555,12 @@ pub unsafe extern "C" fn sigil_repush_crossed_frames(_target_frame: *mut Handler
 /// return arm entries on the BODY_RETURN_ARM_STACK — identity/synth-cont
 /// terminal paths bypass that stack. Instead we drive run_loop for each
 /// return arm here, updating terminal_out in place.
+///
+/// # Safety
+///
+/// `terminal_out` must point to a valid, caller-owned `TerminalResult`.
+/// Frame pointers in the TLS stack must be valid, arena-allocated
+/// `HandlerFrame`s that remain live for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_pop_crossed_frames(count: u32, terminal_out: *mut TerminalResult) {
     for _ in 0..count {
