@@ -328,6 +328,40 @@ pub fn infer_colors(mono: MonoProgram) -> ColoredProgram {
     }
 }
 
+/// Public façade over [`local_color`] for closure_convert: classify a
+/// synthetic `$lambda_N` fn lifted out of an `Expr::Lambda` AFTER
+/// `infer_colors` has already run on the original program. Returns a
+/// `Color` (Native / Cps) rather than the internal `LocalColor` enum.
+///
+/// **Why this exists.** `infer_colors` walks `program.items` in pass-
+/// order and only sees user-declared top-level fns. Closure conversion
+/// runs strictly after color and lifts every `Expr::Lambda` to a fresh
+/// top-level fn, so the lifted fns are missing from `ColoredProgram::
+/// colors` until closure_convert appends entries via this helper. With
+/// no entry, [`ColoredProgram::needs_cps_transform`] returns `false`
+/// (the safe-default for unknown names), which causes `compute_user_
+/// fn_abi` to pick `UserFnAbi::Sync` for the lifted lambda — wrong
+/// when the lambda's body has effects and a discharge-with-lambda
+/// handler runs above it. Using this function at the closure-convert
+/// closeout keeps the lifted-lambda's ABI selection in lock-step with
+/// what the original `Expr::Lambda` would have classified to had it
+/// been a top-level fn from the start.
+///
+/// Skips the SCC propagation phase: a lifted lambda's call edges are
+/// trivially within its own body (it's a leaf in the synthesis-time
+/// call graph) and any transitive CPS pull-in already classified its
+/// parent fn correctly. Conservative — falsely classifying a synthetic
+/// lambda as Cps is safe (the body-shape gates in `compute_user_fn_
+/// abi` ensure the runtime ABI matches what the body can actually
+/// emit); falsely classifying as Native would silently break
+/// composition.
+pub fn classify_lifted_lambda(f: &FnDecl) -> Color {
+    match local_color(f) {
+        LocalColor::Cps(_) => Color::Cps,
+        LocalColor::Native(_) => Color::Native,
+    }
+}
+
 /// Local analysis on a single fn: classify based on its declared row,
 /// any explicit row variable, and any non-IO `perform` operation in
 /// its body (or any nested lambda body). Independent of the call

@@ -60,7 +60,8 @@ fn raise[A, E](e: E) -> A ![Raise[E]] {
 // The body's row is `![Raise[E] | e]` — Raise[E] is discharged
 // here, residual `!e` flows to catch's result row.
 fn catch[A, E](body: () -> A ![Raise[E] | e]) -> Result[A, E] ![| e] {
-  handle Ok(body()) with {
+  handle body() with {
+    return(v) => Ok(v),
     Raise.fail(e, k) => Err(e),
   }
 }

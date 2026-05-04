@@ -7403,7 +7403,8 @@ fn std_raise_catch_conditional_branch() {
 // ===== Plan C Task 72 — State + run_state =====
 
 /// Canonical run_state demo using direct `perform State.set/get`.
-/// Body sets state to 10, gets it back, returns 10 + 1 = 11.
+/// Body sets state to 10, gets it back, returns 10 + 1 = 11. Final
+/// state is 10. `run_state` returns `(11, 10)` — assert both.
 /// Mirrors `examples/state.sigil`'s Plan B' Stage 6.8 trace.
 #[test]
 fn std_state_run_state_set_get_returns_11() {
@@ -7414,30 +7415,37 @@ fn std_state_run_state_set_get_returns_11() {
                  v + 1\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
-                 let result: Int = run_state(5, comp);\n  \
-                 perform IO.println(int_to_string(result));\n  \
+                 let pair: (Int, Int) = run_state(5, comp);\n  \
+                 let v: Int = match pair { (v, _) => v };\n  \
+                 let s: Int = match pair { (_, s) => s };\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 perform IO.println(int_to_string(s));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_state_run_set_get");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "11\n", "stderr={stderr:?}");
+    assert_eq!(stdout, "11\n10\n", "stderr={stderr:?}");
 }
 
 /// Body that only reads state (no set) sees the initial value.
-/// `run_state(42, get_only)` returns 42 — exercises the
-/// initial-value pass-through path.
+/// `run_state(42, get_only)` returns `(42, 42)` — body value is
+/// the initial state (passed through via `get`); final state is
+/// also the initial state (no `set` was performed).
 #[test]
 fn std_state_run_state_get_only_reflects_initial() {
     let src = "import std.state\n\
                fn get_only() -> Int ![State[Int]] { perform State.get() }\n\
                fn main() -> Int ![IO] {\n  \
-                 let result: Int = run_state(42, get_only);\n  \
-                 perform IO.println(int_to_string(result));\n  \
+                 let pair: (Int, Int) = run_state(42, get_only);\n  \
+                 let v: Int = match pair { (v, _) => v };\n  \
+                 let s: Int = match pair { (_, s) => s };\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 perform IO.println(int_to_string(s));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_state_get_only");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "42\n", "stderr={stderr:?}");
+    assert_eq!(stdout, "42\n42\n", "stderr={stderr:?}");
 }
 
 /// **Pin wrapper-fn-frame composition** for the `std/state` surface
@@ -7466,8 +7474,9 @@ fn std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix() {
                  v + 1\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
-                 let result: Int = run_state(5, comp);\n  \
-                 perform IO.println(int_to_string(result));\n  \
+                 let pair: (Int, Int) = run_state(5, comp);\n  \
+                 let v: Int = match pair { (v, _) => v };\n  \
+                 perform IO.println(int_to_string(v));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_state_via_wrappers_pending");
@@ -10867,7 +10876,8 @@ fn task_78_5_g5_lambda_captures_k_with_any_generic_in_program_runs_post_119b() {
                }\n\
                \n\
                fn main() -> Int ![IO] {\n  \
-                 let result: Int = run_state(5, comp);\n  \
+                 let pair: (Int, Int) = run_state(5, comp);\n  \
+                 let result: Int = match pair { (v, _) => v };\n  \
                  let _: Int = id(result);\n  \
                  perform IO.println(int_to_string(result));\n  \
                  0\n\
@@ -10975,7 +10985,8 @@ fn task_78_5_g5_run_state_lambda_capture_in_no_generics_program_compiles_cleanly
                }\n\
                \n\
                fn main() -> Int ![IO] {\n  \
-                 let result: Int = run_state(5, comp);\n  \
+                 let pair: (Int, Int) = run_state(5, comp);\n  \
+                 let result: Int = match pair { (v, _) => v };\n  \
                  perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
@@ -11511,5 +11522,67 @@ fn task_111d_nested_handle_inner_discharge_does_not_leak_to_outer() {
          restored snapshot) and dispatch the return arm (`v + 100 = \
          1090`). Pre-fix output is `99` (leaked DISCHARGED + leaked \
          inner value). stderr={stderr:?}"
+    );
+}
+
+/// Pattern C branch-leaf perform extension: `perform` inside a branch
+/// body. The body has a prefix perform (`State.get`), then a branched
+/// tail where EACH branch contains `let _ = perform State.set(...);`
+/// before its leaf. The existing classifier rejects `Stmt::Let` with
+/// `Perform` RHS inside branch leaves; this test pins the fix.
+///
+/// Trace: helper(3) → S.get()=0, branch n!=0 → S.set(3), recurse
+/// helper(2) → S.get()=3, branch n!=0 → S.set(2), recurse
+/// helper(1) → S.get()=2, branch n!=0 → S.set(1), recurse
+/// helper(0) → S.get()=1, branch n==0 → S.set(42), pure leaf 99.
+/// State ends at 42. comp() → S.get() = 42. Output: "42".
+#[test]
+fn pattern_c_in_branch_perform_state_threading_returns_42() {
+    let src = "import std.io\n\
+               \n\
+               effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               \n\
+               fn helper(n: Int) -> Int ![S] {\n  \
+                 let _x: Int = perform S.get();\n  \
+                 if n == 0 {\n    \
+                   let _s0: Int = perform S.set(42);\n    \
+                   99\n  \
+                 } else {\n    \
+                   let _s1: Int = perform S.set(n);\n    \
+                   helper(n - 1)\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               fn comp() -> Int ![S] {\n  \
+                 let _y: Int = helper(3);\n  \
+                 let v: Int = perform S.get();\n  \
+                 v\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "pattern_c_in_branch_perform");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "Pattern C in-branch perform: helper(3) recurses with State.set \
+         inside each branch. Final S.set(42) at base case. comp() reads \
+         42 via S.get(). Wrong outputs surface a classifier or branch-chain \
+         emit regression. stderr={stderr:?}"
     );
 }

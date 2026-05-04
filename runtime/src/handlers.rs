@@ -486,6 +486,134 @@ pub(crate) fn register_body_return_arm_stack_root_for_calling_thread() -> (*mut 
     })
 }
 
+// Nested-effect-forwarding fix: when sigil_perform crosses intervening
+// handlers, record the crossed frame pointers so lower_k_pair_call can
+// re-push them when resuming the continuation.
+const CROSSED_FRAMES_STACK_SIZE: usize = 32;
+
+thread_local! {
+    static CROSSED_FRAMES_STACK: Cell<[*mut HandlerFrame; CROSSED_FRAMES_STACK_SIZE]> = const {
+        Cell::new([ptr::null_mut(); CROSSED_FRAMES_STACK_SIZE])
+    };
+    static CROSSED_FRAMES_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static CROSSED_FRAMES_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn register_crossed_frames_stack_root_for_calling_thread() -> (*mut c_void, *mut c_void)
+{
+    CROSSED_FRAMES_STACK.with(|cell| {
+        let start =
+            cell as *const Cell<[*mut HandlerFrame; CROSSED_FRAMES_STACK_SIZE]> as *mut c_void;
+        let end = unsafe {
+            (start as *mut u8).add(core::mem::size_of::<
+                [*mut HandlerFrame; CROSSED_FRAMES_STACK_SIZE],
+            >()) as *mut c_void
+        };
+        let already_registered = CROSSED_FRAMES_STACK_ROOTED.with(|rooted| {
+            let r = rooted.get();
+            rooted.set(true);
+            r
+        });
+        if !already_registered {
+            unsafe {
+                crate::gc::GC_add_roots(start, end);
+            }
+        }
+        (start, end)
+    })
+}
+
+/// Push crossed frame pointers recorded by `sigil_perform` for a given
+/// target handler frame. Called by k-pair dispatch before driving run_loop.
+///
+/// Protocol: `sigil_perform` pushes N entries (the crossed frames, outermost
+/// first). `sigil_repush_crossed_frames` re-pushes them onto the handler
+/// stack in the SAME order sigil_perform recorded them (outermost first →
+/// innermost last = on top), so the handler stack matches the original
+/// push order. Returns the count N so the caller can pop them after run_loop.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_repush_crossed_frames(_target_frame: *mut HandlerFrame) -> u32 {
+    let depth = CROSSED_FRAMES_DEPTH.with(|c| c.get());
+    if depth == 0 {
+        return 0;
+    }
+    let stack = CROSSED_FRAMES_STACK.with(|cell| cell.get());
+    let mut count = 0u32;
+    let mut i = depth;
+    while i > 0 {
+        i -= 1;
+        if stack[i].is_null() {
+            break;
+        }
+        count += 1;
+    }
+    let base = depth - count as usize;
+    for j in base..depth {
+        let frame = stack[j];
+        if !frame.is_null() {
+            sigil_handle_push(frame);
+        }
+    }
+    count
+}
+
+/// Pop N crossed frames that were re-pushed by `sigil_repush_crossed_frames`.
+/// After popping the handler frames, applies each crossed handler's return
+/// arm to the current terminal value (innermost first). This is necessary
+/// because the continuation k resumed the body without the crossed handlers'
+/// return arm entries on the BODY_RETURN_ARM_STACK — identity/synth-cont
+/// terminal paths bypass that stack. Instead we drive run_loop for each
+/// return arm here, updating terminal_out in place.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_pop_crossed_frames(count: u32, terminal_out: *mut TerminalResult) {
+    for _ in 0..count {
+        sigil_handle_pop();
+    }
+
+    let depth = CROSSED_FRAMES_DEPTH.with(|c| c.get());
+    let stack = CROSSED_FRAMES_STACK.with(|cell| cell.get());
+
+    let mut n = 0usize;
+    let mut i = depth;
+    while i > 0 {
+        i -= 1;
+        if stack[i].is_null() {
+            break;
+        }
+        n += 1;
+    }
+    let base = depth - n;
+
+    for j in (base..depth).rev() {
+        let frame = stack[j];
+        if frame.is_null() {
+            continue;
+        }
+        let f = &*frame;
+        if f.return_fn.is_null() {
+            continue;
+        }
+        if (*terminal_out).tag != sigil_abi::effect::NEXT_STEP_TAG_DONE as u64 {
+            break;
+        }
+        let value = (*terminal_out).value;
+        let ns = sigil_next_step_call(f.return_closure, f.return_fn, 3);
+        let args = sigil_next_step_args_ptr(ns);
+        ptr::write(args.add(0), value);
+        ptr::write(args.add(1), 0u64);
+        ptr::write(
+            args.add(2),
+            sigil_continuation_identity as *const () as usize as u64,
+        );
+        sigil_run_loop(ns, terminal_out);
+    }
+
+    let remove = count as usize + 1;
+    if depth >= remove {
+        CROSSED_FRAMES_DEPTH.with(|c| c.set(depth - remove));
+    }
+}
+
 /// Inverse of [`register_body_return_arm_stack_root_for_calling_thread`].
 /// Used by `GcThreadEnrolment::drop` in tests.
 #[cfg(test)]
@@ -852,6 +980,7 @@ pub unsafe extern "C" fn sigil_handle_push(frame: *mut HandlerFrame) {
 /// chain — keeps it reachable).
 #[no_mangle]
 pub unsafe extern "C" fn sigil_handle_pop() -> *mut HandlerFrame {
+    let _head = HANDLER_STACK.with(|cell| cell.get());
     // Plan D Task 117 — read the matching push's relink-decision
     // off RELINK_STACK. If the push was a no-op (frame was already
     // on top), the matching pop must also no-op. There are no
@@ -1693,11 +1822,39 @@ pub unsafe extern "C" fn sigil_perform(
     counters::incr(CounterId::HandlerWalkCount);
 
     let mut depth: u64 = 0;
-    let mut frame = HANDLER_STACK.with(|cell| cell.get());
+    let top_frame = HANDLER_STACK.with(|cell| cell.get());
+    let mut frame = top_frame;
     while !frame.is_null() {
         depth += 1;
         if (*frame).effect_id == effect_id {
             counters::add(CounterId::HandlerWalkDepthSum, depth);
+            let crossed = frame != top_frame;
+            if crossed {
+                // Record the crossed frames in the TLS stack so the
+                // k-pair dispatch can re-push them. Push a null sentinel
+                // first, then the crossed frames outermost-first.
+                CROSSED_FRAMES_STACK.with(|cell| {
+                    let mut stack = cell.get();
+                    let mut d = CROSSED_FRAMES_DEPTH.with(|c| c.get());
+                    // Sentinel
+                    if d < CROSSED_FRAMES_STACK_SIZE {
+                        stack[d] = ptr::null_mut();
+                        d += 1;
+                    }
+                    // Collect crossed frames: walk from top_frame to
+                    // (but not including) the matching frame.
+                    let mut cf = top_frame;
+                    while cf != frame && !cf.is_null() {
+                        if d < CROSSED_FRAMES_STACK_SIZE {
+                            stack[d] = cf;
+                            d += 1;
+                        }
+                        cf = (*cf).prev;
+                    }
+                    CROSSED_FRAMES_DEPTH.with(|c| c.set(d));
+                    cell.set(stack);
+                });
+            }
             if op_id >= (*frame).arm_count {
                 eprintln!(
                     "sigil_perform: op_id {op_id} out of range for effect_id {effect_id} \
@@ -1776,6 +1933,13 @@ pub unsafe extern "C" fn sigil_perform(
 pub struct TerminalResult {
     pub value: u64,
     pub tag: u64,
+    /// Effect ID of the discharging arm (only meaningful when
+    /// `tag == NEXT_STEP_TAG_DISCHARGED`). Written by the arm body's
+    /// codegen emit (store to `terminal_out + 16` before
+    /// `sigil_next_step_discharged`). Used by nested handle
+    /// expressions to distinguish own-effect discharge (restore
+    /// snapshot) from foreign-effect discharge (propagate).
+    pub effect_id: u64,
 }
 
 /// Drive the CPS trampoline starting from `initial_step`. Each
@@ -1881,13 +2045,12 @@ pub unsafe extern "C" fn sigil_run_loop(
                     // value); they pass `ptr::null_mut()` and ignore
                     // the channel.
                     if !out.is_null() {
-                        ptr::write(
-                            out,
-                            TerminalResult {
-                                value: v,
-                                tag: tag as u64,
-                            },
-                        );
+                        // Write value + tag but preserve effect_id
+                        // (codegen's arm body already stored the
+                        // discharging effect's ID before returning
+                        // NextStep::Discharged).
+                        (*out).value = v;
+                        (*out).tag = tag as u64;
                     }
                     // Drain outer_post_arm_k stack back to entry-time
                     // depth. Entries pushed by synth-cont Middle steps
@@ -2019,6 +2182,7 @@ pub unsafe extern "C" fn sigil_run_loop(
                         TerminalResult {
                             value: v,
                             tag: tag as u64,
+                            effect_id: 0,
                         },
                     );
                 }
@@ -2028,9 +2192,6 @@ pub unsafe extern "C" fn sigil_run_loop(
                 return v;
             }
             NEXT_STEP_TAG_CALL => {
-                // Copy dispatch info into stack locals before resetting
-                // the arena. The args buffer is also in the arena, so
-                // we copy those out too.
                 let closure_ptr = (*current).closure_ptr;
                 let fn_ptr = (*current).fn_ptr;
                 let arg_count = (*current).arg_count;
@@ -2239,7 +2400,7 @@ mod tests {
         let _guard = crate::test_support::gc_test_lock();
         ensure_gc();
         reset_state();
-        let mut term = TerminalResult { value: 0, tag: 0 };
+        let mut term = TerminalResult { value: 0, tag: 0, effect_id: 0 };
         let ns = unsafe { sigil_next_step_done(0xDEAD_BEEF_u64) };
         let v = unsafe { sigil_run_loop(ns, &mut term as *mut _) };
         assert_eq!(v, 0xDEAD_BEEF_u64);
@@ -2261,7 +2422,7 @@ mod tests {
         let _guard = crate::test_support::gc_test_lock();
         ensure_gc();
         reset_state();
-        let mut term = TerminalResult { value: 0, tag: 0 };
+        let mut term = TerminalResult { value: 0, tag: 0, effect_id: 0 };
         let ns = unsafe { sigil_next_step_discharged(0xCAFE_BABE_u64) };
         let v = unsafe { sigil_run_loop(ns, &mut term as *mut _) };
         assert_eq!(v, 0xCAFE_BABE_u64);
@@ -2305,6 +2466,7 @@ mod tests {
         let mut term = TerminalResult {
             value: 0xFFFF_FFFF_FFFF_FFFF_u64,
             tag: 0xAAAA_AAAA_AAAA_AAAA_u64,
+            effect_id: 0,
         };
         // Drive a Call → Done sequence; the Call iteration is
         // non-terminal, so *out must stay at sentinel until the Done

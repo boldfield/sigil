@@ -274,6 +274,46 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
         hoisted_lambda_parent_clone,
         ..
     } = conv;
+    // Plan C followup (JSON parser unblock) — classify every hoisted
+    // synth `$lambda_N` fn into `colored.colors` BEFORE the items
+    // extend so codegen's `compute_user_fn_abi` sees the right ABI for
+    // lifted lambdas. Pre-fix, lifted lambdas were absent from
+    // `colored.colors` (color ran before this pass), so
+    // `needs_cps_transform` defaulted to `false` and a lambda body
+    // performing a non-IO effect inside a discharge-with-lambda
+    // composition (e.g., the inline `body` parameter to
+    // `std/state.sigil`'s `run_state`) silently received `UserFnAbi::
+    // Sync` — the synth fn's body fired the perform synchronously
+    // through `sigil_run_loop`, but the chained-let-yield + tail
+    // composition past the perform was lost (Sync's body lowering
+    // doesn't compose chained-let-yield with discharge-with-lambda).
+    //
+    // Calling `classify_lifted_lambda(synth_fn)` here mirrors the
+    // pre-existing `local_color` path that user fns went through.
+    // Each lifted fn's color reason is generated synthetically (we
+    // don't have access to the SCC propagation pipeline post-color),
+    // but compute_user_fn_abi only consults the Color variant, not
+    // the reason text — so this is sufficient for ABI selection.
+    let mut new_color_entries: Vec<(String, crate::color::Color)> = Vec::new();
+    for item in &hoisted {
+        if let Item::Fn(f) = item {
+            let c = crate::color::classify_lifted_lambda(f);
+            new_color_entries.push((f.name.clone(), c));
+        }
+    }
+    colored
+        .colors
+        .extend(new_color_entries.iter().map(|(n, c)| (n.clone(), *c)));
+    let mut new_reason_entries: Vec<(String, String)> = Vec::new();
+    for (n, c) in &new_color_entries {
+        let reason = match c {
+            crate::color::Color::Cps => format!("cps: lifted lambda `{n}` (effects in row or body)"),
+            crate::color::Color::Native => "native: lifted lambda — pure body".to_string(),
+        };
+        new_reason_entries.push((n.clone(), reason));
+    }
+    colored.reasons.extend(new_reason_entries);
+
     new_items.extend(hoisted);
 
     // Build the flat per-fn captures summary from the final item list.
@@ -763,10 +803,37 @@ impl Converter {
                     params.iter().map(|p| p.name.clone()).collect();
                 let rewritten_body = self.rewrite_expr(*body, &inner_locals, &caps);
 
-                let body_block = Block {
-                    stmts: Vec::new(),
-                    tail: Some(rewritten_body),
-                    span: span.clone(),
+                // **Block-shape preservation.** If the lambda body is an
+                // `Expr::Block`, fold its stmts/tail into the synth fn's
+                // top-level Block instead of nesting it as a tail-only
+                // expression. Pre-fix, codegen's chain classifier (which
+                // walks `body.stmts` to detect chained-let-yield-then-
+                // pure-tail) saw an empty `stmts` list and rejected the
+                // shape — the lifted lambda landed on the Sync ABI even
+                // when the original lambda body was a let-perform chain
+                // followed by a tail expression. Concrete failure: an
+                // inline `body` argument to `run_state` like
+                //
+                //     run_state(99, fn () -> Int ![S] => {
+                //       let pos: Int = perform S.get();
+                //       pos + 7
+                //     })
+                //
+                // got UserFnAbi::Sync, dispatched the perform through
+                // sigil_run_loop synchronously, and the discharge-with-
+                // lambda return arm captured `pos` (the resumed value)
+                // as the body's "result" — losing the `+ 7` tail. Output
+                // was 99 instead of 106. Folding the inner Block makes
+                // the synth fn's stmts visible to the classifier, the
+                // chain-let-yield path activates, and the synth-cont
+                // chain composes correctly with discharge-with-lambda.
+                let body_block = match rewritten_body {
+                    Expr::Block(inner_block) => *inner_block,
+                    other => Block {
+                        stmts: Vec::new(),
+                        tail: Some(other),
+                        span: span.clone(),
+                    },
                 };
                 let synthetic = FnDecl {
                     name: fn_name.clone(),

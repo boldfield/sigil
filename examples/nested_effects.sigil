@@ -1,0 +1,31 @@
+import std.state
+import std.raise
+import std.result
+
+fn inner_body() -> Int ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  pos
+}
+
+fn composed() -> Result[Int, String] ![] {
+  let result: (Result[Int, String], Int) = run_state(7, fn () -> Result[Int, String] ![State[Int]] => {
+    catch(fn () -> Int ![Raise[String], State[Int]] => {
+      inner_body()
+    })
+  });
+  match result { (r, _s) => r }
+}
+
+fn main() -> Int ![IO] {
+  let r: Result[Int, String] = composed();
+  match r {
+    Ok(v) => {
+      perform IO.println(int_to_string(v));
+      0
+    },
+    Err(msg) => {
+      perform IO.println(msg);
+      1
+    },
+  }
+}

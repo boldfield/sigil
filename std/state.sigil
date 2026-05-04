@@ -41,13 +41,12 @@
 //    monomorphization. Soundness is enforced at runtime via ScopeId
 //    checks on captured continuations.
 //
-// 2. **`run_state` returns just `A` (body's final value), not
-//    `(A, S)`.** Plan body specifies `(A, S) !e`. Sigil v1's tuple
-//    surface is shipped (Plan D Task 113), but `(A, S)` would
-//    require a second walk over the state-bearing-lambda chain to
-//    surface the final S — orthogonal to Task 119b's E0145 closure.
-//    v1 ships A-only return; users wanting final state capture it
-//    explicitly via the body's return value.
+// 2. **`run_state` returns `(A, S)`.** Plan body specifies
+//    `(A, S) !e`. Closed by this Plan C followup on top of Plan D
+//    Task 113's tuple primitive: the return arm wraps as `(v, s)`
+//    so the natural lambda-chain terminus surfaces both the body's
+//    final value and the threaded state without a second walk —
+//    `s` is the final lambda's parameter (see Section 3 trace).
 //
 // 3. **No `get_state` / `set_state` wrapper functions in v1.**
 //    Plan B' Stage 6.8's run_state landing (PR #39) verified the
@@ -95,22 +94,24 @@ effect State[S] resumes: many {
 
 // `run_state[A, S](initial, body)` discharges the State[S] effect by
 // threading state through every `State.get` / `State.set` perform
-// in `body`. Returns the body's final value.
+// in `body`. Returns `(body_value, final_state)`.
 //
 // **Implementation shape.** Each handler arm returns a state-
-// bearing lambda `(S) -> A ![]`; the handle expression's overall
-// value is the lambda chain that, when applied to `initial`,
-// drives the state through the body. The return arm wraps the
-// body's final value in a no-op state-bearing lambda; the get
-// arm threads the current state into k twice (once as the
-// resume value, once as the next state); the set arm threads
-// `arg` similarly. See `examples/state.sigil` for the detailed
-// trace; `[DEVIATION Task 72]` documents v1 constraints.
-fn run_state[A, S](initial: S, body: () -> A ![State[S]]) -> A ![] {
-  let state_fn: (S) -> A ![] = handle body() with {
-    return(v) => fn (s: S) -> A ![] => v,
-    State.get(k) => fn (s: S) -> A ![] => k(s)(s),
-    State.set(arg, k) => fn (s: S) -> A ![] => k(arg)(arg),
+// bearing lambda `(S) -> (A, S) ![]`; the handle expression's
+// overall value is the lambda chain that, when applied to
+// `initial`, drives the state through the body. The return arm
+// wraps the body's final value `v` paired with its received
+// state-parameter `s` — `s` IS the threaded final state at the
+// chain's terminus, so `(v, s)` surfaces both without a second
+// walk. The get arm threads the current state into k twice (once
+// as the resume value, once as the next state); the set arm
+// threads `arg` similarly. See `examples/state.sigil` for the
+// detailed trace.
+fn run_state[A, S](initial: S, body: () -> A ![State[S] | e]) -> (A, S) ![| e] {
+  let state_fn: (S) -> (A, S) ![| e] = handle body() with {
+    return(v) => fn (s: S) -> (A, S) ![| e] => (v, s),
+    State.get(k) => fn (s: S) -> (A, S) ![| e] => k(s)(s),
+    State.set(arg, k) => fn (s: S) -> (A, S) ![| e] => k(arg)(arg),
   };
   state_fn(initial)
 }
