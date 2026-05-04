@@ -8209,10 +8209,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     })
                                     .unwrap_or(false);
                                 if is_cps_wrapper {
-                                    steps.push(ChainedNextStep::CallCps {
-                                        callee_name: callee_name_opt.expect(
-                                            "is_cps_wrapper implies callee_name_opt is Some",
+                                    let callee_name = match callee_name_opt {
+                                        Some(n) => n,
+                                        None => unreachable!(
+                                            "is_cps_wrapper implies callee_name_opt is Some — \
+                                             is_cps_wrapper short-circuited via the \
+                                             callee_name_opt.as_ref().map(...).unwrap_or(false) \
+                                             chain that returns false on None"
                                         ),
+                                    };
+                                    steps.push(ChainedNextStep::CallCps {
+                                        callee_name,
                                         args: args.clone(),
                                     });
                                     binding_names.push(let_stmt.name.clone());
@@ -9530,9 +9537,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let (body_first_step, synth_cont_func_id_opt): (
                     Option<ChainedNextStep>,
                     Option<cranelift_module::FuncId>,
-                ) = if is_zero_chain {
-                    let synth_cont_func_id =
-                        cps_continuation_synth[synth_cont_idx_opt.unwrap()].func_id;
+                ) = if let Some(idx) = synth_cont_idx_opt.filter(|_| is_zero_chain) {
+                    let synth_cont_func_id = cps_continuation_synth[idx].func_id;
                     (None, Some(synth_cont_func_id))
                 } else if let Some(idx) = synth_cont_idx_opt {
                     let step = match &f.body.stmts[0] {
