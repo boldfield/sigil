@@ -1275,6 +1275,73 @@ fn task_81_sudoku_solves_9x9() {
     );
 }
 
+/// Plan C Task 81 — negative regression for the 9×9 Sudoku
+/// solver's discharge-propagation path (PR #97 review iter 2 #8).
+/// Unsolvable puzzle: two `5`s in row 0 (cells `[0,0] = 5` AND
+/// `[0,1] = 5`) — `cell_valid` rejects every digit at the first
+/// empty cell, every Choose.choose level exhausts via Choose.fail,
+/// and `first_choice` returns `None` at the top.
+///
+/// The success-path test above (`task_81_sudoku_solves_9x9`)
+/// exercises Choose.fail propagation DURING the search (intermediate
+/// k(i) iterations of nested first_choice handles return None),
+/// but the OUTERMOST first_choice's None branch is only hit when
+/// every digit at every empty cell fails — i.e., on an unsolvable
+/// puzzle. This test ensures the top-level discharge handle's
+/// `None => "no solution"; 1` arm fires correctly: discharge
+/// propagation through ~50 nested `solve_with_undo` handles
+/// (each catching inner `Choose.fail` to run `mut_array_set(g, idx,
+/// 0)` undo before re-raising) terminates cleanly at the
+/// outermost `first_choice` with the None outcome, and main exits
+/// with code 1 + stdout `"no solution\n"`.
+#[test]
+fn task_81_sudoku_unsolvable_puzzle_returns_no_solution() {
+    let root = workspace_root();
+    // Read the canonical Sudoku source, then patch a single line
+    // to introduce a contradictory clue. We replace `array_set(g, 1, 3)`
+    // (the `5,3,7` row 0 clue at col 1) with `mut_array_set(g, 1, 5)`
+    // — wait, the file uses immutable Array, so the corresponding
+    // line is `let g1: Array[Int] = array_set(g, 1, 3);`. Replace
+    // the digit `3` with `5` to give row 0 two `5`s (cells 0 and 1).
+    let original_path = root.join("examples/sudoku.sigil");
+    let original = std::fs::read_to_string(&original_path).expect("read sudoku.sigil");
+
+    // Sentinel-line replacement: convert `mut_array_set(g, 1, 3)`
+    // (row 0 col 1 clue) to `mut_array_set(g, 1, 5)` (collision
+    // with col 0's `5`). Use a fully-qualified pattern so a future
+    // edit to the example doesn't accidentally match the wrong
+    // line.
+    let pattern = "let _s1: Unit = mut_array_set(g, 1, 3);";
+    let replacement = "let _s1: Unit = mut_array_set(g, 1, 5);";
+    assert!(
+        original.contains(pattern),
+        "expected sudoku.sigil to contain `{pattern}` for unsolvable-puzzle \
+         test patch — if the example's clue scaffolding shape changed, \
+         update this test's pattern accordingly"
+    );
+    let patched = original.replace(pattern, replacement);
+
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_sudoku_unsolvable_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&src_path, patched).expect("write patched sudoku");
+
+    let (stdout, stderr, code) = compile_file_and_run(&src_path, "sudoku_unsolvable");
+    let _ = std::fs::remove_file(&src_path);
+
+    assert_eq!(
+        code, 1,
+        "unsolvable-puzzle sudoku must exit 1 via `None => 1` arm; \
+         stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout, "no solution\n",
+        "unsolvable-puzzle sudoku must print `no solution` via the \
+         outermost first_choice's None branch; stderr={stderr:?}"
+    );
+}
+
 // ===== Plan A3 Task 45 — E0120 non-exhaustive-match regression ==============
 
 /// Compile a deliberately non-exhaustive `match` on `Option` with
