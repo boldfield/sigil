@@ -965,7 +965,7 @@ pub unsafe extern "C" fn sigil_next_step_done(value: u64) -> *mut NextStep {
 ///    masks the outer pair so sub-Cps-fn calls' natural-exit helpers
 ///    see null and emit `Done(v)` directly (Risk 3 discipline).
 ///
-/// Aborts on stack overflow (cap = `BODY_RETURN_ARM_STACK_SIZE` = 32).
+/// Aborts on stack overflow (cap = `BODY_RETURN_ARM_STACK_SIZE` = 4096).
 /// Every push must be paired with one `sigil_body_return_arm_pop` (the
 /// codegen wrapper that pushes also emits the matching pop).
 ///

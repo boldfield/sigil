@@ -8134,26 +8134,45 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
                             }
                             crate::ast::Expr::Call { callee, args, .. } => {
-                                let callee_name = match callee.as_ref() {
-                                    crate::ast::Expr::Ident(n, _) => n.clone(),
-                                    _ => continue,
+                                // PR #97 review #1: classifier accepts
+                                // non-Ident callees as tail-prefix lets
+                                // when `yield_count > 0 && !expr_-
+                                // contains_perform`. Drop-via-`continue`
+                                // would silently lose the binding here
+                                // (re-introducing the silent-drop
+                                // pattern PR #83 review #5 closed).
+                                // Treat non-Ident callee as a tail-
+                                // prefix let, mirroring the `other =>`
+                                // arm below.
+                                let callee_name_opt = match callee.as_ref() {
+                                    crate::ast::Expr::Ident(n, _) => Some(n.clone()),
+                                    _ => None,
                                 };
                                 // Plan C Task 81 — Cps wrapper Call →
                                 // chain step; non-yielding Call
-                                // (builtin / Sync user fn) → tail-
-                                // prefix let. The classifier accepts
-                                // both shapes; the pre-pass dispatches
-                                // based on callee Cps-color via the
-                                // same `is_supported_cps_user_fn`
-                                // predicate the classifier used.
-                                if is_supported_cps_user_fn(
-                                    &callee_name,
-                                    &fns_by_name,
-                                    &cc.colored,
-                                    &ctors,
-                                ) {
+                                // (builtin / Sync user fn / non-Ident
+                                // callee) → tail-prefix let. The
+                                // classifier accepts both shapes; the
+                                // pre-pass dispatches based on callee
+                                // Cps-color via the same
+                                // `is_supported_cps_user_fn` predicate
+                                // the classifier used.
+                                let is_cps_wrapper = callee_name_opt
+                                    .as_ref()
+                                    .map(|n| {
+                                        is_supported_cps_user_fn(
+                                            n,
+                                            &fns_by_name,
+                                            &cc.colored,
+                                            &ctors,
+                                        )
+                                    })
+                                    .unwrap_or(false);
+                                if is_cps_wrapper {
                                     steps.push(ChainedNextStep::CallCps {
-                                        callee_name,
+                                        callee_name: callee_name_opt.expect(
+                                            "is_cps_wrapper implies callee_name_opt is Some",
+                                        ),
                                         args: args.clone(),
                                     });
                                     binding_names.push(let_stmt.name.clone());
@@ -8221,7 +8240,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // (Final role). Body emit dispatches it directly
                     // with a dummy arg + caller_k_pair forwarded via
                     // the closure record. Synth-cont's FINAL emit
-                    // binds the dummy under `__zero_chain_dummy__`
+                    // binds the dummy under `$zero_chain_dummy`
                     // (which the tail won't reference) and emits the
                     // branched-tail dispatch as usual.
                     let effective_step_count = if chain_length == 0 { 1 } else { chain_length };
@@ -8239,12 +8258,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // Plan C Task 81 — chain_length=0 special case:
                     // emit ONE FINAL synth-cont with synthetic dummy
                     // binding. Body emit will dispatch with args[0]=0.
+                    //
+                    // The synth binding name `$zero_chain_dummy`
+                    // begins with `$`, which the lexer rejects as
+                    // an identifier-start character (lexer.rs:126
+                    // requires `is_ascii_alphabetic() || c == '_'`),
+                    // so the name cannot collide with any user-
+                    // declared parameter or local. Mirrors the
+                    // existing `$lambda_N` naming convention for
+                    // synthetic top-level fns.
                     if chain_length == 0 {
                         cps_continuation_synth.push(CpsContinuationSynth {
                             func_id: step_func_ids[0],
                             parent_fn_name: f.name.clone(),
                             kind: CpsContinuationKind::ChainedLetBindStep {
-                                binding_name: "__zero_chain_dummy__".to_string(),
+                                binding_name: "$zero_chain_dummy".to_string(),
                                 binding_ty: types::I64,
                                 binding_kind: EnvSlotKind::Int,
                                 captures: captures.clone(),
@@ -9443,27 +9471,23 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // (Final). The body emit's Phase 5 chain-body alloc
                 // (further below) builds the closure record correctly
                 // (captures + caller_k_pair). Phase 6 below detects
-                // this case and dispatches NextStep::Call directly to
-                // the synth-cont with a dummy arg, skipping the
-                // body_first_step Perform/CallCps emit. We synthesize
-                // a sentinel `body_first_step` value here that isn't
-                // actually used at Phase 6 in this case.
+                // this case (`body_first_step.is_none()`) and
+                // dispatches NextStep::Call directly to the synth-
+                // cont with a dummy arg, skipping the
+                // body_first_step Perform/CallCps emit. PR #97
+                // review nit: prefer `None` over a synthetic
+                // empty-effect sentinel `ChainedNextStep::Perform`,
+                // which would silently misbehave if any code path
+                // between Phase 4 and Phase 6 inspected the
+                // would-be-Perform's effect/op fields.
                 let is_zero_chain = synth_cont_idx_opt.is_some() && f.body.stmts.is_empty();
-                let (body_first_step, synth_cont_func_id_opt) =
-                    if is_zero_chain {
+                let (body_first_step, synth_cont_func_id_opt): (
+                    Option<ChainedNextStep>,
+                    Option<cranelift_module::FuncId>,
+                ) = if is_zero_chain {
                         let synth_cont_func_id =
                             cps_continuation_synth[synth_cont_idx_opt.unwrap()].func_id;
-                        // Sentinel — Phase 6 detects is_zero_chain
-                        // and bypasses this value.
-                        (
-                            ChainedNextStep::Perform(crate::ast::PerformExpr {
-                                effect: String::new(),
-                                op: String::new(),
-                                args: vec![],
-                                span: crate::errors::Span::synthetic("__zero_chain__"),
-                            }),
-                            Some(synth_cont_func_id),
-                        )
+                        (None, Some(synth_cont_func_id))
                     } else if let Some(idx) = synth_cont_idx_opt {
                         let step = match &f.body.stmts[0] {
                             crate::ast::Stmt::Perform(p) => ChainedNextStep::Perform(p.clone()),
@@ -9496,19 +9520,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             ),
                         };
                         let synth_cont_func_id = cps_continuation_synth[idx].func_id;
-                        (step, Some(synth_cont_func_id))
+                        (Some(step), Some(synth_cont_func_id))
                     } else {
                         let p = match &f.body.tail {
                             Some(crate::ast::Expr::Perform(p)) => p.clone(),
                             _ => unreachable!(
                                 "codegen Phase 4e: CPS-ABI fn `{}` body is not a \
                                  simple tail perform nor a yield-then-(constant|\
-                                 let-pure-tail) — `compute_user_fn_abi` invariant \
-                                 broken",
+                                 let-pure-tail) nor a chain_length=0 branched-cps-\
+                                 tail (Plan C Task 81) — `compute_user_fn_abi` \
+                                 invariant broken",
                                 f.name
                             ),
                         };
-                        (ChainedNextStep::Perform(p), None)
+                        (Some(ChainedNextStep::Perform(p)), None)
                     };
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 assert_cps_arity(&block_params, &format!("Cps body emit fn `{}`", f.name));
@@ -9939,7 +9964,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // Plan C Task 81 — chain_length=0 case: skip the
                 // body_first_step Perform/CallCps dispatch and emit
                 // a direct NextStep::Call to the synth-cont with a
-                // dummy arg (synth-cont binds `__zero_chain_dummy__`
+                // dummy arg (synth-cont binds `$zero_chain_dummy`
                 // which the tail doesn't reference). The closure
                 // record (k_closure_loaded) was allocated by Phase 5
                 // above with captures + caller_k_pair from body's
@@ -9990,7 +10015,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         .store(MemFlags::trusted(), identity_addr, argp_v, 16);
                     ns_ptr
                 } else {
-                    match &body_first_step {
+                    let body_first_step = body_first_step.as_ref().unwrap_or_else(|| {
+                        unreachable!(
+                            "codegen Phase 6: body_first_step is None outside of \
+                             chain_length=0 (is_zero_chain) path — internal invariant \
+                             broken; the is_zero_chain branch above should have \
+                             returned ns_ptr already"
+                        )
+                    });
+                    match body_first_step {
                     ChainedNextStep::Perform(body_perform) => {
                         // Resolve effect_id + op_id at fn entry.
                         let effect_id = match checked.effect_ids.get(&body_perform.effect) {
