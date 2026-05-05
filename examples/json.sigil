@@ -1,31 +1,22 @@
-// examples/json.sigil — Plan C Task 80.
+// examples/json.sigil — Plan C Task 80 (parts 1 + 2).
 //
-// **v1 scope: JSON pretty-printer.** Build a JSON value tree
-// directly in source, render to a `String` via `StringBuilder`
-// (Plan C Task 67) under the `Mem` effect. The companion parser
-// is deferred to a Task 80 part 2 — see the "v1 vs v2" note at
-// the end of this file.
+// **Full JSON pretty-printer + parser round-trip.**
 //
-// **What the demo exercises end-to-end.**
-//   - Recursive sum types (`JValue` + `JList` + `JObject`).
-//   - `StringBuilder` Mem-gated rope construction (Task 67).
-//   - String concatenation across a non-trivial document.
-//   - `int_to_string` numeric formatting.
-//   - Mutual recursion between print helpers.
+// Part 1 (printer) builds a JSON value tree directly in source,
+// renders to a `String` via `StringBuilder` (Plan C Task 67) under
+// the `Mem` effect.
 //
-// **JValue shape.** Subset of the full RFC 8259 model:
-//   - `JNull` — `null` literal.
-//   - `JBool(Bool)` — `true` / `false`.
-//   - `JInt(Int)` — integers within Sigil's 63-bit Int range.
-//   - `JString(String)` — string literal; v1 emits the bytes as
-//     received (no escape-sequence handling). Production code
-//     would route through a real escape encoder; deferred per
-//     the v1-vs-v2 note.
-//   - `JArray(JList)` / `JObject(JObject)` — recursive
-//     containers backed by cons-list helper types because Sigil
-//     v1 has no first-class tuple / association-list type.
+// Part 2 (parser) consumes a `ByteArray` and returns
+// `Result[JValue, String]`, with cursor position managed via
+// `State[Int]` (Plan C Task 72) and `Raise[String]` short-
+// circuiting on malformed input.  `parse(b)` composes
+// `run_state(0, ...)` + `catch(...)` to discharge both effects,
+// returning `Result[JValue, String] ![]`.
 
 import std.string_builder
+import std.raise
+import std.result
+import std.state
 
 type JValue =
   | JNull
@@ -43,10 +34,8 @@ type JObject =
   | JONil
   | JOCons(String, JValue, JObject)
 
-// `print_value` appends `v`'s JSON encoding to `sb`. Unit-returning
-// (`![Mem]`) — the SB carries the running document. Each match arm
-// returns Unit via either an `sb_append` call or a recursion into
-// another Unit-returning helper.
+// ===== Pretty-printer (Task 80 part 1) =====
+
 fn print_value(sb: StringBuilder, v: JValue) -> Unit ![Mem] {
   match v {
     JNull => sb_append(sb, "null"),
@@ -74,11 +63,6 @@ fn print_array(sb: StringBuilder, xs: JList) -> Unit ![Mem] {
   sb_append(sb, "]")
 }
 
-// `print_list_head` handles the first element with no leading
-// separator; the recursive `print_list_tail` prepends `, ` before
-// each subsequent element. Splitting the head case avoids a
-// `first: Bool` accumulator argument and the Unit-literal-on-true
-// subcase that v1 syntax can't express directly.
 fn print_list_head(sb: StringBuilder, xs: JList) -> Unit ![Mem] {
   match xs {
     JLNil => sb_append(sb, ""),
@@ -133,16 +117,352 @@ fn print_field(sb: StringBuilder, name: String, v: JValue) -> Unit ![Mem] {
   print_value(sb, v)
 }
 
-// `to_string(v)` is the user-facing entry point: build a fresh
-// SB, render `v` into it, finalize.
 fn to_string(v: JValue) -> String ![Mem] {
   let sb: StringBuilder = sb_new();
   print_value(sb, v);
   sb_finalize(sb)
 }
 
-// Build a representative JSON document:
-//   {"name": "ada", "age": 36, "tags": ["math", "programming"], "active": true, "spouse": null}
+// ===== Parser (Task 80 part 2) — State[Int] recursive descent =====
+
+fn byte_at_or_neg1(b: ByteArray, pos: Int) -> Int ![] {
+  if pos >= byte_array_length(b) {
+    -1
+  } else {
+    if pos < 0 {
+      -1
+    } else {
+      byte_to_int(byte_array_get(b, pos))
+    }
+  }
+}
+
+fn at_eof(b: ByteArray, pos: Int) -> Bool ![] {
+  if pos >= byte_array_length(b) {
+    true
+  } else {
+    false
+  }
+}
+
+fn is_ws(c: Int) -> Bool ![] {
+  if c == 32 {
+    true
+  } else {
+    if c == 9 {
+      true
+    } else {
+      if c == 10 {
+        true
+      } else {
+        if c == 13 {
+          true
+        } else {
+          false
+        }
+      }
+    }
+  }
+}
+
+fn is_digit(c: Int) -> Bool ![] {
+  if c < 48 {
+    false
+  } else {
+    if c > 57 {
+      false
+    } else {
+      true
+    }
+  }
+}
+
+fn skip_ws(b: ByteArray) -> Int ![State[Int]] {
+  let pos: Int = perform State.get();
+  let c: Int = byte_at_or_neg1(b, pos);
+  if is_ws(c) {
+    let _ws: Int = perform State.set(pos + 1);
+    skip_ws(b)
+  } else {
+    0
+  }
+}
+
+fn match_keyword_loop(b: ByteArray, kw_bytes: ByteArray, base: Int, i: Int, kw_len: Int) -> Bool ![] {
+  if i == kw_len {
+    true
+  } else {
+    if base + i >= byte_array_length(b) {
+      false
+    } else {
+      let bb: Int = byte_to_int(byte_array_get(b, base + i));
+      let kb: Int = byte_to_int(byte_array_get(kw_bytes, i));
+      if bb == kb {
+        match_keyword_loop(b, kw_bytes, base, i + 1, kw_len)
+      } else {
+        false
+      }
+    }
+  }
+}
+
+fn is_keyword(b: ByteArray, pos: Int, kw: String) -> Bool ![] {
+  let kw_bytes: ByteArray = string_to_bytes(kw);
+  let kw_len: Int = byte_array_length(kw_bytes);
+  match_keyword_loop(b, kw_bytes, pos, 0, kw_len)
+}
+
+fn kw_len(kw: String) -> Int ![] {
+  byte_array_length(string_to_bytes(kw))
+}
+
+fn scan_string_end(b: ByteArray, i: Int) -> Int ![Raise[String]] {
+  if i >= byte_array_length(b) {
+    raise("unterminated string")
+  } else {
+    if byte_to_int(byte_array_get(b, i)) == 34 {
+      i
+    } else {
+      scan_string_end(b, i + 1)
+    }
+  }
+}
+
+fn parse_string_inner(b: ByteArray) -> String ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  let end: Int = scan_string_end(b, pos + 1);
+  let _adv: Int = perform State.set(end + 1);
+  let slice: ByteArray = byte_array_slice(b, pos + 1, end);
+  let s: String = string_from_bytes_alloc(slice);
+  s
+}
+
+fn parse_string_value(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let s: String = parse_string_inner(b);
+  JString(s)
+}
+
+fn parse_digits(b: ByteArray, acc: Int, started: Bool) -> Int ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  let c: Int = byte_at_or_neg1(b, pos);
+  if is_digit(c) {
+    let _adv: Int = perform State.set(pos + 1);
+    parse_digits(b, acc * 10 + (c - 48), true)
+  } else {
+    if started {
+      acc
+    } else {
+      raise("expected number")
+    }
+  }
+}
+
+fn parse_negative_int(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let n: Int = parse_digits(b, 0, false);
+  JInt(0 - n)
+}
+
+fn parse_positive_int(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let n: Int = parse_digits(b, 0, false);
+  JInt(n)
+}
+
+fn parse_number(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  let c: Int = byte_at_or_neg1(b, pos);
+  if c == 45 {
+    let _adv: Int = perform State.set(pos + 1);
+    parse_negative_int(b)
+  } else {
+    parse_positive_int(b)
+  }
+}
+
+fn parse_value(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let _ws0: Int = skip_ws(b);
+  let pos: Int = perform State.get();
+  let c: Int = byte_at_or_neg1(b, pos);
+  if c == -1 {
+    raise("unexpected end of input")
+  } else {
+    if c == 110 {
+      if is_keyword(b, pos, "null") {
+        let _sn: Int = perform State.set(pos + kw_len("null"));
+        JNull
+      } else {
+        raise("expected null")
+      }
+    } else {
+      if c == 116 {
+        if is_keyword(b, pos, "true") {
+          let _st: Int = perform State.set(pos + kw_len("true"));
+          JBool(true)
+        } else {
+          raise("expected true")
+        }
+      } else {
+        if c == 102 {
+          if is_keyword(b, pos, "false") {
+            let _sf: Int = perform State.set(pos + kw_len("false"));
+            JBool(false)
+          } else {
+            raise("expected false")
+          }
+        } else {
+          if c == 34 {
+            parse_string_value(b)
+          } else {
+            if c == 91 {
+              parse_array(b)
+            } else {
+              if c == 123 {
+                parse_object(b)
+              } else {
+                if c == 45 {
+                  parse_number(b)
+                } else {
+                  if is_digit(c) {
+                    parse_number(b)
+                  } else {
+                    raise("unexpected character")
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_array(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  let _sa: Int = perform State.set(pos + 1);
+  let _ws1: Int = skip_ws(b);
+  let p1: Int = perform State.get();
+  if byte_at_or_neg1(b, p1) == 93 {
+    let _sc: Int = perform State.set(p1 + 1);
+    JArray(JLNil)
+  } else {
+    parse_array_body(b)
+  }
+}
+
+fn parse_array_body(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let items: JList = parse_array_elems(b);
+  JArray(items)
+}
+
+fn parse_array_elems(b: ByteArray) -> JList ![State[Int], Raise[String]] {
+  let v: JValue = parse_value(b);
+  let _ws2: Int = skip_ws(b);
+  let pos: Int = perform State.get();
+  let c: Int = byte_at_or_neg1(b, pos);
+  if c == 44 {
+    let _s1: Int = perform State.set(pos + 1);
+    parse_array_elems_tail(b, v)
+  } else {
+    if c == 93 {
+      let _s2: Int = perform State.set(pos + 1);
+      JLCons(v, JLNil)
+    } else {
+      raise("expected , or ] in array")
+    }
+  }
+}
+
+fn parse_array_elems_tail(b: ByteArray, head: JValue) -> JList ![State[Int], Raise[String]] {
+  let rest: JList = parse_array_elems(b);
+  JLCons(head, rest)
+}
+
+fn parse_object(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  let _so: Int = perform State.set(pos + 1);
+  let _ws3: Int = skip_ws(b);
+  let p1: Int = perform State.get();
+  if byte_at_or_neg1(b, p1) == 125 {
+    let _sc2: Int = perform State.set(p1 + 1);
+    JObject(JONil)
+  } else {
+    parse_object_body(b)
+  }
+}
+
+fn parse_object_body(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let fields: JObject = parse_object_fields(b);
+  JObject(fields)
+}
+
+fn parse_object_fields(b: ByteArray) -> JObject ![State[Int], Raise[String]] {
+  let _ws4: Int = skip_ws(b);
+  let pos: Int = perform State.get();
+  if byte_at_or_neg1(b, pos) == 34 {
+    parse_object_field_entry(b)
+  } else {
+    raise("expected field name string in object")
+  }
+}
+
+fn parse_object_field_entry(b: ByteArray) -> JObject ![State[Int], Raise[String]] {
+  let name: String = parse_string_inner(b);
+  let _ws5: Int = skip_ws(b);
+  let pos: Int = perform State.get();
+  let colon: Int = byte_at_or_neg1(b, pos);
+  if colon == 58 {
+    let _sc3: Int = perform State.set(pos + 1);
+    parse_object_field_value(b, name)
+  } else {
+    raise("expected ':' after field name")
+  }
+}
+
+fn parse_object_field_value(b: ByteArray, name: String) -> JObject ![State[Int], Raise[String]] {
+  let v: JValue = parse_value(b);
+  let _ws6: Int = skip_ws(b);
+  let pos: Int = perform State.get();
+  let nx: Int = byte_at_or_neg1(b, pos);
+  if nx == 44 {
+    let _s3: Int = perform State.set(pos + 1);
+    parse_object_fields_tail(b, name, v)
+  } else {
+    if nx == 125 {
+      let _s4: Int = perform State.set(pos + 1);
+      JOCons(name, v, JONil)
+    } else {
+      raise("expected , or } in object")
+    }
+  }
+}
+
+fn parse_object_fields_tail(b: ByteArray, name: String, v: JValue) -> JObject ![State[Int], Raise[String]] {
+  let rest: JObject = parse_object_fields(b);
+  JOCons(name, v, rest)
+}
+
+fn parse_body(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let v: JValue = parse_value(b);
+  let _ws7: Int = skip_ws(b);
+  let pos: Int = perform State.get();
+  if at_eof(b, pos) {
+    v
+  } else {
+    raise("trailing characters after JSON value")
+  }
+}
+
+fn parse(b: ByteArray) -> Result[JValue, String] ![] {
+  let result: (Result[JValue, String], Int) = run_state(0, fn () -> Result[JValue, String] ![State[Int]] => {
+    catch(fn () -> JValue ![Raise[String], State[Int]] => {
+      parse_body(b)
+    })
+  });
+  match result { (r, _pos) => r }
+}
+
+// ===== Demo + round-trip =====
+
 fn build_demo() -> JValue ![] {
   let tags: JValue = JArray(
     JLCons(JString("math"),
@@ -158,37 +478,19 @@ fn build_demo() -> JValue ![] {
   JObject(fields)
 }
 
-fn main() -> Int ![IO, Mem] {
-  let doc: JValue = build_demo();
-  let rendered: String = to_string(doc);
-  perform IO.println(rendered);
-  0
+fn roundtrip(v: JValue) -> String ![Mem] {
+  let s1: String = to_string(v);
+  let bytes: ByteArray = string_to_bytes(s1);
+  let parsed: Result[JValue, String] = parse(bytes);
+  match parsed {
+    Ok(v2) => to_string(v2),
+    Err(msg) => string_concat("PARSE ERROR: ", msg),
+  }
 }
 
-// ## v1 vs v2
-//
-// **Parser deferred to Task 80 part 2.** A correct JSON parser
-// requires position tracking (current byte index into a
-// `ByteArray`). The natural Sigil v1 expression of "stateful
-// position" is the `State` effect (`std/state.sigil`, Plan C
-// Task 72), but `[DEVIATION Task 72]` constraint #3 — the
-// wrapper-fn-frame composition gap — bites a recursive descent
-// parser the moment a non-trivial helper inlines `perform
-// State.get()` / `perform State.set(...)`. The codegen-side
-// fixes for that gap are tracked under the planned "Plan D"
-// architectural slice; once it lands, the parser can ship as
-// `parse(b: ByteArray) -> Result[JValue, String] ![]`.
-//
-// **JFloat / JInt64 deferred.** Plan body distinguishes
-// numeric ranges via `JInt` / `JInt64` / `JFloat`. v1 ships
-// `JInt` only — `Float` is not yet a v1 type, and the JInt64
-// surface lights up cleanly once the parser's numeric scanner
-// arrives (it can dispatch on overflow at parse time). Boxed
-// `Int64` runtime support shipped in Task 69 so the parser side
-// has the type ready when it lands.
-//
-// **Escape encoding.** `JString`'s rendering currently emits
-// the input bytes verbatim between `"`s. RFC 8259 mandates
-// escaping `"`, `\`, and control characters; production output
-// would route through a real escape encoder. The same Task 80
-// part 2 closure ships the encoder alongside the parser.
+fn main() -> Int ![IO, Mem] {
+  let doc: JValue = build_demo();
+  let round: String = roundtrip(doc);
+  perform IO.println(round);
+  0
+}

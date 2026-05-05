@@ -2578,6 +2578,11 @@ struct HandlerArmSynth {
     /// outside the arm body still wrap the body's value via the
     /// handle's return arm).
     handle_span: Span,
+    /// Effect ID for the effect this arm belongs to. Used by the
+    /// arm body emit to store the discharging effect's ID into
+    /// `terminal_out.effect_id` so nested handle expressions can
+    /// distinguish own-effect vs foreign-effect discharges.
+    effect_id: u32,
 }
 
 /// Plan B Task 55 (Phase 4g) — per-`Expr::Handle` return-arm synthetic
@@ -3324,7 +3329,297 @@ enum ChainStepRole {
         /// may reference captures, prior chain bindings, and earlier
         /// tail-prefix lets.
         tail_prefix_lets: Vec<TailPrefixLet>,
+        /// Branch-chain synth-cont allocations for PerformChain
+        /// branches in the branched tail. Each entry corresponds to
+        /// one PerformChain branch encountered in DFS order during
+        /// pre-pass traversal. The emit consumes entries via a cursor
+        /// incremented each time a PerformChain leaf is processed.
+        branch_chains: Vec<BranchChainAlloc>,
     },
+    /// Last step of a branch-chain: dispatches a single inner leaf
+    /// (Pure/CpsCall/Perform). Unlike `Final` which evaluates a
+    /// branched tail with Pattern C detection, this role handles
+    /// the post-yield tail of a branch body directly.
+    BranchLeafFinal {
+        tail_expr: Box<crate::ast::Expr>,
+        tail_ty: Type,
+        inner_leaf_kind: BranchedCpsLeaf,
+        tail_prefix_lets: Vec<TailPrefixLet>,
+    },
+}
+
+/// Pre-pass allocation for a branch body containing yields (performs
+/// or CpsCall) before its inner leaf. The emit uses this to route
+/// the branch's first yield through a branch-chain synth-cont.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct BranchChainAlloc {
+    /// FuncIds for each step in the branch chain.
+    step_func_ids: Vec<cranelift_module::FuncId>,
+    /// Per-step yield kind.
+    steps: Vec<ChainedNextStep>,
+    /// Per-step binding info.
+    binding_names: Vec<String>,
+    binding_tys: Vec<Type>,
+    binding_kinds: Vec<EnvSlotKind>,
+    /// Pure lets after the last yield, before the inner tail.
+    inner_tail_prefix_lets: Vec<TailPrefixLet>,
+    /// Captures needed by all branch steps.
+    captures: Vec<SynthContCapture>,
+}
+
+/// Walk a branched tail expression (the tail of a Pattern C body)
+/// and collect `BranchChainAlloc` entries for every `PerformChain`
+/// branch, in DFS order matching the emit's work-stack traversal.
+/// For each PerformChain branch found, declares synth-cont FuncIds
+/// and pushes CpsContinuationSynth entries for the branch chain steps.
+#[allow(clippy::too_many_arguments)]
+fn collect_branch_chain_allocs(
+    tail_expr: &crate::ast::Expr,
+    body_captures: &[SynthContCapture],
+    body_binding_names: &[String],
+    body_binding_kinds: &[EnvSlotKind],
+    body_tail_prefix_lets: &[TailPrefixLet],
+    return_type: &crate::ast::TypeExpr,
+    parent_fn_name: &str,
+    pointer_ty: Type,
+    ctors: &std::collections::BTreeSet<String>,
+    is_supported: &impl Fn(&str) -> bool,
+    synth_cont_sig: &cranelift::codegen::ir::Signature,
+    module: &mut ObjectModule,
+    cps_continuation_synth: &mut Vec<CpsContinuationSynth>,
+) -> Result<Vec<BranchChainAlloc>, String> {
+    let mut allocs: Vec<BranchChainAlloc> = Vec::new();
+
+    // DFS work-stack mirroring the emit's traversal order.
+    // Each entry: (block stmts, block tail, leaf kind).
+    let mut work: Vec<(&[crate::ast::Stmt], &crate::ast::Expr, BranchedCpsLeaf)> = Vec::new();
+
+    // Seed from the tail expression's top-level branches.
+    seed_branch_work(tail_expr, ctors, is_supported, &mut work);
+
+    while let Some((stmts, tail, leaf_kind)) = work.pop() {
+        match leaf_kind {
+            BranchedCpsLeaf::Nested => {
+                seed_branch_work(tail, ctors, is_supported, &mut work);
+            }
+            BranchedCpsLeaf::PerformChain => {
+                // Extract yields and inner tail from this branch body.
+                let mut branch_steps: Vec<ChainedNextStep> = Vec::new();
+                let mut branch_binding_names: Vec<String> = Vec::new();
+                let mut branch_binding_tys: Vec<Type> = Vec::new();
+                let mut branch_binding_kinds: Vec<EnvSlotKind> = Vec::new();
+                let mut inner_tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
+                let mut seen_yield = false;
+
+                for stmt in stmts {
+                    if let crate::ast::Stmt::Let(l) = stmt {
+                        match &l.value {
+                            crate::ast::Expr::Perform(p) => {
+                                branch_steps.push(ChainedNextStep::Perform(p.clone()));
+                                branch_binding_names.push(l.name.clone());
+                                branch_binding_tys
+                                    .push(cranelift_ty_for_type_expr(&l.ty, pointer_ty));
+                                branch_binding_kinds.push(slot_kind_for_type_expr_post_mono(&l.ty));
+                                seen_yield = true;
+                            }
+                            _ => {
+                                if seen_yield {
+                                    inner_tail_prefix_lets.push(TailPrefixLet {
+                                        name: l.name.clone(),
+                                        ty: cranelift_ty_for_type_expr(&l.ty, pointer_ty),
+                                        kind: slot_kind_for_type_expr_post_mono(&l.ty),
+                                        value: l.value.clone(),
+                                    });
+                                }
+                                // Pure lets before first yield: also
+                                // treated as inner_tail_prefix_lets for
+                                // the branch chain's final step.
+                                if !seen_yield {
+                                    inner_tail_prefix_lets.push(TailPrefixLet {
+                                        name: l.name.clone(),
+                                        ty: cranelift_ty_for_type_expr(&l.ty, pointer_ty),
+                                        kind: slot_kind_for_type_expr_post_mono(&l.ty),
+                                        value: l.value.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Conservative captures: all body captures + all
+                // body chain bindings + body-level tail-prefix-lets
+                // (all available in the body chain's last step env).
+                let mut branch_captures: Vec<SynthContCapture> = body_captures.to_vec();
+                for (i, name) in body_binding_names.iter().enumerate() {
+                    branch_captures.push(SynthContCapture {
+                        name: name.clone(),
+                        kind: body_binding_kinds[i],
+                    });
+                }
+                for tpl in body_tail_prefix_lets {
+                    branch_captures.push(SynthContCapture {
+                        name: tpl.name.clone(),
+                        kind: tpl.kind,
+                    });
+                }
+
+                let branch_yield_count = branch_steps.len();
+                assert!(
+                    branch_yield_count > 0,
+                    "PerformChain leaf with 0 yields in branch chain alloc"
+                );
+
+                // Declare FuncIds for the branch chain steps.
+                let base_idx = cps_continuation_synth.len();
+                let mut branch_func_ids: Vec<cranelift_module::FuncId> =
+                    Vec::with_capacity(branch_yield_count);
+                for i in 0..branch_yield_count {
+                    let global_idx = base_idx + i;
+                    let name = format!("sigil_post_yield_cont_{global_idx}");
+                    let func_id = module
+                        .declare_function(&name, Linkage::Local, synth_cont_sig)
+                        .map_err(|e| format!("declare {name}: {e}"))?;
+                    branch_func_ids.push(func_id);
+                }
+
+                // Classify the inner tail to determine the last
+                // step's dispatch kind.
+                let inner_leaf_kind =
+                    classify_branched_cps_tail_branch_expr(tail, ctors, is_supported)
+                        .unwrap_or(BranchedCpsLeaf::Pure);
+
+                let inner_tail_ty = cranelift_ty_for_type_expr(return_type, pointer_ty);
+
+                // Register synth-cont entries for each branch step.
+                for step in 0..branch_yield_count {
+                    let prior_bindings: Vec<ChainedPriorBinding> = (0..step)
+                        .map(|j| ChainedPriorBinding {
+                            name: branch_binding_names[j].clone(),
+                            kind: branch_binding_kinds[j],
+                        })
+                        .collect();
+                    let role = if step + 1 < branch_yield_count {
+                        ChainStepRole::Middle {
+                            next_step: branch_steps[step + 1].clone(),
+                            next_step_func_id: branch_func_ids[step + 1],
+                        }
+                    } else {
+                        ChainStepRole::BranchLeafFinal {
+                            tail_expr: Box::new(tail.clone()),
+                            tail_ty: inner_tail_ty,
+                            inner_leaf_kind,
+                            tail_prefix_lets: inner_tail_prefix_lets.clone(),
+                        }
+                    };
+                    cps_continuation_synth.push(CpsContinuationSynth {
+                        func_id: branch_func_ids[step],
+                        parent_fn_name: parent_fn_name.to_string(),
+                        kind: CpsContinuationKind::ChainedLetBindStep {
+                            binding_name: branch_binding_names[step].clone(),
+                            binding_ty: branch_binding_tys[step],
+                            binding_kind: branch_binding_kinds[step],
+                            captures: branch_captures.clone(),
+                            prior_bindings,
+                            role,
+                            prior_was_call_cps: false,
+                        },
+                    });
+                }
+
+                allocs.push(BranchChainAlloc {
+                    step_func_ids: branch_func_ids,
+                    steps: branch_steps,
+                    binding_names: branch_binding_names,
+                    binding_tys: branch_binding_tys,
+                    binding_kinds: branch_binding_kinds,
+                    inner_tail_prefix_lets,
+                    captures: branch_captures,
+                });
+            }
+            _ => {} // Pure, CpsCall, Perform — no branch chain needed
+        }
+    }
+    Ok(allocs)
+}
+
+/// Seed the DFS work-stack for branch-chain collection from a
+/// branched tail expression (If or Bool-Match). Pushes entries
+/// in reverse order so the first branch is popped first (matching
+/// the emit's work-stack discipline).
+fn seed_branch_work<'a>(
+    tail: &'a crate::ast::Expr,
+    ctors: &std::collections::BTreeSet<String>,
+    is_supported: &impl Fn(&str) -> bool,
+    work: &mut Vec<(
+        &'a [crate::ast::Stmt],
+        &'a crate::ast::Expr,
+        BranchedCpsLeaf,
+    )>,
+) {
+    use crate::ast::{Expr, Pattern};
+    match tail {
+        Expr::If {
+            then_block,
+            else_block,
+            ..
+        } => {
+            let then_kind = classify_branched_cps_tail_branch(then_block, ctors, is_supported);
+            let else_kind = classify_branched_cps_tail_branch(else_block, ctors, is_supported);
+            if let (Some(tk), Some(ek)) = (then_kind, else_kind) {
+                // Push else first, then then — so then is popped first.
+                if let Some(et) = else_block.tail.as_ref() {
+                    work.push((else_block.stmts.as_slice(), et, ek));
+                }
+                if let Some(tt) = then_block.tail.as_ref() {
+                    work.push((then_block.stmts.as_slice(), tt, tk));
+                }
+            }
+        }
+        Expr::Match { arms, .. } if arms.len() == 2 => {
+            let extract_bool = |p: &Pattern| -> Option<bool> {
+                if let Pattern::BoolLit(b, _) = p {
+                    Some(*b)
+                } else {
+                    None
+                }
+            };
+            if let (Some(a0), Some(a1)) = (
+                extract_bool(&arms[0].pattern),
+                extract_bool(&arms[1].pattern),
+            ) {
+                if a0 != a1 {
+                    let (then_arm, else_arm) = if a0 {
+                        (&arms[0], &arms[1])
+                    } else {
+                        (&arms[1], &arms[0])
+                    };
+                    let extract_arm =
+                        |body: &'a Expr| -> Option<(&'a [crate::ast::Stmt], &'a Expr)> {
+                            if let Expr::Block(b) = body {
+                                Some((b.stmts.as_slice(), b.tail.as_ref()?))
+                            } else {
+                                Some((&[], body))
+                            }
+                        };
+                    let then_kind =
+                        classify_branched_cps_tail_branch_expr(&then_arm.body, ctors, is_supported);
+                    let else_kind =
+                        classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_supported);
+                    if let (Some(tk), Some(ek)) = (then_kind, else_kind) {
+                        if let Some((es, et)) = extract_arm(&else_arm.body) {
+                            work.push((es, et, ek));
+                        }
+                        if let Some((ts, tt)) = extract_arm(&then_arm.body) {
+                            work.push((ts, tt, tk));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Plan C Task 81 — one pure `Stmt::Let` intermediate that appears
@@ -4700,6 +4995,11 @@ struct ArmSynthCtx<'a> {
     /// map answers, falling back to the span-keyed source on full
     /// miss. Mirrors `Lowerer::lookup_call_callee_ty`.
     hoisted_lambda_parent_clone: &'a BTreeMap<String, String>,
+    /// Effect name → numeric effect_id map. Used by the arm pre-pass
+    /// to record the effect_id on each `HandlerArmSynth` so the arm
+    /// body emit can store it into `terminal_out.effect_id` on the
+    /// DISCHARGED path.
+    effect_ids: &'a BTreeMap<String, u32>,
 }
 
 struct CollectMut<'a> {
@@ -5157,6 +5457,14 @@ fn collect_handle_arms_in_expr(
                     None
                 };
 
+                let arm_effect_id = match ctx.effect_ids.get(&arm.effect).copied() {
+                    Some(id) => id,
+                    None => unreachable!(
+                        "codegen pre-pass: effect `{}` missing from effect_ids \
+                         — typecheck should have caught this",
+                        arm.effect
+                    ),
+                };
                 out.synth.push(HandlerArmSynth {
                     func_id,
                     body: rewritten_body,
@@ -5168,6 +5476,7 @@ fn collect_handle_arms_in_expr(
                     post_arm_k,
                     post_arm_k_chain,
                     handle_span: span.clone(),
+                    effect_id: arm_effect_id,
                 });
                 arm_indices.push(global_idx);
             }
@@ -7547,6 +7856,30 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_handle_pop", Linkage::Import, &handle_pop_sig)
         .map_err(|e| format!("declare sigil_handle_pop: {e}"))?;
 
+    // sigil_repush_crossed_frames(target_frame: *mut HandlerFrame) -> u32
+    let mut repush_crossed_sig = Signature::new(isa_call_conv(&module));
+    repush_crossed_sig.params.push(AbiParam::new(pointer_ty));
+    repush_crossed_sig.returns.push(AbiParam::new(types::I32));
+    let repush_crossed_frames = module
+        .declare_function(
+            "sigil_repush_crossed_frames",
+            Linkage::Import,
+            &repush_crossed_sig,
+        )
+        .map_err(|e| format!("declare sigil_repush_crossed_frames: {e}"))?;
+
+    // sigil_pop_crossed_frames(count: u32, terminal_out: *mut TerminalResult)
+    let mut pop_crossed_sig = Signature::new(isa_call_conv(&module));
+    pop_crossed_sig.params.push(AbiParam::new(types::I32));
+    pop_crossed_sig.params.push(AbiParam::new(pointer_ty));
+    let pop_crossed_frames = module
+        .declare_function(
+            "sigil_pop_crossed_frames",
+            Linkage::Import,
+            &pop_crossed_sig,
+        )
+        .map_err(|e| format!("declare sigil_pop_crossed_frames: {e}"))?;
+
     // Plan B Task 55 (Phase 3b) — three more handler-ABI imports.
     //
     // sigil_handler_frame_set_arm(frame, op_id: u32,
@@ -8064,8 +8397,29 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // shim wastes ~100 bytes of object code per Cps fn.
             // closure_convert tracks the witnessed-as-value set;
             // skip emission for fns not in it.
-            let shim_needed =
-                abi == UserFnAbi::Cps && cc.top_level_fn_names_seen_as_value.contains(&f.name);
+            //
+            // **Lifted-lambda widening (Plan C followup, JSON parser
+            // unblock):** synthetic `$lambda_N` fns are created by
+            // closure_convert from `Expr::Lambda` nodes; their entry
+            // into the program is via the lambda's `ClosureRecord`
+            // node, not via an `Ident(top_level_fn)` materialization.
+            // They never end up in `top_level_fn_names_seen_as_value`
+            // (which tracks user-named top-level fns taken as values).
+            // Without this widening, a lifted lambda whose body has
+            // effects (`fn () -> Int ![S] => { ... }`) takes the
+            // `UserFnAbi::Cps` body but the no-shim path makes
+            // `lower_closure_record` write its raw Cps func_addr into
+            // the closure record's code_ptr slot — and every indirect
+            // call site builds a Sync-signature `call_indirect` (per
+            // PR #90 R1 issue 4 invariant), producing a silent ABI
+            // mismatch at runtime: args pop wrong, the trampoline
+            // never drives, and the lambda's chained-let-yield body
+            // appears to "return the first perform's resumed value"
+            // instead of the post-perform tail. Every Cps-ABI synth
+            // lambda needs a Sync shim, unconditionally.
+            let is_synth_lambda = f.name.starts_with("$lambda_");
+            let shim_needed = abi == UserFnAbi::Cps
+                && (cc.top_level_fn_names_seen_as_value.contains(&f.name) || is_synth_lambda);
             if shim_needed {
                 let mut shim_sig = Signature::new(isa_call_conv(&module));
                 shim_sig.params.push(AbiParam::new(pointer_ty));
@@ -8298,15 +8652,31 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // index pattern to avoid collisions with user
                     // fns or other synth-conts.
                     let synth_cont_sig = cps_signature(pointer_ty, &module);
+
+                    // Branch-chain allocation FIRST: walk the branched
+                    // tail to find PerformChain branches. For each,
+                    // allocate synth-cont FuncIds and register
+                    // CpsContinuationSynth entries. These must be
+                    // pushed before body chain entries so that
+                    // starting_idx (computed below) correctly points
+                    // at the body chain's first entry.
+                    let branch_chains = collect_branch_chain_allocs(
+                        &tail_expr,
+                        &captures,
+                        &binding_names,
+                        &binding_kinds,
+                        &tail_prefix_lets,
+                        &f.return_type,
+                        &f.name,
+                        pointer_ty,
+                        &ctors,
+                        &|n: &str| is_supported_cps_user_fn(n, &fns_by_name, &cc.colored, &ctors),
+                        &synth_cont_sig,
+                        &mut module,
+                        &mut cps_continuation_synth,
+                    )?;
+
                     let starting_idx = cps_continuation_synth.len();
-                    // Plan C Task 81 — chain_length=0 case: 0-stmt body
-                    // with branched-cps tail. Allocate ONE synth-cont
-                    // (Final role). Body emit dispatches it directly
-                    // with a dummy arg + caller_k_pair forwarded via
-                    // the closure record. Synth-cont's FINAL emit
-                    // binds the dummy under `$zero_chain_dummy`
-                    // (which the tail won't reference) and emits the
-                    // branched-tail dispatch as usual.
                     let effective_step_count = if chain_length == 0 { 1 } else { chain_length };
                     let mut step_func_ids: Vec<cranelift_module::FuncId> =
                         Vec::with_capacity(effective_step_count);
@@ -8345,6 +8715,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     tail_expr: Box::new(tail_expr.clone()),
                                     tail_ty,
                                     tail_prefix_lets: tail_prefix_lets.clone(),
+                                    branch_chains: branch_chains.clone(),
                                 },
                                 prior_was_call_cps: false,
                             },
@@ -8375,6 +8746,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 tail_expr: Box::new(tail_expr.clone()),
                                 tail_ty,
                                 tail_prefix_lets: tail_prefix_lets.clone(),
+                                branch_chains: branch_chains.clone(),
                             }
                         };
                         // Plan D Task 112 — `prior_was_call_cps` flag
@@ -8463,6 +8835,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handle_body_ty_resolved: &cc.colored.mono.handle_body_ty_resolved,
                     current_fn_name: &f.name,
                     hoisted_lambda_parent_clone: &cc.hoisted_lambda_parent_clone,
+                    effect_ids: &checked.effect_ids,
                 };
                 collect_handle_arms_in_block(
                     &f.body,
@@ -8608,6 +8981,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         body_return_arm_push_mask_if_needed,
         body_return_arm_pop_if_flag,
         done_or_dispatch_return_arm,
+        repush_crossed_frames,
+        pop_crossed_frames,
         handler_arm_indices: &handler_arm_indices,
         handler_arm_synth: &handler_arm_synth,
         handler_return_arm_synth: &handler_return_arm_synth,
@@ -8668,6 +9043,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 user_fn_refs,
                 sync_shim_refs,
                 lit_gvs,
+                repush_crossed_frames_ref,
+                pop_crossed_frames_ref,
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
             // Plan B Task 55, Phase 4e — branch on the per-fn ABI
@@ -8944,6 +9321,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         effect_ids: &checked.effect_ids,
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
+                        arm_effect_id: None,
+                        repush_crossed_frames_ref,
+                        pop_crossed_frames_ref,
                         user_fn_refs,
                         sync_shim_refs,
                         user_fns: &user_fns,
@@ -10003,6 +10383,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
+                    arm_effect_id: None,
+                    repush_crossed_frames_ref,
+                    pop_crossed_frames_ref,
                     user_fn_refs,
                     sync_shim_refs,
                     user_fns: &user_fns,
@@ -10432,6 +10815,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
+                arm_effect_id: None,
+                repush_crossed_frames_ref,
+                pop_crossed_frames_ref,
                 user_fn_refs,
                 sync_shim_refs,
                 user_fns: &user_fns,
@@ -10696,7 +11082,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         // pre-first-terminal codepath.
         let null_closure = builder.ins().iconst(pointer_ty, 0);
         let terminal_slot =
-            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3));
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3));
         let terminal_out_v = builder.ins().stack_addr(pointer_ty, terminal_slot, 0);
         let um_call = builder
             .ins()
@@ -10825,6 +11211,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     user_fn_refs,
                     sync_shim_refs,
                     lit_gvs,
+                    repush_crossed_frames_ref,
+                    pop_crossed_frames_ref,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 // Block params: 0 = closure_ptr (null in Phase 4c),
@@ -10965,6 +11353,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
+                    arm_effect_id: None,
+                    repush_crossed_frames_ref,
+                    pop_crossed_frames_ref,
                     user_fn_refs,
                     sync_shim_refs,
                     user_fns: &user_fns,
@@ -11030,6 +11421,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // Slice C / Slice B / tail-k / discharged paths
                 // below — the detector
                 // [`arm_body_needs_branched_routing`] gates entry.
+                lowerer.arm_effect_id = Some(synth.effect_id);
                 let next_step_ptr = if arm_body_needs_branched_routing(&synth.body, &synth.k_name) {
                     lowerer.lower_arm_body_to_next_step(
                         &synth.body,
@@ -11692,14 +12084,22 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // previously TLS); the handle expression's outer
                     // codegen logic loads the tag from the slot and
                     // skips the return arm dispatch.
-                    // Pre-Stage-6.8-followup,
-                    // this site emitted `next_step_done`, which let
-                    // the unconditional return arm dispatch in the
-                    // handle's outer logic apply the return clause
-                    // to a value of type R (handle's overall) as if
-                    // it were type B (body's type) — type-unsound
-                    // when B ≠ R, surfacing as a heap-pointer-shaped
-                    // value in run_state-style programs.
+                    //
+                    // Store the discharging effect's ID into
+                    // `terminal_out.effect_id` so nested handle
+                    // expressions can distinguish own-effect
+                    // discharge (restore snapshot) from foreign-
+                    // effect discharge (propagate to outer handle).
+                    let effect_id_const = lowerer
+                        .builder
+                        .ins()
+                        .iconst(types::I64, synth.effect_id as i64);
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        effect_id_const,
+                        lowerer.terminal_out_param,
+                        TERMINAL_RESULT_EFFECT_ID_OFF,
+                    );
                     let done_call = lowerer
                         .builder
                         .ins()
@@ -11794,6 +12194,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     user_fn_refs,
                     sync_shim_refs,
                     lit_gvs,
+                    repush_crossed_frames_ref,
+                    pop_crossed_frames_ref,
                 } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                 // Block params: 0 = closure_ptr, 1 = args_ptr,
@@ -11922,6 +12324,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     effect_ids: &checked.effect_ids,
                     op_ids: &checked.op_ids,
                     effects: &checked.effects,
+                    arm_effect_id: None,
+                    repush_crossed_frames_ref,
+                    pop_crossed_frames_ref,
                     user_fn_refs,
                     sync_shim_refs,
                     user_fns: &user_fns,
@@ -12174,6 +12579,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 user_fn_refs,
                 sync_shim_refs,
                 lit_gvs,
+                repush_crossed_frames_ref,
+                pop_crossed_frames_ref,
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
             let closure_ptr = block_params[0];
@@ -12210,6 +12617,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 effect_ids: &checked.effect_ids,
                 op_ids: &checked.op_ids,
                 effects: &checked.effects,
+                arm_effect_id: None,
+                repush_crossed_frames_ref,
+                pop_crossed_frames_ref,
                 user_fn_refs,
                 sync_shim_refs,
                 user_fns: &user_fns,
@@ -12475,6 +12885,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         user_fn_refs,
                         sync_shim_refs,
                         lit_gvs,
+                        repush_crossed_frames_ref,
+                        pop_crossed_frames_ref,
                     } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                     let mut lowerer = Lowerer {
@@ -12510,6 +12922,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         effect_ids: &checked.effect_ids,
                         op_ids: &checked.op_ids,
                         effects: &checked.effects,
+                        arm_effect_id: None,
+                        repush_crossed_frames_ref,
+                        pop_crossed_frames_ref,
                         user_fn_refs,
                         sync_shim_refs,
                         user_fns: &user_fns,
@@ -13203,6 +13618,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             user_fn_refs,
                             sync_shim_refs,
                             lit_gvs,
+                            repush_crossed_frames_ref,
+                            pop_crossed_frames_ref,
                         } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                         let closure_ptr = block_params[0];
@@ -13239,6 +13656,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
+                            arm_effect_id: None,
+                            repush_crossed_frames_ref,
+                            pop_crossed_frames_ref,
                             user_fn_refs,
                             sync_shim_refs,
                             user_fns: &user_fns,
@@ -13268,6 +13688,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 tail_expr,
                                 tail_ty,
                                 tail_prefix_lets,
+                                branch_chains,
                             } => {
                                 // Plan C Task 81 — lower tail-prefix
                                 // pure intermediates BEFORE the tail
@@ -13476,6 +13897,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     // emits a leaf (return_/jump
                                     // terminates the block) or pushes 2
                                     // strictly-smaller sub-trees.
+                                    let mut branch_chain_cursor: usize = 0;
                                     let mut work: Vec<(
                                         cranelift::codegen::ir::Block,
                                         &[crate::ast::Stmt],
@@ -13936,6 +14358,308 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 );
                                                 let ns_ptr =
                                                     lowerer.builder.inst_results(perform_call)[0];
+                                                lowerer.builder.ins().return_(&[ns_ptr]);
+                                            }
+                                            BranchedCpsLeaf::PerformChain => {
+                                                // Branch body has yields
+                                                // (performs) before the
+                                                // inner leaf. Allocate a
+                                                // branch-chain closure
+                                                // record and emit the
+                                                // first yield with the
+                                                // branch chain's step_0
+                                                // as continuation.
+                                                let bc = &branch_chains[branch_chain_cursor];
+                                                branch_chain_cursor += 1;
+
+                                                // Lower pure stmts that
+                                                // precede the first yield.
+                                                // The classifier puts ALL
+                                                // branch stmts in leaf_stmts;
+                                                // we split: pure lets before
+                                                // first perform are lowered
+                                                // here, performs are handled
+                                                // by the branch chain.
+                                                for stmt in leaf_stmts {
+                                                    if let crate::ast::Stmt::Let(l) = stmt {
+                                                        if matches!(
+                                                            &l.value,
+                                                            crate::ast::Expr::Perform(_)
+                                                        ) {
+                                                            break;
+                                                        }
+                                                        let v = lowerer.lower_expr(&l.value);
+                                                        lowerer.env.insert(l.name.clone(), v);
+                                                    }
+                                                }
+
+                                                // The first yield in the branch.
+                                                let first_perform = match &bc.steps[0] {
+                                                    ChainedNextStep::Perform(p) => p,
+                                                    ChainedNextStep::CallCps { .. } => unreachable!(
+                                                        "PerformChain branch step_0 is always Perform"
+                                                    ),
+                                                };
+
+                                                // Allocate branch-chain
+                                                // closure record. Layout:
+                                                // [header, null_code_ptr,
+                                                //  captures...,
+                                                //  caller_k_closure,
+                                                //  caller_k_fn]
+                                                let branch_cap_count = bc.captures.len();
+                                                let branch_slot_count = branch_cap_count + 2;
+                                                let mut branch_bitmap: u32 = 0;
+                                                for (i, c) in bc.captures.iter().enumerate() {
+                                                    if c.kind.is_pointer() {
+                                                        branch_bitmap |= 1u32 << (i + 1);
+                                                    }
+                                                }
+                                                // caller_k_closure is pointer
+                                                branch_bitmap |= 1u32 << (branch_cap_count + 1);
+                                                let branch_count: u8 = 1 + branch_slot_count as u8;
+                                                let branch_header: u64 = header_word(
+                                                    TAG_CLOSURE,
+                                                    branch_count,
+                                                    branch_bitmap,
+                                                );
+                                                let branch_payload: i64 =
+                                                    8 + 8 * branch_slot_count as i64;
+
+                                                let bh_v = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(types::I64, branch_header as i64);
+                                                let bp_v = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(pointer_ty, branch_payload);
+                                                let balloc = lowerer.builder.ins().call(
+                                                    lowerer.builtins.alloc_ref,
+                                                    &[bh_v, bp_v],
+                                                );
+                                                lowerer.stackmap.push_placeholder(
+                                                    function_code_offset(&lowerer.builder, balloc),
+                                                );
+                                                let branch_closure =
+                                                    lowerer.builder.inst_results(balloc)[0];
+
+                                                // Null code_ptr at +8.
+                                                let null_v =
+                                                    lowerer.builder.ins().iconst(pointer_ty, 0);
+                                                lowerer.builder.ins().store(
+                                                    MemFlags::trusted(),
+                                                    null_v,
+                                                    branch_closure,
+                                                    8,
+                                                );
+
+                                                // Store captures: copy from
+                                                // the Final step's env.
+                                                // body_captures are at synth_
+                                                // closure_ptr offsets; body
+                                                // chain bindings are in env.
+                                                for (i, cap) in bc.captures.iter().enumerate() {
+                                                    let offset: i32 = 16 + 8 * i as i32;
+                                                    let val = match lowerer.env.get(&cap.name) {
+                                                        Some(v) => {
+                                                            let arg_ty = lowerer
+                                                                .builder
+                                                                .func
+                                                                .dfg
+                                                                .value_type(*v);
+                                                            if arg_ty == types::I64 {
+                                                                *v
+                                                            } else if arg_ty.is_int()
+                                                                && arg_ty.bits() < 64
+                                                            {
+                                                                lowerer
+                                                                    .builder
+                                                                    .ins()
+                                                                    .uextend(types::I64, *v)
+                                                            } else {
+                                                                *v
+                                                            }
+                                                        }
+                                                        None => {
+                                                            // Capture not in env — might be
+                                                            // unused. Store 0.
+                                                            lowerer
+                                                                .builder
+                                                                .ins()
+                                                                .iconst(types::I64, 0)
+                                                        }
+                                                    };
+                                                    lowerer.builder.ins().store(
+                                                        MemFlags::trusted(),
+                                                        val,
+                                                        branch_closure,
+                                                        offset,
+                                                    );
+                                                }
+
+                                                // Store caller_k_pair at
+                                                // trailing slots.
+                                                let branch_k_closure_off: i32 =
+                                                    16 + 8 * branch_cap_count as i32;
+                                                let branch_k_fn_off: i32 = branch_k_closure_off + 8;
+                                                // Load caller_k_pair from
+                                                // the FINAL step's closure
+                                                // record's trailing slots.
+                                                let caller_k_closure_off: i32 = 16
+                                                    + 8 * (captures.len() + prior_bindings.len())
+                                                        as i32;
+                                                let caller_k_fn_off: i32 = caller_k_closure_off + 8;
+                                                let ck_closure = lowerer.builder.ins().load(
+                                                    pointer_ty,
+                                                    MemFlags::trusted(),
+                                                    synth_closure_ptr,
+                                                    caller_k_closure_off,
+                                                );
+                                                let ck_fn = lowerer.builder.ins().load(
+                                                    pointer_ty,
+                                                    MemFlags::trusted(),
+                                                    synth_closure_ptr,
+                                                    caller_k_fn_off,
+                                                );
+                                                lowerer.builder.ins().store(
+                                                    MemFlags::trusted(),
+                                                    ck_closure,
+                                                    branch_closure,
+                                                    branch_k_closure_off,
+                                                );
+                                                lowerer.builder.ins().store(
+                                                    MemFlags::trusted(),
+                                                    ck_fn,
+                                                    branch_closure,
+                                                    branch_k_fn_off,
+                                                );
+
+                                                // Emit the first perform
+                                                // with branch_step_0 as k.
+                                                let effect_id = match lowerer
+                                                    .effect_ids
+                                                    .get(&first_perform.effect)
+                                                    .copied()
+                                                {
+                                                    Some(id) => id,
+                                                    None => unreachable!(
+                                                        "codegen branch chain: effect `{}` missing from effect_ids",
+                                                        first_perform.effect
+                                                    ),
+                                                };
+                                                let op_id = match lowerer
+                                                    .op_ids
+                                                    .get(&(
+                                                        first_perform.effect.clone(),
+                                                        first_perform.op.clone(),
+                                                    ))
+                                                    .copied()
+                                                {
+                                                    Some(id) => id,
+                                                    None => unreachable!(
+                                                        "codegen branch chain: op `{}.{}` missing from op_ids",
+                                                        first_perform.effect, first_perform.op
+                                                    ),
+                                                };
+                                                let eid_v = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(types::I32, effect_id as i64);
+                                                let oid_v = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(types::I32, op_id as i64);
+
+                                                // Pack perform args.
+                                                let user_arg_count = first_perform.args.len();
+                                                let (args_ptr_v, args_len_v) = if first_perform
+                                                    .args
+                                                    .is_empty()
+                                                {
+                                                    (
+                                                        lowerer.builder.ins().iconst(pointer_ty, 0),
+                                                        lowerer.builder.ins().iconst(types::I32, 0),
+                                                    )
+                                                } else {
+                                                    let arg_values: Vec<Value> = first_perform
+                                                        .args
+                                                        .iter()
+                                                        .map(|a| lowerer.lower_expr(a))
+                                                        .collect();
+                                                    let slot_bytes = (user_arg_count * 8) as u32;
+                                                    let slot =
+                                                        lowerer.builder.create_sized_stack_slot(
+                                                            StackSlotData::new(
+                                                                StackSlotKind::ExplicitSlot,
+                                                                slot_bytes,
+                                                                3,
+                                                            ),
+                                                        );
+                                                    for (i, v) in arg_values.iter().enumerate() {
+                                                        let at =
+                                                            lowerer.builder.func.dfg.value_type(*v);
+                                                        let w = if at == types::I64 {
+                                                            *v
+                                                        } else if at.is_int() && at.bits() < 64 {
+                                                            lowerer
+                                                                .builder
+                                                                .ins()
+                                                                .uextend(types::I64, *v)
+                                                        } else {
+                                                            *v
+                                                        };
+                                                        lowerer.builder.ins().stack_store(
+                                                            w,
+                                                            slot,
+                                                            (i * 8) as i32,
+                                                        );
+                                                    }
+                                                    (
+                                                        lowerer
+                                                            .builder
+                                                            .ins()
+                                                            .stack_addr(pointer_ty, slot, 0),
+                                                        lowerer.builder.ins().iconst(
+                                                            types::I32,
+                                                            user_arg_count as i64,
+                                                        ),
+                                                    )
+                                                };
+
+                                                // Declare branch step_0
+                                                // func ref.
+                                                let step0_ref = module.declare_func_in_func(
+                                                    bc.step_func_ids[0],
+                                                    lowerer.builder.func,
+                                                );
+                                                let step0_addr = lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .func_addr(pointer_ty, step0_ref);
+
+                                                // sigil_perform with
+                                                // branch_closure + step0
+                                                // as the continuation.
+                                                let perf_call = lowerer.builder.ins().call(
+                                                    lowerer.perform_ref,
+                                                    &[
+                                                        eid_v,
+                                                        oid_v,
+                                                        args_ptr_v,
+                                                        args_len_v,
+                                                        branch_closure,
+                                                        step0_addr,
+                                                    ],
+                                                );
+                                                lowerer.stackmap.push_placeholder(
+                                                    function_code_offset(
+                                                        &lowerer.builder,
+                                                        perf_call,
+                                                    ),
+                                                );
+                                                let ns_ptr =
+                                                    lowerer.builder.inst_results(perf_call)[0];
                                                 lowerer.builder.ins().return_(&[ns_ptr]);
                                             }
                                         }
@@ -15031,6 +15755,331 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 lowerer.builder.ins().return_(&[next_step_ns]);
                                 lowerer.builder.finalize();
                             }
+                            ChainStepRole::BranchLeafFinal {
+                                tail_expr,
+                                tail_ty,
+                                inner_leaf_kind,
+                                tail_prefix_lets,
+                            } => {
+                                // Lower tail-prefix pure lets.
+                                for tpl in tail_prefix_lets {
+                                    let v = lowerer.lower_expr(&tpl.value);
+                                    lowerer.env.insert(tpl.name.clone(), v);
+                                }
+
+                                // Load caller_k_pair from this synth-
+                                // cont's closure record's trailing slots.
+                                let branch_cap_count = captures.len() + prior_bindings.len();
+                                let caller_k_closure_off: i32 = 16 + 8 * branch_cap_count as i32;
+                                let caller_k_fn_off: i32 = caller_k_closure_off + 8;
+                                let caller_k_closure = lowerer.builder.ins().load(
+                                    pointer_ty,
+                                    MemFlags::trusted(),
+                                    synth_closure_ptr,
+                                    caller_k_closure_off,
+                                );
+                                let caller_k_fn = lowerer.builder.ins().load(
+                                    pointer_ty,
+                                    MemFlags::trusted(),
+                                    synth_closure_ptr,
+                                    caller_k_fn_off,
+                                );
+
+                                match inner_leaf_kind {
+                                    BranchedCpsLeaf::Pure | BranchedCpsLeaf::Nested => {
+                                        // Standard tail lowering:
+                                        // lower_expr + gate dispatch.
+                                        lowerer.emit_terminal_out_reset_to_done();
+                                        let v = lowerer.lower_expr(tail_expr.as_ref());
+                                        lowerer.emit_discharge_propagation_check();
+
+                                        let widened = if *tail_ty == types::I64 {
+                                            v
+                                        } else if tail_ty.is_int() && tail_ty.bits() < 64 {
+                                            lowerer.builder.ins().uextend(types::I64, v)
+                                        } else {
+                                            v
+                                        };
+
+                                        // Build the gate dispatch
+                                        // inline: this is the "done"
+                                        // path — return Done(value)
+                                        // via caller_k_pair. Build
+                                        // NextStep::Call(caller_k_fn,
+                                        // [widened, null, null], 3)
+                                        // if caller_k_fn != null;
+                                        // else Done(widened).
+                                        let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
+                                        let is_null = lowerer.builder.ins().icmp(
+                                            IntCC::Equal,
+                                            caller_k_fn,
+                                            null_v,
+                                        );
+                                        let done_blk = lowerer.builder.create_block();
+                                        let call_blk = lowerer.builder.create_block();
+                                        lowerer.builder.ins().brif(
+                                            is_null,
+                                            done_blk,
+                                            &[],
+                                            call_blk,
+                                            &[],
+                                        );
+
+                                        // Done path.
+                                        lowerer.builder.switch_to_block(done_blk);
+                                        lowerer.builder.seal_block(done_blk);
+                                        let done_call = lowerer
+                                            .builder
+                                            .ins()
+                                            .call(lowerer.next_step_discharged_ref, &[widened]);
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            done_call,
+                                        ));
+                                        let done_ns = lowerer.builder.inst_results(done_call)[0];
+                                        lowerer.builder.ins().return_(&[done_ns]);
+
+                                        // Call-k path: NextStep::Call(
+                                        // caller_k_fn, [widened], 3).
+                                        lowerer.builder.switch_to_block(call_blk);
+                                        lowerer.builder.seal_block(call_blk);
+                                        let arg_count_v =
+                                            lowerer.builder.ins().iconst(types::I32, 3i64);
+                                        let call_ns = lowerer.builder.ins().call(
+                                            lowerer.next_step_call_ref,
+                                            &[caller_k_closure, caller_k_fn, arg_count_v],
+                                        );
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            call_ns,
+                                        ));
+                                        let call_ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                                        let argp_call = lowerer
+                                            .builder
+                                            .ins()
+                                            .call(lowerer.next_step_args_ptr_ref, &[call_ns_ptr]);
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            argp_call,
+                                        ));
+                                        let argp = lowerer.builder.inst_results(argp_call)[0];
+                                        lowerer.builder.ins().store(
+                                            MemFlags::trusted(),
+                                            widened,
+                                            argp,
+                                            0,
+                                        );
+                                        // Null post_arm_k slots.
+                                        lowerer.builder.ins().store(
+                                            MemFlags::trusted(),
+                                            null_v,
+                                            argp,
+                                            8,
+                                        );
+                                        lowerer.builder.ins().store(
+                                            MemFlags::trusted(),
+                                            null_v,
+                                            argp,
+                                            16,
+                                        );
+                                        lowerer.builder.ins().return_(&[call_ns_ptr]);
+                                    }
+                                    BranchedCpsLeaf::CpsCall => {
+                                        // Emit NextStep::Call with
+                                        // caller_k_pair forwarded.
+                                        let (callee_name, call_args) = match tail_expr.as_ref() {
+                                            crate::ast::Expr::Call { callee, args, .. } => {
+                                                match callee.as_ref() {
+                                                    crate::ast::Expr::Ident(n, _) => {
+                                                        (n.clone(), args)
+                                                    }
+                                                    _ => unreachable!(
+                                                        "BranchLeafFinal CpsCall: callee is Ident"
+                                                    ),
+                                                }
+                                            }
+                                            _ => unreachable!(
+                                                "BranchLeafFinal CpsCall: tail is Call"
+                                            ),
+                                        };
+                                        let callee_func_ref = match lowerer
+                                            .user_fn_refs
+                                            .get(&callee_name)
+                                        {
+                                            Some(r) => *r,
+                                            None => unreachable!(
+                                                "BranchLeafFinal CpsCall: callee `{callee_name}` not in user_fn_refs"
+                                            ),
+                                        };
+                                        let callee_addr = lowerer
+                                            .builder
+                                            .ins()
+                                            .func_addr(pointer_ty, callee_func_ref);
+                                        let user_arg_count = call_args.len();
+                                        let mut lowered_args: Vec<Value> =
+                                            Vec::with_capacity(user_arg_count);
+                                        for a in call_args {
+                                            lowered_args.push(lowerer.lower_expr(a));
+                                        }
+                                        let arg_count_total = (user_arg_count + 2) as i64;
+                                        let arg_count_v = lowerer
+                                            .builder
+                                            .ins()
+                                            .iconst(types::I32, arg_count_total);
+                                        let null_closure =
+                                            lowerer.builder.ins().iconst(pointer_ty, 0);
+                                        let call_ns = lowerer.builder.ins().call(
+                                            lowerer.next_step_call_ref,
+                                            &[null_closure, callee_addr, arg_count_v],
+                                        );
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            call_ns,
+                                        ));
+                                        let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
+                                        let argp_call = lowerer
+                                            .builder
+                                            .ins()
+                                            .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            argp_call,
+                                        ));
+                                        let argp = lowerer.builder.inst_results(argp_call)[0];
+                                        for (i, arg_v) in lowered_args.iter().enumerate() {
+                                            let at = lowerer.builder.func.dfg.value_type(*arg_v);
+                                            let w = if at == types::I64 {
+                                                *arg_v
+                                            } else if at.is_int() && at.bits() < 64 {
+                                                lowerer.builder.ins().uextend(types::I64, *arg_v)
+                                            } else {
+                                                *arg_v
+                                            };
+                                            lowerer.builder.ins().store(
+                                                MemFlags::trusted(),
+                                                w,
+                                                argp,
+                                                (i * 8) as i32,
+                                            );
+                                        }
+                                        lowerer.builder.ins().store(
+                                            MemFlags::trusted(),
+                                            caller_k_closure,
+                                            argp,
+                                            k_closure_offset(user_arg_count),
+                                        );
+                                        lowerer.builder.ins().store(
+                                            MemFlags::trusted(),
+                                            caller_k_fn,
+                                            argp,
+                                            k_fn_offset(user_arg_count),
+                                        );
+                                        lowerer.builder.ins().return_(&[ns_ptr]);
+                                    }
+                                    BranchedCpsLeaf::Perform => {
+                                        // Emit sigil_perform with
+                                        // caller_k_pair forwarded.
+                                        let p = match tail_expr.as_ref() {
+                                            crate::ast::Expr::Perform(p) => p,
+                                            _ => unreachable!(
+                                                "BranchLeafFinal Perform: tail is Perform"
+                                            ),
+                                        };
+                                        let effect_id = match lowerer.effect_ids.get(&p.effect) {
+                                            Some(&id) => id,
+                                            None => unreachable!(
+                                                "codegen BranchLeafFinal: effect `{}` missing from effect_ids",
+                                                p.effect
+                                            ),
+                                        };
+                                        let op_id = match lowerer
+                                            .op_ids
+                                            .get(&(p.effect.clone(), p.op.clone()))
+                                        {
+                                            Some(&id) => id,
+                                            None => unreachable!(
+                                                "codegen BranchLeafFinal: op `{}.{}` missing from op_ids",
+                                                p.effect, p.op
+                                            ),
+                                        };
+                                        let eid_v = lowerer
+                                            .builder
+                                            .ins()
+                                            .iconst(types::I32, effect_id as i64);
+                                        let oid_v =
+                                            lowerer.builder.ins().iconst(types::I32, op_id as i64);
+                                        let user_arg_count = p.args.len();
+                                        let (args_ptr_v, args_len_v) = if p.args.is_empty() {
+                                            (
+                                                lowerer.builder.ins().iconst(pointer_ty, 0),
+                                                lowerer.builder.ins().iconst(types::I32, 0),
+                                            )
+                                        } else {
+                                            let arg_values: Vec<Value> = p
+                                                .args
+                                                .iter()
+                                                .map(|a| lowerer.lower_expr(a))
+                                                .collect();
+                                            let slot_bytes = (user_arg_count * 8) as u32;
+                                            let slot = lowerer.builder.create_sized_stack_slot(
+                                                StackSlotData::new(
+                                                    StackSlotKind::ExplicitSlot,
+                                                    slot_bytes,
+                                                    3,
+                                                ),
+                                            );
+                                            for (i, v) in arg_values.iter().enumerate() {
+                                                let at = lowerer.builder.func.dfg.value_type(*v);
+                                                let w = if at == types::I64 {
+                                                    *v
+                                                } else if at.is_int() && at.bits() < 64 {
+                                                    lowerer.builder.ins().uextend(types::I64, *v)
+                                                } else {
+                                                    *v
+                                                };
+                                                lowerer.builder.ins().stack_store(
+                                                    w,
+                                                    slot,
+                                                    (i * 8) as i32,
+                                                );
+                                            }
+                                            (
+                                                lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .stack_addr(pointer_ty, slot, 0),
+                                                lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .iconst(types::I32, user_arg_count as i64),
+                                            )
+                                        };
+                                        let perf_call = lowerer.builder.ins().call(
+                                            lowerer.perform_ref,
+                                            &[
+                                                eid_v,
+                                                oid_v,
+                                                args_ptr_v,
+                                                args_len_v,
+                                                caller_k_closure,
+                                                caller_k_fn,
+                                            ],
+                                        );
+                                        lowerer.stackmap.push_placeholder(function_code_offset(
+                                            &lowerer.builder,
+                                            perf_call,
+                                        ));
+                                        let ns_ptr = lowerer.builder.inst_results(perf_call)[0];
+                                        lowerer.builder.ins().return_(&[ns_ptr]);
+                                    }
+                                    BranchedCpsLeaf::PerformChain => {
+                                        unreachable!(
+                                            "BranchLeafFinal: inner leaf cannot be PerformChain"
+                                        );
+                                    }
+                                }
+                                lowerer.builder.finalize();
+                            }
                         }
                     }
                     CpsContinuationKind::CompoundMatchArmPostPerform {
@@ -15189,6 +16238,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             user_fn_refs,
                             sync_shim_refs,
                             lit_gvs,
+                            repush_crossed_frames_ref,
+                            pop_crossed_frames_ref,
                         } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                         let closure_ptr = block_params[0];
@@ -15225,6 +16276,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             effect_ids: &checked.effect_ids,
                             op_ids: &checked.op_ids,
                             effects: &checked.effects,
+                            arm_effect_id: None,
+                            repush_crossed_frames_ref,
+                            pop_crossed_frames_ref,
                             user_fn_refs,
                             sync_shim_refs,
                             user_fns: &user_fns,
@@ -16002,6 +17056,14 @@ struct Lowerer<'a, 'b> {
     /// returned NextStep).
     effects: &'b BTreeMap<String, crate::ast::EffectDecl>,
 
+    /// Nested-effect-forwarding fix: set to `Some(eid)` while lowering
+    /// a handler arm body so `emit_discharged_next_step` can store the
+    /// discharging effect's ID into `terminal_out.effect_id`.
+    arm_effect_id: Option<u32>,
+
+    repush_crossed_frames_ref: FuncRef,
+    pop_crossed_frames_ref: FuncRef,
+
     /// Per-fn FuncRefs for every user fn (original + synthetic
     /// `$lambda_N`). Used for direct calls and for `func_addr` when
     /// populating a `ClosureRecord`'s `code_ptr` slot.
@@ -16744,6 +17806,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             );
             body_value
         };
+        if let Some(eid) = self.arm_effect_id {
+            let eid_const = self.builder.ins().iconst(types::I64, eid as i64);
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                eid_const,
+                self.terminal_out_param,
+                TERMINAL_RESULT_EFFECT_ID_OFF,
+            );
+        }
         let done_call = self
             .builder
             .ins()
@@ -17838,6 +18909,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.terminal_out_param,
                     TERMINAL_RESULT_TAG_OFF,
                 );
+                let snap_effect_id_v = self.builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_EFFECT_ID_OFF,
+                );
                 let zero_v = self.builder.ins().iconst(types::I64, 0);
                 let done_v = self
                     .builder
@@ -17854,6 +18931,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     done_v,
                     self.terminal_out_param,
                     TERMINAL_RESULT_TAG_OFF,
+                );
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    zero_v,
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_EFFECT_ID_OFF,
                 );
 
                 // Task 78.5 G4 Approach 6 deep-redo — if the body is a
@@ -18143,6 +19226,26 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         );
                         suppression_widened
                     };
+                    // Suppression = return arm already fired (own
+                    // effect) → restore snapshot before merge.
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        snap_value_v,
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_VALUE_OFF,
+                    );
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        snap_tag_v,
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_TAG_OFF,
+                    );
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        snap_effect_id_v,
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_EFFECT_ID_OFF,
+                    );
                     self.builder
                         .ins()
                         .jump(merge_block, &[suppression_val.into()]);
@@ -18154,6 +19257,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.builder
                         .ins()
                         .brif(is_discharged, discharge_block, &[], normal_block, &[]);
+
+                    // Collect this handle's effect_ids for the
+                    // own-vs-foreign discharge check below.
+                    let handle_effect_ids: Vec<u32> = groups
+                        .keys()
+                        .filter_map(|eff_name| self.effect_ids.get(eff_name).copied())
+                        .collect();
 
                     // Discharge block: body_val IS handle's overall.
                     // The Cranelift type of body_val (body's type B)
@@ -18242,6 +19352,70 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             handler_overall_ty
                         )
                     };
+                    // Own-vs-foreign discharge: load the discharged
+                    // effect_id from terminal_out and check if this
+                    // handle owns it. Own discharge → restore snapshot
+                    // (prevent leak to outer handle). Foreign discharge
+                    // → skip restore (propagate DISCHARGED to outer).
+                    let discharged_eid = self.builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_EFFECT_ID_OFF,
+                    );
+                    let mut is_own = self.builder.ins().iconst(types::I8, 0);
+                    for &eid in &handle_effect_ids {
+                        let eid_const = self.builder.ins().iconst(types::I64, eid as i64);
+                        let matches =
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::Equal, discharged_eid, eid_const);
+                        is_own = self.builder.ins().bor(is_own, matches);
+                    }
+                    let own_discharge_block = self.builder.create_block();
+                    let foreign_discharge_block = self.builder.create_block();
+                    let zero_i8_check = self.builder.ins().iconst(types::I8, 0);
+                    let is_own_flag =
+                        self.builder
+                            .ins()
+                            .icmp(IntCC::NotEqual, is_own, zero_i8_check);
+                    self.builder.ins().brif(
+                        is_own_flag,
+                        own_discharge_block,
+                        &[],
+                        foreign_discharge_block,
+                        &[],
+                    );
+
+                    // Own-discharge: restore snapshot, jump to merge.
+                    self.builder.switch_to_block(own_discharge_block);
+                    self.builder.seal_block(own_discharge_block);
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        snap_value_v,
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_VALUE_OFF,
+                    );
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        snap_tag_v,
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_TAG_OFF,
+                    );
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        snap_effect_id_v,
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_EFFECT_ID_OFF,
+                    );
+                    self.builder
+                        .ins()
+                        .jump(merge_block, &[discharge_val.into()]);
+
+                    // Foreign-discharge: don't restore — let
+                    // DISCHARGED propagate to outer handle.
+                    self.builder.switch_to_block(foreign_discharge_block);
+                    self.builder.seal_block(foreign_discharge_block);
                     self.builder
                         .ins()
                         .jump(merge_block, &[discharge_val.into()]);
@@ -18379,22 +19553,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         );
                         widened_handle_val
                     };
-                    self.builder.ins().jump(merge_block, &[normal_val.into()]);
-
-                    // Merge block: yields the conditional's final
-                    // value. The block param's type is
-                    // handler_overall_ty (pre-computed); both
-                    // discharge_block and normal_block jump here with
-                    // values of that type.
-                    self.builder.switch_to_block(merge_block);
-                    self.builder.seal_block(merge_block);
-                    let merge_val = self.builder.block_params(merge_block)[0];
-                    // PR #92 R1 issue 1 — restore the slot snapshot
-                    // captured at this handle's entry. Prevents this
-                    // handle's terminal `(value, tag)` from leaking
-                    // into the surrounding fn's later code (e.g., an
-                    // outer handle's exit-tag query reading this
-                    // inner handle's leftover DISCHARGED state).
+                    // Normal path = body completed without discharge
+                    // → restore snapshot before merge.
                     self.builder.ins().store(
                         MemFlags::trusted(),
                         snap_value_v,
@@ -18407,6 +19567,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         self.terminal_out_param,
                         TERMINAL_RESULT_TAG_OFF,
                     );
+                    self.builder.ins().store(
+                        MemFlags::trusted(),
+                        snap_effect_id_v,
+                        self.terminal_out_param,
+                        TERMINAL_RESULT_EFFECT_ID_OFF,
+                    );
+                    self.builder.ins().jump(merge_block, &[normal_val.into()]);
+
+                    // Merge block: yields the conditional's final
+                    // value. The block param's type is
+                    // handler_overall_ty (pre-computed); all incoming
+                    // edges (suppression, own-discharge, foreign-
+                    // discharge, normal) jump here. Snapshot restore
+                    // is path-specific: own-discharge / normal /
+                    // suppression restore; foreign-discharge skips
+                    // restore to propagate DISCHARGED to outer handle.
+                    self.builder.switch_to_block(merge_block);
+                    self.builder.seal_block(merge_block);
+                    let merge_val = self.builder.block_params(merge_block)[0];
                     return merge_val;
                 }
 
@@ -18500,10 +19679,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 } else if handler_overall_ty == self.pointer_ty {
                     lv_u64
                 } else {
-                    // Round-3 review §6: panic at codegen instead of
-                    // emitting wrong-domain zero placeholders. Same
-                    // rationale as the return-arm-bearing branch's
-                    // discharge_block above.
                     unreachable!(
                         "Bug 1 no-return-arm discharge_block: unsupported \
                          handler_overall_ty {:?} (Bug 1 supports I64, I8 / \
@@ -18512,22 +19687,45 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         handler_overall_ty
                     )
                 };
-                self.builder
-                    .ins()
-                    .jump(merge_block_nra, &[discharge_val.into()]);
 
-                // Normal block: body_val IS handle's overall.
-                self.builder.switch_to_block(normal_block_nra);
-                self.builder.seal_block(normal_block_nra);
-                let _ = body_val_widened;
-                self.builder.ins().jump(merge_block_nra, &[body_val.into()]);
+                // Own-vs-foreign discharge (no-return-arm variant).
+                let handle_effect_ids_nra: Vec<u32> = groups
+                    .keys()
+                    .filter_map(|eff_name| self.effect_ids.get(eff_name).copied())
+                    .collect();
+                let discharged_eid_nra = self.builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_EFFECT_ID_OFF,
+                );
+                let mut is_own_nra = self.builder.ins().iconst(types::I8, 0);
+                for &eid in &handle_effect_ids_nra {
+                    let eid_const = self.builder.ins().iconst(types::I64, eid as i64);
+                    let matches =
+                        self.builder
+                            .ins()
+                            .icmp(IntCC::Equal, discharged_eid_nra, eid_const);
+                    is_own_nra = self.builder.ins().bor(is_own_nra, matches);
+                }
+                let own_discharge_nra = self.builder.create_block();
+                let foreign_discharge_nra = self.builder.create_block();
+                let zero_check_nra = self.builder.ins().iconst(types::I8, 0);
+                let is_own_flag_nra =
+                    self.builder
+                        .ins()
+                        .icmp(IntCC::NotEqual, is_own_nra, zero_check_nra);
+                self.builder.ins().brif(
+                    is_own_flag_nra,
+                    own_discharge_nra,
+                    &[],
+                    foreign_discharge_nra,
+                    &[],
+                );
 
-                self.builder.switch_to_block(merge_block_nra);
-                self.builder.seal_block(merge_block_nra);
-                let merge_val = self.builder.block_params(merge_block_nra)[0];
-                // PR #92 R1 issue 1 — restore the slot snapshot
-                // captured at this handle's entry. See the return-arm
-                // branch above for the full mechanism note.
+                // Own-discharge (nra): restore snapshot, jump merge.
+                self.builder.switch_to_block(own_discharge_nra);
+                self.builder.seal_block(own_discharge_nra);
                 self.builder.ins().store(
                     MemFlags::trusted(),
                     snap_value_v,
@@ -18540,6 +19738,51 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.terminal_out_param,
                     TERMINAL_RESULT_TAG_OFF,
                 );
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    snap_effect_id_v,
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_EFFECT_ID_OFF,
+                );
+                self.builder
+                    .ins()
+                    .jump(merge_block_nra, &[discharge_val.into()]);
+
+                // Foreign-discharge (nra): propagate, skip restore.
+                self.builder.switch_to_block(foreign_discharge_nra);
+                self.builder.seal_block(foreign_discharge_nra);
+                self.builder
+                    .ins()
+                    .jump(merge_block_nra, &[discharge_val.into()]);
+
+                // Normal block: body_val IS handle's overall.
+                // Restore snapshot (body completed without discharge).
+                self.builder.switch_to_block(normal_block_nra);
+                self.builder.seal_block(normal_block_nra);
+                let _ = body_val_widened;
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    snap_value_v,
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_VALUE_OFF,
+                );
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    snap_tag_v,
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_TAG_OFF,
+                );
+                self.builder.ins().store(
+                    MemFlags::trusted(),
+                    snap_effect_id_v,
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_EFFECT_ID_OFF,
+                );
+                self.builder.ins().jump(merge_block_nra, &[body_val.into()]);
+
+                self.builder.switch_to_block(merge_block_nra);
+                self.builder.seal_block(merge_block_nra);
+                let merge_val = self.builder.block_params(merge_block_nra)[0];
                 merge_val
             }
             // Plan D Task 113 — tuple constructor. Heap-allocate a
@@ -18694,6 +19937,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, push_call));
 
+        // Re-push any handler frames that were crossed by the originating
+        // sigil_perform. These are recorded in a TLS stack by sigil_perform
+        // and need to be re-installed so intervening handlers' return arms
+        // fire when the body resumes.
+        let repush_call = self
+            .builder
+            .ins()
+            .call(self.repush_crossed_frames_ref, &[frame_ptr_loaded]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, repush_call));
+        let crossed_count = self.builder.inst_results(repush_call)[0];
+
         // Lower the arg, widen to I64 for the args buffer.
         let arg_v = self.lower_expr(&args[0]);
         let arg_ty = self.builder.func.dfg.value_type(arg_v);
@@ -18768,14 +20023,29 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .call(self.run_loop_ref, &[ns, terminal_out]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, run_loop_call));
-        let widened_result = self.builder.inst_results(run_loop_call)[0];
+        let _initial_result = self.builder.inst_results(run_loop_call)[0];
+
+        // Pop crossed handler frames and apply their return arms to the
+        // terminal value (innermost first). The return arms fire via
+        // run_loop inside sigil_pop_crossed_frames, updating terminal_out.
+        let pop_crossed_call = self
+            .builder
+            .ins()
+            .call(self.pop_crossed_frames_ref, &[crossed_count, terminal_out]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, pop_crossed_call));
+
+        // Reload the result value from terminal_out — crossed return arms
+        // may have transformed it (e.g., catch's return(v) => Ok(v)).
+        let widened_result = self.builder.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.terminal_out_param,
+            TERMINAL_RESULT_VALUE_OFF,
+        );
 
         // Stage-6.8-followup Layer 3c — pop the originating handler
-        // frame we re-pushed before run_loop. This restores the
-        // handler stack to its pre-k(arg) state so subsequent
-        // sigil_perform calls see the correct stack discipline. The
-        // pop's return value (the popped frame's pointer) is unused
-        // here; debug-build invariant: it equals frame_ptr_loaded.
+        // frame we re-pushed before run_loop.
         let pop_call = self.builder.ins().call(self.handle_pop_ref, &[]);
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, pop_call));
@@ -22060,12 +23330,12 @@ const POST_ARM_K_FN_OFF: i32 = 16;
 /// Plan D Task 111d — byte offsets into the caller-owned
 /// `TerminalResult` slot pointed to by `terminal_out_param`. Mirror
 /// of `runtime/src/handlers.rs::TerminalResult`'s `#[repr(C)]`
-/// layout: `{ value: u64 @ 0, tag: u64 @ 8 }`. Codegen loads
-/// 8 bytes from each offset at the handle-exit terminal-tag /
-/// terminal-value query sites that previously called the now-
-/// removed `sigil_last_terminal_*` TLS FFI helpers.
+/// layout: `{ value: u64 @ 0, tag: u64 @ 8, effect_id: u64 @ 16 }`.
+/// Codegen loads 8 bytes from each offset at the handle-exit
+/// terminal-tag / terminal-value / effect-id query sites.
 const TERMINAL_RESULT_VALUE_OFF: i32 = 0;
 const TERMINAL_RESULT_TAG_OFF: i32 = 8;
+const TERMINAL_RESULT_EFFECT_ID_OFF: i32 = 16;
 
 /// Builtin runtime-primitive FuncIds, declared once at `emit_object`'s
 /// top and read by [`prepare_per_fn_refs`] when constructing the
@@ -22308,6 +23578,8 @@ struct PerFnRefsCtx<'a> {
     body_return_arm_push_mask_if_needed: cranelift_module::FuncId,
     body_return_arm_pop_if_flag: cranelift_module::FuncId,
     done_or_dispatch_return_arm: cranelift_module::FuncId,
+    repush_crossed_frames: cranelift_module::FuncId,
+    pop_crossed_frames: cranelift_module::FuncId,
     handler_arm_indices: &'a BTreeMap<Span, Vec<usize>>,
     handler_arm_synth: &'a [HandlerArmSynth],
     /// Plan B Task 55 (Phase 4g) — per-handle return-arm `FuncId` if
@@ -22376,6 +23648,8 @@ struct PerFnRefs {
     body_return_arm_push_mask_if_needed_ref: FuncRef,
     body_return_arm_pop_if_flag_ref: FuncRef,
     done_or_dispatch_return_arm_ref: FuncRef,
+    repush_crossed_frames_ref: FuncRef,
+    pop_crossed_frames_ref: FuncRef,
     handler_arm_refs_per_handle: BTreeMap<Span, Vec<FuncRef>>,
     /// Plan B Task 55 (Phase 4g) — per-handle return-arm `FuncRef` if
     /// the handle has a return arm; absent otherwise. Keyed by handle
@@ -22511,6 +23785,9 @@ fn prepare_per_fn_refs(
         module.declare_func_in_func(ctx.body_return_arm_pop_if_flag, builder.func);
     let done_or_dispatch_return_arm_ref =
         module.declare_func_in_func(ctx.done_or_dispatch_return_arm, builder.func);
+    let repush_crossed_frames_ref =
+        module.declare_func_in_func(ctx.repush_crossed_frames, builder.func);
+    let pop_crossed_frames_ref = module.declare_func_in_func(ctx.pop_crossed_frames, builder.func);
 
     // Per-handle synth-arm-fn FuncRefs, keyed by handle span. Built
     // from the `handler_arm_indices` side-table (one entry per
@@ -22601,6 +23878,8 @@ fn prepare_per_fn_refs(
         body_return_arm_push_mask_if_needed_ref,
         body_return_arm_pop_if_flag_ref,
         done_or_dispatch_return_arm_ref,
+        repush_crossed_frames_ref,
+        pop_crossed_frames_ref,
         handler_arm_refs_per_handle,
         handler_return_arm_refs_per_handle,
         user_fn_refs,
@@ -23514,6 +24793,7 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
     // base-case branch — unlike chained-let-yield's let-RHS recursion
     // which is unconditional and structurally non-terminating.
     let mut has_cps_call = false;
+    let mut has_perform_chain = false;
     match tail {
         Expr::If {
             then_block,
@@ -23530,6 +24810,11 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
             // body emit threads caller_k_pair as the perform's k).
             if leaf_is_cps_eligible(then_kind) || leaf_is_cps_eligible(else_kind) {
                 has_cps_call = true;
+            }
+            if then_kind == BranchedCpsLeaf::PerformChain
+                || else_kind == BranchedCpsLeaf::PerformChain
+            {
+                has_perform_chain = true;
             }
         }
         Expr::Match { arms, .. } => {
@@ -23551,11 +24836,17 @@ fn is_let_yield_prefix_then_branched_cps_tail_body(
                 if leaf_is_cps_eligible(kind) {
                     has_cps_call = true;
                 }
+                if kind == BranchedCpsLeaf::PerformChain {
+                    has_perform_chain = true;
+                }
             }
         }
         _ => return None,
     }
     if !has_cps_call {
+        return None;
+    }
+    if yield_count == 0 && has_perform_chain {
         return None;
     }
     Some(yield_count)
@@ -23673,7 +24964,10 @@ fn classify_branched_cps_tail_branch_expr(
 fn leaf_is_cps_eligible(k: BranchedCpsLeaf) -> bool {
     matches!(
         k,
-        BranchedCpsLeaf::CpsCall | BranchedCpsLeaf::Perform | BranchedCpsLeaf::Nested
+        BranchedCpsLeaf::CpsCall
+            | BranchedCpsLeaf::Perform
+            | BranchedCpsLeaf::Nested
+            | BranchedCpsLeaf::PerformChain
     )
 }
 
@@ -23841,22 +25135,23 @@ fn classify_branched_cps_tail_branch(
     // to-Cps-interop dispatch transparently. `Stmt::Perform` is
     // rejected — that would need chain-step machinery; ditto for
     // Let with Perform RHS.
+    let mut has_branch_perform = false;
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let(l) => {
                 if matches!(&l.value, Expr::Perform(_)) {
-                    return None;
+                    has_branch_perform = true;
                 }
-                // Pure values + Call RHS accepted; emit handles
-                // both via lower_expr (which routes Calls through
-                // lower_call's builtin / Sync-user-fn / Sync-to-Cps-
-                // interop dispatch).
             }
             _ => return None,
         }
     }
     let tail = block.tail.as_ref()?;
-    classify_branched_cps_tail_branch_expr(tail, ctors, is_supported)
+    if has_branch_perform {
+        Some(BranchedCpsLeaf::PerformChain)
+    } else {
+        classify_branched_cps_tail_branch_expr(tail, ctors, is_supported)
+    }
 }
 
 /// Plan D Task 112d — branch-leaf classification result.
@@ -23900,6 +25195,18 @@ enum BranchedCpsLeaf {
     /// re-dispatching each sub-branch's leaf shape until it reaches
     /// a Pure / CpsCall / Perform leaf at the bottom.
     Nested,
+    /// Branch body contains one or more `let _ = perform E.op();`
+    /// statements before reaching an inner leaf (Pure / CpsCall /
+    /// Perform / Nested). The emit allocates a mini chain of synth-
+    /// conts for the branch performs; the first branch perform's
+    /// continuation is the branch chain's step_0.
+    ///
+    /// Shape: `{ let _ = perform E.op1(); ...; inner_leaf }`
+    ///
+    /// `branch_yield_count` is the number of yield-bearing stmts
+    /// (Perform / CallCps) in the branch body. At pre-pass time,
+    /// one synth-cont per yield is allocated for the branch chain.
+    PerformChain,
 }
 
 /// Plan B Task 78.5 G4 (Phase A — shape detector only) — does this fn

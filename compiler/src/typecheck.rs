@@ -8089,9 +8089,23 @@ fn collect_free_vars(
 /// access to the ctor registry; conservative for User types).
 ///
 /// `Pattern::Wildcard` and `Pattern::Var` are catchall against any
-/// non-User type. For User types we conservatively return false —
-/// the User-type exhaustiveness path uses `match_witness` which
-/// handles ctor-aware enumeration.
+/// type. A `Pattern::Var` is a fresh-name binding that captures the
+/// scrutinee value as-is; it does not pattern-match into the value
+/// shape, so it covers every inhabitant of every type.
+///
+/// (Earlier versions special-cased `Ty::User` to return false here,
+/// reasoning that user-type exhaustiveness should defer to the
+/// Maranget path in `match_witness`. That gating is correct at the
+/// top level — `check_match` only enters this function when the
+/// scrutinee is non-User — but **recursive sub-pattern checks**
+/// inside tuple scrutinees do see element types of `Ty::User`. With
+/// the gate, `match (jv, n) { (val, _) => ... }` was rejected as
+/// non-exhaustive because `val: JValue` got the User-gated false,
+/// even though `val` is a fresh binding that subsumes every JValue
+/// inhabitant. The fix: drop the gate. Top-level User-type scrutinees
+/// are still routed through `match_witness` at the call site; this
+/// function is only consulted for tuple / primitive scrutinees and
+/// for tuple sub-patterns.)
 ///
 /// `Pattern::Tuple` is catchall against `Ty::Tuple` of matching
 /// arity iff every sub-pattern is catchall against the matching
@@ -8099,7 +8113,7 @@ fn collect_free_vars(
 fn pattern_is_simple_catchall(p: &Pattern, scrut_ty: &Ty) -> bool {
     match p {
         Pattern::Wildcard(_) => true,
-        Pattern::Var(_, _) => !matches!(scrut_ty, Ty::User(_, _)),
+        Pattern::Var(_, _) => true,
         Pattern::Tuple(pats, _) => match scrut_ty {
             Ty::Tuple(elem_tys) if pats.len() == elem_tys.len() => pats
                 .iter()
@@ -14430,12 +14444,11 @@ mod tests {
     fn import_std_state_typechecks_cleanly() {
         // Pin `State` + `run_state` surface end-to-end. Body sets
         // state to 10, gets it back, returns get-result + 1;
-        // run_state(5, comp) discharges and threads state. Same
+        // run_state(5, comp) discharges and threads state, returning
+        // `(11, 10)` per the (A, S) tuple-return contract. Same
         // shape as examples/state.sigil's canonical trace
-        // (Plan B' Stage 6.8 demo). Uses direct `perform State.x`
-        // invocations per `[DEVIATION Task 72]` v1 constraint #3
-        // (wrapper fns don't compose with the discharge-with-
-        // lambda pattern in v1).
+        // (Plan B' Stage 6.8 demo + Plan C followup tuple-return
+        // migration).
         let src = "import std.state\n\
                    fn comp() -> Int ![State[Int]] {\n  \
                      let _: Int = perform State.set(10);\n  \
@@ -14443,7 +14456,8 @@ mod tests {
                      v + 1\n\
                    }\n\
                    fn main() -> Int ![IO] {\n  \
-                     let result: Int = run_state(5, comp);\n  \
+                     let pair: (Int, Int) = run_state(5, comp);\n  \
+                     let result: Int = match pair { (v, _) => v };\n  \
                      perform IO.println(int_to_string(result));\n  \
                      0\n\
                    }\n";
