@@ -1089,6 +1089,11 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("random_pseudo_int".to_string());
     // Plan C Task 76 — Clock builtin.
     globals.insert("clock_os_now".to_string());
+    // Plan C Stage 7 — Int bitwise / shift / abs builtins.
+    globals.insert("int_xor".to_string());
+    globals.insert("int_shl".to_string());
+    globals.insert("int_shr".to_string());
+    globals.insert("int_abs".to_string());
     let ctors: BTreeSet<String> = collect_ctor_names(program);
     // Plan D Task 117 (b) — pre-pass map of user-fn param-Continuation
     // flags. Consumed by `arm_body_walk`'s generic-call branch to
@@ -7779,6 +7784,42 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_clock_os_now", Linkage::Import, &clock_os_now_sig)
         .map_err(|e| format!("declare sigil_clock_os_now: {e}"))?;
 
+    // Plan C Stage 7 — Int bitwise / shift / abs primitives.
+    // sigil_int_xor(a: i64, b: i64) -> i64
+    let mut int_xor_sig = Signature::new(isa_call_conv(&module));
+    int_xor_sig.params.push(AbiParam::new(types::I64));
+    int_xor_sig.params.push(AbiParam::new(types::I64));
+    int_xor_sig.returns.push(AbiParam::new(types::I64));
+    let int_xor = module
+        .declare_function("sigil_int_xor", Linkage::Import, &int_xor_sig)
+        .map_err(|e| format!("declare sigil_int_xor: {e}"))?;
+
+    // sigil_int_shl(a: i64, b: i64) -> i64
+    let mut int_shl_sig = Signature::new(isa_call_conv(&module));
+    int_shl_sig.params.push(AbiParam::new(types::I64));
+    int_shl_sig.params.push(AbiParam::new(types::I64));
+    int_shl_sig.returns.push(AbiParam::new(types::I64));
+    let int_shl = module
+        .declare_function("sigil_int_shl", Linkage::Import, &int_shl_sig)
+        .map_err(|e| format!("declare sigil_int_shl: {e}"))?;
+
+    // sigil_int_shr(a: i64, b: i64) -> i64
+    let mut int_shr_sig = Signature::new(isa_call_conv(&module));
+    int_shr_sig.params.push(AbiParam::new(types::I64));
+    int_shr_sig.params.push(AbiParam::new(types::I64));
+    int_shr_sig.returns.push(AbiParam::new(types::I64));
+    let int_shr = module
+        .declare_function("sigil_int_shr", Linkage::Import, &int_shr_sig)
+        .map_err(|e| format!("declare sigil_int_shr: {e}"))?;
+
+    // sigil_int_abs(n: i64) -> i64
+    let mut int_abs_sig = Signature::new(isa_call_conv(&module));
+    int_abs_sig.params.push(AbiParam::new(types::I64));
+    int_abs_sig.returns.push(AbiParam::new(types::I64));
+    let int_abs = module
+        .declare_function("sigil_int_abs", Linkage::Import, &int_abs_sig)
+        .map_err(|e| format!("declare sigil_int_abs: {e}"))?;
+
     // Plan D Task 117 (b) Phase 4 — Continuation value object alloc
     // + load helpers. Used at sites that flow a continuation into a
     // fn-parameter (boxing the (k_closure, k_fn, return_closure,
@@ -8961,6 +9002,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             string_length,
             random_pseudo_int,
             clock_os_now,
+            int_xor,
+            int_shl,
+            int_shr,
+            int_abs,
             cont_alloc,
             cont_invoke,
         },
@@ -21435,6 +21480,34 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let call = self.builder.ins().call(self.builtins.clock_os_now_ref, &[]);
                 self.builder.inst_results(call)[0]
             }
+            // Plan C Stage 7 — Int bitwise / shift / abs primitives.
+            Expr::Ident(name, _) if name == "int_xor" => {
+                assert_eq!(args.len(), 2, "int_xor builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int_xor_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int_shl" => {
+                assert_eq!(args.len(), 2, "int_shl builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int_shl_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int_shr" => {
+                assert_eq!(args.len(), 2, "int_shr builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int_shr_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int_abs" => {
+                assert_eq!(args.len(), 1, "int_abs builtin arg count is not 1");
+                let v = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.int_abs_ref, &[v]);
+                self.builder.inst_results(call)[0]
+            }
             Expr::ClosureRecord { code_fn_name, .. } => {
                 // Evaluate the ClosureRecord first (allocates + stores
                 // the closure on the heap) and use its pointer as the
@@ -22906,6 +22979,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
                 Expr::Ident(name, _) if name == "random_pseudo_int" => types::I64,
                 Expr::Ident(name, _) if name == "clock_os_now" => types::I64,
+                // Plan C Stage 7 — Int bitwise / shift / abs return I64.
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "int_xor" | "int_shl" | "int_shr" | "int_abs"
+                    ) =>
+                {
+                    types::I64
+                }
                 Expr::ClosureRecord { code_fn_name, .. } => self
                     .user_fns
                     .get(code_fn_name)
@@ -23426,6 +23508,11 @@ struct BuiltinFuncIds {
     /// Plan C Task 76 — OS clock (nanos since epoch). Backs the
     /// `os_clock` handler in `std/clock.sigil`.
     clock_os_now: cranelift_module::FuncId,
+    /// Plan C Stage 7 — Int bitwise / shift / abs primitives.
+    int_xor: cranelift_module::FuncId,
+    int_shl: cranelift_module::FuncId,
+    int_shr: cranelift_module::FuncId,
+    int_abs: cranelift_module::FuncId,
     /// Plan D Task 117 (b) Phase 4 — Continuation value object
     /// `alloc` (boxes the (k_closure, k_fn, return_closure,
     /// return_fn) quadruple at sites that flow a continuation
@@ -23515,6 +23602,11 @@ struct BuiltinFuncRefs {
     random_pseudo_int_ref: FuncRef,
     /// Plan C Task 76 — OS clock FuncRef.
     clock_os_now_ref: FuncRef,
+    /// Plan C Stage 7 — Int bitwise / shift / abs FuncRefs.
+    int_xor_ref: FuncRef,
+    int_shl_ref: FuncRef,
+    int_shr_ref: FuncRef,
+    int_abs_ref: FuncRef,
     /// Plan D Task 117 (b) Phase 4 — Continuation value object
     /// alloc + invoke helpers (FuncRefs). The load helpers
     /// (`sigil_continuation_load_*`) are called only from inside
@@ -23747,6 +23839,10 @@ fn prepare_builtin_func_refs(
         string_length_ref: module.declare_func_in_func(ids.string_length, builder.func),
         random_pseudo_int_ref: module.declare_func_in_func(ids.random_pseudo_int, builder.func),
         clock_os_now_ref: module.declare_func_in_func(ids.clock_os_now, builder.func),
+        int_xor_ref: module.declare_func_in_func(ids.int_xor, builder.func),
+        int_shl_ref: module.declare_func_in_func(ids.int_shl, builder.func),
+        int_shr_ref: module.declare_func_in_func(ids.int_shr, builder.func),
+        int_abs_ref: module.declare_func_in_func(ids.int_abs, builder.func),
         cont_alloc_ref: module.declare_func_in_func(ids.cont_alloc, builder.func),
         cont_invoke_ref: module.declare_func_in_func(ids.cont_invoke, builder.func),
     }

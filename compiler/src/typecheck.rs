@@ -1222,6 +1222,8 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     register_builtin_random_schemes(&mut tc);
     // Plan C Task 76 — OS clock builtin.
     register_builtin_clock_schemes(&mut tc);
+    // Plan C Stage 7 — Int bitwise / shift / abs builtins.
+    register_builtin_int_bitwise_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -2312,6 +2314,42 @@ fn register_builtin_clock_schemes(tc: &mut Tc) {
     };
     tc.fn_schemes
         .insert("clock_os_now".to_string(), make_scheme(vec![], Ty::Int));
+}
+
+/// Plan C Stage 7 — Int bitwise / shift / abs builtin schemes.
+///
+/// - `int_xor(Int, Int) -> Int ![]` — bitwise XOR
+/// - `int_shl(Int, Int) -> Int ![]` — left shift
+/// - `int_shr(Int, Int) -> Int ![]` — arithmetic right shift
+/// - `int_abs(Int) -> Int ![]` — absolute value
+fn register_builtin_int_bitwise_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        scope_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    tc.fn_schemes.insert(
+        "int_xor".to_string(),
+        make_scheme(vec![Ty::Int, Ty::Int], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "int_shl".to_string(),
+        make_scheme(vec![Ty::Int, Ty::Int], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "int_shr".to_string(),
+        make_scheme(vec![Ty::Int, Ty::Int], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "int_abs".to_string(),
+        make_scheme(vec![Ty::Int], Ty::Int),
+    );
 }
 
 struct Tc {

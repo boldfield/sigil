@@ -9324,6 +9324,57 @@ fn std_random_two_calls_produce_two_outputs() {
     assert_eq!(lines[1], "end");
 }
 
+#[test]
+fn std_random_seeded_produces_deterministic_sequence() {
+    let src = "import std.random\n\
+               fn three_draws() -> Int ![Random] {\n  \
+                 let a: Int = random_int();\n  \
+                 let b: Int = random_int();\n  \
+                 let c: Int = random_int();\n  \
+                 a + b + c\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let r1: Int = run_seeded_random(int64_from_int(42), fn () -> Int ![Random] => {\n    \
+                   three_draws()\n  \
+                 });\n  \
+                 let r2: Int = run_seeded_random(int64_from_int(42), fn () -> Int ![Random] => {\n    \
+                   three_draws()\n  \
+                 });\n  \
+                 perform IO.println(int_to_string(r1));\n  \
+                 perform IO.println(int_to_string(r2));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "std_random_seeded_det");
+    assert_eq!(code, 0);
+    let lines: Vec<&str> = stdout.split_terminator('\n').collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], lines[1], "same seed must produce same sequence");
+}
+
+#[test]
+fn std_random_seeded_different_seeds_differ() {
+    let src = "import std.random\n\
+               fn one_draw() -> Int ![Random] {\n  \
+                 random_int()\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let a: Int = run_seeded_random(int64_from_int(42), fn () -> Int ![Random] => {\n    \
+                   one_draw()\n  \
+                 });\n  \
+                 let b: Int = run_seeded_random(int64_from_int(99), fn () -> Int ![Random] => {\n    \
+                   one_draw()\n  \
+                 });\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "std_random_seeded_diff");
+    assert_eq!(code, 0);
+    let lines: Vec<&str> = stdout.split_terminator('\n').collect();
+    assert_eq!(lines.len(), 2);
+    assert_ne!(lines[0], lines[1], "different seeds must produce different values");
+}
+
 /// Plan C Task 76 part 1 ships `std/clock.sigil` with `now()` and
 /// `run_os_clock`. Wall-clock readings are non-deterministic;
 /// assert only on shape (program returns 0, stdout is a positive

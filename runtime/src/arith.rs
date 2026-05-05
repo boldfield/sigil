@@ -110,6 +110,46 @@ pub extern "C" fn sigil_checked_mul(a: i64, b: i64) -> CheckedInt {
     }
 }
 
+/// Bitwise XOR of two `Int` values.
+///
+/// `int_xor(a, b)` computes `a ^ b`. Both operands and the result are
+/// plain `i64` values (codegen passes raw untagged integers to the
+/// runtime for `Int`-level primitives).
+#[no_mangle]
+pub extern "C" fn sigil_int_xor(a: i64, b: i64) -> i64 {
+    a ^ b
+}
+
+/// Left shift `a` by `b` bit positions.
+///
+/// `int_shl(a, b)` computes `a << (b & 63)`. The shift amount is masked
+/// to 6 bits (standard Rust `wrapping_shl` semantics) so shifts >= 64
+/// wrap rather than panic.
+#[no_mangle]
+pub extern "C" fn sigil_int_shl(a: i64, b: i64) -> i64 {
+    a.wrapping_shl(b as u32)
+}
+
+/// Arithmetic right shift `a` by `b` bit positions.
+///
+/// `int_shr(a, b)` computes `a >> (b & 63)`. Sign-extends from the MSB
+/// (arithmetic shift). The shift amount is masked to 6 bits via
+/// `wrapping_shr`.
+#[no_mangle]
+pub extern "C" fn sigil_int_shr(a: i64, b: i64) -> i64 {
+    a.wrapping_shr(b as u32)
+}
+
+/// Absolute value of an `Int`.
+///
+/// `int_abs(n)` returns `|n|`. Uses `wrapping_abs` so
+/// `int_abs(i64::MIN)` returns `i64::MIN` (two's complement wrap)
+/// rather than panicking.
+#[no_mangle]
+pub extern "C" fn sigil_int_abs(n: i64) -> i64 {
+    n.wrapping_abs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,4 +280,41 @@ mod tests {
     // which preserve the Plan A2 stderr banner + exit-2 behaviour.
     // Direct unit tests for the arm fns would still abort the test
     // runner; the e2e suite is the authoritative cross-check.
+
+    #[test]
+    fn int_xor_basic() {
+        assert_eq!(sigil_int_xor(0b1010, 0b1100), 0b0110);
+        assert_eq!(sigil_int_xor(0, 0), 0);
+        assert_eq!(sigil_int_xor(-1, 0), -1);
+        assert_eq!(sigil_int_xor(-1, -1), 0);
+    }
+
+    #[test]
+    fn int_shl_basic() {
+        assert_eq!(sigil_int_shl(1, 0), 1);
+        assert_eq!(sigil_int_shl(1, 3), 8);
+        assert_eq!(sigil_int_shl(5, 1), 10);
+        // Shift by 64 wraps to shift by 0 (masked to 6 bits).
+        assert_eq!(sigil_int_shl(1, 64), 1);
+    }
+
+    #[test]
+    fn int_shr_basic() {
+        assert_eq!(sigil_int_shr(8, 1), 4);
+        assert_eq!(sigil_int_shr(8, 3), 1);
+        // Arithmetic: sign-extends from MSB.
+        assert_eq!(sigil_int_shr(-1, 1), -1);
+        assert_eq!(sigil_int_shr(-8, 2), -2);
+        // Shift by 64 wraps to shift by 0.
+        assert_eq!(sigil_int_shr(42, 64), 42);
+    }
+
+    #[test]
+    fn int_abs_basic() {
+        assert_eq!(sigil_int_abs(0), 0);
+        assert_eq!(sigil_int_abs(7), 7);
+        assert_eq!(sigil_int_abs(-7), 7);
+        // i64::MIN wraps to itself (two's complement).
+        assert_eq!(sigil_int_abs(i64::MIN), i64::MIN);
+    }
 }

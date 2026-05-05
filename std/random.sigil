@@ -1,38 +1,20 @@
 // sigil: 0.1
 //
-// std/random.sigil — Plan C Task 75.
+// std/random.sigil — Plan C Task 75 + Task 75 part 2.
 //
 // `Random` is a user-declared effect with a single op,
-// `rand_int() -> Int`. The stdlib ships a pseudo-random handler
-// (`run_pseudo_random`) backed by a process-global xorshift64 PRNG
-// (seeded once at first use from system clock + process ID).
+// `rand_int() -> Int`. The stdlib ships two handlers:
 //
-// # ⚠️ NOT CRYPTOGRAPHICALLY SECURE
+// - `run_pseudo_random(body)` — process-global xorshift64 PRNG
+//   (seeded once at first use from system clock + process ID)
+// - `run_seeded_random(seed, body)` — deterministic xorshift64
+//   seeded from an Int64 value, carries state in a MutArray[Int]
 //
-// `random_pseudo_int` and `run_pseudo_random` are deterministic
-// from a small number of observed outputs. **Do not use** for
-// tokens, salts, session IDs, key material, or any other
-// security-relevant context. Names use `pseudo` rather than `os` /
-// `random` to keep the non-crypto property visible at every call
-// site.
+// # NOT CRYPTOGRAPHICALLY SECURE
 //
-// v2 will add an `os_random_int` primitive backed by `getrandom(2)`
-// / `getentropy(3)` / `BCryptGenRandom`; the Sigil-side surface
-// gains a parallel `run_os_random` handler at that point. The
-// pseudo-random surface stays for tests and reproducibility.
-//
-// ## Design notes
-//
-// - `Int` is sigil's i64 (with the high bit reserved at the runtime
-//   Value level). The builtin `random_pseudo_int` returns a 63-bit
-//   non-negative int. Users wanting a smaller range mod the result
-//   themselves: `random_int_below(n) = random_int() % n`.
-//
-// - The plan body specifies a `seeded(Int64)` handler that installs
-//   a deterministic PRNG. That handler is **deferred to a Task 75
-//   follow-up** alongside Task 69 (Int64). An actual implementation
-//   would carry PRNG state via a `MutArray[Int]` in the handler's
-//   closure and step it on each draw, gated on `![Random, Mem]`.
+// Both handlers are deterministic from a small number of observed
+// outputs. Do not use for tokens, salts, session IDs, key material,
+// or any other security-relevant context.
 
 effect Random {
   rand_int: () -> Int,
@@ -58,5 +40,24 @@ fn random_int() -> Int ![Random] {
 fn run_pseudo_random[A](body: () -> A ![Random]) -> A ![] {
   handle body() with {
     Random.rand_int(k) => k(random_pseudo_int()),
+  }
+}
+
+fn xorshift_step(n: Int) -> Int ![] {
+  let a: Int = int_xor(n, int_shl(n, 13));
+  let b: Int = int_xor(a, int_shr(a, 7));
+  let c: Int = int_xor(b, int_shl(b, 17));
+  int_abs(c)
+}
+
+fn run_seeded_random[A](seed: Int64, body: () -> A ![Random]) -> A ![Mem] {
+  let state: MutArray[Int] = mut_array_new(1, int64_to_int(seed));
+  handle body() with {
+    Random.rand_int(k) => {
+      let current: Int = mut_array_get(state, 0);
+      let next: Int = xorshift_step(current);
+      let _: Unit = mut_array_set(state, 0, next);
+      k(next)
+    },
   }
 }
