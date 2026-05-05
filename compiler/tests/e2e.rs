@@ -9378,6 +9378,48 @@ fn std_clock_two_calls_monotonic() {
     );
 }
 
+#[test]
+fn std_clock_frozen_returns_fixed_value() {
+    let src = "import std.clock\n\
+               fn body() -> Int ![Clock] {\n  \
+                 let a: Int = now();\n  \
+                 let b: Int = now();\n  \
+                 a + b\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_frozen_clock(int64_from_int(500), fn () -> Int ![Clock] => {\n    \
+                   body()\n  \
+                 });\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "std_clock_frozen_fixed");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1000\n");
+}
+
+#[test]
+fn std_clock_frozen_different_timestamp() {
+    let src = "import std.clock\n\
+               fn body() -> Int ![Clock] {\n  \
+                 now()\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = run_frozen_clock(int64_from_int(42), fn () -> Int ![Clock] => {\n    \
+                   body()\n  \
+                 });\n  \
+                 let b: Int = run_frozen_clock(int64_from_int(99), fn () -> Int ![Clock] => {\n    \
+                   body()\n  \
+                 });\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "std_clock_frozen_diff");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "42\n99\n");
+}
+
 // ===== Plan C Task 80 — `examples/json.sigil` =====
 
 /// Exercise the JSON pretty-printer over the demo document. Pin

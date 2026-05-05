@@ -1,39 +1,21 @@
 // sigil: 0.1
 //
-// std/clock.sigil — Plan C Task 76.
+// std/clock.sigil — Plan C Task 76 + Task 76 part 2.
 //
 // `Clock` is a user-declared effect with a single op,
 // `now() -> Int` returning nanoseconds since the Unix epoch. The
-// stdlib ships an `os_clock` handler that delegates to the
-// `clock_os_now` runtime builtin (reads `SystemTime::now()` on
-// the host).
+// stdlib ships two handlers:
+//
+// - `run_os_clock(body)` — production use, reads `SystemTime::now()`
+// - `run_frozen_clock(timestamp, body)` — test determinism, returns
+//   a fixed Int64-derived value for every `Clock.now` perform
 //
 // ## Resolution / range
 //
 // `Int` is sigil's i64 with the high bit reserved at the runtime
 // Value layer; the OS handler returns a 63-bit non-negative nanos-
 // since-epoch value. The 63-bit range covers ~292 years past 1970,
-// sufficient through year 2262 for v1 use. v2 `Int64` (Plan C
-// Task 69) gives the full 64-bit range; the `frozen(Int64)`
-// handler from the plan body is **deferred to a Task 76 follow-up**
-// alongside Int64.
-//
-// ## Composition
-//
-// Use `run_os_clock` for production code. Test code wanting
-// deterministic timestamps writes a custom handler that resumes
-// each `Clock.now(k)` arm with a fixed value:
-//
-// ```sigil
-// fn run_frozen[A](timestamp: Int, body: () -> A ![Clock]) -> A ![] {
-//   handle body() with {
-//     Clock.now(k) => k(timestamp),
-//   }
-// }
-// ```
-//
-// (The plan body's `frozen(Int64)` handler is the same shape
-// shifted to Int64 once Task 69 lands.)
+// sufficient through year 2262 for v1 use.
 
 effect Clock {
   now: () -> Int,
@@ -46,5 +28,12 @@ fn now() -> Int ![Clock] {
 fn run_os_clock[A](body: () -> A ![Clock]) -> A ![] {
   handle body() with {
     Clock.now(k) => k(clock_os_now()),
+  }
+}
+
+fn run_frozen_clock[A](timestamp: Int64, body: () -> A ![Clock]) -> A ![] {
+  let nanos: Int = int64_to_int(timestamp);
+  handle body() with {
+    Clock.now(k) => k(nanos),
   }
 }
