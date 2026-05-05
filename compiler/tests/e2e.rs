@@ -9151,6 +9151,87 @@ fn std_int64_import_is_noop() {
     assert_eq!(stdout, "123\n", "stderr={stderr:?}");
 }
 
+// ===== Task 78 — Stdlib edge-case coverage =====
+
+/// Int64 wrapping arithmetic: mul that exceeds i64 range wraps
+/// via two's complement. (2^62 - 1) * 4 = 2^64 - 4 → wraps to -4.
+#[test]
+fn std_int64_mul_overflow_wraps() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let big: Int64 = int64_from_int(4611686018427387903);\n  \
+                 let four: Int64 = int64_from_int(4);\n  \
+                 let result: Int64 = int64_mul(big, four);\n  \
+                 perform IO.println(int64_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_overflow_wrap");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "-4\n", "stderr={stderr:?}");
+}
+
+/// Int64 MIN / -1 aborts. The runtime detects this overflow case
+/// and calls abort (non-zero exit).
+#[test]
+fn std_int64_div_min_by_neg1_aborts() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let min_half: Int64 = int64_from_int(-4611686018427387904);\n  \
+                 let two: Int64 = int64_from_int(2);\n  \
+                 let min_val: Int64 = int64_mul(min_half, two);\n  \
+                 let neg1: Int64 = int64_from_int(-1);\n  \
+                 let _r: Int64 = int64_div(min_val, neg1);\n  \
+                 0\n\
+               }\n";
+    let (_stdout, _stderr, code) = compile_and_run(src, "std_int64_min_div_neg1");
+    assert_ne!(code, 0, "int64_div(MIN, -1) should abort");
+}
+
+/// byte_array_slice at full boundaries: slice(0, length) returns
+/// the entire array contents.
+#[test]
+fn std_byte_array_slice_full_boundary() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = byte_truncate(9);\n  \
+                 let ba: ByteArray = byte_array_alloc(5, b);\n  \
+                 let full: ByteArray = byte_array_slice(ba, 0, 5);\n  \
+                 perform IO.println(int_to_string(byte_array_length(full)));\n  \
+                 perform IO.println(int_to_string(byte_to_int(byte_array_get(full, 0))));\n  \
+                 perform IO.println(int_to_string(byte_to_int(byte_array_get(full, 4))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_slice_full");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n9\n9\n", "stderr={stderr:?}");
+}
+
+/// byte_array_slice with start == end returns empty slice.
+#[test]
+fn std_byte_array_slice_empty() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = byte_truncate(1);\n  \
+                 let ba: ByteArray = byte_array_alloc(10, b);\n  \
+                 let empty: ByteArray = byte_array_slice(ba, 3, 3);\n  \
+                 perform IO.println(int_to_string(byte_array_length(empty)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_slice_empty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// mut_array_new with zero length allocates without crashing
+/// and reports length 0.
+#[test]
+fn std_mut_array_zero_length_alloc() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let ma: MutArray[Int] = mut_array_new(0, 42);\n  \
+                 perform IO.println(int_to_string(mut_array_length(ma)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_zero_len");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 67 — StringBuilder run-and-check-output =====
 
 /// `sb_new` then `sb_finalize` returns the empty string. Smoke
