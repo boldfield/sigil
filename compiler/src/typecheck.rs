@@ -2346,10 +2346,8 @@ fn register_builtin_int_bitwise_schemes(tc: &mut Tc) {
         "int_shr".to_string(),
         make_scheme(vec![Ty::Int, Ty::Int], Ty::Int),
     );
-    tc.fn_schemes.insert(
-        "int_abs".to_string(),
-        make_scheme(vec![Ty::Int], Ty::Int),
-    );
+    tc.fn_schemes
+        .insert("int_abs".to_string(), make_scheme(vec![Ty::Int], Ty::Int));
 }
 
 struct Tc {

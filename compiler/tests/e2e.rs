@@ -9453,7 +9453,10 @@ fn std_random_seeded_different_seeds_differ() {
     assert_eq!(code, 0);
     let lines: Vec<&str> = stdout.split_terminator('\n').collect();
     assert_eq!(lines.len(), 2);
-    assert_ne!(lines[0], lines[1], "different seeds must produce different values");
+    assert_ne!(
+        lines[0], lines[1],
+        "different seeds must produce different values"
+    );
 }
 
 /// Plan C Task 76 part 1 ships `std/clock.sigil` with `now()` and
@@ -12159,4 +12162,25 @@ fn koka_handler_computes_before_resume() {
     assert_eq!(code, 0);
     // ask(3) -> 6, ask(7) -> 14, sum = 20
     assert_eq!(stdout, "20\n");
+}
+
+#[test]
+fn tail_perform_state_get_after_set() {
+    let src = "import std.state\n\
+               fn set_then_get() -> Int ![State[Int]] {\n  \
+                 let _u: Int = perform State.set(42);\n  \
+                 perform State.get()\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: (Int, Int) = run_state(0, fn () -> Int ![State[Int]] => {\n    \
+                   set_then_get()\n  \
+                 });\n  \
+                 match result { (v, _s) => {\n    \
+                   perform IO.println(int_to_string(v));\n    \
+                   0\n  \
+                 }}\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "tail_perform_state");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "42\n");
 }

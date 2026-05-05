@@ -8354,7 +8354,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // field; this commit consumes it for signature selection.
             // The transitional `#[allow(dead_code)]` on
             // `UserFnEntry::abi` is removed at the same time.
-            let abi = compute_user_fn_abi(&f.name, &f.body, &f.params, &cc.colored, &fns_by_name);
+            let normalized_body = normalize_tail_perform_body(&f.body, &f.return_type);
+            let body_for_abi = normalized_body.as_ref().unwrap_or(&f.body);
+            let abi =
+                compute_user_fn_abi(&f.name, body_for_abi, &f.params, &cc.colored, &fns_by_name);
             let (sig, param_tys, ret_ty) = match abi {
                 UserFnAbi::Sync => {
                     // Plan D Task 111b — Sync ABI:
@@ -8540,7 +8543,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let lookup = |callee_name: &str| {
                         is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     };
-                    is_simple_chained_let_yield_then_pure_tail_body(&f.body, &ctors, &lookup)
+                    // Tail-perform normalization: use the same
+                    // normalized body that ABI classification used.
+                    let emit_normalized = normalize_tail_perform_body(&f.body, &f.return_type);
+                    let emit_body = emit_normalized.as_ref().unwrap_or(&f.body);
+                    is_simple_chained_let_yield_then_pure_tail_body(emit_body, &ctors, &lookup)
                         .or_else(|| {
                             // Same `lookup` for both predicates — at
                             // pre-pass level there's no visited-set in
@@ -8549,7 +8556,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // visited-set when the recursion reaches
                             // is_supported_cps_user_fn_inner.
                             is_let_yield_prefix_then_branched_cps_tail_body(
-                                &f.body, &ctors, &lookup, &lookup,
+                                emit_body, &ctors, &lookup, &lookup,
                             )
                         })
                 } {
@@ -8561,6 +8568,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // OR `Expr::Call` with a Cps-color top-level
                     // callee; unreachable!() guards mirror the
                     // ConstantDone branch above.
+                    let arm_normalized = normalize_tail_perform_body(&f.body, &f.return_type);
+                    let arm_body = arm_normalized.as_ref().unwrap_or(&f.body);
                     let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
                     let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
                     let mut binding_tys: Vec<Type> = Vec::with_capacity(chain_length);
@@ -8569,7 +8578,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // (after the last yield, before the tail). Lowered
                     // by the FINAL step's emit before tail_expr.
                     let mut tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
-                    for stmt in &f.body.stmts {
+                    for stmt in &arm_body.stmts {
                         let let_stmt = match stmt {
                             crate::ast::Stmt::Let(l) => l,
                             _ => unreachable!(
@@ -8664,7 +8673,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             }
                         }
                     }
-                    let tail_expr = match &f.body.tail {
+                    let tail_expr = match &arm_body.tail {
                         Some(t) => t.clone(),
                         None => unreachable!(
                             "is_simple_chained_let_yield_then_pure_tail_body \
@@ -22981,10 +22990,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 Expr::Ident(name, _) if name == "clock_os_now" => types::I64,
                 // Plan C Stage 7 — Int bitwise / shift / abs return I64.
                 Expr::Ident(name, _)
-                    if matches!(
-                        name.as_str(),
-                        "int_xor" | "int_shl" | "int_shr" | "int_abs"
-                    ) =>
+                    if matches!(name.as_str(), "int_xor" | "int_shl" | "int_shr" | "int_abs") =>
                 {
                     types::I64
                 }
@@ -24038,6 +24044,58 @@ fn prepare_per_fn_refs(
 ///    closure pre-pass).
 /// 4. Arbitrary CPS-color bodies via the same pre-pass.
 ///
+/// Normalize a function body that ends with a tail-position `perform`
+/// into the chained-let-yield form `{ ...; let __tail_v = perform ...; __tail_v }`.
+///
+/// The chained-let-yield CPS classifier requires a pure tail expression.
+/// A bare tail-position perform (e.g., `{ let _ = perform set(10); perform get() }`)
+/// is semantically identical to binding the perform result and returning it,
+/// but the classifier rejects it because `perform` is not pure. This leaves
+/// the function with Sync ABI, which breaks the lambda-chain discharge model
+/// (the handler arm's return value is returned to the body function as the
+/// perform result instead of being routed through the CPS continuation chain).
+///
+/// The normalization only applies when the body has at least one stmt
+/// containing a perform AND the tail is a perform. Bodies that are ONLY a
+/// single perform (no stmts) are handled by `is_simple_tail_perform_with_pure_args_body`.
+///
+/// Returns `Some(normalized_block)` if normalization was applied, `None` otherwise.
+fn normalize_tail_perform_body(
+    body: &crate::ast::Block,
+    return_type: &crate::ast::TypeExpr,
+) -> Option<crate::ast::Block> {
+    use crate::ast::{Expr, LetStmt, Stmt};
+    if body.stmts.is_empty() {
+        return None;
+    }
+    let has_perform_stmt = body.stmts.iter().any(|s| match s {
+        Stmt::Let(l) => matches!(&l.value, Expr::Perform(_)) || expr_contains_perform(&l.value),
+        Stmt::Perform(_) => true,
+        Stmt::Expr(e) => expr_contains_perform(e),
+    });
+    if !has_perform_stmt {
+        return None;
+    }
+    let perform = match &body.tail {
+        Some(Expr::Perform(p)) => p,
+        _ => return None,
+    };
+    let span = perform.span.clone();
+    let binding_name = "__tail_perform_v".to_string();
+    let mut stmts = body.stmts.clone();
+    stmts.push(Stmt::Let(LetStmt {
+        name: binding_name.clone(),
+        ty: return_type.clone(),
+        value: Expr::Perform(perform.clone()),
+        span: span.clone(),
+    }));
+    Some(crate::ast::Block {
+        stmts,
+        tail: Some(Expr::Ident(binding_name, span.clone())),
+        span: body.span.clone(),
+    })
+}
+
 /// The classifier is conservative — false negatives are acceptable
 /// (force the body through the existing native-ABI path), false
 /// positives are not (would cause codegen to emit incomplete
