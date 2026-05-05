@@ -12184,3 +12184,32 @@ fn tail_perform_state_get_after_set() {
     assert_eq!(code, 0);
     assert_eq!(stdout, "42\n");
 }
+
+/// State+Raise composition: catch inside run_state.
+/// Raise fires, state set before raise survives in final state.
+/// This is the minimal reproduction of the v1 composition limitation.
+#[test]
+fn state_raise_composition_catch_inside_run_state() {
+    let src = "import std.state\n\
+               import std.raise\n\
+               import std.result\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: (Result[Int, String], Int) = run_state(0, fn () -> Result[Int, String] ![State[Int]] => {\n    \
+                   let _a: Int = perform State.set(10);\n    \
+                   catch(fn () -> Int ![Raise[String], State[Int]] => {\n      \
+                     raise(\"boom\")\n    \
+                   })\n  \
+                 });\n  \
+                 match result { (r, s) => {\n    \
+                   match r {\n      \
+                     Ok(v) => perform IO.println(int_to_string(v)),\n      \
+                     Err(msg) => perform IO.println(msg),\n    \
+                   };\n    \
+                   perform IO.println(int_to_string(s));\n    \
+                   0\n  \
+                 }}\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "state_raise_composition");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "boom\n10\n");
+}

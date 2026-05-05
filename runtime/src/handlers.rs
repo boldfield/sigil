@@ -2232,8 +2232,6 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // arg so handle-exit terminal writes from inside the
                 // dispatched Cps callee land in the caller-owned slot.
                 let f: CpsFn = core::mem::transmute(fn_ptr);
-                // args_buf is a stack local; the callee reads value-bytes from the pointer.
-                // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack local, no GC retention).
                 current = f(closure_ptr, args_buf.as_ptr(), arg_count, out);
             }
             _ => {

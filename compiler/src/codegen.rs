@@ -12090,27 +12090,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ns_ptr
                 } else {
                     // --- Non-tail / no-`k` path (Phase 4c shape) ---
-                    //
-                    // Plan B Task 55 (Phase 4g) bugfix: read the
-                    // arm body's actual lowered Cranelift type via
-                    // `dfg.value_type` instead of the pre-stored
-                    // `synth.body_ty`. The pre-pass derives
-                    // `synth.body_ty` from the **op's declared
-                    // return type** (Phase 4c convention), but
-                    // typecheck unifies the arm body's type with
-                    // **handler_overall**, which can differ from
-                    // the op return type (e.g., a `Raise.fail() ->
-                    // Int` op whose handle's return arm produces
-                    // Bool unifies handler_overall = Bool and the
-                    // arm body's `false` lowers to I8). The
-                    // pre-stored body_ty is then I64 but the actual
-                    // value is I8 — Cranelift's verifier rejects
-                    // the I64 → I64 widen branch over an I8 value.
-                    // Mirrors Phase 4e Slice C's `tail_ty` fix at
-                    // codegen.rs:5260-5285 (use post-lowering
-                    // `dfg.value_type` over pre-stored type).
-                    // Latent since Phase 4c; surfaced by Phase 4g's
-                    // body-vs-handler-overall test surface.
                     let body_value = lowerer.lower_expr(&synth.body);
                     let body_actual_ty = lowerer.builder.func.dfg.value_type(body_value);
                     let widened_body = if body_actual_ty == types::I64 {
@@ -12125,25 +12104,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         );
                         body_value
                     };
-                    // Stage-6.8-followup Bug 2 fix: emit
-                    // `sigil_next_step_discharged` instead of
-                    // `sigil_next_step_done`. This is the op arm fn
-                    // body's discard-`k` tail path: arm body
-                    // evaluated to `widened_body` WITHOUT invoking
-                    // `k`, so per algebraic-effects semantics this
-                    // value IS the handle's final value (not subject
-                    // to the return clause's wrapper). The trampoline
-                    // writes DISCHARGED to the caller-owned
-                    // `TerminalResult.tag` slot (Plan D Task 111d;
-                    // previously TLS); the handle expression's outer
-                    // codegen logic loads the tag from the slot and
-                    // skips the return arm dispatch.
-                    //
-                    // Store the discharging effect's ID into
-                    // `terminal_out.effect_id` so nested handle
-                    // expressions can distinguish own-effect
-                    // discharge (restore snapshot) from foreign-
-                    // effect discharge (propagate to outer handle).
                     let effect_id_const = lowerer
                         .builder
                         .ins()
@@ -12158,9 +12118,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         .builder
                         .ins()
                         .call(next_step_discharged_ref, &[widened_body]);
-                    // Stackmap entry: any pointer-typed op-args bound in
-                    // env (String / user-type) are GC roots live across
-                    // this `sigil_next_step_discharged` arena allocation.
                     lowerer
                         .stackmap
                         .push_placeholder(function_code_offset(&lowerer.builder, done_call));
@@ -24410,14 +24367,19 @@ fn expr_contains_perform(e: &crate::ast::Expr) -> bool {
             expr_contains_perform(callee) || args.iter().any(expr_contains_perform)
         }
         Expr::Tuple { elems, .. } => elems.iter().any(expr_contains_perform),
-        Expr::Handle { .. } | Expr::Lambda { .. } | Expr::ClosureRecord { .. } => {
-            // Conservative: handles / lambdas / closure records that
-            // contain performs are still classified as containing
-            // perform (the perform isn't lifted out of the lambda
-            // body, but the syntactic check errs on the side of
-            // rejecting). Refine if a real-world body needs
-            // lambdas-without-perform to pass.
+        Expr::Handle { .. } | Expr::Lambda { .. } => {
+            // Conservative: handles / lambdas that contain performs
+            // are classified as containing perform. Lambda bodies
+            // aren't yet lifted at this check site in some paths;
+            // Handle expressions may contain inline performs.
             true
+        }
+        Expr::ClosureRecord { .. } => {
+            // After lambda-lifting, ClosureRecords are data
+            // structures holding captured values — the code (which
+            // may contain performs) lives in a lifted top-level fn,
+            // not inline in the ClosureRecord.
+            false
         }
     }
 }
@@ -24769,7 +24731,7 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
         return None;
     }
     match &body.tail {
-        Some(t) if expr_is_pure(t, ctors) => Some(yield_count),
+        Some(t) if !expr_contains_perform(t) => Some(yield_count),
         _ => None,
     }
 }
@@ -26485,8 +26447,9 @@ mod tests {
     }
 
     #[test]
-    fn chained_classifier_rejects_impure_tail() {
-        // A non-pure tail (e.g., containing a Call) disqualifies.
+    fn chained_classifier_rejects_perform_in_tail() {
+        // A tail that contains a perform disqualifies — the tail must
+        // be perform-free so it can be lowered as the final Done value.
         use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -26502,11 +26465,12 @@ mod tests {
                 }),
                 span: span.clone(),
             })],
-            tail: Some(Expr::Call {
-                callee: Box::new(Expr::Ident("helper".to_string(), span.clone())),
+            tail: Some(Expr::Perform(PerformExpr {
+                effect: "State".to_string(),
+                op: "get".to_string(),
                 args: Vec::new(),
                 span: span.clone(),
-            }),
+            })),
             span,
         };
         assert_eq!(
