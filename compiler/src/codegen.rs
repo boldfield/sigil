@@ -3352,6 +3352,7 @@ enum ChainStepRole {
 /// or CpsCall) before its inner leaf. The emit uses this to route
 /// the branch's first yield through a branch-chain synth-cont.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct BranchChainAlloc {
     /// FuncIds for each step in the branch chain.
     step_func_ids: Vec<cranelift_module::FuncId>,
@@ -3576,50 +3577,42 @@ fn seed_branch_work<'a>(
                 }
             }
         }
-        Expr::Match { arms, .. } => {
-            if arms.len() == 2 {
-                let extract_bool = |p: &Pattern| -> Option<bool> {
-                    if let Pattern::BoolLit(b, _) = p {
-                        Some(*b)
+        Expr::Match { arms, .. } if arms.len() == 2 => {
+            let extract_bool = |p: &Pattern| -> Option<bool> {
+                if let Pattern::BoolLit(b, _) = p {
+                    Some(*b)
+                } else {
+                    None
+                }
+            };
+            if let (Some(a0), Some(a1)) = (
+                extract_bool(&arms[0].pattern),
+                extract_bool(&arms[1].pattern),
+            ) {
+                if a0 != a1 {
+                    let (then_arm, else_arm) = if a0 {
+                        (&arms[0], &arms[1])
                     } else {
-                        None
-                    }
-                };
-                if let (Some(a0), Some(a1)) = (
-                    extract_bool(&arms[0].pattern),
-                    extract_bool(&arms[1].pattern),
-                ) {
-                    if a0 != a1 {
-                        let (then_arm, else_arm) = if a0 {
-                            (&arms[0], &arms[1])
-                        } else {
-                            (&arms[1], &arms[0])
+                        (&arms[1], &arms[0])
+                    };
+                    let extract_arm =
+                        |body: &'a Expr| -> Option<(&'a [crate::ast::Stmt], &'a Expr)> {
+                            if let Expr::Block(b) = body {
+                                Some((b.stmts.as_slice(), b.tail.as_ref()?))
+                            } else {
+                                Some((&[], body))
+                            }
                         };
-                        let extract_arm =
-                            |body: &'a Expr| -> Option<(&'a [crate::ast::Stmt], &'a Expr)> {
-                                if let Expr::Block(b) = body {
-                                    Some((b.stmts.as_slice(), b.tail.as_ref()?))
-                                } else {
-                                    Some((&[], body))
-                                }
-                            };
-                        let then_kind = classify_branched_cps_tail_branch_expr(
-                            &then_arm.body,
-                            ctors,
-                            is_supported,
-                        );
-                        let else_kind = classify_branched_cps_tail_branch_expr(
-                            &else_arm.body,
-                            ctors,
-                            is_supported,
-                        );
-                        if let (Some(tk), Some(ek)) = (then_kind, else_kind) {
-                            if let Some((es, et)) = extract_arm(&else_arm.body) {
-                                work.push((es, et, ek));
-                            }
-                            if let Some((ts, tt)) = extract_arm(&then_arm.body) {
-                                work.push((ts, tt, tk));
-                            }
+                    let then_kind =
+                        classify_branched_cps_tail_branch_expr(&then_arm.body, ctors, is_supported);
+                    let else_kind =
+                        classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_supported);
+                    if let (Some(tk), Some(ek)) = (then_kind, else_kind) {
+                        if let Some((es, et)) = extract_arm(&else_arm.body) {
+                            work.push((es, et, ek));
+                        }
+                        if let Some((ts, tt)) = extract_arm(&then_arm.body) {
+                            work.push((ts, tt, tk));
                         }
                     }
                 }
@@ -5464,13 +5457,14 @@ fn collect_handle_arms_in_expr(
                     None
                 };
 
-                let arm_effect_id = ctx.effect_ids.get(&arm.effect).copied().unwrap_or_else(|| {
-                    panic!(
+                let arm_effect_id = match ctx.effect_ids.get(&arm.effect).copied() {
+                    Some(id) => id,
+                    None => unreachable!(
                         "codegen pre-pass: effect `{}` missing from effect_ids \
-                             — typecheck should have caught this",
+                         — typecheck should have caught this",
                         arm.effect
-                    )
-                });
+                    ),
+                };
                 out.synth.push(HandlerArmSynth {
                     func_id,
                     body: rewritten_body,
@@ -14543,19 +14537,31 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                                                 // Emit the first perform
                                                 // with branch_step_0 as k.
-                                                let effect_id = lowerer
+                                                let effect_id = match lowerer
                                                     .effect_ids
                                                     .get(&first_perform.effect)
                                                     .copied()
-                                                    .unwrap();
-                                                let op_id = lowerer
+                                                {
+                                                    Some(id) => id,
+                                                    None => unreachable!(
+                                                        "codegen branch chain: effect `{}` missing from effect_ids",
+                                                        first_perform.effect
+                                                    ),
+                                                };
+                                                let op_id = match lowerer
                                                     .op_ids
                                                     .get(&(
                                                         first_perform.effect.clone(),
                                                         first_perform.op.clone(),
                                                     ))
                                                     .copied()
-                                                    .unwrap();
+                                                {
+                                                    Some(id) => id,
+                                                    None => unreachable!(
+                                                        "codegen branch chain: op `{}.{}` missing from op_ids",
+                                                        first_perform.effect, first_perform.op
+                                                    ),
+                                                };
                                                 let eid_v = lowerer
                                                     .builder
                                                     .ins()
@@ -15979,11 +15985,23 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 "BranchLeafFinal Perform: tail is Perform"
                                             ),
                                         };
-                                        let effect_id = *lowerer.effect_ids.get(&p.effect).unwrap();
-                                        let op_id = *lowerer
+                                        let effect_id = match lowerer.effect_ids.get(&p.effect) {
+                                            Some(&id) => id,
+                                            None => unreachable!(
+                                                "codegen BranchLeafFinal: effect `{}` missing from effect_ids",
+                                                p.effect
+                                            ),
+                                        };
+                                        let op_id = match lowerer
                                             .op_ids
                                             .get(&(p.effect.clone(), p.op.clone()))
-                                            .unwrap();
+                                        {
+                                            Some(&id) => id,
+                                            None => unreachable!(
+                                                "codegen BranchLeafFinal: op `{}.{}` missing from op_ids",
+                                                p.effect, p.op
+                                            ),
+                                        };
                                         let eid_v = lowerer
                                             .builder
                                             .ins()
