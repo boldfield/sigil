@@ -3906,7 +3906,10 @@ impl Tc {
         let td = self.types.get(&info.type_name)?.clone();
         let variant = &td.variants[info.variant_index];
         // Always type-check each arg so user errors inside args still surface.
-        let arg_tys: Vec<Option<Ty>> = args.iter().map(|a| self.check_expr(a, row, row_tail)).collect();
+        let arg_tys: Vec<Option<Ty>> = args
+            .iter()
+            .map(|a| self.check_expr(a, row, row_tail))
+            .collect();
         match &variant.fields {
             VariantFields::Positional(param_tys) => {
                 // Plan B task 48 — allocate one fresh `Ty::Var` per
@@ -4478,7 +4481,12 @@ impl Tc {
         );
     }
 
-    fn check_perform(&mut self, p: &PerformExpr, row: &[EffectInst], row_tail: Option<u32>) -> Option<Ty> {
+    fn check_perform(
+        &mut self,
+        p: &PerformExpr,
+        row: &[EffectInst],
+        row_tail: Option<u32>,
+    ) -> Option<Ty> {
         let ctx = format!("perform {}.{}", p.effect, p.op);
         self.register_effect_use(&p.effect, row, row_tail, p.span.clone(), &ctx);
         // Plan B task 54 + Task 57 — every effect (including the
@@ -5115,7 +5123,10 @@ impl Tc {
     ) -> Option<Ty> {
         let callee_ty = self.check_expr(callee, row, row_tail);
         // Always type-check args so we surface any errors in them.
-        let arg_tys: Vec<Option<Ty>> = args.iter().map(|a| self.check_expr(a, row, row_tail)).collect();
+        let arg_tys: Vec<Option<Ty>> = args
+            .iter()
+            .map(|a| self.check_expr(a, row, row_tail))
+            .collect();
 
         let sig = match callee_ty {
             Some(Ty::Fn(sig)) => sig,
@@ -14796,10 +14807,7 @@ mod tests {
                    }\n\
                    fn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
-        assert!(
-            errs.is_empty(),
-            "open row should absorb Baz; got {errs:?}"
-        );
+        assert!(errs.is_empty(), "open row should absorb Baz; got {errs:?}");
     }
 
     #[test]
