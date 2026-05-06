@@ -11912,10 +11912,11 @@ fn koka_state_through_helper_chain() {
     assert_eq!(stdout, "10\n10\n");
 }
 
-/// Handler modifies value before resuming k.
-/// Derived from koka/test/effects/resume-modify.kk
+/// State handler delegated through a generic wrapper function.
+/// Tests that run_state works when called from a polymorphic
+/// helper that unwraps the (A, S) tuple.
 #[test]
-fn koka_resume_with_modified_value() {
+fn koka_state_through_generic_wrapper() {
     let src = "import std.state\n\
                fn body() -> Int ![State[Int]] {\n  \
                  let _: Int = perform State.set(5);\n  \
@@ -12008,12 +12009,11 @@ fn koka_user_effect_multi_op_handler() {
     assert_eq!(stdout, "answer: 42\n");
 }
 
-/// Effect performed in both branches of a conditional — inline.
-/// Tests that both if/else paths correctly capture the
-/// continuation and the handler receives performs from either path.
-/// Derived from koka/test/effects/branch-effect.kk
+/// Two independent handler invocations produce correct isolated results.
+/// Tests that sequential run_state calls with different values each
+/// thread state independently — no cross-contamination between handlers.
 #[test]
-fn koka_effect_in_both_branches() {
+fn koka_independent_handler_invocations() {
     let src = "import std.state\n\
                fn main() -> Int ![IO] {\n  \
                  let r1: (Int, Int) = run_state(0, fn () -> Int ![State[Int]] => {\n    \
@@ -12162,6 +12162,77 @@ fn koka_handler_computes_before_resume() {
     assert_eq!(code, 0);
     // ask(3) -> 6, ask(7) -> 14, sum = 20
     assert_eq!(stdout, "20\n");
+}
+
+/// Functional state: handler arms return closures capturing k, building
+/// a state-passing chain. The handle expression produces a function
+/// `(Int) -> Int` that is applied to the initial state.
+/// Derived from koka/test/algeff/effs4.kk
+#[test]
+fn koka_functional_state_handler_returns_closure() {
+    let src = "import std.io\n\
+               \n\
+               effect FState resumes: many {\n  \
+                 fget: () -> Int,\n  \
+                 fset: (Int) -> Int,\n\
+               }\n\
+               \n\
+               fn test_body() -> Int ![FState] {\n  \
+                 let _: Int = perform FState.fset(2);\n  \
+                 let v: Int = perform FState.fget();\n  \
+                 v + 40\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let step: (Int) -> Int ![] = handle test_body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   FState.fget(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   FState.fset(new_s, k) => fn (s: Int) -> Int ![] => k(new_s)(new_s),\n  \
+                 };\n  \
+                 let result: Int = step(0);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_functional_state");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    // fset(2) → state=2, fget() → 2, 2+40 = 42
+    assert_eq!(stdout, "42\n");
+}
+
+/// Post-resume computation: handler arm calls k once, then adds 20
+/// to the result. Tests that handler arms can do work after the
+/// continuation returns.
+/// Derived from koka/test/algeff/linear1.kk
+#[test]
+fn koka_post_resume_computation_adds_twenty() {
+    let src = "import std.io\n\
+               \n\
+               effect Step resumes: many {\n  \
+                 step: (Int) -> Int,\n\
+               }\n\
+               \n\
+               fn body() -> Int ![Step] {\n  \
+                 let a: Int = perform Step.step(3);\n  \
+                 let b: Int = perform Step.step(7);\n  \
+                 a + b\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle body() with {\n    \
+                   Step.step(n, k) => {\n      \
+                     let r: Int = k(n);\n      \
+                     r + 20\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_post_resume");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    // step(3): k(3) resumes body, a=3
+    // step(7): k(7) resumes body, b=7, returns 3+7=10
+    // inner arm: 10+20=30, outer arm: 30+20=50
+    assert_eq!(stdout, "50\n");
 }
 
 #[test]
