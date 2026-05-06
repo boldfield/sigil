@@ -1212,6 +1212,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // Plan C Task 69 — boxed Int64 arithmetic / comparison /
     // conversion / stringify primitives.
     register_builtin_int64_schemes(&mut tc);
+    register_builtin_float_schemes(&mut tc);
     // Plan C Task 67 — StringBuilder rope primitives, gated by
     // the Mem marker effect.
     register_builtin_string_builder_schemes(&mut tc);
@@ -1831,6 +1832,13 @@ fn builtin_types(file: &str) -> Vec<TypeDecl> {
             variants: Vec::new(),
             span: span.clone(),
         },
+        TypeDecl {
+            name: "Float".to_string(),
+            name_span: span.clone(),
+            generic_params: Vec::new(),
+            variants: Vec::new(),
+            span: span.clone(),
+        },
         // Plan C Task 67 — StringBuilder is opaque, non-generic.
         // Runtime-backed segmented rope; constructed via
         // `sb_new()` and consumed by `sb_finalize` (Mem-gated).
@@ -2155,6 +2163,68 @@ fn register_builtin_int64_schemes(tc: &mut Tc) {
     tc.fn_schemes.insert(
         "int64_to_string".to_string(),
         make_scheme(vec![i64_ty()], Ty::String),
+    );
+}
+
+fn register_builtin_float_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        scope_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    let float_ty = || Ty::User("Float".to_string(), Vec::new());
+    for op in [
+        "float_add",
+        "float_sub",
+        "float_mul",
+        "float_div",
+    ] {
+        tc.fn_schemes.insert(
+            op.to_string(),
+            make_scheme(vec![float_ty(), float_ty()], float_ty()),
+        );
+    }
+    tc.fn_schemes.insert(
+        "float_neg".to_string(),
+        make_scheme(vec![float_ty()], float_ty()),
+    );
+    for cmp in ["float_eq", "float_lt", "float_le", "float_gt", "float_ge"] {
+        tc.fn_schemes.insert(
+            cmp.to_string(),
+            make_scheme(vec![float_ty(), float_ty()], Ty::Bool),
+        );
+    }
+    for math in ["float_abs", "float_floor", "float_ceil", "float_sqrt"] {
+        tc.fn_schemes.insert(
+            math.to_string(),
+            make_scheme(vec![float_ty()], float_ty()),
+        );
+    }
+    tc.fn_schemes.insert(
+        "float_from_int".to_string(),
+        make_scheme(vec![Ty::Int], float_ty()),
+    );
+    tc.fn_schemes.insert(
+        "float_to_int".to_string(),
+        make_scheme(vec![float_ty()], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "float_to_string".to_string(),
+        make_scheme(vec![float_ty()], Ty::String),
+    );
+    tc.fn_schemes.insert(
+        "string_to_float_validate".to_string(),
+        make_scheme(vec![Ty::String], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "string_to_float_parse".to_string(),
+        make_scheme(vec![Ty::String], float_ty()),
     );
 }
 
