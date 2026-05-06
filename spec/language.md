@@ -33,8 +33,9 @@ fn main() -> Int ![IO] {
 ```
 
 Every function declares an **effect row** in `![ … ]`. `IO` is a
-builtin effect; `IO.println` is its only sub-operation in the v1
-surface used here (full IO surface in §13). `perform` is the syntax
+builtin effect with multiple sub-operations (`print`, `println`,
+`read_line`, `read_file`, `write_file` — see §13); these examples
+use only `IO.println`. `perform` is the syntax
 for invoking an effect; the result of `perform IO.println(...)` is
 `Unit` (Sigil's no-information type), discarded by the `;`.
 
@@ -91,14 +92,14 @@ order; the first matching arm wins.
 ```sigil
 import std.option
 
-fn safe_div(num: Int, den: Int) -> Option[Int] ![] {
+fn safe_div(num: Int, den: Int) -> Option[Int] ![ArithError] {
   match den {
     0 => None,
     _ => Some(num / den),
   }
 }
 
-fn main() -> Int ![IO] {
+fn main() -> Int ![IO, ArithError] {
   match safe_div(10, 0) {
     Some(v) => perform IO.println(int_to_string(v)),
     None => perform IO.println("zero divisor"),
@@ -169,7 +170,11 @@ fn unwrap[A](b: Box[A]) -> A ![] {
 type Point = { x: Int, y: Int }
 
 fn manhattan(a: Point, b: Point) -> Int ![] {
-  abs(a.x - b.x) + abs(a.y - b.y)
+  let ax: Int = match a { Point { x, y: _ } => x };
+  let ay: Int = match a { Point { x: _, y } => y };
+  let bx: Int = match b { Point { x, y: _ } => x };
+  let by: Int = match b { Point { x: _, y } => y };
+  abs(ax - bx) + abs(ay - by)
 }
 
 fn abs(n: Int) -> Int ![] {
@@ -180,17 +185,19 @@ fn abs(n: Int) -> Int ![] {
 }
 
 fn main() -> Int ![IO] {
-  let p: Point = { x: 1, y: 2 };
-  let q: Point = { x: 4, y: 6 };
+  let p: Point = Point { x: 1, y: 2 };
+  let q: Point = Point { x: 4, y: 6 };
   perform IO.println(int_to_string(manhattan(p, q)));   // 7
   0
 }
 ```
 
-Record fields are declared `name: Type` in the type, accessed with
-`.name`, and constructed with `{ name: value, … }`. Records are
-nominal — two records with the same fields but different declared
-names do not unify.
+Record fields are declared `name: Type` in the type, constructed
+with `Name { name: value, … }`, and destructured via `match` with
+`Name { name: binding, … }` (field-pun `name` is shorthand for
+`name: name`). v1 has no `.name` field-access syntax; use match
+destructuring instead. Records are nominal — two records with the
+same fields but different declared names do not unify.
 
 ### E8 — Effects: `Raise` for exceptions
 
@@ -232,6 +239,7 @@ string errors, `Raise[Int]` raises integer error codes, etc.
 
 ```sigil
 import std.state
+import std.pair
 
 fn comp() -> Int ![State[Int]] {
   let _: Int = perform State.set(10);
@@ -240,8 +248,8 @@ fn comp() -> Int ![State[Int]] {
 }
 
 fn main() -> Int ![IO] {
-  let result: Int = run_state(5, comp);     // 11
-  perform IO.println(int_to_string(result));
+  let result: (Int, Int) = run_state(5, comp);   // (11, 10)
+  perform IO.println(int_to_string(fst(result))); // 11
   0
 }
 ```
@@ -249,7 +257,8 @@ fn main() -> Int ![IO] {
 `State[S]` is parametric over the state type `S`. `run_state[A, S]
 (initial, body)` discharges the `State[S]` effect by threading
 `initial` through every `perform State.get/set` site in `body`'s call
-tree. The discharger is a higher-order function defined in pure Sigil
+tree, returning `(A, S)` — the body's result paired with the final
+state. The discharger is a higher-order function defined in pure Sigil
 (see [`std/state.sigil`](../std/state.sigil)). Both type parameters
 are inferred from the call site (e.g. `run_state(5, comp)` instantiates
 `A = Int`, `S = Int`).
@@ -342,8 +351,7 @@ For a fuller example see [`examples/json.sigil`](../examples/json.sigil).
 import std.pair
 
 fn swap(p: (Int, String)) -> (String, Int) ![] {
-  let (a, b) = p;
-  (b, a)
+  match p { (a, b) => (b, a) }
 }
 
 fn main() -> Int ![IO] {
@@ -359,8 +367,7 @@ fn main() -> Int ![IO] {
 Tuple types are written `(T1, T2, ...)` and tuple values as
 `(e1, e2, ...)`. Tuples of any arity are supported. Binary tuples
 can use `fst[A, B]` and `snd[A, B]` from `std.pair`; all tuples
-support destructuring via `let (a, b, ...) = expr;` or in match
-patterns.
+support destructuring in match patterns with `(p1, p2, ...)`.
 
 ### E14 — Nondeterminism with `Choose`
 
@@ -417,8 +424,8 @@ identifiers.
 - String: `"..."` with escapes `\\`, `\"`, `\n`, `\t`, `\r`.
 - Char: `'a'`, `'\n'`. Width: 1 byte (ASCII / latin-1 codepoint).
   v1 has no codepoint-aware string ops.
-- Byte: constructed via `byte_truncate(n: Int) -> Byte ![]` or
-  `byte_from_int(n: Int) -> Option[Byte] ![]`.
+- Byte: constructed via `byte_truncate(n: Int) -> Byte ![]` (truncates
+  to low 8 bits) and validated with `byte_in_range(n: Int) -> Bool ![]`.
 - Bool: `true` and `false` are the literal forms of the builtin
   `Bool` type. Pattern-match with `match b { true => ..., false => ... }`.
 - Float: `3.14`, `1e10`, `2.5e-3`. IEEE 754 f64, heap-boxed.
@@ -559,8 +566,7 @@ suggested fix.
 | If/else | `if cond { … } else { … }` |
 | Match | `match scrut { p1 => e1, p2 => e2 }` |
 | Block | `{ stmt1; stmt2; tail }` |
-| Record literal | `{ x: 1, y: 2 }` |
-| Field access | `point.x` |
+| Record literal | `Point { x: 1, y: 2 }` |
 | Sum constructor | `Some(42)`, `Cons(1, Nil)` |
 | Tuple literal | `(1, "hello")` |
 | Perform | `perform Effect.op(args)` |
@@ -586,7 +592,9 @@ pattern := "_"                                          -- wildcard
          | identifier                                    -- binding (matches anything; binds name)
          | integer-literal                               -- exact match
          | bool-literal
-         | constructor-name "(" pattern ("," pattern)* ")"   -- sum constructor
+         | char-literal
+         | constructor-name "(" pattern ("," pattern)* ")"   -- positional constructor
+         | constructor-name "{" field-pats "}"           -- record constructor
          | constructor-name                              -- nullary constructor
          | "(" pattern ("," pattern)* ")"                -- tuple destructure
 ```
@@ -638,15 +646,15 @@ declaration matters for equivalence).
 **Tuples.** Tuple types are built-in — no `type` declaration needed.
 `(Int, String)` is a binary tuple; `(Bool, Int, String)` is a ternary
 tuple. Tuple values are constructed with `(e1, e2, ...)` and
-destructured with pattern matching:
+destructured via `match`:
 
 ```sigil
 let pair: (Int, String) = (42, "hello");
-let (n, s) = pair;
+match pair { (n, s) => perform IO.println(s) };
 ```
 
 Binary tuples have `fst[A, B]` and `snd[A, B]` accessors in
-`std.pair`. Larger tuples use pattern-match destructuring.
+`std.pair`. Larger tuples use match destructuring.
 
 ### §7 — Pattern matching
 
@@ -877,8 +885,8 @@ files are the authoritative API reference.
 | `std.mut_array` | `MutArray[A]` (Mem-gated). |
 | `std.byte_array` | `ByteArray`, conversion to/from `String`. |
 | `std.mut_byte_array` | `MutByteArray` (Mem-gated). |
-| `std.string` | Byte-indexed string ops: `string_concat`, `_substring`, `_byte_at`, `_compare`, `_starts_with`, `_ends_with`, `_contains`, `_index_of`, `_trim`, `_to_int_validate`, `_to_int_parse`, `_length`. |
-| `std.float` | Boxed `Float` (IEEE 754 f64): arithmetic (`float_add`/`sub`/`mul`/`div`/`neg`), comparison (`float_eq`/`lt`/`le`/`gt`/`ge`; NaN≠NaN), math (`float_abs`/`floor`/`ceil`/`sqrt`), conversion (`float_from_int`/`to_int`/`to_string`/`string_to_float_validate`/`_parse`). `float_to_string` always includes `.0` for whole numbers; `inf`/`NaN` unchanged. |
+| `std.string` | Byte-indexed string ops: `string_concat`, `string_substring`, `string_byte_at`, `string_compare`, `string_starts_with`, `string_ends_with`, `string_contains`, `string_index_of`, `string_trim`, `string_to_int_validate`, `string_to_int_parse`, `string_length`. |
+| `std.float` | Boxed `Float` (IEEE 754 f64): arithmetic (`float_add`/`sub`/`mul`/`div`/`neg`), comparison (`float_eq`/`lt`/`le`/`gt`/`ge`; NaN≠NaN), math (`float_abs`/`floor`/`ceil`/`sqrt`), conversion (`float_from_int`/`float_to_int`/`float_to_string`/`string_to_float_validate`/`string_to_float_parse`). `float_to_string` always includes `.0` for whole numbers; `inf`/`NaN` unchanged. |
 | `std.int64` | Boxed `Int64` with arithmetic, comparison, conversion, stringify. |
 | `std.string_builder` | `StringBuilder` rope (Mem-gated). |
 | `std.pair` | `fst[A, B]`, `snd[A, B]` accessors for binary tuples `(A, B)`. |
@@ -901,6 +909,9 @@ These functions are available without any `import`:
 | `int_shl(a, b)` | `(Int, Int) -> Int ![]` | Left shift. `b` masked to 6 bits. |
 | `int_shr(a, b)` | `(Int, Int) -> Int ![]` | Arithmetic right shift. `b` masked to 6 bits. Sign-extends. |
 | `int_abs(n)` | `(Int) -> Int ![]` | Absolute value. `int_abs(i64::MIN)` wraps to `i64::MIN`. |
+| `byte_truncate(n)` | `(Int) -> Byte ![]` | Truncate to low 8 bits. |
+| `byte_in_range(n)` | `(Int) -> Bool ![]` | Range check: `0 <= n < 256`. |
+| `byte_to_int(b)` | `(Byte) -> Int ![]` | Widen byte to integer. |
 | `random_pseudo_int()` | `() -> Int ![]` | Process-global xorshift64. **Not cryptographic.** |
 
 ### §14 — v1 limits
