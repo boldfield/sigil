@@ -9151,6 +9151,87 @@ fn std_int64_import_is_noop() {
     assert_eq!(stdout, "123\n", "stderr={stderr:?}");
 }
 
+// ===== Task 78 — Stdlib edge-case coverage =====
+
+/// Int64 wrapping arithmetic: mul that exceeds i64 range wraps
+/// via two's complement. (2^62 - 1) * 4 = 2^64 - 4 → wraps to -4.
+#[test]
+fn std_int64_mul_overflow_wraps() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let big: Int64 = int64_from_int(4611686018427387903);\n  \
+                 let four: Int64 = int64_from_int(4);\n  \
+                 let result: Int64 = int64_mul(big, four);\n  \
+                 perform IO.println(int64_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int64_overflow_wrap");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "-4\n", "stderr={stderr:?}");
+}
+
+/// Int64 MIN / -1 aborts. The runtime detects this overflow case
+/// and calls abort (non-zero exit).
+#[test]
+fn std_int64_div_min_by_neg1_aborts() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let min_half: Int64 = int64_from_int(-4611686018427387904);\n  \
+                 let two: Int64 = int64_from_int(2);\n  \
+                 let min_val: Int64 = int64_mul(min_half, two);\n  \
+                 let neg1: Int64 = int64_from_int(-1);\n  \
+                 let _r: Int64 = int64_div(min_val, neg1);\n  \
+                 0\n\
+               }\n";
+    let (_stdout, _stderr, code) = compile_and_run(src, "std_int64_min_div_neg1");
+    assert_ne!(code, 0, "int64_div(MIN, -1) should abort");
+}
+
+/// byte_array_slice at full boundaries: slice(0, length) returns
+/// the entire array contents.
+#[test]
+fn std_byte_array_slice_full_boundary() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = byte_truncate(9);\n  \
+                 let ba: ByteArray = byte_array_alloc(5, b);\n  \
+                 let full: ByteArray = byte_array_slice(ba, 0, 5);\n  \
+                 perform IO.println(int_to_string(byte_array_length(full)));\n  \
+                 perform IO.println(int_to_string(byte_to_int(byte_array_get(full, 0))));\n  \
+                 perform IO.println(int_to_string(byte_to_int(byte_array_get(full, 4))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_slice_full");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n9\n9\n", "stderr={stderr:?}");
+}
+
+/// byte_array_slice with start == end returns empty slice.
+#[test]
+fn std_byte_array_slice_empty() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Byte = byte_truncate(1);\n  \
+                 let ba: ByteArray = byte_array_alloc(10, b);\n  \
+                 let empty: ByteArray = byte_array_slice(ba, 3, 3);\n  \
+                 perform IO.println(int_to_string(byte_array_length(empty)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_slice_empty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// mut_array_new with zero length allocates without crashing
+/// and reports length 0.
+#[test]
+fn std_mut_array_zero_length_alloc() {
+    let src = "fn main() -> Int ![IO, Mem] {\n  \
+                 let ma: MutArray[Int] = mut_array_new(0, 42);\n  \
+                 perform IO.println(int_to_string(mut_array_length(ma)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_zero_len");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C Task 67 — StringBuilder run-and-check-output =====
 
 /// `sb_new` then `sb_finalize` returns the empty string. Smoke
@@ -9324,6 +9405,60 @@ fn std_random_two_calls_produce_two_outputs() {
     assert_eq!(lines[1], "end");
 }
 
+#[test]
+fn std_random_seeded_produces_deterministic_sequence() {
+    let src = "import std.random\n\
+               fn three_draws() -> Int ![Random] {\n  \
+                 let a: Int = random_int();\n  \
+                 let b: Int = random_int();\n  \
+                 let c: Int = random_int();\n  \
+                 a + b + c\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let r1: Int = run_seeded_random(int64_from_int(42), fn () -> Int ![Random] => {\n    \
+                   three_draws()\n  \
+                 });\n  \
+                 let r2: Int = run_seeded_random(int64_from_int(42), fn () -> Int ![Random] => {\n    \
+                   three_draws()\n  \
+                 });\n  \
+                 perform IO.println(int_to_string(r1));\n  \
+                 perform IO.println(int_to_string(r2));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "std_random_seeded_det");
+    assert_eq!(code, 0);
+    let lines: Vec<&str> = stdout.split_terminator('\n').collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], lines[1], "same seed must produce same sequence");
+}
+
+#[test]
+fn std_random_seeded_different_seeds_differ() {
+    let src = "import std.random\n\
+               fn one_draw() -> Int ![Random] {\n  \
+                 random_int()\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let a: Int = run_seeded_random(int64_from_int(42), fn () -> Int ![Random] => {\n    \
+                   one_draw()\n  \
+                 });\n  \
+                 let b: Int = run_seeded_random(int64_from_int(99), fn () -> Int ![Random] => {\n    \
+                   one_draw()\n  \
+                 });\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "std_random_seeded_diff");
+    assert_eq!(code, 0);
+    let lines: Vec<&str> = stdout.split_terminator('\n').collect();
+    assert_eq!(lines.len(), 2);
+    assert_ne!(
+        lines[0], lines[1],
+        "different seeds must produce different values"
+    );
+}
+
 /// Plan C Task 76 part 1 ships `std/clock.sigil` with `now()` and
 /// `run_os_clock`. Wall-clock readings are non-deterministic;
 /// assert only on shape (program returns 0, stdout is a positive
@@ -9376,6 +9511,48 @@ fn std_clock_two_calls_monotonic() {
         delta >= 0,
         "second clock read should be >= first; got {delta}"
     );
+}
+
+#[test]
+fn std_clock_frozen_returns_fixed_value() {
+    let src = "import std.clock\n\
+               fn body() -> Int ![Clock] {\n  \
+                 let a: Int = now();\n  \
+                 let b: Int = now();\n  \
+                 a + b\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_frozen_clock(int64_from_int(500), fn () -> Int ![Clock] => {\n    \
+                   body()\n  \
+                 });\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "std_clock_frozen_fixed");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1000\n");
+}
+
+#[test]
+fn std_clock_frozen_different_timestamp() {
+    let src = "import std.clock\n\
+               fn body() -> Int ![Clock] {\n  \
+                 now()\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = run_frozen_clock(int64_from_int(42), fn () -> Int ![Clock] => {\n    \
+                   body()\n  \
+                 });\n  \
+                 let b: Int = run_frozen_clock(int64_from_int(99), fn () -> Int ![Clock] => {\n    \
+                   body()\n  \
+                 });\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "std_clock_frozen_diff");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "42\n99\n");
 }
 
 // ===== Plan C Task 80 — `examples/json.sigil` =====
@@ -11585,4 +11762,542 @@ fn pattern_c_in_branch_perform_state_threading_returns_42() {
          42 via S.get(). Wrong outputs surface a classifier or branch-chain \
          emit regression. stderr={stderr:?}"
     );
+}
+
+// ===== Task 78.5 — Imported Koka effect-handler test subset =====
+//
+// BSD-2 licensed patterns derived from koka-lang/koka test/effects/.
+// Each test exercises a distinct effect-handler composition pattern
+// that the agent-authored test corpus did not independently cover.
+
+/// Simple raise + catch returns Err.
+/// Derived from koka/test/effects/except1.kk
+#[test]
+fn koka_simple_raise_catch() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String]] => {\n    \
+                   raise(\"boom\")\n  \
+                 });\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(msg) => perform IO.println(msg),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_simple_raise");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "boom\n");
+}
+
+/// Raise crosses multiple stack frames before catch.
+/// Derived from koka/test/effects/except2.kk
+#[test]
+fn koka_raise_in_nested_context() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               fn deep(n: Int) -> Int ![Raise[String]] {\n  \
+                 if n == 0 {\n    \
+                   raise(\"deep\")\n  \
+                 } else {\n    \
+                   deep(n - 1) + 1\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String]] => {\n    \
+                   deep(5)\n  \
+                 });\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(msg) => perform IO.println(msg),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_raise_nested");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "deep\n");
+}
+
+/// Basic State get/set round-trip.
+/// Derived from koka/test/effects/state1.kk
+#[test]
+fn koka_state_get_set_round_trip() {
+    let src = "import std.state\n\
+               fn body() -> Int ![State[Int]] {\n  \
+                 let _a: Int = perform State.set(10);\n  \
+                 let x: Int = perform State.get();\n  \
+                 let _b: Int = perform State.set(x + 5);\n  \
+                 let result: Int = perform State.get();\n  \
+                 result\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: (Int, Int) = run_state(0, fn () -> Int ![State[Int]] => {\n    \
+                   body()\n  \
+                 });\n  \
+                 match result { (v, s) => {\n    \
+                   perform IO.println(int_to_string(v));\n    \
+                   perform IO.println(int_to_string(s));\n    \
+                   0\n  \
+                 }}\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_state_round_trip");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "15\n15\n");
+}
+
+/// Long linear chain of State get/set cycles in a single body.
+/// Tests that the lambda-chain discharge threads state correctly
+/// through 6 sequential perform sites without recursion.
+/// Derived from koka/test/effects/state-linear.kk
+#[test]
+fn koka_state_long_linear_chain() {
+    let src = "import std.state\n\
+               fn chain() -> Int ![State[Int]] {\n  \
+                 let _a: Int = perform State.set(1);\n  \
+                 let a: Int = perform State.get();\n  \
+                 let _b: Int = perform State.set(a + 2);\n  \
+                 let b: Int = perform State.get();\n  \
+                 let _c: Int = perform State.set(b + 3);\n  \
+                 let result: Int = perform State.get();\n  \
+                 result\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: (Int, Int) = run_state(0, fn () -> Int ![State[Int]] => {\n    \
+                   chain()\n  \
+                 });\n  \
+                 match result { (v, s) => {\n    \
+                   perform IO.println(int_to_string(v));\n    \
+                   perform IO.println(int_to_string(s));\n    \
+                   0\n  \
+                 }}\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_state_linear");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "6\n6\n");
+}
+
+/// State threading through single-perform helper function calls.
+/// Each helper does exactly one perform; the body chains them
+/// to test the discharge-with-lambda wrapper-fn-frame composition.
+/// Derived from koka/test/effects/state-helpers.kk
+#[test]
+fn koka_state_through_helper_chain() {
+    let src = "import std.state\n\
+               fn get_state() -> Int ![State[Int]] { perform State.get() }\n\
+               fn set_state(s: Int) -> Int ![State[Int]] { perform State.set(s) }\n\
+               fn body() -> Int ![State[Int]] {\n  \
+                 let s1: Int = get_state();\n  \
+                 let _a: Int = set_state(s1 + 1);\n  \
+                 let s2: Int = get_state();\n  \
+                 let _b: Int = set_state(s2 + 1);\n  \
+                 let s3: Int = get_state();\n  \
+                 let _c: Int = set_state(s3 * 2);\n  \
+                 let result: Int = get_state();\n  \
+                 result\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: (Int, Int) = run_state(3, fn () -> Int ![State[Int]] => {\n    \
+                   body()\n  \
+                 });\n  \
+                 match result { (v, s) => {\n    \
+                   perform IO.println(int_to_string(v));\n    \
+                   perform IO.println(int_to_string(s));\n    \
+                   0\n  \
+                 }}\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_state_helpers");
+    assert_eq!(code, 0);
+    // (3 + 1 + 1) * 2 = 10
+    assert_eq!(stdout, "10\n10\n");
+}
+
+/// Handler modifies the performed value before resuming k.
+/// The body performs apply(3) and apply(4), but the handler negates
+/// each value before resuming, so the body sees -3 and -4.
+/// Derived from the resume-modify pattern in Koka's effect handler tests.
+#[test]
+fn koka_resume_with_modified_value() {
+    let src = "import std.io\n\
+               \n\
+               effect Transform {\n  \
+                 apply: (Int) -> Int,\n\
+               }\n\
+               \n\
+               fn body() -> Int ![Transform] {\n  \
+                 let a: Int = perform Transform.apply(3);\n  \
+                 let b: Int = perform Transform.apply(4);\n  \
+                 a * 10 + b\n\
+               }\n\
+               \n\
+               fn run_negated(action: () -> Int ![Transform]) -> Int ![] {\n  \
+                 handle action() with {\n    \
+                   Transform.apply(n, k) => k(0 - n),\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_negated(body);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_resume_modify");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    // apply(3) → k(-3), apply(4) → k(-4), (-3)*10+(-4) = -34
+    assert_eq!(stdout, "-34\n");
+}
+
+/// Multiple effects in one body: State + Raise.
+/// Derived from koka/test/effects/multi.kk
+#[test]
+fn koka_multiple_effects_in_body() {
+    let src = "import std.state\n\
+               import std.raise\n\
+               import std.result\n\
+               fn work() -> Int ![State[Int], Raise[String]] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let s: Int = perform State.get();\n  \
+                 if s > 5 {\n    \
+                   s + 1\n  \
+                 } else {\n    \
+                   raise(\"too small\")\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: (Result[Int, String], Int) = run_state(0, fn () -> Result[Int, String] ![State[Int]] => {\n    \
+                   catch(fn () -> Int ![Raise[String], State[Int]] => {\n      \
+                     work()\n    \
+                   })\n  \
+                 });\n  \
+                 match result { (r, s) => {\n    \
+                   match r {\n      \
+                     Ok(v) => perform IO.println(int_to_string(v)),\n      \
+                     Err(msg) => perform IO.println(msg),\n    \
+                   };\n    \
+                   perform IO.println(int_to_string(s));\n    \
+                   0\n  \
+                 }}\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_multi_effects");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "11\n10\n");
+}
+
+/// User-declared effect with multiple ops — handler computes
+/// before resuming. Tests that each op dispatch is independent
+/// and the handler can do arbitrary work before calling k.
+/// Derived from koka/test/effects/multi-op.kk
+#[test]
+fn koka_user_effect_multi_op_handler() {
+    let src = "import std.io\n\
+               effect Env {\n  \
+                 get_name: () -> String,\n  \
+                 get_value: () -> Int,\n\
+               }\n\
+               fn greet() -> String ![Env] {\n  \
+                 let name: String = perform Env.get_name();\n  \
+                 let val: Int = perform Env.get_value();\n  \
+                 string_concat(name, string_concat(\": \", int_to_string(val)))\n\
+               }\n\
+               fn with_env(action: () -> String ![Env]) -> String ![] {\n  \
+                 handle action() with {\n    \
+                   Env.get_name(k) => k(\"answer\"),\n    \
+                   Env.get_value(k) => k(42),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let msg: String = with_env(greet);\n  \
+                 perform IO.println(msg);\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_multi_op");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "answer: 42\n");
+}
+
+/// Effect performed in both branches of a conditional.
+/// A function with an if/else where each branch performs an effect
+/// operation in tail position. Tests that codegen handles perform
+/// sites in both paths of a conditional body.
+/// Derived from the branch-effect pattern in Koka's effect handler tests.
+#[test]
+fn koka_effect_in_both_branches() {
+    let src = "import std.state\n\
+               \n\
+               fn pick(flag: Bool) -> Int ![State[Int]] {\n  \
+                 if flag {\n    \
+                   perform State.set(100)\n  \
+                 } else {\n    \
+                   perform State.set(200)\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let r1: (Int, Int) = run_state(0, fn () -> Int ![State[Int]] => {\n    \
+                   pick(true)\n  \
+                 });\n  \
+                 let r2: (Int, Int) = run_state(0, fn () -> Int ![State[Int]] => {\n    \
+                   pick(false)\n  \
+                 });\n  \
+                 match r1 { (v1, s1) => {\n    \
+                   match r2 { (v2, s2) => {\n      \
+                     perform IO.println(int_to_string(v1));\n      \
+                     perform IO.println(int_to_string(s1));\n      \
+                     perform IO.println(int_to_string(v2));\n      \
+                     perform IO.println(int_to_string(s2));\n      \
+                     0\n    \
+                   }}\n  \
+                 }}\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_branch_effect");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    // pick(true): set(100) → value=100, state=100
+    // pick(false): set(200) → value=200, state=200
+    assert_eq!(stdout, "100\n100\n200\n200\n");
+}
+
+/// Multi-shot choose enumerates all pairs.
+/// Derived from koka/test/effects/choice1.kk
+#[test]
+fn koka_choose_all_pairs() {
+    let src = "import std.choose\n\
+               import std.list\n\
+               fn pick_pair() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.choose(3);\n  \
+                 let b: Int = perform Choose.choose(2);\n  \
+                 a * 10 + b\n\
+               }\n\
+               fn print_list(xs: List[Int]) -> Unit ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => perform IO.println(\"done\"),\n    \
+                   Cons(x, rest) => {\n      \
+                     perform IO.println(int_to_string(x));\n      \
+                     print_list(rest)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let results: List[Int] = all_choices(fn () -> Int ![Choose] => {\n    \
+                   pick_pair()\n  \
+                 });\n  \
+                 print_list(results);\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_choose_pairs");
+    assert_eq!(code, 0);
+    let lines: Vec<&str> = stdout.split_terminator('\n').collect();
+    assert_eq!(lines.len(), 7, "3*2=6 pairs + done; got {lines:?}");
+    assert_eq!(lines[6], "done");
+}
+
+/// first_choice short-circuits on first success.
+/// Derived from koka/test/effects/choice-first.kk
+#[test]
+fn koka_first_choice_short_circuits() {
+    let src = "import std.choose\n\
+               import std.option\n\
+               fn find_it() -> Int ![Choose] {\n  \
+                 let x: Int = perform Choose.choose(10);\n  \
+                 if x == 7 {\n    \
+                   x\n  \
+                 } else {\n    \
+                   perform Choose.fail()\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Option[Int] = first_choice(fn () -> Int ![Choose] => {\n    \
+                   find_it()\n  \
+                 });\n  \
+                 match r {\n    \
+                   Some(v) => perform IO.println(int_to_string(v)),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_first_choice");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "7\n");
+}
+
+/// Raise from nested helper functions — the exception propagates
+/// through multiple call frames to the nearest catch.
+/// Derived from koka/test/effects/except-deep-helper.kk
+#[test]
+fn koka_raise_through_helper_chain() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               fn level3() -> Int ![Raise[String]] {\n  \
+                 raise(\"from level 3\")\n\
+               }\n\
+               fn level2() -> Int ![Raise[String]] {\n  \
+                 level3() + 10\n\
+               }\n\
+               fn level1() -> Int ![Raise[String]] {\n  \
+                 level2() + 100\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String]] => {\n    \
+                   level1()\n  \
+                 });\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(msg) => perform IO.println(msg),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_raise_helper_chain");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "from level 3\n");
+}
+
+/// User-declared effect — handler intercepts perform and resumes
+/// with a computed value (not a constant). Tests handler-side
+/// computation before calling k.
+/// Derived from koka/test/effects/handler-compute.kk
+#[test]
+fn koka_handler_computes_before_resume() {
+    let src = "import std.io\n\
+               effect Ask {\n  \
+                 ask: (Int) -> Int,\n\
+               }\n\
+               fn use_ask() -> Int ![Ask] {\n  \
+                 let a: Int = perform Ask.ask(3);\n  \
+                 let b: Int = perform Ask.ask(7);\n  \
+                 a + b\n\
+               }\n\
+               fn run_doubler(action: () -> Int ![Ask]) -> Int ![] {\n  \
+                 handle action() with {\n    \
+                   Ask.ask(n, k) => k(n * 2),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_doubler(use_ask);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_handler_compute");
+    assert_eq!(code, 0);
+    // ask(3) -> 6, ask(7) -> 14, sum = 20
+    assert_eq!(stdout, "20\n");
+}
+
+/// Functional state: handler arms return closures capturing k, building
+/// a state-passing chain. The handle expression produces a function
+/// `(Int) -> Int` that is applied to the initial state.
+/// Derived from koka/test/algeff/effs4.kk
+#[test]
+fn koka_functional_state_handler_returns_closure() {
+    let src = "import std.io\n\
+               \n\
+               effect FState resumes: many {\n  \
+                 fget: () -> Int,\n  \
+                 fset: (Int) -> Int,\n\
+               }\n\
+               \n\
+               fn test_body() -> Int ![FState] {\n  \
+                 let _: Int = perform FState.fset(2);\n  \
+                 let v: Int = perform FState.fget();\n  \
+                 v + 40\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let step: (Int) -> Int ![] = handle test_body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   FState.fget(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   FState.fset(new_s, k) => fn (s: Int) -> Int ![] => k(new_s)(new_s),\n  \
+                 };\n  \
+                 let result: Int = step(0);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_functional_state");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    // fset(2) → state=2, fget() → 2, 2+40 = 42
+    assert_eq!(stdout, "42\n");
+}
+
+/// Post-resume computation: handler arm calls k once, then adds 20
+/// to the result. Tests that handler arms can do work after the
+/// continuation returns.
+/// Derived from koka/test/algeff/linear1.kk
+#[test]
+fn koka_post_resume_computation_adds_twenty() {
+    let src = "import std.io\n\
+               \n\
+               effect Step resumes: many {\n  \
+                 step: (Int) -> Int,\n\
+               }\n\
+               \n\
+               fn body() -> Int ![Step] {\n  \
+                 let a: Int = perform Step.step(3);\n  \
+                 let b: Int = perform Step.step(7);\n  \
+                 a + b\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle body() with {\n    \
+                   Step.step(n, k) => {\n      \
+                     let r: Int = k(n);\n      \
+                     r + 20\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "koka_post_resume");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    // step(3): k(3) resumes body, a=3
+    // step(7): k(7) resumes body, b=7, returns 3+7=10
+    // inner arm: 10+20=30, outer arm: 30+20=50
+    assert_eq!(stdout, "50\n");
+}
+
+#[test]
+fn tail_perform_state_get_after_set() {
+    let src = "import std.state\n\
+               fn set_then_get() -> Int ![State[Int]] {\n  \
+                 let _u: Int = perform State.set(42);\n  \
+                 perform State.get()\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: (Int, Int) = run_state(0, fn () -> Int ![State[Int]] => {\n    \
+                   set_then_get()\n  \
+                 });\n  \
+                 match result { (v, _s) => {\n    \
+                   perform IO.println(int_to_string(v));\n    \
+                   0\n  \
+                 }}\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "tail_perform_state");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "42\n");
+}
+
+/// State+Raise composition: catch inside run_state.
+/// Raise fires, state set before raise survives in final state.
+/// This is the minimal reproduction of the v1 composition limitation.
+#[test]
+fn state_raise_composition_catch_inside_run_state() {
+    let src = "import std.state\n\
+               import std.raise\n\
+               import std.result\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: (Result[Int, String], Int) = run_state(0, fn () -> Result[Int, String] ![State[Int]] => {\n    \
+                   let _a: Int = perform State.set(10);\n    \
+                   catch(fn () -> Int ![Raise[String], State[Int]] => {\n      \
+                     raise(\"boom\")\n    \
+                   })\n  \
+                 });\n  \
+                 match result { (r, s) => {\n    \
+                   match r {\n      \
+                     Ok(v) => perform IO.println(int_to_string(v)),\n      \
+                     Err(msg) => perform IO.println(msg),\n    \
+                   };\n    \
+                   perform IO.println(int_to_string(s));\n    \
+                   0\n  \
+                 }}\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "state_raise_composition");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "boom\n10\n");
 }

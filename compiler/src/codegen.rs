@@ -1089,6 +1089,11 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("random_pseudo_int".to_string());
     // Plan C Task 76 — Clock builtin.
     globals.insert("clock_os_now".to_string());
+    // Plan C Stage 7 — Int bitwise / shift / abs builtins.
+    globals.insert("int_xor".to_string());
+    globals.insert("int_shl".to_string());
+    globals.insert("int_shr".to_string());
+    globals.insert("int_abs".to_string());
     let ctors: BTreeSet<String> = collect_ctor_names(program);
     // Plan D Task 117 (b) — pre-pass map of user-fn param-Continuation
     // flags. Consumed by `arm_body_walk`'s generic-call branch to
@@ -7779,6 +7784,42 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_clock_os_now", Linkage::Import, &clock_os_now_sig)
         .map_err(|e| format!("declare sigil_clock_os_now: {e}"))?;
 
+    // Plan C Stage 7 — Int bitwise / shift / abs primitives.
+    // sigil_int_xor(a: i64, b: i64) -> i64
+    let mut int_xor_sig = Signature::new(isa_call_conv(&module));
+    int_xor_sig.params.push(AbiParam::new(types::I64));
+    int_xor_sig.params.push(AbiParam::new(types::I64));
+    int_xor_sig.returns.push(AbiParam::new(types::I64));
+    let int_xor = module
+        .declare_function("sigil_int_xor", Linkage::Import, &int_xor_sig)
+        .map_err(|e| format!("declare sigil_int_xor: {e}"))?;
+
+    // sigil_int_shl(a: i64, b: i64) -> i64
+    let mut int_shl_sig = Signature::new(isa_call_conv(&module));
+    int_shl_sig.params.push(AbiParam::new(types::I64));
+    int_shl_sig.params.push(AbiParam::new(types::I64));
+    int_shl_sig.returns.push(AbiParam::new(types::I64));
+    let int_shl = module
+        .declare_function("sigil_int_shl", Linkage::Import, &int_shl_sig)
+        .map_err(|e| format!("declare sigil_int_shl: {e}"))?;
+
+    // sigil_int_shr(a: i64, b: i64) -> i64
+    let mut int_shr_sig = Signature::new(isa_call_conv(&module));
+    int_shr_sig.params.push(AbiParam::new(types::I64));
+    int_shr_sig.params.push(AbiParam::new(types::I64));
+    int_shr_sig.returns.push(AbiParam::new(types::I64));
+    let int_shr = module
+        .declare_function("sigil_int_shr", Linkage::Import, &int_shr_sig)
+        .map_err(|e| format!("declare sigil_int_shr: {e}"))?;
+
+    // sigil_int_abs(n: i64) -> i64
+    let mut int_abs_sig = Signature::new(isa_call_conv(&module));
+    int_abs_sig.params.push(AbiParam::new(types::I64));
+    int_abs_sig.returns.push(AbiParam::new(types::I64));
+    let int_abs = module
+        .declare_function("sigil_int_abs", Linkage::Import, &int_abs_sig)
+        .map_err(|e| format!("declare sigil_int_abs: {e}"))?;
+
     // Plan D Task 117 (b) Phase 4 — Continuation value object alloc
     // + load helpers. Used at sites that flow a continuation into a
     // fn-parameter (boxing the (k_closure, k_fn, return_closure,
@@ -8313,7 +8354,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // field; this commit consumes it for signature selection.
             // The transitional `#[allow(dead_code)]` on
             // `UserFnEntry::abi` is removed at the same time.
-            let abi = compute_user_fn_abi(&f.name, &f.body, &f.params, &cc.colored, &fns_by_name);
+            let normalized_body = normalize_tail_perform_body(&f.body, &f.return_type);
+            let body_for_abi = normalized_body.as_ref().unwrap_or(&f.body);
+            let abi =
+                compute_user_fn_abi(&f.name, body_for_abi, &f.params, &cc.colored, &fns_by_name);
             let (sig, param_tys, ret_ty) = match abi {
                 UserFnAbi::Sync => {
                     // Plan D Task 111b — Sync ABI:
@@ -8483,300 +8527,288 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         kind,
                     });
                     cps_continuation_synth_indices.insert(f.name.clone(), synth_cont_idx);
-                } else if let Some(chain_length) = {
-                    // Plan D Task 112a/112b — reuse hoisted
-                    // `fns_by_name` (built once at emit_object entry
-                    // above) and the shared `is_supported_cps_user_fn`
-                    // helper (accepts both tail-perform and chained-
-                    // let-yield Cps wrappers).
-                    //
-                    // Plan D Task 112d — ALSO accept Pattern C bodies
-                    // (let-yield-prefix + If-tail with pure-or-Cps-call
-                    // branches) per `is_let_yield_prefix_then_branched
-                    // _cps_tail_body`. Pattern C reuses the same chain
-                    // step machinery; only the Final synth-cont's tail
-                    // emit differs (branched routing vs lower_expr+gate).
+                } else {
+                    let chain_normalized = normalize_tail_perform_body(&f.body, &f.return_type);
+                    let chain_body = chain_normalized.as_ref().unwrap_or(&f.body);
                     let lookup = |callee_name: &str| {
                         is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     };
-                    is_simple_chained_let_yield_then_pure_tail_body(&f.body, &ctors, &lookup)
-                        .or_else(|| {
-                            // Same `lookup` for both predicates — at
-                            // pre-pass level there's no visited-set in
-                            // scope; tied-knot semantic is provided by
-                            // `is_supported_cps_user_fn`'s internal
-                            // visited-set when the recursion reaches
-                            // is_supported_cps_user_fn_inner.
-                            is_let_yield_prefix_then_branched_cps_tail_body(
-                                &f.body, &ctors, &lookup, &lookup,
-                            )
-                        })
-                } {
-                    // Extract per-step let-binding info (name +
-                    // declared type + slot kind) and the yield-bearing
-                    // step kind (Perform OR wrapper-Call per Plan D
-                    // Task 112). Classifier guarantees every stmt is
-                    // a `Stmt::Let` whose value is `Expr::Perform`
-                    // OR `Expr::Call` with a Cps-color top-level
-                    // callee; unreachable!() guards mirror the
-                    // ConstantDone branch above.
-                    let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
-                    let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
-                    let mut binding_tys: Vec<Type> = Vec::with_capacity(chain_length);
-                    let mut binding_kinds: Vec<EnvSlotKind> = Vec::with_capacity(chain_length);
-                    // Plan C Task 81 — pure trailing intermediates
-                    // (after the last yield, before the tail). Lowered
-                    // by the FINAL step's emit before tail_expr.
-                    let mut tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
-                    for stmt in &f.body.stmts {
-                        let let_stmt = match stmt {
-                            crate::ast::Stmt::Let(l) => l,
-                            _ => unreachable!(
-                                "is_simple_chained_let_yield_then_pure_tail_body \
+                    let chain_length = is_simple_chained_let_yield_then_pure_tail_body(
+                        chain_body, &ctors, &lookup,
+                    )
+                    .or_else(|| {
+                        is_let_yield_prefix_then_branched_cps_tail_body(
+                            chain_body, &ctors, &lookup, &lookup,
+                        )
+                    });
+                    if let Some(chain_length) = chain_length {
+                        let arm_body = chain_body;
+                        let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
+                        let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
+                        let mut binding_tys: Vec<Type> = Vec::with_capacity(chain_length);
+                        let mut binding_kinds: Vec<EnvSlotKind> = Vec::with_capacity(chain_length);
+                        // Plan C Task 81 — pure trailing intermediates
+                        // (after the last yield, before the tail). Lowered
+                        // by the FINAL step's emit before tail_expr.
+                        let mut tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
+                        for stmt in &arm_body.stmts {
+                            let let_stmt = match stmt {
+                                crate::ast::Stmt::Let(l) => l,
+                                _ => unreachable!(
+                                    "is_simple_chained_let_yield_then_pure_tail_body \
                                  classifier guarantees every stmt is Stmt::Let"
-                            ),
-                        };
-                        match &let_stmt.value {
-                            crate::ast::Expr::Perform(p) => {
-                                steps.push(ChainedNextStep::Perform(p.clone()));
-                                binding_names.push(let_stmt.name.clone());
-                                binding_tys
-                                    .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
-                                binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
-                            }
-                            crate::ast::Expr::Call { callee, args, .. } => {
-                                // PR #97 review #1: classifier accepts
-                                // non-Ident callees as tail-prefix lets
-                                // when `yield_count > 0 && !expr_-
-                                // contains_perform`. Drop-via-`continue`
-                                // would silently lose the binding here
-                                // (re-introducing the silent-drop
-                                // pattern PR #83 review #5 closed).
-                                // Treat non-Ident callee as a tail-
-                                // prefix let, mirroring the `other =>`
-                                // arm below.
-                                let callee_name_opt = match callee.as_ref() {
-                                    crate::ast::Expr::Ident(n, _) => Some(n.clone()),
-                                    _ => None,
-                                };
-                                // Plan C Task 81 — Cps wrapper Call →
-                                // chain step; non-yielding Call
-                                // (builtin / Sync user fn / non-Ident
-                                // callee) → tail-prefix let. The
-                                // classifier accepts both shapes; the
-                                // pre-pass dispatches based on callee
-                                // Cps-color via the same
-                                // `is_supported_cps_user_fn` predicate
-                                // the classifier used.
-                                let is_cps_wrapper = callee_name_opt
-                                    .as_ref()
-                                    .map(|n| {
-                                        is_supported_cps_user_fn(
-                                            n,
-                                            &fns_by_name,
-                                            &cc.colored,
-                                            &ctors,
-                                        )
-                                    })
-                                    .unwrap_or(false);
-                                if is_cps_wrapper {
-                                    let callee_name = match callee_name_opt {
-                                        Some(n) => n,
-                                        None => unreachable!(
-                                            "is_cps_wrapper implies callee_name_opt is Some — \
-                                             is_cps_wrapper short-circuited via the \
-                                             callee_name_opt.as_ref().map(...).unwrap_or(false) \
-                                             chain that returns false on None"
-                                        ),
-                                    };
-                                    steps.push(ChainedNextStep::CallCps {
-                                        callee_name,
-                                        args: args.clone(),
-                                    });
+                                ),
+                            };
+                            match &let_stmt.value {
+                                crate::ast::Expr::Perform(p) => {
+                                    steps.push(ChainedNextStep::Perform(p.clone()));
                                     binding_names.push(let_stmt.name.clone());
                                     binding_tys
                                         .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
                                     binding_kinds
                                         .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
-                                } else {
+                                }
+                                crate::ast::Expr::Call { callee, args, .. } => {
+                                    // PR #97 review #1: classifier accepts
+                                    // non-Ident callees as tail-prefix lets
+                                    // when `yield_count > 0 && !expr_-
+                                    // contains_perform`. Drop-via-`continue`
+                                    // would silently lose the binding here
+                                    // (re-introducing the silent-drop
+                                    // pattern PR #83 review #5 closed).
+                                    // Treat non-Ident callee as a tail-
+                                    // prefix let, mirroring the `other =>`
+                                    // arm below.
+                                    let callee_name_opt = match callee.as_ref() {
+                                        crate::ast::Expr::Ident(n, _) => Some(n.clone()),
+                                        _ => None,
+                                    };
+                                    // Plan C Task 81 — Cps wrapper Call →
+                                    // chain step; non-yielding Call
+                                    // (builtin / Sync user fn / non-Ident
+                                    // callee) → tail-prefix let. The
+                                    // classifier accepts both shapes; the
+                                    // pre-pass dispatches based on callee
+                                    // Cps-color via the same
+                                    // `is_supported_cps_user_fn` predicate
+                                    // the classifier used.
+                                    let is_cps_wrapper = callee_name_opt
+                                        .as_ref()
+                                        .map(|n| {
+                                            is_supported_cps_user_fn(
+                                                n,
+                                                &fns_by_name,
+                                                &cc.colored,
+                                                &ctors,
+                                            )
+                                        })
+                                        .unwrap_or(false);
+                                    if is_cps_wrapper {
+                                        let callee_name = match callee_name_opt {
+                                            Some(n) => n,
+                                            None => unreachable!(
+                                                "is_cps_wrapper implies callee_name_opt is Some — \
+                                             is_cps_wrapper short-circuited via the \
+                                             callee_name_opt.as_ref().map(...).unwrap_or(false) \
+                                             chain that returns false on None"
+                                            ),
+                                        };
+                                        steps.push(ChainedNextStep::CallCps {
+                                            callee_name,
+                                            args: args.clone(),
+                                        });
+                                        binding_names.push(let_stmt.name.clone());
+                                        binding_tys.push(cranelift_ty_for_type_expr(
+                                            &let_stmt.ty,
+                                            pointer_ty,
+                                        ));
+                                        binding_kinds
+                                            .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                                    } else {
+                                        tail_prefix_lets.push(TailPrefixLet {
+                                            name: let_stmt.name.clone(),
+                                            ty: cranelift_ty_for_type_expr(
+                                                &let_stmt.ty,
+                                                pointer_ty,
+                                            ),
+                                            kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
+                                            value: let_stmt.value.clone(),
+                                        });
+                                    }
+                                }
+                                other => {
+                                    // Plan C Task 81 — pure trailing
+                                    // intermediate (classifier accepted
+                                    // it after at least one yield was
+                                    // seen). Append to tail_prefix_lets;
+                                    // FINAL step's emit lowers them in
+                                    // order before lowering tail_expr.
                                     tail_prefix_lets.push(TailPrefixLet {
                                         name: let_stmt.name.clone(),
                                         ty: cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty),
                                         kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
-                                        value: let_stmt.value.clone(),
+                                        value: other.clone(),
                                     });
                                 }
                             }
-                            other => {
-                                // Plan C Task 81 — pure trailing
-                                // intermediate (classifier accepted
-                                // it after at least one yield was
-                                // seen). Append to tail_prefix_lets;
-                                // FINAL step's emit lowers them in
-                                // order before lowering tail_expr.
-                                tail_prefix_lets.push(TailPrefixLet {
-                                    name: let_stmt.name.clone(),
-                                    ty: cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty),
-                                    kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
-                                    value: other.clone(),
-                                });
-                            }
                         }
-                    }
-                    let tail_expr = match &f.body.tail {
-                        Some(t) => t.clone(),
-                        None => unreachable!(
-                            "is_simple_chained_let_yield_then_pure_tail_body \
+                        let tail_expr = match &arm_body.tail {
+                            Some(t) => t.clone(),
+                            None => unreachable!(
+                                "is_simple_chained_let_yield_then_pure_tail_body \
                              classifier guarantees tail is Some"
-                        ),
-                    };
-                    let tail_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+                            ),
+                        };
+                        let tail_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
 
-                    // Free-var analysis across all step args + tail:
-                    // helper user params referenced anywhere in the
-                    // chain. Each step's closure record carries this
-                    // captures vec (constant across all steps) plus
-                    // its own prior_bindings (step_0..step_{i-1}).
-                    let captures = collect_chained_synth_cont_captures(
-                        &steps,
-                        &tail_expr,
-                        &tail_prefix_lets,
-                        &binding_names,
-                        &f.params,
-                    );
+                        // Free-var analysis across all step args + tail:
+                        // helper user params referenced anywhere in the
+                        // chain. Each step's closure record carries this
+                        // captures vec (constant across all steps) plus
+                        // its own prior_bindings (step_0..step_{i-1}).
+                        let captures = collect_chained_synth_cont_captures(
+                            &steps,
+                            &tail_expr,
+                            &tail_prefix_lets,
+                            &binding_names,
+                            &f.params,
+                        );
 
-                    // Pass 1: declare all N FuncIds. Each step's
-                    // synth-cont uses the uniform CPS calling
-                    // convention `(closure_ptr, args_ptr, args_len)
-                    // -> *mut NextStep`. Names follow the global-
-                    // index pattern to avoid collisions with user
-                    // fns or other synth-conts.
-                    let synth_cont_sig = cps_signature(pointer_ty, &module);
+                        // Pass 1: declare all N FuncIds. Each step's
+                        // synth-cont uses the uniform CPS calling
+                        // convention `(closure_ptr, args_ptr, args_len)
+                        // -> *mut NextStep`. Names follow the global-
+                        // index pattern to avoid collisions with user
+                        // fns or other synth-conts.
+                        let synth_cont_sig = cps_signature(pointer_ty, &module);
 
-                    // Branch-chain allocation FIRST: walk the branched
-                    // tail to find PerformChain branches. For each,
-                    // allocate synth-cont FuncIds and register
-                    // CpsContinuationSynth entries. These must be
-                    // pushed before body chain entries so that
-                    // starting_idx (computed below) correctly points
-                    // at the body chain's first entry.
-                    let branch_chains = collect_branch_chain_allocs(
-                        &tail_expr,
-                        &captures,
-                        &binding_names,
-                        &binding_kinds,
-                        &tail_prefix_lets,
-                        &f.return_type,
-                        &f.name,
-                        pointer_ty,
-                        &ctors,
-                        &|n: &str| is_supported_cps_user_fn(n, &fns_by_name, &cc.colored, &ctors),
-                        &synth_cont_sig,
-                        &mut module,
-                        &mut cps_continuation_synth,
-                    )?;
+                        // Branch-chain allocation FIRST: walk the branched
+                        // tail to find PerformChain branches. For each,
+                        // allocate synth-cont FuncIds and register
+                        // CpsContinuationSynth entries. These must be
+                        // pushed before body chain entries so that
+                        // starting_idx (computed below) correctly points
+                        // at the body chain's first entry.
+                        let branch_chains = collect_branch_chain_allocs(
+                            &tail_expr,
+                            &captures,
+                            &binding_names,
+                            &binding_kinds,
+                            &tail_prefix_lets,
+                            &f.return_type,
+                            &f.name,
+                            pointer_ty,
+                            &ctors,
+                            &|n: &str| {
+                                is_supported_cps_user_fn(n, &fns_by_name, &cc.colored, &ctors)
+                            },
+                            &synth_cont_sig,
+                            &mut module,
+                            &mut cps_continuation_synth,
+                        )?;
 
-                    let starting_idx = cps_continuation_synth.len();
-                    let effective_step_count = if chain_length == 0 { 1 } else { chain_length };
-                    let mut step_func_ids: Vec<cranelift_module::FuncId> =
-                        Vec::with_capacity(effective_step_count);
-                    for step in 0..effective_step_count {
-                        let global_idx = starting_idx + step;
-                        let synth_cont_name = format!("sigil_post_yield_cont_{global_idx}");
-                        let synth_cont_func_id = module
-                            .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
-                            .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
-                        step_func_ids.push(synth_cont_func_id);
-                    }
+                        let starting_idx = cps_continuation_synth.len();
+                        let effective_step_count = if chain_length == 0 { 1 } else { chain_length };
+                        let mut step_func_ids: Vec<cranelift_module::FuncId> =
+                            Vec::with_capacity(effective_step_count);
+                        for step in 0..effective_step_count {
+                            let global_idx = starting_idx + step;
+                            let synth_cont_name = format!("sigil_post_yield_cont_{global_idx}");
+                            let synth_cont_func_id = module
+                                .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
+                                .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
+                            step_func_ids.push(synth_cont_func_id);
+                        }
 
-                    // Plan C Task 81 — chain_length=0 special case:
-                    // emit ONE FINAL synth-cont with synthetic dummy
-                    // binding. Body emit will dispatch with args[0]=0.
-                    //
-                    // The synth binding name `$zero_chain_dummy`
-                    // begins with `$`, which the lexer rejects as
-                    // an identifier-start character (lexer.rs:126
-                    // requires `is_ascii_alphabetic() || c == '_'`),
-                    // so the name cannot collide with any user-
-                    // declared parameter or local. Mirrors the
-                    // existing `$lambda_N` naming convention for
-                    // synthetic top-level fns.
-                    if chain_length == 0 {
-                        cps_continuation_synth.push(CpsContinuationSynth {
-                            func_id: step_func_ids[0],
-                            parent_fn_name: f.name.clone(),
-                            kind: CpsContinuationKind::ChainedLetBindStep {
-                                binding_name: "$zero_chain_dummy".to_string(),
-                                binding_ty: types::I64,
-                                binding_kind: EnvSlotKind::Int,
-                                captures: captures.clone(),
-                                prior_bindings: vec![],
-                                role: ChainStepRole::Final {
+                        // Plan C Task 81 — chain_length=0 special case:
+                        // emit ONE FINAL synth-cont with synthetic dummy
+                        // binding. Body emit will dispatch with args[0]=0.
+                        //
+                        // The synth binding name `$zero_chain_dummy`
+                        // begins with `$`, which the lexer rejects as
+                        // an identifier-start character (lexer.rs:126
+                        // requires `is_ascii_alphabetic() || c == '_'`),
+                        // so the name cannot collide with any user-
+                        // declared parameter or local. Mirrors the
+                        // existing `$lambda_N` naming convention for
+                        // synthetic top-level fns.
+                        if chain_length == 0 {
+                            cps_continuation_synth.push(CpsContinuationSynth {
+                                func_id: step_func_ids[0],
+                                parent_fn_name: f.name.clone(),
+                                kind: CpsContinuationKind::ChainedLetBindStep {
+                                    binding_name: "$zero_chain_dummy".to_string(),
+                                    binding_ty: types::I64,
+                                    binding_kind: EnvSlotKind::Int,
+                                    captures: captures.clone(),
+                                    prior_bindings: vec![],
+                                    role: ChainStepRole::Final {
+                                        tail_expr: Box::new(tail_expr.clone()),
+                                        tail_ty,
+                                        tail_prefix_lets: tail_prefix_lets.clone(),
+                                        branch_chains: branch_chains.clone(),
+                                    },
+                                    prior_was_call_cps: false,
+                                },
+                            });
+                            cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
+                            continue;
+                        }
+
+                        // Pass 2: build N CpsContinuationSynth entries.
+                        // step_idx 0..N-2 → Middle; step_idx == N-1 →
+                        // Final. prior_bindings for step i is the slice
+                        // binding_{0..i} (so step_0's prior_bindings is
+                        // empty; step_{N-1}'s is binding_{0..N-1}).
+                        for step in 0..chain_length {
+                            let prior_bindings: Vec<ChainedPriorBinding> = (0..step)
+                                .map(|j| ChainedPriorBinding {
+                                    name: binding_names[j].clone(),
+                                    kind: binding_kinds[j],
+                                })
+                                .collect();
+                            let role = if step + 1 < chain_length {
+                                ChainStepRole::Middle {
+                                    next_step: steps[step + 1].clone(),
+                                    next_step_func_id: step_func_ids[step + 1],
+                                }
+                            } else {
+                                ChainStepRole::Final {
                                     tail_expr: Box::new(tail_expr.clone()),
                                     tail_ty,
                                     tail_prefix_lets: tail_prefix_lets.clone(),
                                     branch_chains: branch_chains.clone(),
+                                }
+                            };
+                            // Plan D Task 112 — `prior_was_call_cps` flag
+                            // `prior_was_call_cps` for step_i is true iff
+                            // `steps[i]` is `CallCps` — step_i's synth-cont
+                            // fires after `steps[i]`'s dispatch (helper-body
+                            // for i=0; step_{i-1}'s Middle for i>0). When
+                            // true, the synth-cont body POPs
+                            // BODY_RETURN_ARM_STACK at entry (Risk 3
+                            // protection for the preceding CallCps emit's
+                            // PUSH).
+                            let prior_was_call_cps =
+                                matches!(steps[step], ChainedNextStep::CallCps { .. });
+                            cps_continuation_synth.push(CpsContinuationSynth {
+                                func_id: step_func_ids[step],
+                                parent_fn_name: f.name.clone(),
+                                kind: CpsContinuationKind::ChainedLetBindStep {
+                                    binding_name: binding_names[step].clone(),
+                                    binding_ty: binding_tys[step],
+                                    binding_kind: binding_kinds[step],
+                                    captures: captures.clone(),
+                                    prior_bindings,
+                                    role,
+                                    prior_was_call_cps,
                                 },
-                                prior_was_call_cps: false,
-                            },
-                        });
+                            });
+                        }
+                        // Map points at step_0; helper body emit reads
+                        // step_0's captures + first perform's k_fn.
                         cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
-                        continue;
                     }
-
-                    // Pass 2: build N CpsContinuationSynth entries.
-                    // step_idx 0..N-2 → Middle; step_idx == N-1 →
-                    // Final. prior_bindings for step i is the slice
-                    // binding_{0..i} (so step_0's prior_bindings is
-                    // empty; step_{N-1}'s is binding_{0..N-1}).
-                    for step in 0..chain_length {
-                        let prior_bindings: Vec<ChainedPriorBinding> = (0..step)
-                            .map(|j| ChainedPriorBinding {
-                                name: binding_names[j].clone(),
-                                kind: binding_kinds[j],
-                            })
-                            .collect();
-                        let role = if step + 1 < chain_length {
-                            ChainStepRole::Middle {
-                                next_step: steps[step + 1].clone(),
-                                next_step_func_id: step_func_ids[step + 1],
-                            }
-                        } else {
-                            ChainStepRole::Final {
-                                tail_expr: Box::new(tail_expr.clone()),
-                                tail_ty,
-                                tail_prefix_lets: tail_prefix_lets.clone(),
-                                branch_chains: branch_chains.clone(),
-                            }
-                        };
-                        // Plan D Task 112 — `prior_was_call_cps` flag
-                        // `prior_was_call_cps` for step_i is true iff
-                        // `steps[i]` is `CallCps` — step_i's synth-cont
-                        // fires after `steps[i]`'s dispatch (helper-body
-                        // for i=0; step_{i-1}'s Middle for i>0). When
-                        // true, the synth-cont body POPs
-                        // BODY_RETURN_ARM_STACK at entry (Risk 3
-                        // protection for the preceding CallCps emit's
-                        // PUSH).
-                        let prior_was_call_cps =
-                            matches!(steps[step], ChainedNextStep::CallCps { .. });
-                        cps_continuation_synth.push(CpsContinuationSynth {
-                            func_id: step_func_ids[step],
-                            parent_fn_name: f.name.clone(),
-                            kind: CpsContinuationKind::ChainedLetBindStep {
-                                binding_name: binding_names[step].clone(),
-                                binding_ty: binding_tys[step],
-                                binding_kind: binding_kinds[step],
-                                captures: captures.clone(),
-                                prior_bindings,
-                                role,
-                                prior_was_call_cps,
-                            },
-                        });
-                    }
-                    // Map points at step_0; helper body emit reads
-                    // step_0's captures + first perform's k_fn.
-                    cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
                 }
             }
         }
@@ -8961,6 +8993,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             string_length,
             random_pseudo_int,
             clock_os_now,
+            int_xor,
+            int_shl,
+            int_shr,
+            int_abs,
             cont_alloc,
             cont_invoke,
         },
@@ -12037,26 +12073,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 } else {
                     // --- Non-tail / no-`k` path (Phase 4c shape) ---
                     //
-                    // Plan B Task 55 (Phase 4g) bugfix: read the
-                    // arm body's actual lowered Cranelift type via
-                    // `dfg.value_type` instead of the pre-stored
-                    // `synth.body_ty`. The pre-pass derives
-                    // `synth.body_ty` from the **op's declared
-                    // return type** (Phase 4c convention), but
-                    // typecheck unifies the arm body's type with
-                    // **handler_overall**, which can differ from
-                    // the op return type (e.g., a `Raise.fail() ->
-                    // Int` op whose handle's return arm produces
-                    // Bool unifies handler_overall = Bool and the
-                    // arm body's `false` lowers to I8). The
-                    // pre-stored body_ty is then I64 but the actual
-                    // value is I8 — Cranelift's verifier rejects
-                    // the I64 → I64 widen branch over an I8 value.
-                    // Mirrors Phase 4e Slice C's `tail_ty` fix at
-                    // codegen.rs:5260-5285 (use post-lowering
-                    // `dfg.value_type` over pre-stored type).
-                    // Latent since Phase 4c; surfaced by Phase 4g's
-                    // body-vs-handler-overall test surface.
+                    // Phase 4g bugfix: read the arm body's actual
+                    // lowered Cranelift type via `dfg.value_type`
+                    // instead of the pre-stored `synth.body_ty`.
+                    // The pre-pass derives body_ty from the op's
+                    // declared return type, but typecheck unifies
+                    // the arm body with handler_overall, which can
+                    // differ (e.g. Raise.fail()->Int arm producing
+                    // Bool lowers to I8, not I64).
                     let body_value = lowerer.lower_expr(&synth.body);
                     let body_actual_ty = lowerer.builder.func.dfg.value_type(body_value);
                     let widened_body = if body_actual_ty == types::I64 {
@@ -12071,25 +12095,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         );
                         body_value
                     };
-                    // Stage-6.8-followup Bug 2 fix: emit
-                    // `sigil_next_step_discharged` instead of
-                    // `sigil_next_step_done`. This is the op arm fn
-                    // body's discard-`k` tail path: arm body
-                    // evaluated to `widened_body` WITHOUT invoking
-                    // `k`, so per algebraic-effects semantics this
-                    // value IS the handle's final value (not subject
-                    // to the return clause's wrapper). The trampoline
-                    // writes DISCHARGED to the caller-owned
-                    // `TerminalResult.tag` slot (Plan D Task 111d;
-                    // previously TLS); the handle expression's outer
-                    // codegen logic loads the tag from the slot and
-                    // skips the return arm dispatch.
-                    //
-                    // Store the discharging effect's ID into
-                    // `terminal_out.effect_id` so nested handle
-                    // expressions can distinguish own-effect
-                    // discharge (restore snapshot) from foreign-
-                    // effect discharge (propagate to outer handle).
+                    // Emit DISCHARGED (not DONE): arm body evaluated
+                    // WITHOUT invoking k, so per algebraic-effects
+                    // semantics this value IS the handle's final
+                    // value, not subject to the return clause. The
+                    // effect_id write lets nested handle expressions
+                    // distinguish own-effect discharge from foreign.
                     let effect_id_const = lowerer
                         .builder
                         .ins()
@@ -12104,9 +12115,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         .builder
                         .ins()
                         .call(next_step_discharged_ref, &[widened_body]);
-                    // Stackmap entry: any pointer-typed op-args bound in
-                    // env (String / user-type) are GC roots live across
-                    // this `sigil_next_step_discharged` arena allocation.
                     lowerer
                         .stackmap
                         .push_placeholder(function_code_offset(&lowerer.builder, done_call));
@@ -21435,6 +21443,34 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let call = self.builder.ins().call(self.builtins.clock_os_now_ref, &[]);
                 self.builder.inst_results(call)[0]
             }
+            // Plan C Stage 7 — Int bitwise / shift / abs primitives.
+            Expr::Ident(name, _) if name == "int_xor" => {
+                assert_eq!(args.len(), 2, "int_xor builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int_xor_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int_shl" => {
+                assert_eq!(args.len(), 2, "int_shl builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int_shl_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int_shr" => {
+                assert_eq!(args.len(), 2, "int_shr builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.int_shr_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int_abs" => {
+                assert_eq!(args.len(), 1, "int_abs builtin arg count is not 1");
+                let v = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.int_abs_ref, &[v]);
+                self.builder.inst_results(call)[0]
+            }
             Expr::ClosureRecord { code_fn_name, .. } => {
                 // Evaluate the ClosureRecord first (allocates + stores
                 // the closure on the heap) and use its pointer as the
@@ -22906,6 +22942,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
                 Expr::Ident(name, _) if name == "random_pseudo_int" => types::I64,
                 Expr::Ident(name, _) if name == "clock_os_now" => types::I64,
+                // Plan C Stage 7 — Int bitwise / shift / abs return I64.
+                Expr::Ident(name, _)
+                    if matches!(name.as_str(), "int_xor" | "int_shl" | "int_shr" | "int_abs") =>
+                {
+                    types::I64
+                }
                 Expr::ClosureRecord { code_fn_name, .. } => self
                     .user_fns
                     .get(code_fn_name)
@@ -23426,6 +23468,11 @@ struct BuiltinFuncIds {
     /// Plan C Task 76 — OS clock (nanos since epoch). Backs the
     /// `os_clock` handler in `std/clock.sigil`.
     clock_os_now: cranelift_module::FuncId,
+    /// Plan C Stage 7 — Int bitwise / shift / abs primitives.
+    int_xor: cranelift_module::FuncId,
+    int_shl: cranelift_module::FuncId,
+    int_shr: cranelift_module::FuncId,
+    int_abs: cranelift_module::FuncId,
     /// Plan D Task 117 (b) Phase 4 — Continuation value object
     /// `alloc` (boxes the (k_closure, k_fn, return_closure,
     /// return_fn) quadruple at sites that flow a continuation
@@ -23515,6 +23562,11 @@ struct BuiltinFuncRefs {
     random_pseudo_int_ref: FuncRef,
     /// Plan C Task 76 — OS clock FuncRef.
     clock_os_now_ref: FuncRef,
+    /// Plan C Stage 7 — Int bitwise / shift / abs FuncRefs.
+    int_xor_ref: FuncRef,
+    int_shl_ref: FuncRef,
+    int_shr_ref: FuncRef,
+    int_abs_ref: FuncRef,
     /// Plan D Task 117 (b) Phase 4 — Continuation value object
     /// alloc + invoke helpers (FuncRefs). The load helpers
     /// (`sigil_continuation_load_*`) are called only from inside
@@ -23747,6 +23799,10 @@ fn prepare_builtin_func_refs(
         string_length_ref: module.declare_func_in_func(ids.string_length, builder.func),
         random_pseudo_int_ref: module.declare_func_in_func(ids.random_pseudo_int, builder.func),
         clock_os_now_ref: module.declare_func_in_func(ids.clock_os_now, builder.func),
+        int_xor_ref: module.declare_func_in_func(ids.int_xor, builder.func),
+        int_shl_ref: module.declare_func_in_func(ids.int_shl, builder.func),
+        int_shr_ref: module.declare_func_in_func(ids.int_shr, builder.func),
+        int_abs_ref: module.declare_func_in_func(ids.int_abs, builder.func),
         cont_alloc_ref: module.declare_func_in_func(ids.cont_alloc, builder.func),
         cont_invoke_ref: module.declare_func_in_func(ids.cont_invoke, builder.func),
     }
@@ -23942,6 +23998,58 @@ fn prepare_per_fn_refs(
 ///    closure pre-pass).
 /// 4. Arbitrary CPS-color bodies via the same pre-pass.
 ///
+/// Normalize a function body that ends with a tail-position `perform`
+/// into the chained-let-yield form `{ ...; let __tail_v = perform ...; __tail_v }`.
+///
+/// The chained-let-yield CPS classifier requires a pure tail expression.
+/// A bare tail-position perform (e.g., `{ let _ = perform set(10); perform get() }`)
+/// is semantically identical to binding the perform result and returning it,
+/// but the classifier rejects it because `perform` is not pure. This leaves
+/// the function with Sync ABI, which breaks the lambda-chain discharge model
+/// (the handler arm's return value is returned to the body function as the
+/// perform result instead of being routed through the CPS continuation chain).
+///
+/// The normalization only applies when the body has at least one stmt
+/// containing a perform AND the tail is a perform. Bodies that are ONLY a
+/// single perform (no stmts) are handled by `is_simple_tail_perform_with_pure_args_body`.
+///
+/// Returns `Some(normalized_block)` if normalization was applied, `None` otherwise.
+fn normalize_tail_perform_body(
+    body: &crate::ast::Block,
+    return_type: &crate::ast::TypeExpr,
+) -> Option<crate::ast::Block> {
+    use crate::ast::{Expr, LetStmt, Stmt};
+    if body.stmts.is_empty() {
+        return None;
+    }
+    let has_perform_stmt = body.stmts.iter().any(|s| match s {
+        Stmt::Let(l) => matches!(&l.value, Expr::Perform(_)) || expr_contains_perform(&l.value),
+        Stmt::Perform(_) => true,
+        Stmt::Expr(e) => expr_contains_perform(e),
+    });
+    if !has_perform_stmt {
+        return None;
+    }
+    let perform = match &body.tail {
+        Some(Expr::Perform(p)) => p,
+        _ => return None,
+    };
+    let span = perform.span.clone();
+    let binding_name = "__tail_perform_v".to_string();
+    let mut stmts = body.stmts.clone();
+    stmts.push(Stmt::Let(LetStmt {
+        name: binding_name.clone(),
+        ty: return_type.clone(),
+        value: Expr::Perform(perform.clone()),
+        span: span.clone(),
+    }));
+    Some(crate::ast::Block {
+        stmts,
+        tail: Some(Expr::Ident(binding_name, span.clone())),
+        span: body.span.clone(),
+    })
+}
+
 /// The classifier is conservative — false negatives are acceptable
 /// (force the body through the existing native-ABI path), false
 /// positives are not (would cause codegen to emit incomplete
@@ -24256,14 +24364,21 @@ fn expr_contains_perform(e: &crate::ast::Expr) -> bool {
             expr_contains_perform(callee) || args.iter().any(expr_contains_perform)
         }
         Expr::Tuple { elems, .. } => elems.iter().any(expr_contains_perform),
-        Expr::Handle { .. } | Expr::Lambda { .. } | Expr::ClosureRecord { .. } => {
-            // Conservative: handles / lambdas / closure records that
-            // contain performs are still classified as containing
-            // perform (the perform isn't lifted out of the lambda
-            // body, but the syntactic check errs on the side of
-            // rejecting). Refine if a real-world body needs
-            // lambdas-without-perform to pass.
+        Expr::Handle { .. } | Expr::Lambda { .. } => {
+            // Conservative: handles / lambdas that contain performs
+            // are classified as containing perform. Lambda bodies
+            // aren't yet lifted at this check site in some paths;
+            // Handle expressions may contain inline performs.
             true
+        }
+        Expr::ClosureRecord { .. } => {
+            // INVARIANT: this function must only be called after
+            // closure conversion. Post-lifting, ClosureRecords are
+            // data structs holding captured values — the code
+            // (which may contain performs) lives in a lifted
+            // top-level fn, not inline in the ClosureRecord.
+            // Pre-lifting this would be a false negative.
+            false
         }
     }
 }
@@ -24615,7 +24730,7 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
         return None;
     }
     match &body.tail {
-        Some(t) if expr_is_pure(t, ctors) => Some(yield_count),
+        Some(t) if !expr_contains_perform(t) => Some(yield_count),
         _ => None,
     }
 }
@@ -26331,8 +26446,46 @@ mod tests {
     }
 
     #[test]
-    fn chained_classifier_rejects_impure_tail() {
-        // A non-pure tail (e.g., containing a Call) disqualifies.
+    fn chained_classifier_rejects_perform_in_tail() {
+        // A tail that contains a perform disqualifies — the tail must
+        // be perform-free so it can be lowered as the final Done value.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Perform(PerformExpr {
+                effect: "State".to_string(),
+                op: "get".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            })),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new(),
+                &|_| false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn chained_classifier_accepts_call_in_tail() {
+        // A perform-free Call in tail position is accepted — the tail
+        // just needs to be perform-free, not side-effect-free.
         use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -26361,7 +26514,7 @@ mod tests {
                 &std::collections::BTreeSet::new(),
                 &|_| false,
             ),
-            None
+            Some(1)
         );
     }
 
