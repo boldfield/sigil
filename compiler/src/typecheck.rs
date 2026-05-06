@@ -4466,6 +4466,9 @@ impl Tc {
             return;
         }
         if row_tail.is_some() {
+            // The row variable absorbs the unlisted effect. The u32 ID
+            // is carried (not just a bool) for future constraint recording
+            // at call-site unification; today only presence is checked.
             return;
         }
         self.push_error(
@@ -5490,6 +5493,7 @@ impl Tc {
         op_arms: &[HandleOpArm],
         row: &[EffectInst],
         row_tail: Option<u32>,
+        // Keys the `handle_arm_captures` side-table populated below.
         handle_span: &Span,
     ) -> Option<Ty> {
         // Plan D Task 117 — allocate the handle's scope id once at
@@ -14862,6 +14866,44 @@ mod tests {
         assert!(
             errs.is_empty(),
             "row var should absorb both B and C; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn row_poly_fn_called_from_closed_row_requires_handling() {
+        let src = "effect Foo { bar: () -> Int }\n\
+                   effect Baz { qux: () -> Int }\n\
+                   fn wrapper() -> Int ![Foo | e] {\n  \
+                     perform Foo.bar();\n  \
+                     perform Baz.qux();\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] {\n  \
+                     wrapper();\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "calling row-poly fn from closed row without handling absorbed effects should E0042; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn closed_row_lambda_inside_open_row_fn_rejects_unlisted() {
+        let src = "effect Foo { bar: () -> Int }\n\
+                   effect Baz { qux: () -> Int }\n\
+                   fn wrapper() -> Int ![Foo | e] {\n  \
+                     let f: () -> Int ![Foo] = fn () -> Int ![Foo] => {\n    \
+                       perform Baz.qux()\n  \
+                     };\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "closed-row lambda should reject unlisted Baz even inside open-row fn; got {errs:?}"
         );
     }
 }
