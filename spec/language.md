@@ -421,8 +421,10 @@ identifiers.
   `byte_from_int(n: Int) -> Option[Byte] ![]`.
 - Bool: `true` and `false` are the literal forms of the builtin
   `Bool` type. Pattern-match with `match b { true => ..., false => ... }`.
-
-There is no `Float` literal in v1.
+- Float: `3.14`, `1e10`, `2.5e-3`. IEEE 754 f64, heap-boxed.
+  Requires digits before and after the decimal point (`3.0` not `3.`
+  or `.3`). Exponent form uses `e`/`E` with optional `+`/`-`.
+  Negative float literals: `-3.14` (unary minus is constant-folded).
 
 ### §2 — Top-level items
 
@@ -458,6 +460,7 @@ fn main() -> Int ![IO] { 0 }                   // function
 | `MutArray[A]` | Mutable indexed collection (Mem-gated). |
 | `ByteArray` | Immutable flat byte buffer. |
 | `MutByteArray` | Mutable flat byte buffer (Mem-gated). |
+| `Float` | Boxed IEEE 754 f64. |
 | `Int64` | Boxed 64-bit signed integer. |
 | `StringBuilder` | Segmented-rope string accumulator (Mem-gated). |
 | `(T1, T2, …)` | Tuple types of arbitrary arity. Binary tuples have `fst`/`snd` accessors in `std.pair`. |
@@ -538,6 +541,7 @@ suggested fix.
 | Form | Example |
 |------|---------|
 | Integer literal | `42` |
+| Float literal | `3.14`, `1e10` |
 | String literal | `"hello"` |
 | Char literal | `'A'` |
 | Bool literal | `true`, `false` |
@@ -842,7 +846,7 @@ Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/cata
 - **Memory:** Boehm conservative GC. Every heap object begins with
   an 8-byte header `(tag, count, bitmap, reserved)`.
 - **Tagged values:** `Int` is 63-bit at FFI boundaries (one bit
-  reserved for the heap-vs-immediate tag); `Int64` is heap-boxed.
+  reserved for the heap-vs-immediate tag); `Int64` and `Float` are heap-boxed.
 - **Effects:** dispatched through a CPS trampoline
   (`sigil_run_loop`); each `perform` returns a `NextStep` packet
   that the trampoline routes to the matching arm fn or the
@@ -868,6 +872,7 @@ files are the authoritative API reference.
 | `std.byte_array` | `ByteArray`, conversion to/from `String`. |
 | `std.mut_byte_array` | `MutByteArray` (Mem-gated). |
 | `std.string` | Byte-indexed string ops: `string_concat`, `_substring`, `_byte_at`, `_compare`, `_starts_with`, `_ends_with`, `_contains`, `_index_of`, `_trim`, `_to_int_validate`, `_to_int_parse`, `_length`. |
+| `std.float` | Boxed `Float` (IEEE 754 f64): arithmetic (`float_add`/`sub`/`mul`/`div`/`neg`), comparison (`float_eq`/`lt`/`le`/`gt`/`ge`; NaN≠NaN), math (`float_abs`/`floor`/`ceil`/`sqrt`), conversion (`float_from_int`/`to_int`/`to_string`/`string_to_float_validate`/`_parse`). `float_to_string` always includes `.0` for whole numbers; `inf`/`NaN` unchanged. |
 | `std.int64` | Boxed `Int64` with arithmetic, comparison, conversion, stringify. |
 | `std.string_builder` | `StringBuilder` rope (Mem-gated). |
 | `std.pair` | `fst[A, B]`, `snd[A, B]` accessors for binary tuples `(A, B)`. |
@@ -896,7 +901,6 @@ These functions are available without any `import`:
 
 The following limits are permanent v1 design choices:
 
-- **`Float` type:** no v1 floating-point.
 - **`Unit` literal:** Unit values can only be obtained as the
   return of a `Mem` mutation op or `IO.println`. No `()` literal.
 - **`for` / `while`:** no looping syntax; recursion is the only
