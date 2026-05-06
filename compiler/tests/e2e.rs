@@ -12301,3 +12301,58 @@ fn state_raise_composition_catch_inside_run_state() {
     assert_eq!(code, 0, "stderr: {_stderr}");
     assert_eq!(stdout, "boom\n10\n");
 }
+
+#[test]
+fn top_level_row_poly_with_logging_wrapper() {
+    let src = "effect Ask { ask: () -> Int }\n\
+               fn with_io(body: () -> Int ![IO | e]) -> Int ![IO | e] {\n  \
+                 perform IO.println(\"start\");\n  \
+                 let result: Int = body();\n  \
+                 perform IO.println(\"end\");\n  \
+                 result\n\
+               }\n\
+               fn computation() -> Int ![IO, Ask] {\n  \
+                 perform IO.println(\"inner\");\n  \
+                 let v: Int = perform Ask.ask();\n  \
+                 v\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle with_io(computation) with {\n    \
+                   return(v) => v,\n    \
+                   Ask.ask(k) => k(42),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "top_level_row_poly_logging");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "start\ninner\nend\n42\n");
+}
+
+#[test]
+fn top_level_row_poly_handler_passes_residual() {
+    let src = "effect A resumes: many { op_a: () -> Int }\n\
+               effect B resumes: many { op_b: () -> Int }\n\
+               fn handle_a(body: () -> Int ![A | e]) -> Int ![| e] {\n  \
+                 handle body() with {\n    \
+                   return(v) => v,\n    \
+                   A.op_a(k) => k(10),\n  \
+                 }\n\
+               }\n\
+               fn computation() -> Int ![A, B] {\n  \
+                 let a: Int = perform A.op_a();\n  \
+                 let b: Int = perform B.op_b();\n  \
+                 a + b\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle handle_a(computation) with {\n    \
+                   return(v) => v,\n    \
+                   B.op_b(k) => k(20),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "top_level_row_poly_residual");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "30\n");
+}

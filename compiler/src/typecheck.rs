@@ -3900,12 +3900,16 @@ impl Tc {
         args: &[Expr],
         span: &Span,
         row: &[EffectInst],
+        row_tail: Option<u32>,
     ) -> Option<Ty> {
         let info = self.ctors.get(name).cloned()?;
         let td = self.types.get(&info.type_name)?.clone();
         let variant = &td.variants[info.variant_index];
         // Always type-check each arg so user errors inside args still surface.
-        let arg_tys: Vec<Option<Ty>> = args.iter().map(|a| self.check_expr(a, row)).collect();
+        let arg_tys: Vec<Option<Ty>> = args
+            .iter()
+            .map(|a| self.check_expr(a, row, row_tail))
+            .collect();
         match &variant.fields {
             VariantFields::Positional(param_tys) => {
                 // Plan B task 48 — allocate one fresh `Ty::Var` per
@@ -4013,13 +4017,14 @@ impl Tc {
         fields: &[RecordFieldLit],
         span: &Span,
         row: &[EffectInst],
+        row_tail: Option<u32>,
     ) -> Option<Ty> {
         let info = match self.ctors.get(name).cloned() {
             Some(i) => i,
             None => {
                 // Still evaluate field values so errors inside them surface.
                 for f in fields {
-                    let _ = self.check_expr(&f.value, row);
+                    let _ = self.check_expr(&f.value, row, row_tail);
                 }
                 self.push_error(
                     "E0114",
@@ -4037,7 +4042,7 @@ impl Tc {
             VariantFields::Record(fs) => fs.clone(),
             VariantFields::Unit => {
                 for f in fields {
-                    let _ = self.check_expr(&f.value, row);
+                    let _ = self.check_expr(&f.value, row, row_tail);
                 }
                 self.push_error(
                     "E0115",
@@ -4051,7 +4056,7 @@ impl Tc {
             }
             VariantFields::Positional(_) => {
                 for f in fields {
-                    let _ = self.check_expr(&f.value, row);
+                    let _ = self.check_expr(&f.value, row, row_tail);
                 }
                 self.push_error(
                     "E0115",
@@ -4097,7 +4102,7 @@ impl Tc {
         // Check each supplied field's value type against the declared
         // field's type (resolved under the per-call ctor substitution).
         for f in fields {
-            let v_ty = self.check_expr(&f.value, row);
+            let v_ty = self.check_expr(&f.value, row, row_tail);
             let Some(decl) = declared.iter().find(|d| d.name == f.name) else {
                 self.push_error(
                     "E0115",
@@ -4276,7 +4281,8 @@ impl Tc {
         // Plan D Task 114 — body row carries args so per-call
         // subsumption sees `Raise[Int]` rather than bare `Raise`.
         let body_row = effect_refs_to_insts(&f.effects, &self.types, &self.current_generic_subst);
-        let body_ty = self.check_block(&f.body, &body_row);
+        let row_tail = row_var_id;
+        let body_ty = self.check_block(&f.body, &body_row, row_tail);
 
         // Plan B task 48 — generalise the inferred signature into a
         // scheme for `fn_schemes`. Concrete (non-generic, closed-row)
@@ -4336,14 +4342,14 @@ impl Tc {
     /// caller distinguish "the block's tail didn't typecheck" (`None`) from
     /// "the block is a statement sequence with no tail" (`Some(Unit)`),
     /// which matters for `if`-branch unification.
-    fn check_block(&mut self, b: &Block, row: &[EffectInst]) -> Option<Ty> {
+    fn check_block(&mut self, b: &Block, row: &[EffectInst], row_tail: Option<u32>) -> Option<Ty> {
         for s in &b.stmts {
             match s {
                 Stmt::Expr(e) => {
-                    let _ = self.check_expr(e, row);
+                    let _ = self.check_expr(e, row, row_tail);
                 }
                 Stmt::Perform(p) => {
-                    let _ = self.check_perform(p, row);
+                    let _ = self.check_perform(p, row, row_tail);
                 }
                 Stmt::Let(l) => {
                     // Plan B task 48: let-binding annotation may now
@@ -4399,7 +4405,7 @@ impl Tc {
                                 .to_string(),
                         );
                     }
-                    let got = self.check_expr(&l.value, row);
+                    let got = self.check_expr(&l.value, row, row_tail);
                     let declared = self.ty_from_type_expr_here(&l.ty);
                     if let (Some(got_ty), Some(decl_ty)) = (got.as_ref(), declared.as_ref()) {
                         if !self.unify_ty(decl_ty, got_ty, &l.span) {
@@ -4432,7 +4438,7 @@ impl Tc {
             }
         }
         match &b.tail {
-            Some(tail) => self.check_expr(tail, row),
+            Some(tail) => self.check_expr(tail, row, row_tail),
             None => Some(Ty::Unit),
         }
     }
@@ -4455,21 +4461,34 @@ impl Tc {
         &mut self,
         effect_name: &str,
         row: &[EffectInst],
+        row_tail: Option<u32>,
         span: Span,
         ctx: &str,
     ) {
-        if !row.iter().any(|e| e.name == effect_name) {
-            self.push_error(
-                "E0042",
-                span,
-                format!("`{ctx}` requires `{effect_name}` in the enclosing function's effect row"),
-            );
+        if row.iter().any(|e| e.name == effect_name) {
+            return;
         }
+        if row_tail.is_some() {
+            // The row variable absorbs the unlisted effect. The u32 ID
+            // is carried (not just a bool) for future constraint recording
+            // at call-site unification; today only presence is checked.
+            return;
+        }
+        self.push_error(
+            "E0042",
+            span,
+            format!("`{ctx}` requires `{effect_name}` in the enclosing function's effect row"),
+        );
     }
 
-    fn check_perform(&mut self, p: &PerformExpr, row: &[EffectInst]) -> Option<Ty> {
+    fn check_perform(
+        &mut self,
+        p: &PerformExpr,
+        row: &[EffectInst],
+        row_tail: Option<u32>,
+    ) -> Option<Ty> {
         let ctx = format!("perform {}.{}", p.effect, p.op);
-        self.register_effect_use(&p.effect, row, p.span.clone(), &ctx);
+        self.register_effect_use(&p.effect, row, row_tail, p.span.clone(), &ctx);
         // Plan B task 54 + Task 57 — every effect (including the
         // builtin `IO` and `ArithError`) dispatches through the
         // typechecker's effect registry built in the top-level
@@ -4500,7 +4519,7 @@ impl Tc {
                     ),
                 );
                 for a in &p.args {
-                    let _ = self.check_expr(a, row);
+                    let _ = self.check_expr(a, row, row_tail);
                 }
                 return None;
             }
@@ -4518,7 +4537,7 @@ impl Tc {
                     ),
                 );
                 for a in &p.args {
-                    let _ = self.check_expr(a, row);
+                    let _ = self.check_expr(a, row, row_tail);
                 }
                 return None;
             }
@@ -4599,12 +4618,12 @@ impl Tc {
                 ),
             );
             for a in &p.args {
-                let _ = self.check_expr(a, row);
+                let _ = self.check_expr(a, row, row_tail);
             }
             return op_ret_ty.map(|t| self.deref(&t));
         }
         for (i, arg) in p.args.iter().enumerate() {
-            let arg_ty = self.check_expr(arg, row);
+            let arg_ty = self.check_expr(arg, row, row_tail);
             if let (Some(at), Some(pt)) = (arg_ty, param_tys.get(i).and_then(|x| x.clone())) {
                 let _ = self.unify_ty(&pt, &at, &arg.span());
             }
@@ -4612,7 +4631,7 @@ impl Tc {
         op_ret_ty.map(|t| self.deref(&t))
     }
 
-    fn check_expr(&mut self, e: &Expr, row: &[EffectInst]) -> Option<Ty> {
+    fn check_expr(&mut self, e: &Expr, row: &[EffectInst], row_tail: Option<u32>) -> Option<Ty> {
         match e {
             Expr::IntLit(_, _) => Some(Ty::Int),
             Expr::StringLit(s, span) => {
@@ -4688,17 +4707,17 @@ impl Tc {
                         && !self.env.contains_key(name)
                         && !self.fn_env.contains_key(name)
                     {
-                        return self.resolve_ctor_positional_use(name, args, span, row);
+                        return self.resolve_ctor_positional_use(name, args, span, row, row_tail);
                     }
                 }
-                self.check_call(callee, args, span.clone(), row)
+                self.check_call(callee, args, span.clone(), row, row_tail)
             }
-            Expr::Perform(p) => self.check_perform(p, row),
+            Expr::Perform(p) => self.check_perform(p, row, row_tail),
             Expr::BoolLit(_, _) => Some(Ty::Bool),
             Expr::CharLit(_, _) => Some(Ty::Char),
             Expr::Binary { op, lhs, rhs, span } => {
-                let lt = self.check_expr(lhs, row);
-                let rt = self.check_expr(rhs, row);
+                let lt = self.check_expr(lhs, row, row_tail);
+                let rt = self.check_expr(rhs, row, row_tail);
                 // Plan B Task 57 — `BinOp::Div` and `BinOp::Mod`
                 // elaborate to a perform-bearing form (`if rhs == 0
                 // { perform ArithError.{div,mod}_by_zero() } else {
@@ -4711,12 +4730,12 @@ impl Tc {
                 if matches!(op, BinOp::Div | BinOp::Mod) {
                     let opname = if matches!(op, BinOp::Div) { "/" } else { "%" };
                     let ctx = format!("operator `{opname}` (may abort with ArithError)");
-                    self.register_effect_use("ArithError", row, span.clone(), &ctx);
+                    self.register_effect_use("ArithError", row, row_tail, span.clone(), &ctx);
                 }
                 self.check_binop(*op, lt, rt, lhs.span(), rhs.span())
             }
             Expr::Unary { op, operand, span } => {
-                let ot = self.check_expr(operand, row);
+                let ot = self.check_expr(operand, row, row_tail);
                 self.check_unop(*op, ot, span.clone())
             }
             Expr::If {
@@ -4725,7 +4744,7 @@ impl Tc {
                 else_block,
                 span,
             } => {
-                let cond_ty = self.check_expr(cond, row);
+                let cond_ty = self.check_expr(cond, row, row_tail);
                 if let Some(t) = cond_ty {
                     if t != Ty::Bool {
                         self.push_error(
@@ -4735,8 +4754,8 @@ impl Tc {
                         );
                     }
                 }
-                let then_ty = self.check_block(then_block, row);
-                let else_ty = self.check_block(else_block, row);
+                let then_ty = self.check_block(then_block, row, row_tail);
+                let else_ty = self.check_block(else_block, row, row_tail);
                 match (then_ty, else_ty) {
                     (Some(t), Some(e)) => {
                         // Task 78.5 G3 — defer cross-branch unify until
@@ -4809,14 +4828,14 @@ impl Tc {
                 scrutinee,
                 arms,
                 span,
-            } => self.check_match(scrutinee, arms, span.clone(), row),
+            } => self.check_match(scrutinee, arms, span.clone(), row, row_tail),
             // `Expr::Block` is introduced by elaboration (plan A2 task
             // 23); the surface parser never produces it, so this arm is
             // a structural fallback for exhaustiveness only. Typecheck
             // is not re-run after elaborate in Plan A2's pipeline, so
             // the body of this arm is defensive rather than reached in
             // practice.
-            Expr::Block(b) => self.check_block(b, row),
+            Expr::Block(b) => self.check_block(b, row, row_tail),
             Expr::Lambda {
                 params,
                 return_type,
@@ -4927,7 +4946,7 @@ impl Tc {
             // record variant. E0114 / E0115 / E0044 cover the various
             // failure modes.
             Expr::RecordLit { name, fields, span } => {
-                self.resolve_ctor_record_use(name, fields, span, row)
+                self.resolve_ctor_record_use(name, fields, span, row, row_tail)
             }
             // Plan B task 54 — `handle <body> with { ... }` runs
             // proper handler typing (env extension for op-arm params
@@ -4943,7 +4962,7 @@ impl Tc {
                 return_arm,
                 op_arms,
                 span,
-            } => self.check_handle(body, return_arm.as_deref(), op_arms, row, span),
+            } => self.check_handle(body, return_arm.as_deref(), op_arms, row, row_tail, span),
             // Plan D Task 113 — tuple value: `(e1, e2, ...)`. Check each
             // element under the active row; the tuple's type is the
             // element-wise Ty::Tuple. Empty tuples are rejected by the
@@ -4953,7 +4972,7 @@ impl Tc {
                 let elem_tys: Vec<Ty> = elems
                     .iter()
                     .map(|e| {
-                        self.check_expr(e, row)
+                        self.check_expr(e, row, row_tail)
                             .unwrap_or(Ty::Var(self.fresh_ty_var()))
                     })
                     .collect();
@@ -5100,10 +5119,14 @@ impl Tc {
         args: &[Expr],
         span: Span,
         row: &[EffectInst],
+        row_tail: Option<u32>,
     ) -> Option<Ty> {
-        let callee_ty = self.check_expr(callee, row);
+        let callee_ty = self.check_expr(callee, row, row_tail);
         // Always type-check args so we surface any errors in them.
-        let arg_tys: Vec<Option<Ty>> = args.iter().map(|a| self.check_expr(a, row)).collect();
+        let arg_tys: Vec<Option<Ty>> = args
+            .iter()
+            .map(|a| self.check_expr(a, row, row_tail))
+            .collect();
 
         let sig = match callee_ty {
             Some(Ty::Fn(sig)) => sig,
@@ -5399,7 +5422,7 @@ impl Tc {
         }
 
         // (4) check body against the lambda's own effect row.
-        let body_ty = self.check_expr(body, effects);
+        let body_ty = self.check_expr(body, effects, effect_row_var_id);
 
         // (5) restore and check return-type unification. Plan B
         //     task 48: route through `unify_ty` so an inferred body
@@ -5480,8 +5503,8 @@ impl Tc {
         return_arm: Option<&HandleReturnArm>,
         op_arms: &[HandleOpArm],
         row: &[EffectInst],
-        // Plan B Task 55 (Phase 4d): handle span used to key the
-        // `handle_arm_captures` side-table populated below.
+        row_tail: Option<u32>,
+        // Keys the `handle_arm_captures` side-table populated below.
         handle_span: &Span,
     ) -> Option<Ty> {
         // Plan D Task 117 — allocate the handle's scope id once at
@@ -5753,7 +5776,7 @@ impl Tc {
         self.handler_scopes.push(HandlerScope {
             effect_substs: effect_substs.clone(),
         });
-        let body_ty = self.check_expr(body, &body_row);
+        let body_ty = self.check_expr(body, &body_row, row_tail);
         self.handler_scopes.pop();
 
         // Plan B Stage 6 cleanup — populate the per-handle body type
@@ -5860,7 +5883,7 @@ impl Tc {
                 // outer name. The env_insert debug-assert exists for
                 // the *function-level* no-shadowing contract.
                 self.env.insert(ra.binding.clone(), v_ty);
-                let ra_ty = self.check_expr(&ra.body, row);
+                let ra_ty = self.check_expr(&ra.body, row, row_tail);
                 self.env = saved_env;
                 if let Some(rt) = ra_ty {
                     let _ = self.unify_ty(&handler_overall, &rt, &ra.span);
@@ -5996,7 +6019,7 @@ impl Tc {
             self.current_arm_scope_id = Some(handle_scope_id);
             // Arm body runs at caller's row (the discharged effect is
             // *not* in scope here — we are servicing it).
-            let arm_ty = self.check_expr(&arm.body, row);
+            let arm_ty = self.check_expr(&arm.body, row, row_tail);
             self.current_arm_scope_id = saved_arm_scope_id;
             self.env = saved_env;
             // Unify arm body type with handler-overall only when the
@@ -6068,8 +6091,9 @@ impl Tc {
         arms: &[MatchArm],
         span: Span,
         row: &[EffectInst],
+        row_tail: Option<u32>,
     ) -> Option<Ty> {
-        let scrut_ty = self.check_expr(scrutinee, row);
+        let scrut_ty = self.check_expr(scrutinee, row, row_tail);
 
         // Record the scrutinee type for codegen's pattern disambiguator
         // (Plan A3 task 41.2). Only well-typed scrutinees land in the
@@ -6125,7 +6149,7 @@ impl Tc {
             for (name, ty) in &bindings {
                 self.env.insert(name.clone(), ty.clone());
             }
-            let body_ty = self.check_expr(&arm.body, row);
+            let body_ty = self.check_expr(&arm.body, row, row_tail);
             for (name, prev) in saved {
                 match prev {
                     Some(ty) => {
@@ -14770,5 +14794,124 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn top_level_row_var_absorbs_unlisted_effect() {
+        let src = "effect Foo { bar: () -> Int }\n\
+                   effect Baz { qux: () -> Int }\n\
+                   fn wrapper() -> Int ![Foo | e] {\n  \
+                     perform Foo.bar();\n  \
+                     perform Baz.qux();\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "open row should absorb Baz; got {errs:?}");
+    }
+
+    #[test]
+    fn closed_row_still_rejects_unlisted_effect() {
+        let src = "effect Foo { bar: () -> Int }\n\
+                   effect Baz { qux: () -> Int }\n\
+                   fn wrapper() -> Int ![Foo] {\n  \
+                     perform Baz.qux();\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "closed row must reject Baz; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn top_level_row_var_listed_effect_still_passes() {
+        let src = "import std.io\n\
+                   fn with_logging() -> Int ![IO | e] {\n  \
+                     perform IO.println(\"before\");\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "explicitly listed IO should still pass; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn lambda_inside_open_row_fn_inherits_row_tail() {
+        let src = "effect Foo { bar: () -> Int }\n\
+                   fn wrapper() -> Int ![Foo | e] {\n  \
+                     let f: () -> Int ![Foo | e] = fn () -> Int ![Foo | e] => {\n    \
+                       perform Foo.bar()\n  \
+                     };\n  \
+                     f()\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "lambda should inherit enclosing row tail; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn top_level_row_var_multiple_unlisted_effects() {
+        let src = "effect A { op_a: () -> Int }\n\
+                   effect B { op_b: () -> Int }\n\
+                   effect C { op_c: () -> Int }\n\
+                   fn multi() -> Int ![A | e] {\n  \
+                     perform A.op_a();\n  \
+                     perform B.op_b();\n  \
+                     perform C.op_c();\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "row var should absorb both B and C; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn row_poly_fn_called_from_closed_row_requires_handling() {
+        let src = "effect Foo { bar: () -> Int }\n\
+                   effect Baz { qux: () -> Int }\n\
+                   fn wrapper() -> Int ![Foo | e] {\n  \
+                     perform Foo.bar();\n  \
+                     perform Baz.qux();\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] {\n  \
+                     wrapper();\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "calling row-poly fn from closed row without handling absorbed effects should E0042; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn closed_row_lambda_inside_open_row_fn_rejects_unlisted() {
+        let src = "effect Foo { bar: () -> Int }\n\
+                   effect Baz { qux: () -> Int }\n\
+                   fn wrapper() -> Int ![Foo | e] {\n  \
+                     let f: () -> Int ![Foo] = fn () -> Int ![Foo] => {\n    \
+                       perform Baz.qux()\n  \
+                     };\n  \
+                     0\n\
+                   }\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0042"),
+            "closed-row lambda should reject unlisted Baz even inside open-row fn; got {errs:?}"
+        );
     }
 }

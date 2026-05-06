@@ -498,18 +498,25 @@ An effect row is a comma-separated set of effect names enclosed in
 Rows are unordered. Two rows are equivalent iff they list the same
 name set (modulo type arguments for generic effects like `Raise[E]`).
 
-**Row variables.** Function-typed parameters may include a row
-variable `| e` to express row polymorphism:
+**Row variables.** Functions may include a row variable `| e` in
+their effect row to express row polymorphism:
 
 ```sigil
 fn catch[A, E](body: () -> A ![Raise[E] | e]) -> Result[A, E] ![| e]
+
+fn with_io[A](body: () -> A ![IO | e]) -> A ![IO | e] {
+  perform IO.println("start");
+  let result: A = body();
+  perform IO.println("end");
+  result
+}
 ```
 
-The row variable `e` captures whatever additional effects the body
-carries beyond `Raise[E]`, and the caller's row must include those
-effects. Row variables are resolved through the enclosing function's
-effect row. Top-level row polymorphism (a function whose own declared
-row contains `| e`) is not supported in v1.
+The row variable `e` captures whatever additional effects are not
+explicitly listed. Effects performed by the body that aren't in the
+explicit list are absorbed by the row variable and resolved at call
+sites via row unification. Row variables work both in fn-typed
+parameter positions and in a function's own declared effect row.
 
 #### §3.4 — Inference rules (overview)
 
@@ -894,9 +901,6 @@ The following limits are permanent v1 design choices:
   return of a `Mem` mutation op or `IO.println`. No `()` literal.
 - **`for` / `while`:** no looping syntax; recursion is the only
   iteration mechanism.
-- **Top-level row polymorphism:** row variables work in fn-typed
-  parameter positions (`| e`), but a function's own declared effect
-  row cannot contain a row variable.
 - **Multi-shot N at runtime without continuations:** the static
   N-let-chain (§8.3) requires N to be known at compile time. For
   runtime-N iteration, use first-class continuations (§8.5) as
