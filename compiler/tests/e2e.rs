@@ -11912,33 +11912,39 @@ fn koka_state_through_helper_chain() {
     assert_eq!(stdout, "10\n10\n");
 }
 
-/// State handler delegated through a generic wrapper function.
-/// Tests that run_state works when called from a polymorphic
-/// helper that unwraps the (A, S) tuple.
+/// Handler modifies the performed value before resuming k.
+/// The body performs apply(3) and apply(4), but the handler negates
+/// each value before resuming, so the body sees -3 and -4.
+/// Derived from the resume-modify pattern in Koka's effect handler tests.
 #[test]
-fn koka_state_through_generic_wrapper() {
-    let src = "import std.state\n\
-               fn body() -> Int ![State[Int]] {\n  \
-                 let _: Int = perform State.set(5);\n  \
-                 let x: Int = perform State.get();\n  \
-                 x\n\
+fn koka_resume_with_modified_value() {
+    let src = "import std.io\n\
+               \n\
+               effect Transform {\n  \
+                 apply: (Int) -> Int,\n\
                }\n\
-               fn double_state[A](body: () -> A ![State[Int]]) -> A ![] {\n  \
-                 let result: (A, Int) = run_state(0, fn () -> A ![State[Int]] => {\n    \
-                   body()\n  \
-                 });\n  \
-                 match result { (v, _s) => v }\n\
+               \n\
+               fn body() -> Int ![Transform] {\n  \
+                 let a: Int = perform Transform.apply(3);\n  \
+                 let b: Int = perform Transform.apply(4);\n  \
+                 a * 10 + b\n\
                }\n\
+               \n\
+               fn run_negated(action: () -> Int ![Transform]) -> Int ![] {\n  \
+                 handle action() with {\n    \
+                   Transform.apply(n, k) => k(0 - n),\n  \
+                 }\n\
+               }\n\
+               \n\
                fn main() -> Int ![IO] {\n  \
-                 let v: Int = double_state(fn () -> Int ![State[Int]] => {\n    \
-                   body()\n  \
-                 });\n  \
-                 perform IO.println(int_to_string(v));\n  \
+                 let result: Int = run_negated(body);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, _stderr, code) = compile_and_run(src, "koka_resume_modify");
-    assert_eq!(code, 0);
-    assert_eq!(stdout, "5\n");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    // apply(3) → k(-3), apply(4) → k(-4), (-3)*10+(-4) = -34
+    assert_eq!(stdout, "-34\n");
 }
 
 /// Multiple effects in one body: State + Raise.
@@ -12009,34 +12015,45 @@ fn koka_user_effect_multi_op_handler() {
     assert_eq!(stdout, "answer: 42\n");
 }
 
-/// Two independent handler invocations produce correct isolated results.
-/// Tests that sequential run_state calls with different values each
-/// thread state independently — no cross-contamination between handlers.
+/// Effect performed in both branches of a conditional.
+/// A function with an if/else where each branch performs an effect
+/// operation in tail position. Tests that codegen handles perform
+/// sites in both paths of a conditional body.
+/// Derived from the branch-effect pattern in Koka's effect handler tests.
 #[test]
-fn koka_independent_handler_invocations() {
+fn koka_effect_in_both_branches() {
     let src = "import std.state\n\
+               \n\
+               fn pick(flag: Bool) -> Int ![State[Int]] {\n  \
+                 if flag {\n    \
+                   perform State.set(100)\n  \
+                 } else {\n    \
+                   perform State.set(200)\n  \
+                 }\n\
+               }\n\
+               \n\
                fn main() -> Int ![IO] {\n  \
                  let r1: (Int, Int) = run_state(0, fn () -> Int ![State[Int]] => {\n    \
-                   let _a: Int = perform State.set(100);\n    \
-                   let v: Int = perform State.get();\n    \
-                   v\n  \
+                   pick(true)\n  \
                  });\n  \
                  let r2: (Int, Int) = run_state(0, fn () -> Int ![State[Int]] => {\n    \
-                   let _a: Int = perform State.set(200);\n    \
-                   let v: Int = perform State.get();\n    \
-                   v\n  \
+                   pick(false)\n  \
                  });\n  \
-                 match r1 { (v1, _s1) => {\n    \
-                   match r2 { (v2, _s2) => {\n      \
+                 match r1 { (v1, s1) => {\n    \
+                   match r2 { (v2, s2) => {\n      \
                      perform IO.println(int_to_string(v1));\n      \
+                     perform IO.println(int_to_string(s1));\n      \
                      perform IO.println(int_to_string(v2));\n      \
+                     perform IO.println(int_to_string(s2));\n      \
                      0\n    \
                    }}\n  \
                  }}\n\
                }\n";
     let (stdout, _stderr, code) = compile_and_run(src, "koka_branch_effect");
-    assert_eq!(code, 0);
-    assert_eq!(stdout, "100\n200\n");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    // pick(true): set(100) → value=100, state=100
+    // pick(false): set(200) → value=200, state=200
+    assert_eq!(stdout, "100\n100\n200\n200\n");
 }
 
 /// Multi-shot choose enumerates all pairs.
