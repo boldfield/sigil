@@ -141,6 +141,7 @@ fn resolve_expr(
         | Expr::FloatLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
         | Expr::StringLit(_, _)
         | Expr::Ident(_, _)
         | Expr::ClosureRecord { .. }

@@ -556,7 +556,8 @@ impl Converter {
             | Expr::FloatLit(..)
             | Expr::StringLit(..)
             | Expr::BoolLit(..)
-            | Expr::CharLit(..) => e,
+            | Expr::CharLit(..)
+            | Expr::UnitLit(..) => e,
             Expr::Ident(name, span) => {
                 if locals.contains(&name) {
                     // Local param / let — passes through unchanged.

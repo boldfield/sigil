@@ -440,6 +440,7 @@ fn find_any_perform_in_expr(e: &Expr) -> Option<(String, String)> {
         | Expr::StringLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
         | Expr::Ident(_, _)
         | Expr::ClosureEnvLoad { .. } => None,
         Expr::Call { callee, args, .. } => {
@@ -605,6 +606,7 @@ fn collect_calls_in_expr(
         | Expr::StringLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
         | Expr::ClosureEnvLoad { .. } => {}
         Expr::Ident(name, span) => {
             if calls.contains_key(span) {
@@ -1156,6 +1158,7 @@ mod tests {
             | Expr::StringLit(_, _)
             | Expr::BoolLit(_, _)
             | Expr::CharLit(_, _)
+            | Expr::UnitLit(_)
             | Expr::ClosureEnvLoad { .. } => {}
             Expr::Handle {
                 body,

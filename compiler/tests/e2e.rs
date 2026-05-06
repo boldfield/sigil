@@ -9794,16 +9794,39 @@ fn tuple_arity_three_destructure() {
 /// and rejected by the parser. Pins the diagnostic so a future
 /// re-purposing of `()` doesn't silently slip through.
 #[test]
-fn parser_rejects_empty_parens_as_value() {
+fn unit_literal_typechecks_as_unit() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let u: Unit = ();\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "unit_literal_typechecks");
+    assert_eq!(code, 0, "unit literal exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "", "unit literal should produce no output");
+}
+
+#[test]
+fn unit_literal_passed_to_fn() {
+    let src = "fn accept_unit(u: Unit) -> Int ![] {\n  \
+                 42\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 accept_unit(())\n\
+               }\n";
+    let (_stdout, stderr, code) = compile_and_run(src, "unit_literal_passed");
+    assert_eq!(code, 42, "unit literal passed to fn; stderr={stderr:?}");
+}
+
+#[test]
+fn unit_literal_type_mismatch_rejected() {
     let src = "fn main() -> Int ![IO] {\n  \
                  let p: (Int, Int) = ();\n  \
                  0\n\
                }\n";
     assert_compile_fails_with_code(
         src,
-        "error",
-        &["empty `()` is not a valid expression"],
-        "parser_rejects_empty_parens_value",
+        "E0044",
+        &["type mismatch"],
+        "unit_literal_type_mismatch",
     );
 }
 

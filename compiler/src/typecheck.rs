@@ -4779,6 +4779,7 @@ impl Tc {
             Expr::Perform(p) => self.check_perform(p, row, row_tail),
             Expr::BoolLit(_, _) => Some(Ty::Bool),
             Expr::CharLit(_, _) => Some(Ty::Char),
+            Expr::UnitLit(_) => Some(Ty::Unit),
             Expr::Binary { op, lhs, rhs, span } => {
                 let lt = self.check_expr(lhs, row, row_tail);
                 let rt = self.check_expr(rhs, row, row_tail);
@@ -7496,6 +7497,7 @@ fn desugar_expr_handles(e: &mut Expr) {
         | Expr::FloatLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
         | Expr::StringLit(_, _)
         | Expr::Ident(_, _)
         | Expr::ClosureEnvLoad { .. } => {}
@@ -7603,6 +7605,7 @@ fn arm_body_shadows_k_name(e: &Expr, k_name: &str) -> bool {
         | Expr::FloatLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
         | Expr::StringLit(_, _)
         | Expr::Ident(_, _)
         | Expr::ClosureEnvLoad { .. } => false,
@@ -7875,6 +7878,7 @@ fn apply_subst_to_expr(e: &mut Expr, subst: &BTreeMap<String, String>) {
         | Expr::FloatLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
         | Expr::StringLit(_, _)
         | Expr::ClosureEnvLoad { .. } => {}
         Expr::Call { callee, args, .. } => {
@@ -8034,7 +8038,8 @@ fn collect_free_vars(
             | Expr::FloatLit(..)
             | Expr::StringLit(..)
             | Expr::BoolLit(..)
-            | Expr::CharLit(..) => {}
+            | Expr::CharLit(..)
+            | Expr::UnitLit(..) => {}
             Expr::Binary { lhs, rhs, .. } => {
                 walk(lhs, outer_names, param_names, locals, captures);
                 walk(rhs, outer_names, param_names, locals, captures);
@@ -8342,7 +8347,8 @@ fn count_in_expr(e: &Expr, k_name: &str) -> usize {
         | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
-        | Expr::CharLit(..) => 0,
+        | Expr::CharLit(..)
+        | Expr::UnitLit(..) => 0,
         Expr::Ident(name, _) => {
             if name == k_name {
                 1
