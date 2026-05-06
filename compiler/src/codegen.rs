@@ -7629,35 +7629,34 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
     // Helper for binary `(Float, Float) -> Float` shape:
     // arithmetic ops `add/sub/mul/div`.
-    let make_float_binop = |name: &str, sig_holder: &mut Signature| {
+    let make_float_binop = |sig_holder: &mut Signature| {
         sig_holder.params.clear();
         sig_holder.returns.clear();
         sig_holder.params.push(AbiParam::new(pointer_ty));
         sig_holder.params.push(AbiParam::new(pointer_ty));
         sig_holder.returns.push(AbiParam::new(pointer_ty));
-        let _ = name;
     };
 
     let mut float_add_sig = Signature::new(isa_call_conv(&module));
-    make_float_binop("sigil_float_add", &mut float_add_sig);
+    make_float_binop(&mut float_add_sig);
     let float_add = module
         .declare_function("sigil_float_add", Linkage::Import, &float_add_sig)
         .map_err(|e| format!("declare sigil_float_add: {e}"))?;
 
     let mut float_sub_sig = Signature::new(isa_call_conv(&module));
-    make_float_binop("sigil_float_sub", &mut float_sub_sig);
+    make_float_binop(&mut float_sub_sig);
     let float_sub = module
         .declare_function("sigil_float_sub", Linkage::Import, &float_sub_sig)
         .map_err(|e| format!("declare sigil_float_sub: {e}"))?;
 
     let mut float_mul_sig = Signature::new(isa_call_conv(&module));
-    make_float_binop("sigil_float_mul", &mut float_mul_sig);
+    make_float_binop(&mut float_mul_sig);
     let float_mul = module
         .declare_function("sigil_float_mul", Linkage::Import, &float_mul_sig)
         .map_err(|e| format!("declare sigil_float_mul: {e}"))?;
 
     let mut float_div_sig = Signature::new(isa_call_conv(&module));
-    make_float_binop("sigil_float_div", &mut float_div_sig);
+    make_float_binop(&mut float_div_sig);
     let float_div = module
         .declare_function("sigil_float_div", Linkage::Import, &float_div_sig)
         .map_err(|e| format!("declare sigil_float_div: {e}"))?;

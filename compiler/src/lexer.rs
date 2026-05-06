@@ -160,16 +160,29 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
                 cursor.advance();
                 lit.push_str(&cursor.take_while(|ch| ch.is_ascii_digit()));
             }
-            // Check for exponent: `e` or `E` with optional `+`/`-`.
+            // Check for exponent: `e`/`E`, optional `+`/`-`, then digit(s).
+            // Only commit if at least one digit follows the exponent marker
+            // (with optional sign). Otherwise leave `e` unconsumed so `1e`
+            // lexes as integer `1` followed by identifier `e`.
             if cursor.peek() == 'e' || cursor.peek() == 'E' {
-                is_float = true;
-                lit.push(cursor.peek());
-                cursor.advance();
-                if cursor.peek() == '+' || cursor.peek() == '-' {
+                let skip_sign = if cursor.peek_at(1).is_some_and(|ch| ch == '+' || ch == '-') {
+                    2
+                } else {
+                    1
+                };
+                if cursor
+                    .peek_at(skip_sign)
+                    .is_some_and(|ch| ch.is_ascii_digit())
+                {
+                    is_float = true;
                     lit.push(cursor.peek());
                     cursor.advance();
+                    if cursor.peek() == '+' || cursor.peek() == '-' {
+                        lit.push(cursor.peek());
+                        cursor.advance();
+                    }
+                    lit.push_str(&cursor.take_while(|ch| ch.is_ascii_digit()));
                 }
-                lit.push_str(&cursor.take_while(|ch| ch.is_ascii_digit()));
             }
             let span = Span::new(file, start_line, start_col, cursor.line, cursor.col);
             if is_float {
@@ -887,5 +900,29 @@ mod tests {
             Eof,
         ];
         assert_eq!(ks, expected);
+    }
+
+    #[test]
+    fn float_exponent_requires_digits() {
+        use TokenKind::*;
+        let (toks, errs) = lex("<test>", "1e");
+        assert!(errs.is_empty());
+        assert_eq!(kinds(&toks), vec![IntLit(1), Ident("e".into()), Eof]);
+    }
+
+    #[test]
+    fn float_exponent_sign_requires_digits() {
+        use TokenKind::*;
+        let (toks, errs) = lex("<test>", "1e+");
+        assert!(errs.is_empty());
+        assert_eq!(kinds(&toks), vec![IntLit(1), Ident("e".into()), Plus, Eof]);
+    }
+
+    #[test]
+    fn float_valid_exponent_parses() {
+        use TokenKind::*;
+        let (toks, errs) = lex("<test>", "2e10");
+        assert!(errs.is_empty());
+        assert_eq!(kinds(&toks), vec![FloatLit(2e10), Eof]);
     }
 }
