@@ -78,14 +78,18 @@ pub enum CounterId {
     /// 40 bytes per record; matches the
     /// `counters::add(_, 40)` call at the alloc site).
     ContinuationAllocBytes = 23,
+    FloatAllocCount = 24,
+    FloatAllocBytes = 25,
 }
 
-const COUNTER_SLOTS: usize = 24;
+const COUNTER_SLOTS: usize = 26;
 
 /// Static backing storage for all counters. Mutable only via atomic relaxed
 /// operations; never touched by reference. This is the only global atomic
 /// state the runtime owns.
 static COUNTERS: [AtomicU64; COUNTER_SLOTS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -139,6 +143,8 @@ pub const NAMES: [&str; COUNTER_SLOTS] = [
     "SIGIL_COUNTER_STRING_BUILDER_ALLOC_BYTES",
     "SIGIL_COUNTER_CONTINUATION_ALLOC_COUNT",
     "SIGIL_COUNTER_CONTINUATION_ALLOC_BYTES",
+    "SIGIL_COUNTER_FLOAT_ALLOC_COUNT",
+    "SIGIL_COUNTER_FLOAT_ALLOC_BYTES",
 ];
 
 #[inline]
