@@ -47,9 +47,11 @@ unsafe fn read_float(p: *const u8) -> f64 {
 
 // ── Boxing / unboxing ──────────────────────────────────────────────
 
+/// Box an f64 from its bit pattern (passed as i64 to stay in the
+/// integer register class, matching codegen's `iconst` + call pattern).
 #[no_mangle]
-pub extern "C" fn sigil_float_box(f: f64) -> *mut u8 {
-    alloc_float(f)
+pub extern "C" fn sigil_float_box(bits: i64) -> *mut u8 {
+    alloc_float(f64::from_bits(bits as u64))
 }
 
 /// # Safety
@@ -284,10 +286,14 @@ mod tests {
         read_float(p)
     }
 
+    fn boxf(f: f64) -> *mut u8 {
+        sigil_float_box(f.to_bits() as i64)
+    }
+
     #[test]
     fn box_unbox_round_trip() {
         let _g = gc_test_lock();
-        let p = sigil_float_box(3.14);
+        let p = boxf(3.14);
         unsafe {
             assert!((sigil_float_unbox(p) - 3.14).abs() < f64::EPSILON);
         }
@@ -296,7 +302,7 @@ mod tests {
     #[test]
     fn box_negative_round_trips() {
         let _g = gc_test_lock();
-        let p = sigil_float_box(-2.5);
+        let p = boxf(-2.5);
         unsafe {
             assert!((read(p) - (-2.5)).abs() < f64::EPSILON);
         }
@@ -305,8 +311,8 @@ mod tests {
     #[test]
     fn add_sums() {
         let _g = gc_test_lock();
-        let a = sigil_float_box(1.5);
-        let b = sigil_float_box(2.5);
+        let a = boxf(1.5);
+        let b = boxf(2.5);
         unsafe {
             let r = sigil_float_add(a, b);
             assert!((read(r) - 4.0).abs() < f64::EPSILON);
@@ -316,8 +322,8 @@ mod tests {
     #[test]
     fn sub_subtracts() {
         let _g = gc_test_lock();
-        let a = sigil_float_box(5.0);
-        let b = sigil_float_box(2.0);
+        let a = boxf(5.0);
+        let b = boxf(2.0);
         unsafe {
             assert!((read(sigil_float_sub(a, b)) - 3.0).abs() < f64::EPSILON);
         }
@@ -326,8 +332,8 @@ mod tests {
     #[test]
     fn mul_multiplies() {
         let _g = gc_test_lock();
-        let a = sigil_float_box(3.0);
-        let b = sigil_float_box(4.0);
+        let a = boxf(3.0);
+        let b = boxf(4.0);
         unsafe {
             assert!((read(sigil_float_mul(a, b)) - 12.0).abs() < f64::EPSILON);
         }
@@ -336,8 +342,8 @@ mod tests {
     #[test]
     fn div_divides() {
         let _g = gc_test_lock();
-        let a = sigil_float_box(10.0);
-        let b = sigil_float_box(4.0);
+        let a = boxf(10.0);
+        let b = boxf(4.0);
         unsafe {
             assert!((read(sigil_float_div(a, b)) - 2.5).abs() < f64::EPSILON);
         }
@@ -346,8 +352,8 @@ mod tests {
     #[test]
     fn div_by_zero_yields_inf() {
         let _g = gc_test_lock();
-        let a = sigil_float_box(1.0);
-        let b = sigil_float_box(0.0);
+        let a = boxf(1.0);
+        let b = boxf(0.0);
         unsafe {
             let r = read(sigil_float_div(a, b));
             assert!(r.is_infinite() && r.is_sign_positive());
@@ -357,7 +363,7 @@ mod tests {
     #[test]
     fn neg_negates() {
         let _g = gc_test_lock();
-        let a = sigil_float_box(3.5);
+        let a = boxf(3.5);
         unsafe {
             assert!((read(sigil_float_neg(a)) - (-3.5)).abs() < f64::EPSILON);
         }
@@ -366,8 +372,8 @@ mod tests {
     #[test]
     fn comparisons() {
         let _g = gc_test_lock();
-        let a = sigil_float_box(1.0);
-        let b = sigil_float_box(2.0);
+        let a = boxf(1.0);
+        let b = boxf(2.0);
         unsafe {
             assert_eq!(sigil_float_eq(a, a), 1);
             assert_eq!(sigil_float_eq(a, b), 0);
@@ -382,7 +388,7 @@ mod tests {
     #[test]
     fn nan_not_equal_to_self() {
         let _g = gc_test_lock();
-        let nan = sigil_float_box(f64::NAN);
+        let nan = boxf(f64::NAN);
         unsafe {
             assert_eq!(sigil_float_eq(nan, nan), 0);
             assert_eq!(sigil_float_lt(nan, nan), 0);
@@ -393,12 +399,12 @@ mod tests {
     fn abs_floor_ceil_sqrt() {
         let _g = gc_test_lock();
         unsafe {
-            let neg = sigil_float_box(-3.7);
+            let neg = boxf(-3.7);
             assert!((read(sigil_float_abs(neg)) - 3.7).abs() < f64::EPSILON);
             assert!((read(sigil_float_floor(neg)) - (-4.0)).abs() < f64::EPSILON);
             assert!((read(sigil_float_ceil(neg)) - (-3.0)).abs() < f64::EPSILON);
 
-            let four = sigil_float_box(4.0);
+            let four = boxf(4.0);
             assert!((read(sigil_float_sqrt(four)) - 2.0).abs() < f64::EPSILON);
         }
     }
@@ -416,8 +422,8 @@ mod tests {
     #[test]
     fn to_int_clamps_overflow() {
         let _g = gc_test_lock();
-        let big = sigil_float_box(1e30);
-        let small = sigil_float_box(-1e30);
+        let big = boxf(1e30);
+        let small = boxf(-1e30);
         unsafe {
             assert_eq!(sigil_float_to_int(big), i64::MAX);
             assert_eq!(sigil_float_to_int(small), i64::MIN);
@@ -427,7 +433,7 @@ mod tests {
     #[test]
     fn to_int_nan_yields_zero() {
         let _g = gc_test_lock();
-        let nan = sigil_float_box(f64::NAN);
+        let nan = boxf(f64::NAN);
         unsafe {
             assert_eq!(sigil_float_to_int(nan), 0);
         }
@@ -436,7 +442,7 @@ mod tests {
     #[test]
     fn to_string_formats() {
         let _g = gc_test_lock();
-        let p = sigil_float_box(3.14);
+        let p = boxf(3.14);
         unsafe {
             let s = sigil_float_to_string(p);
             let len = crate::gc::sigil_string_len(s);
@@ -479,7 +485,7 @@ mod tests {
     fn counter_increments_on_alloc() {
         let _g = gc_test_lock();
         let before = counters::read(CounterId::FloatAllocCount);
-        let _ = sigil_float_box(1.0);
+        let _ = boxf(1.0);
         let after = counters::read(CounterId::FloatAllocCount);
         assert!(after > before);
     }

@@ -2179,12 +2179,7 @@ fn register_builtin_float_schemes(tc: &mut Tc) {
         })),
     };
     let float_ty = || Ty::User("Float".to_string(), Vec::new());
-    for op in [
-        "float_add",
-        "float_sub",
-        "float_mul",
-        "float_div",
-    ] {
+    for op in ["float_add", "float_sub", "float_mul", "float_div"] {
         tc.fn_schemes.insert(
             op.to_string(),
             make_scheme(vec![float_ty(), float_ty()], float_ty()),
@@ -2201,10 +2196,8 @@ fn register_builtin_float_schemes(tc: &mut Tc) {
         );
     }
     for math in ["float_abs", "float_floor", "float_ceil", "float_sqrt"] {
-        tc.fn_schemes.insert(
-            math.to_string(),
-            make_scheme(vec![float_ty()], float_ty()),
-        );
+        tc.fn_schemes
+            .insert(math.to_string(), make_scheme(vec![float_ty()], float_ty()));
     }
     tc.fn_schemes.insert(
         "float_from_int".to_string(),
@@ -8037,7 +8030,11 @@ fn collect_free_vars(
                     captures.push(name.clone());
                 }
             }
-            Expr::IntLit(..) | Expr::FloatLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => {}
+            Expr::IntLit(..)
+            | Expr::FloatLit(..)
+            | Expr::StringLit(..)
+            | Expr::BoolLit(..)
+            | Expr::CharLit(..) => {}
             Expr::Binary { lhs, rhs, .. } => {
                 walk(lhs, outer_names, param_names, locals, captures);
                 walk(rhs, outer_names, param_names, locals, captures);
@@ -8341,7 +8338,11 @@ pub(crate) fn count_continuation_uses(e: &Expr, k_name: &str) -> usize {
 
 fn count_in_expr(e: &Expr, k_name: &str) -> usize {
     match e {
-        Expr::IntLit(..) | Expr::FloatLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => 0,
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..) => 0,
         Expr::Ident(name, _) => {
             if name == k_name {
                 1

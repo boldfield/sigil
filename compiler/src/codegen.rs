@@ -1069,6 +1069,26 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("int64_ge".to_string());
     globals.insert("int64_to_int".to_string());
     globals.insert("int64_to_string".to_string());
+    // Plan D — boxed Float builtins.
+    globals.insert("float_add".to_string());
+    globals.insert("float_sub".to_string());
+    globals.insert("float_mul".to_string());
+    globals.insert("float_div".to_string());
+    globals.insert("float_neg".to_string());
+    globals.insert("float_eq".to_string());
+    globals.insert("float_lt".to_string());
+    globals.insert("float_le".to_string());
+    globals.insert("float_gt".to_string());
+    globals.insert("float_ge".to_string());
+    globals.insert("float_abs".to_string());
+    globals.insert("float_floor".to_string());
+    globals.insert("float_ceil".to_string());
+    globals.insert("float_sqrt".to_string());
+    globals.insert("float_from_int".to_string());
+    globals.insert("float_to_int".to_string());
+    globals.insert("float_to_string".to_string());
+    globals.insert("string_to_float_validate".to_string());
+    globals.insert("string_to_float_parse".to_string());
     // Plan C Task 67 — StringBuilder builtins (Mem-gated).
     globals.insert("sb_new".to_string());
     globals.insert("sb_append".to_string());
@@ -2031,7 +2051,11 @@ fn arm_body_walk(
 ) -> Option<String> {
     use crate::ast::Expr;
     match e {
-        Expr::IntLit(..) | Expr::FloatLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::StringLit(..) => None,
         Expr::ClosureEnvLoad { name, .. } => {
             // Plan B Task 55, Phase 4e captures+ Slice D — `Expr::
             // ClosureEnvLoad` in arm bodies is now allowed. The arm
@@ -4510,7 +4534,11 @@ fn walk_collect_post_arm_k_captures(
 ) {
     use crate::ast::Expr;
     match e {
-        Expr::IntLit(..) | Expr::FloatLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => {}
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..) => {}
         Expr::Ident(name, _) => {
             if !bound.contains(name) {
                 if let Some(idx) = arm_params.iter().position(|p| p.name == *name) {
@@ -6098,7 +6126,11 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
 ) -> Option<String> {
     use crate::ast::Expr;
     match tail_expr {
-        Expr::IntLit(..) | Expr::FloatLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::StringLit(..) => None,
         Expr::Ident(name, _) => {
             if name == k_name {
                 return Some(format!(
@@ -6582,7 +6614,11 @@ fn rewrite_expr(
     use crate::ast::Expr;
     use std::collections::BTreeSet;
     match e {
-        Expr::IntLit(..) | Expr::FloatLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => e.clone(),
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..) => e.clone(),
         Expr::Ident(name, span) => {
             if name_in_active_scope(name, scopes) {
                 e.clone()
@@ -7579,6 +7615,190 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             &int64_to_string_sig,
         )
         .map_err(|e| format!("declare sigil_int64_to_string: {e}"))?;
+
+    // Plan D — runtime Float primitives. Boxed f64; arithmetic / math
+    // / construction ops allocate a fresh `TAG_FLOAT` record.
+
+    // sigil_float_box(bits: i64) -> *mut u8
+    let mut float_box_sig = Signature::new(isa_call_conv(&module));
+    float_box_sig.params.push(AbiParam::new(types::I64));
+    float_box_sig.returns.push(AbiParam::new(pointer_ty));
+    let float_box = module
+        .declare_function("sigil_float_box", Linkage::Import, &float_box_sig)
+        .map_err(|e| format!("declare sigil_float_box: {e}"))?;
+
+    // Helper for binary `(Float, Float) -> Float` shape:
+    // arithmetic ops `add/sub/mul/div`.
+    let make_float_binop = |name: &str, sig_holder: &mut Signature| {
+        sig_holder.params.clear();
+        sig_holder.returns.clear();
+        sig_holder.params.push(AbiParam::new(pointer_ty));
+        sig_holder.params.push(AbiParam::new(pointer_ty));
+        sig_holder.returns.push(AbiParam::new(pointer_ty));
+        let _ = name;
+    };
+
+    let mut float_add_sig = Signature::new(isa_call_conv(&module));
+    make_float_binop("sigil_float_add", &mut float_add_sig);
+    let float_add = module
+        .declare_function("sigil_float_add", Linkage::Import, &float_add_sig)
+        .map_err(|e| format!("declare sigil_float_add: {e}"))?;
+
+    let mut float_sub_sig = Signature::new(isa_call_conv(&module));
+    make_float_binop("sigil_float_sub", &mut float_sub_sig);
+    let float_sub = module
+        .declare_function("sigil_float_sub", Linkage::Import, &float_sub_sig)
+        .map_err(|e| format!("declare sigil_float_sub: {e}"))?;
+
+    let mut float_mul_sig = Signature::new(isa_call_conv(&module));
+    make_float_binop("sigil_float_mul", &mut float_mul_sig);
+    let float_mul = module
+        .declare_function("sigil_float_mul", Linkage::Import, &float_mul_sig)
+        .map_err(|e| format!("declare sigil_float_mul: {e}"))?;
+
+    let mut float_div_sig = Signature::new(isa_call_conv(&module));
+    make_float_binop("sigil_float_div", &mut float_div_sig);
+    let float_div = module
+        .declare_function("sigil_float_div", Linkage::Import, &float_div_sig)
+        .map_err(|e| format!("declare sigil_float_div: {e}"))?;
+
+    // Helper for unary `(Float) -> Float` shape:
+    // neg/abs/floor/ceil/sqrt.
+    let make_float_unary = |sig_holder: &mut Signature| {
+        sig_holder.params.clear();
+        sig_holder.returns.clear();
+        sig_holder.params.push(AbiParam::new(pointer_ty));
+        sig_holder.returns.push(AbiParam::new(pointer_ty));
+    };
+
+    let mut float_neg_sig = Signature::new(isa_call_conv(&module));
+    make_float_unary(&mut float_neg_sig);
+    let float_neg = module
+        .declare_function("sigil_float_neg", Linkage::Import, &float_neg_sig)
+        .map_err(|e| format!("declare sigil_float_neg: {e}"))?;
+
+    let mut float_abs_sig = Signature::new(isa_call_conv(&module));
+    make_float_unary(&mut float_abs_sig);
+    let float_abs = module
+        .declare_function("sigil_float_abs", Linkage::Import, &float_abs_sig)
+        .map_err(|e| format!("declare sigil_float_abs: {e}"))?;
+
+    let mut float_floor_sig = Signature::new(isa_call_conv(&module));
+    make_float_unary(&mut float_floor_sig);
+    let float_floor = module
+        .declare_function("sigil_float_floor", Linkage::Import, &float_floor_sig)
+        .map_err(|e| format!("declare sigil_float_floor: {e}"))?;
+
+    let mut float_ceil_sig = Signature::new(isa_call_conv(&module));
+    make_float_unary(&mut float_ceil_sig);
+    let float_ceil = module
+        .declare_function("sigil_float_ceil", Linkage::Import, &float_ceil_sig)
+        .map_err(|e| format!("declare sigil_float_ceil: {e}"))?;
+
+    let mut float_sqrt_sig = Signature::new(isa_call_conv(&module));
+    make_float_unary(&mut float_sqrt_sig);
+    let float_sqrt = module
+        .declare_function("sigil_float_sqrt", Linkage::Import, &float_sqrt_sig)
+        .map_err(|e| format!("declare sigil_float_sqrt: {e}"))?;
+
+    // sigil_float_eq / _lt / _le / _gt / _ge (Float, Float) -> u8 (Bool)
+    let make_float_cmp = |sig_holder: &mut Signature, ptr_ty: types::Type| {
+        sig_holder.params.clear();
+        sig_holder.returns.clear();
+        sig_holder.params.push(AbiParam::new(ptr_ty));
+        sig_holder.params.push(AbiParam::new(ptr_ty));
+        sig_holder.returns.push(AbiParam::new(types::I8));
+    };
+
+    let mut float_eq_sig = Signature::new(isa_call_conv(&module));
+    make_float_cmp(&mut float_eq_sig, pointer_ty);
+    let float_eq = module
+        .declare_function("sigil_float_eq", Linkage::Import, &float_eq_sig)
+        .map_err(|e| format!("declare sigil_float_eq: {e}"))?;
+
+    let mut float_lt_sig = Signature::new(isa_call_conv(&module));
+    make_float_cmp(&mut float_lt_sig, pointer_ty);
+    let float_lt = module
+        .declare_function("sigil_float_lt", Linkage::Import, &float_lt_sig)
+        .map_err(|e| format!("declare sigil_float_lt: {e}"))?;
+
+    let mut float_le_sig = Signature::new(isa_call_conv(&module));
+    make_float_cmp(&mut float_le_sig, pointer_ty);
+    let float_le = module
+        .declare_function("sigil_float_le", Linkage::Import, &float_le_sig)
+        .map_err(|e| format!("declare sigil_float_le: {e}"))?;
+
+    let mut float_gt_sig = Signature::new(isa_call_conv(&module));
+    make_float_cmp(&mut float_gt_sig, pointer_ty);
+    let float_gt = module
+        .declare_function("sigil_float_gt", Linkage::Import, &float_gt_sig)
+        .map_err(|e| format!("declare sigil_float_gt: {e}"))?;
+
+    let mut float_ge_sig = Signature::new(isa_call_conv(&module));
+    make_float_cmp(&mut float_ge_sig, pointer_ty);
+    let float_ge = module
+        .declare_function("sigil_float_ge", Linkage::Import, &float_ge_sig)
+        .map_err(|e| format!("declare sigil_float_ge: {e}"))?;
+
+    // sigil_float_from_int(v: i64) -> *mut u8
+    let mut float_from_int_sig = Signature::new(isa_call_conv(&module));
+    float_from_int_sig.params.push(AbiParam::new(types::I64));
+    float_from_int_sig.returns.push(AbiParam::new(pointer_ty));
+    let float_from_int = module
+        .declare_function("sigil_float_from_int", Linkage::Import, &float_from_int_sig)
+        .map_err(|e| format!("declare sigil_float_from_int: {e}"))?;
+
+    // sigil_float_to_int(p: *const u8) -> i64
+    let mut float_to_int_sig = Signature::new(isa_call_conv(&module));
+    float_to_int_sig.params.push(AbiParam::new(pointer_ty));
+    float_to_int_sig.returns.push(AbiParam::new(types::I64));
+    let float_to_int = module
+        .declare_function("sigil_float_to_int", Linkage::Import, &float_to_int_sig)
+        .map_err(|e| format!("declare sigil_float_to_int: {e}"))?;
+
+    // sigil_float_to_string(p: *const u8) -> *mut u8
+    let mut float_to_string_sig = Signature::new(isa_call_conv(&module));
+    float_to_string_sig.params.push(AbiParam::new(pointer_ty));
+    float_to_string_sig.returns.push(AbiParam::new(pointer_ty));
+    let float_to_string = module
+        .declare_function(
+            "sigil_float_to_string",
+            Linkage::Import,
+            &float_to_string_sig,
+        )
+        .map_err(|e| format!("declare sigil_float_to_string: {e}"))?;
+
+    // sigil_string_to_float_validate(p: *const u8) -> i64
+    let mut string_to_float_validate_sig = Signature::new(isa_call_conv(&module));
+    string_to_float_validate_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    string_to_float_validate_sig
+        .returns
+        .push(AbiParam::new(types::I64));
+    let string_to_float_validate = module
+        .declare_function(
+            "sigil_string_to_float_validate",
+            Linkage::Import,
+            &string_to_float_validate_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_to_float_validate: {e}"))?;
+
+    // sigil_string_to_float_parse(p: *const u8) -> *mut u8
+    let mut string_to_float_parse_sig = Signature::new(isa_call_conv(&module));
+    string_to_float_parse_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    string_to_float_parse_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
+    let string_to_float_parse = module
+        .declare_function(
+            "sigil_string_to_float_parse",
+            Linkage::Import,
+            &string_to_float_parse_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_to_float_parse: {e}"))?;
 
     // Plan C Task 67 — runtime StringBuilder primitives. Mem-gated
     // segmented rope; allocates segments on overflow.
@@ -8985,6 +9205,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             int64_ge,
             int64_to_int,
             int64_to_string,
+            float_box,
+            float_add,
+            float_sub,
+            float_mul,
+            float_div,
+            float_neg,
+            float_eq,
+            float_lt,
+            float_le,
+            float_gt,
+            float_ge,
+            float_abs,
+            float_floor,
+            float_ceil,
+            float_sqrt,
+            float_from_int,
+            float_to_int,
+            float_to_string,
+            string_to_float_validate,
+            string_to_float_parse,
             sb_new,
             sb_append,
             sb_finalize,
@@ -18469,7 +18709,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         use crate::ast::Expr;
         match e {
             Expr::IntLit(n, _) => self.builder.ins().iconst(types::I64, *n),
-            Expr::FloatLit(_f, _span) => todo!("float literal codegen"),
+            Expr::FloatLit(f, _span) => {
+                let bits = f.to_bits() as i64;
+                let raw = self.builder.ins().iconst(types::I64, bits);
+                let call = self.builder.ins().call(self.builtins.float_box_ref, &[raw]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
             Expr::BoolLit(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
             Expr::CharLit(c, _) => self.builder.ins().iconst(types::I32, *c as i64),
             Expr::StringLit(_, span) => self.lower_string_literal(span),
@@ -21263,6 +21510,191 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .push_placeholder(function_code_offset(&self.builder, call));
                 self.builder.inst_results(call)[0]
             }
+            // Plan D — boxed Float primitives. Arithmetic / math /
+            // construction ops allocate and emit stackmap placeholders.
+            // Comparisons and to_int / string_to_float_validate do not.
+            Expr::Ident(name, _) if name == "float_add" => {
+                assert_eq!(args.len(), 2, "float_add builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.float_add_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_sub" => {
+                assert_eq!(args.len(), 2, "float_sub builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.float_sub_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_mul" => {
+                assert_eq!(args.len(), 2, "float_mul builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.float_mul_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_div" => {
+                assert_eq!(args.len(), 2, "float_div builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.float_div_ref, &[a, b]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_neg" => {
+                assert_eq!(args.len(), 1, "float_neg builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.float_neg_ref, &[a]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_abs" => {
+                assert_eq!(args.len(), 1, "float_abs builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.float_abs_ref, &[a]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_floor" => {
+                assert_eq!(args.len(), 1, "float_floor builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.float_floor_ref, &[a]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_ceil" => {
+                assert_eq!(args.len(), 1, "float_ceil builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.float_ceil_ref, &[a]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_sqrt" => {
+                assert_eq!(args.len(), 1, "float_sqrt builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.float_sqrt_ref, &[a]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_eq" => {
+                assert_eq!(args.len(), 2, "float_eq builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.float_eq_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_lt" => {
+                assert_eq!(args.len(), 2, "float_lt builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.float_lt_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_le" => {
+                assert_eq!(args.len(), 2, "float_le builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.float_le_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_gt" => {
+                assert_eq!(args.len(), 2, "float_gt builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.float_gt_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_ge" => {
+                assert_eq!(args.len(), 2, "float_ge builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.float_ge_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_from_int" => {
+                assert_eq!(args.len(), 1, "float_from_int builtin arg count is not 1");
+                let v = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.float_from_int_ref, &[v]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_to_int" => {
+                assert_eq!(args.len(), 1, "float_to_int builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.float_to_int_ref, &[a]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "float_to_string" => {
+                assert_eq!(args.len(), 1, "float_to_string builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.float_to_string_ref, &[a]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_to_float_validate" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "string_to_float_validate builtin arg count is not 1"
+                );
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_to_float_validate_ref, &[a]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "string_to_float_parse" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "string_to_float_parse builtin arg count is not 1"
+                );
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.string_to_float_parse_ref, &[a]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
             // Plan C Task 67 — runtime StringBuilder primitives.
             // Mem-gated; sb_new and sb_finalize allocate (push
             // stackmap placeholder), sb_append writes into existing
@@ -22690,7 +23122,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         use crate::ast::{BinOp, Expr, UnOp};
         match e {
             Expr::IntLit(..) => types::I64,
-            Expr::FloatLit(..) => todo!("float literal codegen"),
+            Expr::FloatLit(..) => self.pointer_ty,
             Expr::BoolLit(..) => types::I8,
             Expr::Perform(p) => {
                 // Plan B Task 55 (Phase 3b) + Task 57 — every effect
@@ -22908,6 +23340,42 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     types::I8
                 }
                 Expr::Ident(name, _) if name == "int64_to_int" => types::I64,
+                // Plan D — boxed Float return-type predictions.
+                // Constructors / arithmetic / math / conversions that
+                // return Float return pointer; comparisons return Bool
+                // (I8); `float_to_int` returns Int (I64);
+                // `float_to_string` / `string_to_float_parse` return
+                // String/Float pointer; `string_to_float_validate`
+                // returns I64.
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "float_add"
+                            | "float_sub"
+                            | "float_mul"
+                            | "float_div"
+                            | "float_neg"
+                            | "float_abs"
+                            | "float_floor"
+                            | "float_ceil"
+                            | "float_sqrt"
+                            | "float_from_int"
+                            | "float_to_string"
+                            | "string_to_float_parse"
+                    ) =>
+                {
+                    self.pointer_ty
+                }
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "float_eq" | "float_lt" | "float_le" | "float_gt" | "float_ge"
+                    ) =>
+                {
+                    types::I8
+                }
+                Expr::Ident(name, _) if name == "float_to_int" => types::I64,
+                Expr::Ident(name, _) if name == "string_to_float_validate" => types::I64,
                 // Plan C Task 67 — StringBuilder return-type predictions.
                 // `sb_new` / `sb_finalize` return pointer; `sb_append`
                 // returns Unit (I8 zero).
@@ -23453,6 +23921,27 @@ struct BuiltinFuncIds {
     int64_ge: cranelift_module::FuncId,
     int64_to_int: cranelift_module::FuncId,
     int64_to_string: cranelift_module::FuncId,
+    /// Plan D — boxed Float runtime primitive FuncIds.
+    float_box: cranelift_module::FuncId,
+    float_add: cranelift_module::FuncId,
+    float_sub: cranelift_module::FuncId,
+    float_mul: cranelift_module::FuncId,
+    float_div: cranelift_module::FuncId,
+    float_neg: cranelift_module::FuncId,
+    float_eq: cranelift_module::FuncId,
+    float_lt: cranelift_module::FuncId,
+    float_le: cranelift_module::FuncId,
+    float_gt: cranelift_module::FuncId,
+    float_ge: cranelift_module::FuncId,
+    float_abs: cranelift_module::FuncId,
+    float_floor: cranelift_module::FuncId,
+    float_ceil: cranelift_module::FuncId,
+    float_sqrt: cranelift_module::FuncId,
+    float_from_int: cranelift_module::FuncId,
+    float_to_int: cranelift_module::FuncId,
+    float_to_string: cranelift_module::FuncId,
+    string_to_float_validate: cranelift_module::FuncId,
+    string_to_float_parse: cranelift_module::FuncId,
     /// Plan C Task 67 — runtime StringBuilder primitive FuncIds.
     /// Mem-gated.
     sb_new: cranelift_module::FuncId,
@@ -23553,6 +24042,27 @@ struct BuiltinFuncRefs {
     int64_ge_ref: FuncRef,
     int64_to_int_ref: FuncRef,
     int64_to_string_ref: FuncRef,
+    /// Plan D — boxed Float primitive FuncRefs.
+    float_box_ref: FuncRef,
+    float_add_ref: FuncRef,
+    float_sub_ref: FuncRef,
+    float_mul_ref: FuncRef,
+    float_div_ref: FuncRef,
+    float_neg_ref: FuncRef,
+    float_eq_ref: FuncRef,
+    float_lt_ref: FuncRef,
+    float_le_ref: FuncRef,
+    float_gt_ref: FuncRef,
+    float_ge_ref: FuncRef,
+    float_abs_ref: FuncRef,
+    float_floor_ref: FuncRef,
+    float_ceil_ref: FuncRef,
+    float_sqrt_ref: FuncRef,
+    float_from_int_ref: FuncRef,
+    float_to_int_ref: FuncRef,
+    float_to_string_ref: FuncRef,
+    string_to_float_validate_ref: FuncRef,
+    string_to_float_parse_ref: FuncRef,
     /// Plan C Task 67 — StringBuilder primitive FuncRefs (Mem-gated).
     sb_new_ref: FuncRef,
     sb_append_ref: FuncRef,
@@ -23793,6 +24303,28 @@ fn prepare_builtin_func_refs(
         int64_ge_ref: module.declare_func_in_func(ids.int64_ge, builder.func),
         int64_to_int_ref: module.declare_func_in_func(ids.int64_to_int, builder.func),
         int64_to_string_ref: module.declare_func_in_func(ids.int64_to_string, builder.func),
+        float_box_ref: module.declare_func_in_func(ids.float_box, builder.func),
+        float_add_ref: module.declare_func_in_func(ids.float_add, builder.func),
+        float_sub_ref: module.declare_func_in_func(ids.float_sub, builder.func),
+        float_mul_ref: module.declare_func_in_func(ids.float_mul, builder.func),
+        float_div_ref: module.declare_func_in_func(ids.float_div, builder.func),
+        float_neg_ref: module.declare_func_in_func(ids.float_neg, builder.func),
+        float_eq_ref: module.declare_func_in_func(ids.float_eq, builder.func),
+        float_lt_ref: module.declare_func_in_func(ids.float_lt, builder.func),
+        float_le_ref: module.declare_func_in_func(ids.float_le, builder.func),
+        float_gt_ref: module.declare_func_in_func(ids.float_gt, builder.func),
+        float_ge_ref: module.declare_func_in_func(ids.float_ge, builder.func),
+        float_abs_ref: module.declare_func_in_func(ids.float_abs, builder.func),
+        float_floor_ref: module.declare_func_in_func(ids.float_floor, builder.func),
+        float_ceil_ref: module.declare_func_in_func(ids.float_ceil, builder.func),
+        float_sqrt_ref: module.declare_func_in_func(ids.float_sqrt, builder.func),
+        float_from_int_ref: module.declare_func_in_func(ids.float_from_int, builder.func),
+        float_to_int_ref: module.declare_func_in_func(ids.float_to_int, builder.func),
+        float_to_string_ref: module.declare_func_in_func(ids.float_to_string, builder.func),
+        string_to_float_validate_ref: module
+            .declare_func_in_func(ids.string_to_float_validate, builder.func),
+        string_to_float_parse_ref: module
+            .declare_func_in_func(ids.string_to_float_parse, builder.func),
         sb_new_ref: module.declare_func_in_func(ids.sb_new, builder.func),
         sb_append_ref: module.declare_func_in_func(ids.sb_append, builder.func),
         sb_finalize_ref: module.declare_func_in_func(ids.sb_finalize, builder.func),
