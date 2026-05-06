@@ -743,6 +743,7 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
     use crate::ast::Expr;
     match e {
         Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
         | Expr::StringLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
@@ -1318,6 +1319,7 @@ fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
             None
         }
         Expr::IntLit(..)
+        | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
@@ -1405,6 +1407,7 @@ fn expr_unsupported_handle(
     use crate::ast::Expr;
     match e {
         Expr::IntLit(..)
+        | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
@@ -2028,7 +2031,7 @@ fn arm_body_walk(
 ) -> Option<String> {
     use crate::ast::Expr;
     match e {
-        Expr::IntLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
+        Expr::IntLit(..) | Expr::FloatLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
         Expr::ClosureEnvLoad { name, .. } => {
             // Plan B Task 55, Phase 4e captures+ Slice D — `Expr::
             // ClosureEnvLoad` in arm bodies is now allowed. The arm
@@ -3952,6 +3955,7 @@ fn walk_collect_arm_post_perform_captures(
     use crate::ast::Expr;
     match e {
         Expr::IntLit(..)
+        | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
@@ -4241,6 +4245,7 @@ fn walk_collect_captures(
     use crate::ast::Expr;
     match e {
         Expr::IntLit(..)
+        | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
@@ -4351,6 +4356,7 @@ fn walk_collect_arm_captures(
     use crate::ast::Expr;
     match e {
         Expr::IntLit(..)
+        | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
@@ -4504,7 +4510,7 @@ fn walk_collect_post_arm_k_captures(
 ) {
     use crate::ast::Expr;
     match e {
-        Expr::IntLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => {}
+        Expr::IntLit(..) | Expr::FloatLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => {}
         Expr::Ident(name, _) => {
             if !bound.contains(name) {
                 if let Some(idx) = arm_params.iter().position(|p| p.name == *name) {
@@ -4735,6 +4741,7 @@ fn unwrap_closure_env_loads_for_post_arm_k(
     use crate::ast::Expr;
     match e {
         Expr::IntLit(..)
+        | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
@@ -5051,6 +5058,7 @@ fn collect_handle_arms_in_expr(
     use crate::ast::Expr;
     match e {
         Expr::IntLit(..)
+        | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
@@ -6090,7 +6098,7 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
 ) -> Option<String> {
     use crate::ast::Expr;
     match tail_expr {
-        Expr::IntLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
+        Expr::IntLit(..) | Expr::FloatLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) | Expr::StringLit(..) => None,
         Expr::Ident(name, _) => {
             if name == k_name {
                 return Some(format!(
@@ -6492,6 +6500,7 @@ fn find_closure_env_load_lambda_source(
             } if n == name => Some((*index, *kind)),
             Expr::ClosureEnvLoad { .. }
             | Expr::IntLit(..)
+            | Expr::FloatLit(..)
             | Expr::BoolLit(..)
             | Expr::CharLit(..)
             | Expr::StringLit(..)
@@ -6573,7 +6582,7 @@ fn rewrite_expr(
     use crate::ast::Expr;
     use std::collections::BTreeSet;
     match e {
-        Expr::IntLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => e.clone(),
+        Expr::IntLit(..) | Expr::FloatLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => e.clone(),
         Expr::Ident(name, span) => {
             if name_in_active_scope(name, scopes) {
                 e.clone()
@@ -18460,6 +18469,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         use crate::ast::Expr;
         match e {
             Expr::IntLit(n, _) => self.builder.ins().iconst(types::I64, *n),
+            Expr::FloatLit(_f, _span) => todo!("float literal codegen"),
             Expr::BoolLit(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
             Expr::CharLit(c, _) => self.builder.ins().iconst(types::I32, *c as i64),
             Expr::StringLit(_, span) => self.lower_string_literal(span),
@@ -22680,6 +22690,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         use crate::ast::{BinOp, Expr, UnOp};
         match e {
             Expr::IntLit(..) => types::I64,
+            Expr::FloatLit(..) => todo!("float literal codegen"),
             Expr::BoolLit(..) => types::I8,
             Expr::Perform(p) => {
                 // Plan B Task 55 (Phase 3b) + Task 57 — every effect
@@ -23296,6 +23307,7 @@ fn arm_body_has_k_pair_lambda(
                     .any(|a| arm_body_has_k_pair_lambda(&a.body, arm_k_pair_captures))
         }
         Expr::IntLit(..)
+        | Expr::FloatLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
         | Expr::StringLit(..)
@@ -24336,6 +24348,7 @@ fn expr_contains_perform(e: &crate::ast::Expr) -> bool {
     match e {
         Expr::Perform(_) => true,
         Expr::IntLit(..)
+        | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
@@ -24412,6 +24425,7 @@ fn expr_is_pure(e: &crate::ast::Expr, ctors: &std::collections::BTreeSet<String>
     use crate::ast::Expr;
     match e {
         Expr::IntLit(..)
+        | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)

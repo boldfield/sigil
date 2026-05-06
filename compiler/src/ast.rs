@@ -374,6 +374,7 @@ impl EnvSlotKind {
 #[derive(Clone, Debug)]
 pub enum Expr {
     IntLit(i64, Span),
+    FloatLit(f64, Span),
     StringLit(String, Span),
     BoolLit(bool, Span),
     CharLit(char, Span),
@@ -719,6 +720,7 @@ impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::IntLit(_, s)
+            | Expr::FloatLit(_, s)
             | Expr::StringLit(_, s)
             | Expr::BoolLit(_, s)
             | Expr::CharLit(_, s)

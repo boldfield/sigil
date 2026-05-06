@@ -436,6 +436,7 @@ fn find_any_perform_in_block(b: &Block) -> Option<(String, String)> {
 fn find_any_perform_in_expr(e: &Expr) -> Option<(String, String)> {
     match e {
         Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
         | Expr::StringLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
@@ -600,6 +601,7 @@ fn collect_calls_in_expr(
 ) {
     match e {
         Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
         | Expr::StringLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
@@ -1150,6 +1152,7 @@ mod tests {
                 }
             }
             Expr::IntLit(_, _)
+            | Expr::FloatLit(_, _)
             | Expr::StringLit(_, _)
             | Expr::BoolLit(_, _)
             | Expr::CharLit(_, _)

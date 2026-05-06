@@ -1020,9 +1020,12 @@ impl<'a> Parser<'a> {
             TokenKind::Minus => {
                 self.advance();
                 let operand = self.parse_unary()?;
-                // Constant-fold `-<int-literal>`.
+                // Constant-fold `-<int-literal>` and `-<float-literal>`.
                 if let Expr::IntLit(n, _) = &operand {
                     return Some(Expr::IntLit(n.wrapping_neg(), tok.span));
+                }
+                if let Expr::FloatLit(f, _) = &operand {
+                    return Some(Expr::FloatLit(-f, tok.span));
                 }
                 Some(Expr::Unary {
                     op: UnOp::Neg,
@@ -1081,6 +1084,10 @@ impl<'a> Parser<'a> {
             TokenKind::IntLit(n) => {
                 self.advance();
                 Some(Expr::IntLit(n, tok.span))
+            }
+            TokenKind::FloatLit(f) => {
+                self.advance();
+                Some(Expr::FloatLit(f, tok.span))
             }
             TokenKind::StringLit(ref s) => {
                 self.advance();

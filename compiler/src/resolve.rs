@@ -138,6 +138,7 @@ fn resolve_expr(
         // Leaves and post-closure-conversion shapes (resolve runs pre-CC,
         // so the post-CC variants are unreachable in practice).
         Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
         | Expr::StringLit(_, _)

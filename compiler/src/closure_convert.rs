@@ -552,7 +552,7 @@ impl Converter {
         captures: &[(String, Ty)],
     ) -> Expr {
         match e {
-            Expr::IntLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => e,
+            Expr::IntLit(..) | Expr::FloatLit(..) | Expr::StringLit(..) | Expr::BoolLit(..) | Expr::CharLit(..) => e,
             Expr::Ident(name, span) => {
                 if locals.contains(&name) {
                     // Local param / let — passes through unchanged.

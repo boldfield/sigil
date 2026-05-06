@@ -30,7 +30,7 @@
 
 use crate::errors::{self, CompilerError, Severity, Span};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TokenKind {
     // keywords
     Fn,
@@ -53,6 +53,7 @@ pub enum TokenKind {
     // atoms
     Ident(String),
     IntLit(i64),
+    FloatLit(f64),
     StringLit(String),
     CharLit(char),
 
@@ -150,29 +151,64 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
         }
 
         if c.is_ascii_digit() {
-            let lit = cursor.take_while(|ch| ch.is_ascii_digit());
+            let mut lit = cursor.take_while(|ch| ch.is_ascii_digit());
+            let mut is_float = false;
+            // Check for fractional part: `.` followed by a digit.
+            if cursor.peek() == '.' && cursor.peek_at(1).is_some_and(|ch| ch.is_ascii_digit()) {
+                is_float = true;
+                lit.push('.');
+                cursor.advance();
+                lit.push_str(&cursor.take_while(|ch| ch.is_ascii_digit()));
+            }
+            // Check for exponent: `e` or `E` with optional `+`/`-`.
+            if cursor.peek() == 'e' || cursor.peek() == 'E' {
+                is_float = true;
+                lit.push(cursor.peek());
+                cursor.advance();
+                if cursor.peek() == '+' || cursor.peek() == '-' {
+                    lit.push(cursor.peek());
+                    cursor.advance();
+                }
+                lit.push_str(&cursor.take_while(|ch| ch.is_ascii_digit()));
+            }
             let span = Span::new(file, start_line, start_col, cursor.line, cursor.col);
-            match lit.parse::<i64>() {
-                Ok(n) => tokens.push(Token {
-                    kind: TokenKind::IntLit(n),
-                    span,
-                }),
-                Err(_) => {
-                    // Preserve forward progress for subsequent tokens: we
-                    // still emit a token slot (with value 0) so downstream
-                    // parser positions do not shift, then attach the
-                    // positioned E0050. The zero never reaches codegen —
-                    // compile aborts after the errors sweep.
-                    errors.push(CompilerError::new(
-                        Severity::Error,
-                        errors::code("E0050"),
-                        span.clone(),
-                        format!("integer literal `{lit}` is out of range for `Int` (i64)"),
-                    ));
-                    tokens.push(Token {
-                        kind: TokenKind::IntLit(0),
+            if is_float {
+                match lit.parse::<f64>() {
+                    Ok(f) => tokens.push(Token {
+                        kind: TokenKind::FloatLit(f),
                         span,
-                    });
+                    }),
+                    Err(_) => {
+                        errors.push(CompilerError::new(
+                            Severity::Error,
+                            errors::code("E0050"),
+                            span.clone(),
+                            format!("float literal `{lit}` is out of range"),
+                        ));
+                        tokens.push(Token {
+                            kind: TokenKind::FloatLit(0.0),
+                            span,
+                        });
+                    }
+                }
+            } else {
+                match lit.parse::<i64>() {
+                    Ok(n) => tokens.push(Token {
+                        kind: TokenKind::IntLit(n),
+                        span,
+                    }),
+                    Err(_) => {
+                        errors.push(CompilerError::new(
+                            Severity::Error,
+                            errors::code("E0050"),
+                            span.clone(),
+                            format!("integer literal `{lit}` is out of range for `Int` (i64)"),
+                        ));
+                        tokens.push(Token {
+                            kind: TokenKind::IntLit(0),
+                            span,
+                        });
+                    }
                 }
             }
             continue;

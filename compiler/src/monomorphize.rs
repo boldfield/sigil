@@ -976,6 +976,7 @@ impl<'a> Monomorphizer<'a> {
     fn rewrite_expr(&mut self, e: &Expr, subst: &Substitution) -> Expr {
         match e {
             Expr::IntLit(_, _)
+            | Expr::FloatLit(_, _)
             | Expr::StringLit(_, _)
             | Expr::BoolLit(_, _)
             | Expr::CharLit(_, _) => e.clone(),
