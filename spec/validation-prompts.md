@@ -1,13 +1,8 @@
 # Sigil spec validation prompts
 
 Each prompt is run against a fresh LLM session given only `spec/language.md`.
-The session produces a program; `scripts/validate-spec.sh` (added in Plan C)
-compiles it, runs it, and checks the output against the oracle.
-
-Plan A1 seeds three prompts whose feature surface is covered by the hello-world
-vertical slice. Plans A2, A3, B, and C add the remaining 17 prompts as their
-feature surface enables them; the full bank reaches 20 before Plan C can
-declare the spec validated.
+The session produces a program; `scripts/validate-spec.sh` compiles it, runs
+it, and checks the output against the oracle.
 
 Each prompt carries:
 - **Prompt:** exactly what the fresh LLM session receives (after `spec/language.md`).
@@ -43,11 +38,6 @@ hello, world
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** If the compiler does not yet expose `string_concat`
-(Plan A1 may not — the primitive is required from Plan A2 onward), this
-prompt is graded only against "program compiles"; the run portion is
-deferred until the feature lands.
-
 ## P03 — multi-line output
 
 **Prompt:** Write a Sigil program that calls `perform IO.println` twice, once
@@ -78,11 +68,9 @@ IO.println`, then return `0` as the process exit status.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Exercises Stage-3 features — a recursive
-user-defined fn with a single `Int` parameter, `match` on an `Int`
-scrutinee with a literal pattern and a wildcard, the `int_to_string`
-builtin (Plan A2 task 34), and the closure-calling-convention
-direct-call path for a top-level recursive fn.
+**Oracle (notes):** Exercises recursion with `match` on `Int`
+(literal pattern + wildcard), the `int_to_string` builtin, and
+top-level recursive function calls.
 
 ## P05 — parity check via mod and if/else
 
@@ -99,12 +87,10 @@ even
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Exercises Stage-2 features — the `%` operator, the
-`==` comparison on `Int`, a `let` binding of type `Bool`, and
-`if`/`else` as an expression whose branches unify to `String`. The
-prompt deliberately hard-codes `n = 14` so the oracle is
-deterministic; generalising to runtime-varied input arrives with Plan
-B's effect handlers.
+**Oracle (notes):** Exercises the `%` operator, `==` comparison on
+`Int`, a `let` binding of type `Bool`, and `if`/`else` as an
+expression whose branches unify to `String`. The prompt hard-codes
+`n = 14` so the oracle is deterministic.
 
 ## P06 — multiplication table via nested recursion
 
@@ -131,12 +117,10 @@ until `row > 3`. In `main`, call `print_rows(1)`, then return `0`.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Plan A2 has no `for`/`while` loops; the only way
-to iterate is recursion, and the only way to short-circuit is a match
-or if-guard on the loop counter. The prompt's two-fn shape pins that
-shape so the oracle stdout is deterministic. Exercises nested
-recursion over the closure-calling-convention direct-call path,
-plus the `int_to_string` builtin (Plan A2 task 34).
+**Oracle (notes):** Sigil has no `for`/`while` loops; the only way to
+iterate is recursion with a match or if-guard on the loop counter.
+The two-fn shape pins the iteration structure so the oracle is
+deterministic. Exercises nested recursion and `int_to_string`.
 
 ## P07 — safe divide with explicit divisor check
 
@@ -151,13 +135,10 @@ status (no stdout output).
 **Oracle (exit):** `255`
 
 **Oracle (notes):** Unix exit codes are unsigned 8-bit, so `-1`
-surfaces as `255` to a calling shell. The prompt tests the Stage-2
-"explicit guard around `/`" pattern: without the guard the runtime
-trap (E0401) fires and the process exits with status `2`. A correct
-program threads a `Bool` through `if`/`else` to select between `-1`
-and `n / d`, dodging the trap entirely. Plan B replaces this pattern
-with a `Raise[ArithError]` effect the caller can handle; until then,
-`if` guards are the only tool.
+surfaces as `255` to a calling shell. Without the guard, the
+runtime's ArithError handler fires and the process exits with
+status `2`. A correct program uses `if`/`else` to select between
+`-1` and `n / d`, avoiding the trap.
 
 ## P08 — print fib(n) for n = 10..15
 
@@ -181,13 +162,9 @@ itself with `n + 1`; when `n > end` it returns `0`. In `main`, call
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Plan A2 has no `for`/`while` loops; iteration must
-go through a recursive helper. `match` on `Bool` (reached via `n >
-end` desugared through elaborate's `if` → `match` rewrite) gates the
-recursion's base case. Exercises the closure-calling-convention
-direct-call path for both self-referential recursion (`fib`) and
-cross-fn recursion (`print_range` → `fib`), plus the `int_to_string`
-builtin (Plan A2 task 34).
+**Oracle (notes):** Exercises recursion-as-iteration (no loops in
+v1), `match` on `Bool` for the loop guard, self-referential
+recursion (`fib`) and cross-fn recursion (`print_range` → `fib`).
 
 ## P09 — partial application via a returned lambda
 
@@ -206,16 +183,9 @@ return `0` as the process exit status.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Graded end-to-end as of Plan B' Stage 6.8
-(PR #38 / commit `4bb38ad`). `TypeExpr::Fn` surface syntax shipped
-under B.3 (Phase A → C+ Part 2): function types in user-fn return
-positions and `let`-binding types are accepted; closure conversion
-preserves the captured `x` through a synthetic `$lambda_N` whose env
-is `[x: Int]`; codegen's `sigil_alloc` + `call_indirect` path wires
-the application site to the heap-allocated closure record. The e2e
-test `make_adder_returns_12` exercises the same canonical shape
-(`make_adder(5)(7) → 12`) end-to-end through Phase C+ Part 1's
-recursive Call-of-Call dispatch.
+**Oracle (notes):** Exercises function types in return position,
+lambda expressions that capture outer parameters, and closure
+application at the call site.
 
 ## P10 — compose two lambdas
 
@@ -233,16 +203,9 @@ lambda `fn (x: Int) -> Int ![] => f(g(x))`. In `main`, call
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Graded end-to-end as of Plan B' Stage 6.8
-(PR #38 / commit `4bb38ad`). `TypeExpr::Fn` surface syntax in
-parameter, return, and `let`-binding positions is shipped under B.3.
-Two-level closure capture (`compose`'s body-lambda captures both `f`
-and `g`) flows through Phase C+ Part 2's `ClosureEnvLoad`-callee
-dispatch — the inner lambda's `f(g(x))` invokes `g` then `f` via
-captured-fn-typed-value indirect calls. The e2e test
-`compose_body_via_closure_env_callees_returns_42` exercises the
-generic-context analog (compose with `Ty::Var`-bearing fn-typed
-captures, resolved per-clone via Phase C++).
+**Oracle (notes):** Exercises function types in parameter positions,
+two-level closure capture (the body-lambda captures both `f` and
+`g`), and indirect calls through captured fn-typed values.
 
 ## P11 — length of a cons-list via recursive match
 
@@ -259,19 +222,10 @@ via `int_to_string`, print via `perform IO.println`, and return `0`.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Exercises Plan A3's new nominal sum-type
-machinery end-to-end: the `type` decl allocates a per-program tag
-(0x10+), constructor application `Cons(..)` synthesises a
-`sigil_alloc` call with the right payload-word count and pointer
-bitmap (bit for `List` pointer field set; bit for `Int` field clear,
-plus bit 0 for the discriminant word is clear by convention), the
-`match` arms become a discriminant test then a field load, and the
-recursive `length(rest)` call lands the closure-calling-convention
-path on a user-declared function carrying a user-typed parameter.
-`Nil` is a nullary constructor pattern — the parser emits
-`Pattern::Var("Nil")` and the typechecker reinterprets it against
-`length`'s scrutinee type. The wildcard `_` in `Cons(_, rest)` binds
-no variable; `rest` is a fresh variable pattern.
+**Oracle (notes):** Exercises nominal sum-type declaration,
+constructor application, pattern matching with a wildcard `_` and
+a variable binding `rest`, and recursive function calls with
+user-declared types.
 
 ## P12 — sum of a cons-list
 
@@ -289,15 +243,10 @@ IO.println`, return `0`.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Same machinery as P11 but the `Cons` arm now
-destructures the head field into a variable. Exercises that each
-constructor-pattern positional slot can bind a distinct fresh
-variable that is in scope for the arm body. The arm-body expression
-is `Binary { op: Add, .. }` which the elaborator already ANF-
-flattens for binary operators, so the recursive call `sum(rest)`
-becomes a hoisted `let $elab_tN: Int = sum(rest);` pre-existing
-in the A2 pipeline — Plan A3 just preserves that shape past its
-new pattern-desugaring step.
+**Oracle (notes):** Same machinery as P11 but the `Cons` arm
+destructures both the head and tail into variables. Exercises that
+each constructor-pattern positional slot binds a distinct variable
+scoped to the arm body.
 
 ## P13 — Option-returning safe lookup
 
@@ -319,24 +268,19 @@ the resulting string, return `0`.
 **Oracle (exit):** `0`
 
 **Oracle (notes):** Demonstrates two sum types in the same program
-(each gets its own type tag) and two matches (one scrutinee is
-`List`, one is `Option`). Exhaustiveness must accept
-`None => ..., Some(n) => ...` as complete over `Option`'s variant
-set without a wildcard. The nested `if/else` inside `Cons`'s arm
-body desugars through the elaborator's existing A2 `if → match on
-Bool` pass, independent of the outer match on `List`.
+(each gets its own type tag) and two matches (one on `List`, one on
+`Option`). Exhaustiveness must accept `None => ..., Some(n) => ...`
+as complete without a wildcard. The nested `if/else` inside `Cons`'s
+arm body is independent of the outer match.
 
 ## P14 — 2D-point record with Euclidean-ish distance
 
 **Prompt:** Declare `type Point = { x: Int, y: Int }` (single-
-constructor record shorthand). Declare `fn sq(n: Int) -> Int ![] {
-n * n }` and `fn dist_sq(p: Point, q: Point) -> Int ![] { match p
-{ Point { x: px, y: py } => match q { Point { x: qx, y: qy } =>
-sq(px - qx) + sq(py - qy), }, } }` (two nested matches because
-Plan A3 has no field-access syntax — destructuring is the only way
-to read record fields). In `main`, build `Point { x: 0, y: 0 }` and
-`Point { x: 3, y: 4 }`, call `dist_sq` on them, convert via
-`int_to_string`, print, return `0`.
+constructor record). Declare `fn sq(n: Int) -> Int ![] {
+n * n }` and `fn dist_sq(p: Point, q: Point) -> Int ![] {
+sq(p.x - q.x) + sq(p.y - q.y) }` using field-access syntax.
+In `main`, build `Point { x: 0, y: 0 }` and `Point { x: 3, y: 4 }`,
+call `dist_sq` on them, convert via `int_to_string`, print, return `0`.
 
 **Oracle (stdout):**
 ```
@@ -345,17 +289,9 @@ to read record fields). In `main`, build `Point { x: 0, y: 0 }` and
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** The record shorthand produces a single-variant
-sum type whose variant's name equals the type name (`Point`). The
-match on a single-variant type is exhaustive with one arm. Record
-constructor patterns use rename syntax (`x: px`) to separate the
-field name from the binding name. Plan A3 intentionally omits
-field-access syntax (`p.x`) — matching / destructuring is the only
-field read primitive, and doubly so for types that might grow into
-multi-variant sums in a later plan revision. If field-access syntax
-arrives in a later plan, the oracle body may be rewritten to
-`sq(p.x - q.x) + sq(p.y - q.y)` — either form is accepted once
-both surface forms exist.
+**Oracle (notes):** Exercises record type declaration, record literal
+construction, and field-access syntax (`p.x`). Records can also be
+destructured via match: `match p { Point { x: px, y: py } => ... }`.
 
 ## P15 — map a function over a cons-list
 
@@ -374,18 +310,11 @@ should be `11 + 21 + 31 = 63`), `int_to_string`, print, return `0`.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Approximation of the classical `map` under
-Plan A3's lack of higher-order generics — the incrementing function
-is hard-coded into `map_inc`'s arm body. A proper `map: (List, (Int)
--> Int ![]) -> List ![]` requires `TypeExpr::Fn` surface syntax
-(first widely useful in Plan A3 via the `[PLAN-A3]` deferral from
-P09/P10) AND generic list types (deferred to Plan B). The semantic
-target here is that each arm of a recursive function can both
-destructure an input sum-type and allocate a fresh constructor of
-the same type — exercising that constructor allocation is a full
-`sigil_alloc` call at every recursive step, not a borrow / pointer
-reuse (aligned with Plan A3's "no interior pointers" discipline
-from the design doc).
+**Oracle (notes):** Exercises that a recursive function can both
+destructure a sum type and allocate a fresh constructor of the same
+type at every recursive step. The incrementing function is hard-coded
+because this prompt uses a monomorphic `List` — the generic
+`map` in `std.list` uses `List[A]`.
 
 ## P16 — generic identity function applied at Int and String
 
@@ -402,31 +331,19 @@ sigil
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Exercises Plan B Stage 5 generics end-to-end:
-single-parameter generic fn declaration (Task 47 parser surface
-`fn id[A]`), HM let-polymorphism with two distinct call-site
-instantiations of the same generic in one program scope (Task 48
-type checker), and reachability-bounded monomorphization producing
-exactly two clones `id$$Int` and `id$$String` (Task 49). Both
-monomorphs classify as native under Task 50 color inference (row
-`![]`, leaf body, no `perform` to a non-IO effect). The semantic
-target is that fresh-var-per-call instantiation (Algorithm W) plus
-reachability-bounded specialization produce *exactly two* clones —
-not one polymorphic body with erased types, and not three from
-double-counted call sites. The id-of-String case also pins that the
-codegen path for an `Ident` reference whose declared type contains
-no user-defined sum type still routes through Task 49's call-site
-mangling rewrite (so the call resolves to `id$$String`, not the
-unspecialized `id`).
+**Oracle (notes):** Exercises generics end-to-end: single-parameter
+generic fn declaration (`fn id[A]`), HM let-polymorphism with two
+distinct call-site instantiations (`id(42)` as `Int`, `id("sigil")`
+as `String`), and monomorphization producing exactly two specialized
+clones.
 
 ## P17 — compose two unary functions across types
 
 **Prompt:** Declare `fn compose[A, B, C](f: (B) -> C ![], g: (A) ->
 B ![]) -> (A) -> C ![] ![]` whose body is the lambda `fn (x: A) ->
-C ![] => f(g(x))`. Declare a thin user-side wrapper `fn its(n: Int)
--> String ![] { int_to_string(n) }` so `int_to_string` is not used
-as a fn-as-value directly (Plan B' v1 closes user-fn-as-value but
-defers builtin-as-fn-value to Plan C). In `main`, bind `let
+C ![] => f(g(x))`. Declare a thin wrapper `fn its(n: Int) ->
+String ![] { int_to_string(n) }` (builtins cannot be passed as
+fn-values directly; wrap them in a user fn). In `main`, bind `let
 inc_then_format: (Int) -> String ![] = compose(its, fn (n: Int) ->
 Int ![] => n + 1);`, then `perform IO.println(inc_then_format(41))`.
 Return `0`.
@@ -438,30 +355,12 @@ Return `0`.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Graded end-to-end as of Plan B' Stage 6.8
-(PR #38 / commit `4bb38ad`). `TypeExpr::Fn` surface syntax in
-parameter, return, and `let`-binding positions is shipped under
-B.3; the per-arrow `![..]` discipline applies (the outer return
-type's two `![..]` markers — first for the inner `(A) -> C` fn-
-type, second for `compose`'s own effect row — per
-`[DEVIATION Task 103]`). The semantic target: `compose` is generic
-in three types (`A`, `B`, `C`), inferred instantiation
-`(A=Int, B=Int, C=String)`, monomorphized to one clone mangled
-`compose$$Int$$Int$$String`. The `its` user wrapper sidesteps the
-builtin-as-fn-value blocker named in `[DEVIATION p17_compose
-blocker analysis]` (Blocker 2): `int_to_string` is seeded into
-typecheck's `fn_env` as a builtin and is absent from the
-`top_level_fn_names` set that closure-convert's fn-as-value
-materialization consults, so closure-convert leaves bare
-`Ident("int_to_string")` unrewritten and codegen panics on
-unknown-ident in fn-value position. Wrapping it in a user-declared
-`its` makes it a `top_level_fn_name` for which closure-convert
-emits a captureless ClosureRecord materialization. P10 exercises
-the same generic-compose shape at a single concrete `(Int, Int,
-Int)` triple via the canonical e2e
-`compose_body_via_closure_env_callees_returns_42`; P17's
-distinguishing addition is `A != C`, forcing the result type to
-genuinely travel through composition.
+**Oracle (notes):** Exercises three-type-parameter generics (`A`,
+`B`, `C`), inferred instantiation `(A=Int, B=Int, C=String)`, and
+monomorphization to a single specialized clone. The `its` wrapper
+is needed because builtins like `int_to_string` cannot be used as
+fn-values directly — wrapping in a user fn makes it materializable
+as a closure.
 
 ## P18 — Raise[String]-based safe parser for a small grammar
 
@@ -486,25 +385,14 @@ token zero is not allowed
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Exercises Plan B Stage 6 algebraic effects end-
-to-end: `effect ... { fail: (String) -> Int }` declaration with a
-`String`-payload op (Phase 4b perform-side args-buffer packing for
-pointer-typed args + Phase 4c arm-side arg unpacking on the
-pointer-typeless path), `match` body shape with one branch that
-performs and one that doesn't (Sync ABI synchronous run_loop driver
-per Phase 4d MVP since `match` doesn't match
-`is_simple_let_yield_then_pure_tail_body`), multi-stmt arm body `{
-perform IO.println(msg); -1 }` with discard-`k` semantics where the
-arm value (-1) flows to the handle expression's binding rather than
-through `parse_token`'s tail (Phase 4e captures+ colorer-handler-
-discharge refinement for use-`k`-or-discard-`k` arms across function-
-call boundaries). The "small grammar" framing is conceptual — `0` is
-the only invalid token in this minimum prompt; v2 prompts may extend
-to larger grammars once string-character-level primitives ship.
-Independent of the Stage-6-prerequisite checks: the arm-body's
-`perform IO.println(msg)` exercises that the top-level IO handler
-(installed by Task 57's main shim) is reachable from inside a
-nested user handler frame.
+**Oracle (notes):** Exercises user-declared effects, a `String`-payload
+operation, multi-statement arm bodies with discard-`k` semantics
+(the arm value -1 flows to the handle expression rather than through
+the continuation), and nested handler frames (the arm body's
+`perform IO.println(msg)` reaches the top-level IO handler from
+inside the user handler). Note: `std.raise` provides a generic
+`Raise[E]` with `catch`; this prompt uses a hand-declared
+non-generic `Raise` to exercise the raw `handle` surface.
 
 ## P19 — State[Int]-based counter threaded through a list walk
 
@@ -533,23 +421,13 @@ return `0`.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Graded end-to-end as of Plan B' Stage 6.8
-(PR #38 / commit `4bb38ad` for the language-surface lifts +
-PR #39 / commit `cf358bb` for the runtime chain integration). The
-literal algebraic-effects `run_state` higher-order helper composes
-every Stage 6.8 surface in one program: `TypeExpr::Fn` parameter
-types (the `comp: () -> Int ![State, IO]` shape, B.3); fn-as-value
-of a top-level user fn (`comp` passed by name, Plan B' Phase C v1
-Task 104); arm-body lambdas (B.4 Phase A); k-capturing arm-body
-lambdas (B.4 Phase B trailing-pair convention); recursive Call-of-
-Call dispatch on the fn returned by `k(s)(s)` (Phase C+ Part 1);
-trailing-triple `(k_closure, k_fn, frame_ptr)` for the lifted
-lambda's escape from its handle (PR #39 Layer 3c); Sync-ABI shim
-for the Cps-effected `comp` parameter at fn-as-value materialization
-(PR #39 Layer 3b). The e2e tests
-`run_state_canonical_higher_order_helper_returns_threaded_value`
-and `state_example_canonical_run_state_returns_11` pin the shape
-(both pass deterministically across all CI lanes).
+**Oracle (notes):** Exercises the full higher-order handler pattern:
+fn-typed parameters (`comp: () -> Int ![State, IO]`), fn-as-value
+passing of a top-level user fn, arm-body lambdas that capture `k`,
+recursive Call-of-Call dispatch (`k(s)(s)`), and the lambda-chain
+state-threading discipline. Note: `std.state` provides a generic
+`State[S]` with `run_state`; this prompt uses a hand-declared
+non-generic `State` to exercise the raw handler machinery.
 
 ## P20 — multi-shot Choose finds all (a, b) pairs with a + b == 7
 
@@ -580,21 +458,11 @@ the `a + b == 7` predicate. Return `0`.
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Graded end-to-end as of Plan B' Stage 6.7
-(PR #37 / commit `a5e92e7`). The two surfaces this prompt requires —
-(a) **multi-perform helper bodies** (the chained-synth-cont
-extension, B.2) and (b) **N-resume arm bodies** (the Slice C
-N-chain extension, B.1) — both shipped under Stage 6.7 with the
-chained-closure-record discipline shared between them. Tasks 93–96
-(B.2) extended `is_simple_let_yield_then_pure_tail_body`'s "exactly
-one let stmt" cap to N stmts and added the
-`CpsContinuationKind::ChainedLetBindThenTail` synth-cont chain;
-Tasks 97–100 (B.1) extended `arm_body_multi_let_then_pure_tail_-
-shape`'s 2-let cap to N lets and added the `PostArmKChain` /
-`PostArmKStep` data shapes. Multi-shot composition (the outer
-post_arm_k stack pushing per-`sigil_perform` and routing on Done)
-landed in `b7063b0`. The e2e test `choose_example_pair_generator_-
-returns_10` (canonical 2-flip pair generator, closed form
-(1+2)+(3+4) = 10) covers the same shape at smaller scale; P20's
-6-resume `[low, high]` enumeration extends the same machinery
-without requiring further surface lifts.
+**Oracle (notes):** Exercises multi-shot effects (`resumes: many`),
+multi-perform bodies (chained let-binds with performs), and N-resume
+arm bodies (the static let-chain pattern). The arm iterates
+`k(low)`, `k(low+1)`, …, `k(high)` using a recursive helper with
+the let-chain shape. Note: `std.choose` provides `Choose` with
+`all_choices` / `first_choice` dischargers that use first-class
+continuations for runtime-N enumeration; this prompt uses a
+hand-rolled handler to exercise the raw multi-shot surface.

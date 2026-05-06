@@ -2,8 +2,7 @@
 
 Append-only log of validation runs. Each entry records the date, prompt,
 model, produced program, compile/run result, and any resulting spec edits.
-Plan C's `scripts/validate-spec.sh` drives these runs; Plan A1 ships the
-empty template so later plans don't start from scratch.
+`scripts/validate-spec.sh` drives these runs.
 
 Schema per entry:
 
@@ -21,5 +20,4 @@ Schema per entry:
 **Notes:** <free-form>
 ```
 
-No entries yet — Plan A1 seeds only the prompt bank; the validation
-runner ships in Plan C.
+No entries yet.

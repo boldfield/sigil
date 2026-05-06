@@ -8533,271 +8533,281 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let lookup = |callee_name: &str| {
                         is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     };
-                    let chain_length = is_simple_chained_let_yield_then_pure_tail_body(chain_body, &ctors, &lookup)
-                        .or_else(|| {
-                            is_let_yield_prefix_then_branched_cps_tail_body(
-                                chain_body, &ctors, &lookup, &lookup,
-                            )
-                        });
+                    let chain_length = is_simple_chained_let_yield_then_pure_tail_body(
+                        chain_body, &ctors, &lookup,
+                    )
+                    .or_else(|| {
+                        is_let_yield_prefix_then_branched_cps_tail_body(
+                            chain_body, &ctors, &lookup, &lookup,
+                        )
+                    });
                     if let Some(chain_length) = chain_length {
-                    let arm_body = chain_body;
-                    let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
-                    let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
-                    let mut binding_tys: Vec<Type> = Vec::with_capacity(chain_length);
-                    let mut binding_kinds: Vec<EnvSlotKind> = Vec::with_capacity(chain_length);
-                    // Plan C Task 81 — pure trailing intermediates
-                    // (after the last yield, before the tail). Lowered
-                    // by the FINAL step's emit before tail_expr.
-                    let mut tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
-                    for stmt in &arm_body.stmts {
-                        let let_stmt = match stmt {
-                            crate::ast::Stmt::Let(l) => l,
-                            _ => unreachable!(
-                                "is_simple_chained_let_yield_then_pure_tail_body \
+                        let arm_body = chain_body;
+                        let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
+                        let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
+                        let mut binding_tys: Vec<Type> = Vec::with_capacity(chain_length);
+                        let mut binding_kinds: Vec<EnvSlotKind> = Vec::with_capacity(chain_length);
+                        // Plan C Task 81 — pure trailing intermediates
+                        // (after the last yield, before the tail). Lowered
+                        // by the FINAL step's emit before tail_expr.
+                        let mut tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
+                        for stmt in &arm_body.stmts {
+                            let let_stmt = match stmt {
+                                crate::ast::Stmt::Let(l) => l,
+                                _ => unreachable!(
+                                    "is_simple_chained_let_yield_then_pure_tail_body \
                                  classifier guarantees every stmt is Stmt::Let"
-                            ),
-                        };
-                        match &let_stmt.value {
-                            crate::ast::Expr::Perform(p) => {
-                                steps.push(ChainedNextStep::Perform(p.clone()));
-                                binding_names.push(let_stmt.name.clone());
-                                binding_tys
-                                    .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
-                                binding_kinds.push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
-                            }
-                            crate::ast::Expr::Call { callee, args, .. } => {
-                                // PR #97 review #1: classifier accepts
-                                // non-Ident callees as tail-prefix lets
-                                // when `yield_count > 0 && !expr_-
-                                // contains_perform`. Drop-via-`continue`
-                                // would silently lose the binding here
-                                // (re-introducing the silent-drop
-                                // pattern PR #83 review #5 closed).
-                                // Treat non-Ident callee as a tail-
-                                // prefix let, mirroring the `other =>`
-                                // arm below.
-                                let callee_name_opt = match callee.as_ref() {
-                                    crate::ast::Expr::Ident(n, _) => Some(n.clone()),
-                                    _ => None,
-                                };
-                                // Plan C Task 81 — Cps wrapper Call →
-                                // chain step; non-yielding Call
-                                // (builtin / Sync user fn / non-Ident
-                                // callee) → tail-prefix let. The
-                                // classifier accepts both shapes; the
-                                // pre-pass dispatches based on callee
-                                // Cps-color via the same
-                                // `is_supported_cps_user_fn` predicate
-                                // the classifier used.
-                                let is_cps_wrapper = callee_name_opt
-                                    .as_ref()
-                                    .map(|n| {
-                                        is_supported_cps_user_fn(
-                                            n,
-                                            &fns_by_name,
-                                            &cc.colored,
-                                            &ctors,
-                                        )
-                                    })
-                                    .unwrap_or(false);
-                                if is_cps_wrapper {
-                                    let callee_name = match callee_name_opt {
-                                        Some(n) => n,
-                                        None => unreachable!(
-                                            "is_cps_wrapper implies callee_name_opt is Some — \
-                                             is_cps_wrapper short-circuited via the \
-                                             callee_name_opt.as_ref().map(...).unwrap_or(false) \
-                                             chain that returns false on None"
-                                        ),
-                                    };
-                                    steps.push(ChainedNextStep::CallCps {
-                                        callee_name,
-                                        args: args.clone(),
-                                    });
+                                ),
+                            };
+                            match &let_stmt.value {
+                                crate::ast::Expr::Perform(p) => {
+                                    steps.push(ChainedNextStep::Perform(p.clone()));
                                     binding_names.push(let_stmt.name.clone());
                                     binding_tys
                                         .push(cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty));
                                     binding_kinds
                                         .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
-                                } else {
+                                }
+                                crate::ast::Expr::Call { callee, args, .. } => {
+                                    // PR #97 review #1: classifier accepts
+                                    // non-Ident callees as tail-prefix lets
+                                    // when `yield_count > 0 && !expr_-
+                                    // contains_perform`. Drop-via-`continue`
+                                    // would silently lose the binding here
+                                    // (re-introducing the silent-drop
+                                    // pattern PR #83 review #5 closed).
+                                    // Treat non-Ident callee as a tail-
+                                    // prefix let, mirroring the `other =>`
+                                    // arm below.
+                                    let callee_name_opt = match callee.as_ref() {
+                                        crate::ast::Expr::Ident(n, _) => Some(n.clone()),
+                                        _ => None,
+                                    };
+                                    // Plan C Task 81 — Cps wrapper Call →
+                                    // chain step; non-yielding Call
+                                    // (builtin / Sync user fn / non-Ident
+                                    // callee) → tail-prefix let. The
+                                    // classifier accepts both shapes; the
+                                    // pre-pass dispatches based on callee
+                                    // Cps-color via the same
+                                    // `is_supported_cps_user_fn` predicate
+                                    // the classifier used.
+                                    let is_cps_wrapper = callee_name_opt
+                                        .as_ref()
+                                        .map(|n| {
+                                            is_supported_cps_user_fn(
+                                                n,
+                                                &fns_by_name,
+                                                &cc.colored,
+                                                &ctors,
+                                            )
+                                        })
+                                        .unwrap_or(false);
+                                    if is_cps_wrapper {
+                                        let callee_name = match callee_name_opt {
+                                            Some(n) => n,
+                                            None => unreachable!(
+                                                "is_cps_wrapper implies callee_name_opt is Some — \
+                                             is_cps_wrapper short-circuited via the \
+                                             callee_name_opt.as_ref().map(...).unwrap_or(false) \
+                                             chain that returns false on None"
+                                            ),
+                                        };
+                                        steps.push(ChainedNextStep::CallCps {
+                                            callee_name,
+                                            args: args.clone(),
+                                        });
+                                        binding_names.push(let_stmt.name.clone());
+                                        binding_tys.push(cranelift_ty_for_type_expr(
+                                            &let_stmt.ty,
+                                            pointer_ty,
+                                        ));
+                                        binding_kinds
+                                            .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
+                                    } else {
+                                        tail_prefix_lets.push(TailPrefixLet {
+                                            name: let_stmt.name.clone(),
+                                            ty: cranelift_ty_for_type_expr(
+                                                &let_stmt.ty,
+                                                pointer_ty,
+                                            ),
+                                            kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
+                                            value: let_stmt.value.clone(),
+                                        });
+                                    }
+                                }
+                                other => {
+                                    // Plan C Task 81 — pure trailing
+                                    // intermediate (classifier accepted
+                                    // it after at least one yield was
+                                    // seen). Append to tail_prefix_lets;
+                                    // FINAL step's emit lowers them in
+                                    // order before lowering tail_expr.
                                     tail_prefix_lets.push(TailPrefixLet {
                                         name: let_stmt.name.clone(),
                                         ty: cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty),
                                         kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
-                                        value: let_stmt.value.clone(),
+                                        value: other.clone(),
                                     });
                                 }
                             }
-                            other => {
-                                // Plan C Task 81 — pure trailing
-                                // intermediate (classifier accepted
-                                // it after at least one yield was
-                                // seen). Append to tail_prefix_lets;
-                                // FINAL step's emit lowers them in
-                                // order before lowering tail_expr.
-                                tail_prefix_lets.push(TailPrefixLet {
-                                    name: let_stmt.name.clone(),
-                                    ty: cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty),
-                                    kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
-                                    value: other.clone(),
-                                });
-                            }
                         }
-                    }
-                    let tail_expr = match &arm_body.tail {
-                        Some(t) => t.clone(),
-                        None => unreachable!(
-                            "is_simple_chained_let_yield_then_pure_tail_body \
+                        let tail_expr = match &arm_body.tail {
+                            Some(t) => t.clone(),
+                            None => unreachable!(
+                                "is_simple_chained_let_yield_then_pure_tail_body \
                              classifier guarantees tail is Some"
-                        ),
-                    };
-                    let tail_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
+                            ),
+                        };
+                        let tail_ty = cranelift_ty_for_type_expr(&f.return_type, pointer_ty);
 
-                    // Free-var analysis across all step args + tail:
-                    // helper user params referenced anywhere in the
-                    // chain. Each step's closure record carries this
-                    // captures vec (constant across all steps) plus
-                    // its own prior_bindings (step_0..step_{i-1}).
-                    let captures = collect_chained_synth_cont_captures(
-                        &steps,
-                        &tail_expr,
-                        &tail_prefix_lets,
-                        &binding_names,
-                        &f.params,
-                    );
+                        // Free-var analysis across all step args + tail:
+                        // helper user params referenced anywhere in the
+                        // chain. Each step's closure record carries this
+                        // captures vec (constant across all steps) plus
+                        // its own prior_bindings (step_0..step_{i-1}).
+                        let captures = collect_chained_synth_cont_captures(
+                            &steps,
+                            &tail_expr,
+                            &tail_prefix_lets,
+                            &binding_names,
+                            &f.params,
+                        );
 
-                    // Pass 1: declare all N FuncIds. Each step's
-                    // synth-cont uses the uniform CPS calling
-                    // convention `(closure_ptr, args_ptr, args_len)
-                    // -> *mut NextStep`. Names follow the global-
-                    // index pattern to avoid collisions with user
-                    // fns or other synth-conts.
-                    let synth_cont_sig = cps_signature(pointer_ty, &module);
+                        // Pass 1: declare all N FuncIds. Each step's
+                        // synth-cont uses the uniform CPS calling
+                        // convention `(closure_ptr, args_ptr, args_len)
+                        // -> *mut NextStep`. Names follow the global-
+                        // index pattern to avoid collisions with user
+                        // fns or other synth-conts.
+                        let synth_cont_sig = cps_signature(pointer_ty, &module);
 
-                    // Branch-chain allocation FIRST: walk the branched
-                    // tail to find PerformChain branches. For each,
-                    // allocate synth-cont FuncIds and register
-                    // CpsContinuationSynth entries. These must be
-                    // pushed before body chain entries so that
-                    // starting_idx (computed below) correctly points
-                    // at the body chain's first entry.
-                    let branch_chains = collect_branch_chain_allocs(
-                        &tail_expr,
-                        &captures,
-                        &binding_names,
-                        &binding_kinds,
-                        &tail_prefix_lets,
-                        &f.return_type,
-                        &f.name,
-                        pointer_ty,
-                        &ctors,
-                        &|n: &str| is_supported_cps_user_fn(n, &fns_by_name, &cc.colored, &ctors),
-                        &synth_cont_sig,
-                        &mut module,
-                        &mut cps_continuation_synth,
-                    )?;
+                        // Branch-chain allocation FIRST: walk the branched
+                        // tail to find PerformChain branches. For each,
+                        // allocate synth-cont FuncIds and register
+                        // CpsContinuationSynth entries. These must be
+                        // pushed before body chain entries so that
+                        // starting_idx (computed below) correctly points
+                        // at the body chain's first entry.
+                        let branch_chains = collect_branch_chain_allocs(
+                            &tail_expr,
+                            &captures,
+                            &binding_names,
+                            &binding_kinds,
+                            &tail_prefix_lets,
+                            &f.return_type,
+                            &f.name,
+                            pointer_ty,
+                            &ctors,
+                            &|n: &str| {
+                                is_supported_cps_user_fn(n, &fns_by_name, &cc.colored, &ctors)
+                            },
+                            &synth_cont_sig,
+                            &mut module,
+                            &mut cps_continuation_synth,
+                        )?;
 
-                    let starting_idx = cps_continuation_synth.len();
-                    let effective_step_count = if chain_length == 0 { 1 } else { chain_length };
-                    let mut step_func_ids: Vec<cranelift_module::FuncId> =
-                        Vec::with_capacity(effective_step_count);
-                    for step in 0..effective_step_count {
-                        let global_idx = starting_idx + step;
-                        let synth_cont_name = format!("sigil_post_yield_cont_{global_idx}");
-                        let synth_cont_func_id = module
-                            .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
-                            .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
-                        step_func_ids.push(synth_cont_func_id);
-                    }
+                        let starting_idx = cps_continuation_synth.len();
+                        let effective_step_count = if chain_length == 0 { 1 } else { chain_length };
+                        let mut step_func_ids: Vec<cranelift_module::FuncId> =
+                            Vec::with_capacity(effective_step_count);
+                        for step in 0..effective_step_count {
+                            let global_idx = starting_idx + step;
+                            let synth_cont_name = format!("sigil_post_yield_cont_{global_idx}");
+                            let synth_cont_func_id = module
+                                .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
+                                .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
+                            step_func_ids.push(synth_cont_func_id);
+                        }
 
-                    // Plan C Task 81 — chain_length=0 special case:
-                    // emit ONE FINAL synth-cont with synthetic dummy
-                    // binding. Body emit will dispatch with args[0]=0.
-                    //
-                    // The synth binding name `$zero_chain_dummy`
-                    // begins with `$`, which the lexer rejects as
-                    // an identifier-start character (lexer.rs:126
-                    // requires `is_ascii_alphabetic() || c == '_'`),
-                    // so the name cannot collide with any user-
-                    // declared parameter or local. Mirrors the
-                    // existing `$lambda_N` naming convention for
-                    // synthetic top-level fns.
-                    if chain_length == 0 {
-                        cps_continuation_synth.push(CpsContinuationSynth {
-                            func_id: step_func_ids[0],
-                            parent_fn_name: f.name.clone(),
-                            kind: CpsContinuationKind::ChainedLetBindStep {
-                                binding_name: "$zero_chain_dummy".to_string(),
-                                binding_ty: types::I64,
-                                binding_kind: EnvSlotKind::Int,
-                                captures: captures.clone(),
-                                prior_bindings: vec![],
-                                role: ChainStepRole::Final {
+                        // Plan C Task 81 — chain_length=0 special case:
+                        // emit ONE FINAL synth-cont with synthetic dummy
+                        // binding. Body emit will dispatch with args[0]=0.
+                        //
+                        // The synth binding name `$zero_chain_dummy`
+                        // begins with `$`, which the lexer rejects as
+                        // an identifier-start character (lexer.rs:126
+                        // requires `is_ascii_alphabetic() || c == '_'`),
+                        // so the name cannot collide with any user-
+                        // declared parameter or local. Mirrors the
+                        // existing `$lambda_N` naming convention for
+                        // synthetic top-level fns.
+                        if chain_length == 0 {
+                            cps_continuation_synth.push(CpsContinuationSynth {
+                                func_id: step_func_ids[0],
+                                parent_fn_name: f.name.clone(),
+                                kind: CpsContinuationKind::ChainedLetBindStep {
+                                    binding_name: "$zero_chain_dummy".to_string(),
+                                    binding_ty: types::I64,
+                                    binding_kind: EnvSlotKind::Int,
+                                    captures: captures.clone(),
+                                    prior_bindings: vec![],
+                                    role: ChainStepRole::Final {
+                                        tail_expr: Box::new(tail_expr.clone()),
+                                        tail_ty,
+                                        tail_prefix_lets: tail_prefix_lets.clone(),
+                                        branch_chains: branch_chains.clone(),
+                                    },
+                                    prior_was_call_cps: false,
+                                },
+                            });
+                            cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
+                            continue;
+                        }
+
+                        // Pass 2: build N CpsContinuationSynth entries.
+                        // step_idx 0..N-2 → Middle; step_idx == N-1 →
+                        // Final. prior_bindings for step i is the slice
+                        // binding_{0..i} (so step_0's prior_bindings is
+                        // empty; step_{N-1}'s is binding_{0..N-1}).
+                        for step in 0..chain_length {
+                            let prior_bindings: Vec<ChainedPriorBinding> = (0..step)
+                                .map(|j| ChainedPriorBinding {
+                                    name: binding_names[j].clone(),
+                                    kind: binding_kinds[j],
+                                })
+                                .collect();
+                            let role = if step + 1 < chain_length {
+                                ChainStepRole::Middle {
+                                    next_step: steps[step + 1].clone(),
+                                    next_step_func_id: step_func_ids[step + 1],
+                                }
+                            } else {
+                                ChainStepRole::Final {
                                     tail_expr: Box::new(tail_expr.clone()),
                                     tail_ty,
                                     tail_prefix_lets: tail_prefix_lets.clone(),
                                     branch_chains: branch_chains.clone(),
+                                }
+                            };
+                            // Plan D Task 112 — `prior_was_call_cps` flag
+                            // `prior_was_call_cps` for step_i is true iff
+                            // `steps[i]` is `CallCps` — step_i's synth-cont
+                            // fires after `steps[i]`'s dispatch (helper-body
+                            // for i=0; step_{i-1}'s Middle for i>0). When
+                            // true, the synth-cont body POPs
+                            // BODY_RETURN_ARM_STACK at entry (Risk 3
+                            // protection for the preceding CallCps emit's
+                            // PUSH).
+                            let prior_was_call_cps =
+                                matches!(steps[step], ChainedNextStep::CallCps { .. });
+                            cps_continuation_synth.push(CpsContinuationSynth {
+                                func_id: step_func_ids[step],
+                                parent_fn_name: f.name.clone(),
+                                kind: CpsContinuationKind::ChainedLetBindStep {
+                                    binding_name: binding_names[step].clone(),
+                                    binding_ty: binding_tys[step],
+                                    binding_kind: binding_kinds[step],
+                                    captures: captures.clone(),
+                                    prior_bindings,
+                                    role,
+                                    prior_was_call_cps,
                                 },
-                                prior_was_call_cps: false,
-                            },
-                        });
+                            });
+                        }
+                        // Map points at step_0; helper body emit reads
+                        // step_0's captures + first perform's k_fn.
                         cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
-                        continue;
-                    }
-
-                    // Pass 2: build N CpsContinuationSynth entries.
-                    // step_idx 0..N-2 → Middle; step_idx == N-1 →
-                    // Final. prior_bindings for step i is the slice
-                    // binding_{0..i} (so step_0's prior_bindings is
-                    // empty; step_{N-1}'s is binding_{0..N-1}).
-                    for step in 0..chain_length {
-                        let prior_bindings: Vec<ChainedPriorBinding> = (0..step)
-                            .map(|j| ChainedPriorBinding {
-                                name: binding_names[j].clone(),
-                                kind: binding_kinds[j],
-                            })
-                            .collect();
-                        let role = if step + 1 < chain_length {
-                            ChainStepRole::Middle {
-                                next_step: steps[step + 1].clone(),
-                                next_step_func_id: step_func_ids[step + 1],
-                            }
-                        } else {
-                            ChainStepRole::Final {
-                                tail_expr: Box::new(tail_expr.clone()),
-                                tail_ty,
-                                tail_prefix_lets: tail_prefix_lets.clone(),
-                                branch_chains: branch_chains.clone(),
-                            }
-                        };
-                        // Plan D Task 112 — `prior_was_call_cps` flag
-                        // `prior_was_call_cps` for step_i is true iff
-                        // `steps[i]` is `CallCps` — step_i's synth-cont
-                        // fires after `steps[i]`'s dispatch (helper-body
-                        // for i=0; step_{i-1}'s Middle for i>0). When
-                        // true, the synth-cont body POPs
-                        // BODY_RETURN_ARM_STACK at entry (Risk 3
-                        // protection for the preceding CallCps emit's
-                        // PUSH).
-                        let prior_was_call_cps =
-                            matches!(steps[step], ChainedNextStep::CallCps { .. });
-                        cps_continuation_synth.push(CpsContinuationSynth {
-                            func_id: step_func_ids[step],
-                            parent_fn_name: f.name.clone(),
-                            kind: CpsContinuationKind::ChainedLetBindStep {
-                                binding_name: binding_names[step].clone(),
-                                binding_ty: binding_tys[step],
-                                binding_kind: binding_kinds[step],
-                                captures: captures.clone(),
-                                prior_bindings,
-                                role,
-                                prior_was_call_cps,
-                            },
-                        });
-                    }
-                    // Map points at step_0; helper body emit reads
-                    // step_0's captures + first perform's k_fn.
-                    cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
                     }
                 }
             }

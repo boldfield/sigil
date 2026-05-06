@@ -6,8 +6,8 @@ a strict recursive-descent parser, type-checked by a Hindley–Milner
 checker extended with effect rows, lowered to Cranelift IR, and
 linked against a small Boehm-GC'd runtime.
 
-This document is **examples-first**: twelve worked examples
-(E1–E12) introduce the language by progressive elaboration. The
+This document is **examples-first**: fourteen worked examples
+(E1–E14) introduce the language by progressive elaboration. The
 reference sections after the examples are intended as lookup, not
 linear reading.
 
@@ -21,7 +21,7 @@ linear reading.
 
 ---
 
-## Worked examples (E1–E12)
+## Worked examples (E1–E14)
 
 ### E1 — Hello, world
 
@@ -82,9 +82,9 @@ fn main() -> Int ![IO] {
 `match` is **exhaustive**. Omitting either the `0`, the `1`, or the
 `_` arm fires `E0066: \`match\` on \`Int\` is not exhaustive` at
 compile time. Patterns include integer literals, sum-type
-constructors, record patterns, identifier patterns (`name` binds),
-and the wildcard `_`. Patterns are matched in source order; the
-first matching arm wins.
+constructors, record patterns, tuple patterns, identifier patterns
+(`name` binds), and the wildcard `_`. Patterns are matched in source
+order; the first matching arm wins.
 
 ### E4 — Sum types and pattern matching
 
@@ -198,7 +198,7 @@ names do not unify.
 import std.raise
 import std.result
 
-fn parse_pos(n: Int) -> Int ![Raise] {
+fn parse_pos(n: Int) -> Int ![Raise[String]] {
   match n {
     0 => raise("expected positive"),
     _ => n,
@@ -206,7 +206,7 @@ fn parse_pos(n: Int) -> Int ![Raise] {
 }
 
 fn main() -> Int ![IO] {
-  let result: Result[Int, String] = catch(fn () -> Int ![Raise] => parse_pos(0));
+  let result: Result[Int, String] = catch(fn () -> Int ![Raise[String]] => parse_pos(0));
   match result {
     Ok(v) => perform IO.println(int_to_string(v)),
     Err(m) => perform IO.println(m),
@@ -215,16 +215,18 @@ fn main() -> Int ![IO] {
 }
 ```
 
-`std.raise` ships an effect:
+`std.raise` ships a generic effect:
 
 ```sigil
-effect Raise { fail: (String) -> Int }
+effect Raise[E] { fail: (E) -> Int }
 ```
 
 Calling `raise(s)` performs `Raise.fail(s)`; under `catch`'s
 discharging handler, the call short-circuits to an `Err` result.
-The `Int` return is a v1 placeholder (no `Never` type yet); the
-perform never actually returns under `catch`.
+`Raise[E]` is generic over the error type — `Raise[String]` raises
+string errors, `Raise[Int]` raises integer error codes, etc.
+
+`catch` is row-polymorphic: `catch[A, E](body: () -> A ![Raise[E] | e]) -> Result[A, E] ![| e]` — it discharges the `Raise[E]` effect and passes any other effects in the row through to the caller.
 
 ### E9 — Effects: `State[S]` for threaded state
 
@@ -257,7 +259,7 @@ are inferred from the call site (e.g. `run_state(5, comp)` instantiates
 ```sigil
 import std.raise
 
-fn pipeline(s: String) -> Int ![IO, Raise] {
+fn pipeline(s: String) -> Int ![IO, Raise[String]] {
   perform IO.println(string_concat("processing: ", s));
   match string_compare(s, "") {
     0 => raise("empty input"),
@@ -266,7 +268,7 @@ fn pipeline(s: String) -> Int ![IO, Raise] {
 }
 
 fn main() -> Int ![IO] {
-  let r: Result[Int, String] = catch(fn () -> Int ![IO, Raise] => pipeline("hello"));
+  let r: Result[Int, String] = catch(fn () -> Int ![IO, Raise[String]] => pipeline("hello"));
   match r {
     Ok(n) => perform IO.println(int_to_string(n)),
     Err(m) => perform IO.println(string_concat("error: ", m)),
@@ -275,15 +277,14 @@ fn main() -> Int ![IO] {
 }
 ```
 
-Effect rows are unordered sets of effect names. `![IO, Raise]` and
-`![Raise, IO]` are the same row. A function with row `![Raise]` may
-be called from any row that **contains** `Raise`; `![IO, Raise]`
-calls `![Raise]` callees freely.
+Effect rows are unordered sets of effect names. `![IO, Raise[String]]` and
+`![Raise[String], IO]` are the same row. A function with row `![Raise[String]]`
+may be called from any row that **contains** `Raise[String]`; `![IO, Raise[String]]`
+calls `![Raise[String]]` callees freely.
 
-In v1, `catch[A](body: () -> A ![Raise]) -> Result[A, String] ![]`
-is closed over the body's row — it accepts only `![Raise]` bodies.
-The row-polymorphic `catch` (which would accept `![IO, Raise]`
-bodies and pass `IO` through) lands in v2 (`[DEVIATION Task 71]`).
+`catch` is row-polymorphic — it accepts bodies with extra effects
+beyond `Raise[E]` and passes them through. The `| e` row variable
+in `catch`'s signature captures the residual row.
 
 ### E11 — Mutable state via the `Mem` effect
 
@@ -335,6 +336,58 @@ single `String`. Avoids the O(n²) cost of repeated
 
 For a fuller example see [`examples/json.sigil`](../examples/json.sigil).
 
+### E13 — Tuples and pair destructuring
+
+```sigil
+import std.pair
+
+fn swap(p: (Int, String)) -> (String, Int) ![] {
+  let (a, b) = p;
+  (b, a)
+}
+
+fn main() -> Int ![IO] {
+  let pair: (Int, String) = (42, "hello");
+  perform IO.println(int_to_string(fst(pair)));      // 42
+  perform IO.println(snd(pair));                      // hello
+  let swapped: (String, Int) = swap(pair);
+  perform IO.println(fst(swapped));                   // hello
+  0
+}
+```
+
+Tuple types are written `(T1, T2, ...)` and tuple values as
+`(e1, e2, ...)`. Tuples of any arity are supported. Binary tuples
+can use `fst[A, B]` and `snd[A, B]` from `std.pair`; all tuples
+support destructuring via `let (a, b, ...) = expr;` or in match
+patterns.
+
+### E14 — Nondeterminism with `Choose`
+
+```sigil
+import std.choose
+import std.list
+import std.io
+
+fn pick_pair() -> Int ![Choose] {
+  let a: Int = perform Choose.choose(3);
+  let b: Int = perform Choose.choose(3);
+  a * 10 + b
+}
+
+fn main() -> Int ![IO] {
+  let results: List[Int] = all_choices(pick_pair);
+  perform IO.println(int_to_string(length(results)));   // 9
+  0
+}
+```
+
+`Choose` is a multi-shot effect (`resumes: many`): the handler can
+invoke the continuation multiple times per perform. `all_choices`
+enumerates every branch by resuming `k(0)`, `k(1)`, …, `k(n-1)` and
+collecting results into a list. `first_choice` returns the first
+non-failing branch as `Option[A]`.
+
 ---
 
 ## Reference
@@ -360,14 +413,12 @@ identifiers.
 
 **Literals.**
 - Integer: decimal `42`, `-7`, `0`. No hex/oct/bin literals in v1.
-  Range: `[-2^62, 2^62)` (Plan A2's 63-bit tagged Int).
+  Range: `[-2^62, 2^62)` (63-bit tagged Int).
 - String: `"..."` with escapes `\\`, `\"`, `\n`, `\t`, `\r`.
 - Char: `'a'`, `'\n'`. Width: 1 byte (ASCII / latin-1 codepoint).
   v1 has no codepoint-aware string ops.
 - Byte: constructed via `byte_truncate(n: Int) -> Byte ![]` or
-  `byte_from_int(n: Int) -> Option[Byte] ![]` (the latter is the
-  range-checking constructor; deferred to a follow-up per
-  `[DEVIATION Task 66.5]` namespace work).
+  `byte_from_int(n: Int) -> Option[Byte] ![]`.
 - Bool: `true` and `false` are the literal forms of the builtin
   `Bool` type. Pattern-match with `match b { true => ..., false => ... }`.
 
@@ -407,8 +458,10 @@ fn main() -> Int ![IO] { 0 }                   // function
 | `MutArray[A]` | Mutable indexed collection (Mem-gated). |
 | `ByteArray` | Immutable flat byte buffer. |
 | `MutByteArray` | Mutable flat byte buffer (Mem-gated). |
-| `Int64` | Boxed 64-bit signed integer (Task 69). |
+| `Int64` | Boxed 64-bit signed integer. |
 | `StringBuilder` | Segmented-rope string accumulator (Mem-gated). |
+| `(T1, T2, …)` | Tuple types of arbitrary arity. Binary tuples have `fst`/`snd` accessors in `std.pair`. |
+| `Continuation[OpRet, Ret]` | First-class single-shot or multi-shot continuation captured from a handler arm's `k`. Dynamic-extent enforcement via scope IDs. |
 
 User-declared sum types and records form the rest of the type
 universe (§6).
@@ -420,11 +473,16 @@ type-expr := identifier
            | identifier "[" type-expr ("," type-expr)* "]"   -- generic instantiation
            | "(" type-expr ("," type-expr)* ")" "->" type-expr "![" effects "]"
                                                               -- function type
+           | "(" type-expr ("," type-expr)* ")"              -- tuple type
 ```
 
 Function types carry effect rows just like declarations:
 `(Int) -> Int ![]` is the type of a pure unary integer function;
-`(String) -> Int ![Raise]` is a fallible parser.
+`(String) -> Int ![Raise[String]]` is a fallible parser.
+
+Tuple types are written `(T1, T2)` — parentheses with comma-separated
+element types. Arity 1 is not a tuple (it's just a parenthesized
+type); arity 2+ creates a distinct tuple type.
 
 #### §3.3 — Effect rows
 
@@ -432,14 +490,26 @@ An effect row is a comma-separated set of effect names enclosed in
 `![ … ]`:
 
 ```text
-![]                 -- pure
-![IO]               -- can do IO
-![IO, Raise, Mem]   -- can do all three
+![]                            -- pure
+![IO]                          -- can do IO
+![IO, Raise[String], Mem]      -- can do all three
 ```
 
 Rows are unordered. Two rows are equivalent iff they list the same
-name set. Row variables (for row-polymorphic functions) are not
-yet supported in v1 (`[DEVIATION Task 71]`).
+name set (modulo type arguments for generic effects like `Raise[E]`).
+
+**Row variables.** Function-typed parameters may include a row
+variable `| e` to express row polymorphism:
+
+```sigil
+fn catch[A, E](body: () -> A ![Raise[E] | e]) -> Result[A, E] ![| e]
+```
+
+The row variable `e` captures whatever additional effects the body
+carries beyond `Raise[E]`, and the caller's row must include those
+effects. Row variables are resolved through the enclosing function's
+effect row. Top-level row polymorphism (a function whose own declared
+row contains `| e`) is not supported in v1.
 
 #### §3.4 — Inference rules (overview)
 
@@ -475,6 +545,7 @@ suggested fix.
 | Record literal | `{ x: 1, y: 2 }` |
 | Field access | `point.x` |
 | Sum constructor | `Some(42)`, `Cons(1, Nil)` |
+| Tuple literal | `(1, "hello")` |
 | Perform | `perform Effect.op(args)` |
 | Handle | `handle expr with { return(v) => …, Effect.op(args, k) => … }` |
 
@@ -489,7 +560,7 @@ suggested fix.
 
 `/` and `%` perform `ArithError.div_by_zero` / `mod_by_zero` on
 zero divisors; the top-level `main` shim installs default handlers
-that print to stderr and exit 2 (matching Plan A2 behavior).
+that print to stderr and exit 2.
 
 #### §4.3 — Match patterns
 
@@ -500,6 +571,7 @@ pattern := "_"                                          -- wildcard
          | bool-literal
          | constructor-name "(" pattern ("," pattern)* ")"   -- sum constructor
          | constructor-name                              -- nullary constructor
+         | "(" pattern ("," pattern)* ")"                -- tuple destructure
 ```
 
 Patterns are matched in source order. Bindings introduced by
@@ -527,7 +599,7 @@ There is no shadowing: `let x = 1; let x = 2;` is a compile error.
 There is no `return` statement; the block's value flows out
 naturally.
 
-### §6 — Sum types and records
+### §6 — Sum types, records, and tuples
 
 ```sigil
 type Option[A] = | Some(A) | None
@@ -545,6 +617,19 @@ use site (inferred from constructor argument types).
 **Records.** Field declarations are unordered; field access and
 construction are nominal (the record's name in the `type`
 declaration matters for equivalence).
+
+**Tuples.** Tuple types are built-in — no `type` declaration needed.
+`(Int, String)` is a binary tuple; `(Bool, Int, String)` is a ternary
+tuple. Tuple values are constructed with `(e1, e2, ...)` and
+destructured with pattern matching:
+
+```sigil
+let pair: (Int, String) = (42, "hello");
+let (n, s) = pair;
+```
+
+Binary tuples have `fst[A, B]` and `snd[A, B]` accessors in
+`std.pair`. Larger tuples use pattern-match destructuring.
 
 ### §7 — Pattern matching
 
@@ -568,21 +653,28 @@ match's overall type is that unified arm-body type.
 #### §8.1 — Declaring effects
 
 ```sigil
-effect Raise {
-  fail: (String) -> Int,
+effect Raise[E] {
+  fail: (E) -> Int,
 }
 
-effect State resumes: many {
-  get: () -> Int,
-  set: (Int) -> Int,
+effect State[S] resumes: many {
+  get: () -> S,
+  set: (S) -> S,
+}
+
+effect Logger {
+  log: (String) -> Unit,
 }
 ```
 
 Each effect declares zero or more **operations**; each op is a typed
-function declaration without a body. The optional `resumes: many`
-annotation marks a multi-shot effect (the op's continuation `k` may
-be invoked more than once per arm activation). Default is single-
-shot.
+function declaration without a body. Effects may be generic
+(`Raise[E]`, `State[S]`); type parameters follow the effect name in
+`[…]` brackets.
+
+The optional `resumes: many` annotation marks a multi-shot effect
+(the op's continuation `k` may be invoked more than once per arm
+activation). Default is single-shot.
 
 In v1 only the builtin `Mem` effect has zero ops (it's a marker).
 
@@ -627,8 +719,21 @@ Effect.op(arg, k) => {
 }
 ```
 
-N is fixed at compile time; runtime-N variations need first-class
-continuations (v2 work).
+N is fixed at compile time; runtime-N variations use first-class
+continuations (see §8.5).
+
+**Conditional k-call.** Handler arm bodies may use `if`/`else` and
+`match` to conditionally invoke `k`:
+
+```sigil
+Effect.op(arg, k) => {
+  if arg > 0 {
+    k(arg)
+  } else {
+    0    -- discard k, short-circuit
+  }
+}
+```
 
 #### §8.4 — Effect row inference
 
@@ -637,6 +742,30 @@ When a function calls another function whose row contains effect
 `handle`). Row inference is structural — the checker computes the
 union of effects performed by the body and unifies it against the
 declared row. Mismatches fire E0042.
+
+#### §8.5 — First-class continuations
+
+The continuation `k` in a handler arm can be bound to a variable
+of type `Continuation[OpRet, Ret]` where `OpRet` is the operation's
+return type and `Ret` is the handler's return type:
+
+```sigil
+effect Step resumes: many {
+  step: (Int) -> Int,
+}
+
+handle body() with {
+  Step.step(n, k) => {
+    let f: Continuation[Int, Int] = k;
+    f(n + 1)
+  },
+}
+```
+
+First-class continuations enable passing `k` to helper functions
+(including recursive helpers for runtime-N enumeration, as used by
+`all_choices` in `std.choose`). Dynamic-extent enforcement ensures
+a continuation cannot be invoked after its handler frame has exited.
 
 ### §9 — `Mem` and mutation
 
@@ -665,8 +794,7 @@ import std.list
 
 Imports are flat — every public item from each imported module
 becomes available in the importing file's scope. There is no
-re-export, alias, or namespace qualification in v1; collisions
-between stdlib modules are deferred (`[DEVIATION Task 66.5]`).
+re-export, alias, or namespace qualification in v1.
 
 The `std.io` / `std.array` / `std.mut_array` / `std.byte_array` /
 `std.mut_byte_array` / `std.mem` / `std.string` / `std.int64` /
@@ -712,9 +840,10 @@ Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/cata
   (`sigil_run_loop`); each `perform` returns a `NextStep` packet
   that the trampoline routes to the matching arm fn or the
   enclosing handler frame.
-- **Multi-shot machinery:** Plan B' Stage 6.7 outer-post-arm-k
-  thread-local stack handles re-entry from within multi-shot arm
-  bodies; canonical pattern is the static-N let-chain (§8.3).
+- **Multi-shot machinery:** thread-local stack handles re-entry from
+  within multi-shot arm bodies; canonical pattern is the static-N
+  let-chain (§8.3). Runtime-N enumeration uses first-class
+  continuations (§8.5).
 
 ### §13 — Stdlib reference
 
@@ -734,80 +863,44 @@ files are the authoritative API reference.
 | `std.string` | Byte-indexed string ops: `string_concat`, `_substring`, `_byte_at`, `_compare`, `_starts_with`, `_ends_with`, `_contains`, `_index_of`, `_trim`, `_to_int_validate`, `_to_int_parse`, `_length`. |
 | `std.int64` | Boxed `Int64` with arithmetic, comparison, conversion, stringify. |
 | `std.string_builder` | `StringBuilder` rope (Mem-gated). |
+| `std.pair` | `fst[A, B]`, `snd[A, B]` accessors for binary tuples `(A, B)`. |
 | `std.io` | `IO` effect: `print`, `println`, `read_line`, `read_file`, `write_file`. |
 | `std.mem` | `Mem` marker effect. |
-| `std.random` | `Random` effect + `run_pseudo_random` (xorshift64; **not** cryptographic). |
-| `std.clock` | `Clock` effect + `run_os_clock` (wall-clock nanos). |
-| `std.raise` | `Raise[E]` effect (generic over error type, Plan D Task 114) + `raise[A, E](e: E) -> A ![Raise[E]]` + `catch[A, E](body) -> Result[A, E] ![| e]` (row-poly residual, Plan D Task 116). |
-| `std.state` | `State[S]` effect (generic over state type, Plan D Task 119b) + `run_state[A, S](initial, body) -> A ![]`. |
-| `std.choose` | `Choose resumes: many` effect declaration; dischargers (`all_choices`, `first_choice`) deferred to v2. |
+| `std.random` | `Random` effect + `run_pseudo_random` (process-global xorshift64) + `run_seeded_random` (deterministic xorshift64 from an `Int64` seed). **Not cryptographically secure.** |
+| `std.clock` | `Clock` effect + `run_os_clock` (wall-clock nanos) + `run_frozen_clock` (fixed `Int64` timestamp for test determinism). |
+| `std.raise` | `Raise[E]` effect (generic over error type) + `raise[A, E](e: E) -> A ![Raise[E]]` + `catch[A, E](body) -> Result[A, E] ![| e]` (row-polymorphic residual). |
+| `std.state` | `State[S]` effect (generic over state type) + `run_state[A, S](initial, body) -> A ![]`. |
+| `std.choose` | `Choose resumes: many` effect + `all_choices[A](body) -> List[A]` (enumerate all branches) + `first_choice[A](body) -> Option[A]` (find first non-failing branch). Both use first-class continuations for runtime-N enumeration. |
 
-### §14 — v1 limits (deferred to v2)
+#### §13.2 — Builtin primitives (not in stdlib modules)
 
-The Plan D architectural cluster (Tasks 111–118) closed every limit
-in this section that originally pointed at a v2 lift in Plan C
-deviations. Survivors below are limits with no Plan D / Plan C
-closure path — they ship as permanent v1 design choices or queue
-for a future plan-tier slice.
+These functions are available without any `import`:
 
-- **`Float` type:** no v1 floating-point. No closure path scheduled
-  in any current plan.
+| Function | Type | Description |
+|----------|------|-------------|
+| `int_to_string(n)` | `(Int) -> String ![]` | Decimal string from Int. |
+| `int_xor(a, b)` | `(Int, Int) -> Int ![]` | Bitwise XOR. |
+| `int_shl(a, b)` | `(Int, Int) -> Int ![]` | Left shift. `b` masked to 6 bits. |
+| `int_shr(a, b)` | `(Int, Int) -> Int ![]` | Arithmetic right shift. `b` masked to 6 bits. Sign-extends. |
+| `int_abs(n)` | `(Int) -> Int ![]` | Absolute value. `int_abs(i64::MIN)` wraps to `i64::MIN`. |
+| `random_pseudo_int()` | `() -> Int ![]` | Process-global xorshift64. **Not cryptographic.** |
+
+### §14 — v1 limits
+
+The following limits are permanent v1 design choices:
+
+- **`Float` type:** no v1 floating-point.
 - **`Unit` literal:** Unit values can only be obtained as the
-  return of a `Mem` mutation op or `IO.println`. Permanent v1
-  surface decision (no `()` literal).
+  return of a `Mem` mutation op or `IO.println`. No `()` literal.
 - **`for` / `while`:** no looping syntax; recursion is the only
-  iteration mechanism. Permanent v1 surface decision.
-
-The following limits ship as **closed in v1** by Plan D and remain
-documented here as a closure log for the v1 → v2 transition:
-
-- **First-class continuations:** Closed by Plan D Task 117 (PR #60
-  substrate `4b3f0b4` + follow-up type-position `Continuation[op_-
-  ret, ret]` surface). `Ty::Continuation` + escape barrier +
-  ScopeId enforce dynamic extent; both single-shot (`let f = k;
-  f(42)`) and multi-shot 2-let (`let f = k; let r1 = f(true); let
-  r2 = f(false); r1 + r2`) work end-to-end.
-- **Conditional / branched k-call:** Closed by Plan D Task 118
-  (PR #81 squash `3904a12`). `lower_arm_body_to_next_step`
-  recursively descends arm-body tail through `Expr::Block` /
-  `Expr::If` / `Expr::Match`, emitting one `*NextStep` ptr per leaf.
-- **Wrapper-fn-frame discharge composition:** Closed by Plan D
-  Task 112 (a + b + c). Tail-perform Cps wrapper composition
-  (PR #83), chained-let-yield Cps wrapper composition (PR #85),
-  Case D wrapper-in-chain + Slice B outer arm (PR #86).
-- **Type-parameterized effect rows:** Closed by Plan D Task 114
-  (PR #54). `EffectRef`/`EffectInst` split with structural row
-  unification + E0143 row-arg arity check.
-- **Tuple types / `Pair[A, B]`:** Closed by Plan D Task 113
-  (PR #53). `(T1, T2, ...)` types, `(e1, e2, ...)` values,
-  `Pattern::Tuple` element-wise unification + destructure,
-  `std/pair.sigil` with `fst[A,B]` / `snd[A,B]`.
-- **Row-polymorphic fn-typed params:** Closed by Plan D Task 116
-  (PR #56). Row vars in inner `FnTypeExpr`s resolve through the
-  enclosing fn's `effect_row_var`; E0137 narrowed to fire only on
-  unbound row vars.
-- **Captured-k inside lambdas across generic-fn boundaries
-  (E0145):** Closed by Plan D Task 119b. The pre-119b
-  `program_has_generics` typecheck gate was a workaround for a
-  `Substitution::apply_to_ty(Ty::Continuation)` panic in
-  monomorphization. Post-119b: mono substitutes through
-  `Ty::Continuation` (recursive op_ret/ret + preserved scope_id),
-  and per-clone resolved-Ty maps (`call_callee_tys_resolved`,
-  `handle_body_ty_resolved`) plus hoisted-lambda parent-clone
-  lookup deliver fully-substituted Tys to codegen. Soundness for
-  captured-k that escapes its handle's dynamic extent is enforced
-  at runtime via ScopeId checks (RELINK_STACK + dynamic-extent
-  dispatch). The narrower E0145 emit sites (cross-fn /
-  generic-instantiation arg-unify mismatch, cross-handle
-  scope-mismatch in `unify_ty`) remain.
-
-Each Plan-D-shipped closure cross-references its `[DEVIATION
-Task NN]` entry by task number in
-[`PLAN_D_DEVIATIONS.md`](../PLAN_D_DEVIATIONS.md); the non-Plan-D
-survivors live as named entries in
-[`PLAN_C_DEVIATIONS.md`](../PLAN_C_DEVIATIONS.md). Reader's grep
-target: search by `[DEVIATION Task <N>]` for any task number cited
-above.
+  iteration mechanism.
+- **Top-level row polymorphism:** row variables work in fn-typed
+  parameter positions (`| e`), but a function's own declared effect
+  row cannot contain a row variable.
+- **Multi-shot N at runtime without continuations:** the static
+  N-let-chain (§8.3) requires N to be known at compile time. For
+  runtime-N iteration, use first-class continuations (§8.5) as
+  `all_choices` does.
 
 ### §15 — Build and run
 
