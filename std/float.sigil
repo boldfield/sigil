@@ -1,0 +1,54 @@
+// sigil: 0.1
+//
+// std/float.sigil — **Documentation only.**
+//
+// This file is listed in `compiler/src/imports.rs::BUILTIN_INJECTED`
+// — `import std.float` is a no-op at the resolver. The `Float`
+// type and its operations are registered as builtins via
+// `typecheck::builtin_types()` and `register_builtin_float_schemes()`;
+// codegen dispatches each call site through the `BuiltinFuncIds` /
+// `BuiltinFuncRefs` aggregate. Users never need to write the import;
+// the type and ops are in scope from program start.
+//
+// == Type ==
+//
+// Float — boxed IEEE 754 f64, heap-allocated (tag 0x0B, count=1,
+//         bitmap=0). Constructed via float literals (3.14, 1e10) or
+//         float_from_int.
+//
+// == Arithmetic ==
+//
+// float_add(Float, Float) -> Float
+// float_sub(Float, Float) -> Float
+// float_mul(Float, Float) -> Float
+// float_div(Float, Float) -> Float  (IEEE 754: div-by-zero → ±Inf)
+// float_neg(Float) -> Float
+//
+// == Comparison ==
+//
+// float_eq(Float, Float) -> Bool  (NaN != NaN)
+// float_lt(Float, Float) -> Bool
+// float_le(Float, Float) -> Bool
+// float_gt(Float, Float) -> Bool
+// float_ge(Float, Float) -> Bool
+//
+// == Math ==
+//
+// float_abs(Float) -> Float
+// float_floor(Float) -> Float
+// float_ceil(Float) -> Float
+// float_sqrt(Float) -> Float
+//
+// == Conversion ==
+//
+// float_from_int(Int) -> Float
+// float_to_int(Float) -> Int   (truncate toward zero, clamp, NaN → 0)
+// float_to_string(Float) -> String  (whole numbers include ".0"; inf/NaN unchanged)
+// string_to_float_validate(String) -> Int  (0 = valid, 1 = invalid)
+// string_to_float_parse(String) -> Float   (caller must validate first)
+//
+// == Per-op allocation ==
+//
+// Every arithmetic/math/conversion op that returns a Float allocates
+// a fresh 16-byte record (8-byte header + 8-byte f64 payload).
+// Comparisons and float_to_int do not allocate.

@@ -174,6 +174,18 @@ pub const MAX_TUPLE_ARITY: usize = 31;
 /// therefore its frame — is on the call stack above us).
 pub const TAG_CONTINUATION: u8 = 0x0A;
 
+/// Boxed Float (IEEE 754 f64) layout:
+///
+/// ```text
+/// offset 0  : 8-byte header (tag = TAG_FLOAT, count = 1, bitmap = 0)
+/// offset 8  : f64 payload (stored as 8 raw bytes)
+/// ```
+///
+/// Bitmap is `0` (atomic alloc): the payload is a scalar, never a
+/// pointer, so Boehm uses `GC_malloc_atomic`. Follows the `TAG_INT64`
+/// boxed-scalar precedent exactly.
+pub const TAG_FLOAT: u8 = 0x0B;
+
 /// Payload-word-count field layout.
 pub const COUNT_BITS: u32 = 6;
 pub const COUNT_SHIFT: u32 = 8;
@@ -253,6 +265,8 @@ mod tests {
         assert_eq!(TAG_MUT_BYTE_ARRAY, 0x07);
         assert_eq!(TAG_STRING_BUILDER, 0x08);
         assert_eq!(TAG_TUPLE, 0x09);
+        assert_eq!(TAG_CONTINUATION, 0x0A);
+        assert_eq!(TAG_FLOAT, 0x0B);
         assert_eq!(TAG_EXTERNAL_DESCRIPTOR, 0xFF);
     }
 

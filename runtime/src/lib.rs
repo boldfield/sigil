@@ -59,6 +59,7 @@ pub mod byte_array;
 pub mod clock;
 pub mod continuation;
 pub mod counters;
+pub mod float;
 pub mod gc;
 pub mod handlers;
 pub mod header;

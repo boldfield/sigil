@@ -12356,3 +12356,149 @@ fn top_level_row_poly_handler_passes_residual() {
     assert_eq!(code, 0, "stderr: {_stderr}");
     assert_eq!(stdout, "30\n");
 }
+
+// ── Float type e2e tests ──────────────────────────────────────────
+
+#[test]
+fn float_literal_prints_3_14() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(float_to_string(3.14));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "float_literal");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "3.14\n");
+}
+
+#[test]
+fn float_add_two_values() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(float_to_string(float_add(1.5, 2.5)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "float_add");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "4.0\n");
+}
+
+#[test]
+fn float_neg_and_sub() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let a: Float = float_neg(3.5);\n  \
+                 let b: Float = float_sub(a, 1.5);\n  \
+                 perform IO.println(float_to_string(b));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "float_neg_sub");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "-5.0\n");
+}
+
+#[test]
+fn float_div_by_zero_yields_inf() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(float_to_string(float_div(1.0, 0.0)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "float_div_zero");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "inf\n");
+}
+
+#[test]
+fn float_from_int_round_trip() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let v: Int = float_to_int(float_from_int(42));\n  \
+                 perform IO.println(int_to_string(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "float_from_int_rt");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "42\n");
+}
+
+#[test]
+fn float_comparisons() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let a: Float = 1.5;\n  \
+                 let b: Float = 2.5;\n  \
+                 if float_lt(a, b) {\n    \
+                   perform IO.println(\"lt_ok\");\n    0\n  \
+                 } else {\n    \
+                   perform IO.println(\"lt_fail\");\n    0\n  \
+                 };\n  \
+                 if float_eq(a, a) {\n    \
+                   perform IO.println(\"eq_ok\");\n    0\n  \
+                 } else {\n    \
+                   perform IO.println(\"eq_fail\");\n    0\n  \
+                 };\n  \
+                 if float_gt(b, a) {\n    \
+                   perform IO.println(\"gt_ok\");\n    0\n  \
+                 } else {\n    \
+                   perform IO.println(\"gt_fail\");\n    0\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "float_cmp");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "lt_ok\neq_ok\ngt_ok\n");
+}
+
+#[test]
+fn float_math_floor_ceil() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(float_to_string(float_floor(3.7)));\n  \
+                 perform IO.println(float_to_string(float_ceil(3.2)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "float_math");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "3.0\n4.0\n");
+}
+
+#[test]
+fn float_string_parse_validate() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let valid: Int = string_to_float_validate(\"2.718\");\n  \
+                 if valid == 0 {\n    \
+                   let f: Float = string_to_float_parse(\"2.718\");\n    \
+                   perform IO.println(float_to_string(f));\n    \
+                   0\n  \
+                 } else {\n    \
+                   perform IO.println(\"invalid\");\n    \
+                   0\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "float_parse");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "2.718\n");
+}
+
+#[test]
+fn float_nan_not_equal_to_self() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let nan: Float = float_sqrt(float_neg(1.0));\n  \
+                 if float_eq(nan, nan) {\n    \
+                   perform IO.println(\"equal\");\n    0\n  \
+                 } else {\n    \
+                   perform IO.println(\"not_equal\");\n    0\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "float_nan");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "not_equal\n");
+}
+
+#[test]
+fn float_doc_only_import() {
+    let src = "import std.float\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(float_to_string(float_add(1.0, 2.0)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "float_import");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "3.0\n");
+}

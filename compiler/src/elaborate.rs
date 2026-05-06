@@ -169,6 +169,7 @@ impl Elaborator {
         match e {
             // Trivial forms: no transformation.
             Expr::IntLit(..)
+            | Expr::FloatLit(..)
             | Expr::StringLit(..)
             | Expr::BoolLit(..)
             | Expr::CharLit(..)
