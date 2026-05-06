@@ -423,8 +423,11 @@ identifiers.
   `Bool` type. Pattern-match with `match b { true => ..., false => ... }`.
 - Float: `3.14`, `1e10`, `2.5e-3`. IEEE 754 f64, heap-boxed.
   Requires digits before and after the decimal point (`3.0` not `3.`
-  or `.3`). Exponent form uses `e`/`E` with optional `+`/`-`.
+  or `.3`). Exponent form uses `e`/`E` with optional `+`/`-`,
+  but requires at least one digit after the marker (`1e10` is a
+  float; `1e` is integer `1` followed by identifier `e`).
   Negative float literals: `-3.14` (unary minus is constant-folded).
+  Float literals are not valid in pattern position.
 
 ### §2 — Top-level items
 
