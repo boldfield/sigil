@@ -124,7 +124,8 @@ pub extern "C" fn sigil_int_xor(a: i64, b: i64) -> i64 {
 ///
 /// `int_shl(a, b)` computes `a << (b & 63)`. The shift amount is masked
 /// to 6 bits (standard Rust `wrapping_shl` semantics) so shifts >= 64
-/// wrap rather than panic.
+/// wrap rather than panic. Negative `b` values are truncated to u32
+/// before the 6-bit mask: e.g. `int_shl(x, -1)` shifts by 63.
 #[no_mangle]
 pub extern "C" fn sigil_int_shl(a: i64, b: i64) -> i64 {
     a.wrapping_shl(b as u32)
@@ -134,7 +135,8 @@ pub extern "C" fn sigil_int_shl(a: i64, b: i64) -> i64 {
 ///
 /// `int_shr(a, b)` computes `a >> (b & 63)`. Sign-extends from the MSB
 /// (arithmetic shift). The shift amount is masked to 6 bits via
-/// `wrapping_shr`.
+/// `wrapping_shr`. Negative `b` values are truncated to u32 before
+/// the mask: e.g. `int_shr(x, -1)` shifts by 63.
 #[no_mangle]
 pub extern "C" fn sigil_int_shr(a: i64, b: i64) -> i64 {
     a.wrapping_shr(b as u32)

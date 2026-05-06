@@ -51,7 +51,10 @@ fn xorshift_step(n: Int) -> Int ![] {
 }
 
 fn run_seeded_random[A](seed: Int64, body: () -> A ![Random]) -> A ![Mem] {
-  let state: MutArray[Int] = mut_array_new(1, int64_to_int(seed));
+  // xorshift has an absorbing state at zero — map seed 0 to 1
+  let raw_seed: Int = int64_to_int(seed);
+  let safe_seed: Int = match raw_seed { 0 => 1, n => n };
+  let state: MutArray[Int] = mut_array_new(1, safe_seed);
   handle body() with {
     Random.rand_int(k) => {
       let current: Int = mut_array_get(state, 0);

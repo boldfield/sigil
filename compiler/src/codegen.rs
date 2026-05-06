@@ -8527,49 +8527,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         kind,
                     });
                     cps_continuation_synth_indices.insert(f.name.clone(), synth_cont_idx);
-                } else if let Some(chain_length) = {
-                    // Plan D Task 112a/112b — reuse hoisted
-                    // `fns_by_name` (built once at emit_object entry
-                    // above) and the shared `is_supported_cps_user_fn`
-                    // helper (accepts both tail-perform and chained-
-                    // let-yield Cps wrappers).
-                    //
-                    // Plan D Task 112d — ALSO accept Pattern C bodies
-                    // (let-yield-prefix + If-tail with pure-or-Cps-call
-                    // branches) per `is_let_yield_prefix_then_branched
-                    // _cps_tail_body`. Pattern C reuses the same chain
-                    // step machinery; only the Final synth-cont's tail
-                    // emit differs (branched routing vs lower_expr+gate).
+                } else {
+                    let chain_normalized = normalize_tail_perform_body(&f.body, &f.return_type);
+                    let chain_body = chain_normalized.as_ref().unwrap_or(&f.body);
                     let lookup = |callee_name: &str| {
                         is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     };
-                    // Tail-perform normalization: use the same
-                    // normalized body that ABI classification used.
-                    let emit_normalized = normalize_tail_perform_body(&f.body, &f.return_type);
-                    let emit_body = emit_normalized.as_ref().unwrap_or(&f.body);
-                    is_simple_chained_let_yield_then_pure_tail_body(emit_body, &ctors, &lookup)
+                    let chain_length = is_simple_chained_let_yield_then_pure_tail_body(chain_body, &ctors, &lookup)
                         .or_else(|| {
-                            // Same `lookup` for both predicates — at
-                            // pre-pass level there's no visited-set in
-                            // scope; tied-knot semantic is provided by
-                            // `is_supported_cps_user_fn`'s internal
-                            // visited-set when the recursion reaches
-                            // is_supported_cps_user_fn_inner.
                             is_let_yield_prefix_then_branched_cps_tail_body(
-                                emit_body, &ctors, &lookup, &lookup,
+                                chain_body, &ctors, &lookup, &lookup,
                             )
-                        })
-                } {
-                    // Extract per-step let-binding info (name +
-                    // declared type + slot kind) and the yield-bearing
-                    // step kind (Perform OR wrapper-Call per Plan D
-                    // Task 112). Classifier guarantees every stmt is
-                    // a `Stmt::Let` whose value is `Expr::Perform`
-                    // OR `Expr::Call` with a Cps-color top-level
-                    // callee; unreachable!() guards mirror the
-                    // ConstantDone branch above.
-                    let arm_normalized = normalize_tail_perform_body(&f.body, &f.return_type);
-                    let arm_body = arm_normalized.as_ref().unwrap_or(&f.body);
+                        });
+                    if let Some(chain_length) = chain_length {
+                    let arm_body = chain_body;
                     let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
                     let mut binding_names: Vec<String> = Vec::with_capacity(chain_length);
                     let mut binding_tys: Vec<Type> = Vec::with_capacity(chain_length);
@@ -8827,6 +8798,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // Map points at step_0; helper body emit reads
                     // step_0's captures + first perform's k_fn.
                     cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
+                    }
                 }
             }
         }
@@ -12090,6 +12062,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     ns_ptr
                 } else {
                     // --- Non-tail / no-`k` path (Phase 4c shape) ---
+                    //
+                    // Phase 4g bugfix: read the arm body's actual
+                    // lowered Cranelift type via `dfg.value_type`
+                    // instead of the pre-stored `synth.body_ty`.
+                    // The pre-pass derives body_ty from the op's
+                    // declared return type, but typecheck unifies
+                    // the arm body with handler_overall, which can
+                    // differ (e.g. Raise.fail()->Int arm producing
+                    // Bool lowers to I8, not I64).
                     let body_value = lowerer.lower_expr(&synth.body);
                     let body_actual_ty = lowerer.builder.func.dfg.value_type(body_value);
                     let widened_body = if body_actual_ty == types::I64 {
@@ -12104,6 +12085,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         );
                         body_value
                     };
+                    // Emit DISCHARGED (not DONE): arm body evaluated
+                    // WITHOUT invoking k, so per algebraic-effects
+                    // semantics this value IS the handle's final
+                    // value, not subject to the return clause. The
+                    // effect_id write lets nested handle expressions
+                    // distinguish own-effect discharge from foreign.
                     let effect_id_const = lowerer
                         .builder
                         .ins()
@@ -24375,10 +24362,12 @@ fn expr_contains_perform(e: &crate::ast::Expr) -> bool {
             true
         }
         Expr::ClosureRecord { .. } => {
-            // After lambda-lifting, ClosureRecords are data
-            // structures holding captured values — the code (which
-            // may contain performs) lives in a lifted top-level fn,
-            // not inline in the ClosureRecord.
+            // INVARIANT: this function must only be called after
+            // closure conversion. Post-lifting, ClosureRecords are
+            // data structs holding captured values — the code
+            // (which may contain performs) lives in a lifted
+            // top-level fn, not inline in the ClosureRecord.
+            // Pre-lifting this would be a false negative.
             false
         }
     }
@@ -26480,6 +26469,42 @@ mod tests {
                 &|_| false,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn chained_classifier_accepts_call_in_tail() {
+        // A perform-free Call in tail position is accepted — the tail
+        // just needs to be perform-free, not side-effect-free.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    args: Vec::new(),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Call {
+                callee: Box::new(Expr::Ident("helper".to_string(), span.clone())),
+                args: Vec::new(),
+                span: span.clone(),
+            }),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new(),
+                &|_| false,
+            ),
+            Some(1)
         );
     }
 
