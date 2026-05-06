@@ -217,8 +217,16 @@ pub unsafe extern "C" fn sigil_float_to_int(a: *const u8) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn sigil_float_to_string(a: *const u8) -> *mut u8 {
     let f = read_float(a);
-    let s = format!("{}", f);
-    // SAFETY: gc-heap-ptr arithmetic (Rust-owned String buffer; sigil_string_new copies into a fresh GC allocation).
+    let mut s = format!("{}", f);
+    if !s.contains('.')
+        && !s.contains('e')
+        && !s.contains('E')
+        && s != "inf"
+        && s != "-inf"
+        && s != "NaN"
+    {
+        s.push_str(".0");
+    }
     crate::gc::sigil_string_new(s.as_ptr(), s.len())
 }
 
@@ -449,6 +457,21 @@ mod tests {
             let payload: *const u8 = s.add(16);
             let bytes = std::slice::from_raw_parts(payload, len);
             assert_eq!(bytes, b"3.14");
+
+            let whole = sigil_float_to_string(boxf(4.0));
+            let wlen = crate::gc::sigil_string_len(whole);
+            let wbytes = std::slice::from_raw_parts(whole.add(16), wlen);
+            assert_eq!(wbytes, b"4.0");
+
+            let inf_p = sigil_float_to_string(boxf(f64::INFINITY));
+            let ilen = crate::gc::sigil_string_len(inf_p);
+            let ibytes = std::slice::from_raw_parts(inf_p.add(16), ilen);
+            assert_eq!(ibytes, b"inf");
+
+            let nan_p = sigil_float_to_string(boxf(f64::NAN));
+            let nlen = crate::gc::sigil_string_len(nan_p);
+            let nbytes = std::slice::from_raw_parts(nan_p.add(16), nlen);
+            assert_eq!(nbytes, b"NaN");
         }
     }
 
