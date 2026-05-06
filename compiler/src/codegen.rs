@@ -747,6 +747,7 @@ fn expr_uses_generic(e: &crate::ast::Expr, params: &std::collections::BTreeSet<S
         | Expr::StringLit(_, _)
         | Expr::BoolLit(_, _)
         | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
         | Expr::Ident(_, _) => false,
         Expr::Binary { lhs, rhs, .. } => {
             expr_uses_generic(lhs, params) || expr_uses_generic(rhs, params)
@@ -1343,6 +1344,7 @@ fn expr_unsupported_indirect_call(e: &crate::ast::Expr) -> Option<String> {
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => None,
         Expr::Tuple { elems, .. } => {
@@ -1431,6 +1433,7 @@ fn expr_unsupported_handle(
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => None,
         Expr::Binary { lhs, rhs, .. } => expr_unsupported_handle(
@@ -2055,6 +2058,7 @@ fn arm_body_walk(
         | Expr::FloatLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::StringLit(..) => None,
         Expr::ClosureEnvLoad { name, .. } => {
             // Plan B Task 55, Phase 4e captures+ Slice D — `Expr::
@@ -3983,6 +3987,7 @@ fn walk_collect_arm_post_perform_captures(
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::ClosureEnvLoad { .. } => {}
         Expr::Ident(name, _) => {
             if bound.contains(name) {
@@ -4273,6 +4278,7 @@ fn walk_collect_captures(
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::ClosureEnvLoad { .. } => {}
         Expr::Ident(name, _) => {
             if !bound.contains(name) {
@@ -4384,6 +4390,7 @@ fn walk_collect_arm_captures(
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::ClosureEnvLoad { .. } => {}
         Expr::Ident(name, _) => {
             if !bound.contains(name) {
@@ -4538,7 +4545,8 @@ fn walk_collect_post_arm_k_captures(
         | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
-        | Expr::CharLit(..) => {}
+        | Expr::CharLit(..)
+        | Expr::UnitLit(..) => {}
         Expr::Ident(name, _) => {
             if !bound.contains(name) {
                 if let Some(idx) = arm_params.iter().position(|p| p.name == *name) {
@@ -4773,6 +4781,7 @@ fn unwrap_closure_env_loads_for_post_arm_k(
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::Ident(..) => e.clone(),
         Expr::ClosureEnvLoad { name, span, .. } => {
             if captures.iter().any(|c| c.name == *name) {
@@ -5090,6 +5099,7 @@ fn collect_handle_arms_in_expr(
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. }
         | Expr::Perform(_) => Ok(()),
@@ -6130,6 +6140,7 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
         | Expr::FloatLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::StringLit(..) => None,
         Expr::Ident(name, _) => {
             if name == k_name {
@@ -6535,6 +6546,7 @@ fn find_closure_env_load_lambda_source(
             | Expr::FloatLit(..)
             | Expr::BoolLit(..)
             | Expr::CharLit(..)
+            | Expr::UnitLit(..)
             | Expr::StringLit(..)
             | Expr::Ident(..) => None,
             Expr::Binary { lhs, rhs, .. } => scan_expr(lhs, name).or_else(|| scan_expr(rhs, name)),
@@ -6618,7 +6630,8 @@ fn rewrite_expr(
         | Expr::FloatLit(..)
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
-        | Expr::CharLit(..) => e.clone(),
+        | Expr::CharLit(..)
+        | Expr::UnitLit(..) => e.clone(),
         Expr::Ident(name, span) => {
             if name_in_active_scope(name, scopes) {
                 e.clone()
@@ -18718,6 +18731,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             }
             Expr::BoolLit(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
             Expr::CharLit(c, _) => self.builder.ins().iconst(types::I32, *c as i64),
+            Expr::UnitLit(_) => self.builder.ins().iconst(types::I8, 0),
             Expr::StringLit(_, span) => self.lower_string_literal(span),
             Expr::Ident(name, _) => {
                 // Plan A3 task 41.1: if the identifier isn't in the
@@ -23146,6 +23160,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
             }
             Expr::CharLit(..) => types::I32,
+            Expr::UnitLit(..) => types::I8,
             Expr::StringLit(..) | Expr::RecordLit { .. } => self.pointer_ty,
             Expr::Ident(name, _) => {
                 if let Some(v) = self.env.get(name) {
@@ -23777,6 +23792,7 @@ fn arm_body_has_k_pair_lambda(
         | Expr::FloatLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::StringLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => false,
@@ -24883,6 +24899,7 @@ fn expr_contains_perform(e: &crate::ast::Expr) -> bool {
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => false,
         Expr::Binary { lhs, rhs, .. } => expr_contains_perform(lhs) || expr_contains_perform(rhs),
@@ -24960,6 +24977,7 @@ fn expr_is_pure(e: &crate::ast::Expr, ctors: &std::collections::BTreeSet<String>
         | Expr::StringLit(..)
         | Expr::BoolLit(..)
         | Expr::CharLit(..)
+        | Expr::UnitLit(..)
         | Expr::Ident(..)
         | Expr::ClosureEnvLoad { .. } => true,
         Expr::Binary { lhs, rhs, .. } => expr_is_pure(lhs, ctors) && expr_is_pure(rhs, ctors),

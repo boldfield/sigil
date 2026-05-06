@@ -378,6 +378,7 @@ pub enum Expr {
     StringLit(String, Span),
     BoolLit(bool, Span),
     CharLit(char, Span),
+    UnitLit(Span),
     Ident(String, Span),
     Call {
         callee: Box<Expr>,
@@ -724,6 +725,7 @@ impl Expr {
             | Expr::StringLit(_, s)
             | Expr::BoolLit(_, s)
             | Expr::CharLit(_, s)
+            | Expr::UnitLit(s)
             | Expr::Ident(_, s)
             | Expr::Call { span: s, .. }
             | Expr::Binary { span: s, .. }

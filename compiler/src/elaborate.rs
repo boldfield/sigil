@@ -173,6 +173,7 @@ impl Elaborator {
             | Expr::StringLit(..)
             | Expr::BoolLit(..)
             | Expr::CharLit(..)
+            | Expr::UnitLit(..)
             | Expr::Ident(..) => (e, Vec::new()),
 
             Expr::Binary { op, lhs, rhs, span } => {

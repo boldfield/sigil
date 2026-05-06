@@ -979,7 +979,8 @@ impl<'a> Monomorphizer<'a> {
             | Expr::FloatLit(_, _)
             | Expr::StringLit(_, _)
             | Expr::BoolLit(_, _)
-            | Expr::CharLit(_, _) => e.clone(),
+            | Expr::CharLit(_, _)
+            | Expr::UnitLit(_) => e.clone(),
             Expr::Ident(name, span) => {
                 // Three name-resolution categories:
                 // 1. Captured fn instantiation — rewrite to mangled

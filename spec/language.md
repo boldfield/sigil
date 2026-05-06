@@ -428,6 +428,8 @@ identifiers.
   float; `1e` is integer `1` followed by identifier `e`).
   Negative float literals: `-3.14` (unary minus is constant-folded).
   Float literals are not valid in pattern position.
+- Unit: `()`. The singleton value of type `Unit`. Not valid in
+  pattern position.
 
 ### §2 — Top-level items
 
@@ -458,7 +460,7 @@ fn main() -> Int ![IO] { 0 }                   // function
 | `String` | Immutable UTF-8 byte sequence. |
 | `Char` | 1-byte codepoint. |
 | `Byte` | 1-byte unsigned integer (0..255). |
-| `Unit` | The single-value type returned by mutation ops. No literal in v1. |
+| `Unit` | The single-value type. Literal: `()`. |
 | `Array[A]` | Immutable indexed collection. |
 | `MutArray[A]` | Mutable indexed collection (Mem-gated). |
 | `ByteArray` | Immutable flat byte buffer. |
@@ -548,6 +550,7 @@ suggested fix.
 | String literal | `"hello"` |
 | Char literal | `'A'` |
 | Bool literal | `true`, `false` |
+| Unit literal | `()` |
 | Identifier | `x`, `length` |
 | Function call | `f(x, y)` |
 | Lambda | `fn (x: Int) -> Int ![] => x + 1` |
@@ -904,8 +907,6 @@ These functions are available without any `import`:
 
 The following limits are permanent v1 design choices:
 
-- **`Unit` literal:** Unit values can only be obtained as the
-  return of a `Mem` mutation op or `IO.println`. No `()` literal.
 - **`for` / `while`:** no looping syntax; recursion is the only
   iteration mechanism.
 - **Multi-shot N at runtime without continuations:** the static

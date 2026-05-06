@@ -1124,25 +1124,24 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Perform => self.parse_perform_expr().map(Expr::Perform),
             TokenKind::LParen => {
-                // Plan D Task 113 — parenthesised expression OR tuple
-                // value. Discriminated by whether a `,` follows the
-                // first inner expression: `(e)` is paren-grouping,
-                // `(e1, e2, ...)` is a tuple value (arity ≥ 2). Empty
-                // `()` is reserved for a future Unit-literal spelling
-                // and rejected here.
+                // Parenthesised expression, tuple value, or Unit literal.
+                // `()` → UnitLit, `(e)` → paren-grouping, `(e1, e2, …)` → tuple.
                 let lparen_span = self.peek().span.clone();
                 self.advance();
                 let saved = self.no_record_lits;
                 self.no_record_lits = false;
                 if matches!(self.peek().kind, TokenKind::RParen) {
+                    let rparen_span = self.peek().span.clone();
                     self.no_record_lits = saved;
                     self.advance();
-                    self.err(
-                        lparen_span,
-                        "empty `()` is not a valid expression — use a Unit constructor \
-                         when one is in scope, or `(e1, e2, ...)` for a tuple value",
+                    let span = Span::new(
+                        &lparen_span.file,
+                        lparen_span.line,
+                        lparen_span.column,
+                        rparen_span.end_line,
+                        rparen_span.end_column,
                     );
-                    return None;
+                    return Some(Expr::UnitLit(span));
                 }
                 let first = self.parse_expr()?;
                 if matches!(self.peek().kind, TokenKind::Comma) {
