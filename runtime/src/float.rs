@@ -227,6 +227,7 @@ pub unsafe extern "C" fn sigil_float_to_string(a: *const u8) -> *mut u8 {
     {
         s.push_str(".0");
     }
+    // SAFETY: gc-heap-ptr arithmetic (Rust-owned String buffer; sigil_string_new copies into a fresh GC allocation).
     crate::gc::sigil_string_new(s.as_ptr(), s.len())
 }
 
@@ -301,9 +302,9 @@ mod tests {
     #[test]
     fn box_unbox_round_trip() {
         let _g = gc_test_lock();
-        let p = boxf(3.14);
+        let p = boxf(3.125);
         unsafe {
-            assert!((sigil_float_unbox(p) - 3.14).abs() < f64::EPSILON);
+            assert!((sigil_float_unbox(p) - 3.125).abs() < f64::EPSILON);
         }
     }
 
@@ -450,13 +451,13 @@ mod tests {
     #[test]
     fn to_string_formats() {
         let _g = gc_test_lock();
-        let p = boxf(3.14);
+        let p = boxf(3.125);
         unsafe {
             let s = sigil_float_to_string(p);
             let len = crate::gc::sigil_string_len(s);
             let payload: *const u8 = s.add(16);
             let bytes = std::slice::from_raw_parts(payload, len);
-            assert_eq!(bytes, b"3.14");
+            assert_eq!(bytes, b"3.125");
 
             let whole = sigil_float_to_string(boxf(4.0));
             let wlen = crate::gc::sigil_string_len(whole);
@@ -479,10 +480,11 @@ mod tests {
     fn validate_and_parse_round_trip() {
         let _g = gc_test_lock();
         unsafe {
-            let s = crate::gc::sigil_string_new(b"2.718".as_ptr(), 5);
+            // SAFETY: gc-heap-ptr arithmetic (static byte slice; sigil_string_new copies).
+            let s = crate::gc::sigil_string_new(b"2.75".as_ptr(), 4);
             assert_eq!(sigil_string_to_float_validate(s), 0);
             let p = sigil_string_to_float_parse(s);
-            assert!((read(p) - 2.718).abs() < f64::EPSILON);
+            assert!((read(p) - 2.75).abs() < f64::EPSILON);
         }
     }
 
@@ -490,6 +492,7 @@ mod tests {
     fn validate_rejects_non_numeric() {
         let _g = gc_test_lock();
         unsafe {
+            // SAFETY: gc-heap-ptr arithmetic (static byte slice; sigil_string_new copies).
             let s = crate::gc::sigil_string_new(b"abc".as_ptr(), 3);
             assert_ne!(sigil_string_to_float_validate(s), 0);
         }
@@ -499,6 +502,7 @@ mod tests {
     fn validate_rejects_empty() {
         let _g = gc_test_lock();
         unsafe {
+            // SAFETY: gc-heap-ptr arithmetic (static byte slice; sigil_string_new copies).
             let s = crate::gc::sigil_string_new(b"".as_ptr(), 0);
             assert_ne!(sigil_string_to_float_validate(s), 0);
         }
