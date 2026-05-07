@@ -8949,7 +8949,25 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // calls and forwarded into `sigil_run_loop` at every
                     // Sync→Cps interop wrapper. main() shim allocates the
                     // root TerminalResult and passes its pointer in.
-                    let mut sig = Signature::new(isa_call_conv(&module));
+                    //
+                    // TCO-4 — non-`main` Sync user fns use
+                    // `CallConv::Tail` so `lower_call_in_tail_pos` can
+                    // emit Cranelift `return_call` (which the verifier
+                    // rejects under SystemV / AppleAarch64). `main`
+                    // stays at the host triple-default CC because its
+                    // sole caller is the C-ABI main shim (SystemV); a
+                    // Tail-CC main would require a cross-CC call from
+                    // the shim, which is needlessly delicate when main
+                    // is structurally non-tail-recursive (the Sigil
+                    // typechecker enforces an `Int` return + `[]` /
+                    // `[IO]` row, so user code rarely tail-calls
+                    // itself across the main boundary).
+                    let cc = if f.name == "main" {
+                        isa_call_conv(&module)
+                    } else {
+                        isa::CallConv::Tail
+                    };
+                    let mut sig = Signature::new(cc);
                     // arg 0: closure_ptr (always pointer-sized).
                     sig.params.push(AbiParam::new(pointer_ty));
                     let mut param_tys: Vec<Type> = Vec::with_capacity(f.params.len() + 2);
@@ -23491,16 +23509,24 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
                 // Build the Cranelift signature matching this fn-type.
                 // Closure-convention ABI: closure_ptr first, then
-                // user-declared params, then ret type. Call conv
-                // matches the surrounding fn's (host triple default).
+                // user-declared params, then ret type.
                 //
                 // Plan D Task 111b — fn-typed values resolve to Sync
                 // ABI callees (either a hoisted user fn directly or a
                 // Sync shim wrapping a Cps user fn). The Sync ABI now
                 // carries a trailing `terminal_out: *mut TerminalResult`
                 // pointer; the indirect signature must match.
-                let call_conv = self.builder.func.signature.call_conv;
-                let mut sig = Signature::new(call_conv);
+                //
+                // TCO-4 — closures wrap Sync user fns (the only
+                // user-fn flavour reified via `ClosureRecord`). Sync
+                // user fns use `CallConv::Tail` (see the user-fn sig
+                // builder), so the indirect-call sig must match —
+                // otherwise Cranelift generates a SystemV-shaped call
+                // against a Tail-CC callee and the runtime ABI
+                // corrupts. The surrounding fn's CC is irrelevant
+                // here; Cranelift's `call_indirect` uses the
+                // sig_ref's CC for the call boundary.
+                let mut sig = Signature::new(isa::CallConv::Tail);
                 sig.params.push(AbiParam::new(self.pointer_ty));
                 let ret_ty = match &callee_sig {
                     CalleeSig::Surface(fty) => {
