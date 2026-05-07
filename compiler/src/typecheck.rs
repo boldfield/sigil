@@ -5180,19 +5180,51 @@ impl Tc {
                 Some(Ty::Bool)
             }
             BinOp::Eq | BinOp::NotEq => {
-                if let (Some(a), Some(b)) = (lt, rt) {
+                if let (Some(a), Some(b)) = (lt.clone(), rt.clone()) {
                     if a != b {
                         // Report against the right-hand operand's span so
                         // the user sees which side "doesn't match the
                         // other".
                         self.push_error(
                             "E0060",
-                            rspan,
+                            rspan.clone(),
                             format!(
                                 "`{}` operands must have the same primitive type; got `{}` and `{}`",
                                 binop_symbol(op),
                                 ty_display(&a),
                                 ty_display(&b),
+                            ),
+                        );
+                    }
+                }
+                // Plan C addendum (Char) — boxed `Char` (TAG_CHAR) is
+                // heap-allocated; lowering `==` / `!=` to `icmp` would
+                // compare pointer identity, not codepoint, silently
+                // returning the wrong answer. Reject with E0060
+                // pointing at the named `char_eq` / `char_*` ops.
+                // Float / Int64 (also boxed) inherit the same trap;
+                // generalizing the rejection is queued for a follow-up
+                // plan since the existing `float_eq` / `int64_eq`
+                // discipline currently hides the bug.
+                if let Some(a) = lt.as_ref() {
+                    if matches!(a, Ty::Char) {
+                        let suggestion = match op {
+                            BinOp::Eq => "char_eq(a, b)",
+                            BinOp::NotEq => "!char_eq(a, b)",
+                            _ => unreachable!(
+                                "typecheck: BinOp::Eq | NotEq match arm reached with op {op:?}"
+                            ),
+                        };
+                        self.push_error(
+                            "E0060",
+                            rspan,
+                            format!(
+                                "`{}` is not defined on `Char` — use `{suggestion}` (or \
+                                 `char_lt` / `char_le` / `char_gt` / `char_ge` for ordering). \
+                                 Boxed `Char` is heap-allocated; `{}` would compare pointer \
+                                 identity rather than codepoints.",
+                                binop_symbol(op),
+                                binop_symbol(op),
                             ),
                         );
                     }
@@ -15235,5 +15267,33 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn char_eq_operator_is_e0060() {
+        // Plan C addendum review item 1 (MUST-FIX) — boxed `Char` is
+        // heap-allocated; `==` / `!=` would compare pointer identity
+        // not codepoints. Typecheck must reject and point users at
+        // `char_eq`.
+        let src = "fn main() -> Int ![] {\n  \
+                     match 'a' == 'a' { true => 0, false => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0060"),
+            "expected E0060 (char ==); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn char_neq_operator_is_e0060() {
+        let src = "fn main() -> Int ![] {\n  \
+                     match 'a' != 'b' { true => 0, false => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0060"),
+            "expected E0060 (char !=); got {errs:?}"
+        );
     }
 }

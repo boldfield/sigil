@@ -23374,9 +23374,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .store(MemFlags::trusted(), disc_v, ptr, 8);
 
         // Fields in payload words 1..N. Each field stores an 8-byte
-        // word; sub-word primitives (Bool, Byte, Char, Unit) are
-        // zero-extended on store, pointer-typed fields flow through
-        // unchanged.
+        // word; sub-word primitives (Bool, Byte, Unit) are zero-
+        // extended on store, pointer-typed fields flow through
+        // unchanged. (Plan C addendum: `Char` is now pointer-typed —
+        // boxed TAG_CHAR — so it takes the pass-through branch.)
         for (i, &val) in field_values.iter().enumerate() {
             let val_ty = self.builder.func.dfg.value_type(val);
             let store_val = if val_ty == types::I64 || val_ty == self.pointer_ty {

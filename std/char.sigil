@@ -91,6 +91,17 @@
 //   decode. Invalid sequences emit `U+FFFD` (replacement char) and
 //   resync to the next valid byte. Lossy by design — no error
 //   effect on the call site.
+//
+//   **U+FFFD merging** — invalid bytes are replaced one-for-one
+//   (one `U+FFFD` per invalid byte), matching Rust's
+//   `String::from_utf8_lossy`. The WHATWG Encoding spec defines a
+//   "maximal subpart" rule that emits one `U+FFFD` per invalid
+//   subsequence (so `\xC2\x42` produces ONE `U+FFFD + 'B'` instead
+//   of `U+FFFD + 'B'`). Sigil v1 follows the simpler per-byte
+//   convention. If the maximal-subpart shape is ever required for
+//   round-trip parity with another decoder, a strict variant
+//   `string_chars_strict: (String) -> Result[List[Char], Utf8Error]`
+//   is queued as a v2 follow-up.
 // - `string_char_at(String, Int) -> Option[Char] ![]`  —
 //   **codepoint** index (not byte). Returns `None` if index out of
 //   bounds. O(n) decode walk.

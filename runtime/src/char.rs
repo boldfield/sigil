@@ -411,22 +411,105 @@ pub unsafe extern "C" fn sigil_string_chars(
     tail
 }
 
+/// Walk `bytes` lossily and return the codepoint at codepoint index
+/// `idx`, or `None` if `idx` is out of bounds. Single-pass with
+/// early-exit — used by both `sigil_string_char_at_validate` and
+/// `sigil_string_char_at` so each call is O(idx + decode_cost) and
+/// allocates nothing on the hot path. Pre-refactor each entry point
+/// re-decoded the entire string into a fresh `Vec<u32>`, making any
+/// `for i in 0..n: char_at(s, i)` loop O(n²) with O(n) transient
+/// allocations. Plan C addendum review item 2.
+fn find_nth_codepoint(bytes: &[u8], idx: i64) -> Option<u32> {
+    if idx < 0 {
+        return None;
+    }
+    let target = idx as usize;
+    let mut count = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        let cp;
+        let len;
+        if b0 < 0x80 {
+            cp = b0 as u32;
+            len = 1;
+        } else {
+            let cont = |b: u8| (b & 0xC0) == 0x80;
+            let payload = |b: u8| (b & 0x3F) as u32;
+            let (decoded, decoded_len) = if (b0 & 0xE0) == 0xC0
+                && i + 1 < bytes.len()
+                && cont(bytes[i + 1])
+            {
+                (((b0 & 0x1F) as u32) << 6 | payload(bytes[i + 1]), 2usize)
+            } else if (b0 & 0xF0) == 0xE0
+                && i + 2 < bytes.len()
+                && cont(bytes[i + 1])
+                && cont(bytes[i + 2])
+            {
+                (
+                    ((b0 & 0x0F) as u32) << 12 | payload(bytes[i + 1]) << 6 | payload(bytes[i + 2]),
+                    3usize,
+                )
+            } else if (b0 & 0xF8) == 0xF0
+                && i + 3 < bytes.len()
+                && cont(bytes[i + 1])
+                && cont(bytes[i + 2])
+                && cont(bytes[i + 3])
+            {
+                (
+                    ((b0 & 0x07) as u32) << 18
+                        | payload(bytes[i + 1]) << 12
+                        | payload(bytes[i + 2]) << 6
+                        | payload(bytes[i + 3]),
+                    4usize,
+                )
+            } else {
+                (REPLACEMENT_CODEPOINT, 0usize)
+            };
+            if decoded_len == 0 {
+                cp = REPLACEMENT_CODEPOINT;
+                len = 1;
+            } else {
+                let overlong = match decoded_len {
+                    2 => decoded < 0x80,
+                    3 => decoded < 0x800,
+                    4 => decoded < 0x10000,
+                    _ => false,
+                };
+                let valid = !overlong
+                    && decoded <= MAX_CODEPOINT
+                    && !(SURROGATE_LO..=SURROGATE_HI).contains(&decoded);
+                if valid {
+                    cp = decoded;
+                    len = decoded_len;
+                } else {
+                    cp = REPLACEMENT_CODEPOINT;
+                    len = 1;
+                }
+            }
+        }
+        if count == target {
+            return Some(cp);
+        }
+        count += 1;
+        i += len;
+    }
+    None
+}
+
 /// Validate a codepoint index for `string_char_at`. Returns `0` if
 /// `idx` is in `0..codepoint_count(s)`; `1` otherwise. Lossy decode
-/// (matching `sigil_string_chars`).
+/// (matching `sigil_string_chars`); single-pass early-exit walk via
+/// `find_nth_codepoint`.
 ///
 /// # Safety
 ///
 /// `s` must point at a valid `TAG_STRING` header.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_string_char_at_validate(s: *const u8, idx: i64) -> i64 {
-    if idx < 0 {
-        return 1;
-    }
     let (bytes, len) = string_bytes(s);
     let slice = std::slice::from_raw_parts(bytes, len);
-    let cp_count = decode_codepoints_lossy(slice).len() as i64;
-    if idx < cp_count {
+    if find_nth_codepoint(slice, idx).is_some() {
         0
     } else {
         1
@@ -444,8 +527,16 @@ pub unsafe extern "C" fn sigil_string_char_at_validate(s: *const u8, idx: i64) -
 pub unsafe extern "C" fn sigil_string_char_at(s: *const u8, idx: i64) -> *mut u8 {
     let (bytes, len) = string_bytes(s);
     let slice = std::slice::from_raw_parts(bytes, len);
-    let cps = decode_codepoints_lossy(slice);
-    let cp = cps[idx as usize];
+    let cp = match find_nth_codepoint(slice, idx) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "sigil_string_char_at: idx {idx} out of bounds; caller must invoke \
+                 sigil_string_char_at_validate first"
+            );
+            std::process::abort();
+        }
+    };
     alloc_char(cp)
 }
 
@@ -861,6 +952,55 @@ mod tests {
             assert_eq!(
                 list_to_codepoints(list),
                 vec![b'a' as u32, REPLACEMENT_CODEPOINT, b'b' as u32]
+            );
+        }
+    }
+
+    #[test]
+    fn string_chars_overlong_2byte_replaces() {
+        // Plan C addendum review item 4 — `[0xC0, 0x80]` is the
+        // 2-byte overlong of U+0000 (canonical 1-byte). The decoder
+        // must reject overlongs and emit U+FFFD per invalid byte.
+        let _g = gc_test_lock();
+        unsafe {
+            let s = make_string(&[0xC0, 0x80]);
+            let list = sigil_string_chars(
+                s,
+                cons_header_word(),
+                TEST_CONS_DISC,
+                nil_header_word(),
+                TEST_NIL_DISC,
+            );
+            assert_eq!(
+                list_to_codepoints(list),
+                vec![REPLACEMENT_CODEPOINT, REPLACEMENT_CODEPOINT]
+            );
+        }
+    }
+
+    #[test]
+    fn string_chars_overlong_3byte_surrogate_replaces() {
+        // Plan C addendum review item 4 — `[0xED, 0xA0, 0x80]` is
+        // the 3-byte UTF-8 form of U+D800 (a surrogate codepoint,
+        // which is invalid as a Unicode scalar). The decoder must
+        // reject and resync byte-by-byte.
+        let _g = gc_test_lock();
+        unsafe {
+            let s = make_string(&[0xED, 0xA0, 0x80]);
+            let list = sigil_string_chars(
+                s,
+                cons_header_word(),
+                TEST_CONS_DISC,
+                nil_header_word(),
+                TEST_NIL_DISC,
+            );
+            assert_eq!(
+                list_to_codepoints(list),
+                vec![
+                    REPLACEMENT_CODEPOINT,
+                    REPLACEMENT_CODEPOINT,
+                    REPLACEMENT_CODEPOINT
+                ]
             );
         }
     }

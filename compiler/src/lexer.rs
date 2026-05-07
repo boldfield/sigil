@@ -834,10 +834,23 @@ impl<'a> Cursor<'a> {
         }
         if self.peek() != '\'' {
             let span = Span::new(self.file, start_line, start_col, self.line, self.col);
-            // Count how many codepoints follow before the next '.
+            // Count how many codepoints follow before the next '. Use
+            // UTF-8-aware advance so multi-byte source bytes count as
+            // a single codepoint (`'aé'` reports "got 2", not "got 3").
             let mut extra = 1;
             while !self.at_eof() && self.peek() != '\'' && self.peek() != '\n' {
-                self.advance();
+                let b = self.peek() as u32;
+                if b >= 0x80 {
+                    match self.peek_utf8() {
+                        Ok((_, len)) => self.advance_utf8(len),
+                        // Invalid UTF-8 mid-body — fall back to a
+                        // single byte step so the count loop
+                        // terminates rather than spinning.
+                        Err(()) => self.advance(),
+                    }
+                } else {
+                    self.advance();
+                }
                 extra += 1;
             }
             if !self.at_eof() && self.peek() == '\'' {
@@ -1144,6 +1157,21 @@ mod tests {
             TokenKind::CharLit(c) => assert_eq!(c as u32, 0xE000),
             _ => panic!("expected CharLit"),
         }
+    }
+
+    #[test]
+    fn char_literal_multi_codepoint_count_is_codepoint_not_byte() {
+        // Plan C addendum review item 5 — count loop must use UTF-8-
+        // aware advance so multi-byte body bytes count as one
+        // codepoint each.
+        let (_toks, errs) = lex("x.sigil", "'aé'");
+        assert!(!errs.is_empty());
+        assert_eq!(errs[0].code.as_str(), "E0010");
+        assert!(
+            errs[0].message.contains("got 2"),
+            "expected `got 2`; got: {}",
+            errs[0].message
+        );
     }
 
     #[test]
