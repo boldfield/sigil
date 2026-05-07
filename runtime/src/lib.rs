@@ -56,6 +56,7 @@ pub mod arith;
 pub mod array;
 pub mod byte;
 pub mod byte_array;
+pub mod char;
 pub mod clock;
 pub mod continuation;
 pub mod counters;
