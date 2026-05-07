@@ -12936,7 +12936,7 @@ fn env_var_present_returns_some() {
                import std.io\n\
                import std.option\n\
                fn main() -> Int ![IO, Env] {\n  \
-                 match var(\"__SIGIL_E2E_VAR_PRESENT__\") {\n    \
+                 match env_var(\"__SIGIL_E2E_VAR_PRESENT__\") {\n    \
                    Some(v) => perform IO.println(v),\n    \
                    None => perform IO.println(\"absent\"),\n  \
                  };\n  \
@@ -12961,7 +12961,7 @@ fn env_var_absent_returns_none() {
                import std.io\n\
                import std.option\n\
                fn main() -> Int ![IO, Env] {\n  \
-                 match var(\"__SIGIL_E2E_VAR_DEFINITELY_ABSENT__\") {\n    \
+                 match env_var(\"__SIGIL_E2E_VAR_DEFINITELY_ABSENT__\") {\n    \
                    Some(_v) => perform IO.println(\"present\"),\n    \
                    None => perform IO.println(\"none\"),\n  \
                  };\n  \
@@ -12974,16 +12974,16 @@ fn env_var_absent_returns_none() {
 
 #[test]
 fn env_args_returns_at_least_one() {
-    // Emits two sentinels around `args()` so a CI failure points at
-    // *which* step crashed: `pre-args` printed alone means `args()`
-    // itself signal-killed mid-call; both printed plus a count means
-    // success.
+    // Emits two sentinels around `env_args()` so a CI failure points
+    // at *which* step crashed: `pre-args` printed alone means
+    // `env_args()` itself signal-killed mid-call; both printed plus a
+    // count means success.
     let src = "import std.env\n\
                import std.io\n\
                import std.list\n\
                fn main() -> Int ![IO, Env] {\n  \
                  perform IO.println(\"pre-args\");\n  \
-                 let xs: List[String] = args();\n  \
+                 let xs: List[String] = env_args();\n  \
                  perform IO.println(\"post-args\");\n  \
                  perform IO.println(int_to_string(length(xs)));\n  \
                  0\n\
@@ -12999,7 +12999,7 @@ fn env_args_returns_at_least_one() {
     assert_eq!(
         lines.get(1).copied(),
         Some("post-args"),
-        "missing post-args sentinel — args() call itself failed; stdout={stdout:?}"
+        "missing post-args sentinel — env_args() call itself failed; stdout={stdout:?}"
     );
     let n_str = lines.get(2).copied().unwrap_or("");
     let n: i64 = n_str
@@ -13316,4 +13316,184 @@ fn process_run_captures_stderr_separately() {
     let (stdout, stderr, code) = compile_and_run(src, "process_run_stderr");
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "out\nerr\n");
+}
+
+// ── Coverage tests added in PR #N+1 (cli-effects follow-up) ────────
+// Plug gaps the reviewer flagged on PR #106: `env_vars` / `is_file` /
+// `is_dir` / `remove_file` had only runtime unit-test coverage; the
+// E15 spec example imports both `std.env` and `std.fs` but no e2e
+// exercised the dual-import path; `run_list` is a new wrapper this
+// PR introduces and needs at least one happy-path test.
+
+#[test]
+fn env_vars_returns_at_least_one_pair() {
+    // The cargo-test harness inherits a populated environment
+    // (PATH, HOME, CARGO_*, USER, etc.). `env_vars()` should
+    // return at least one (name, value) pair. Test asserts
+    // `length(env_vars()) >= 1`.
+    //
+    // SAFETY: see env_var_present_returns_some.
+    unsafe {
+        std::env::set_var("__SIGIL_E2E_VARS_PRESENT__", "1");
+    }
+    let src = "import std.env\n\
+               import std.io\n\
+               import std.list\n\
+               fn main() -> Int ![IO, Env] {\n  \
+                 let xs: List[(String, String)] = env_vars();\n  \
+                 perform IO.println(int_to_string(length(xs)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "env_vars_count");
+    // SAFETY: see env_var_present_returns_some.
+    unsafe {
+        std::env::remove_var("__SIGIL_E2E_VARS_PRESENT__");
+    }
+    assert_eq!(code, 0, "code != 0; stdout={stdout:?}; stderr={stderr:?}");
+    let n: i64 = stdout
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("env_vars count not parseable; stdout={stdout:?}"));
+    assert!(n >= 1, "env_vars must return at least one pair; got {n}");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_is_file_predicate() {
+    let path = cli_temp_path("isfile");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"x").expect("write fixture");
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match is_file(\"{path_str}\") {{ true => perform IO.println(\"yes\"), false => perform IO.println(\"no\") }};\n  \
+           match is_file(\"/nonexistent/path/__sigil_e2e_no__\") {{ true => perform IO.println(\"yes\"), false => perform IO.println(\"no\") }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_is_file");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "yes\nno\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_is_dir_predicate() {
+    let dir = cli_temp_path("isdir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).expect("create dir fixture");
+    let dir_str = dir.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match is_dir(\"{dir_str}\") {{ true => perform IO.println(\"yes\"), false => perform IO.println(\"no\") }};\n  \
+           match is_dir(\"/nonexistent/dir/__sigil_e2e_no__\") {{ true => perform IO.println(\"yes\"), false => perform IO.println(\"no\") }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_is_dir");
+    let _ = std::fs::remove_dir(&dir);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "yes\nno\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_remove_file_round_trip() {
+    let path = cli_temp_path("rm_round");
+    std::fs::write(&path, b"x").expect("write fixture");
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match remove_file(\"{path_str}\") {{\n    \
+             Ok(_) => perform IO.println(\"removed\"),\n    \
+             Err(_) => perform IO.println(\"err\"),\n  \
+           }};\n  \
+           match exists(\"{path_str}\") {{ true => perform IO.println(\"still_there\"), false => perform IO.println(\"gone\") }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_remove_file");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "removed\ngone\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_list_with_list_argv() {
+    // `run_list` wraps `run` with a `List[String]` argv — the more
+    // idiomatic LLM-friendly shape vs. `array_alloc` + sequential
+    // `array_set`. Equivalent to `process_run_echo_returns_zero_with_-
+    // stdout` but exercising the List path.
+    let src = "import std.process\n\
+               import std.list\n\
+               import std.io\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Process] {\n  \
+                 match run_list(\"echo\", Cons(\"hello\", Nil)) {\n    \
+                   Ok((code, out, _err)) => match code {\n      \
+                     0 => perform IO.println(out),\n      \
+                     _ => perform IO.println(\"nonzero\"),\n    \
+                   },\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "process_run_list");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "hello\n\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_combined_env_and_fs_imports() {
+    // E15 spec example shape: import both `std.env` and `std.fs` in
+    // one program. Exercises the import-resolver dedup path (both
+    // files import std.array internally) plus the dual-effect row
+    // `![IO, Env, Fs]` on main.
+    let dir = cli_temp_path("e15");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).expect("create temp dir");
+    std::fs::write(dir.join("a"), b"a").expect("write a");
+    let dir_str = dir.to_str().expect("utf-8 path");
+    // SAFETY: see env_var_present_returns_some.
+    unsafe {
+        std::env::set_var("__SIGIL_E2E_E15__", "ok");
+    }
+    let src = format!(
+        "import std.env\n\
+         import std.fs\n\
+         import std.io\n\
+         import std.list\n\
+         import std.option\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Env, Fs] {{\n  \
+           match env_var(\"__SIGIL_E2E_E15__\") {{\n    \
+             Some(v) => perform IO.println(v),\n    \
+             None => perform IO.println(\"none\"),\n  \
+           }};\n  \
+           match read_dir(\"{dir_str}\") {{\n    \
+             Ok(xs) => perform IO.println(int_to_string(length(xs))),\n    \
+             Err(_) => perform IO.println(\"err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "cli_combined");
+    // SAFETY: see env_var_present_returns_some.
+    unsafe {
+        std::env::remove_var("__SIGIL_E2E_E15__");
+    }
+    let _ = std::fs::remove_file(dir.join("a"));
+    let _ = std::fs::remove_dir(&dir);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "ok\n1\n");
 }

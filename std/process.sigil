@@ -27,19 +27,16 @@
 // - `stdout` and `stderr` are captured as Strings (lossy UTF-8 —
 //   invalid bytes become `U+FFFD`, matching `string_chars`'s policy).
 //
-// ## Example
+// ## Example (via `run_list`, the LLM-friendly surface)
 //
 // ```sigil
 // import std.process
 // import std.io
-// import std.array
+// import std.list
 //
-// fn main() -> Int ![IO, Process, Mem] {
+// fn main() -> Int ![IO, Process] {
 //   // No shell invocation — direct exec only.
-//   let args: Array[String] = array_alloc(2, "");
-//   let args: Array[String] = array_set(args, 0, "status");
-//   let args: Array[String] = array_set(args, 1, "--porcelain");
-//   match run("git", args) {
+//   match run_list("git", Cons("status", Cons("--porcelain", Nil))) {
 //     Ok((code, out, _err)) => match code {
 //       0 => perform IO.println(out),
 //       _ => perform IO.println("git status failed"),
@@ -51,6 +48,11 @@
 // }
 // ```
 //
+// `run` (Array[String]) and `run_list` (List[String]) are
+// equivalent surfaces; `run_list` calls into `run` after a
+// List→Array conversion. List is the more idiomatic argv shape and
+// composes naturally with `env_args()` / `Cons` / `map` / `filter`.
+//
 // ## Scope guardrails
 //
 // - **No shell invocation.** `run("ls", args)` directly execs `ls`;
@@ -61,6 +63,7 @@
 //   child exits.
 
 import std.array
+import std.list
 import std.result
 
 type ProcessError =
@@ -79,4 +82,14 @@ fn run(cmd: String, args: Array[String]) -> Result[(Int, String, String), Proces
     (2, _, _, _) => Err(PermissionDenied),
     (_, _, _, err) => Err(Other(err)),
   }
+}
+
+// `run_list(cmd, args)` is identical to `run` but takes the argv as
+// `List[String]`. Converts internally via
+// `std/list.sigil::__list_to_array` then forwards to `run`. This is
+// the more idiomatic surface — `Cons("a", Cons("b", Nil))` reads
+// cleaner than the immutable `array_alloc` + sequential `array_set`
+// dance, and List composes with `env_args()` / `map` / `filter`.
+fn run_list(cmd: String, args: List[String]) -> Result[(Int, String, String), ProcessError] ![Process] {
+  run(cmd, __list_to_array(args, ""))
 }

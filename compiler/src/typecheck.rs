@@ -1002,12 +1002,18 @@ fn builtin_effects() -> Vec<EffectDecl> {
         elems: vec![int_ty(), string_ty()],
         span: span.clone(),
     };
-    let int_int64_tuple_ty = || TypeExpr::Tuple {
-        elems: vec![int_ty(), int64_ty()],
+    let int_int64_string_tuple_ty = || TypeExpr::Tuple {
+        // (tag: Int, payload: Int64, msg: String) — `msg` carries the
+        // OS-error display when tag indexes the `Other` variant;
+        // otherwise empty. Lets `file_size`'s `Other` case round-
+        // trip its diagnostic message through the wrapper.
+        elems: vec![int_ty(), int64_ty(), string_ty()],
         span: span.clone(),
     };
-    let int_array_string_tuple_ty = || TypeExpr::Tuple {
-        elems: vec![int_ty(), array_string_ty()],
+    let int_array_string_string_tuple_ty = || TypeExpr::Tuple {
+        // (tag: Int, payload: Array[String], msg: String) — same
+        // rationale as `int_int64_string_tuple_ty`.
+        elems: vec![int_ty(), array_string_ty(), string_ty()],
         span: span.clone(),
     };
     let process_run_result_ty = || TypeExpr::Tuple {
@@ -1017,7 +1023,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
     };
 
     // Env — environment + process arguments. No fallible ops at the
-    // effect layer; the `Option[String]` surface for `env.var(name)`
+    // effect layer; the `Option[String]` surface for `env_var(name)`
     // is constructed by the stdlib wrapper from the raw `(Int,
     // String)` tuple (tag 0 = Some, tag 1 = None).
     //
@@ -1085,7 +1091,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
                 name_span: span.clone(),
                 generic_params: Vec::new(),
                 params: vec![string_ty()],
-                return_type: int_int64_tuple_ty(),
+                return_type: int_int64_string_tuple_ty(),
                 span: span.clone(),
             },
             EffectOp {
@@ -1117,7 +1123,7 @@ fn builtin_effects() -> Vec<EffectDecl> {
                 name_span: span.clone(),
                 generic_params: Vec::new(),
                 params: vec![string_ty()],
-                return_type: int_array_string_tuple_ty(),
+                return_type: int_array_string_string_tuple_ty(),
                 span: span.clone(),
             },
             EffectOp {
@@ -1345,11 +1351,19 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     for item in &program.items {
         if let Item::Effect(ed) = item {
             if effects.contains_key(&ed.name) {
+                let msg = if BUILTIN_EFFECT_NAMES.contains(&ed.name.as_str()) {
+                    format!(
+                        "duplicate effect declaration `{}` (reserved builtin effect name; pick a different name like `Cfg`/`AppEnv`/`MyFs` for user effects)",
+                        ed.name,
+                    )
+                } else {
+                    format!("duplicate effect declaration `{}`", ed.name)
+                };
                 errors.push(CompilerError::new(
                     Severity::Error,
                     errors::code("E0136"),
                     ed.name_span.clone(),
-                    format!("duplicate effect declaration `{}`", ed.name),
+                    msg,
                 ));
             } else {
                 let mut canonical = (**ed).clone();
@@ -11941,6 +11955,32 @@ mod tests {
         );
     }
 
+    /// Plan C addendum follow-up — when a user redeclares any builtin
+    /// effect (`IO`, `ArithError`, `Mem`, `Env`, `Fs`, `Process`),
+    /// E0136 fires with a message that explicitly names the reserved
+    /// builtin and suggests picking a different name. The plain
+    /// `duplicate effect declaration` message was unhelpful when the
+    /// user didn't know `Env` / `Fs` / `Process` are stdlib-reserved.
+    #[test]
+    fn redeclaring_builtin_env_fs_process_mentions_reserved_in_message() {
+        for builtin in ["Env", "Fs", "Process", "IO", "ArithError", "Mem"] {
+            let src = format!(
+                "effect {builtin} {{ ping: () -> Int }}\n\
+                 fn main() -> Int ![] {{ 0 }}\n"
+            );
+            let errs = pipeline(&src);
+            let e0136 = errs
+                .iter()
+                .find(|e| e.code.as_str() == "E0136")
+                .unwrap_or_else(|| panic!("expected E0136 for `effect {builtin}`; got: {errs:?}"));
+            assert!(
+                e0136.message.contains("reserved builtin effect name"),
+                "E0136 for builtin `{builtin}` should call out reserved-name status; got: {msg:?}",
+                msg = e0136.message,
+            );
+        }
+    }
+
     #[test]
     fn op_ids_assigned_alphabetically_per_effect() {
         // Plan B Task 55 — op_ids are assigned alphabetically within
@@ -14805,7 +14845,7 @@ mod tests {
         let src = "import std.env\n\
                    import std.option\n\
                    fn main() -> Int ![Env] {\n  \
-                     match var(\"HOME\") {\n    \
+                     match env_var(\"HOME\") {\n    \
                        Some(_h) => 0,\n    \
                        None => 1,\n  \
                      }\n\

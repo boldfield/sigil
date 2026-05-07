@@ -434,7 +434,7 @@ fn fail_with(msg: String) -> Int ![IO] {
 fn main() -> Int ![IO, Env, Fs] {
   // First arg after argv[0] is the directory to list; default to "."
   // if not provided.
-  let argv: List[String] = args();
+  let argv: List[String] = env_args();
   let path: String = match argv {
     Nil => ".",
     Cons(_prog, Nil) => ".",
@@ -444,12 +444,13 @@ fn main() -> Int ![IO, Env, Fs] {
 }
 ```
 
-This is the CLI-tool baseline: `args()` gives the argv list (POSIX
-convention — `args()[0]` is the program name); `read_dir(path)`
-returns `Result[List[String], FsError]` with entry names (no path
-joining); pattern-match handles each FsError variant; output prints
-via `IO.println`. Replace `read_dir` with `read_file(p)` to read a
-file; replace with `run("cmd", args)` to spawn a subprocess.
+This is the CLI-tool baseline: `env_args()` gives the argv list
+(POSIX convention — `env_args()[0]` is the program name);
+`read_dir(path)` returns `Result[List[String], FsError]` with entry
+names (no path joining); pattern-match handles each FsError variant;
+output prints via `IO.println`. Replace `read_dir` with
+`read_file(p)` to read a file; replace with `run("cmd", argv)` to
+spawn a subprocess.
 
 ---
 
@@ -863,6 +864,27 @@ activation). Default is single-shot.
 
 In v1 only the builtin `Mem` effect has zero ops (it's a marker).
 
+##### Reserved effect names
+
+The following effect names are reserved by the standard library;
+declaring `effect <name> { … }` for any of them is a compile-time
+error (E0136 — duplicate effect declaration):
+
+`ArithError`, `IO`, `Mem`, `Env`, `Fs`, `Process`, `Random`,
+`Clock`, `Raise[E]`, `State[S]`, `Choose`.
+
+The first six (`ArithError`, `IO`, `Mem`, `Env`, `Fs`, `Process`)
+are *builtin* effects — synthesized at typecheck pre-pass with
+fixed effect IDs (`ArithError = 0`, `IO = 1`, `Mem = 2`, `Env = 3`,
+`Fs = 4`, `Process = 5`). They appear in every program's effect-
+id table whether the program uses them or not. The remaining names
+are user-stdlib effects defined in `std/<name>.sigil`; redeclaring
+them collides at typecheck unless the user code shadows the
+import.
+
+User effects with novel names (`Cfg`, `Network`, `Audit`, etc.)
+remain free.
+
 #### §8.2 — Performing effects
 
 ```sigil
@@ -1052,9 +1074,9 @@ files are the authoritative API reference.
 | `std.string_builder` | `StringBuilder` rope (Mem-gated). |
 | `std.pair` | `fst[A, B]`, `snd[A, B]` accessors for binary tuples `(A, B)`. |
 | `std.io` | `IO` effect: `print`, `println`, `read_line`. (File ops moved to `std.fs`.) |
-| `std.env` | `Env` effect: `args() -> List[String]`, `var(name) -> Option[String]`, `vars() -> List[(String, String)]`. |
+| `std.env` | `Env` effect: `env_args() -> List[String]`, `env_var(name) -> Option[String]`, `env_vars() -> List[(String, String)]`. The effect-prefixed naming matches `random_int` / `clock_now` and avoids shadowing the very common parameter name `args`. |
 | `std.fs` | `Fs` effect + `FsError` sum type. Predicates: `exists`, `is_file`, `is_dir` → `Bool`. Fallible ops: `read_file`, `write_file`, `read_dir`, `mkdir`, `remove_file`, `remove_dir`, `file_size` → `Result[T, FsError]`. `FsError = \| NotFound \| PermissionDenied \| AlreadyExists \| NotADirectory \| IsADirectory \| InvalidUtf8 \| Other(String)`. |
-| `std.process` | `Process` effect + `ProcessError` sum type. `run(cmd, args: Array[String]) -> Result[(Int, String, String), ProcessError]` — direct exec (no shell), captures stdout / stderr after wait. `ProcessError = \| NotFound \| PermissionDenied \| Other(String)`. |
+| `std.process` | `Process` effect + `ProcessError` sum type. `run(cmd, args: Array[String]) -> Result[(Int, String, String), ProcessError]` — direct exec (no shell), captures stdout / stderr after wait. `run_list(cmd, args: List[String])` — same surface with the more idiomatic `List[String]` argv shape; converts internally and forwards to `run`. `ProcessError = \| NotFound \| PermissionDenied \| Other(String)`. |
 | `std.mem` | `Mem` marker effect. |
 | `std.random` | `Random` effect + `run_pseudo_random` (process-global xorshift64) + `run_seeded_random` (deterministic xorshift64 from an `Int64` seed). **Not cryptographically secure.** |
 | `std.clock` | `Clock` effect + `run_os_clock` (wall-clock nanos) + `run_frozen_clock` (fixed `Int64` timestamp for test determinism). |

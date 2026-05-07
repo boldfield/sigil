@@ -119,3 +119,40 @@ fn range(start: Int, end: Int) -> List[Int] ![] {
 // write a direct recursive `match` helper for now; the canonical
 // v2 surface lands when row-poly fn-typed params + a Unit literal
 // (or a sequencing primitive in match arm bodies) ships.
+
+// Internal helper: convert `Array[A]` slots `[idx, n)` into a
+// `List[A]` (head-first). Lives here rather than in `std/env.sigil`
+// or `std/fs.sigil` because both files used to ship identical
+// monomorphic copies (`__array_to_list_string`,
+// `__array_to_list_pair`) — pulling the generic version into list-
+// land deduplicates and lets future array-consuming wrappers reuse
+// it without each defining their own.
+//
+// O(n - idx) stack frames; same recursion bound as the rest of this
+// module.
+fn __array_to_list[A](arr: Array[A], idx: Int, n: Int) -> List[A] ![] {
+  match idx < n {
+    true => Cons(array_get(arr, idx), __array_to_list(arr, idx + 1, n)),
+    false => Nil,
+  }
+}
+
+// Internal helper: convert `List[A]` to `Array[A]`. The `fill`
+// argument is required by `array_alloc[A](len, fill)` since v1
+// arrays are immutable (allocate-then-set returns fresh arrays each
+// time). Caller passes any A — typically the natural zero of the
+// type (`""` for String, `0` for Int, etc.). Used by
+// `std/process.sigil::run_list` to thread `List[String]` argv into
+// the `Array[String]` shape `Process.run` expects.
+//
+// O(n) recursive `array_set` calls — each returns a fresh array.
+fn __list_to_array[A](xs: List[A], fill: A) -> Array[A] ![] {
+  __list_to_array_acc(xs, array_alloc(length(xs), fill), 0)
+}
+
+fn __list_to_array_acc[A](xs: List[A], arr: Array[A], idx: Int) -> Array[A] ![] {
+  match xs {
+    Nil => arr,
+    Cons(h, t) => __list_to_array_acc(t, array_set(arr, idx, h), idx + 1),
+  }
+}
