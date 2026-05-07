@@ -2135,6 +2135,8 @@ fn user_discard_k_io_handler_unwinds_helper_at_perform_site() {
     // must be exhaustive — the discard-k semantics this test pins
     // apply uniformly across all ops; only the println arm is
     // exercised at runtime since helper() performs only println.
+    // Plan C addendum (CLI external-system effects, EE1) — IO trimmed
+    // to print / println / read_line; file ops migrated to Fs effect.
     let src = "fn helper() -> Int ![IO] {\n  \
                  perform IO.println(\"a\");\n  \
                  1\n\
@@ -2143,9 +2145,7 @@ fn user_discard_k_io_handler_unwinds_helper_at_perform_site() {
                  let n: Int = handle helper() with {\n    \
                    IO.print(s, k) => 0,\n    \
                    IO.println(s, k) => 0,\n    \
-                   IO.read_file(p, k) => 0,\n    \
-                   IO.read_line(k) => 0,\n    \
-                   IO.write_file(p, d, k) => 0,\n  \
+                   IO.read_line(k) => 0,\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
@@ -7358,25 +7358,11 @@ fn std_io_read_line_via_piped_stdin() {
     );
 }
 
-/// `IO.write_file` then `IO.read_file` round-trips a string through
-/// the filesystem. Uses a tmp path to avoid CI / pod conflicts.
-#[test]
-fn std_io_read_write_file_round_trip() {
-    let tmp = std::env::temp_dir().join(format!("sigil_e2e_io_rw_{}.txt", std::process::id()));
-    let tmp_str = tmp.to_str().expect("tmp path utf8");
-    let src = format!(
-        "fn main() -> Int ![IO] {{\n  \
-           perform IO.write_file(\"{tmp_str}\", \"hello, file\");\n  \
-           let contents: String = perform IO.read_file(\"{tmp_str}\");\n  \
-           perform IO.println(contents);\n  \
-           0\n\
-         }}\n"
-    );
-    let (stdout, stderr, code) = compile_and_run(&src, "std_io_read_write_file");
-    let _ = std::fs::remove_file(&tmp);
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "hello, file\n", "stderr={stderr:?}");
-}
+// Plan C addendum (CLI external-system effects, EE1+EE6) — the
+// `IO.write_file` / `IO.read_file` round-trip moves to the Fs surface.
+// The new round-trip lives in EE6's `fs_*` e2e suite, exercising
+// `write_file` + `read_file` stdlib wrappers from `std/fs.sigil` that
+// return `Result[Unit, FsError]` / `Result[String, FsError]`.
 
 // ===== Plan C Task 71 — Raise + catch run-and-check-output =====
 

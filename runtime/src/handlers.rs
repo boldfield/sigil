@@ -1911,60 +1911,13 @@ pub unsafe extern "C" fn sigil_io_read_line_arm(
     ns
 }
 
-/// Plan C Task 70 — runtime-side default handler for `IO.read_file`.
-/// One user arg (path: String); returns the file contents as a
-/// fresh Sigil String. Aborts on IO error or invalid UTF-8.
-///
-/// # Safety
-///
-/// Same as `sigil_io_println_arm`.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_io_read_file_arm(
-    _closure_ptr: *const u8,
-    in_args: *const u64,
-    args_len: u32,
-    _terminal_out: *mut TerminalResult,
-) -> *mut NextStep {
-    debug_assert!(args_len == 3);
-    debug_assert!(!in_args.is_null());
-    let path_ptr = *in_args as *const u8;
-    debug_assert!(!path_ptr.is_null());
-    let k_closure = *in_args.add(1) as *mut u8;
-    let k_fn = *in_args.add(2) as *mut u8;
-    let contents_ptr = crate::io::sigil_read_file(path_ptr);
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    let out_args = sigil_next_step_args_ptr(ns);
-    *out_args = contents_ptr as u64;
-    ns
-}
-
-/// Plan C Task 70 — runtime-side default handler for `IO.write_file`.
-/// Two user args (path, data); writes the data to the file path,
-/// replacing any existing contents. Returns Unit. Aborts on IO error.
-///
-/// # Safety
-///
-/// `in_args` must point at 4 readable u64 (path, data, k_closure, k_fn).
-#[no_mangle]
-pub unsafe extern "C" fn sigil_io_write_file_arm(
-    _closure_ptr: *const u8,
-    in_args: *const u64,
-    args_len: u32,
-    _terminal_out: *mut TerminalResult,
-) -> *mut NextStep {
-    debug_assert!(args_len == 4);
-    debug_assert!(!in_args.is_null());
-    let path_ptr = *in_args as *const u8;
-    let data_ptr = *in_args.add(1) as *const u8;
-    debug_assert!(!path_ptr.is_null() && !data_ptr.is_null());
-    let k_closure = *in_args.add(2) as *mut u8;
-    let k_fn = *in_args.add(3) as *mut u8;
-    crate::io::sigil_write_file(path_ptr, data_ptr);
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    let out_args = sigil_next_step_args_ptr(ns);
-    *out_args = 0; // unit
-    ns
-}
+// Plan C addendum (CLI external-system effects, EE1) —
+// `sigil_io_read_file_arm` and `sigil_io_write_file_arm` were
+// removed alongside their corresponding `IO.read_file` /
+// `IO.write_file` ops. File operations migrate to the `Fs` effect's
+// raw-shape ops, dispatched through codegen-synthesized arm fns
+// that build `(Int, String)` tuples + map errors to `FsError`
+// variants in stdlib `std/fs.sigil` wrappers.
 
 /// Plan B Task 57 — runtime-side default handler for
 /// `ArithError.div_by_zero`. Conforms to the Phase 4 CPS arm fn ABI.

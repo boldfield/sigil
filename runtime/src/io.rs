@@ -87,61 +87,13 @@ pub unsafe extern "C" fn sigil_read_line() -> *mut u8 {
     sigil_string_new(buf.as_bytes().as_ptr(), buf.len())
 }
 
-/// Plan C Task 70 — read the contents of `path` as a byte sequence
-/// and return it as a fresh Sigil `String`. Aborts on IO error
-/// (missing file, permission denied) or invalid UTF-8.
-///
-/// # Safety
-///
-/// `path_obj` must be a non-null pointer returned by
-/// `sigil_string_new` whose payload is a valid filesystem path.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_read_file(path_obj: *const u8) -> *mut u8 {
-    let (bytes, len) = string_bytes(path_obj);
-    let slice = std::slice::from_raw_parts(bytes, len);
-    let path = match std::str::from_utf8(slice) {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("sigil_read_file: path is not valid UTF-8");
-            std::process::abort();
-        }
-    };
-    let contents = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("sigil_read_file: failed to read `{path}`: {e}");
-            std::process::abort();
-        }
-    };
-    // SAFETY: gc-heap-ptr arithmetic (contents is a stack-local String, not a heap object — false-positive).
-    sigil_string_new(contents.as_bytes().as_ptr(), contents.len())
-}
-
-/// Plan C Task 70 — write the contents of `data_obj` to the file at
-/// `path_obj`, replacing any existing contents. Aborts on IO error.
-///
-/// # Safety
-///
-/// Both arguments must be non-null pointers returned by
-/// `sigil_string_new`.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_write_file(path_obj: *const u8, data_obj: *const u8) {
-    let (path_bytes, path_len) = string_bytes(path_obj);
-    let path_slice = std::slice::from_raw_parts(path_bytes, path_len);
-    let path = match std::str::from_utf8(path_slice) {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("sigil_write_file: path is not valid UTF-8");
-            std::process::abort();
-        }
-    };
-    let (data_bytes, data_len) = string_bytes(data_obj);
-    let data_slice = std::slice::from_raw_parts(data_bytes, data_len);
-    if let Err(e) = std::fs::write(path, data_slice) {
-        eprintln!("sigil_write_file: failed to write `{path}`: {e}");
-        std::process::abort();
-    }
-}
+// Plan C addendum (CLI external-system effects, EE1) — `sigil_read_file`
+// and `sigil_write_file` (which aborted on IO error) were removed
+// alongside their `IO.read_file` / `IO.write_file` arm fns. Their
+// error-aware replacements live in `runtime/src/fs.rs` (EE2) and
+// surface through the `Fs` effect's raw-shape ops + `std/fs.sigil`'s
+// `read_file` / `write_file` wrappers returning
+// `Result[String, FsError]` / `Result[Unit, FsError]`.
 
 #[cfg(test)]
 mod tests {

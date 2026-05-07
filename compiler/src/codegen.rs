@@ -8745,16 +8745,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
     // Plan C Task 70 — additional IO arm fns. Same ABI shape as
     // `sigil_io_println_arm`.
+    //
+    // Plan C addendum (CLI external-system effects, EE1) —
+    // `sigil_io_read_file_arm` and `sigil_io_write_file_arm` removed
+    // alongside the corresponding `IO.read_file` / `IO.write_file`
+    // ops. File operations migrate to the `Fs` effect's raw-shape
+    // ops, dispatched through codegen-synthesized arm fns wired up
+    // in EE3.
     let io_print_arm = module
         .declare_function("sigil_io_print_arm", Linkage::Import, &io_println_arm_sig)
         .map_err(|e| format!("declare sigil_io_print_arm: {e}"))?;
-    let io_read_file_arm = module
-        .declare_function(
-            "sigil_io_read_file_arm",
-            Linkage::Import,
-            &io_println_arm_sig,
-        )
-        .map_err(|e| format!("declare sigil_io_read_file_arm: {e}"))?;
     let io_read_line_arm = module
         .declare_function(
             "sigil_io_read_line_arm",
@@ -8762,13 +8762,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             &io_println_arm_sig,
         )
         .map_err(|e| format!("declare sigil_io_read_line_arm: {e}"))?;
-    let io_write_file_arm = module
-        .declare_function(
-            "sigil_io_write_file_arm",
-            Linkage::Import,
-            &io_println_arm_sig,
-        )
-        .map_err(|e| format!("declare sigil_io_write_file_arm: {e}"))?;
 
     // Plan B Task 57 — sigil_arith_error_div_by_zero_arm and
     // sigil_arith_error_mod_by_zero_arm, the two runtime-side default
@@ -11561,9 +11554,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let io_println_arm_ref = module.declare_func_in_func(io_println_arm, builder.func);
         // Plan C Task 70 — additional IO arm fns.
         let io_print_arm_ref = module.declare_func_in_func(io_print_arm, builder.func);
-        let io_read_file_arm_ref = module.declare_func_in_func(io_read_file_arm, builder.func);
         let io_read_line_arm_ref = module.declare_func_in_func(io_read_line_arm, builder.func);
-        let io_write_file_arm_ref = module.declare_func_in_func(io_write_file_arm, builder.func);
         let arith_div_arm_ref = module.declare_func_in_func(arith_error_div_arm, builder.func);
         let arith_mod_arm_ref = module.declare_func_in_func(arith_error_mod_arm, builder.func);
 
@@ -11620,12 +11611,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         stackmap.push_placeholder(function_code_offset(&builder, arith_push_call));
 
         // ────── IO handler frame (last-pushed, first-popped) ──────
-        // effect_id=1, arm_count=5. Op IDs assigned alphabetically:
-        // 0=print, 1=println, 2=read_file, 3=read_line, 4=write_file.
-        // (Plan C Task 70 added the four non-`println` ops; their
-        // alphabetical positions shifted `println` from op_id 0 to 1.)
+        // effect_id=1, arm_count=3. Op IDs (alphabetical, post-Plan-C-
+        // addendum-EE1): 0=print, 1=println, 2=read_line.
+        // (Plan C Task 70 grew IO from 1 → 5 ops. Plan C addendum EE1
+        // removed `read_file` / `write_file` — file ops migrated to
+        // `Fs` effect's raw-shape ops + stdlib `read_file` /
+        // `write_file` wrappers in `std/fs.sigil`.)
         let io_effect_id_v = builder.ins().iconst(types::I32, 1);
-        let io_arm_count_v = builder.ins().iconst(types::I32, 5);
+        let io_arm_count_v = builder.ins().iconst(types::I32, 3);
         let io_resumes_many_v = builder.ins().iconst(types::I32, 0);
         let io_frame_new_call = builder.ins().call(
             frame_new_ref,
@@ -11650,9 +11643,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         };
         install_io_arm(&mut builder, &mut stackmap, 0, io_print_arm_ref); // print
         install_io_arm(&mut builder, &mut stackmap, 1, io_println_arm_ref); // println
-        install_io_arm(&mut builder, &mut stackmap, 2, io_read_file_arm_ref); // read_file
-        install_io_arm(&mut builder, &mut stackmap, 3, io_read_line_arm_ref); // read_line
-        install_io_arm(&mut builder, &mut stackmap, 4, io_write_file_arm_ref); // write_file
+        install_io_arm(&mut builder, &mut stackmap, 2, io_read_line_arm_ref); // read_line
 
         // Push the IO frame.
         let push_call = builder.ins().call(handle_push_ref, &[io_frame_ptr]);
