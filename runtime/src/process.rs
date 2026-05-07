@@ -283,4 +283,30 @@ mod tests {
             assert_eq!(&bytes[2], "γ".as_bytes());
         }
     }
+
+    /// Pins `PROCESS_*` constants against `std/process.sigil`'s
+    /// `match (tag, _, _, _) { (1, ...) => Err(NotFound), (2, ...) =>
+    /// Err(PermissionDenied), (_, ...) => Err(Other(err)) }`. Same
+    /// rationale as `fs::tests::fs_err_tag_round_trip_*`: the
+    /// runtime + stdlib jointly own the tag → variant contract.
+    #[test]
+    fn process_err_tag_round_trip_pinned_against_stdlib_variants() {
+        assert_eq!(PROCESS_OK, 0, "tag 0 reserved for `Ok`");
+        assert_eq!(PROCESS_ERR_NOT_FOUND, 1);
+        assert_eq!(PROCESS_ERR_PERMISSION_DENIED, 2);
+        assert_eq!(PROCESS_ERR_OTHER, 3);
+
+        assert_eq!(
+            map_launch_err(&io::Error::new(io::ErrorKind::NotFound, "")),
+            PROCESS_ERR_NOT_FOUND,
+        );
+        assert_eq!(
+            map_launch_err(&io::Error::new(io::ErrorKind::PermissionDenied, "")),
+            PROCESS_ERR_PERMISSION_DENIED,
+        );
+        assert_eq!(
+            map_launch_err(&io::Error::new(io::ErrorKind::InvalidInput, "")),
+            PROCESS_ERR_OTHER,
+        );
+    }
 }

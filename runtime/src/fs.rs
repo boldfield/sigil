@@ -93,10 +93,18 @@ unsafe fn build_int_string_tuple(tag: i64, value: *mut u8) -> *mut u8 {
     alloc_tuple(&[tag as u64, value as u64], 0b10)
 }
 
-/// Build an `(Int, T)` tuple where `T` is a pointer-typed Sigil
-/// value (Int64, Array, Tuple). Same bitmap as Int+String.
-unsafe fn build_int_pointer_tuple(tag: i64, ptr: *mut u8) -> *mut u8 {
-    alloc_tuple(&[tag as u64, ptr as u64], 0b10)
+/// Build an `(Int, T, String)` tuple where `T` is a pointer-typed
+/// Sigil value (Int64, Array). The trailing `msg` slot carries the
+/// OS-error display string when the tag indexes the `Other` variant;
+/// otherwise empty. Bitmap = `0b110` (slots 1 + 2 are pointers; slot
+/// 0 is the scalar tag).
+///
+/// Used by `file_size` (T = Int64) and `read_dir` (T = Array[String])
+/// — each needs to round-trip the OS error message through to the
+/// stdlib `Err(Other(msg))` construction site. Earlier draft used a
+/// 2-tuple `(Int, T)` here which dropped the message on the floor.
+unsafe fn build_int_pointer_string_tuple(tag: i64, ptr: *mut u8, msg: *mut u8) -> *mut u8 {
+    alloc_tuple(&[tag as u64, ptr as u64, msg as u64], 0b110)
 }
 
 // ── Predicates ─────────────────────────────────────────────────────
@@ -205,26 +213,42 @@ pub unsafe extern "C" fn sigil_fs_file_size_arm(
     let k_closure = *in_args.add(1) as *mut u8;
     let k_fn = *in_args.add(2) as *mut u8;
 
-    let (tag, size_value) = match path_str_from_sigil_arg(path_ptr) {
+    let (tag, size_value, msg) = match path_str_from_sigil_arg(path_ptr) {
         Some(p) => match std::fs::metadata(p) {
             Ok(m) => {
                 // `Metadata::len()` returns u64. Sigil's `Int64` is
                 // signed, so files >= 2^63 bytes (~9.2 EB) would wrap
                 // to negative on a naked `as i64` cast. Surface that
-                // case as `FsError::Other` rather than silently
-                // misreporting size.
+                // case as `FsError::Other("file size exceeds Int64
+                // range")` rather than silently misreporting size.
                 let len = m.len();
                 if len > i64::MAX as u64 {
-                    (FS_ERR_OTHER, alloc_int64(0))
+                    (
+                        FS_ERR_OTHER,
+                        alloc_int64(0),
+                        alloc_string_from_str("file size exceeds Int64 range"),
+                    )
                 } else {
-                    (FS_OK, alloc_int64(len as i64))
+                    (FS_OK, alloc_int64(len as i64), alloc_string_from_str(""))
                 }
             }
-            Err(e) => (map_io_err(&e), alloc_int64(0)),
+            Err(e) => {
+                let kind = map_io_err(&e);
+                let display = if kind == FS_ERR_OTHER {
+                    alloc_string_from_str(&format!("{e}"))
+                } else {
+                    alloc_string_from_str("")
+                };
+                (kind, alloc_int64(0), display)
+            }
         },
-        None => (FS_ERR_INVALID_UTF8, alloc_int64(0)),
+        None => (
+            FS_ERR_INVALID_UTF8,
+            alloc_int64(0),
+            alloc_string_from_str(""),
+        ),
     };
-    let tup = build_int_pointer_tuple(tag, size_value);
+    let tup = build_int_pointer_string_tuple(tag, size_value, msg);
 
     let ns = sigil_next_step_call(k_closure, k_fn, 1);
     *sigil_next_step_args_ptr(ns) = tup as u64;
@@ -297,7 +321,7 @@ pub unsafe extern "C" fn sigil_fs_read_dir_arm(
     let k_closure = *in_args.add(1) as *mut u8;
     let k_fn = *in_args.add(2) as *mut u8;
 
-    let (tag, arr) = match path_str_from_sigil_arg(path_ptr) {
+    let (tag, arr, msg) = match path_str_from_sigil_arg(path_ptr) {
         Some(p) => match std::fs::read_dir(p) {
             Ok(rd) => {
                 // Collect entry names (Rust strings, allocator-
@@ -323,13 +347,25 @@ pub unsafe extern "C" fn sigil_fs_read_dir_arm(
                     let s = alloc_string_from_str(name);
                     array_set_slot_raw(arr, i, s as u64);
                 }
-                (FS_OK, arr)
+                (FS_OK, arr, alloc_string_from_str(""))
             }
-            Err(e) => (map_io_err(&e), alloc_array_with_capacity(0)),
+            Err(e) => {
+                let kind = map_io_err(&e);
+                let display = if kind == FS_ERR_OTHER {
+                    alloc_string_from_str(&format!("{e}"))
+                } else {
+                    alloc_string_from_str("")
+                };
+                (kind, alloc_array_with_capacity(0), display)
+            }
         },
-        None => (FS_ERR_INVALID_UTF8, alloc_array_with_capacity(0)),
+        None => (
+            FS_ERR_INVALID_UTF8,
+            alloc_array_with_capacity(0),
+            alloc_string_from_str(""),
+        ),
     };
-    let tup = build_int_pointer_tuple(tag, arr);
+    let tup = build_int_pointer_string_tuple(tag, arr, msg);
 
     let ns = sigil_next_step_call(k_closure, k_fn, 1);
     *sigil_next_step_args_ptr(ns) = tup as u64;
@@ -681,5 +717,66 @@ mod tests {
         assert_eq!(map_io_err(&ae), FS_ERR_ALREADY_EXISTS);
         let other = io::Error::new(io::ErrorKind::InvalidInput, "");
         assert_eq!(map_io_err(&other), FS_ERR_OTHER);
+    }
+
+    /// `std/fs.sigil`'s `__tag_to_fs_error(tag, msg)` does this
+    /// mapping in Sigil:
+    ///
+    /// ```sigil
+    /// match tag {
+    ///   1 => NotFound,
+    ///   2 => PermissionDenied,
+    ///   3 => AlreadyExists,
+    ///   4 => NotADirectory,
+    ///   5 => IsADirectory,
+    ///   6 => InvalidUtf8,
+    ///   _ => Other(msg),
+    /// }
+    /// ```
+    ///
+    /// The runtime side (this file) and the stdlib side
+    /// (`std/fs.sigil`) hold both halves of a tag → variant
+    /// contract. Reordering or renumbering one side without the
+    /// other silently misclassifies errors at runtime. This test
+    /// pins the literal tag values so a mismatched reorder is a
+    /// compile-time failure here, and the comment block above is
+    /// the canonical reference for the stdlib match arms.
+    #[test]
+    fn fs_err_tag_round_trip_pinned_against_stdlib_variants() {
+        // Pins literal tag values. If you renumber any of these,
+        // `std/fs.sigil`'s `__tag_to_fs_error` match arms must
+        // change in lockstep.
+        assert_eq!(FS_OK, 0, "tag 0 reserved for `Ok`");
+        assert_eq!(FS_ERR_NOT_FOUND, 1);
+        assert_eq!(FS_ERR_PERMISSION_DENIED, 2);
+        assert_eq!(FS_ERR_ALREADY_EXISTS, 3);
+        assert_eq!(FS_ERR_NOT_A_DIRECTORY, 4);
+        assert_eq!(FS_ERR_IS_A_DIRECTORY, 5);
+        assert_eq!(FS_ERR_INVALID_UTF8, 6);
+        assert_eq!(FS_ERR_OTHER, 7);
+
+        // Pins `map_io_err` for each non-Other kind. `Other` is the
+        // catch-all and gets exercised by `map_io_err_covers_known_-
+        // kinds` above.
+        assert_eq!(
+            map_io_err(&io::Error::new(io::ErrorKind::NotFound, "")),
+            FS_ERR_NOT_FOUND,
+        );
+        assert_eq!(
+            map_io_err(&io::Error::new(io::ErrorKind::PermissionDenied, "")),
+            FS_ERR_PERMISSION_DENIED,
+        );
+        assert_eq!(
+            map_io_err(&io::Error::new(io::ErrorKind::AlreadyExists, "")),
+            FS_ERR_ALREADY_EXISTS,
+        );
+        assert_eq!(
+            map_io_err(&io::Error::new(io::ErrorKind::NotADirectory, "")),
+            FS_ERR_NOT_A_DIRECTORY,
+        );
+        assert_eq!(
+            map_io_err(&io::Error::new(io::ErrorKind::IsADirectory, "")),
+            FS_ERR_IS_A_DIRECTORY,
+        );
     }
 }

@@ -89,8 +89,8 @@ fn is_dir(p: String) -> Bool ![Fs] {
 // sizes can exceed `Int`'s 63-bit range on huge volumes).
 fn file_size(p: String) -> Result[Int64, FsError] ![Fs] {
   match perform Fs.file_size(p) {
-    (0, n) => Ok(n),
-    (t, _) => Err(__tag_to_fs_error(t, "")),
+    (0, n, _) => Ok(n),
+    (t, _, msg) => Err(__tag_to_fs_error(t, msg)),
   }
 }
 
@@ -110,8 +110,8 @@ fn mkdir(p: String) -> Result[Unit, FsError] ![Fs] {
 // path component each, no recursive walk; symlinks followed).
 fn read_dir(p: String) -> Result[List[String], FsError] ![Fs] {
   match perform Fs.read_dir(p) {
-    (0, arr) => Ok(__array_to_list_string(arr, 0, array_length(arr))),
-    (t, _) => Err(__tag_to_fs_error(t, "")),
+    (0, arr, _) => Ok(__array_to_list(arr, 0, array_length(arr))),
+    (t, _, msg) => Err(__tag_to_fs_error(t, msg)),
   }
 }
 
@@ -168,10 +168,6 @@ fn __tag_to_fs_error(tag: Int, msg: String) -> FsError ![] {
   }
 }
 
-// Array[String] → List[String] (for `read_dir`'s entry list).
-fn __array_to_list_string(arr: Array[String], idx: Int, n: Int) -> List[String] ![] {
-  match idx < n {
-    true => Cons(array_get(arr, idx), __array_to_list_string(arr, idx + 1, n)),
-    false => Nil,
-  }
-}
+// Generic `__array_to_list[A]` lives in `std/list.sigil`; `read_dir`
+// instantiates it at A = String to convert the runtime's
+// `Array[String]` into the stdlib's idiomatic `List[String]`.
