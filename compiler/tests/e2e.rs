@@ -7327,17 +7327,12 @@ fn std_io_read_line_via_piped_stdin() {
                  perform IO.println(line);\n  \
                  0\n\
                }\n";
-    let src_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_read_line_{}.sigil",
-        std::process::id()
-    ));
+    let src_path =
+        std::env::temp_dir().join(format!("sigil_e2e_read_line_{}.sigil", std::process::id()));
     std::fs::write(&src_path, src).expect("write source");
     let root = workspace_root();
     let sigil_bin = sigil_binary();
-    let bin_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_read_line_{}",
-        std::process::id()
-    ));
+    let bin_path = std::env::temp_dir().join(format!("sigil_e2e_read_line_{}", std::process::id()));
     let compile = Command::new(&sigil_bin)
         .arg(&src_path)
         .arg("-o")

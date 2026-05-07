@@ -904,7 +904,11 @@ pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
     let frame_ptr = obj.add(8) as *mut HandlerFrame;
     (*frame_ptr).effect_id = effect_id;
     let arm_count_with_flag = (arm_count & ARM_COUNT_MASK)
-        | (if resumes_many != 0 { RESUMES_MANY_BIT } else { 0 });
+        | (if resumes_many != 0 {
+            RESUMES_MANY_BIT
+        } else {
+            0
+        });
     (*frame_ptr).arm_count = arm_count_with_flag;
     (*frame_ptr).return_fn = ptr::null_mut();
     (*frame_ptr).return_closure = ptr::null_mut();
@@ -1704,11 +1708,11 @@ unsafe fn wrap_continuation_with_outer_post_arm_k(
 
     // Pop owned entries (top-first). entries[0] = top,
     // entries[owned-1] = bottom-of-owned (just above entry_depth).
-    let mut entries: [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE] =
-        [OuterPostArmKEntry {
-            closure_ptr: ptr::null_mut(),
-            fn_ptr: ptr::null_mut(),
-        }; OUTER_POST_ARM_K_STACK_SIZE];
+    let mut entries: [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE] = [OuterPostArmKEntry {
+        closure_ptr: ptr::null_mut(),
+        fn_ptr: ptr::null_mut(),
+    };
+        OUTER_POST_ARM_K_STACK_SIZE];
     let mut count = 0usize;
     while count < owned {
         match outer_post_arm_k_try_pop() {
@@ -2151,13 +2155,12 @@ pub unsafe extern "C" fn sigil_perform(
             } else {
                 false
             };
-            let (actual_k_closure, actual_k_fn) = if crossed_is_multi_shot
-                && OUTER_POST_ARM_K_DEPTH.with(|c| c.get()) > 0
-            {
-                wrap_continuation_with_outer_post_arm_k(k_closure_ptr, k_fn_ptr)
-            } else {
-                (k_closure_ptr, k_fn_ptr)
-            };
+            let (actual_k_closure, actual_k_fn) =
+                if crossed_is_multi_shot && OUTER_POST_ARM_K_DEPTH.with(|c| c.get()) > 0 {
+                    wrap_continuation_with_outer_post_arm_k(k_closure_ptr, k_fn_ptr)
+                } else {
+                    (k_closure_ptr, k_fn_ptr)
+                };
 
             // Build a NextStep::Call to the arm with the args followed
             // by (k_closure_ptr, k_fn_ptr) packed as two u64s. The arm
@@ -2174,7 +2177,9 @@ pub unsafe extern "C" fn sigil_perform(
                 ns_args.add(i).write(*args_ptr.add(i));
             }
             // Append k_closure_ptr, k_fn_ptr.
-            ns_args.add(args_len as usize).write(actual_k_closure as u64);
+            ns_args
+                .add(args_len as usize)
+                .write(actual_k_closure as u64);
             ns_args.add(args_len as usize + 1).write(actual_k_fn as u64);
             return ns;
         }

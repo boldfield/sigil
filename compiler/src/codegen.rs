@@ -11644,9 +11644,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // (or as null_ptr if captures was also empty), and
                 // reading would access invalid memory.
                 let arm_body_for_scan = &synth.body;
-                let handle_has_return_arm_for_frame =
-                    synth.post_arm_k_chain.is_some()
-                        && handler_return_arm_indices.contains_key(&synth.handle_span);
+                let handle_has_return_arm_for_frame = synth.post_arm_k_chain.is_some()
+                    && handler_return_arm_indices.contains_key(&synth.handle_span);
                 let arm_needs_frame_ptr =
                     arm_body_has_k_pair_lambda(arm_body_for_scan, &cc.arm_k_pair_captures)
                         || handle_has_return_arm_for_frame;
@@ -11808,10 +11807,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // synth-cont can load the handler frame and read
                     // (return_fn, return_closure) at the pinned offsets
                     // to apply the return arm before binding.
-                    let extra_for_return_arm: usize =
-                        if chain.has_return_arm { 1 } else { 0 };
-                    let total_capture_slots: usize =
-                        2 + captures.len() + extra_for_return_arm;
+                    let extra_for_return_arm: usize = if chain.has_return_arm { 1 } else { 0 };
+                    let total_capture_slots: usize = 2 + captures.len() + extra_for_return_arm;
                     assert!(
                         total_capture_slots < MAX_CLOSURE_ENV_SLOTS,
                         "Plan B' Stage 6.7 Task 100b: arm-fn step_0 closure capture \
@@ -13077,8 +13074,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // Plotkin fix — when has_return_arm, an extra
                     // frame_ptr slot lives between captures and
                     // prior_bindings; shift prior_offset_base by 8.
-                    let frame_ptr_offset: i32 =
-                        captures_offset_base + 8 * captures.len() as i32;
+                    let frame_ptr_offset: i32 = captures_offset_base + 8 * captures.len() as i32;
                     let prior_offset_base: i32 = if chain.has_return_arm {
                         frame_ptr_offset + 8
                     } else {
@@ -13118,12 +13114,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                         let next_step_call_local = module
                             .declare_func_in_func(per_fn_refs_ctx.next_step_call, builder.func);
-                        let next_step_args_ptr_local = module.declare_func_in_func(
-                            per_fn_refs_ctx.next_step_args_ptr,
-                            builder.func,
-                        );
-                        let run_loop_local = module
-                            .declare_func_in_func(per_fn_refs_ctx.run_loop, builder.func);
+                        let next_step_args_ptr_local = module
+                            .declare_func_in_func(per_fn_refs_ctx.next_step_args_ptr, builder.func);
+                        let run_loop_local =
+                            module.declare_func_in_func(per_fn_refs_ctx.run_loop, builder.func);
                         let continuation_identity_local = module.declare_func_in_func(
                             per_fn_refs_ctx.continuation_identity,
                             builder.func,
@@ -13136,8 +13130,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         );
                         stackmap.push_placeholder(function_code_offset(&builder, ns_call));
                         let ns_v = builder.inst_results(ns_call)[0];
-                        let argp_call =
-                            builder.ins().call(next_step_args_ptr_local, &[ns_v]);
+                        let argp_call = builder.ins().call(next_step_args_ptr_local, &[ns_v]);
                         stackmap.push_placeholder(function_code_offset(&builder, argp_call));
                         let argp_v = builder.inst_results(argp_call)[0];
                         builder.ins().store(
@@ -13153,16 +13146,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             argp_v,
                             POST_ARM_K_CLOSURE_OFF,
                         );
-                        let identity_addr =
-                            builder.ins().func_addr(pointer_ty, continuation_identity_local);
+                        let identity_addr = builder
+                            .ins()
+                            .func_addr(pointer_ty, continuation_identity_local);
                         builder.ins().store(
                             MemFlags::trusted(),
                             identity_addr,
                             argp_v,
                             POST_ARM_K_FN_OFF,
                         );
-                        let rl_call =
-                            builder.ins().call(run_loop_local, &[ns_v, terminal_out]);
+                        let rl_call = builder.ins().call(run_loop_local, &[ns_v, terminal_out]);
                         stackmap.push_placeholder(function_code_offset(&builder, rl_call));
                         builder.ins().load(
                             types::I64,
@@ -13486,8 +13479,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let p = prior_count_next;
                                 let cap_off: i32 = 32;
                                 let frame_off: i32 = cap_off + 8 * c as i32;
-                                let prior_off: i32 = frame_off
-                                    + 8 * extra_for_return_arm as i32;
+                                let prior_off: i32 = frame_off + 8 * extra_for_return_arm as i32;
                                 (
                                     2 + c + extra_for_return_arm + p,
                                     cap_off,
@@ -13499,14 +13491,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let p = prior_count_next;
                                 let cap_off: i32 = 16;
                                 let frame_off: i32 = cap_off + 8 * c as i32;
-                                let prior_off: i32 = frame_off
-                                    + 8 * extra_for_return_arm as i32;
-                                (
-                                    c + extra_for_return_arm + p,
-                                    cap_off,
-                                    frame_off,
-                                    prior_off,
-                                )
+                                let prior_off: i32 = frame_off + 8 * extra_for_return_arm as i32;
+                                (c + extra_for_return_arm + p, cap_off, frame_off, prior_off)
                             };
                             assert!(
                                 next_capture_count < MAX_CLOSURE_ENV_SLOTS,
@@ -13532,10 +13518,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 for (j, p) in next_step.prior_bindings.iter().enumerate() {
                                     if p.kind.is_pointer() {
                                         bitmap |= 1u32
-                                            << (2 + captures.len()
-                                                + extra_for_return_arm
-                                                + j
-                                                + 1);
+                                            << (2 + captures.len() + extra_for_return_arm + j + 1);
                                     }
                                 }
                             } else {
@@ -13550,11 +13533,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 }
                                 for (j, p) in next_step.prior_bindings.iter().enumerate() {
                                     if p.kind.is_pointer() {
-                                        bitmap |= 1u32
-                                            << (captures.len()
-                                                + extra_for_return_arm
-                                                + j
-                                                + 1);
+                                        bitmap |=
+                                            1u32 << (captures.len() + extra_for_return_arm + j + 1);
                                     }
                                 }
                             }
@@ -14424,37 +14404,39 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         // "for completeness" pure-let
                                         // pass here.
                                         if !matches!(leaf_kind, BranchedCpsLeaf::PerformChain) {
-                                        for stmt in leaf_stmts {
-                                            if let crate::ast::Stmt::Let(l) = stmt {
-                                                let is_cps_call_rhs = match &l.value {
-                                                    crate::ast::Expr::Call { callee, .. } => {
-                                                        if let crate::ast::Expr::Ident(n, _) =
-                                                            callee.as_ref()
-                                                        {
-                                                            cc.colored.needs_cps_transform(n)
-                                                        } else {
-                                                            false
+                                            for stmt in leaf_stmts {
+                                                if let crate::ast::Stmt::Let(l) = stmt {
+                                                    let is_cps_call_rhs = match &l.value {
+                                                        crate::ast::Expr::Call {
+                                                            callee, ..
+                                                        } => {
+                                                            if let crate::ast::Expr::Ident(n, _) =
+                                                                callee.as_ref()
+                                                            {
+                                                                cc.colored.needs_cps_transform(n)
+                                                            } else {
+                                                                false
+                                                            }
                                                         }
+                                                        _ => false,
+                                                    };
+                                                    // PR #97 review iter 2 #1-#4: use
+                                                    // the unified discharge-gate
+                                                    // helpers so this site stays in
+                                                    // lockstep with the other three
+                                                    // (tail-prefix-let, Pure leaf,
+                                                    // standard tail). Reset BEFORE
+                                                    // lower_expr; check AFTER.
+                                                    if is_cps_call_rhs {
+                                                        lowerer.emit_terminal_out_reset_to_done();
                                                     }
-                                                    _ => false,
-                                                };
-                                                // PR #97 review iter 2 #1-#4: use
-                                                // the unified discharge-gate
-                                                // helpers so this site stays in
-                                                // lockstep with the other three
-                                                // (tail-prefix-let, Pure leaf,
-                                                // standard tail). Reset BEFORE
-                                                // lower_expr; check AFTER.
-                                                if is_cps_call_rhs {
-                                                    lowerer.emit_terminal_out_reset_to_done();
+                                                    let v = lowerer.lower_expr(&l.value);
+                                                    if is_cps_call_rhs {
+                                                        lowerer.emit_discharge_propagation_check();
+                                                    }
+                                                    lowerer.env.insert(l.name.clone(), v);
                                                 }
-                                                let v = lowerer.lower_expr(&l.value);
-                                                if is_cps_call_rhs {
-                                                    lowerer.emit_discharge_propagation_check();
-                                                }
-                                                lowerer.env.insert(l.name.clone(), v);
                                             }
-                                        }
                                         }
                                         if matches!(leaf_kind, BranchedCpsLeaf::Nested) {
                                             let nested = detect_pattern_c_dispatch(
@@ -20816,10 +20798,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 types::I64,
                 sigil_abi::effect::NEXT_STEP_TAG_DISCHARGED as i64,
             );
-            let is_discharged = self
-                .builder
-                .ins()
-                .icmp(IntCC::Equal, term_tag, disch_const);
+            let is_discharged = self.builder.ins().icmp(IntCC::Equal, term_tag, disch_const);
             let term_eid = self.builder.ins().load(
                 types::I64,
                 MemFlags::trusted(),
@@ -20829,30 +20808,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             let mut is_own = self.builder.ins().iconst(types::I8, 0);
             for &eid in &handle_effect_ids {
                 let eid_const = self.builder.ins().iconst(types::I64, eid as i64);
-                let matches = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::Equal, term_eid, eid_const);
+                let matches = self.builder.ins().icmp(IntCC::Equal, term_eid, eid_const);
                 is_own = self.builder.ins().bor(is_own, matches);
             }
             let zero_i8 = self.builder.ins().iconst(types::I8, 0);
-            let is_foreign = self
-                .builder
-                .ins()
-                .icmp(IntCC::Equal, is_own, zero_i8);
-            let needs_propagate = self
-                .builder
-                .ins()
-                .band(is_discharged, is_foreign);
+            let is_foreign = self.builder.ins().icmp(IntCC::Equal, is_own, zero_i8);
+            let needs_propagate = self.builder.ins().band(is_discharged, is_foreign);
             let propagate_blk = self.builder.create_block();
             let continue_blk = self.builder.create_block();
-            self.builder.ins().brif(
-                needs_propagate,
-                propagate_blk,
-                &[],
-                continue_blk,
-                &[],
-            );
+            self.builder
+                .ins()
+                .brif(needs_propagate, propagate_blk, &[], continue_blk, &[]);
 
             // Propagate: skip the surrounding expression's continuation
             // (e.g., the outer apply in `k(s)(s)`) and return early.
@@ -21204,8 +21170,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.lower_ctor_alloc(&type_name, variant_idx, &field_vals)
             }
             Expr::Ident(name, _)
-                if self.user_fn_refs.contains_key(name)
-                    && !self.env.contains_key(name) =>
+                if self.user_fn_refs.contains_key(name) && !self.env.contains_key(name) =>
             {
                 // The `!self.env.contains_key(name)` guard
                 // honours lexical shadowing: when a local
