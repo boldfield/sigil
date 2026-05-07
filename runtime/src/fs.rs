@@ -207,7 +207,19 @@ pub unsafe extern "C" fn sigil_fs_file_size_arm(
 
     let (tag, size_value) = match path_str_from_sigil_arg(path_ptr) {
         Some(p) => match std::fs::metadata(p) {
-            Ok(m) => (FS_OK, alloc_int64(m.len() as i64)),
+            Ok(m) => {
+                // `Metadata::len()` returns u64. Sigil's `Int64` is
+                // signed, so files >= 2^63 bytes (~9.2 EB) would wrap
+                // to negative on a naked `as i64` cast. Surface that
+                // case as `FsError::Other` rather than silently
+                // misreporting size.
+                let len = m.len();
+                if len > i64::MAX as u64 {
+                    (FS_ERR_OTHER, alloc_int64(0))
+                } else {
+                    (FS_OK, alloc_int64(len as i64))
+                }
+            }
             Err(e) => (map_io_err(&e), alloc_int64(0)),
         },
         None => (FS_ERR_INVALID_UTF8, alloc_int64(0)),
@@ -290,12 +302,20 @@ pub unsafe extern "C" fn sigil_fs_read_dir_arm(
             Ok(rd) => {
                 // Collect entry names (Rust strings, allocator-
                 // independent of Boehm). Then fill an empty Sigil
-                // Array slot-by-slot.
+                // Array slot-by-slot. Filenames with non-UTF-8 bytes
+                // become lossy (U+FFFD substituted) rather than
+                // silently dropped — keeps the entry count honest
+                // and matches the rest of the runtime's lossy-string
+                // convention (stdout/stderr capture, `string_chars`).
+                // `DirEntry` IO errors (`entry_result.err()`) are
+                // still skipped — the alternative is aborting the
+                // whole listing on the first transient EACCES, which
+                // is worse for v1.
                 let names: Vec<String> = rd
                     .filter_map(|entry_result| {
                         entry_result
                             .ok()
-                            .and_then(|entry| entry.file_name().into_string().ok())
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
                     })
                     .collect();
                 let arr = alloc_array_with_capacity(names.len());

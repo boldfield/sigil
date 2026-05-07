@@ -980,7 +980,6 @@ fn builtin_effects() -> Vec<EffectDecl> {
     // user-facing `Result[T, FsError]` / `Option[T]` / `List[T]`
     // surfaces — same convention as `std/random.sigil`'s
     // `random_int()` wrapper around `perform Random.rand_int()`.
-    let unit_ty = || TypeExpr::Named("Unit".to_string(), span.clone());
     let int_ty = || TypeExpr::Named("Int".to_string(), span.clone());
     let int64_ty = || TypeExpr::Named("Int64".to_string(), span.clone());
     let bool_ty = || TypeExpr::Named("Bool".to_string(), span.clone());
@@ -1167,7 +1166,6 @@ fn builtin_effects() -> Vec<EffectDecl> {
     // the `(Int, String, String)` triple `(exit_code, stdout, stderr)`.
     //
     // No shell invocation — direct `exec` only.
-    let _ = unit_ty;
     out.push(EffectDecl {
         name: "Process".to_string(),
         name_span: span.clone(),

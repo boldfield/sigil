@@ -12960,20 +12960,40 @@ fn env_var_absent_returns_none() {
 
 #[test]
 fn env_args_returns_at_least_one() {
+    // Emits two sentinels around `args()` so a CI failure points at
+    // *which* step crashed: `pre-args` printed alone means `args()`
+    // itself signal-killed mid-call; both printed plus a count means
+    // success.
     let src = "import std.env\n\
                import std.io\n\
                import std.list\n\
                fn main() -> Int ![IO, Env] {\n  \
+                 perform IO.println(\"pre-args\");\n  \
                  let xs: List[String] = args();\n  \
+                 perform IO.println(\"post-args\");\n  \
                  perform IO.println(int_to_string(length(xs)));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "env_args_count");
-    assert_eq!(code, 0, "stderr: {stderr}");
-    let n: i64 = stdout.trim().parse().expect("argv count");
+    assert_eq!(code, 0, "code != 0; stdout={stdout:?}; stderr={stderr:?}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("pre-args"),
+        "missing pre-args sentinel; stdout={stdout:?}"
+    );
+    assert_eq!(
+        lines.get(1).copied(),
+        Some("post-args"),
+        "missing post-args sentinel — args() call itself failed; stdout={stdout:?}"
+    );
+    let n_str = lines.get(2).copied().unwrap_or("");
+    let n: i64 = n_str
+        .parse()
+        .unwrap_or_else(|_| panic!("argv count not parseable; stdout={stdout:?}"));
     assert!(
         n >= 1,
-        "argv must always carry at least program name; got {n}"
+        "argv must always carry at least program name; got {n}; stdout={stdout:?}"
     );
 }
 
