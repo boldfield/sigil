@@ -163,12 +163,28 @@ pub struct NextStep {
 #[repr(C)]
 pub struct HandlerFrame {
     pub effect_id: u32,
+    /// Plotkin fix — `arm_count` lives in low 16 bits. The high
+    /// bit (bit 31) encodes the effect's `resumes: many` flag so
+    /// `wrap_continuation_with_outer_post_arm_k` can determine
+    /// whether the crossed frame's effect is multi-shot at perform
+    /// time. Cap-aware: arm_count caps at MAX_HANDLER_ARMS = 14
+    /// (well under 16-bit range), so the high bit is free for the
+    /// resumes_many flag without ABI churn. Codegen masks the
+    /// flag in via the new
+    /// `sigil_handler_frame_new_with_resumes_many` entry; legacy
+    /// `sigil_handler_frame_new` keeps the flag clear (single-shot
+    /// default).
     pub arm_count: u32,
     pub return_fn: *mut u8,
     pub return_closure: *mut u8,
     pub prev: *mut HandlerFrame,
     // arms follow: [(fn_ptr: *mut u8, closure_ptr: *mut u8); arm_count]
 }
+
+/// Mask for the arm_count's low bits (excluding the resumes_many flag
+/// at bit 31).
+const ARM_COUNT_MASK: u32 = 0x7FFF_FFFF;
+const RESUMES_MANY_BIT: u32 = 1u32 << 31;
 
 // Thread-local handler stack head. Frames link via `prev`. Null = no
 // active handlers (top-level user code).
@@ -343,6 +359,34 @@ thread_local! {
     };
     static OUTER_POST_ARM_K_DEPTH: Cell<usize> = const { Cell::new(0) };
     static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
+
+    /// Current `sigil_run_loop`'s `outer_post_arm_k_entry_depth`
+    /// snapshot. `wrap_continuation_with_outer_post_arm_k` reads
+    /// this to determine how many `OUTER_POST_ARM_K` entries the
+    /// current run_loop owns — only those may be popped into the
+    /// wrapper chain. Entries below this depth belong to enclosing
+    /// run_loops and must not be moved (doing so would silently
+    /// underflow the parent's `outer_post_arm_k_entry_depth`
+    /// invariant and dereference garbage on the next pop).
+    ///
+    /// Single `Cell<usize>` rather than a TLS stack: nested
+    /// run_loops save the prior value into the run_loop's local
+    /// Rust stack frame at entry and restore it at every return
+    /// path. The save/restore is naturally bounded by C-stack
+    /// depth (no separate stack-overflow surface), and the read
+    /// path from `wrap_continuation_with_outer_post_arm_k` cannot
+    /// panic on a `RefCell` borrow.
+    static RUN_LOOP_ENTRY_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+#[inline]
+fn run_loop_entry_depth_get() -> usize {
+    RUN_LOOP_ENTRY_DEPTH.with(|c| c.get())
+}
+
+#[inline]
+fn run_loop_entry_depth_set(value: usize) {
+    RUN_LOOP_ENTRY_DEPTH.with(|c| c.set(value));
 }
 
 /// Plan D Task 117 (b) Phase 4 — snapshot the current
@@ -806,6 +850,33 @@ pub unsafe extern "C" fn sigil_handler_frame_new(
     effect_id: u32,
     arm_count: u32,
 ) -> *mut HandlerFrame {
+    sigil_handler_frame_new_with_resumes_many(effect_id, arm_count, 0)
+}
+
+/// Plotkin fix — variant of `sigil_handler_frame_new` that records
+/// the effect's `resumes: many` flag in the frame header. Codegen
+/// emits this entry instead of the legacy one when the effect
+/// declaration has `resumes: many`. Read at perform time by
+/// `wrap_continuation_with_outer_post_arm_k` to decide whether to
+/// preserve the crossed-frame's chain entries (multi-shot semantics)
+/// or let them flow through as normal Done routing (single-shot).
+///
+/// # Safety
+///
+/// `arm_count` must be `<= MAX_HANDLER_ARMS` (the function aborts
+/// otherwise — checked, not a precondition). `resumes_many` is
+/// treated as a boolean (zero or non-zero); any non-zero value
+/// sets `RESUMES_MANY_BIT` on the frame's `arm_count` field.
+/// The returned pointer is GC-managed (allocated via `sigil_alloc`)
+/// and may be moved to a TLS-rooted slot before the caller
+/// allocates again. Callers are responsible for installing the
+/// frame onto the handler stack via `sigil_handle_push`.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
+    effect_id: u32,
+    arm_count: u32,
+    resumes_many: u32,
+) -> *mut HandlerFrame {
     if arm_count > MAX_HANDLER_ARMS {
         eprintln!(
             "sigil_handler_frame_new: arm_count {arm_count} exceeds MAX_HANDLER_ARMS ({})",
@@ -843,7 +914,13 @@ pub unsafe extern "C" fn sigil_handler_frame_new(
     // the pointer is not stored or returned beyond this initialisation).
     let frame_ptr = obj.add(8) as *mut HandlerFrame;
     (*frame_ptr).effect_id = effect_id;
-    (*frame_ptr).arm_count = arm_count;
+    let arm_count_with_flag = (arm_count & ARM_COUNT_MASK)
+        | (if resumes_many != 0 {
+            RESUMES_MANY_BIT
+        } else {
+            0
+        });
+    (*frame_ptr).arm_count = arm_count_with_flag;
     (*frame_ptr).return_fn = ptr::null_mut();
     (*frame_ptr).return_closure = ptr::null_mut();
     (*frame_ptr).prev = ptr::null_mut();
@@ -890,7 +967,7 @@ pub unsafe extern "C" fn sigil_handler_frame_set_arm(
         eprintln!("sigil_handler_frame_set_arm: null frame");
         std::process::abort();
     }
-    let arm_count = (*frame).arm_count;
+    let arm_count = (*frame).arm_count & ARM_COUNT_MASK;
     if op_id >= arm_count {
         eprintln!(
             "sigil_handler_frame_set_arm: op_id {op_id} out of range (arm_count={arm_count})"
@@ -1504,16 +1581,206 @@ pub unsafe extern "C" fn sigil_continuation_identity(
     );
     // SAFETY: caller (codegen tail-k lowering or synth-cont post-arm-k
     // dispatch) guarantees args_ptr points to >= 1 readable u64
-    // holding the captured arg at slot 0. Trailing slots, if any
-    // (Slice A's post-arm-k pair at slots 1..3), are ignored —
-    // identity is the terminal continuation.
+    // holding the captured arg at slot 0.
     let value = *args_ptr;
+    // Plotkin fix — when called as the k_fn for an arm's k-call with
+    // a multi-shot post_arm_k chain trailing pair (args_len == 3 with
+    // a non-null, non-identity fn at slot 2), dispatch through the
+    // trailing pair so chain step_0 fires. This is necessary for
+    // tail-perform body shapes (e.g., `body() => perform Effect.op()`)
+    // where the body has no chain step that would otherwise push the
+    // trailing pair onto OUTER_POST_ARM_K via the
+    // `outer_post_arm_k_push_ref` call at codegen.rs:16014. Without
+    // this dispatch, the arm's `k(arg)` lands here (the identity k_fn
+    // selected by `lower_handle_body_direct_cps_call` / Sync-side
+    // body call), and chain step_0 is silently dropped — the multi-
+    // shot enumeration produces only the first branch's value.
+    if args_len == 3 {
+        // SAFETY: gc-heap-ptr arithmetic (caller-owned args buffer at args_len=3 reads slot 1 of trailing pair — identity-as-k_fn dispatch convention)
+        let post_arm_k_closure = *args_ptr.add(1) as *mut u8;
+        // SAFETY: gc-heap-ptr arithmetic (same args buffer, slot 2)
+        let post_arm_k_fn = *args_ptr.add(2) as *mut u8;
+        let self_addr = sigil_continuation_identity as *mut u8;
+        if !post_arm_k_fn.is_null() && post_arm_k_fn != self_addr {
+            let ns = sigil_next_step_call(post_arm_k_closure, post_arm_k_fn, 1);
+            let ns_args = sigil_next_step_args_ptr(ns);
+            ns_args.write(value);
+            return ns;
+        }
+    }
     sigil_next_step_done(value)
 }
 
 // ---------------------------------------------------------------------
 // Builtin top-level handler arm fns (Plan B Task 57)
 // ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// Plotkin fix — continuation wrapper for OUTER_POST_ARM_K save
+// ---------------------------------------------------------------------
+
+/// CPS function that re-pushes a saved OUTER_POST_ARM_K entry and then
+/// delegates to an inner continuation. Used by `sigil_perform` when a
+/// perform crosses handlers AND OUTER_POST_ARM_K has entries — those
+/// entries belong to the inner-handler chain that the perform crosses
+/// through; consuming them at the outer-handler arm's Done would
+/// dispatch the wrong value to the inner chain. Instead, perform pops
+/// all entries and embeds them into a chain of wrappers around the
+/// captured continuation. When the continuation is eventually invoked
+/// (e.g., via the outer arm's lambda `fn(s) => k(s)(s)` body), the
+/// wrappers re-push the entries in the original bottom-to-top order
+/// before delegating to the original continuation. This preserves the
+/// inner chain across the outer-handler termination boundary.
+///
+/// Closure layout (TAG_CLOSURE, count=5, bitmap=0b01010):
+///   offset  8: code_ptr (null — never read; required by closure ABI)
+///   offset 16: inner_closure (GC ptr — bitmap bit 1)
+///   offset 24: inner_fn (code addr — bit 2 clear)
+///   offset 32: saved_closure (GC ptr — bitmap bit 3)
+///   offset 40: saved_fn (code addr — bit 4 clear)
+///
+/// # Safety
+///
+/// `closure_ptr` must point to a wrapper closure with the exact
+/// layout documented above (allocated by
+/// `wrap_continuation_with_outer_post_arm_k`). `args_ptr` and
+/// `args_len` follow the standard CPS-call ABI: a non-null buffer of
+/// `args_len` u64 slots that the caller (the trampoline) keeps
+/// alive across this call. The returned `NextStep` is arena-
+/// allocated and consumed by the trampoline before the next
+/// dispatch (which resets the arena).
+#[no_mangle]
+pub unsafe extern "C" fn sigil_k_continuation_wrapper(
+    closure_ptr: *mut u8,
+    args_ptr: *const u64,
+    args_len: u32,
+    _terminal_out: *mut TerminalResult,
+) -> *mut NextStep {
+    // SAFETY: gc-heap-ptr arithmetic (fixed-layout 5-slot wrapper closure: code_ptr@0, inner_closure@16, inner_fn@24, saved_closure@32, saved_fn@40)
+    let inner_closure = *(closure_ptr.add(16) as *const *mut u8);
+    // SAFETY: gc-heap-ptr arithmetic (same fixed wrapper-closure layout)
+    let inner_fn = *(closure_ptr.add(24) as *const *mut u8);
+    // SAFETY: gc-heap-ptr arithmetic (same fixed wrapper-closure layout)
+    let saved_closure = *(closure_ptr.add(32) as *const *mut u8);
+    // SAFETY: gc-heap-ptr arithmetic (same fixed wrapper-closure layout)
+    let saved_fn = *(closure_ptr.add(40) as *const *mut u8);
+
+    sigil_outer_post_arm_k_push(saved_closure, saved_fn);
+
+    let ns = sigil_next_step_call(inner_closure, inner_fn, args_len);
+    let ns_args = sigil_next_step_args_ptr(ns);
+    for i in 0..args_len as usize {
+        // SAFETY: gc-heap-ptr arithmetic (copying caller-provided u64 args into NextStep's args buffer; bounds enforced by args_len)
+        ns_args.add(i).write(*args_ptr.add(i));
+    }
+    ns
+}
+
+/// Pop all OUTER_POST_ARM_K entries and build a chain of wrapper
+/// closures around `(k_closure, k_fn)`. When the outermost wrapper is
+/// invoked, it re-pushes entries in the original bottom-to-top order
+/// before delegating to the original continuation. Returns
+/// `(k_closure, k_fn)` unchanged when OUTER_POST_ARM_K is empty.
+unsafe fn wrap_continuation_with_outer_post_arm_k(
+    k_closure: *mut u8,
+    k_fn: *mut u8,
+) -> (*mut u8, *mut u8) {
+    use crate::gc::sigil_alloc;
+
+    let depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+    if depth == 0 {
+        return (k_closure, k_fn);
+    }
+
+    // Only pop entries owned by the current run_loop — entries
+    // below the current entry_depth belong to enclosing run_loops
+    // and would silently break their invariants if moved into the
+    // wrapper chain (the parent's `outer_post_arm_k_entry_depth`
+    // is set at entry; popping below it underflows the depth and
+    // dereferences a null fn_ptr at the next pop).
+    let entry_depth = run_loop_entry_depth_get();
+    let owned = depth - entry_depth;
+    if owned == 0 {
+        return (k_closure, k_fn);
+    }
+
+    // CORRECTNESS — skip re-wrapping when ANY owned entry is
+    // already a continuation wrapper. Not just an optimization:
+    // a fresh wrap on top of an existing wrapper chain would
+    // repackage the SAME saved outer-arm chain entries under a
+    // new layer, so when the outer wrapper later invokes inner,
+    // the inner wrapper would re-push entries already pushed by
+    // the outer one — duplicating the chain on
+    // OUTER_POST_ARM_K_STACK and routing the next Done through
+    // the wrong (duplicated) chain step. The stack-overflow
+    // symptom on json-shaped deep cross-handler recursion is the
+    // visible failure mode; the silent invariant break (chain
+    // step double-fire) is the load-bearing reason this guard
+    // matters. The existing wrapper(s) already captured the
+    // outer arm chain; let them drain naturally on their
+    // run_loop's terminal.
+    let wrapper_fn_addr_check = sigil_k_continuation_wrapper as *mut u8;
+    let any_wrapper = OUTER_POST_ARM_K_STACK.with(|cell| {
+        let stack = cell.get();
+        let mut i = depth;
+        while i > entry_depth {
+            i -= 1;
+            if stack[i].fn_ptr == wrapper_fn_addr_check {
+                return true;
+            }
+        }
+        false
+    });
+    if any_wrapper {
+        return (k_closure, k_fn);
+    }
+
+    // Pop owned entries (top-first). entries[0] = top,
+    // entries[owned-1] = bottom-of-owned (just above entry_depth).
+    let mut entries: [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE] = [OuterPostArmKEntry {
+        closure_ptr: ptr::null_mut(),
+        fn_ptr: ptr::null_mut(),
+    };
+        OUTER_POST_ARM_K_STACK_SIZE];
+    let mut count = 0usize;
+    while count < owned {
+        match outer_post_arm_k_try_pop() {
+            Some(entry) => {
+                entries[count] = entry;
+                count += 1;
+            }
+            None => break,
+        }
+    }
+
+    let wrapper_fn_addr = sigil_k_continuation_wrapper as *mut u8;
+    let mut current_closure = k_closure;
+    let mut current_fn = k_fn;
+
+    // Iterate from top (i=0) to bottom (i=count-1). Each wrapper
+    // pushes its saved entry then delegates to the previous wrapper
+    // (or original k). Execution order: outermost (= bottom-saved)
+    // pushes bottom entry first, innermost (= top-saved) pushes top
+    // entry last → restored stack = [bottom..top] = original.
+    for entry in entries.iter().take(count) {
+        // bitmap=0b01010: bits 1 and 3 set (inner_closure at slot 1,
+        // saved_closure at slot 3 are GC-managed pointers). Slot 0 is
+        // code_ptr (null), slot 2 is inner_fn (code addr), slot 4 is
+        // saved_fn (code addr).
+        let h = Header::new(TAG_CLOSURE, 5, 0b01010);
+        let wrapper = sigil_alloc(h.raw(), 40);
+        *(wrapper.add(8) as *mut *mut u8) = ptr::null_mut();
+        *(wrapper.add(16) as *mut *mut u8) = current_closure;
+        *(wrapper.add(24) as *mut *mut u8) = current_fn;
+        *(wrapper.add(32) as *mut *mut u8) = entry.closure_ptr;
+        *(wrapper.add(40) as *mut *mut u8) = entry.fn_ptr;
+
+        current_closure = wrapper;
+        current_fn = wrapper_fn_addr;
+    }
+
+    (current_closure, current_fn)
+}
 
 /// Plan B Task 57 — runtime-side default handler for `IO.println`.
 ///
@@ -1858,11 +2125,11 @@ pub unsafe extern "C" fn sigil_perform(
                     }
                 });
             }
-            if op_id >= (*frame).arm_count {
+            if op_id >= ((*frame).arm_count & ARM_COUNT_MASK) {
                 eprintln!(
                     "sigil_perform: op_id {op_id} out of range for effect_id {effect_id} \
                      (arm_count={})",
-                    (*frame).arm_count
+                    (*frame).arm_count & ARM_COUNT_MASK
                 );
                 std::process::abort();
             }
@@ -1876,6 +2143,54 @@ pub unsafe extern "C" fn sigil_perform(
                 );
                 std::process::abort();
             }
+            // Plotkin fix — when this perform crosses handlers AND
+            // OUTER_POST_ARM_K has entries, the entries belong to the
+            // inner-handler chain that this perform crosses through.
+            // Consuming them at the outer-handler arm's Done would
+            // dispatch the wrong value (e.g., State arm's lambda
+            // closure) to the inner arm chain (which expects body's
+            // natural value). Wrap the continuation: pop all entries
+            // and embed them into a chain of wrapper closures. When
+            // the continuation is later invoked (by the outer arm
+            // calling k(s)), the wrappers re-push the entries, then
+            // the inner chain runs correctly.
+            // Plotkin fix — wrap_continuation only fires when:
+            //   (1) the perform crosses one or more handler frames,
+            //   (2) OUTER_POST_ARM_K has entries (an inner-arm chain
+            //       might be in progress that needs preservation), AND
+            //   (3) at least one of the crossed frames belongs to a
+            //       `resumes: many` handler.
+            //
+            // (3) discriminates the case that needs wrap (Plotkin's
+            //   State perform crossing Amb's multi-shot frame, where
+            //   Amb's chain step entries must survive the outer-arm
+            //   discharge and be replayed when the captured k is
+            //   invoked) from cases that don't (json's State perform
+            //   crossing catch's single-shot Raise frame, where the
+            //   chain entries belong to body's own chain steps and
+            //   wrap would just accumulate wrappers per perform until
+            //   OUTER_POST_ARM_K_STACK overflows on deep recursion).
+            let crossed_is_multi_shot = if crossed {
+                let mut cf = top_frame;
+                let mut found = false;
+                while cf != frame && !cf.is_null() {
+                    if (*cf).arm_count & RESUMES_MANY_BIT != 0 {
+                        found = true;
+                        break;
+                    }
+                    cf = (*cf).prev;
+                }
+                found
+            } else {
+                false
+            };
+            let (actual_k_closure, actual_k_fn) =
+                if crossed_is_multi_shot && OUTER_POST_ARM_K_DEPTH.with(|c| c.get()) > 0 {
+                    wrap_continuation_with_outer_post_arm_k(k_closure_ptr, k_fn_ptr)
+                } else {
+                    (k_closure_ptr, k_fn_ptr)
+                };
+
             // Build a NextStep::Call to the arm with the args followed
             // by (k_closure_ptr, k_fn_ptr) packed as two u64s. The arm
             // prologue (Task 55 codegen) reads the trailing two slots
@@ -1891,8 +2206,10 @@ pub unsafe extern "C" fn sigil_perform(
                 ns_args.add(i).write(*args_ptr.add(i));
             }
             // Append k_closure_ptr, k_fn_ptr.
-            ns_args.add(args_len as usize).write(k_closure_ptr as u64);
-            ns_args.add(args_len as usize + 1).write(k_fn_ptr as u64);
+            ns_args
+                .add(args_len as usize)
+                .write(actual_k_closure as u64);
+            ns_args.add(args_len as usize + 1).write(actual_k_fn as u64);
             return ns;
         }
         frame = (*frame).prev;
@@ -1994,6 +2311,17 @@ pub unsafe extern "C" fn sigil_run_loop(
         out
     );
     let mut current = initial_step;
+    // Plotkin fix — install this run_loop's entry depth into the
+    // single TLS `RUN_LOOP_ENTRY_DEPTH` Cell so
+    // `wrap_continuation_with_outer_post_arm_k` can determine which
+    // OUTER_POST_ARM_K entries this run_loop owns (entries above
+    // entry_depth) versus inherited from enclosing run_loops
+    // (entries at-or-below entry_depth). Save the prior value into
+    // our local frame; restore at every return path below so
+    // nested run_loops nest correctly via C-stack save/restore.
+    let prior_run_loop_entry_depth = run_loop_entry_depth_get();
+    let entry_depth_for_wrap = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+    run_loop_entry_depth_set(entry_depth_for_wrap);
     // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
     // run_loop entry. On the DISCHARGED bypass terminal (introduced by
     // Layer 3c to preserve algebraic-effects discharge semantics
@@ -2090,6 +2418,7 @@ pub unsafe extern "C" fn sigil_run_loop(
                     );
                     OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
                     crate::arena::sigil_arena_reset();
+                    run_loop_entry_depth_set(prior_run_loop_entry_depth);
                     return v;
                 }
                 // Plan B' Stage 6.7 multi-shot composition fix: before
@@ -2192,6 +2521,7 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
+                run_loop_entry_depth_set(prior_run_loop_entry_depth);
                 return v;
             }
             NEXT_STEP_TAG_CALL => {
@@ -2259,6 +2589,20 @@ fn handler_frame_pointer_bitmap(arm_count: usize) -> u32 {
     // Word 2: return_closure — GC pointer.
     // Word 3: prev — GC pointer (to another HandlerFrame, also GC-allocated).
     // Words 4+: arms — even slots are fn_ptrs (skip), odd slots are closure_ptrs (track).
+    //
+    // Defensive check: `arm_count` must be the masked count (low 16
+    // bits of `HandlerFrame::arm_count`), NOT the raw field with the
+    // `RESUMES_MANY_BIT` flag set. A caller passing the raw u32 would
+    // iterate ~2^31 times here (silently producing garbage); catch
+    // that misuse early in dev builds.
+    debug_assert!(
+        arm_count <= MAX_HANDLER_ARMS as usize,
+        "handler_frame_pointer_bitmap: arm_count {arm_count} exceeds \
+         MAX_HANDLER_ARMS ({}); caller likely passed a raw \
+         arm_count field with RESUMES_MANY_BIT set instead of the \
+         masked value",
+        MAX_HANDLER_ARMS
+    );
     let mut bitmap: u32 = 0;
     bitmap |= 1 << 2;
     bitmap |= 1 << 3;
@@ -2597,23 +2941,30 @@ mod tests {
         // `[arg, post_arm_k_closure, post_arm_k_fn]` at `args_len=3`.
         // When the arm dispatches into identity directly (perform in
         // tail position of the handle body, no helper synth-cont in
-        // scope), identity sees args_len=3 — the trailing pair is
-        // irrelevant since identity is the terminal continuation.
+        // scope), identity sees args_len=3 with trailing pair set to
+        // `(null, &sigil_continuation_identity)` — identity is the
+        // terminal continuation and recognises its own self address
+        // as a no-op trailing fn.
         //
-        // Identity must read only `args_ptr[0]` and produce
-        // `NextStep::Done(args_ptr[0])`, ignoring the trailing slots.
+        // Identity must read `args_ptr[0]`, observe the (null,
+        // identity) trailing pair, and produce
+        // `NextStep::Done(args_ptr[0])`.
         //
-        // Bisecting hint: a regression in the existing
-        // `arm_uses_k_in_tail_position_returns_continuation_value`
-        // e2e test after Slice A would surface as identity's
-        // arity-1 invariant firing here. This unit test pins the
-        // contract directly so the failure attribution is unambiguous.
+        // Plotkin fix: identity NOW dispatches through the trailing
+        // pair when `post_arm_k_fn` is non-null AND not its own
+        // self-address (required for tail-perform body shapes where
+        // the chain step_0 isn't pushed by the body's own chain).
+        // This test pins the self-address-skip contract; the
+        // sibling test
+        // `continuation_identity_dispatches_through_non_identity_trailing_fn`
+        // pins the dispatch contract.
         let _guard = crate::test_support::gc_test_lock();
         ensure_gc();
         reset_state();
         let known: u64 = 0xFEEDFACE_DEADBEEF;
-        // [arg, post_arm_k_closure (null), post_arm_k_fn (irrelevant)]
-        let args: [u64; 3] = [known, 0xCAFE, 0xBABE];
+        let identity_self_addr = sigil_continuation_identity as *const () as usize as u64;
+        // [arg, post_arm_k_closure (null), post_arm_k_fn (identity)]
+        let args: [u64; 3] = [known, 0, identity_self_addr];
         // SAFETY: gc-heap-ptr arithmetic (stack array, non-GC, outlives the call).
         let args_ptr = args.as_ptr();
         let ns = unsafe { sigil_continuation_identity(ptr::null(), args_ptr, 3, ptr::null_mut()) };
@@ -2623,6 +2974,43 @@ mod tests {
             assert_eq!((*ns).arg_count, 0);
             assert!((*ns).closure_ptr.is_null());
             assert!((*ns).fn_ptr.is_null());
+        }
+        reset_state();
+    }
+
+    #[test]
+    fn continuation_identity_dispatches_through_non_identity_trailing_fn() {
+        // Plotkin fix — when identity is dispatched as the k_fn for
+        // an arm's k(arg) call with a multi-shot chain trailing
+        // pair (a non-null, non-identity post_arm_k_fn), identity
+        // forwards to the chain step instead of returning Done.
+        // This is the load-bearing path for tail-perform body
+        // shapes (e.g. `body() => perform Effect.op()`) where the
+        // chain step_0 isn't pushed by the body's own chain machinery.
+        //
+        // Verify: identity returns NextStep::Call(post_arm_k_closure,
+        // post_arm_k_fn, [args[0]]) so the trampoline dispatches the
+        // chain step with the captured value as its single arg.
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let known: u64 = 0xFEEDFACE_DEADBEEF;
+        // Arbitrary non-null, non-identity sentinel addresses — the
+        // dispatch only inspects them as opaque pointer values.
+        let post_arm_k_closure: u64 = 0x1000;
+        let post_arm_k_fn: u64 = 0x2000;
+        let args: [u64; 3] = [known, post_arm_k_closure, post_arm_k_fn];
+        // SAFETY: gc-heap-ptr arithmetic (stack array, non-GC, outlives the call).
+        let args_ptr = args.as_ptr();
+        let ns = unsafe { sigil_continuation_identity(ptr::null(), args_ptr, 3, ptr::null_mut()) };
+        unsafe {
+            assert_eq!((*ns).tag, NEXT_STEP_TAG_CALL);
+            assert_eq!((*ns).closure_ptr as u64, post_arm_k_closure);
+            assert_eq!((*ns).fn_ptr as u64, post_arm_k_fn);
+            assert_eq!((*ns).arg_count, 1);
+            // arg_count=1 means args_ptr[0] holds the captured value.
+            let dispatched_args = sigil_next_step_args_ptr(ns);
+            assert_eq!(*dispatched_args, known);
         }
         reset_state();
     }

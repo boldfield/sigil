@@ -4177,7 +4177,7 @@ fn slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_args() {
     let src = "effect Choose resumes: many { flip: () -> Bool }\n\
                fn helper() -> Int ![Choose, IO] {\n  \
                  let b: Bool = perform Choose.flip();\n  \
-                 if b { 1 } else { 0 }\n\
+                 if b { 10 } else { 3 }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle helper() with {\n    \
@@ -4193,10 +4193,54 @@ fn slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_args() {
     let (stdout, stderr, code) = compile_and_run(src, "slice_c_choose_multi_shot");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "1\n",
-        "Slice C multi-shot: arm invokes k(true) → r1=1 (helper's tail with \
-         b=true), then k(false) → r2=0 (helper's tail with b=false); arm \
-         returns r1+r2 = 1. stderr={stderr:?}"
+        stdout, "13\n",
+        "Slice C multi-shot: arm invokes k(true) → r1=10 (helper's tail with \
+         b=true), then k(false) → r2=3 (helper's tail with b=false); arm \
+         returns r1+r2 = 13. stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_c_choose_multi_shot_with_return_arm_collects_both_branches() {
+    // Slice C multi-shot + return arm: the handler has both a multi-let
+    // arm body (`let r1 = k(true); let r2 = k(false); append(r1, r2)`)
+    // and a `return(v) => Cons(v, Nil)` arm. Each k-invocation must
+    // apply the return arm inline (wrapping body-type Bool into
+    // handler-overall-type List[Bool]) before the tail `append` combines
+    // them. Without inline return-arm application, k returns raw Bool
+    // values and append dereferences them as List pointers → SIGSEGV.
+    let src = "import std.list\n\
+               import std.io\n\
+               \n\
+               effect Amb resumes: many { flip: () -> Bool }\n\
+               \n\
+               fn body() -> Bool ![Amb] {\n  \
+                 perform Amb.flip()\n\
+               }\n\
+               \n\
+               fn amb_handle(action: () -> Bool ![Amb]) -> List[Bool] ![] {\n  \
+                 handle action() with {\n    \
+                   Amb.flip(k) => {\n      \
+                     let r1: List[Bool] = k(true);\n      \
+                     let r2: List[Bool] = k(false);\n      \
+                     append(r1, r2)\n    \
+                   },\n    \
+                   return(v) => Cons(v, Nil),\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: List[Bool] = amb_handle(body);\n  \
+                 perform IO.println(int_to_string(length(result)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_multi_shot_return_arm");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "2\n",
+        "multi-shot + return arm: k(true) → Cons(true, Nil), \
+         k(false) → Cons(false, Nil), append → list of length 2; \
+         stderr={stderr:?}"
     );
 }
 
@@ -4351,6 +4395,45 @@ fn slice_c_choose_multi_shot_with_string_chain_threads_pointer_through_closures(
         stdout, "no\n",
         "Slice C String-typed chain: r1=\"yes\" (helper(true)), r2=\"no\" \
          (helper(false)); tail returns r2 = \"no\". stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn slice_c_multi_shot_arm_body_with_sync_fn_call_in_tail() {
+    // Slice C tail purity extension: the arm body tail may call an
+    // effect-free (Sync-ABI) user function like `append`. Pre-fix,
+    // `expr_is_pure` rejected non-constructor calls in the tail,
+    // blocking the canonical multi-shot `append(r1, r2)` pattern.
+    // The fix extends the arm-body pre-pass to accept calls to
+    // functions with empty closed effect rows.
+    let src = "import std.list\n\
+               import std.io\n\
+               \n\
+               effect Choose resumes: many { flip: () -> Bool }\n\
+               \n\
+               fn helper() -> List[Bool] ![Choose] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
+                 Cons(b, Nil)\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: List[Bool] = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: List[Bool] = k(true);\n      \
+                     let r2: List[Bool] = k(false);\n      \
+                     append(r1, r2)\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(length(result)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "slice_c_multi_shot_sync_tail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "2\n",
+        "Slice C sync-fn tail: k(true) → [true], k(false) → [false]; \
+         append([true], [false]) = [true, false]; length = 2. \
+         stderr={stderr:?}"
     );
 }
 
@@ -7237,17 +7320,55 @@ fn std_io_print_without_newline() {
 /// for future test infra work. The compile-only path is exercised
 /// by the `io_read_line_returns_string` typecheck test.
 #[test]
-#[ignore = "needs piped-stdin test infrastructure; tracked for Task 78"]
-fn std_io_read_line_via_piped_stdin_pending_test_infra() {
-    // The future-shape:
-    //   - Spawn the compiled binary with a pipe to stdin.
-    //   - Write `"hello\n"` to the pipe; close it.
-    //   - Assert stdout contains `"hello\n"` (round-trip).
-    //
-    // The runtime contract is pinned by `runtime/src/io.rs`'s
-    // `sigil_read_line` Rust unit (read_line strips exactly one
-    // trailing `\n` or `\r\n`, EOF returns empty).
-    let _ = "placeholder";
+fn std_io_read_line_via_piped_stdin() {
+    use std::io::Write;
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let line: String = perform IO.read_line();\n  \
+                 perform IO.println(line);\n  \
+                 0\n\
+               }\n";
+    let src_path =
+        std::env::temp_dir().join(format!("sigil_e2e_read_line_{}.sigil", std::process::id()));
+    std::fs::write(&src_path, src).expect("write source");
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+    let bin_path = std::env::temp_dir().join(format!("sigil_e2e_read_line_{}", std::process::id()));
+    let compile = Command::new(&sigil_bin)
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(&root)
+        .output()
+        .expect("invoke sigil compiler");
+    let _ = std::fs::remove_file(&src_path);
+    assert!(
+        compile.status.success(),
+        "compile failed: stderr={}",
+        String::from_utf8_lossy(&compile.stderr),
+    );
+    let mut child = Command::new(&bin_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn compiled binary");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"hello\n")
+        .expect("write to stdin");
+    let output = child.wait_with_output().expect("wait");
+    let _ = std::fs::remove_file(&bin_path);
+    let code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "hello\n",
+        "read_line round-trip: stdin \"hello\\n\" → stdout \"hello\\n\"; \
+         stderr={stderr:?}"
+    );
 }
 
 /// `IO.write_file` then `IO.read_file` round-trips a string through
@@ -11397,7 +11518,6 @@ fn task_78_5_g2a_minimal_bracketed_e_alias_typechecks() {
 /// `run_state_poly` shares the State frame across both. Final list =
 /// `[true, false]`; length = 2; stdout = `"2\n"`.
 #[test]
-#[ignore = "Plan D Task 119 audit (2026-05-03): G2.a closed (Task 78.5 g2a-bracketed-alias-detection); G2.b's row-poly lambda gap closed by Plan D Task 116. Now blocks on **E0145** introduced by Plan D Task 117's escape barrier — captured-k inside lambdas is rejected in any program containing a generic fn (run_state_poly[A] is generic; amb_handle[e]'s arm captures k into a lambda passed across the State[Int]/A generic boundary). Mechanical fix path: either move the handler into a non-generic wrapper around the generic body, or rewrite the arm body to call k(arg) directly without intermediate lambda capture. Both rewrites change the test's narrative (Plotkin state(amb)); they're orthogonal closures, not regressions of Plan D's lifts."]
 fn task_78_5_pending_g2a_bracketed_e_alias_unconstrained() {
     // Inline row-poly + body-type-poly run_state (mirrors std/raise.sigil's
     // catch shape). std/state.sigil's run_state is closed-row + Int-only,

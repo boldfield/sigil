@@ -273,14 +273,15 @@ the resulting string, return `0`.
 as complete without a wildcard. The nested `if/else` inside `Cons`'s
 arm body is independent of the outer match.
 
-## P14 — 2D-point record with Euclidean-ish distance
+## P14 — 2D-point record with match destructuring
 
 **Prompt:** Declare `type Point = { x: Int, y: Int }` (single-
-constructor record). Declare `fn sq(n: Int) -> Int ![] {
-n * n }` and `fn dist_sq(p: Point, q: Point) -> Int ![] {
-sq(p.x - q.x) + sq(p.y - q.y) }` using field-access syntax.
-In `main`, build `Point { x: 0, y: 0 }` and `Point { x: 3, y: 4 }`,
-call `dist_sq` on them, convert via `int_to_string`, print, return `0`.
+constructor record). Declare `fn sq(n: Int) -> Int ![] { n * n }` and
+`fn dist_sq(p: Point, q: Point) -> Int ![]` that extracts fields via
+match destructuring (e.g., `match p { Point { x: px, y: _ } => px }`)
+and computes `sq(px - qx) + sq(py - qy)`. In `main`, build
+`Point { x: 0, y: 0 }` and `Point { x: 3, y: 4 }`, call `dist_sq`
+on them, convert via `int_to_string`, print, return `0`.
 
 **Oracle (stdout):**
 ```
@@ -290,8 +291,9 @@ call `dist_sq` on them, convert via `int_to_string`, print, return `0`.
 **Oracle (exit):** `0`
 
 **Oracle (notes):** Exercises record type declaration, record literal
-construction, and field-access syntax (`p.x`). Records can also be
-destructured via match: `match p { Point { x: px, y: py } => ... }`.
+construction with `Name { field: value }` syntax, and record pattern
+destructuring via `match`. Sigil v1 has no `.name` field-access
+syntax; records are accessed exclusively through match destructuring.
 
 ## P15 — map a function over a cons-list
 
