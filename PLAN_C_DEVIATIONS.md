@@ -749,3 +749,52 @@ The Linux pass is **not** evidence of TCO. It is incidental: x86_64 callee-saved
 **Failure mode.** Without TCO-4 (or a successor), Sigil's recursion-only iteration model is depth-bounded by default thread stack divided by per-frame size. Today: ~1M depth on x86_64 Linux, sub-1M on aarch64 macOS. Future LLM-authored programs that recurse over large structures (fold over a 10M-element list, walk a 5M-node tree) will silently overflow at runtime — no diagnostic, just a SIGSEGV process exit. The fight-the-priors guardrail (no `for`/`while`/`loop`) is load-bearing here: there is no escape hatch for the user.
 
 **Implementing commit(s).** [HEAD] (this commit lands the deviation entry alongside TCO-1's diagnostic tests; TCO-4's implementing commits gated on human signoff).
+
+## 2026-05-07 — [DEVIATION Task TCO-3 follow-up] Cps coverage gate resolved — Sync `return_call` is the full TCO surface
+
+**Context.** The prior TCO-3 entry surfaced three open questions for the human reviewer; question 1 (Cps coverage gate) gated the scope of TCO-4. To close it, a third diagnostic was added — `tail_recursive_cps_colored_count_down_one_million` — exercising a Cps-COLORED user fn (`let _: Int = perform State.get(); match n { 0 => 0, _ => count_down_cps(n - 1) }`, body shape mirroring `examples/fib_cps_perf.sigil`). CI verdict on commit `88c0f1a`:
+
+| test | ubuntu-24.04 x86_64 | macos-14 aarch64 |
+|---|---|---|
+| `tail_recursive_count_down_one_million` (pure Sync) | PASS | FAIL (exit -1) |
+| `tail_recursive_mutual_ping_pong_one_million` (mutual Sync) | PASS | FAIL (exit -1) |
+| `tail_recursive_cps_colored_count_down_one_million` (Cps-colored Sync ABI) | **FAIL (exit -1)** | **FAIL (exit -1)** |
+
+**Analysis.** All exits are `-1` (signal-kill, classic stack overflow). The Cps-colored shape overflows EARLIER than pure-Sync — Linux x86_64 fails on the Cps test at 1M but passes the pure-Sync test at the same depth on the same machine. The cause is a frame-size effect, NOT an architectural one:
+
+- `compute_user_fn_abi` (codegen.rs:189) picks `UserFnAbi::Sync` for the Cps-colored fn because the recursive match arm fails the `pure_tail` predicate. The recursive call site uses the same Sync direct-call branch (codegen.rs:21759) as the pure-Sync diagnostic.
+- Each Cps-colored fn frame is LARGER than each pure-Sync fn frame: per-perform `lower_perform_to_value` machinery (args buffer stack slot, `sigil_run_loop` driver invocation, arm fn frame, `terminal_out` plumbing) bloats the frame. 1M frames × bloated size overflows even x86_64's 8 MB.
+
+**Why this resolves the Cps gate.** When TCO-4 ships `return_call` at `lower_call`'s Sync direct branch:
+
+- The fn's frame is eliminated by tail jump on every recursion step.
+- Per-perform machinery occurs and unwinds **within one iteration's frame**, then `return_call` reuses that frame for the next iteration.
+- Stack growth becomes O(1) regardless of frame size.
+
+So the same Sync `return_call` fix covers Cps-colored fns too. There is no additional Cps-specific work needed — the architectural concern in the prior entry (whether the trampoline provides effective TCO for Cps tail recursion) was a misread of the ABI mechanics.
+
+**Why there is no tail-recursive Cps-ABI fn shape.** `compute_user_fn_abi`'s three Cps-ABI body shapes — `is_simple_tail_perform_with_pure_args_body`, `is_simple_yield_then_constant_tail_body`, `is_simple_let_yield_then_pure_tail_body` — all exclude recursive calls by construction (`pure_tail` excludes calls; constant tail is a literal; bare-tail-perform has no tail call). Tail recursion in Sigil today is exclusively Sync-ABI, even when the colorer flags the fn Cps. There is therefore no separate Cps-ABI tail-call lowering path that needs `return_call` treatment.
+
+**Resolution of the prior entry's open questions:**
+
+1. **Cps coverage gate.** Resolved. Sync-only `return_call` at `lower_call`'s Sync direct branch is the full TCO surface for every tail-recursive shape Sigil supports today. No separate Cps fix needed.
+2. **"No partial-TCO" guardrail vs Sync-only ship.** Satisfied. Sync-only is not partial — it covers everything. The guardrail wording ("If TCO-4 ships, it covers self + mutual + Cps + Sync") was based on the same misread; the right reformulation is "covers self + mutual + Sync-ABI tail recursion, which subsumes Cps-colored Sync-ABI tail recursion." TCO-4 may ship Sync-only.
+3. **Stack-depth assertions.** Bump regression depths to **10M** in the TCO-4 commit (post-fix). With `return_call` active, frame-size differences are irrelevant, so 10M is a clean ceiling that closes the incidental-stack-fit loophole (1M happened to fit on x86_64 today; 10M can't on either platform without TCO).
+
+**TCO-4 scope (locked, awaiting implementation):**
+
+- Add `enum TailPos { Tail, NonTail }` threaded through `lower_expr` and friends per the prior entry's "Proposed fix surface."
+- At `lower_call`'s `UserFnAbi::Sync` direct branch (~21759): emit `.ins().return_call(func_ref, &all_args)` when `ctx == Tail`, drop the `inst_results` extraction.
+- At the closure-indirect path (~23181): emit `.ins().return_call_indirect(sig_ref, code_ptr, &all_args)` when `ctx == Tail`.
+- `UserFnAbi::Cps` branch (~21850): leave non-tail. No tail-recursive Cps-ABI shape exists, and Cps-colored Sync-ABI fns route through the Sync direct branch above.
+- Verify cranelift workspace pin supports `return_call` on x86_64 + aarch64 (≥ 0.94).
+- Bump the three TCO-1 diagnostic tests' depths from 1,000,000 to 10,000,000.
+- Add the additional shape-coverage tests called out in the original plan TCO-4: `tail_recursive_with_let_intermediate`, `tail_recursive_through_if`, `tail_recursive_through_match`, `tail_recursive_with_effect_row`.
+- Land the spec section in `spec/language.md` (Runtime model → Tail-call optimization).
+- Update `PLAN_C_PROGRESS.md` with the Stage TCO closure entry.
+
+**Closure path.** This deviation closes alongside the TCO-4 implementing commits.
+
+**Failure mode.** Same as the prior entry — if TCO-4 doesn't ship, Sigil's recursion-only iteration model remains depth-bounded by stack-size / frame-size, with no user-facing diagnostic on overflow.
+
+**Implementing commit(s).** [HEAD] (this entry resolves the Cps gate using the diagnostic data from PR #108 commit `88c0f1a`; TCO-4 implementation gated on human signoff to proceed).
