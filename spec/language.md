@@ -395,6 +395,62 @@ enumerates every branch by resuming `k(0)`, `k(1)`, …, `k(n-1)` and
 collecting results into a list. `first_choice` returns the first
 non-failing branch as `Option[A]`.
 
+### E15 — CLI: argv + `Fs.read_dir` + `Fs.read_file`
+
+```sigil
+import std.env
+import std.fs
+import std.io
+import std.list
+
+fn dump_dir(path: String) -> Int ![IO, Fs] {
+  match read_dir(path) {
+    Ok(entries) => dump_each(entries),
+    Err(NotFound) => fail_with("(directory missing)"),
+    Err(_) => fail_with("(error reading directory)"),
+  }
+}
+
+fn dump_each(xs: List[String]) -> Int ![IO] {
+  match xs {
+    Nil => 0,
+    Cons(name, rest) => dump_each_step(name, rest),
+  }
+}
+
+// Helper: print one entry then recurse on the rest. Sigil v1's
+// match arm body must be a single expression, so the
+// print-and-recurse sequence lives in a fn body (which IS a block).
+fn dump_each_step(name: String, rest: List[String]) -> Int ![IO] {
+  perform IO.println(name);
+  dump_each(rest)
+}
+
+fn fail_with(msg: String) -> Int ![IO] {
+  perform IO.println(msg);
+  1
+}
+
+fn main() -> Int ![IO, Env, Fs] {
+  // First arg after argv[0] is the directory to list; default to "."
+  // if not provided.
+  let argv: List[String] = args();
+  let path: String = match argv {
+    Nil => ".",
+    Cons(_prog, Nil) => ".",
+    Cons(_prog, Cons(p, _)) => p,
+  };
+  dump_dir(path)
+}
+```
+
+This is the CLI-tool baseline: `args()` gives the argv list (POSIX
+convention — `args()[0]` is the program name); `read_dir(path)`
+returns `Result[List[String], FsError]` with entry names (no path
+joining); pattern-match handles each FsError variant; output prints
+via `IO.println`. Replace `read_dir` with `read_file(p)` to read a
+file; replace with `run("cmd", args)` to spawn a subprocess.
+
 ---
 
 ## Reference
@@ -465,6 +521,26 @@ fn main() -> Int ![IO] { 0 }                   // function
 - Return type is mandatory.
 - Effect row is mandatory (use `![]` for pure).
 - Body is an expression; multi-statement bodies use a block (§5).
+
+**`fn main` constraints.** `fn main` must take no parameters and
+return `Int`. Its effect row may only contain effects discharged by
+the top-level shim:
+
+- `IO` — `print`, `println`, `read_line` arms (`std.io`)
+- `ArithError` — div-by-zero / mod-by-zero default handlers
+- `Mem` — marker effect (no shim handler; allowed for type-level
+  gating)
+- `Env` — `args`, `var`, `vars` (`std.env`)
+- `Fs` — `read_file`, `write_file`, `read_dir`, `exists`, `is_file`,
+  `is_dir`, `file_size`, `mkdir`, `remove_file`, `remove_dir`
+  (`std.fs`)
+- `Process` — `run` (`std.process`)
+
+Other effects (`Random`, `Clock`, `Raise[E]`, `State[S]`, `Choose`,
+user-defined) must be handled inside `main`'s body via `handle ...
+with { ... }` or stdlib helpers like `run_pseudo_random` /
+`run_state` / `catch`. A `main`-row entry referencing an effect
+without a top-level handler frame is rejected at typecheck (E0041).
 
 ### §3 — Type system
 
@@ -975,7 +1051,10 @@ files are the authoritative API reference.
 | `std.int64` | Boxed `Int64` with arithmetic, comparison, conversion, stringify. |
 | `std.string_builder` | `StringBuilder` rope (Mem-gated). |
 | `std.pair` | `fst[A, B]`, `snd[A, B]` accessors for binary tuples `(A, B)`. |
-| `std.io` | `IO` effect: `print`, `println`, `read_line`, `read_file`, `write_file`. |
+| `std.io` | `IO` effect: `print`, `println`, `read_line`. (File ops moved to `std.fs`.) |
+| `std.env` | `Env` effect: `args() -> List[String]`, `var(name) -> Option[String]`, `vars() -> List[(String, String)]`. |
+| `std.fs` | `Fs` effect + `FsError` sum type. Predicates: `exists`, `is_file`, `is_dir` → `Bool`. Fallible ops: `read_file`, `write_file`, `read_dir`, `mkdir`, `remove_file`, `remove_dir`, `file_size` → `Result[T, FsError]`. `FsError = \| NotFound \| PermissionDenied \| AlreadyExists \| NotADirectory \| IsADirectory \| InvalidUtf8 \| Other(String)`. |
+| `std.process` | `Process` effect + `ProcessError` sum type. `run(cmd, args: Array[String]) -> Result[(Int, String, String), ProcessError]` — direct exec (no shell), captures stdout / stderr after wait. `ProcessError = \| NotFound \| PermissionDenied \| Other(String)`. |
 | `std.mem` | `Mem` marker effect. |
 | `std.random` | `Random` effect + `run_pseudo_random` (process-global xorshift64) + `run_seeded_random` (deterministic xorshift64 from an `Int64` seed). **Not cryptographically secure.** |
 | `std.clock` | `Clock` effect + `run_os_clock` (wall-clock nanos) + `run_frozen_clock` (fixed `Int64` timestamp for test determinism). |
@@ -1017,6 +1096,14 @@ The following limits are permanent v1 design choices:
 | Codepoint-aware `string_split` / `string_replace` | Future `string-codepoint-helpers` plan (depends on stdlib namespace qualification, not on `Char`). |
 | Unicode-aware `is_unicode_*` / `to_lower_unicode` / `to_upper_unicode` / case folding / normalization | Future `std/unicode.sigil` plan (ships general-category + case-folding tables as embedded data + dispatchers). The v1 `*_ascii` suffix lets the Unicode set ship additively without renaming. |
 | Strict-UTF-8 `string_chars_strict : (String) -> Result[List[Char], Utf8Error]` | v1 ships only the lossy `string_chars`; v2 may add the strict variant additively. |
+| Network effects (`Net`: TCP, TLS, DNS, sockets) | Future plan once the LLM-first thesis closes and Sigil expands beyond demo programs. Not in v1 scope. |
+| Timer effects (sleep, monotonic time, deadlines) | Future plan. `Clock.now` (wall-clock) ships in v1 via `std.clock`; deadline / sleep semantics defer. |
+| Process stdin piping | Future v2 follow-up of the `Process` effect. v1's `Process.run` runs with stdin closed. |
+| Process stdout / stderr streaming | Future v2 follow-up. v1 captures full stdout / stderr after the child exits via `Command::output()`. |
+| Effect ops returning user-defined sum types directly (e.g., `Fs.read_file: (String) -> Result[String, FsError]` as a perform-direct surface) | Path 1 architecture from the CLI-effects plan; deferred. v1 ships path 4 (raw-shape effect ops + stdlib Sigil wrappers — `match read_file(p) { Ok(s) => ..., Err(NotFound) => ... }` as a stdlib fn call). Closure path = future `BuiltinEffectArmSynth` codegen-arm-fn architecture. See `[DEVIATION Task EE]` in `PLAN_C_DEVIATIONS.md`. |
+| Filesystem path manipulation (`join`, `basename`, `dirname`, `normalize`) | Future `std/path.sigil` plan. The CLI-effects plan ships only the `Fs` effect's primitive ops. |
+| Recursive `mkdir -p` and recursive `rm -rf` | Future stdlib helpers layered on top of `mkdir` / `remove_dir` / `read_dir`. v1 `Fs.mkdir` / `remove_dir` are single-level. |
+| Symlink-aware ops (`is_symlink`, `read_link`, `create_symlink`) | Future v2 work. v1 follows symlinks transparently; no symlink-specific surface. |
 
 ### §15 — Build and run
 
