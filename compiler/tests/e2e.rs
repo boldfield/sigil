@@ -12859,6 +12859,42 @@ fn char_eq_distinguishes_different_codepoints() {
 }
 
 #[test]
+fn string_chars_invalid_utf8_replaces() {
+    // Plan C addendum review item 10 — e2e coverage for the
+    // user-visible lossy-decode path. Construct a ByteArray with
+    // a known-invalid leading byte (0xFF), bypass validation via
+    // `string_from_bytes_alloc` (which copies bytes verbatim per
+    // the validate-then-construct contract), then `string_chars`
+    // it. The decoder must emit U+FFFD (0xFFFD = 65533) for the
+    // invalid byte. Pre-PR runtime unit tests covered the decoder
+    // itself; this test pins the runtime → user-program path.
+    let src = "import std.io\n\
+               import std.list\n\
+               import std.byte_array\n\
+               fn main() -> Int ![IO] {\n  \
+                 let h: ByteArray = byte_array_alloc(1, byte_truncate(104));\n  \
+                 let bad: ByteArray = byte_array_alloc(1, byte_truncate(255));\n  \
+                 let bs: ByteArray = byte_array_concat(h, bad);\n  \
+                 let s: String = string_from_bytes_alloc(bs);\n  \
+                 let xs: List[Char] = string_chars(s);\n  \
+                 match xs {\n    \
+                   Nil => perform IO.println(\"empty\"),\n    \
+                   Cons(_h, t) => match t {\n      \
+                     Nil => perform IO.println(\"only-one\"),\n      \
+                     Cons(c2, _) => perform IO.println(int_to_string(char_to_int(c2))),\n    \
+                   },\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "string_chars_invalid_utf8");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(
+        stdout, "65533\n",
+        "decode of invalid byte 0xFF must emit U+FFFD (65533)"
+    );
+}
+
+#[test]
 fn char_doc_only_import() {
     // `import std.char` is a documentation skip-list path; it
     // compiles but pulls no Sigil items into the program. The

@@ -288,69 +288,86 @@ pub unsafe extern "C" fn sigil_char_to_upper_ascii(a: *const u8) -> *mut u8 {
 
 // ── String codepoint ops ───────────────────────────────────────────
 
+/// Decode the next codepoint at `bytes[offset..]` lossily. Returns
+/// `(codepoint, byte_len_consumed)`. On any decode failure (invalid
+/// leading byte, missing/invalid continuation, overlong encoding,
+/// surrogate, > 0x10FFFF) emits `U+FFFD` and advances exactly one
+/// byte so callers resync at the next valid leading byte. Caller
+/// must guarantee `offset < bytes.len()`.
+///
+/// This is the single source of truth for Sigil's lossy UTF-8
+/// decode — `decode_codepoints_lossy` (drives `string_chars`) and
+/// `find_nth_codepoint` (drives `string_char_at`) both step through
+/// it so their codepoint boundaries are identical by construction.
+fn decode_next_codepoint(bytes: &[u8], offset: usize) -> (u32, usize) {
+    let b0 = bytes[offset];
+    if b0 < 0x80 {
+        return (b0 as u32, 1);
+    }
+    // Decode continuation bytes following b0. Each must satisfy
+    // 10xxxxxx; otherwise the sequence is invalid and we emit
+    // U+FFFD for b0 alone, advancing one byte. Overlong encodings
+    // and surrogate-range codepoints are also rejected per the
+    // standard UTF-8 decoder.
+    let cont = |b: u8| (b & 0xC0) == 0x80;
+    let payload = |b: u8| (b & 0x3F) as u32;
+    let (cp, len) = if (b0 & 0xE0) == 0xC0 && offset + 1 < bytes.len() && cont(bytes[offset + 1]) {
+        (
+            ((b0 & 0x1F) as u32) << 6 | payload(bytes[offset + 1]),
+            2usize,
+        )
+    } else if (b0 & 0xF0) == 0xE0
+        && offset + 2 < bytes.len()
+        && cont(bytes[offset + 1])
+        && cont(bytes[offset + 2])
+    {
+        (
+            ((b0 & 0x0F) as u32) << 12
+                | payload(bytes[offset + 1]) << 6
+                | payload(bytes[offset + 2]),
+            3usize,
+        )
+    } else if (b0 & 0xF8) == 0xF0
+        && offset + 3 < bytes.len()
+        && cont(bytes[offset + 1])
+        && cont(bytes[offset + 2])
+        && cont(bytes[offset + 3])
+    {
+        (
+            ((b0 & 0x07) as u32) << 18
+                | payload(bytes[offset + 1]) << 12
+                | payload(bytes[offset + 2]) << 6
+                | payload(bytes[offset + 3]),
+            4usize,
+        )
+    } else {
+        return (REPLACEMENT_CODEPOINT, 1);
+    };
+    let overlong = match len {
+        2 => cp < 0x80,
+        3 => cp < 0x800,
+        4 => cp < 0x10000,
+        _ => false,
+    };
+    let valid = !overlong && cp <= MAX_CODEPOINT && !(SURROGATE_LO..=SURROGATE_HI).contains(&cp);
+    if valid {
+        (cp, len)
+    } else {
+        (REPLACEMENT_CODEPOINT, 1)
+    }
+}
+
 /// Decode UTF-8 from `bytes` into a Vec of codepoints, replacing each
 /// invalid byte with U+FFFD and resyncing at the next valid leading
-/// byte. Implements the same lossy contract as
-/// `String::from_utf8_lossy`, but exposed as a `Vec<u32>` so the
-/// caller can build a Sigil `List[Char]` cell-by-cell.
+/// byte. Steps through `decode_next_codepoint` so its decoder
+/// boundaries match `find_nth_codepoint` exactly.
 fn decode_codepoints_lossy(bytes: &[u8]) -> Vec<u32> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        let b0 = bytes[i];
-        if b0 < 0x80 {
-            out.push(b0 as u32);
-            i += 1;
-            continue;
-        }
-        // Decode continuation bytes following b0. Each must satisfy
-        // 10xxxxxx; otherwise the sequence is invalid and we emit
-        // U+FFFD for b0 alone, advancing one byte. Overlong encodings
-        // and surrogate-range codepoints are also rejected per the
-        // standard UTF-8 decoder.
-        let cont = |b: u8| (b & 0xC0) == 0x80;
-        let payload = |b: u8| (b & 0x3F) as u32;
-        let (cp, len) = if (b0 & 0xE0) == 0xC0 && i + 1 < bytes.len() && cont(bytes[i + 1]) {
-            let v = ((b0 & 0x1F) as u32) << 6 | payload(bytes[i + 1]);
-            (v, 2usize)
-        } else if (b0 & 0xF0) == 0xE0
-            && i + 2 < bytes.len()
-            && cont(bytes[i + 1])
-            && cont(bytes[i + 2])
-        {
-            let v = ((b0 & 0x0F) as u32) << 12 | payload(bytes[i + 1]) << 6 | payload(bytes[i + 2]);
-            (v, 3usize)
-        } else if (b0 & 0xF8) == 0xF0
-            && i + 3 < bytes.len()
-            && cont(bytes[i + 1])
-            && cont(bytes[i + 2])
-            && cont(bytes[i + 3])
-        {
-            let v = ((b0 & 0x07) as u32) << 18
-                | payload(bytes[i + 1]) << 12
-                | payload(bytes[i + 2]) << 6
-                | payload(bytes[i + 3]);
-            (v, 4usize)
-        } else {
-            out.push(REPLACEMENT_CODEPOINT);
-            i += 1;
-            continue;
-        };
-        let overlong = match len {
-            2 => cp < 0x80,
-            3 => cp < 0x800,
-            4 => cp < 0x10000,
-            _ => false,
-        };
-        let valid =
-            !overlong && cp <= MAX_CODEPOINT && !(SURROGATE_LO..=SURROGATE_HI).contains(&cp);
-        if valid {
-            out.push(cp);
-            i += len;
-        } else {
-            out.push(REPLACEMENT_CODEPOINT);
-            i += 1;
-        }
+        let (cp, len) = decode_next_codepoint(bytes, i);
+        out.push(cp);
+        i += len;
     }
     out
 }
@@ -427,67 +444,7 @@ fn find_nth_codepoint(bytes: &[u8], idx: i64) -> Option<u32> {
     let mut count = 0usize;
     let mut i = 0;
     while i < bytes.len() {
-        let b0 = bytes[i];
-        let cp;
-        let len;
-        if b0 < 0x80 {
-            cp = b0 as u32;
-            len = 1;
-        } else {
-            let cont = |b: u8| (b & 0xC0) == 0x80;
-            let payload = |b: u8| (b & 0x3F) as u32;
-            let (decoded, decoded_len) = if (b0 & 0xE0) == 0xC0
-                && i + 1 < bytes.len()
-                && cont(bytes[i + 1])
-            {
-                (((b0 & 0x1F) as u32) << 6 | payload(bytes[i + 1]), 2usize)
-            } else if (b0 & 0xF0) == 0xE0
-                && i + 2 < bytes.len()
-                && cont(bytes[i + 1])
-                && cont(bytes[i + 2])
-            {
-                (
-                    ((b0 & 0x0F) as u32) << 12 | payload(bytes[i + 1]) << 6 | payload(bytes[i + 2]),
-                    3usize,
-                )
-            } else if (b0 & 0xF8) == 0xF0
-                && i + 3 < bytes.len()
-                && cont(bytes[i + 1])
-                && cont(bytes[i + 2])
-                && cont(bytes[i + 3])
-            {
-                (
-                    ((b0 & 0x07) as u32) << 18
-                        | payload(bytes[i + 1]) << 12
-                        | payload(bytes[i + 2]) << 6
-                        | payload(bytes[i + 3]),
-                    4usize,
-                )
-            } else {
-                (REPLACEMENT_CODEPOINT, 0usize)
-            };
-            if decoded_len == 0 {
-                cp = REPLACEMENT_CODEPOINT;
-                len = 1;
-            } else {
-                let overlong = match decoded_len {
-                    2 => decoded < 0x80,
-                    3 => decoded < 0x800,
-                    4 => decoded < 0x10000,
-                    _ => false,
-                };
-                let valid = !overlong
-                    && decoded <= MAX_CODEPOINT
-                    && !(SURROGATE_LO..=SURROGATE_HI).contains(&decoded);
-                if valid {
-                    cp = decoded;
-                    len = decoded_len;
-                } else {
-                    cp = REPLACEMENT_CODEPOINT;
-                    len = 1;
-                }
-            }
-        }
+        let (cp, len) = decode_next_codepoint(bytes, i);
         if count == target {
             return Some(cp);
         }
@@ -1038,6 +995,34 @@ mod tests {
                 TEST_NIL_DISC,
             );
             assert_eq!(list_to_codepoints(list), Vec::<u32>::new());
+        }
+    }
+
+    #[test]
+    fn string_char_at_overlong_replaces() {
+        // Plan C addendum review item D non-blocking observation —
+        // pin that `find_nth_codepoint` (drives `string_char_at`)
+        // and `decode_codepoints_lossy` (drives `string_chars`) agree
+        // on codepoint counts for invalid input. With both routed
+        // through `decode_next_codepoint`, this is now an
+        // identical-by-construction property; the test guards
+        // against a future refactor splitting them.
+        let _g = gc_test_lock();
+        unsafe {
+            // [0xC0, 0x80, b'a'] — overlong at idx 0, then 'a' at
+            // codepoint idx 1 (since the overlong consumed a single
+            // byte and emitted U+FFFD).
+            let s = make_string(&[0xC0, 0x80, b'a']);
+            assert_eq!(sigil_string_char_at_validate(s, 0), 0);
+            assert_eq!(sigil_string_char_at_validate(s, 1), 0);
+            assert_eq!(sigil_string_char_at_validate(s, 2), 0);
+            assert_eq!(sigil_string_char_at_validate(s, 3), 1);
+            let c0 = sigil_string_char_at(s, 0);
+            assert_eq!(read_char(c0), REPLACEMENT_CODEPOINT);
+            let c1 = sigil_string_char_at(s, 1);
+            assert_eq!(read_char(c1), REPLACEMENT_CODEPOINT);
+            let c2 = sigil_string_char_at(s, 2);
+            assert_eq!(read_char(c2), b'a' as u32);
         }
     }
 

@@ -5197,37 +5197,58 @@ impl Tc {
                         );
                     }
                 }
-                // Plan C addendum (Char) — boxed `Char` (TAG_CHAR) is
-                // heap-allocated; lowering `==` / `!=` to `icmp` would
-                // compare pointer identity, not codepoint, silently
-                // returning the wrong answer. Reject with E0060
-                // pointing at the named `char_eq` / `char_*` ops.
-                // Float / Int64 (also boxed) inherit the same trap;
-                // generalizing the rejection is queued for a follow-up
-                // plan since the existing `float_eq` / `int64_eq`
-                // discipline currently hides the bug.
-                if let Some(a) = lt.as_ref() {
-                    if matches!(a, Ty::Char) {
-                        let suggestion = match op {
-                            BinOp::Eq => "char_eq(a, b)",
-                            BinOp::NotEq => "!char_eq(a, b)",
-                            _ => unreachable!(
-                                "typecheck: BinOp::Eq | NotEq match arm reached with op {op:?}"
-                            ),
-                        };
-                        self.push_error(
-                            "E0060",
-                            rspan,
-                            format!(
-                                "`{}` is not defined on `Char` — use `{suggestion}` (or \
-                                 `char_lt` / `char_le` / `char_gt` / `char_ge` for ordering). \
-                                 Boxed `Char` is heap-allocated; `{}` would compare pointer \
-                                 identity rather than codepoints.",
-                                binop_symbol(op),
-                                binop_symbol(op),
-                            ),
-                        );
-                    }
+                // Plan C addendum — heap-boxed primitives (`Char`,
+                // `Float`, `Int64`) lower `==` / `!=` to `icmp` over
+                // their pointers, which compares object identity, not
+                // payload. Silently wrong; reject at typecheck and
+                // point the user at the named `*_eq` op. Stdlib code
+                // already uses the named ops by convention; an
+                // LLM-authored program (the language's load-bearing
+                // use case) wouldn't.
+                //
+                // Check BOTH operand types so the hint still fires
+                // when only the RHS is the boxed-primitive (review
+                // item #1 from the third re-review). Per typecheck
+                // ordering, when LHS errored (`lt = None`) and RHS is
+                // boxed-primitive, the cascade-error skip would
+                // otherwise hide the hint.
+                let lt_boxed = lt.as_ref().and_then(boxed_primitive_eq_name);
+                let rt_boxed = rt.as_ref().and_then(boxed_primitive_eq_name);
+                if let Some(name) = lt_boxed.or(rt_boxed) {
+                    let suggestion = match (name, op) {
+                        (BoxedPrim::Char, BinOp::Eq) => "char_eq(a, b)",
+                        (BoxedPrim::Char, BinOp::NotEq) => "!char_eq(a, b)",
+                        (BoxedPrim::Float, BinOp::Eq) => "float_eq(a, b)",
+                        (BoxedPrim::Float, BinOp::NotEq) => "!float_eq(a, b)",
+                        (BoxedPrim::Int64, BinOp::Eq) => "int64_eq(a, b)",
+                        (BoxedPrim::Int64, BinOp::NotEq) => "!int64_eq(a, b)",
+                        (_, _) => unreachable!(
+                            "typecheck: BinOp::Eq | NotEq match arm reached with op {op:?}"
+                        ),
+                    };
+                    let ty_name = name.display();
+                    let ord_hint = match name {
+                        BoxedPrim::Char => "`char_lt` / `char_le` / `char_gt` / `char_ge`",
+                        BoxedPrim::Float => "`float_lt` / `float_le` / `float_gt` / `float_ge`",
+                        BoxedPrim::Int64 => "`int64_lt` / `int64_le` / `int64_gt` / `int64_ge`",
+                    };
+                    self.push_error(
+                        "E0060",
+                        rspan,
+                        format!(
+                            "`{}` is not defined on `{ty_name}` — use `{suggestion}` \
+                             (or {ord_hint} for ordering). Boxed `{ty_name}` is heap-\
+                             allocated; `{}` would compare pointer identity rather than \
+                             {payload}.",
+                            binop_symbol(op),
+                            binop_symbol(op),
+                            payload = match name {
+                                BoxedPrim::Char => "codepoints",
+                                BoxedPrim::Float => "values (with NaN-aware semantics)",
+                                BoxedPrim::Int64 => "values",
+                            },
+                        ),
+                    );
                 }
                 Some(Ty::Bool)
             }
@@ -7393,6 +7414,35 @@ fn ty_display(t: &Ty) -> String {
                 ty_display(&c.ret)
             )
         }
+    }
+}
+
+/// Plan C addendum — heap-boxed primitive types whose `==` / `!=`
+/// must be rejected at typecheck. Pointer-identity icmp at codegen
+/// would silently return the wrong answer.
+#[derive(Clone, Copy)]
+enum BoxedPrim {
+    Char,
+    Float,
+    Int64,
+}
+
+impl BoxedPrim {
+    fn display(self) -> &'static str {
+        match self {
+            BoxedPrim::Char => "Char",
+            BoxedPrim::Float => "Float",
+            BoxedPrim::Int64 => "Int64",
+        }
+    }
+}
+
+fn boxed_primitive_eq_name(ty: &Ty) -> Option<BoxedPrim> {
+    match ty {
+        Ty::Char => Some(BoxedPrim::Char),
+        Ty::User(name, args) if args.is_empty() && name == "Float" => Some(BoxedPrim::Float),
+        Ty::User(name, args) if args.is_empty() && name == "Int64" => Some(BoxedPrim::Int64),
+        _ => None,
     }
 }
 
@@ -15294,6 +15344,64 @@ mod tests {
         assert!(
             has_code(&errs, "E0060"),
             "expected E0060 (char !=); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn float_eq_operator_is_e0060() {
+        // Plan C addendum review item 9 — extend the heap-boxed-
+        // primitive `==` rejection to Float (boxed IEEE 754 f64;
+        // pointer compare would be silently wrong).
+        let src = "fn main() -> Int ![] {\n  \
+                     match 3.14 == 3.14 { true => 0, false => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0060"),
+            "expected E0060 (float ==); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn float_neq_operator_is_e0060() {
+        let src = "fn main() -> Int ![] {\n  \
+                     match 1.0 != 2.0 { true => 0, false => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0060"),
+            "expected E0060 (float !=); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn int64_eq_operator_is_e0060() {
+        // Plan C addendum review item 9 — extend the rejection to
+        // Int64 (boxed 64-bit signed; pointer compare would be
+        // silently wrong).
+        let src = "fn main() -> Int ![] {\n  \
+                     let a: Int64 = int64_from_int(1);\n  \
+                     let b: Int64 = int64_from_int(1);\n  \
+                     match a == b { true => 0, false => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0060"),
+            "expected E0060 (int64 ==); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn int64_neq_operator_is_e0060() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let a: Int64 = int64_from_int(1);\n  \
+                     let b: Int64 = int64_from_int(2);\n  \
+                     match a != b { true => 0, false => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0060"),
+            "expected E0060 (int64 !=); got {errs:?}"
         );
     }
 }

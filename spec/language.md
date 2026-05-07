@@ -431,7 +431,7 @@ identifiers.
   lexer rejects multi-codepoint bodies, `\u{...}` values >
   `0x10FFFF`, and surrogate-range values at parse time.
   Operator overloading (`==`, `<`) is **not** provided — use the
-  named functions `char_eq` / `char_lt` etc. (§3.4). Pattern-
+  named functions `char_eq` / `char_lt` etc. (§3.1.1). Pattern-
   matching against literal Chars in `match c { 'a' => ... }`
   IS supported.
 - Byte: constructed via `byte_truncate(n: Int) -> Byte ![]` (truncates

@@ -10793,7 +10793,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                                     builder.ins().uextend(types::I64, raw)
                                 }
-                                // Plan C addendum (Char) — boxed Char is pointer-typed.
                                 EnvSlotKind::Char
                                 | EnvSlotKind::String
                                 | EnvSlotKind::Closure
@@ -10885,7 +10884,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                                     builder.ins().uextend(types::I64, raw)
                                 }
-                                // Plan C addendum (Char) — boxed Char is pointer-typed.
                                 EnvSlotKind::Char
                                 | EnvSlotKind::String
                                 | EnvSlotKind::Closure
@@ -12141,7 +12139,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             | crate::ast::EnvSlotKind::Unit => {
                                 lowerer.builder.ins().uextend(types::I64, val)
                             }
-                            // Plan C addendum (Char) — boxed Char is pointer-typed.
                             crate::ast::EnvSlotKind::Char
                             | crate::ast::EnvSlotKind::String
                             | crate::ast::EnvSlotKind::Closure
@@ -12390,7 +12387,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         raw
                                     }
                                 }
-                                // Plan C addendum (Char) — boxed Char is pointer-typed.
                                 crate::ast::EnvSlotKind::Char
                                 | crate::ast::EnvSlotKind::String
                                 | crate::ast::EnvSlotKind::Closure
@@ -13108,7 +13104,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         crate::ast::EnvSlotKind::Bool
                         | crate::ast::EnvSlotKind::Byte
                         | crate::ast::EnvSlotKind::Unit => builder.ins().ireduce(types::I8, raw),
-                        // Plan C addendum (Char) — boxed Char is pointer-typed.
                         crate::ast::EnvSlotKind::Char
                         | crate::ast::EnvSlotKind::String
                         | crate::ast::EnvSlotKind::Closure
@@ -13486,7 +13481,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             | crate::ast::EnvSlotKind::Unit => {
                                 builder.ins().ireduce(types::I8, raw)
                             }
-                            // Plan C addendum (Char) — boxed Char is pointer-typed.
                             crate::ast::EnvSlotKind::Char
                             | crate::ast::EnvSlotKind::String
                             | crate::ast::EnvSlotKind::Closure
@@ -14285,7 +14279,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                                     builder.ins().ireduce(types::I8, raw)
                                 }
-                                // Plan C addendum (Char) — boxed Char is pointer-typed.
                                 EnvSlotKind::Char
                                 | EnvSlotKind::String
                                 | EnvSlotKind::Closure
@@ -16889,7 +16882,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                                     builder.ins().ireduce(types::I8, raw)
                                 }
-                                // Plan C addendum (Char) — boxed Char is pointer-typed.
                                 EnvSlotKind::Char
                                 | EnvSlotKind::String
                                 | EnvSlotKind::Closure
@@ -23092,7 +23084,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                     self.builder.ins().uextend(types::I64, *raw)
                 }
-                // Plan C addendum (Char) — boxed Char is pointer-typed.
                 EnvSlotKind::Char
                 | EnvSlotKind::String
                 | EnvSlotKind::Closure
@@ -23253,7 +23244,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // unsigned in their bit-level storage).
                     self.builder.ins().uextend(types::I64, *raw)
                 }
-                // Plan C addendum (Char) — boxed Char is pointer-typed.
                 EnvSlotKind::Char
                 | EnvSlotKind::String
                 | EnvSlotKind::Closure
@@ -23954,7 +23944,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         Ty::Bool | Ty::Byte | Ty::Unit => {
                             self.builder.ins().ireduce(types::I8, raw)
                         }
-                        // Plan C addendum (Char) — boxed Char is pointer-typed.
                         Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
                         // Plan D Task 117 — Continuation in a tuple
                         // element would require storing k in a heap-
@@ -24016,7 +24005,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match field_ty {
             Ty::Int => raw,
             Ty::Bool | Ty::Byte | Ty::Unit => self.builder.ins().ireduce(types::I8, raw),
-            // Plan C addendum (Char) — boxed Char is pointer-typed.
             Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
             // Plan D Task 117 — Continuation in a user-type field
             // would require storing k in a heap record, which the
@@ -24580,7 +24568,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 crate::ast::EnvSlotKind::Bool
                 | crate::ast::EnvSlotKind::Byte
                 | crate::ast::EnvSlotKind::Unit => types::I8,
-                // Plan C addendum (Char) — boxed Char is pointer-typed.
                 crate::ast::EnvSlotKind::Char
                 | crate::ast::EnvSlotKind::String
                 | crate::ast::EnvSlotKind::Closure

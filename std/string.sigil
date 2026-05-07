@@ -10,7 +10,7 @@
 //
 // String operations are split into **byte-indexed** and **codepoint-
 // indexed** surfaces. Byte-indexed ops (`string_byte_at`,
-// `string_substring`, `string_index_of`, `string_byte_at`) take and
+// `string_substring`, `string_index_of`, `string_length`) take and
 // return byte offsets in the underlying UTF-8 buffer; they are O(1)
 // and sit closest to the runtime representation. Codepoint-indexed
 // ops (`string_chars`, `string_char_at`, `string_from_chars`) walk
