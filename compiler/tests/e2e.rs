@@ -12803,11 +12803,16 @@ fn string_char_at_codepoint_index() {
 #[test]
 fn string_from_chars_round_trip() {
     // Bare UTF-8 in the source string literal (no `\u{HEX}` in
-    // strings; only Char literals support that escape).
+    // strings; only Char literals support that escape). The
+    // explicit `xs: List[Char]` annotation forces monomorphization
+    // of `List[Char]` so codegen's `string_from_chars` lowering
+    // can resolve `Cons$$Char` / `Nil$$Char` in the ctor index.
     let src = "import std.io\n\
+               import std.list\n\
                fn main() -> Int ![IO] {\n  \
                  let s: String = \"héllo 😀\";\n  \
-                 perform IO.println(string_from_chars(string_chars(s)));\n  \
+                 let xs: List[Char] = string_chars(s);\n  \
+                 perform IO.println(string_from_chars(xs));\n  \
                  0\n\
                }\n";
     let (stdout, _stderr, code) = compile_and_run(src, "string_from_chars_round_trip");

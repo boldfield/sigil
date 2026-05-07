@@ -577,6 +577,34 @@ impl<'a> Cursor<'a> {
                 self.advance();
                 continue;
             }
+            if (c as u32) >= 0x80 {
+                // Plan C addendum (Char) — bare multi-byte UTF-8 in
+                // string source. Pre-addendum the lexer treated each
+                // byte as a Latin-1 char and re-encoded via
+                // `String::push`, which double-encoded multi-byte
+                // sequences (e.g. source `é` = 0xC3 0xA9 produced 4
+                // bytes in the resulting String). Decode the codepoint
+                // here so the runtime byte buffer matches the source
+                // byte sequence.
+                match self.peek_utf8() {
+                    Ok((decoded, len)) => {
+                        s.push(decoded);
+                        self.advance_utf8(len);
+                        continue;
+                    }
+                    Err(()) => {
+                        let span =
+                            Span::new(self.file, self.line, self.col, self.line, self.col + 1);
+                        self.advance();
+                        return Err(CompilerError::new(
+                            Severity::Error,
+                            errors::code("E0010"),
+                            span,
+                            "invalid UTF-8 in string literal",
+                        ));
+                    }
+                }
+            }
             s.push(c);
             self.advance();
         }
@@ -1115,6 +1143,30 @@ mod tests {
         match toks[0].kind {
             TokenKind::CharLit(c) => assert_eq!(c as u32, 0xE000),
             _ => panic!("expected CharLit"),
+        }
+    }
+
+    #[test]
+    fn string_literal_preserves_multibyte_utf8() {
+        // Plan C addendum — bare multi-byte UTF-8 in string source
+        // must round-trip into the resulting StringLit verbatim.
+        // Pre-addendum the lexer treated each byte as Latin-1 and
+        // re-encoded, doubling multi-byte sequences.
+        let (toks, errs) = lex("x.sigil", "\"héllo\"");
+        assert!(errs.is_empty(), "{errs:?}");
+        match toks[0].kind {
+            TokenKind::StringLit(ref s) => assert_eq!(s, "héllo"),
+            _ => panic!("expected StringLit"),
+        }
+    }
+
+    #[test]
+    fn string_literal_preserves_supplementary_plane_utf8() {
+        let (toks, errs) = lex("x.sigil", "\"😀\"");
+        assert!(errs.is_empty(), "{errs:?}");
+        match toks[0].kind {
+            TokenKind::StringLit(ref s) => assert_eq!(s, "😀"),
+            _ => panic!("expected StringLit"),
         }
     }
 
