@@ -224,11 +224,27 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
 pub unsafe extern "C" fn sigil_string_new(src: *const u8, len: usize) -> *mut u8 {
     // The payload is: one length word (8 bytes) + len data bytes, padded up
     // to a multiple of 8 so the object's payload-word count is a whole
-    // number. For Stage 1's hello-world all strings are ≤63 words.
+    // number.
+    //
+    // `Header::count` is 6 bits — capped at 63 payload words = 504 bytes
+    // (496 bytes of String content + 8 bytes for the length word). Real-
+    // world strings (env-var values, file contents, captured stdout) can
+    // exceed this. Mirror the convention `runtime/src/array.rs` uses for
+    // the same problem: when the payload would overflow `count`, write
+    // `count = 0` and rely on Boehm's allocator-tracked size for any
+    // scan-step that needs the block bound. `TAG_STRING` has `bitmap = 0`
+    // (payload bytes hold no pointers), so the GC never walks per-element
+    // slots; the actual byte length lives in the explicit length word at
+    // offset 8 and `sigil_string_len` reads from there, not `count`.
     let payload_bytes = 8 + round_up_to_word(len);
-    let payload_words = (payload_bytes / 8) as u8;
+    let payload_words = payload_bytes / 8;
+    let count_field: u8 = if payload_words <= 63 {
+        payload_words as u8
+    } else {
+        0
+    };
 
-    let h = Header::new(header::TAG_STRING, payload_words, 0);
+    let h = Header::new(header::TAG_STRING, count_field, 0);
     let obj = sigil_alloc(h.raw(), payload_bytes);
 
     // Write the length word at offset 8.
@@ -332,5 +348,29 @@ mod tests {
         let obj = unsafe { sigil_string_new(std::ptr::null(), 0) };
         assert!(!obj.is_null());
         assert_eq!(unsafe { sigil_string_len(obj) }, 0);
+    }
+
+    #[test]
+    fn alloc_string_longer_than_count_field_capacity() {
+        // The 6-bit `count` field caps at 63 payload words = 504
+        // payload bytes (496 bytes of content + 8 bytes for the
+        // length word). Real-world env-var values can exceed this
+        // (PR #106 follow-up CI surfaced a ~520-byte env var on the
+        // GH macOS runner). Pin that strings beyond the 6-bit count
+        // limit allocate, round-trip their bytes, and report length
+        // correctly — `count` overflow now lands at `0` instead of
+        // panicking in `Header::new`.
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        // 1024 bytes — comfortably past the 496-byte content cap.
+        let src: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        // SAFETY: gc-heap-ptr arithmetic (Rust-owned `Vec<u8>`; sigil_string_new copies into a fresh GC alloc).
+        let obj = unsafe { sigil_string_new(src.as_ptr(), src.len()) };
+        assert!(!obj.is_null());
+        assert_eq!(unsafe { sigil_string_len(obj) }, 1024);
+        let (bytes, len) = unsafe { string_bytes(obj) };
+        assert_eq!(len, 1024);
+        let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+        assert_eq!(slice, &src[..]);
     }
 }
