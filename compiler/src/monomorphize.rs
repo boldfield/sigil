@@ -204,6 +204,25 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
     // monomorphized type set rather than the original generic decls.
     anf.checked.program.items = new_items;
     let mut new_types: BTreeMap<String, TypeDecl> = BTreeMap::new();
+    // Plan C addendum (CLI external-system effects, EE2 fix) —
+    // builtin user-type TypeDecls (`Int64`, `Float`, `Array`,
+    // `MutArray`, `ByteArray`, `MutByteArray`, `StringBuilder`)
+    // live in `tc.types` only — they're injected by typecheck's
+    // pre-pass and never appear as `Item::Type` in `program.items`.
+    // The original rebuild loop below only walks `program.items`,
+    // so without this preserve-pass those builtins drop out of
+    // `new_types` and any cloned generic instantiation that
+    // substitutes one of them as a field type (e.g. `Result[Int64,
+    // FsError]` → `Ok` field is `Named("Int64")`) hits
+    // `build_layouts`'s "unresolved field type" panic. Preserve
+    // every non-generic-template entry from `anf.checked.types`
+    // before adding program-item types and synthetic builtin
+    // specializations.
+    for (name, td) in &anf.checked.types {
+        if td.generic_params.is_empty() {
+            new_types.insert(name.clone(), td.clone());
+        }
+    }
     for item in &anf.checked.program.items {
         if let Item::Type(td) = item {
             new_types.insert(td.name.clone(), (**td).clone());

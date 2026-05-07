@@ -8745,16 +8745,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
     // Plan C Task 70 — additional IO arm fns. Same ABI shape as
     // `sigil_io_println_arm`.
+    //
+    // Plan C addendum (CLI external-system effects, EE1) —
+    // `sigil_io_read_file_arm` and `sigil_io_write_file_arm` removed
+    // alongside the corresponding `IO.read_file` / `IO.write_file`
+    // ops. File operations migrate to the `Fs` effect's raw-shape
+    // ops, dispatched through codegen-synthesized arm fns wired up
+    // in EE3.
     let io_print_arm = module
         .declare_function("sigil_io_print_arm", Linkage::Import, &io_println_arm_sig)
         .map_err(|e| format!("declare sigil_io_print_arm: {e}"))?;
-    let io_read_file_arm = module
-        .declare_function(
-            "sigil_io_read_file_arm",
-            Linkage::Import,
-            &io_println_arm_sig,
-        )
-        .map_err(|e| format!("declare sigil_io_read_file_arm: {e}"))?;
     let io_read_line_arm = module
         .declare_function(
             "sigil_io_read_line_arm",
@@ -8762,13 +8762,83 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             &io_println_arm_sig,
         )
         .map_err(|e| format!("declare sigil_io_read_line_arm: {e}"))?;
-    let io_write_file_arm = module
+
+    // Plan C addendum (CLI external-system effects, EE3) — Env / Fs /
+    // Process arm fn declarations. All share the same CPS arm fn
+    // signature; each builds its raw-shape return value (tuples /
+    // arrays / scalars) and dispatches to the trailing-pair k via
+    // `sigil_next_step_call`. Implementations live in
+    // `runtime/src/{env,fs,process}.rs`.
+    let env_args_arm = module
+        .declare_function("sigil_env_args_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_env_args_arm: {e}"))?;
+    let env_var_arm = module
+        .declare_function("sigil_env_var_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_env_var_arm: {e}"))?;
+    let env_vars_arm = module
+        .declare_function("sigil_env_vars_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_env_vars_arm: {e}"))?;
+    let fs_exists_arm = module
+        .declare_function("sigil_fs_exists_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_fs_exists_arm: {e}"))?;
+    let fs_file_size_arm = module
         .declare_function(
-            "sigil_io_write_file_arm",
+            "sigil_fs_file_size_arm",
             Linkage::Import,
             &io_println_arm_sig,
         )
-        .map_err(|e| format!("declare sigil_io_write_file_arm: {e}"))?;
+        .map_err(|e| format!("declare sigil_fs_file_size_arm: {e}"))?;
+    let fs_is_dir_arm = module
+        .declare_function("sigil_fs_is_dir_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_fs_is_dir_arm: {e}"))?;
+    let fs_is_file_arm = module
+        .declare_function("sigil_fs_is_file_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_fs_is_file_arm: {e}"))?;
+    let fs_mkdir_arm = module
+        .declare_function("sigil_fs_mkdir_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_fs_mkdir_arm: {e}"))?;
+    let fs_read_dir_arm = module
+        .declare_function(
+            "sigil_fs_read_dir_arm",
+            Linkage::Import,
+            &io_println_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_fs_read_dir_arm: {e}"))?;
+    let fs_read_file_arm = module
+        .declare_function(
+            "sigil_fs_read_file_arm",
+            Linkage::Import,
+            &io_println_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_fs_read_file_arm: {e}"))?;
+    let fs_remove_dir_arm = module
+        .declare_function(
+            "sigil_fs_remove_dir_arm",
+            Linkage::Import,
+            &io_println_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_fs_remove_dir_arm: {e}"))?;
+    let fs_remove_file_arm = module
+        .declare_function(
+            "sigil_fs_remove_file_arm",
+            Linkage::Import,
+            &io_println_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_fs_remove_file_arm: {e}"))?;
+    let fs_write_file_arm = module
+        .declare_function(
+            "sigil_fs_write_file_arm",
+            Linkage::Import,
+            &io_println_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_fs_write_file_arm: {e}"))?;
+    let process_run_arm = module
+        .declare_function(
+            "sigil_process_run_arm",
+            Linkage::Import,
+            &io_println_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_process_run_arm: {e}"))?;
 
     // Plan B Task 57 — sigil_arith_error_div_by_zero_arm and
     // sigil_arith_error_mod_by_zero_arm, the two runtime-side default
@@ -11561,9 +11631,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let io_println_arm_ref = module.declare_func_in_func(io_println_arm, builder.func);
         // Plan C Task 70 — additional IO arm fns.
         let io_print_arm_ref = module.declare_func_in_func(io_print_arm, builder.func);
-        let io_read_file_arm_ref = module.declare_func_in_func(io_read_file_arm, builder.func);
         let io_read_line_arm_ref = module.declare_func_in_func(io_read_line_arm, builder.func);
-        let io_write_file_arm_ref = module.declare_func_in_func(io_write_file_arm, builder.func);
+        // Plan C addendum (CLI external-system effects, EE3) — Env / Fs /
+        // Process arm fn FuncRefs for the main shim's frame-install
+        // sequence below.
+        let env_args_arm_ref = module.declare_func_in_func(env_args_arm, builder.func);
+        let env_var_arm_ref = module.declare_func_in_func(env_var_arm, builder.func);
+        let env_vars_arm_ref = module.declare_func_in_func(env_vars_arm, builder.func);
+        let fs_exists_arm_ref = module.declare_func_in_func(fs_exists_arm, builder.func);
+        let fs_file_size_arm_ref = module.declare_func_in_func(fs_file_size_arm, builder.func);
+        let fs_is_dir_arm_ref = module.declare_func_in_func(fs_is_dir_arm, builder.func);
+        let fs_is_file_arm_ref = module.declare_func_in_func(fs_is_file_arm, builder.func);
+        let fs_mkdir_arm_ref = module.declare_func_in_func(fs_mkdir_arm, builder.func);
+        let fs_read_dir_arm_ref = module.declare_func_in_func(fs_read_dir_arm, builder.func);
+        let fs_read_file_arm_ref = module.declare_func_in_func(fs_read_file_arm, builder.func);
+        let fs_remove_dir_arm_ref = module.declare_func_in_func(fs_remove_dir_arm, builder.func);
+        let fs_remove_file_arm_ref = module.declare_func_in_func(fs_remove_file_arm, builder.func);
+        let fs_write_file_arm_ref = module.declare_func_in_func(fs_write_file_arm, builder.func);
+        let process_run_arm_ref = module.declare_func_in_func(process_run_arm, builder.func);
         let arith_div_arm_ref = module.declare_func_in_func(arith_error_div_arm, builder.func);
         let arith_mod_arm_ref = module.declare_func_in_func(arith_error_mod_arm, builder.func);
 
@@ -11620,12 +11705,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         stackmap.push_placeholder(function_code_offset(&builder, arith_push_call));
 
         // ────── IO handler frame (last-pushed, first-popped) ──────
-        // effect_id=1, arm_count=5. Op IDs assigned alphabetically:
-        // 0=print, 1=println, 2=read_file, 3=read_line, 4=write_file.
-        // (Plan C Task 70 added the four non-`println` ops; their
-        // alphabetical positions shifted `println` from op_id 0 to 1.)
+        // effect_id=1, arm_count=3. Op IDs (alphabetical, post-Plan-C-
+        // addendum-EE1): 0=print, 1=println, 2=read_line.
+        // (Plan C Task 70 grew IO from 1 → 5 ops. Plan C addendum EE1
+        // removed `read_file` / `write_file` — file ops migrated to
+        // `Fs` effect's raw-shape ops + stdlib `read_file` /
+        // `write_file` wrappers in `std/fs.sigil`.)
         let io_effect_id_v = builder.ins().iconst(types::I32, 1);
-        let io_arm_count_v = builder.ins().iconst(types::I32, 5);
+        let io_arm_count_v = builder.ins().iconst(types::I32, 3);
         let io_resumes_many_v = builder.ins().iconst(types::I32, 0);
         let io_frame_new_call = builder.ins().call(
             frame_new_ref,
@@ -11650,13 +11737,112 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         };
         install_io_arm(&mut builder, &mut stackmap, 0, io_print_arm_ref); // print
         install_io_arm(&mut builder, &mut stackmap, 1, io_println_arm_ref); // println
-        install_io_arm(&mut builder, &mut stackmap, 2, io_read_file_arm_ref); // read_file
-        install_io_arm(&mut builder, &mut stackmap, 3, io_read_line_arm_ref); // read_line
-        install_io_arm(&mut builder, &mut stackmap, 4, io_write_file_arm_ref); // write_file
+        install_io_arm(&mut builder, &mut stackmap, 2, io_read_line_arm_ref); // read_line
 
         // Push the IO frame.
         let push_call = builder.ins().call(handle_push_ref, &[io_frame_ptr]);
         stackmap.push_placeholder(function_code_offset(&builder, push_call));
+
+        // ────── Env handler frame (effect_id=3, arm_count=3) ──────
+        // Plan C addendum (CLI external-system effects, EE3). Op IDs
+        // (alphabetical): args=0, var=1, vars=2.
+        let env_effect_id_v = builder.ins().iconst(types::I32, 3);
+        let env_arm_count_v = builder.ins().iconst(types::I32, 3);
+        let env_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let env_frame_new_call = builder.ins().call(
+            frame_new_ref,
+            &[env_effect_id_v, env_arm_count_v, env_resumes_many_v],
+        );
+        stackmap.push_placeholder(function_code_offset(&builder, env_frame_new_call));
+        let env_frame_ptr = builder.inst_results(env_frame_new_call)[0];
+        let env_null_closure = builder.ins().iconst(pointer_ty, 0);
+        let install_env_arm = |builder: &mut FunctionBuilder<'_>,
+                               stackmap: &mut StackMapBuilder,
+                               op_id: i64,
+                               arm_fn_ref: FuncRef| {
+            let op_id_v = builder.ins().iconst(types::I32, op_id);
+            let arm_fn_ptr = builder.ins().func_addr(pointer_ty, arm_fn_ref);
+            let set_arm_call = builder.ins().call(
+                frame_set_arm_ref,
+                &[env_frame_ptr, op_id_v, arm_fn_ptr, env_null_closure],
+            );
+            stackmap.push_placeholder(function_code_offset(builder, set_arm_call));
+        };
+        install_env_arm(&mut builder, &mut stackmap, 0, env_args_arm_ref);
+        install_env_arm(&mut builder, &mut stackmap, 1, env_var_arm_ref);
+        install_env_arm(&mut builder, &mut stackmap, 2, env_vars_arm_ref);
+        let env_push_call = builder.ins().call(handle_push_ref, &[env_frame_ptr]);
+        stackmap.push_placeholder(function_code_offset(&builder, env_push_call));
+
+        // ────── Fs handler frame (effect_id=4, arm_count=10) ──────
+        // Op IDs (alphabetical): exists=0, file_size=1, is_dir=2,
+        // is_file=3, mkdir=4, read_dir=5, read_file=6, remove_dir=7,
+        // remove_file=8, write_file=9.
+        let fs_effect_id_v = builder.ins().iconst(types::I32, 4);
+        let fs_arm_count_v = builder.ins().iconst(types::I32, 10);
+        let fs_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let fs_frame_new_call = builder.ins().call(
+            frame_new_ref,
+            &[fs_effect_id_v, fs_arm_count_v, fs_resumes_many_v],
+        );
+        stackmap.push_placeholder(function_code_offset(&builder, fs_frame_new_call));
+        let fs_frame_ptr = builder.inst_results(fs_frame_new_call)[0];
+        let fs_null_closure = builder.ins().iconst(pointer_ty, 0);
+        let install_fs_arm = |builder: &mut FunctionBuilder<'_>,
+                              stackmap: &mut StackMapBuilder,
+                              op_id: i64,
+                              arm_fn_ref: FuncRef| {
+            let op_id_v = builder.ins().iconst(types::I32, op_id);
+            let arm_fn_ptr = builder.ins().func_addr(pointer_ty, arm_fn_ref);
+            let set_arm_call = builder.ins().call(
+                frame_set_arm_ref,
+                &[fs_frame_ptr, op_id_v, arm_fn_ptr, fs_null_closure],
+            );
+            stackmap.push_placeholder(function_code_offset(builder, set_arm_call));
+        };
+        install_fs_arm(&mut builder, &mut stackmap, 0, fs_exists_arm_ref);
+        install_fs_arm(&mut builder, &mut stackmap, 1, fs_file_size_arm_ref);
+        install_fs_arm(&mut builder, &mut stackmap, 2, fs_is_dir_arm_ref);
+        install_fs_arm(&mut builder, &mut stackmap, 3, fs_is_file_arm_ref);
+        install_fs_arm(&mut builder, &mut stackmap, 4, fs_mkdir_arm_ref);
+        install_fs_arm(&mut builder, &mut stackmap, 5, fs_read_dir_arm_ref);
+        install_fs_arm(&mut builder, &mut stackmap, 6, fs_read_file_arm_ref);
+        install_fs_arm(&mut builder, &mut stackmap, 7, fs_remove_dir_arm_ref);
+        install_fs_arm(&mut builder, &mut stackmap, 8, fs_remove_file_arm_ref);
+        install_fs_arm(&mut builder, &mut stackmap, 9, fs_write_file_arm_ref);
+        let fs_push_call = builder.ins().call(handle_push_ref, &[fs_frame_ptr]);
+        stackmap.push_placeholder(function_code_offset(&builder, fs_push_call));
+
+        // ────── Process handler frame (effect_id=5, arm_count=1) ──────
+        // Op IDs: run=0.
+        let process_effect_id_v = builder.ins().iconst(types::I32, 5);
+        let process_arm_count_v = builder.ins().iconst(types::I32, 1);
+        let process_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let process_frame_new_call = builder.ins().call(
+            frame_new_ref,
+            &[
+                process_effect_id_v,
+                process_arm_count_v,
+                process_resumes_many_v,
+            ],
+        );
+        stackmap.push_placeholder(function_code_offset(&builder, process_frame_new_call));
+        let process_frame_ptr = builder.inst_results(process_frame_new_call)[0];
+        let process_null_closure = builder.ins().iconst(pointer_ty, 0);
+        let process_run_op_id_v = builder.ins().iconst(types::I32, 0);
+        let process_run_fn_ptr = builder.ins().func_addr(pointer_ty, process_run_arm_ref);
+        let process_set_run_call = builder.ins().call(
+            frame_set_arm_ref,
+            &[
+                process_frame_ptr,
+                process_run_op_id_v,
+                process_run_fn_ptr,
+                process_null_closure,
+            ],
+        );
+        stackmap.push_placeholder(function_code_offset(&builder, process_set_run_call));
+        let process_push_call = builder.ins().call(handle_push_ref, &[process_frame_ptr]);
+        stackmap.push_placeholder(function_code_offset(&builder, process_push_call));
 
         // user-main takes the closure-calling-convention closure_ptr as
         // arg 0. The shim is not a closure entry point, so it passes a
@@ -11692,11 +11878,64 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             .call(user_main_ref, &[null_closure, terminal_out_v]);
         stackmap.push_placeholder(function_code_offset(&builder, um_call));
 
-        // Pop in reverse: IO first, then ArithError. In debug builds
-        // verify the IO pop matches the IO push (local sanity check)
-        // and the ArithError pop matches the snapshot taken at the
-        // first push (the discipline trap, mirrors Phase 4f's
-        // `Expr::Handle`-exit discipline).
+        // Pop in reverse order of push: Process, Fs, Env, IO,
+        // ArithError. In debug builds verify each pop matches the
+        // corresponding frame pointer (local sanity check on each;
+        // ArithError gets the discipline trap at the bottom — mirrors
+        // Phase 4f's `Expr::Handle`-exit discipline).
+        let process_pop_call = builder.ins().call(handle_pop_ref, &[]);
+        stackmap.push_placeholder(function_code_offset(&builder, process_pop_call));
+        if cfg!(debug_assertions) {
+            let popped_process = builder.inst_results(process_pop_call)[0];
+            let process_mismatch =
+                builder
+                    .ins()
+                    .icmp(IntCC::NotEqual, popped_process, process_frame_ptr);
+            let ok = builder.create_block();
+            let bad = builder.create_block();
+            builder.ins().brif(process_mismatch, bad, &[], ok, &[]);
+            builder.switch_to_block(bad);
+            builder.seal_block(bad);
+            builder
+                .ins()
+                .trap(TrapCode::unwrap_user(TRAP_HANDLE_DISCIPLINE_VIOLATION));
+            builder.switch_to_block(ok);
+            builder.seal_block(ok);
+        }
+        let fs_pop_call = builder.ins().call(handle_pop_ref, &[]);
+        stackmap.push_placeholder(function_code_offset(&builder, fs_pop_call));
+        if cfg!(debug_assertions) {
+            let popped_fs = builder.inst_results(fs_pop_call)[0];
+            let fs_mismatch = builder.ins().icmp(IntCC::NotEqual, popped_fs, fs_frame_ptr);
+            let ok = builder.create_block();
+            let bad = builder.create_block();
+            builder.ins().brif(fs_mismatch, bad, &[], ok, &[]);
+            builder.switch_to_block(bad);
+            builder.seal_block(bad);
+            builder
+                .ins()
+                .trap(TrapCode::unwrap_user(TRAP_HANDLE_DISCIPLINE_VIOLATION));
+            builder.switch_to_block(ok);
+            builder.seal_block(ok);
+        }
+        let env_pop_call = builder.ins().call(handle_pop_ref, &[]);
+        stackmap.push_placeholder(function_code_offset(&builder, env_pop_call));
+        if cfg!(debug_assertions) {
+            let popped_env = builder.inst_results(env_pop_call)[0];
+            let env_mismatch = builder
+                .ins()
+                .icmp(IntCC::NotEqual, popped_env, env_frame_ptr);
+            let ok = builder.create_block();
+            let bad = builder.create_block();
+            builder.ins().brif(env_mismatch, bad, &[], ok, &[]);
+            builder.switch_to_block(bad);
+            builder.seal_block(bad);
+            builder
+                .ins()
+                .trap(TrapCode::unwrap_user(TRAP_HANDLE_DISCIPLINE_VIOLATION));
+            builder.switch_to_block(ok);
+            builder.seal_block(ok);
+        }
         let io_pop_call = builder.ins().call(handle_pop_ref, &[]);
         stackmap.push_placeholder(function_code_offset(&builder, io_pop_call));
         if cfg!(debug_assertions) {

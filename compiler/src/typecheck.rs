@@ -857,7 +857,20 @@ pub struct CtorInfo {
 /// order (phase 2). The `main` shim hardcodes the resulting effect_
 /// ids when emitting the top-level handler frames; the reserved-low-
 /// id convention is what keeps those constants stable per program.
-pub const BUILTIN_EFFECT_NAMES: &[&str] = &["ArithError", "IO", "Mem"];
+pub const BUILTIN_EFFECT_NAMES: &[&str] = &[
+    "ArithError",
+    "IO",
+    "Mem",
+    // Plan C addendum (CLI external-system effects) — Env / Fs /
+    // Process append at the end so existing reserved-low-ids
+    // (ArithError=0, IO=1, Mem=2) stay stable. Effect-op ABI for the
+    // new effects uses *raw shapes* (tuples, arrays, scalars) only;
+    // user-facing `Result[T, FsError]` / `Option[T]` construction
+    // happens in stdlib Sigil wrappers at `std/{env,fs,process}.sigil`.
+    "Env",
+    "Fs",
+    "Process",
+];
 
 /// Plan B Task 57 — construct synthetic `EffectDecl`s for the
 /// builtin effects (`IO`, `ArithError`). Returned in the order
@@ -920,37 +933,23 @@ fn builtin_effects() -> Vec<EffectDecl> {
                 return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
                 span: span.clone(),
             },
-            // Plan C Task 70 — `read_file(path) -> String`. Aborts
-            // on IO error / invalid UTF-8.
-            EffectOp {
-                name: "read_file".to_string(),
-                name_span: span.clone(),
-                generic_params: Vec::new(),
-                params: vec![TypeExpr::Named("String".to_string(), span.clone())],
-                return_type: TypeExpr::Named("String".to_string(), span.clone()),
-                span: span.clone(),
-            },
             // Plan C Task 70 — `read_line() -> String`. Trailing CR/LF
             // stripped. EOF without bytes returns the empty string.
+            //
+            // Plan C addendum (CLI external-system effects, EE1) —
+            // `IO.read_file` and `IO.write_file` were removed: they
+            // had no error-reporting surface and would silently
+            // abort or return garbage on filesystem failures. They
+            // migrate to `Fs.read_file` / `Fs.write_file` (raw ops)
+            // which return `(Int, String)` tuples; stdlib wrappers
+            // at `std/fs.sigil` surface them as
+            // `read_file(p) -> Result[String, FsError]`.
             EffectOp {
                 name: "read_line".to_string(),
                 name_span: span.clone(),
                 generic_params: Vec::new(),
                 params: Vec::new(),
                 return_type: TypeExpr::Named("String".to_string(), span.clone()),
-                span: span.clone(),
-            },
-            // Plan C Task 70 — `write_file(path, data)`. Replaces
-            // existing contents.
-            EffectOp {
-                name: "write_file".to_string(),
-                name_span: span.clone(),
-                generic_params: Vec::new(),
-                params: vec![
-                    TypeExpr::Named("String".to_string(), span.clone()),
-                    TypeExpr::Named("String".to_string(), span.clone()),
-                ],
-                return_type: TypeExpr::Named("Unit".to_string(), span.clone()),
                 span: span.clone(),
             },
         ],
@@ -969,8 +968,220 @@ fn builtin_effects() -> Vec<EffectDecl> {
         generic_params: Vec::new(),
         resumes_many: false,
         ops: Vec::new(),
+        span: span.clone(),
+    });
+
+    // Plan C addendum (CLI external-system effects, EE1) — Env / Fs /
+    // Process. Effect-op signatures use raw shapes (tuples, arrays,
+    // scalars) so the runtime can construct them from fixed-tag types
+    // (TAG_TUPLE, TAG_ARRAY, TAG_STRING, TAG_INT64) without monomorph-
+    // ization-dependent layout info. Stdlib Sigil wrappers at
+    // `std/{env,fs,process}.sigil` translate the raw shapes to
+    // user-facing `Result[T, FsError]` / `Option[T]` / `List[T]`
+    // surfaces — same convention as `std/random.sigil`'s
+    // `random_int()` wrapper around `perform Random.rand_int()`.
+    let int_ty = || TypeExpr::Named("Int".to_string(), span.clone());
+    let int64_ty = || TypeExpr::Named("Int64".to_string(), span.clone());
+    let bool_ty = || TypeExpr::Named("Bool".to_string(), span.clone());
+    let string_ty = || TypeExpr::Named("String".to_string(), span.clone());
+    let array_string_ty = || TypeExpr::Apply {
+        name: "Array".to_string(),
+        args: vec![string_ty()],
+        span: span.clone(),
+    };
+    let pair_string_string_ty = || TypeExpr::Tuple {
+        elems: vec![string_ty(), string_ty()],
+        span: span.clone(),
+    };
+    let array_pair_string_string_ty = || TypeExpr::Apply {
+        name: "Array".to_string(),
+        args: vec![pair_string_string_ty()],
+        span: span.clone(),
+    };
+    let int_string_tuple_ty = || TypeExpr::Tuple {
+        elems: vec![int_ty(), string_ty()],
+        span: span.clone(),
+    };
+    let int_int64_tuple_ty = || TypeExpr::Tuple {
+        elems: vec![int_ty(), int64_ty()],
+        span: span.clone(),
+    };
+    let int_array_string_tuple_ty = || TypeExpr::Tuple {
+        elems: vec![int_ty(), array_string_ty()],
+        span: span.clone(),
+    };
+    let process_run_result_ty = || TypeExpr::Tuple {
+        // (error_tag: Int, exit_code: Int, stdout: String, stderr: String)
+        elems: vec![int_ty(), int_ty(), string_ty(), string_ty()],
+        span: span.clone(),
+    };
+
+    // Env — environment + process arguments. No fallible ops at the
+    // effect layer; the `Option[String]` surface for `env.var(name)`
+    // is constructed by the stdlib wrapper from the raw `(Int,
+    // String)` tuple (tag 0 = Some, tag 1 = None).
+    //
+    // Op IDs (alphabetical): args=0, var=1, vars=2.
+    out.push(EffectDecl {
+        name: "Env".to_string(),
+        name_span: span.clone(),
+        generic_params: Vec::new(),
+        resumes_many: false,
+        ops: vec![
+            EffectOp {
+                name: "args".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: Vec::new(),
+                return_type: array_string_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "var".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty()],
+                return_type: int_string_tuple_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "vars".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: Vec::new(),
+                return_type: array_pair_string_string_ty(),
+                span: span.clone(),
+            },
+        ],
+        span: span.clone(),
+    });
+
+    // Fs — filesystem read / write / metadata / mkdir / remove. All
+    // fallible ops return `(Int, T)` where tag 0 = success and tag>0
+    // indexes an `FsError` variant defined in `std/fs.sigil`. The
+    // `Bool`-returning predicates (`exists`, `is_file`, `is_dir`)
+    // take the slot directly — no wrapping needed; absent paths
+    // legitimately answer `false`.
+    //
+    // Op IDs (alphabetical): exists=0, file_size=1, is_dir=2,
+    // is_file=3, mkdir=4, read_dir=5, read_file=6, remove_dir=7,
+    // remove_file=8, write_file=9.
+    out.push(EffectDecl {
+        name: "Fs".to_string(),
+        name_span: span.clone(),
+        generic_params: Vec::new(),
+        resumes_many: false,
+        ops: vec![
+            EffectOp {
+                name: "exists".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty()],
+                return_type: bool_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "file_size".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty()],
+                return_type: int_int64_tuple_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "is_dir".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty()],
+                return_type: bool_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "is_file".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty()],
+                return_type: bool_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "mkdir".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty()],
+                return_type: int_string_tuple_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "read_dir".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty()],
+                return_type: int_array_string_tuple_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "read_file".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty()],
+                return_type: int_string_tuple_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "remove_dir".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty()],
+                return_type: int_string_tuple_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "remove_file".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty()],
+                return_type: int_string_tuple_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "write_file".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty(), string_ty()],
+                return_type: int_string_tuple_ty(),
+                span: span.clone(),
+            },
+        ],
+        span: span.clone(),
+    });
+
+    // Process — spawn a subprocess and capture stdout/stderr. The
+    // single op's tuple return packs `(error_tag, exit_code, stdout,
+    // stderr)`; tag 0 = launched successfully (exit_code may be
+    // non-zero — that's not a launch error, the child ran fine but
+    // returned a non-zero status). Tag 1+ indexes a `ProcessError`
+    // variant. Stdlib wrapper at `std/process.sigil` translates to
+    // `Result[ProcessResult, ProcessError]` where `ProcessResult` is
+    // the `(Int, String, String)` triple `(exit_code, stdout, stderr)`.
+    //
+    // No shell invocation — direct `exec` only.
+    out.push(EffectDecl {
+        name: "Process".to_string(),
+        name_span: span.clone(),
+        generic_params: Vec::new(),
+        resumes_many: false,
+        ops: vec![EffectOp {
+            name: "run".to_string(),
+            name_span: span.clone(),
+            generic_params: Vec::new(),
+            params: vec![string_ty(), array_string_ty()],
+            return_type: process_run_result_ty(),
+            span: span.clone(),
+        }],
         span,
     });
+
     debug_assert_eq!(
         out.len(),
         BUILTIN_EFFECT_NAMES.len(),
@@ -4416,13 +4627,20 @@ impl Tc {
             }
             for effect in &f.effects {
                 let name = effect.name.as_str();
-                if name != "IO" && name != "ArithError" && name != "Mem" {
+                // Plan C addendum (CLI external-system effects, EE1)
+                // — Env / Fs / Process get top-level handler frames
+                // installed by the main shim alongside ArithError /
+                // IO. Mem is a marker effect (no shim handler).
+                let allowed =
+                    matches!(name, "IO" | "ArithError" | "Mem" | "Env" | "Fs" | "Process");
+                if !allowed {
                     self.push_error(
                         "E0041",
                         f.span.clone(),
                         format!(
                             "`fn main`'s effect row may only contain effects discharged by \
-                             the top-level shim (`IO`, `ArithError`, or `Mem`); saw `{name}`",
+                             the top-level shim (`IO`, `ArithError`, `Mem`, `Env`, `Fs`, or \
+                             `Process`); saw `{name}`",
                         ),
                     );
                 }
@@ -11605,37 +11823,50 @@ mod tests {
     fn effect_ids_assigned_alphabetically_per_program() {
         // Plan B Task 55 + Task 57 — user effect_ids are assigned in
         // alphabetical order, **starting at `BUILTIN_EFFECT_NAMES.len()`**.
-        // Plan C Task 66 added `Mem` as a third builtin (zero-op
-        // marker effect), bumping the user-id start to 3. Reserved
-        // low ids: 0 (`ArithError`), 1 (`IO`), 2 (`Mem`).
+        // Plan C Task 66 added `Mem` as a third builtin. Plan C
+        // addendum (CLI external-system effects) appended `Env` /
+        // `Fs` / `Process` (ids 3, 4, 5), bumping the user-id start
+        // to 6. Reserved low ids: 0 (`ArithError`), 1 (`IO`), 2
+        // (`Mem`), 3 (`Env`), 4 (`Fs`), 5 (`Process`).
         let src = "effect Zeta { z: () -> Int }\n\
                    effect Alpha { a: () -> Int }\n\
                    effect Mu { m: () -> Int }\n\
                    fn main() -> Int ![] { 0 }\n";
         let (cp, errs) = pipeline_checked(src);
         assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
-        // Builtins occupy 0, 1, 2.
+        // Builtins occupy 0..6.
         assert_eq!(cp.effect_ids.get("ArithError"), Some(&0));
         assert_eq!(cp.effect_ids.get("IO"), Some(&1));
         assert_eq!(cp.effect_ids.get("Mem"), Some(&2));
-        // User effects start at 3 in alphabetical order.
-        assert_eq!(cp.effect_ids.get("Alpha"), Some(&3));
-        assert_eq!(cp.effect_ids.get("Mu"), Some(&4));
-        assert_eq!(cp.effect_ids.get("Zeta"), Some(&5));
+        assert_eq!(cp.effect_ids.get("Env"), Some(&3));
+        assert_eq!(cp.effect_ids.get("Fs"), Some(&4));
+        assert_eq!(cp.effect_ids.get("Process"), Some(&5));
+        // User effects start at 6 in alphabetical order.
+        assert_eq!(cp.effect_ids.get("Alpha"), Some(&6));
+        assert_eq!(cp.effect_ids.get("Mu"), Some(&7));
+        assert_eq!(cp.effect_ids.get("Zeta"), Some(&8));
     }
 
     #[test]
     fn builtin_effects_present_in_every_program() {
         // Plan B Task 57 — even programs that declare no effects of
-        // their own carry the synthetic builtins `IO` (effect_id 1)
-        // and `ArithError` (effect_id 0) in `tc.effects`. The `main`
-        // shim hardcodes these effect_ids when emitting top-level
-        // handler frames; this test pins the convention.
+        // their own carry the synthetic builtins in `tc.effects`. The
+        // `main` shim hardcodes these effect_ids when emitting top-
+        // level handler frames; this test pins the convention.
+        //
+        // Plan C addendum (CLI external-system effects, EE1) —
+        // `IO.read_file` / `IO.write_file` removed; ops shift to
+        // `print=0, println=1, read_line=2`. New effects `Env=3`,
+        // `Fs=4`, `Process=5` appended.
         let src = "fn main() -> Int ![] { 0 }\n";
         let (cp, errs) = pipeline_checked(src);
         assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
         assert_eq!(cp.effect_ids.get("ArithError"), Some(&0));
         assert_eq!(cp.effect_ids.get("IO"), Some(&1));
+        assert_eq!(cp.effect_ids.get("Mem"), Some(&2));
+        assert_eq!(cp.effect_ids.get("Env"), Some(&3));
+        assert_eq!(cp.effect_ids.get("Fs"), Some(&4));
+        assert_eq!(cp.effect_ids.get("Process"), Some(&5));
         // ArithError op_ids: div_by_zero (alphabetically first), mod_by_zero.
         assert_eq!(
             cp.op_ids
@@ -11647,8 +11878,7 @@ mod tests {
                 .get(&("ArithError".to_string(), "mod_by_zero".to_string())),
             Some(&1)
         );
-        // IO op_ids (alphabetical, post-Task-70):
-        // 0=print, 1=println, 2=read_file, 3=read_line, 4=write_file.
+        // IO op_ids (alphabetical, post-EE1): 0=print, 1=println, 2=read_line.
         assert_eq!(
             cp.op_ids.get(&("IO".to_string(), "print".to_string())),
             Some(&0)
@@ -11658,16 +11888,41 @@ mod tests {
             Some(&1)
         );
         assert_eq!(
-            cp.op_ids.get(&("IO".to_string(), "read_file".to_string())),
+            cp.op_ids.get(&("IO".to_string(), "read_line".to_string())),
             Some(&2)
         );
+        // Env op_ids (alphabetical): args=0, var=1, vars=2.
         assert_eq!(
-            cp.op_ids.get(&("IO".to_string(), "read_line".to_string())),
-            Some(&3)
+            cp.op_ids.get(&("Env".to_string(), "args".to_string())),
+            Some(&0)
         );
         assert_eq!(
-            cp.op_ids.get(&("IO".to_string(), "write_file".to_string())),
-            Some(&4)
+            cp.op_ids.get(&("Env".to_string(), "var".to_string())),
+            Some(&1)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("Env".to_string(), "vars".to_string())),
+            Some(&2)
+        );
+        // Fs op_ids (alphabetical): exists=0, file_size=1, is_dir=2,
+        // is_file=3, mkdir=4, read_dir=5, read_file=6, remove_dir=7,
+        // remove_file=8, write_file=9.
+        assert_eq!(
+            cp.op_ids.get(&("Fs".to_string(), "exists".to_string())),
+            Some(&0)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("Fs".to_string(), "read_file".to_string())),
+            Some(&6)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("Fs".to_string(), "write_file".to_string())),
+            Some(&9)
+        );
+        // Process: run=0.
+        assert_eq!(
+            cp.op_ids.get(&("Process".to_string(), "run".to_string())),
+            Some(&0)
         );
     }
 
@@ -14534,25 +14789,116 @@ mod tests {
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
+    // Plan C addendum (CLI external-system effects, EE1) — `IO.read_file`
+    // and `IO.write_file` removed. The Plan C Task 70 typecheck pins for
+    // these ops are obsolete; replacements live as `Fs.read_file` /
+    // `Fs.write_file` raw-shape ops + stdlib `read_file` / `write_file`
+    // wrappers in `std/fs.sigil`. New typecheck pins are added in
+    // CLI-effects-EE6 (e2e tests for the user-facing surface).
+
     #[test]
-    fn io_read_file_takes_path_returns_contents() {
+    fn import_std_env_typechecks_cleanly() {
+        // Plan C addendum (CLI external-system effects, EE4) — the
+        // `std.env` wrappers translate `Env`'s raw-shape ops to
+        // `List[String]` / `Option[String]` returns. Pin that the
+        // user-facing surface typechecks end-to-end.
+        let src = "import std.env\n\
+                   import std.option\n\
+                   fn main() -> Int ![Env] {\n  \
+                     match var(\"HOME\") {\n    \
+                       Some(_h) => 0,\n    \
+                       None => 1,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn import_std_fs_typechecks_cleanly() {
+        let src = "import std.fs\n\
+                   import std.result\n\
+                   fn main() -> Int ![Fs] {\n  \
+                     match read_file(\"/dev/null\") {\n    \
+                       Ok(_s) => 0,\n    \
+                       Err(NotFound) => 1,\n    \
+                       Err(PermissionDenied) => 2,\n    \
+                       Err(AlreadyExists) => 3,\n    \
+                       Err(NotADirectory) => 4,\n    \
+                       Err(IsADirectory) => 5,\n    \
+                       Err(InvalidUtf8) => 6,\n    \
+                       Err(Other(_msg)) => 7,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn import_std_process_typechecks_cleanly() {
+        let src = "import std.process\n\
+                   import std.array\n\
+                   import std.result\n\
+                   fn main() -> Int ![Process] {\n  \
+                     let args: Array[String] = array_alloc(0, \"\");\n  \
+                     match run(\"true\", args) {\n    \
+                       Ok((_code, _out, _err)) => 0,\n    \
+                       Err(NotFound) => 1,\n    \
+                       Err(PermissionDenied) => 2,\n    \
+                       Err(Other(_msg)) => 3,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn fs_exists_returns_bool() {
+        let src = "import std.fs\n\
+                   fn main() -> Int ![Fs] {\n  \
+                     match exists(\"/tmp\") { true => 0, false => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn cli_main_row_allowed() {
+        // Plan C addendum EE1 — main allow-list extended with
+        // Env / Fs / Process. Pin all three combinations.
+        let src = "fn main() -> Int ![IO, Env, Fs, Process] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn io_read_file_removed_is_e0042() {
+        // Pre-EE1 test pinned `IO.read_file` typechecks; post-removal
+        // we pin the rejection so a future regression that adds it
+        // back without removing this guard surfaces immediately.
         let src = "fn main() -> Int ![IO] {\n  \
                      let s: String = perform IO.read_file(\"/dev/null\");\n  \
                      perform IO.println(s);\n  \
                      0\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (read_file removed from IO); got {errs:?}"
+        );
     }
 
     #[test]
-    fn io_write_file_takes_path_and_data() {
+    fn io_write_file_removed_is_e0042() {
         let src = "fn main() -> Int ![IO] {\n  \
                      perform IO.write_file(\"/tmp/x\", \"hi\");\n  \
                      0\n\
                    }\n";
         let errs = pipeline(src);
-        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert!(
+            has_code(&errs, "E0042"),
+            "expected E0042 (write_file removed from IO); got {errs:?}"
+        );
     }
 
     #[test]

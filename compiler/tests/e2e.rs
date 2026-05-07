@@ -2135,6 +2135,8 @@ fn user_discard_k_io_handler_unwinds_helper_at_perform_site() {
     // must be exhaustive — the discard-k semantics this test pins
     // apply uniformly across all ops; only the println arm is
     // exercised at runtime since helper() performs only println.
+    // Plan C addendum (CLI external-system effects, EE1) — IO trimmed
+    // to print / println / read_line; file ops migrated to Fs effect.
     let src = "fn helper() -> Int ![IO] {\n  \
                  perform IO.println(\"a\");\n  \
                  1\n\
@@ -2143,9 +2145,7 @@ fn user_discard_k_io_handler_unwinds_helper_at_perform_site() {
                  let n: Int = handle helper() with {\n    \
                    IO.print(s, k) => 0,\n    \
                    IO.println(s, k) => 0,\n    \
-                   IO.read_file(p, k) => 0,\n    \
-                   IO.read_line(k) => 0,\n    \
-                   IO.write_file(p, d, k) => 0,\n  \
+                   IO.read_line(k) => 0,\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
@@ -7358,25 +7358,11 @@ fn std_io_read_line_via_piped_stdin() {
     );
 }
 
-/// `IO.write_file` then `IO.read_file` round-trips a string through
-/// the filesystem. Uses a tmp path to avoid CI / pod conflicts.
-#[test]
-fn std_io_read_write_file_round_trip() {
-    let tmp = std::env::temp_dir().join(format!("sigil_e2e_io_rw_{}.txt", std::process::id()));
-    let tmp_str = tmp.to_str().expect("tmp path utf8");
-    let src = format!(
-        "fn main() -> Int ![IO] {{\n  \
-           perform IO.write_file(\"{tmp_str}\", \"hello, file\");\n  \
-           let contents: String = perform IO.read_file(\"{tmp_str}\");\n  \
-           perform IO.println(contents);\n  \
-           0\n\
-         }}\n"
-    );
-    let (stdout, stderr, code) = compile_and_run(&src, "std_io_read_write_file");
-    let _ = std::fs::remove_file(&tmp);
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "hello, file\n", "stderr={stderr:?}");
-}
+// Plan C addendum (CLI external-system effects, EE1+EE6) — the
+// `IO.write_file` / `IO.read_file` round-trip moves to the Fs surface.
+// The new round-trip lives in EE6's `fs_*` e2e suite, exercising
+// `write_file` + `read_file` stdlib wrappers from `std/fs.sigil` that
+// return `Result[Unit, FsError]` / `Result[String, FsError]`.
 
 // ===== Plan C Task 71 — Raise + catch run-and-check-output =====
 
@@ -12110,20 +12096,23 @@ fn koka_multiple_effects_in_body() {
 /// Derived from koka/test/effects/multi-op.kk
 #[test]
 fn koka_user_effect_multi_op_handler() {
+    // Plan C addendum (CLI external-system effects, EE1) added `Env`
+    // as a builtin effect. The original Koka test used `effect Env`;
+    // renamed to `Cfg` to avoid the duplicate-effect collision.
     let src = "import std.io\n\
-               effect Env {\n  \
+               effect Cfg {\n  \
                  get_name: () -> String,\n  \
                  get_value: () -> Int,\n\
                }\n\
-               fn greet() -> String ![Env] {\n  \
-                 let name: String = perform Env.get_name();\n  \
-                 let val: Int = perform Env.get_value();\n  \
+               fn greet() -> String ![Cfg] {\n  \
+                 let name: String = perform Cfg.get_name();\n  \
+                 let val: Int = perform Cfg.get_value();\n  \
                  string_concat(name, string_concat(\": \", int_to_string(val)))\n\
                }\n\
-               fn with_env(action: () -> String ![Env]) -> String ![] {\n  \
+               fn with_env(action: () -> String ![Cfg]) -> String ![] {\n  \
                  handle action() with {\n    \
-                   Env.get_name(k) => k(\"answer\"),\n    \
-                   Env.get_value(k) => k(42),\n  \
+                   Cfg.get_name(k) => k(\"answer\"),\n    \
+                   Cfg.get_value(k) => k(42),\n  \
                  }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
@@ -12908,4 +12897,423 @@ fn char_doc_only_import() {
     let (stdout, _stderr, code) = compile_and_run(src, "char_doc_import");
     assert_eq!(code, 0, "stderr: {_stderr}");
     assert_eq!(stdout, "A\n");
+}
+
+// ===== Plan C addendum (CLI external-system effects, EE6) ============
+//
+// User-facing surface for the `Env` / `Fs` / `Process` effects via
+// stdlib wrappers in `std/env.sigil` / `std/fs.sigil` /
+// `std/process.sigil`. Each test compiles a small Sigil program and
+// runs it against the test binary's host environment + a per-test
+// tempdir.
+
+#[cfg(unix)]
+fn cli_temp_path(suffix: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "sigil_cli_e2e_{}_{}_{suffix}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    p
+}
+
+#[test]
+fn env_var_present_returns_some() {
+    // SAFETY: `set_var`/`remove_var` are flagged unsafe in newer
+    // Rust because they're not thread-safe vs. concurrent reads;
+    // here the var name is unique to this test so cargo's parallel
+    // test runner can't collide on it, and the surrounding test
+    // harness reads it only via the spawned child process (which
+    // inherits the variable but doesn't share Rust's `environ`).
+    unsafe {
+        std::env::set_var("__SIGIL_E2E_VAR_PRESENT__", "ok");
+    }
+    let src = "import std.env\n\
+               import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO, Env] {\n  \
+                 match var(\"__SIGIL_E2E_VAR_PRESENT__\") {\n    \
+                   Some(v) => perform IO.println(v),\n    \
+                   None => perform IO.println(\"absent\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "env_var_present");
+    // SAFETY: see set_var note above.
+    unsafe {
+        std::env::remove_var("__SIGIL_E2E_VAR_PRESENT__");
+    }
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "ok\n");
+}
+
+#[test]
+fn env_var_absent_returns_none() {
+    // SAFETY: see env_var_present_returns_some.
+    unsafe {
+        std::env::remove_var("__SIGIL_E2E_VAR_DEFINITELY_ABSENT__");
+    }
+    let src = "import std.env\n\
+               import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO, Env] {\n  \
+                 match var(\"__SIGIL_E2E_VAR_DEFINITELY_ABSENT__\") {\n    \
+                   Some(_v) => perform IO.println(\"present\"),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "env_var_absent");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "none\n");
+}
+
+#[test]
+fn env_args_returns_at_least_one() {
+    // Emits two sentinels around `args()` so a CI failure points at
+    // *which* step crashed: `pre-args` printed alone means `args()`
+    // itself signal-killed mid-call; both printed plus a count means
+    // success.
+    let src = "import std.env\n\
+               import std.io\n\
+               import std.list\n\
+               fn main() -> Int ![IO, Env] {\n  \
+                 perform IO.println(\"pre-args\");\n  \
+                 let xs: List[String] = args();\n  \
+                 perform IO.println(\"post-args\");\n  \
+                 perform IO.println(int_to_string(length(xs)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "env_args_count");
+    assert_eq!(code, 0, "code != 0; stdout={stdout:?}; stderr={stderr:?}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("pre-args"),
+        "missing pre-args sentinel; stdout={stdout:?}"
+    );
+    assert_eq!(
+        lines.get(1).copied(),
+        Some("post-args"),
+        "missing post-args sentinel — args() call itself failed; stdout={stdout:?}"
+    );
+    let n_str = lines.get(2).copied().unwrap_or("");
+    let n: i64 = n_str
+        .parse()
+        .unwrap_or_else(|_| panic!("argv count not parseable; stdout={stdout:?}"));
+    assert!(
+        n >= 1,
+        "argv must always carry at least program name; got {n}; stdout={stdout:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_exists_known_unknown() {
+    let path = cli_temp_path("exists");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"x").expect("write fixture");
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match exists(\"{path_str}\") {{ true => perform IO.println(\"yes\"), false => perform IO.println(\"no\") }};\n  \
+           match exists(\"/nonexistent/path/__sigil_e2e_no__\") {{ true => perform IO.println(\"yes\"), false => perform IO.println(\"no\") }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_exists");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "yes\nno\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_read_existing_file() {
+    let path = cli_temp_path("read");
+    std::fs::write(&path, b"hello, fs").expect("write fixture");
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match read_file(\"{path_str}\") {{\n    \
+             Ok(s) => perform IO.println(s),\n    \
+             Err(_e) => perform IO.println(\"err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_read_existing");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "hello, fs\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_read_missing_is_not_found() {
+    let path = cli_temp_path("missing");
+    let _ = std::fs::remove_file(&path);
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match read_file(\"{path_str}\") {{\n    \
+             Ok(_s) => perform IO.println(\"unexpected ok\"),\n    \
+             Err(NotFound) => perform IO.println(\"not_found\"),\n    \
+             Err(_) => perform IO.println(\"other_err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_read_missing");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "not_found\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_write_then_read_round_trip() {
+    let path = cli_temp_path("rw");
+    let _ = std::fs::remove_file(&path);
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match write_file(\"{path_str}\", \"hello, file\") {{\n    \
+             Ok(_) => 0,\n    \
+             Err(_) => 0,\n  \
+           }};\n  \
+           match read_file(\"{path_str}\") {{\n    \
+             Ok(s) => perform IO.println(s),\n    \
+             Err(_) => perform IO.println(\"err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_rw_round_trip");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "hello, file\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_invalid_utf8_returns_invalid_utf8() {
+    let path = cli_temp_path("invalid_utf8");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, [0xFFu8, 0xFE]).expect("write invalid bytes");
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match read_file(\"{path_str}\") {{\n    \
+             Ok(_) => perform IO.println(\"unexpected ok\"),\n    \
+             Err(InvalidUtf8) => perform IO.println(\"invalid_utf8\"),\n    \
+             Err(_) => perform IO.println(\"other_err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_invalid_utf8");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "invalid_utf8\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_mkdir_remove_round_trip() {
+    let dir = cli_temp_path("mkrm");
+    let _ = std::fs::remove_dir(&dir);
+    let dir_str = dir.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match mkdir(\"{dir_str}\") {{\n    \
+             Ok(_) => perform IO.println(\"created\"),\n    \
+             Err(_) => perform IO.println(\"mkdir_err\"),\n  \
+           }};\n  \
+           match remove_dir(\"{dir_str}\") {{\n    \
+             Ok(_) => perform IO.println(\"removed\"),\n    \
+             Err(_) => perform IO.println(\"rm_err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_mkdir_rm");
+    let _ = std::fs::remove_dir(&dir);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "created\nremoved\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_file_size_returns_byte_count() {
+    let path = cli_temp_path("size");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, [0u8; 100]).expect("write 100 bytes");
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.int64\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match file_size(\"{path_str}\") {{\n    \
+             Ok(n) => perform IO.println(int64_to_string(n)),\n    \
+             Err(_) => perform IO.println(\"err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_size");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "100\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_read_dir_lists_entries() {
+    let dir = cli_temp_path("readdir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).expect("create temp dir");
+    std::fs::write(dir.join("a"), b"a").expect("write a");
+    std::fs::write(dir.join("b"), b"b").expect("write b");
+    std::fs::write(dir.join("c"), b"c").expect("write c");
+    let dir_str = dir.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.list\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match read_dir(\"{dir_str}\") {{\n    \
+             Ok(xs) => perform IO.println(int_to_string(length(xs))),\n    \
+             Err(_) => perform IO.println(\"err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_read_dir");
+    let _ = std::fs::remove_file(dir.join("a"));
+    let _ = std::fs::remove_file(dir.join("b"));
+    let _ = std::fs::remove_file(dir.join("c"));
+    let _ = std::fs::remove_dir(&dir);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "3\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_echo_returns_zero_with_stdout() {
+    let src = "import std.process\n\
+               import std.array\n\
+               import std.io\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Process] {\n  \
+                 let args: Array[String] = array_alloc(1, \"hello\");\n  \
+                 match run(\"echo\", args) {\n    \
+                   Ok((code, out, _err)) => match code {\n      \
+                     0 => perform IO.println(out),\n      \
+                     _ => perform IO.println(\"nonzero\"),\n    \
+                   },\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "process_run_echo");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    // `echo` prints "hello\n" + IO.println adds another newline.
+    assert_eq!(stdout, "hello\n\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_false_returns_nonzero_exit() {
+    let src = "import std.process\n\
+               import std.array\n\
+               import std.io\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Process] {\n  \
+                 let args: Array[String] = array_alloc(0, \"\");\n  \
+                 match run(\"false\", args) {\n    \
+                   Ok((code, _out, _err)) => perform IO.println(int_to_string(code)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "process_run_false");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "1\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_missing_executable_is_not_found() {
+    let src = "import std.process\n\
+               import std.array\n\
+               import std.io\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Process] {\n  \
+                 let args: Array[String] = array_alloc(0, \"\");\n  \
+                 match run(\"/nonexistent/path/__sigil_e2e_missing__\", args) {\n    \
+                   Ok(_) => perform IO.println(\"unexpected ok\"),\n    \
+                   Err(NotFound) => perform IO.println(\"not_found\"),\n    \
+                   Err(_) => perform IO.println(\"other_err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "process_run_missing");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "not_found\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_captures_stderr_separately() {
+    // Sigil v1's match arm body must be a single expression —
+    // block syntax `{ stmt; expr }` is rejected at the arm-body
+    // position. Destructure once into a tuple of `(out, err)`,
+    // then concat + print.
+    // Sigil's typecheck `env_insert` debug_assert fires on `let`
+    // shadowing the same name; use distinct `args0` / `args1` /
+    // `args2` chain for the array-build pipeline.
+    let src = "import std.process\n\
+               import std.array\n\
+               import std.io\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Process] {\n  \
+                 let args0: Array[String] = array_alloc(2, \"\");\n  \
+                 let args1: Array[String] = array_set(args0, 0, \"-c\");\n  \
+                 let args2: Array[String] = array_set(args1, 1, \"echo out; echo err >&2\");\n  \
+                 let pair: (String, String) = match run(\"sh\", args2) {\n    \
+                   Ok((_code, o, e)) => (o, e),\n    \
+                   Err(_) => (\"\", \"\"),\n  \
+                 };\n  \
+                 match pair {\n    \
+                   (o, e) => perform IO.print(string_concat(o, e)),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "process_run_stderr");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "out\nerr\n");
 }
