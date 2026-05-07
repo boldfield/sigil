@@ -406,6 +406,53 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// Decode a single UTF-8 codepoint at the current position without
+    /// advancing. Returns `Err(())` for invalid UTF-8 leading bytes —
+    /// callers are responsible for surfacing that as a lex error.
+    /// Used by `take_char_lit` for `'é'` / `'中'` / `'😀'` style
+    /// bare-codepoint literal bodies.
+    fn peek_utf8(&self) -> Result<(char, usize), ()> {
+        if self.at_eof() {
+            return Err(());
+        }
+        let b0 = self.src[self.pos];
+        let len = if b0 < 0x80 {
+            1
+        } else if (b0 & 0xE0) == 0xC0 {
+            2
+        } else if (b0 & 0xF0) == 0xE0 {
+            3
+        } else if (b0 & 0xF8) == 0xF0 {
+            4
+        } else {
+            return Err(());
+        };
+        if self.pos + len > self.src.len() {
+            return Err(());
+        }
+        let bytes = &self.src[self.pos..self.pos + len];
+        match std::str::from_utf8(bytes) {
+            Ok(s) => match s.chars().next() {
+                Some(c) => Ok((c, len)),
+                None => Err(()),
+            },
+            Err(_) => Err(()),
+        }
+    }
+
+    /// Advance the cursor by `n` bytes; updates `col` by 1 (treating the
+    /// codepoint as one column for source-position purposes). Used by
+    /// `take_char_lit` after `peek_utf8` confirms a multi-byte codepoint.
+    fn advance_utf8(&mut self, n: usize) {
+        for _ in 0..n {
+            if self.at_eof() {
+                return;
+            }
+            self.pos += 1;
+        }
+        self.col += 1;
+    }
+
     fn peek_at(&self, offset: usize) -> Option<char> {
         let p = self.pos + offset;
         if p < self.src.len() {
@@ -580,6 +627,117 @@ impl<'a> Cursor<'a> {
                 'r' => '\r',
                 '\\' => '\\',
                 '\'' => '\'',
+                '"' => '"',
+                '0' => '\0',
+                'u' => {
+                    // Unicode escape `\u{HEX}`. 1–6 hex digits;
+                    // surrogates and >0x10FFFF rejected at parse time.
+                    if self.at_eof() || self.peek() != '{' {
+                        let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+                        return Err(CompilerError::new(
+                            Severity::Error,
+                            errors::code("E0010"),
+                            span,
+                            "expected `{` after `\\u` in character literal",
+                        ));
+                    }
+                    self.advance(); // consume '{'
+                    let mut hex = String::new();
+                    while !self.at_eof() && self.peek() != '}' {
+                        let h = self.peek();
+                        if !h.is_ascii_hexdigit() {
+                            let span =
+                                Span::new(self.file, start_line, start_col, self.line, self.col);
+                            return Err(CompilerError::new(
+                                Severity::Error,
+                                errors::code("E0010"),
+                                span,
+                                format!(
+                                    "expected hex digit in `\\u{{...}}` Unicode escape; got `{h}`"
+                                ),
+                            ));
+                        }
+                        hex.push(h);
+                        self.advance();
+                        if hex.len() > 6 {
+                            let span =
+                                Span::new(self.file, start_line, start_col, self.line, self.col);
+                            return Err(CompilerError::new(
+                                Severity::Error,
+                                errors::code("E0010"),
+                                span,
+                                "expected 1–6 hex digits in Unicode escape",
+                            ));
+                        }
+                    }
+                    if self.at_eof() {
+                        let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+                        return Err(CompilerError::new(
+                            Severity::Error,
+                            errors::code("E0010"),
+                            span,
+                            "unterminated `\\u{...}` Unicode escape (missing `}`)",
+                        ));
+                    }
+                    if hex.is_empty() {
+                        let span =
+                            Span::new(self.file, start_line, start_col, self.line, self.col + 1);
+                        self.advance(); // consume '}'
+                        return Err(CompilerError::new(
+                            Severity::Error,
+                            errors::code("E0010"),
+                            span,
+                            "expected 1–6 hex digits in Unicode escape",
+                        ));
+                    }
+                    self.advance(); // consume '}'
+                    let n = match u32::from_str_radix(&hex, 16) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let span =
+                                Span::new(self.file, start_line, start_col, self.line, self.col);
+                            return Err(CompilerError::new(
+                                Severity::Error,
+                                errors::code("E0010"),
+                                span,
+                                format!("invalid hex value in Unicode escape: `{hex}`"),
+                            ));
+                        }
+                    };
+                    if n > 0x10_FFFF {
+                        let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+                        return Err(CompilerError::new(
+                            Severity::Error,
+                            errors::code("E0010"),
+                            span,
+                            "Unicode codepoint out of range (max 0x10FFFF)",
+                        ));
+                    }
+                    if (0xD800..=0xDFFF).contains(&n) {
+                        let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+                        return Err(CompilerError::new(
+                            Severity::Error,
+                            errors::code("E0010"),
+                            span,
+                            "Unicode surrogate codepoints not allowed",
+                        ));
+                    }
+                    // Safe by validation above: n is in
+                    // `0..=0x10FFFF` and not in the surrogate range.
+                    match char::from_u32(n) {
+                        Some(c) => c,
+                        None => {
+                            let span =
+                                Span::new(self.file, start_line, start_col, self.line, self.col);
+                            return Err(CompilerError::new(
+                                Severity::Error,
+                                errors::code("E0010"),
+                                span,
+                                format!("invalid Unicode codepoint U+{n:04X}"),
+                            ));
+                        }
+                    }
+                }
                 other => {
                     let span = Span::new(self.file, start_line, start_col, self.line, self.col);
                     return Err(CompilerError::new(
@@ -600,19 +758,68 @@ impl<'a> Cursor<'a> {
                 span,
                 "empty character literal",
             ));
-        } else {
-            self.advance();
-            ch
-        };
-        // Require the closing quote. Multi-char literals like `'ab'` are
-        // rejected here.
-        if self.at_eof() || self.peek() != '\'' {
+        } else if ch == '\n' {
+            // Newline before closing quote — same line check the
+            // closing-quote branch would catch, surfaced earlier with
+            // a clearer message.
             let span = Span::new(self.file, start_line, start_col, self.line, self.col);
             return Err(CompilerError::new(
                 Severity::Error,
                 errors::code("E0010"),
                 span,
-                "expected closing `'` in character literal",
+                "unterminated character literal (newline before closing `'`)",
+            ));
+        } else if (ch as u32) < 0x80 {
+            // ASCII bare codepoint — single byte.
+            self.advance();
+            ch
+        } else {
+            // Multi-byte UTF-8 bare codepoint (`'é'`, `'中'`, `'😀'`,
+            // ...). The byte-based cursor would otherwise see N bytes
+            // here and reject as multi-codepoint.
+            match self.peek_utf8() {
+                Ok((c, len)) => {
+                    self.advance_utf8(len);
+                    c
+                }
+                Err(()) => {
+                    let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+                    return Err(CompilerError::new(
+                        Severity::Error,
+                        errors::code("E0010"),
+                        span,
+                        "invalid UTF-8 in character literal",
+                    ));
+                }
+            }
+        };
+        // Require the closing quote. Multi-codepoint literals like `'ab'`
+        // are rejected here with a more specific message.
+        if self.at_eof() {
+            let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+            return Err(CompilerError::new(
+                Severity::Error,
+                errors::code("E0010"),
+                span,
+                "unterminated character literal",
+            ));
+        }
+        if self.peek() != '\'' {
+            let span = Span::new(self.file, start_line, start_col, self.line, self.col);
+            // Count how many codepoints follow before the next '.
+            let mut extra = 1;
+            while !self.at_eof() && self.peek() != '\'' && self.peek() != '\n' {
+                self.advance();
+                extra += 1;
+            }
+            if !self.at_eof() && self.peek() == '\'' {
+                self.advance();
+            }
+            return Err(CompilerError::new(
+                Severity::Error,
+                errors::code("E0010"),
+                span,
+                format!("Char literal must be a single codepoint; got {extra}"),
             ));
         }
         self.advance();
@@ -789,6 +996,136 @@ mod tests {
         let (_toks, errs) = lex("x.sigil", "'ab'");
         assert!(!errs.is_empty());
         assert_eq!(errs[0].code.as_str(), "E0010");
+    }
+
+    // ===== Plan C addendum (Char) — new escape coverage =============
+
+    #[test]
+    fn char_literal_double_quote_escape() {
+        let (toks, errs) = lex("x.sigil", r#"'\"'"#);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(toks[0].kind, TokenKind::CharLit('"')));
+    }
+
+    #[test]
+    fn char_literal_null_escape() {
+        let (toks, errs) = lex("x.sigil", r"'\0'");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(toks[0].kind, TokenKind::CharLit('\0')));
+    }
+
+    #[test]
+    fn char_literal_unicode_short_escape() {
+        let (toks, errs) = lex("x.sigil", r"'\u{41}'");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(matches!(toks[0].kind, TokenKind::CharLit('A')));
+    }
+
+    #[test]
+    fn char_literal_unicode_long_escape() {
+        // Single supplementary-plane codepoint via 5-hex escape.
+        let (toks, errs) = lex("x.sigil", r"'\u{1F600}'");
+        assert!(errs.is_empty(), "{errs:?}");
+        match toks[0].kind {
+            TokenKind::CharLit(c) => assert_eq!(c as u32, 0x1F600),
+            _ => panic!("expected CharLit"),
+        }
+    }
+
+    #[test]
+    fn char_literal_bare_2byte_codepoint() {
+        // 'é' — single codepoint UTF-8 source.
+        let (toks, errs) = lex("x.sigil", "'é'");
+        assert!(errs.is_empty(), "{errs:?}");
+        match toks[0].kind {
+            TokenKind::CharLit(c) => assert_eq!(c as u32, 0xE9),
+            _ => panic!("expected CharLit"),
+        }
+    }
+
+    #[test]
+    fn char_literal_bare_3byte_codepoint() {
+        let (toks, errs) = lex("x.sigil", "'中'");
+        assert!(errs.is_empty(), "{errs:?}");
+        match toks[0].kind {
+            TokenKind::CharLit(c) => assert_eq!(c as u32, 0x4E2D),
+            _ => panic!("expected CharLit"),
+        }
+    }
+
+    #[test]
+    fn char_literal_bare_4byte_codepoint() {
+        let (toks, errs) = lex("x.sigil", "'😀'");
+        assert!(errs.is_empty(), "{errs:?}");
+        match toks[0].kind {
+            TokenKind::CharLit(c) => assert_eq!(c as u32, 0x1F600),
+            _ => panic!("expected CharLit"),
+        }
+    }
+
+    #[test]
+    fn char_literal_unicode_empty_braces_rejected() {
+        let (_toks, errs) = lex("x.sigil", r"'\u{}'");
+        assert!(!errs.is_empty());
+        assert_eq!(errs[0].code.as_str(), "E0010");
+    }
+
+    #[test]
+    fn char_literal_unicode_too_many_hex_digits_rejected() {
+        let (_toks, errs) = lex("x.sigil", r"'\u{1234567}'");
+        assert!(!errs.is_empty());
+        assert_eq!(errs[0].code.as_str(), "E0010");
+    }
+
+    #[test]
+    fn char_literal_unicode_out_of_range_rejected() {
+        let (_toks, errs) = lex("x.sigil", r"'\u{110000}'");
+        assert!(!errs.is_empty());
+        assert_eq!(errs[0].code.as_str(), "E0010");
+    }
+
+    #[test]
+    fn char_literal_unicode_surrogate_rejected() {
+        let (_toks, errs) = lex("x.sigil", r"'\u{D800}'");
+        assert!(!errs.is_empty());
+        assert_eq!(errs[0].code.as_str(), "E0010");
+    }
+
+    #[test]
+    fn char_literal_unicode_high_surrogate_rejected() {
+        let (_toks, errs) = lex("x.sigil", r"'\u{DFFF}'");
+        assert!(!errs.is_empty());
+        assert_eq!(errs[0].code.as_str(), "E0010");
+    }
+
+    #[test]
+    fn char_literal_unicode_just_below_surrogate_accepted() {
+        let (toks, errs) = lex("x.sigil", r"'\u{D7FF}'");
+        assert!(errs.is_empty(), "{errs:?}");
+        match toks[0].kind {
+            TokenKind::CharLit(c) => assert_eq!(c as u32, 0xD7FF),
+            _ => panic!("expected CharLit"),
+        }
+    }
+
+    #[test]
+    fn char_literal_unicode_just_above_surrogate_accepted() {
+        let (toks, errs) = lex("x.sigil", r"'\u{E000}'");
+        assert!(errs.is_empty(), "{errs:?}");
+        match toks[0].kind {
+            TokenKind::CharLit(c) => assert_eq!(c as u32, 0xE000),
+            _ => panic!("expected CharLit"),
+        }
+    }
+
+    #[test]
+    fn char_literal_unicode_max_accepted() {
+        let (toks, errs) = lex("x.sigil", r"'\u{10FFFF}'");
+        assert!(errs.is_empty(), "{errs:?}");
+        match toks[0].kind {
+            TokenKind::CharLit(c) => assert_eq!(c as u32, 0x10FFFF),
+            _ => panic!("expected CharLit"),
+        }
     }
 
     // ===== Plan A3 task 36 — Stage-4 tokens =========================
