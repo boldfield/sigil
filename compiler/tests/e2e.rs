@@ -13556,3 +13556,50 @@ fn tail_recursive_mutual_ping_pong_one_million() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
 }
+
+// Plan C TCO addendum — Cps-shape diagnostic (TCO-3 follow-up).
+//
+// Tail recursion through a Cps-COLORED user fn whose body shape
+// (`let _ = perform State.get(); match { 0 => 0, _ => recurse(n-1) }`)
+// is identical to `examples/fib_cps_perf.sigil` — closest-shape
+// known-passing test for "Cps-colored fn that compiles". Per
+// `compute_user_fn_abi` (codegen.rs:189) the body's recursive match
+// arm fails the `pure_tail` predicate, so the fn lowers as
+// `UserFnAbi::Sync` despite being `Color::Cps` — every perform site
+// drives a synchronous `sigil_run_loop` and the recursive call uses
+// the same Sync direct-call branch (codegen.rs:21759) as the pure-
+// Sync diagnostic above.
+//
+// Diagnostic question this test answers: does the per-perform
+// `sigil_run_loop` driver (1M dispatches through the State.get arm)
+// add stack growth that count_down doesn't see? If yes, Cps-colored
+// tail recursion overflows EARLIER than pure-Sync — and TCO-4 needs
+// scope beyond `return_call` at lower_call's Sync direct branch.
+// If no, Sync `return_call` at lower_call covers every tail-
+// recursive shape the user can write today.
+//
+// Either way the test serves as a regression guard post-fix.
+
+#[test]
+fn tail_recursive_cps_colored_count_down_one_million() {
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
+               fn count_down_cps(n: Int) -> Int ![State, IO] {\n  \
+                 let _: Int = perform State.get();\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_cps(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle count_down_cps(1000000) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "tail_recursive_cps_colored_count_down_one_million");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
