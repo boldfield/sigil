@@ -798,3 +798,47 @@ So the same Sync `return_call` fix covers Cps-colored fns too. There is no addit
 **Failure mode.** Same as the prior entry — if TCO-4 doesn't ship, Sigil's recursion-only iteration model remains depth-bounded by stack-size / frame-size, with no user-facing diagnostic on overflow.
 
 **Implementing commit(s).** [HEAD] (this entry resolves the Cps gate using the diagnostic data from PR #108 commit `88c0f1a`; TCO-4 implementation gated on human signoff to proceed).
+
+## 2026-05-07 — [DEVIATION Task TCO-4] [CLOSED] User-fn tail-call optimization shipped via Sync `return_call` at lower_call's direct branch
+
+**Context.** TCO-3 surfaced the codegen gap (zero `return_call` IR emissions, no tail-position threading in `lower_call`); the Cps-coverage follow-up resolved the architectural scope question (Sync direct branch covers Cps-colored Sync-ABI fns through the same path). TCO-4 implements the fix.
+
+**Implementation.** A new family of helper methods on `Lowerer` in `compiler/src/codegen.rs`:
+
+- `TailResult` enum — `Value(Value)` / `NoValue` / `Terminated`. The `Terminated` case signals that Cranelift `return_call` was emitted; callers MUST NOT emit any subsequent terminator.
+- `lower_fn_tail_block(b)` — entry point, called from the fn-body lowering site at line ~11542. Lowers stmts via `lower_stmt`, then routes the tail expression through `lower_expr_in_tail_pos`.
+- `lower_expr_in_tail_pos(e)` — dispatches on expression shape: `Block` recurses via `lower_fn_tail_block`, `Match` via `lower_match_in_tail_pos`, `Call` via `lower_call_in_tail_pos`. Everything else falls back to `lower_expr` and wraps as `Value`. `Expr::Handle` and `Expr::Perform` are intentionally non-tail-preserving (their bodies execute under synchronous trampoline drivers; tail-jumping out would skip the machinery and break handler semantics).
+- `lower_call_in_tail_pos(callee, args, span)` — emits Cranelift `return_call` iff: callee is `Expr::Ident(name, _)` resolving via `user_fn_refs` (and not lexically shadowed by a local), the callee's ABI is `UserFnAbi::Sync`, AND the callee's signature exactly matches the current fn's signature. Cross-arity tail calls fall back to a non-tail `lower_call`. The signature-match constraint is a Cranelift verifier requirement (`return_call` rejects mismatched signatures at IR-build time); the typechecker guarantees return-type match for tail expressions, but param shapes may differ across user fns.
+- `lower_match_in_tail_pos(scrutinee, arms, match_span)` — mirrors `lower_match` for arm processing. Each arm body lowers through `lower_expr_in_tail_pos`. Arms returning `Terminated` skip the cont jump (the body block is terminated by `return_call`); arms returning `Value` jump to cont as usual. When every arm terminated, `cont` has zero predecessors and is sealed as dead; the match itself returns `Terminated`. The catchall and non-catchall arm paths preserve `lower_match`'s pattern-test + bind + body-block + jump-to-next structure verbatim.
+
+The fn-body site at line ~11542 was rewritten to switch on `TailResult`:
+
+```rust
+let tail_result = lowerer.lower_fn_tail_block(&f.body);
+match tail_result {
+    TailResult::Value(v) if is_main => /* ishl_imm tag + return */,
+    TailResult::Value(v) => /* return v */,
+    TailResult::NoValue => /* return iconst 0 of ret_ty */,
+    TailResult::Terminated => /* no return — return_call already emitted */,
+}
+```
+
+**Indirect-call TCO is deferred.** `return_call_indirect` for closure dispatch is a sensible follow-up but adds complexity (the closure's `code_ptr` signature must be checked against the current fn's signature at runtime or via the `sig_ref` machinery). No current diagnostic test exercises indirect tail recursion; the four shape-coverage tests added by TCO-4 are all direct calls. A future plan can extend `lower_call_in_tail_pos` if real programs surface a depth-bounded indirect-recursion pattern.
+
+**Test surface.** Three TCO-1 diagnostic tests (bumped from 1M to 10M for the pure-Sync shapes; held at 1M for the Cps-colored shape per CI runtime budget — per-iteration `perform State.get` overhead would push 10M past sensible bounds) plus four TCO-4 shape-coverage tests:
+
+- `tail_recursive_count_down_ten_million` — self tail recursion via match arms, `![]` row.
+- `tail_recursive_mutual_ping_pong_ten_million` — mutual tail recursion via match arms, `![]` row.
+- `tail_recursive_cps_colored_count_down_one_million` — Cps-colored Sync-ABI fn with per-call `perform State.get`, `![State, IO]` row.
+- `tail_recursive_with_let_intermediate` — tail expression is a `Block` with stmt `let m = n - 1` and tail `count_down_let(m)`. Pins `lower_fn_tail_block` recursion via `Expr::Block`.
+- `tail_recursive_through_if` — `if cond { base } else { recurse }`. `Expr::If` is desugared to `Expr::Match` by `elaborate`, so the if-arms reach `lower_match_in_tail_pos` as match arms.
+- `tail_recursive_through_match` — multi-arm match (literal arms + catchall) with multiple tail-recursive arms. Pins the conditional-arm-chain path of `lower_match_in_tail_pos`.
+- `tail_recursive_with_effect_row` — tail recursion in a fn declaring `![Mem]`, `if` body. Pins that effect-row threading via `terminal_out_param` doesn't break TCO. Closest-shape passing test: `examples/sudoku.sigil`'s `print_grid`.
+
+**Spec.** `spec/language.md` gains §12.1 — Tail-call optimization, documenting tail positions (last expr of fn body, tail of Block / let-block, Match arm bodies, if-arm bodies via match desugaring), mutual-recursion support gated on signature match, and the four exclusions (operand of binop / non-tail stmt / scrutinee / inside Handle body / inside perform args). Cross-references the regression tests and the diagnostic-first plan.
+
+**Closure path.** Closes this entry alongside the closure of `[DEVIATION Task TCO-3]` and `[DEVIATION Task TCO-3 follow-up]` above, all bundled into the same TCO-4 commit.
+
+**Failure mode.** If a future codegen change introduces a path that emits `return_call` outside the four guards above (direct user-fn Ident + Sync ABI + matching signature + tail position propagated through Block/Match/Call only), Cranelift's verifier rejects the IR at finalize time and every test using the affected lowering crashes loudly. The fallback path (non-tail `lower_call`) is correctness-safe at the cost of one stack frame per recursion level; missed tail-call detection is a slow-not-broken regression.
+
+**Implementing commit(s).** [HEAD] (TCO-4 implementing commit; closes the TCO-3 + TCO-3-follow-up + TCO-4 deviations).

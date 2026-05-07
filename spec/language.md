@@ -1052,6 +1052,80 @@ Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/cata
   let-chain (§8.3). Runtime-N enumeration uses first-class
   continuations (§8.5).
 
+#### §12.1 — Tail-call optimization
+
+Every direct user-fn call in **tail position** is lowered to
+Cranelift's `return_call` instruction — a native tail-jump that
+deallocates the current stack frame before transferring control to
+the callee. Programs may rely on this for **unbounded recursion**.
+
+A call is in tail position when it appears as:
+
+- The last expression of a function body (the body's tail
+  expression after any preceding statements).
+- The tail expression of a `Block` whose surrounding context is
+  itself in tail position.
+- An arm body of a `match` whose surrounding context is in tail
+  position. `if/else` desugars to `match`, so an `if`-arm in tail
+  position is a tail-position match arm.
+- The body of a `let x = …; tail` whose surrounding context is in
+  tail position (i.e., the `tail` slot of a let-block).
+
+A call is **not** in tail position when it appears as:
+
+- An operand of `+`, `-`, `*`, etc. (the surrounding operator
+  consumes the call's value).
+- A non-tail statement of a block (`let _ = recurse(…); …`).
+- The scrutinee of a `match` (the scrutinee feeds pattern tests,
+  not the match's value).
+- Inside a `handle … with { … }` body (the body executes under a
+  synchronous trampoline driver; tail-jumping out would skip the
+  handler machinery).
+- Inside a `perform` argument (a perform's args are non-tail by
+  construction).
+
+Tail-call optimization covers:
+
+- **Self-recursion** (`f` calling `f`).
+- **Mutual recursion** (`f → g → f → …`) — provided the recursive
+  fns share an exact signature (param types, return type, calling
+  convention). Sigil's typechecker enforces matching return types
+  for tail-position calls; cross-arity tail calls fall back to a
+  non-tail call (one stack frame per call), since Cranelift's
+  `return_call` rejects signature mismatches at verifier time.
+- **Cps-colored fns whose body contains tail recursion**. Such fns
+  lower as Sync ABI (the recursive arm fails the `pure_tail`
+  predicate that selects Cps ABI; see `compute_user_fn_abi` in
+  `compiler/src/codegen.rs`); the recursive call routes through
+  the same Sync direct-call branch as pure-Sync recursion. Per-
+  iteration `perform` machinery occurs and unwinds within one
+  iteration's frame, then `return_call` reuses the slot.
+
+Tail-call optimization does **not** apply to:
+
+- Indirect calls (closure dispatch through `code_ptr`). A future
+  follow-up may extend the optimization to `return_call_indirect`
+  when a closure-typed callee in tail position has a signature
+  matching the current fn.
+- Calls to Cps-ABI user fns (those returning `*mut NextStep` rather
+  than the user's value type). The Cps ABI wraps each call in a
+  synchronous `sigil_run_loop` driver; tail-jumping over the driver
+  would skip the trampoline. By construction Sigil today has no
+  tail-recursive Cps-ABI fn body shape — the three Cps-ABI body
+  shapes (`is_simple_tail_perform_with_pure_args_body`,
+  `is_simple_yield_then_constant_tail_body`,
+  `is_simple_let_yield_then_pure_tail_body`) all exclude recursive
+  calls in their tail position.
+
+Regression tests in `compiler/tests/e2e.rs` pin the guarantee at
+depth 10,000,000 for pure-Sync shapes (self, mutual, let-block
+tail, if-arm tail, match-arm tail, `Mem`-effect-row body) and
+1,000,000 for the Cps-colored shape (per-iteration `State.get`
+overhead). See `done/2026-05-07-01-sigil-tco-verify.md` and
+`[DEVIATION Task TCO-3 follow-up]` in `PLAN_C_DEVIATIONS.md` for
+the diagnostic-first plan and the architectural rationale behind
+covering Cps-colored fns through the Sync direct-call branch.
+
 ### §13 — Stdlib reference
 
 Each module is documented in its own `std/<name>.sigil` source

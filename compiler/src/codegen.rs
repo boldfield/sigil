@@ -11539,7 +11539,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arm_k_name: None,
             };
 
-            let tail_val = lowerer.lower_block(&f.body);
+            // TCO-4 — route fn-body lowering through
+            // `lower_fn_tail_block` so direct user-fn calls in tail
+            // position emit Cranelift `return_call` (terminator)
+            // instead of `call` + `return_`. When the helper returns
+            // `Terminated`, the body has already emitted its
+            // terminator; do NOT emit `return_()`. See
+            // `done/2026-05-07-01-sigil-tco-verify.md` (TCO-4) and
+            // `[DEVIATION Task TCO-3 follow-up]` in
+            // `PLAN_C_DEVIATIONS.md` for the architectural rationale.
+            let tail_result = lowerer.lower_fn_tail_block(&f.body);
 
             // main tags its Int return with `ishl_imm TAG_INT_SHIFT`
             // so the C-main shim can `sshr_imm` → i32. Other user fns
@@ -11561,15 +11570,43 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // the shift amount so any future ABI revision edits one
             // constant in `sigil-abi` rather than hunting inline
             // literals.
-            let ret_val = match tail_val {
-                Some(v) if is_main => lowerer.builder.ins().ishl_imm(v, i64::from(TAG_INT_SHIFT)),
-                Some(v) => v,
-                // No tail → Unit. Return a zero of the expected Cranelift
-                // type. For main, ret_ty is i64 (tagged); `iconst(I64, 0)`
-                // represents tagged-Int zero.
-                None => lowerer.builder.ins().iconst(entry.ret_ty, 0),
-            };
-            lowerer.builder.ins().return_(&[ret_val]);
+            //
+            // TCO-4 note: `main` is structurally `UserFnAbi::Sync`
+            // (`compute_user_fn_abi` short-circuits on `name ==
+            // "main"`), but its body's tail-recursive call sites
+            // (if any) cannot tail-call themselves into a
+            // signature-matching callee — main returns a raw Int
+            // (i32 or i64 depending on profile), and would-be
+            // tail-callees return their raw user value too; the
+            // C-ABI boundary is only at main's `return_`. So
+            // tail_result for main is virtually always `Value(_)`
+            // or `NoValue`; `Terminated` would require a recursive
+            // main-to-main tail call, which Sigil's typechecker
+            // permits (main signature matches itself) but no real
+            // program writes.
+            match tail_result {
+                TailResult::Value(v) if is_main => {
+                    let v_tagged = lowerer.builder.ins().ishl_imm(v, i64::from(TAG_INT_SHIFT));
+                    lowerer.builder.ins().return_(&[v_tagged]);
+                }
+                TailResult::Value(v) => {
+                    lowerer.builder.ins().return_(&[v]);
+                }
+                TailResult::NoValue => {
+                    // No tail → Unit. Return a zero of the expected
+                    // Cranelift type. For main, ret_ty is i64
+                    // (tagged); `iconst(I64, 0)` represents tagged-
+                    // Int zero.
+                    let zero = lowerer.builder.ins().iconst(entry.ret_ty, 0);
+                    lowerer.builder.ins().return_(&[zero]);
+                }
+                TailResult::Terminated => {
+                    // `return_call` already emitted; the fn body's
+                    // terminator is the tail-call. No `return_()`
+                    // here — Cranelift would reject duplicate
+                    // terminators in the same block.
+                }
+            }
             lowerer.builder.finalize();
         }
         module
@@ -18263,6 +18300,30 @@ fn body_as_direct_cps_call_with_lookup(
     None
 }
 
+/// TCO-4 — outcome of lowering an expression in tail position
+/// w.r.t. the enclosing fn body. Produced by `lower_fn_tail_block`,
+/// `lower_expr_in_tail_pos`, `lower_call_in_tail_pos`, and
+/// `lower_match_in_tail_pos`.
+///
+/// - `Value(v)` — the expression produced a value `v`. The fn-body
+///   site emits `return_(v)`; a match-arm body jumps to `cont` with
+///   `v` as the block argument.
+/// - `NoValue` — block-style "no tail expression"; the caller
+///   substitutes a zero of the expected return type.
+/// - `Terminated` — Cranelift `return_call` was emitted. Control has
+///   transferred out of the current function. The caller MUST NOT
+///   emit any subsequent terminator (no `return_`, no `jump`).
+///
+/// See `done/2026-05-07-01-sigil-tco-verify.md` (TCO-4) for the
+/// architectural rationale; the `[DEVIATION Task TCO-3 follow-up]`
+/// entry in `PLAN_C_DEVIATIONS.md` for the Cps coverage analysis
+/// (Sync `return_call` is the full TCO surface).
+enum TailResult {
+    Value(Value),
+    NoValue,
+    Terminated,
+}
+
 impl<'a, 'b> Lowerer<'a, 'b> {
     /// Plan D Task 119b — look up a call's resolved callee `Ty`
     /// for the span. Walks from `current_fn_name` up the
@@ -18321,6 +18382,303 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.lower_stmt(s);
         }
         b.tail.as_ref().map(|t| self.lower_expr(t))
+    }
+
+    /// TCO-4 — lower a `Block` as the tail of the enclosing fn body.
+    /// Statements lower normally (they're never in tail position); the
+    /// tail expression goes through `lower_expr_in_tail_pos`, which
+    /// recurses through tail-preserving shapes (Block, Match, Annot)
+    /// and emits `return_call` for direct user-fn calls with matching
+    /// signatures. Returns `TailResult::NoValue` for stmt-only blocks.
+    ///
+    /// Only invoked from the fn-body lowering site at the top of
+    /// `compile_program`. Inner Blocks reached via tail recursion go
+    /// through this same helper (Block → lower_fn_tail_block).
+    fn lower_fn_tail_block(&mut self, b: &crate::ast::Block) -> TailResult {
+        for s in &b.stmts {
+            self.lower_stmt(s);
+        }
+        match &b.tail {
+            None => TailResult::NoValue,
+            Some(t) => self.lower_expr_in_tail_pos(t),
+        }
+    }
+
+    /// TCO-4 — lower an expression in tail position w.r.t. the
+    /// enclosing fn body. Tail-preserving shapes recurse so a
+    /// recursive user-fn call buried inside `match`/`if`-desugared-
+    /// to-match/`Block`/`Annot` reaches `lower_call_in_tail_pos`.
+    /// Everything else falls back to `lower_expr` and is wrapped as
+    /// `Value` — those expressions produce a value the caller will
+    /// `return_` or `jump` with.
+    ///
+    /// Note: `Expr::If` is desugared to `Expr::Match` by `elaborate`
+    /// (see `lower_expr`'s own `Expr::If` arm panic), so an `if` in
+    /// tail position reaches us as a `Match` and recurses through
+    /// `lower_match_in_tail_pos`'s arm bodies. The
+    /// `tail_recursive_through_if` regression test pins this.
+    ///
+    /// `Expr::Handle` is intentionally NOT tail-preserving: a handle
+    /// expression's body executes under a synchronous `run_loop`
+    /// driver inside `lower_expr`'s `Expr::Handle` arm, and a
+    /// `return_call` inside the body would skip that machinery and
+    /// break handler semantics. The handle expression itself is a
+    /// value-producing leaf from this helper's perspective.
+    /// `Expr::Perform` is similarly opaque (it routes through
+    /// `lower_perform_to_value`'s synchronous trampoline).
+    fn lower_expr_in_tail_pos(&mut self, e: &crate::ast::Expr) -> TailResult {
+        use crate::ast::Expr;
+        match e {
+            Expr::Block(b) => self.lower_fn_tail_block(b),
+            Expr::Match {
+                scrutinee,
+                arms,
+                span,
+            } => self.lower_match_in_tail_pos(scrutinee, arms, span),
+            Expr::Call {
+                callee, args, span, ..
+            } => self.lower_call_in_tail_pos(callee, args, span),
+            _ => TailResult::Value(self.lower_expr(e)),
+        }
+    }
+
+    /// TCO-4 — lower a `Call` in tail position. Emits Cranelift's
+    /// `return_call` IFF:
+    ///
+    /// 1. The callee is a direct top-level user fn (`Expr::Ident`
+    ///    resolving via `user_fn_refs` and not lexically shadowed by
+    ///    a local in `env`).
+    /// 2. The callee's ABI is `UserFnAbi::Sync` (Cps callees return
+    ///    `*mut NextStep`, not the user's value type — `return_call`
+    ///    would skip the trampoline driver and break semantics; the
+    ///    Cps coverage analysis in `PLAN_C_DEVIATIONS.md`
+    ///    [DEVIATION Task TCO-3 follow-up] establishes that no
+    ///    tail-recursive Cps-ABI fn shape exists in Sigil today —
+    ///    Cps-colored fns with recursive bodies route through
+    ///    `UserFnAbi::Sync` because the recursive arm fails the
+    ///    `pure_tail` predicate, so the Sync direct-call branch
+    ///    here covers them too).
+    /// 3. The callee's signature exactly matches the current fn's
+    ///    signature. Cranelift's `return_call` IR rejects sig
+    ///    mismatches at verifier time; we pre-check to keep the
+    ///    fallback path clean (typecheck guarantees return-type
+    ///    match for tail expressions, but param count/types may
+    ///    differ across user fns of different arity, e.g. an
+    ///    `f(x) -> Int` calling `g(a, b) -> Int`).
+    ///
+    /// Other shapes — Cps-ABI callees, indirect calls (closure
+    /// dispatch through `ClosureRecord` / `ClosureEnvLoad`), ctor
+    /// applications, signature mismatches — fall back to
+    /// `lower_call` and wrap the result in `TailResult::Value`. The
+    /// fallback path means tail-call detection is a best-effort
+    /// optimization; missed tail calls are slow (one frame per
+    /// recursion level) but correct.
+    ///
+    /// Indirect-call TCO (`return_call_indirect` for closure
+    /// dispatch) is a deferred follow-up. The diagnostic tests
+    /// added by TCO-1 are all direct calls; the four shape-coverage
+    /// tests added by TCO-4 are also direct. A future follow-up can
+    /// extend this helper to detect indirect-tail-call shapes if
+    /// real programs surface a depth-bounded indirect-recursion
+    /// pattern.
+    fn lower_call_in_tail_pos(
+        &mut self,
+        callee: &crate::ast::Expr,
+        args: &[crate::ast::Expr],
+        call_span: &crate::errors::Span,
+    ) -> TailResult {
+        use crate::ast::Expr;
+
+        if let Expr::Ident(name, _) = callee {
+            if self.user_fn_refs.contains_key(name) && !self.env.contains_key(name) {
+                let abi_is_sync = self
+                    .user_fns
+                    .get(name)
+                    .map(|e| matches!(e.abi, UserFnAbi::Sync))
+                    .unwrap_or(false);
+                if abi_is_sync {
+                    let func_ref = self.user_fn_refs[name];
+                    let callee_sig_ref = self.builder.func.dfg.ext_funcs[func_ref].signature;
+                    // Clone to release the dfg borrow before reading
+                    // self.builder.func.signature.
+                    let callee_sig = self.builder.func.dfg.signatures[callee_sig_ref].clone();
+                    let signatures_match = callee_sig == self.builder.func.signature;
+                    if signatures_match {
+                        // Mirror lower_call's Sync direct branch arg
+                        // packing: lower each arg via lower_expr (NonTail —
+                        // args are not in tail position by definition),
+                        // honoring the per-callee Continuation-arg flags
+                        // for Plan D Task 117(b) parameter-position
+                        // Continuation values.
+                        let cont_flags: Option<Vec<bool>> =
+                            self.cont_param_callees.get(name).cloned();
+                        let arg_vals: Vec<Value> = args
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| {
+                                let is_cont_pos = cont_flags
+                                    .as_ref()
+                                    .is_some_and(|f| f.get(i).copied().unwrap_or(false));
+                                if is_cont_pos {
+                                    self.lower_continuation_arg(a)
+                                } else {
+                                    self.lower_expr(a)
+                                }
+                            })
+                            .collect();
+                        let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+                        let terminal_out = self.terminal_out_param;
+                        let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
+                        all_args.push(null_closure);
+                        all_args.extend(arg_vals);
+                        all_args.push(terminal_out);
+                        // Emit Cranelift's tail-call IR. `return_call`
+                        // is a terminator: no inst-results, no
+                        // subsequent emission allowed in this block.
+                        self.builder.ins().return_call(func_ref, &all_args);
+                        return TailResult::Terminated;
+                    }
+                }
+            }
+        }
+
+        // Fall back to a normal (non-tail) call. lower_call handles
+        // every callee shape — Sync/Cps/indirect/ctor — and returns
+        // the call's value, which the caller wraps as
+        // TailResult::Value.
+        TailResult::Value(self.lower_call(callee, args, call_span))
+    }
+
+    /// TCO-4 — lower a `Match` in tail position. Mirrors the
+    /// `lower_match` structure for arm processing; the differences
+    /// are (a) each arm body lowers through `lower_expr_in_tail_pos`
+    /// (which may emit `return_call`), and (b) the post-loop
+    /// switch-to-cont / return-Value path is gated on whether any
+    /// arm jumped to `cont`. If every arm emitted `return_call`
+    /// (`Terminated`), `cont` has zero predecessors and is sealed as
+    /// dead; the match itself returns `TailResult::Terminated`.
+    fn lower_match_in_tail_pos(
+        &mut self,
+        scrutinee: &crate::ast::Expr,
+        arms: &[crate::ast::MatchArm],
+        match_span: &Span,
+    ) -> TailResult {
+        // Scrutinee is NOT in tail position — its value is consumed
+        // by the pattern test machinery, never returned.
+        let s = self.lower_expr(scrutinee);
+        let scrut_ty = self.lookup_match_scrut_ty(match_span);
+
+        let mut preview: BTreeMap<String, Type> = BTreeMap::new();
+        self.predict_pattern_bindings(&arms[0].pattern, scrut_ty.as_ref(), &mut preview);
+        let result_ty = self.type_of_expr(&arms[0].body, &preview);
+        let cont = self.builder.create_block();
+        self.builder.append_block_param(cont, result_ty);
+
+        let mut chain_terminated = false;
+        let mut cont_has_preds = false;
+
+        for arm in arms.iter() {
+            if self.is_catchall_pattern(&arm.pattern, scrut_ty.as_ref()) {
+                let saved = match &arm.pattern {
+                    crate::ast::Pattern::Var(name, _) => {
+                        let prev = self.env.insert(name.clone(), s);
+                        Some((name.clone(), prev))
+                    }
+                    _ => None,
+                };
+                let result = self.lower_expr_in_tail_pos(&arm.body);
+                if let Some((name, prev)) = saved {
+                    match prev {
+                        Some(p) => {
+                            self.env.insert(name, p);
+                        }
+                        None => {
+                            self.env.remove(&name);
+                        }
+                    }
+                }
+                match result {
+                    TailResult::Value(v) => {
+                        self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
+                        cont_has_preds = true;
+                    }
+                    TailResult::NoValue => {
+                        let zero = self.builder.ins().iconst(result_ty, 0);
+                        self.builder.ins().jump(cont, &[BlockArg::Value(zero)]);
+                        cont_has_preds = true;
+                    }
+                    TailResult::Terminated => {
+                        // body block is terminated by return_call;
+                        // no jump to cont from this arm.
+                    }
+                }
+                chain_terminated = true;
+                break;
+            }
+
+            let body = self.builder.create_block();
+            let next = self.builder.create_block();
+            let mut bindings: Vec<(String, Value)> = Vec::new();
+            self.emit_pattern_test(&arm.pattern, s, scrut_ty.as_ref(), next, &mut bindings);
+            self.builder.ins().jump(body, &[]);
+
+            self.builder.switch_to_block(body);
+            self.builder.seal_block(body);
+            let saved: Vec<(String, Option<Value>)> = bindings
+                .into_iter()
+                .map(|(name, val)| {
+                    let prev = self.env.insert(name.clone(), val);
+                    (name, prev)
+                })
+                .collect();
+            let result = self.lower_expr_in_tail_pos(&arm.body);
+            for (name, prev) in saved {
+                match prev {
+                    Some(p) => {
+                        self.env.insert(name, p);
+                    }
+                    None => {
+                        self.env.remove(&name);
+                    }
+                }
+            }
+            match result {
+                TailResult::Value(v) => {
+                    self.builder.ins().jump(cont, &[BlockArg::Value(v)]);
+                    cont_has_preds = true;
+                }
+                TailResult::NoValue => {
+                    let zero = self.builder.ins().iconst(result_ty, 0);
+                    self.builder.ins().jump(cont, &[BlockArg::Value(zero)]);
+                    cont_has_preds = true;
+                }
+                TailResult::Terminated => {
+                    // body block terminated by return_call.
+                }
+            }
+
+            self.builder.switch_to_block(next);
+            self.builder.seal_block(next);
+        }
+
+        if !chain_terminated {
+            self.builder
+                .ins()
+                .trap(TrapCode::unwrap_user(TRAP_NONEXHAUSTIVE_MATCH));
+        }
+
+        if cont_has_preds {
+            self.builder.switch_to_block(cont);
+            self.builder.seal_block(cont);
+            TailResult::Value(self.builder.block_params(cont)[0])
+        } else {
+            // cont has zero predecessors. Seal it as dead; do NOT
+            // switch_to_block(cont) — that would place the builder
+            // in unreachable position and any subsequent emissions
+            // would land in the dead block.
+            self.builder.seal_block(cont);
+            TailResult::Terminated
+        }
     }
 
     /// Plan B Task 55 (Phase 4d) — lower the prefix statements of a
