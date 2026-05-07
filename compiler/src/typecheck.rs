@@ -1213,6 +1213,9 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // conversion / stringify primitives.
     register_builtin_int64_schemes(&mut tc);
     register_builtin_float_schemes(&mut tc);
+    // Plan C addendum (Char) — Char eq / ord / conversion / classifier
+    // / case primitives + codepoint-aware string ops.
+    register_builtin_char_schemes(&mut tc);
     // Plan C Task 67 — StringBuilder rope primitives, gated by
     // the Mem marker effect.
     register_builtin_string_builder_schemes(&mut tc);
@@ -2218,6 +2221,90 @@ fn register_builtin_float_schemes(tc: &mut Tc) {
     tc.fn_schemes.insert(
         "string_to_float_parse".to_string(),
         make_scheme(vec![Ty::String], float_ty()),
+    );
+}
+
+/// Plan C addendum — `Char` builtin schemes.
+///
+/// Registers the 19 user-facing primitives:
+///
+/// - 5 equality/ordering: `char_eq`, `char_lt`, `char_le`, `char_gt`,
+///   `char_ge` — `(Char, Char) -> Bool`
+/// - 3 conversion: `char_to_int` `(Char) -> Int`, `int_to_char`
+///   `(Int) -> Option[Char]`, `char_to_string` `(Char) -> String`
+/// - 5 ASCII classifiers: `is_ascii`, `is_ascii_digit`,
+///   `is_ascii_alpha`, `is_ascii_alphanumeric`,
+///   `is_ascii_whitespace` — `(Char) -> Bool`
+/// - 2 ASCII case: `to_lower_ascii`, `to_upper_ascii` —
+///   `(Char) -> Char`
+/// - 4 string codepoint ops: `string_chars`
+///   `(String) -> List[Char]`, `string_char_at`
+///   `(String, Int) -> Option[Char]`, `string_from_chars`
+///   `(List[Char]) -> String`
+///
+/// `int_to_char` and `string_char_at` lower at codegen time to a
+/// validate-then-construct pattern (mirroring `string_to_int_-
+/// validate` / `string_to_int_parse`); the validators
+/// (`int_to_char_validate`, `string_char_at_validate`) and the
+/// post-validation primitives are codegen-internal — not registered
+/// here as user-callable schemes.
+fn register_builtin_char_schemes(tc: &mut Tc) {
+    let make_scheme = |params: Vec<Ty>, ret: Ty| Scheme {
+        type_vars: Vec::new(),
+        row_vars: Vec::new(),
+        scope_vars: Vec::new(),
+        body: Ty::Fn(Box::new(FnSig {
+            params,
+            ret,
+            effects: Vec::new(),
+            effect_row_var: None,
+        })),
+    };
+    let option_char_ty = || Ty::User("Option".to_string(), vec![Ty::Char]);
+    let list_char_ty = || Ty::User("List".to_string(), vec![Ty::Char]);
+    for cmp in ["char_eq", "char_lt", "char_le", "char_gt", "char_ge"] {
+        tc.fn_schemes.insert(
+            cmp.to_string(),
+            make_scheme(vec![Ty::Char, Ty::Char], Ty::Bool),
+        );
+    }
+    tc.fn_schemes.insert(
+        "char_to_int".to_string(),
+        make_scheme(vec![Ty::Char], Ty::Int),
+    );
+    tc.fn_schemes.insert(
+        "int_to_char".to_string(),
+        make_scheme(vec![Ty::Int], option_char_ty()),
+    );
+    tc.fn_schemes.insert(
+        "char_to_string".to_string(),
+        make_scheme(vec![Ty::Char], Ty::String),
+    );
+    for cls in [
+        "is_ascii",
+        "is_ascii_digit",
+        "is_ascii_alpha",
+        "is_ascii_alphanumeric",
+        "is_ascii_whitespace",
+    ] {
+        tc.fn_schemes
+            .insert(cls.to_string(), make_scheme(vec![Ty::Char], Ty::Bool));
+    }
+    for case in ["to_lower_ascii", "to_upper_ascii"] {
+        tc.fn_schemes
+            .insert(case.to_string(), make_scheme(vec![Ty::Char], Ty::Char));
+    }
+    tc.fn_schemes.insert(
+        "string_chars".to_string(),
+        make_scheme(vec![Ty::String], list_char_ty()),
+    );
+    tc.fn_schemes.insert(
+        "string_char_at".to_string(),
+        make_scheme(vec![Ty::String, Ty::Int], option_char_ty()),
+    );
+    tc.fn_schemes.insert(
+        "string_from_chars".to_string(),
+        make_scheme(vec![list_char_ty()], Ty::String),
     );
 }
 
@@ -14994,5 +15081,159 @@ mod tests {
             has_code(&errs, "E0042"),
             "closed-row lambda should reject unlisted Baz even inside open-row fn; got {errs:?}"
         );
+    }
+
+    // ===== Plan C addendum (Char) — typecheck schemes ===============
+
+    #[test]
+    fn char_eq_typechecks() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let b: Bool = char_eq('a', 'b');\n  \
+                     match b { true => 0, false => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn char_to_int_typechecks() {
+        let src = "fn main() -> Int ![] { char_to_int('A') }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn int_to_char_returns_option_char() {
+        let src = "import std.option\n\
+                   fn main() -> Int ![] {\n  \
+                     match int_to_char(65) {\n    \
+                       Some(_c) => 0,\n    \
+                       None => 1,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn int_to_char_string_arg_is_e0044() {
+        let src = "import std.option\n\
+                   fn main() -> Int ![] {\n  \
+                     match int_to_char(\"65\") {\n    \
+                       Some(_c) => 0,\n    \
+                       None => 1,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 (Int vs String); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn is_ascii_digit_typechecks() {
+        let src = "fn main() -> Int ![] {\n  \
+                     match is_ascii_digit('5') { true => 0, false => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn string_chars_returns_list_char() {
+        let src = "import std.list\n\
+                   fn main() -> Int ![] {\n  \
+                     match string_chars(\"hello\") {\n    \
+                       Nil => 0,\n    \
+                       Cons(_h, _t) => 1,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn string_chars_int_arg_is_e0044() {
+        let src = "import std.list\n\
+                   fn main() -> Int ![] {\n  \
+                     match string_chars(42) {\n    \
+                       Nil => 0,\n    \
+                       Cons(_h, _t) => 1,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0044"),
+            "expected E0044 (Int vs String); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn string_from_chars_takes_list_char() {
+        let src = "import std.list\n\
+                   fn main() -> Int ![] {\n  \
+                     let s: String = string_from_chars(Cons('a', Cons('b', Nil)));\n  \
+                     string_length(s)\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn char_literal_infers_char() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let _c: Char = 'A';\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn char_literal_int_annotation_is_e0045() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let _c: Int = 'A';\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0045"),
+            "expected E0045 (Char vs Int annotation); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn char_to_string_typechecks() {
+        let src = "import std.io\n\
+                   fn main() -> Int ![IO] {\n  \
+                     perform IO.println(char_to_string('A'));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn to_lower_ascii_typechecks() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let _c: Char = to_lower_ascii('A');\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn string_char_at_returns_option_char() {
+        let src = "import std.option\n\
+                   fn main() -> Int ![] {\n  \
+                     match string_char_at(\"hi\", 0) {\n    \
+                       Some(_c) => 0,\n    \
+                       None => 1,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
     }
 }
