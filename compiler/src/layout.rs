@@ -547,9 +547,11 @@ mod tests {
             effects: vec![],
             effect_row_var: None,
         }))));
+        // Plan C addendum: boxed `Char` (TAG_CHAR) is heap-allocated,
+        // so it joins the gc-pointer set alongside String / User / Fn.
+        assert!(is_gc_pointer_ty(&Ty::Char));
         assert!(!is_gc_pointer_ty(&Ty::Int));
         assert!(!is_gc_pointer_ty(&Ty::Bool));
-        assert!(!is_gc_pointer_ty(&Ty::Char));
         assert!(!is_gc_pointer_ty(&Ty::Byte));
         assert!(!is_gc_pointer_ty(&Ty::Unit));
     }

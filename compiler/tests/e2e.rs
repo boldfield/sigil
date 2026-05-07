@@ -12762,10 +12762,13 @@ fn string_chars_ascii() {
 
 #[test]
 fn string_chars_multibyte() {
+    // Bare UTF-8 in the source string literal — Sigil's string lexer
+    // doesn't accept `\u{HEX}` (only char literals do); the bytes `é`
+    // (0xC3 0xA9) appear directly in the source.
     let src = "import std.io\n\
                import std.list\n\
                fn main() -> Int ![IO] {\n  \
-                 let xs: List[Char] = string_chars(\"h\\u{00E9}llo\");\n  \
+                 let xs: List[Char] = string_chars(\"héllo\");\n  \
                  perform IO.println(int_to_string(length(xs)));\n  \
                  0\n\
                }\n";
@@ -12778,14 +12781,15 @@ fn string_chars_multibyte() {
 fn string_char_at_codepoint_index() {
     // codepoint-indexed: 'h' 'é' 'l' 'l' 'o' (héllo).
     // The é is at codepoint index 1 even though it occupies bytes 1..3.
+    // Bare UTF-8 in source (string literals don't accept `\u{HEX}`).
     let src = "import std.io\n\
                import std.option\n\
                fn main() -> Int ![IO] {\n  \
-                 match string_char_at(\"h\\u{00E9}llo\", 1) {\n    \
+                 match string_char_at(\"héllo\", 1) {\n    \
                    Some(c) => perform IO.println(char_to_string(c)),\n    \
                    None => perform IO.println(\"oob\"),\n  \
                  };\n  \
-                 match string_char_at(\"h\\u{00E9}llo\", 5) {\n    \
+                 match string_char_at(\"héllo\", 5) {\n    \
                    Some(_c) => perform IO.println(\"some\"),\n    \
                    None => perform IO.println(\"oob\"),\n  \
                  };\n  \
@@ -12798,9 +12802,11 @@ fn string_char_at_codepoint_index() {
 
 #[test]
 fn string_from_chars_round_trip() {
+    // Bare UTF-8 in the source string literal (no `\u{HEX}` in
+    // strings; only Char literals support that escape).
     let src = "import std.io\n\
                fn main() -> Int ![IO] {\n  \
-                 let s: String = \"h\\u{00E9}llo \\u{1F600}\";\n  \
+                 let s: String = \"héllo 😀\";\n  \
                  perform IO.println(string_from_chars(string_chars(s)));\n  \
                  0\n\
                }\n";
