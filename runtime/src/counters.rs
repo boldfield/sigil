@@ -80,14 +80,24 @@ pub enum CounterId {
     ContinuationAllocBytes = 23,
     FloatAllocCount = 24,
     FloatAllocBytes = 25,
+    /// Plan C addendum (Char) — count of `sigil_char_box` /
+    /// `sigil_int_to_char_box` / classifier-allocating invocations.
+    /// Each call allocates one fresh boxed `Char` record.
+    CharAllocCount = 26,
+    /// Plan C addendum (Char) — total bytes allocated for boxed
+    /// `Char` records (header + 4-byte codepoint + 4-byte padding;
+    /// 16 bytes per record, matching the `Float` / `Int64` cost).
+    CharAllocBytes = 27,
 }
 
-const COUNTER_SLOTS: usize = 26;
+const COUNTER_SLOTS: usize = 28;
 
 /// Static backing storage for all counters. Mutable only via atomic relaxed
 /// operations; never touched by reference. This is the only global atomic
 /// state the runtime owns.
 static COUNTERS: [AtomicU64; COUNTER_SLOTS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -145,6 +155,8 @@ pub const NAMES: [&str; COUNTER_SLOTS] = [
     "SIGIL_COUNTER_CONTINUATION_ALLOC_BYTES",
     "SIGIL_COUNTER_FLOAT_ALLOC_COUNT",
     "SIGIL_COUNTER_FLOAT_ALLOC_BYTES",
+    "SIGIL_COUNTER_CHAR_ALLOC_COUNT",
+    "SIGIL_COUNTER_CHAR_ALLOC_BYTES",
 ];
 
 #[inline]

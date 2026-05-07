@@ -226,9 +226,10 @@ fn compute_pointer_bitmap(fields: &[Ty]) -> u32 {
 }
 
 /// Whether a `Ty` is represented at runtime as a GC-managed heap
-/// pointer (String, Fn/closure record, or another user type).
+/// pointer (String, Fn/closure record, another user type, or boxed
+/// `Char` — TAG_CHAR; see Plan C addendum).
 pub fn is_gc_pointer_ty(ty: &Ty) -> bool {
-    matches!(ty, Ty::String | Ty::Fn(_) | Ty::User(_, _))
+    matches!(ty, Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Char)
 }
 
 /// Build an O(1) constructor-name → (type_name, variant_index) index
@@ -546,9 +547,11 @@ mod tests {
             effects: vec![],
             effect_row_var: None,
         }))));
+        // Plan C addendum: boxed `Char` (TAG_CHAR) is heap-allocated,
+        // so it joins the gc-pointer set alongside String / User / Fn.
+        assert!(is_gc_pointer_ty(&Ty::Char));
         assert!(!is_gc_pointer_ty(&Ty::Int));
         assert!(!is_gc_pointer_ty(&Ty::Bool));
-        assert!(!is_gc_pointer_ty(&Ty::Char));
         assert!(!is_gc_pointer_ty(&Ty::Byte));
         assert!(!is_gc_pointer_ty(&Ty::Unit));
     }

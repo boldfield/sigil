@@ -2832,24 +2832,17 @@ fn arm_reads_multi_args_in_declared_order() {
 
 #[test]
 fn arm_reads_char_arg_branches_on_codepoint() {
-    // Phase 4c — arg-content verification (2b/4): Char arg goes
-    // through `uextend(I64, _)` (perform side, I32 → I64) → u64
-    // slot → `ireduce(I32, _)` (arm side) → branch via `==`.
-    //
-    // Bool (test 2a above) exercises the I8 width of the widen/
-    // ireduce path; this test exercises the I32 (Char) width of
-    // the same path. They are distinct Cranelift instructions
-    // operating on distinct value widths, so the Bool test
-    // alone leaves the I32 leg verifier-checked but not value-
-    // checked. A wrong-direction extend (`sextend` vs `uextend`)
-    // or a width-swap regression on the Char path would land
-    // green under Bool-only coverage.
-    //
-    // Closes part of PR #24 review MF1 (Char arg-readback).
+    // Phase 4c — arg-content verification (2b/4): pre-Plan-C-addendum
+    // this test exercised the I32 (Char) width of the perform-side
+    // widen → arm-side ireduce path. Post-addendum Char is boxed
+    // (`pointer_ty`), so the arm-side path is now a pointer-store —
+    // same width as String args (test 3 below). The arm-body branch
+    // dispatches through `char_eq` (Plan C addendum surface) which
+    // derefs both Chars and compares codepoints via `sigil_char_eq`.
     let src = "effect E { op: (Char) -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform E.op('Z')) with {\n    \
-                   E.op(c, k) => if c == 'Z' { 1 } else { 0 },\n  \
+                   E.op(c, k) => if char_eq(c, 'Z') { 1 } else { 0 },\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
@@ -2897,20 +2890,20 @@ fn perform_side_narrow_to_bool_value_checked() {
 #[test]
 fn perform_side_narrow_to_char_value_checked() {
     // Phase 4c — perform-side narrow value-check (closes PR #24
-    // review MF2 second leg). Mirror of `perform_side_narrow_to_bool_value_checked`
-    // for the I32 (Char) width. Op is declared `(Int) -> Char`;
-    // arm body returns the Char `'Y'`; perform-side narrow uses
-    // `ireduce(I32, widened)` to restore the Char Cranelift
-    // type so the subsequent `c == 'Y'` equality check operates
-    // on matching widths. Bool covers the I8 width, this covers
-    // the I32 width — symmetric to MF1's Bool-vs-Char split on
-    // the perform→arm widen leg.
+    // review MF2 second leg). Char became boxed in the Plan C
+    // addendum (`TAG_CHAR`); pointer comparison via `==` would no
+    // longer match codepoint equality, so the post-handle test
+    // dispatches through `char_eq` (which compares the boxed
+    // payloads' codepoints via `sigil_char_eq`). The handle's
+    // arm-body return path still exercises the boxed-Char widen /
+    // narrow symmetry through `args_ptr` since the op's declared
+    // return is `Char`.
     let src = "effect E { op: (Int) -> Char }\n\
                fn main() -> Int ![IO] {\n  \
                  let c: Char = handle (perform E.op(1)) with {\n    \
                    E.op(n, k) => 'Y',\n  \
                  };\n  \
-                 let n: Int = if c == 'Y' { 11 } else { 22 };\n  \
+                 let n: Int = if char_eq(c, 'Y') { 11 } else { 22 };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
@@ -3647,25 +3640,19 @@ fn cps_abi_captures_bearing_with_bool_capture_exercises_widen_narrow_symmetry() 
 #[test]
 fn cps_abi_captures_bearing_with_char_capture_exercises_widen_narrow_symmetry() {
     // PR #26 mid-flight at 73c7e53 (no-context) review item #4:
-    // parallel coverage to the Bool capture test for the other
-    // sub-I64 width-discrepant kind. Char captures store as I32 in
-    // the closure record's slot:
-    //   - On the WRITE side (helper's body emit alloc): widen
-    //     I32 → I64 via uextend.
-    //   - On the READ side (synth-cont's capture-load): narrow
-    //     I64 → I32 via ireduce.
-    // A regression in either side would surface as wrong upper
-    // bits leaking into the Char comparison at runtime.
-    //
-    // helper takes `marker: Char` user param, captures it; tail
-    // `if marker == 'A' then x else 0`. use-k arm `=> k(99)` →
-    // synth-cont loads marker from closure record (offset 16,
-    // narrows I64→I32), binds x=99, lowers the conditional with
-    // marker='A' → 99 / marker='B' → 0.
+    // originally parallel coverage to the Bool capture test for the
+    // I32 (Char) sub-I64 width-discrepant kind. Plan C addendum
+    // boxed `Char`, so a Char capture is now a `pointer_ty` slot
+    // (no widen / narrow symmetry to exercise on the closure-record
+    // boundary for this width). The test still pins the captured-
+    // value flow through synth-cont closure records — every Char
+    // capture is a pointer to a `TAG_CHAR` record — and the
+    // post-resume comparison runs through `char_eq` (which derefs
+    // both Chars and compares codepoints via `sigil_char_eq`).
     let src = "effect Raise { fail: () -> Int }\n\
                fn helper(marker: Char) -> Int ![Raise, IO] {\n  \
                  let x: Int = perform Raise.fail();\n  \
-                 if marker == 'A' { x } else { 0 }\n\
+                 if char_eq(marker, 'A') { x } else { 0 }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  let a: Int = handle helper('A') with { Raise.fail(k) => k(99) };\n  \
@@ -3678,9 +3665,9 @@ fn cps_abi_captures_bearing_with_char_capture_exercises_widen_narrow_symmetry() 
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "99\n0\n",
-        "Char capture's widen/narrow symmetry: helper('A') k(99) → \
-         marker=='A' so x=99 returned; helper('B') k(99) → marker=='B' \
-         is false so 0 returned. stderr={stderr:?}"
+        "boxed-Char capture flows through synth-cont's closure record: \
+         helper('A') k(99) → char_eq(marker,'A') so x=99 returned; \
+         helper('B') k(99) → char_eq false so 0 returned. stderr={stderr:?}"
     );
 }
 
@@ -10316,22 +10303,17 @@ fn task_78_5_g4_approach6_nested_handles_each_return_arm_fires_for_its_own_body(
 /// `IO.println(result)` then dereferences a corrupt pointer and either
 /// segfaults or prints garbage.
 ///
-/// **Setup**: body is `body_returning_char()` — a Cps fn returning
-/// `Char` (I32) that performs `E.op` and tails on a Char literal. The
-/// handle declares `result: String` and `return(_c) => "ok"` — so R =
-/// String (pointer_ty = I64). The arm `E.op(k) => k(0)` keeps the body
-/// running so its tail Char `'a'` becomes the helper's argument, then
-/// the helper invokes return_arm which yields the String "ok".
+/// **Setup** (post-Plan-C-addendum): body is `body_returning_char()` —
+/// a Cps fn returning `Char` (now `pointer_ty`, boxed) that performs
+/// `E.op` and tails on a Char literal. The handle declares `result:
+/// String` and `return(_c) => "ok"`. Pre-Plan-C-addendum, this exercised
+/// B != R width discrepancy (B = Char = I32; R = String = pointer_ty);
+/// post-addendum both B and R are `pointer_ty`, so the value-flow
+/// discrepancy collapses but the wrapper / return-arm composition still
+/// runs end-to-end and the test pins the smoke shape.
 ///
-/// The wrapper now returns `(body_val, raw_u64, fired_v)`: `body_val`
-/// stays narrowed to B for Phase 4g's non-suppression paths, but the
-/// suppression branch consumes `raw_u64` directly (full 64 bits) and
-/// narrows once to handler_overall_ty.
-///
-/// **Invariant**: stdout = `"ok\n"`, exit 0. Pre-fix output is
-/// non-deterministic (segfault, garbage bytes, or panic) depending on
-/// the host's pointer layout — any non-`"ok\n"` outcome surfaces the
-/// regression.
+/// **Invariant**: stdout = `"ok\n"`, exit 0. Any non-`"ok\n"` outcome
+/// surfaces a wrapper-composition regression.
 #[test]
 fn task_78_5_g4_approach6_b_neq_r_pointer_return_arm_through_char_body() {
     let src = "import std.io\n\
@@ -10358,12 +10340,8 @@ fn task_78_5_g4_approach6_b_neq_r_pointer_return_arm_through_char_body() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "ok\n",
-        "B != R: body returns Char (I32, narrower), handler returns \
-         String (pointer_ty = I64, wider). Pre-fix wrapper narrowed \
-         raw_u64 to Char and the suppression branch's re-widen via \
-         uextend lost the upper 32 bits of the \"ok\" String pointer. \
-         Wrong stdout (or segfault) surfaces the regression. \
-         stderr={stderr:?}"
+        "wrapper composition end-to-end with body→Char and handler→String \
+         (both pointer_ty post-Plan-C-addendum). stderr={stderr:?}"
     );
 }
 
@@ -12644,4 +12622,290 @@ fn float_doc_only_import() {
     let (stdout, _stderr, code) = compile_and_run(src, "float_import");
     assert_eq!(code, 0, "stderr: {_stderr}");
     assert_eq!(stdout, "3.0\n");
+}
+
+// ===== Plan C addendum (Char) — boxed Char e2e ===================
+//
+// `Char` is a heap-allocated TAG_CHAR record (16 bytes) that holds a
+// Unicode codepoint. The 19 user-facing primitives + Char literals
+// + pattern matching are exercised here end-to-end through compile-
+// and-run.
+
+#[test]
+fn char_literal_round_trips_via_to_string() {
+    let src = "import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(char_to_string('A'));\n  \
+                 perform IO.println(char_to_string('\\u{1F600}'));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_literal_round_trip");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "A\n😀\n");
+}
+
+#[test]
+fn char_codepoint_round_trip() {
+    let src = "import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = char_to_int('Z');\n  \
+                 let r: Int = match int_to_char(n) {\n    \
+                   Some(c) => char_to_int(c),\n    \
+                   None => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_codepoint_round_trip");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "90\n", "Z is codepoint 90; round-trip preserves it");
+}
+
+#[test]
+fn int_to_char_rejects_out_of_range() {
+    let src = "import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_to_char(1114112) {\n    \
+                   Some(_c) => perform IO.println(\"some\"),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "int_to_char_oor");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "none\n", "0x110000 > 0x10FFFF, must be None");
+}
+
+#[test]
+fn int_to_char_rejects_surrogate() {
+    let src = "import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_to_char(55296) {\n    \
+                   Some(_c) => perform IO.println(\"some\"),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "int_to_char_surrogate");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "none\n", "0xD800 is a surrogate, must be None");
+}
+
+#[test]
+fn int_to_char_accepts_valid() {
+    let src = "import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_to_char(65) {\n    \
+                   Some(c) => perform IO.println(char_to_string(c)),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "int_to_char_valid");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "A\n");
+}
+
+#[test]
+fn is_ascii_classifiers_basic() {
+    let src = "import std.io\n\
+               fn say(b: Bool) -> Int ![IO] {\n  \
+                 match b {\n    \
+                   true => perform IO.println(\"y\"),\n    \
+                   false => perform IO.println(\"n\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 say(is_ascii_digit('5'));\n  \
+                 say(is_ascii_alpha('a'));\n  \
+                 say(is_ascii_whitespace(' '));\n  \
+                 say(is_ascii('\\u{00E9}'));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_classifiers_basic");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "y\ny\ny\nn\n");
+}
+
+#[test]
+fn to_lower_upper_ascii_passthrough() {
+    let src = "import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(char_to_string(to_upper_ascii('a')));\n  \
+                 perform IO.println(char_to_string(to_upper_ascii('\\u{00E9}')));\n  \
+                 perform IO.println(char_to_string(to_lower_ascii('Z')));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_case_passthrough");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "A\né\nz\n");
+}
+
+#[test]
+fn string_chars_ascii() {
+    let src = "import std.io\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Char] = string_chars(\"hi\");\n  \
+                 perform IO.println(int_to_string(length(xs)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "string_chars_ascii");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "2\n");
+}
+
+#[test]
+fn string_chars_multibyte() {
+    // Bare UTF-8 in the source string literal — Sigil's string lexer
+    // doesn't accept `\u{HEX}` (only char literals do); the bytes `é`
+    // (0xC3 0xA9) appear directly in the source.
+    let src = "import std.io\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Char] = string_chars(\"héllo\");\n  \
+                 perform IO.println(int_to_string(length(xs)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "string_chars_multibyte");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "5\n", "héllo is 5 codepoints (h é l l o)");
+}
+
+#[test]
+fn string_char_at_codepoint_index() {
+    // codepoint-indexed: 'h' 'é' 'l' 'l' 'o' (héllo).
+    // The é is at codepoint index 1 even though it occupies bytes 1..3.
+    // Bare UTF-8 in source (string literals don't accept `\u{HEX}`).
+    let src = "import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match string_char_at(\"héllo\", 1) {\n    \
+                   Some(c) => perform IO.println(char_to_string(c)),\n    \
+                   None => perform IO.println(\"oob\"),\n  \
+                 };\n  \
+                 match string_char_at(\"héllo\", 5) {\n    \
+                   Some(_c) => perform IO.println(\"some\"),\n    \
+                   None => perform IO.println(\"oob\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "string_char_at_codepoint_index");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "é\noob\n");
+}
+
+#[test]
+fn string_from_chars_round_trip() {
+    // Bare UTF-8 in the source string literal (no `\u{HEX}` in
+    // strings; only Char literals support that escape). The
+    // explicit `xs: List[Char]` annotation forces monomorphization
+    // of `List[Char]` so codegen's `string_from_chars` lowering
+    // can resolve `Cons$$Char` / `Nil$$Char` in the ctor index.
+    let src = "import std.io\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = \"héllo 😀\";\n  \
+                 let xs: List[Char] = string_chars(s);\n  \
+                 perform IO.println(string_from_chars(xs));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "string_from_chars_round_trip");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "héllo 😀\n");
+}
+
+#[test]
+fn char_pattern_match_against_literal() {
+    // Match patterns on Char literals should compare codepoints (load
+    // payload at offset 8, icmp), not boxed-pointer identity.
+    let src = "import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 let c: Char = 'B';\n  \
+                 match c {\n    \
+                   'A' => perform IO.println(\"a\"),\n    \
+                   'B' => perform IO.println(\"b\"),\n    \
+                   _ => perform IO.println(\"other\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_pattern_literal");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "b\n");
+}
+
+#[test]
+fn char_eq_distinguishes_different_codepoints() {
+    let src = "import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 match char_eq('a', 'a') {\n    \
+                   true => perform IO.println(\"y\"),\n    \
+                   false => perform IO.println(\"n\"),\n  \
+                 };\n  \
+                 match char_eq('a', 'b') {\n    \
+                   true => perform IO.println(\"y\"),\n    \
+                   false => perform IO.println(\"n\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_eq_distinct");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "y\nn\n");
+}
+
+#[test]
+fn string_chars_invalid_utf8_replaces() {
+    // Plan C addendum review item 10 — e2e coverage for the
+    // user-visible lossy-decode path. Construct a ByteArray with
+    // a known-invalid leading byte (0xFF), bypass validation via
+    // `string_from_bytes_alloc` (which copies bytes verbatim per
+    // the validate-then-construct contract), then `string_chars`
+    // it. The decoder must emit U+FFFD (0xFFFD = 65533) for the
+    // invalid byte. Pre-PR runtime unit tests covered the decoder
+    // itself; this test pins the runtime → user-program path.
+    let src = "import std.io\n\
+               import std.list\n\
+               import std.byte_array\n\
+               fn main() -> Int ![IO] {\n  \
+                 let h: ByteArray = byte_array_alloc(1, byte_truncate(104));\n  \
+                 let bad: ByteArray = byte_array_alloc(1, byte_truncate(255));\n  \
+                 let bs: ByteArray = byte_array_concat(h, bad);\n  \
+                 let s: String = string_from_bytes_alloc(bs);\n  \
+                 let xs: List[Char] = string_chars(s);\n  \
+                 match xs {\n    \
+                   Nil => perform IO.println(\"empty\"),\n    \
+                   Cons(_h, t) => match t {\n      \
+                     Nil => perform IO.println(\"only-one\"),\n      \
+                     Cons(c2, _) => perform IO.println(int_to_string(char_to_int(c2))),\n    \
+                   },\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "string_chars_invalid_utf8");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(
+        stdout, "65533\n",
+        "decode of invalid byte 0xFF must emit U+FFFD (65533)"
+    );
+}
+
+#[test]
+fn char_doc_only_import() {
+    // `import std.char` is a documentation skip-list path; it
+    // compiles but pulls no Sigil items into the program. The
+    // builtin `Char` ops are registered at the typechecker level.
+    let src = "import std.char\n\
+               import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(char_to_string('A'));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_doc_import");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "A\n");
 }

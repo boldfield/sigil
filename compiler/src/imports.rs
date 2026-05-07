@@ -69,6 +69,7 @@ const BUILTIN_INJECTED: &[&str] = &[
     "int64.sigil",
     "string_builder.sigil",
     "float.sigil",
+    "char.sigil",
 ];
 
 /// Resolve every `Item::Import` in `program` against the embedded stdlib.

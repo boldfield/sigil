@@ -311,14 +311,14 @@ Compiler internals would consume the `extern fn` declarations directly — no `r
 **Why accepted.** The 12 byte-indexed ops give the rest of Stage 7's stdlib (Task 67's `string_builder`, Task 70's `IO.read_file`/`IO.write_file`, demos in Stage 8) a usable working set. The 8 deferred ops have specific, narrow blockers — none are blocked on Task 68 internals. Shipping the 12 unblocks P02's `string_concat` run-portion + P05/etc. that need substring/comparison; deferring 8 keeps Task 68 part 1 mechanical and reviewable.
 
 **Closure path.**
-- Codepoint ops: ship alongside `Char` user-surface widening (v2).
-- List ops: ship after stdlib namespace qualification.
-- Float ops: ship after `Float` primitive lands (v2).
+- ~~Codepoint ops: ship alongside `Char` user-surface widening (v2).~~ **CLOSED** by the Plan C addendum (`Char` primitive + codepoint string ops, branch `plan-c-char-codepoint`). `string_chars` / `string_char_at` / `string_from_chars` now ship as builtin schemes; classes 1 and 5 are closed.
+- List ops: ship after stdlib namespace qualification. Codepoint-aware `string_split` / `string_replace` (which take a separator/pattern Char and return / consume `List[String]`) remain deferred — they depend on the namespace fix, not on Char any more. Closure path: a future `string-codepoint-helpers` plan once namespace qualification lands.
+- Float ops: ship after `Float` primitive lands (v2). **CLOSED** by the Float type follow-up (PR #101) — `string_to_float_validate` / `string_to_float_parse` / `float_to_string` ship.
 - Sum-typed wrappers: same as List ops (namespace).
 
 **Failure mode.** Users wanting deferred ops write equivalents in their own program against the byte-indexed primitives. Verbose but expressible for ASCII-pinned use cases.
 
-**Implementing commit(s).** `d6401b2`.
+**Implementing commit(s).** `d6401b2` (part 1); Plan C addendum branch `plan-c-char-codepoint` closes deferred classes 1 and 5; Float type follow-up (PR #101) closes class 3.
 
 ## 2026-04-30 — [DEVIATION Task 70] IO op-id reordering + alphabetical ABI
 

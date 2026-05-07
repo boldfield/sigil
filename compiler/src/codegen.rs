@@ -504,7 +504,9 @@ fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
         "Int" => types::I64,
         "String" => pointer_ty,
         "Bool" | "Byte" | "Unit" => types::I8,
-        "Char" => types::I32,
+        // Plan C addendum (Char) — boxed Char (TAG_CHAR) represented
+        // as a heap pointer, mirroring Float / Int64 / String.
+        "Char" => pointer_ty,
         _ => pointer_ty,
     }
 }
@@ -532,7 +534,9 @@ fn cranelift_ty_of_ty(ty: &crate::typecheck::Ty, pointer_ty: Type) -> Type {
     match ty {
         Ty::Int => types::I64,
         Ty::Bool | Ty::Byte | Ty::Unit => types::I8,
-        Ty::Char => types::I32,
+        // Plan C addendum (Char) — boxed Char (TAG_CHAR) represented
+        // as a heap pointer, mirroring Float / Int64 / String.
+        Ty::Char => pointer_ty,
         Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => pointer_ty,
         // Plan D Task 117 — `Ty::Continuation`'s runtime
         // representation is a 2-slot value `(closure_ptr, fn_addr)`.
@@ -1090,6 +1094,25 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("float_to_string".to_string());
     globals.insert("string_to_float_validate".to_string());
     globals.insert("string_to_float_parse".to_string());
+    // Plan C addendum — boxed Char user-facing builtins.
+    globals.insert("char_eq".to_string());
+    globals.insert("char_lt".to_string());
+    globals.insert("char_le".to_string());
+    globals.insert("char_gt".to_string());
+    globals.insert("char_ge".to_string());
+    globals.insert("char_to_int".to_string());
+    globals.insert("int_to_char".to_string());
+    globals.insert("char_to_string".to_string());
+    globals.insert("is_ascii".to_string());
+    globals.insert("is_ascii_digit".to_string());
+    globals.insert("is_ascii_alpha".to_string());
+    globals.insert("is_ascii_alphanumeric".to_string());
+    globals.insert("is_ascii_whitespace".to_string());
+    globals.insert("to_lower_ascii".to_string());
+    globals.insert("to_upper_ascii".to_string());
+    globals.insert("string_chars".to_string());
+    globals.insert("string_char_at".to_string());
+    globals.insert("string_from_chars".to_string());
     // Plan C Task 67 — StringBuilder builtins (Mem-gated).
     globals.insert("sb_new".to_string());
     globals.insert("sb_append".to_string());
@@ -7839,6 +7862,227 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_string_to_float_parse: {e}"))?;
 
+    // Plan C addendum — runtime Char primitives. Boxed Unicode
+    // codepoint; arithmetic / classifier / case / conversion ops
+    // mirror the Float ABI shape.
+
+    // sigil_char_box(codepoint: i64) -> *mut u8
+    let mut char_box_sig = Signature::new(isa_call_conv(&module));
+    char_box_sig.params.push(AbiParam::new(types::I64));
+    char_box_sig.returns.push(AbiParam::new(pointer_ty));
+    let char_box = module
+        .declare_function("sigil_char_box", Linkage::Import, &char_box_sig)
+        .map_err(|e| format!("declare sigil_char_box: {e}"))?;
+
+    // (Char, Char) -> u8 (Bool) — eq / lt / le / gt / ge.
+    let make_char_cmp = |sig_holder: &mut Signature, ptr_ty: types::Type| {
+        sig_holder.params.clear();
+        sig_holder.returns.clear();
+        sig_holder.params.push(AbiParam::new(ptr_ty));
+        sig_holder.params.push(AbiParam::new(ptr_ty));
+        sig_holder.returns.push(AbiParam::new(types::I8));
+    };
+    let mut char_eq_sig = Signature::new(isa_call_conv(&module));
+    make_char_cmp(&mut char_eq_sig, pointer_ty);
+    let char_eq = module
+        .declare_function("sigil_char_eq", Linkage::Import, &char_eq_sig)
+        .map_err(|e| format!("declare sigil_char_eq: {e}"))?;
+    let mut char_lt_sig = Signature::new(isa_call_conv(&module));
+    make_char_cmp(&mut char_lt_sig, pointer_ty);
+    let char_lt = module
+        .declare_function("sigil_char_lt", Linkage::Import, &char_lt_sig)
+        .map_err(|e| format!("declare sigil_char_lt: {e}"))?;
+    let mut char_le_sig = Signature::new(isa_call_conv(&module));
+    make_char_cmp(&mut char_le_sig, pointer_ty);
+    let char_le = module
+        .declare_function("sigil_char_le", Linkage::Import, &char_le_sig)
+        .map_err(|e| format!("declare sigil_char_le: {e}"))?;
+    let mut char_gt_sig = Signature::new(isa_call_conv(&module));
+    make_char_cmp(&mut char_gt_sig, pointer_ty);
+    let char_gt = module
+        .declare_function("sigil_char_gt", Linkage::Import, &char_gt_sig)
+        .map_err(|e| format!("declare sigil_char_gt: {e}"))?;
+    let mut char_ge_sig = Signature::new(isa_call_conv(&module));
+    make_char_cmp(&mut char_ge_sig, pointer_ty);
+    let char_ge = module
+        .declare_function("sigil_char_ge", Linkage::Import, &char_ge_sig)
+        .map_err(|e| format!("declare sigil_char_ge: {e}"))?;
+
+    // sigil_char_to_int(*const u8) -> i64
+    let mut char_to_int_sig = Signature::new(isa_call_conv(&module));
+    char_to_int_sig.params.push(AbiParam::new(pointer_ty));
+    char_to_int_sig.returns.push(AbiParam::new(types::I64));
+    let char_to_int = module
+        .declare_function("sigil_char_to_int", Linkage::Import, &char_to_int_sig)
+        .map_err(|e| format!("declare sigil_char_to_int: {e}"))?;
+
+    // sigil_int_to_char_validate(n: i64) -> i64 (0=ok, 1=fail)
+    let mut int_to_char_validate_sig = Signature::new(isa_call_conv(&module));
+    int_to_char_validate_sig
+        .params
+        .push(AbiParam::new(types::I64));
+    int_to_char_validate_sig
+        .returns
+        .push(AbiParam::new(types::I64));
+    let int_to_char_validate = module
+        .declare_function(
+            "sigil_int_to_char_validate",
+            Linkage::Import,
+            &int_to_char_validate_sig,
+        )
+        .map_err(|e| format!("declare sigil_int_to_char_validate: {e}"))?;
+
+    // sigil_int_to_char_box(n: i64) -> *mut u8 (post-validation)
+    let mut int_to_char_box_sig = Signature::new(isa_call_conv(&module));
+    int_to_char_box_sig.params.push(AbiParam::new(types::I64));
+    int_to_char_box_sig.returns.push(AbiParam::new(pointer_ty));
+    let int_to_char_box = module
+        .declare_function(
+            "sigil_int_to_char_box",
+            Linkage::Import,
+            &int_to_char_box_sig,
+        )
+        .map_err(|e| format!("declare sigil_int_to_char_box: {e}"))?;
+
+    // sigil_char_to_string(*const u8) -> *mut u8
+    let mut char_to_string_sig = Signature::new(isa_call_conv(&module));
+    char_to_string_sig.params.push(AbiParam::new(pointer_ty));
+    char_to_string_sig.returns.push(AbiParam::new(pointer_ty));
+    let char_to_string = module
+        .declare_function("sigil_char_to_string", Linkage::Import, &char_to_string_sig)
+        .map_err(|e| format!("declare sigil_char_to_string: {e}"))?;
+
+    // ASCII classifiers: (Char) -> u8 (Bool).
+    let make_char_unary_bool = |sig_holder: &mut Signature, ptr_ty: types::Type| {
+        sig_holder.params.clear();
+        sig_holder.returns.clear();
+        sig_holder.params.push(AbiParam::new(ptr_ty));
+        sig_holder.returns.push(AbiParam::new(types::I8));
+    };
+    let mut char_is_ascii_sig = Signature::new(isa_call_conv(&module));
+    make_char_unary_bool(&mut char_is_ascii_sig, pointer_ty);
+    let char_is_ascii = module
+        .declare_function("sigil_char_is_ascii", Linkage::Import, &char_is_ascii_sig)
+        .map_err(|e| format!("declare sigil_char_is_ascii: {e}"))?;
+    let mut char_is_ascii_digit_sig = Signature::new(isa_call_conv(&module));
+    make_char_unary_bool(&mut char_is_ascii_digit_sig, pointer_ty);
+    let char_is_ascii_digit = module
+        .declare_function(
+            "sigil_char_is_ascii_digit",
+            Linkage::Import,
+            &char_is_ascii_digit_sig,
+        )
+        .map_err(|e| format!("declare sigil_char_is_ascii_digit: {e}"))?;
+    let mut char_is_ascii_alpha_sig = Signature::new(isa_call_conv(&module));
+    make_char_unary_bool(&mut char_is_ascii_alpha_sig, pointer_ty);
+    let char_is_ascii_alpha = module
+        .declare_function(
+            "sigil_char_is_ascii_alpha",
+            Linkage::Import,
+            &char_is_ascii_alpha_sig,
+        )
+        .map_err(|e| format!("declare sigil_char_is_ascii_alpha: {e}"))?;
+    let mut char_is_ascii_alphanumeric_sig = Signature::new(isa_call_conv(&module));
+    make_char_unary_bool(&mut char_is_ascii_alphanumeric_sig, pointer_ty);
+    let char_is_ascii_alphanumeric = module
+        .declare_function(
+            "sigil_char_is_ascii_alphanumeric",
+            Linkage::Import,
+            &char_is_ascii_alphanumeric_sig,
+        )
+        .map_err(|e| format!("declare sigil_char_is_ascii_alphanumeric: {e}"))?;
+    let mut char_is_ascii_whitespace_sig = Signature::new(isa_call_conv(&module));
+    make_char_unary_bool(&mut char_is_ascii_whitespace_sig, pointer_ty);
+    let char_is_ascii_whitespace = module
+        .declare_function(
+            "sigil_char_is_ascii_whitespace",
+            Linkage::Import,
+            &char_is_ascii_whitespace_sig,
+        )
+        .map_err(|e| format!("declare sigil_char_is_ascii_whitespace: {e}"))?;
+
+    // ASCII case folding: (Char) -> Char (allocates).
+    let make_char_unary_char = |sig_holder: &mut Signature, ptr_ty: types::Type| {
+        sig_holder.params.clear();
+        sig_holder.returns.clear();
+        sig_holder.params.push(AbiParam::new(ptr_ty));
+        sig_holder.returns.push(AbiParam::new(ptr_ty));
+    };
+    let mut char_to_lower_ascii_sig = Signature::new(isa_call_conv(&module));
+    make_char_unary_char(&mut char_to_lower_ascii_sig, pointer_ty);
+    let char_to_lower_ascii = module
+        .declare_function(
+            "sigil_char_to_lower_ascii",
+            Linkage::Import,
+            &char_to_lower_ascii_sig,
+        )
+        .map_err(|e| format!("declare sigil_char_to_lower_ascii: {e}"))?;
+    let mut char_to_upper_ascii_sig = Signature::new(isa_call_conv(&module));
+    make_char_unary_char(&mut char_to_upper_ascii_sig, pointer_ty);
+    let char_to_upper_ascii = module
+        .declare_function(
+            "sigil_char_to_upper_ascii",
+            Linkage::Import,
+            &char_to_upper_ascii_sig,
+        )
+        .map_err(|e| format!("declare sigil_char_to_upper_ascii: {e}"))?;
+
+    // sigil_string_chars(s, cons_h, cons_d, nil_h, nil_d) -> *mut u8
+    let mut string_chars_sig = Signature::new(isa_call_conv(&module));
+    string_chars_sig.params.push(AbiParam::new(pointer_ty));
+    string_chars_sig.params.push(AbiParam::new(types::I64)); // cons_header
+    string_chars_sig.params.push(AbiParam::new(types::I64)); // cons_disc
+    string_chars_sig.params.push(AbiParam::new(types::I64)); // nil_header
+    string_chars_sig.params.push(AbiParam::new(types::I64)); // nil_disc
+    string_chars_sig.returns.push(AbiParam::new(pointer_ty));
+    let string_chars = module
+        .declare_function("sigil_string_chars", Linkage::Import, &string_chars_sig)
+        .map_err(|e| format!("declare sigil_string_chars: {e}"))?;
+
+    // sigil_string_char_at_validate(s, idx) -> i64
+    let mut string_char_at_validate_sig = Signature::new(isa_call_conv(&module));
+    string_char_at_validate_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
+    string_char_at_validate_sig
+        .params
+        .push(AbiParam::new(types::I64));
+    string_char_at_validate_sig
+        .returns
+        .push(AbiParam::new(types::I64));
+    let string_char_at_validate = module
+        .declare_function(
+            "sigil_string_char_at_validate",
+            Linkage::Import,
+            &string_char_at_validate_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_char_at_validate: {e}"))?;
+
+    // sigil_string_char_at(s, idx) -> *mut u8 (Char)
+    let mut string_char_at_sig = Signature::new(isa_call_conv(&module));
+    string_char_at_sig.params.push(AbiParam::new(pointer_ty));
+    string_char_at_sig.params.push(AbiParam::new(types::I64));
+    string_char_at_sig.returns.push(AbiParam::new(pointer_ty));
+    let string_char_at = module
+        .declare_function("sigil_string_char_at", Linkage::Import, &string_char_at_sig)
+        .map_err(|e| format!("declare sigil_string_char_at: {e}"))?;
+
+    // sigil_string_from_chars(list, cons_disc, nil_disc) -> *mut u8
+    let mut string_from_chars_sig = Signature::new(isa_call_conv(&module));
+    string_from_chars_sig.params.push(AbiParam::new(pointer_ty));
+    string_from_chars_sig.params.push(AbiParam::new(types::I64));
+    string_from_chars_sig.params.push(AbiParam::new(types::I64));
+    string_from_chars_sig
+        .returns
+        .push(AbiParam::new(pointer_ty));
+    let string_from_chars = module
+        .declare_function(
+            "sigil_string_from_chars",
+            Linkage::Import,
+            &string_from_chars_sig,
+        )
+        .map_err(|e| format!("declare sigil_string_from_chars: {e}"))?;
+
     // Plan C Task 67 — runtime StringBuilder primitives. Mem-gated
     // segmented rope; allocates segments on overflow.
 
@@ -9264,6 +9508,27 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             float_to_string,
             string_to_float_validate,
             string_to_float_parse,
+            char_box,
+            char_eq,
+            char_lt,
+            char_le,
+            char_gt,
+            char_ge,
+            char_to_int,
+            int_to_char_validate,
+            int_to_char_box,
+            char_to_string,
+            char_is_ascii,
+            char_is_ascii_digit,
+            char_is_ascii_alpha,
+            char_is_ascii_alphanumeric,
+            char_is_ascii_whitespace,
+            char_to_lower_ascii,
+            char_to_upper_ascii,
+            string_chars,
+            string_char_at_validate,
+            string_char_at,
+            string_from_chars,
             sb_new,
             sb_append,
             sb_finalize,
@@ -10525,13 +10790,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             };
                             let slot_val = match capture.kind {
                                 EnvSlotKind::Int => raw,
-                                EnvSlotKind::Bool
-                                | EnvSlotKind::Byte
-                                | EnvSlotKind::Unit
-                                | EnvSlotKind::Char => builder.ins().uextend(types::I64, raw),
-                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
-                                    raw
+                                EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
+                                    builder.ins().uextend(types::I64, raw)
                                 }
+                                EnvSlotKind::Char
+                                | EnvSlotKind::String
+                                | EnvSlotKind::Closure
+                                | EnvSlotKind::User => raw,
                             };
                             let offset: i32 = 16 + 8 * i as i32;
                             builder
@@ -10616,13 +10881,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             };
                             let slot_val = match capture.kind {
                                 EnvSlotKind::Int => raw,
-                                EnvSlotKind::Bool
-                                | EnvSlotKind::Byte
-                                | EnvSlotKind::Unit
-                                | EnvSlotKind::Char => builder.ins().uextend(types::I64, raw),
-                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
-                                    raw
+                                EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
+                                    builder.ins().uextend(types::I64, raw)
                                 }
+                                EnvSlotKind::Char
+                                | EnvSlotKind::String
+                                | EnvSlotKind::Closure
+                                | EnvSlotKind::User => raw,
                             };
                             let offset: i32 = 16 + 8 * i as i32;
                             builder
@@ -11871,11 +12136,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             crate::ast::EnvSlotKind::Int => val,
                             crate::ast::EnvSlotKind::Bool
                             | crate::ast::EnvSlotKind::Byte
-                            | crate::ast::EnvSlotKind::Unit
-                            | crate::ast::EnvSlotKind::Char => {
+                            | crate::ast::EnvSlotKind::Unit => {
                                 lowerer.builder.ins().uextend(types::I64, val)
                             }
-                            crate::ast::EnvSlotKind::String
+                            crate::ast::EnvSlotKind::Char
+                            | crate::ast::EnvSlotKind::String
                             | crate::ast::EnvSlotKind::Closure
                             | crate::ast::EnvSlotKind::User => val,
                         };
@@ -12115,15 +12380,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 crate::ast::EnvSlotKind::Int => raw,
                                 crate::ast::EnvSlotKind::Bool
                                 | crate::ast::EnvSlotKind::Byte
-                                | crate::ast::EnvSlotKind::Unit
-                                | crate::ast::EnvSlotKind::Char => {
+                                | crate::ast::EnvSlotKind::Unit => {
                                     if needs_widen {
                                         lowerer.builder.ins().uextend(types::I64, raw)
                                     } else {
                                         raw
                                     }
                                 }
-                                crate::ast::EnvSlotKind::String
+                                crate::ast::EnvSlotKind::Char
+                                | crate::ast::EnvSlotKind::String
                                 | crate::ast::EnvSlotKind::Closure
                                 | crate::ast::EnvSlotKind::User => raw,
                             };
@@ -12839,8 +13104,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         crate::ast::EnvSlotKind::Bool
                         | crate::ast::EnvSlotKind::Byte
                         | crate::ast::EnvSlotKind::Unit => builder.ins().ireduce(types::I8, raw),
-                        crate::ast::EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
-                        crate::ast::EnvSlotKind::String
+                        crate::ast::EnvSlotKind::Char
+                        | crate::ast::EnvSlotKind::String
                         | crate::ast::EnvSlotKind::Closure
                         | crate::ast::EnvSlotKind::User => {
                             if pointer_ty == types::I64 {
@@ -13216,8 +13481,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             | crate::ast::EnvSlotKind::Unit => {
                                 builder.ins().ireduce(types::I8, raw)
                             }
-                            crate::ast::EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
-                            crate::ast::EnvSlotKind::String
+                            crate::ast::EnvSlotKind::Char
+                            | crate::ast::EnvSlotKind::String
                             | crate::ast::EnvSlotKind::Closure
                             | crate::ast::EnvSlotKind::User => {
                                 if pointer_ty == types::I64 {
@@ -14014,8 +14279,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                                     builder.ins().ireduce(types::I8, raw)
                                 }
-                                EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
-                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
+                                EnvSlotKind::Char
+                                | EnvSlotKind::String
+                                | EnvSlotKind::Closure
+                                | EnvSlotKind::User => {
                                     if pointer_ty == types::I64 {
                                         raw
                                     } else {
@@ -14211,18 +14478,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             );
                                             raw_v
                                         }
-                                        EnvSlotKind::Char => {
-                                            debug_assert_eq!(
-                                                lowerer.builder.func.dfg.value_type(raw_v),
-                                                types::I32,
-                                                "Plan C Task 81 tail-prefix-let: lower_expr \
-                                                 contract — Char must produce I32 (got {:?}); \
-                                                 fix lower_expr or update this dispatch",
-                                                lowerer.builder.func.dfg.value_type(raw_v)
-                                            );
-                                            raw_v
-                                        }
-                                        EnvSlotKind::String
+                                        // Plan C addendum (Char) — boxed Char is pointer-typed,
+                                        // matching String / Closure / User.
+                                        EnvSlotKind::Char
+                                        | EnvSlotKind::String
                                         | EnvSlotKind::Closure
                                         | EnvSlotKind::User => {
                                             debug_assert_eq!(
@@ -16623,8 +16882,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                                     builder.ins().ireduce(types::I8, raw)
                                 }
-                                EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
-                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
+                                EnvSlotKind::Char
+                                | EnvSlotKind::String
+                                | EnvSlotKind::Closure
+                                | EnvSlotKind::User => {
                                     if pointer_ty == types::I64 {
                                         raw
                                     } else {
@@ -18938,7 +19199,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.inst_results(call)[0]
             }
             Expr::BoolLit(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
-            Expr::CharLit(c, _) => self.builder.ins().iconst(types::I32, *c as i64),
+            Expr::CharLit(c, _) => {
+                // Plan C addendum (Char) — boxed Char literal: codepoint
+                // immediate as i64, then sigil_char_box → pointer_ty.
+                let cp = self.builder.ins().iconst(types::I64, *c as i64);
+                let call = self.builder.ins().call(self.builtins.char_box_ref, &[cp]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
             Expr::UnitLit(_) => self.builder.ins().iconst(types::I8, 0),
             Expr::StringLit(_, span) => self.lower_string_literal(span),
             Expr::Ident(name, _) => {
@@ -22099,6 +22368,168 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .push_placeholder(function_code_offset(&self.builder, call));
                 self.builder.inst_results(call)[0]
             }
+            // Plan C addendum (Char) — dispatch to runtime char
+            // primitives. Comparators / classifiers return I8 (Bool);
+            // `char_to_int` returns I64 (Int); allocating ops
+            // (`to_lower_ascii`, `to_upper_ascii`, `char_to_string`)
+            // push a stackmap placeholder. `int_to_char` and
+            // `string_char_at` lower to a validate-then-construct
+            // pattern with a runtime branch building Some / None.
+            // `string_chars` and `string_from_chars` thread the
+            // codegen-computed `List[Char]` Cons / Nil header words
+            // and discriminants to the runtime.
+            Expr::Ident(name, _) if name == "char_eq" => {
+                assert_eq!(args.len(), 2, "char_eq builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.char_eq_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "char_lt" => {
+                assert_eq!(args.len(), 2, "char_lt builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.char_lt_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "char_le" => {
+                assert_eq!(args.len(), 2, "char_le builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.char_le_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "char_gt" => {
+                assert_eq!(args.len(), 2, "char_gt builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.char_gt_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "char_ge" => {
+                assert_eq!(args.len(), 2, "char_ge builtin arg count is not 2");
+                let a = self.lower_expr(&args[0]);
+                let b = self.lower_expr(&args[1]);
+                let call = self.builder.ins().call(self.builtins.char_ge_ref, &[a, b]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "char_to_int" => {
+                assert_eq!(args.len(), 1, "char_to_int builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self.builder.ins().call(self.builtins.char_to_int_ref, &[a]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "char_to_string" => {
+                assert_eq!(args.len(), 1, "char_to_string builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.char_to_string_ref, &[a]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "is_ascii" => {
+                assert_eq!(args.len(), 1, "is_ascii builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.char_is_ascii_ref, &[a]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "is_ascii_digit" => {
+                assert_eq!(args.len(), 1, "is_ascii_digit builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.char_is_ascii_digit_ref, &[a]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "is_ascii_alpha" => {
+                assert_eq!(args.len(), 1, "is_ascii_alpha builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.char_is_ascii_alpha_ref, &[a]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "is_ascii_alphanumeric" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "is_ascii_alphanumeric builtin arg count is not 1"
+                );
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.char_is_ascii_alphanumeric_ref, &[a]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "is_ascii_whitespace" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "is_ascii_whitespace builtin arg count is not 1"
+                );
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.char_is_ascii_whitespace_ref, &[a]);
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "to_lower_ascii" => {
+                assert_eq!(args.len(), 1, "to_lower_ascii builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.char_to_lower_ascii_ref, &[a]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "to_upper_ascii" => {
+                assert_eq!(args.len(), 1, "to_upper_ascii builtin arg count is not 1");
+                let a = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.char_to_upper_ascii_ref, &[a]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "int_to_char" => {
+                assert_eq!(args.len(), 1, "int_to_char builtin arg count is not 1");
+                let n = self.lower_expr(&args[0]);
+                self.lower_int_to_char(n)
+            }
+            Expr::Ident(name, _) if name == "string_chars" => {
+                assert_eq!(args.len(), 1, "string_chars builtin arg count is not 1");
+                let s = self.lower_expr(&args[0]);
+                self.lower_string_chars(s)
+            }
+            Expr::Ident(name, _) if name == "string_char_at" => {
+                assert_eq!(args.len(), 2, "string_char_at builtin arg count is not 2");
+                let s = self.lower_expr(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                self.lower_string_char_at(s, idx)
+            }
+            Expr::Ident(name, _) if name == "string_from_chars" => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "string_from_chars builtin arg count is not 1"
+                );
+                let list = self.lower_expr(&args[0]);
+                self.lower_string_from_chars(list)
+            }
             // Plan C Task 67 — runtime StringBuilder primitives.
             // Mem-gated; sb_new and sb_finalize allocate (push
             // stackmap placeholder), sb_append writes into existing
@@ -22653,8 +23084,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                     self.builder.ins().uextend(types::I64, *raw)
                 }
-                EnvSlotKind::Char => self.builder.ins().uextend(types::I64, *raw),
-                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => *raw,
+                EnvSlotKind::Char
+                | EnvSlotKind::String
+                | EnvSlotKind::Closure
+                | EnvSlotKind::User => *raw,
             };
             let offset: i32 = 16 + 8 * i as i32;
             self.builder
@@ -22811,8 +23244,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // unsigned in their bit-level storage).
                     self.builder.ins().uextend(types::I64, *raw)
                 }
-                EnvSlotKind::Char => self.builder.ins().uextend(types::I64, *raw),
-                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => *raw,
+                EnvSlotKind::Char
+                | EnvSlotKind::String
+                | EnvSlotKind::Closure
+                | EnvSlotKind::User => *raw,
             };
             let offset: i32 = 16 + 8 * i as i32;
             self.builder
@@ -22929,9 +23364,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .store(MemFlags::trusted(), disc_v, ptr, 8);
 
         // Fields in payload words 1..N. Each field stores an 8-byte
-        // word; sub-word primitives (Bool, Byte, Char, Unit) are
-        // zero-extended on store, pointer-typed fields flow through
-        // unchanged.
+        // word; sub-word primitives (Bool, Byte, Unit) are zero-
+        // extended on store, pointer-typed fields flow through
+        // unchanged. (Plan C addendum: `Char` is now pointer-typed —
+        // boxed TAG_CHAR — so it takes the pass-through branch.)
         for (i, &val) in field_values.iter().enumerate() {
             let val_ty = self.builder.func.dfg.value_type(val);
             let store_val = if val_ty == types::I64 || val_ty == self.pointer_ty {
@@ -22949,6 +23385,211 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         ptr
     }
 
+    /// Plan C addendum (Char) — `int_to_char(n)` validate-then-construct
+    /// lowering. Calls `sigil_int_to_char_validate(n)`; on success
+    /// (returns 0) allocates a `Char` via `sigil_int_to_char_box(n)`
+    /// and wraps it in `Some`; on failure builds `None`. Both branches
+    /// merge at a continuation block carrying the `Option[Char]`
+    /// pointer in a block param.
+    fn lower_int_to_char(&mut self, n: Value) -> Value {
+        let (option_name, some_idx, none_idx) = self.option_layout_for(crate::typecheck::Ty::Char);
+
+        let validate_call = self
+            .builder
+            .ins()
+            .call(self.builtins.int_to_char_validate_ref, &[n]);
+        let ok = self.builder.inst_results(validate_call)[0];
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let is_ok = self.builder.ins().icmp(IntCC::Equal, ok, zero);
+
+        let some_blk = self.builder.create_block();
+        let none_blk = self.builder.create_block();
+        let merge_blk = self.builder.create_block();
+        self.builder.append_block_param(merge_blk, self.pointer_ty);
+
+        self.builder.ins().brif(is_ok, some_blk, &[], none_blk, &[]);
+
+        // Some(sigil_int_to_char_box(n))
+        self.builder.switch_to_block(some_blk);
+        self.builder.seal_block(some_blk);
+        let box_call = self
+            .builder
+            .ins()
+            .call(self.builtins.int_to_char_box_ref, &[n]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, box_call));
+        let char_ptr = self.builder.inst_results(box_call)[0];
+        let some_v = self.lower_ctor_alloc(&option_name, some_idx, &[char_ptr]);
+        self.builder.ins().jump(merge_blk, &[some_v.into()]);
+
+        // None
+        self.builder.switch_to_block(none_blk);
+        self.builder.seal_block(none_blk);
+        let none_v = self.lower_ctor_alloc(&option_name, none_idx, &[]);
+        self.builder.ins().jump(merge_blk, &[none_v.into()]);
+
+        self.builder.switch_to_block(merge_blk);
+        self.builder.seal_block(merge_blk);
+        self.builder.block_params(merge_blk)[0]
+    }
+
+    /// Plan C addendum (Char) — `string_char_at(s, idx)` validate-
+    /// then-construct lowering. Mirrors `lower_int_to_char` but with
+    /// the (s, idx) pair flowing through both validate and fetch.
+    fn lower_string_char_at(&mut self, s: Value, idx: Value) -> Value {
+        let (option_name, some_idx, none_idx) = self.option_layout_for(crate::typecheck::Ty::Char);
+
+        let validate_call = self
+            .builder
+            .ins()
+            .call(self.builtins.string_char_at_validate_ref, &[s, idx]);
+        let ok = self.builder.inst_results(validate_call)[0];
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let is_ok = self.builder.ins().icmp(IntCC::Equal, ok, zero);
+
+        let some_blk = self.builder.create_block();
+        let none_blk = self.builder.create_block();
+        let merge_blk = self.builder.create_block();
+        self.builder.append_block_param(merge_blk, self.pointer_ty);
+
+        self.builder.ins().brif(is_ok, some_blk, &[], none_blk, &[]);
+
+        self.builder.switch_to_block(some_blk);
+        self.builder.seal_block(some_blk);
+        let fetch_call = self
+            .builder
+            .ins()
+            .call(self.builtins.string_char_at_ref, &[s, idx]);
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, fetch_call));
+        let char_ptr = self.builder.inst_results(fetch_call)[0];
+        let some_v = self.lower_ctor_alloc(&option_name, some_idx, &[char_ptr]);
+        self.builder.ins().jump(merge_blk, &[some_v.into()]);
+
+        self.builder.switch_to_block(none_blk);
+        self.builder.seal_block(none_blk);
+        let none_v = self.lower_ctor_alloc(&option_name, none_idx, &[]);
+        self.builder.ins().jump(merge_blk, &[none_v.into()]);
+
+        self.builder.switch_to_block(merge_blk);
+        self.builder.seal_block(merge_blk);
+        self.builder.block_params(merge_blk)[0]
+    }
+
+    /// Plan C addendum (Char) — `string_chars(s)` lowering. Threads
+    /// the codegen-computed `List[Char]` Cons / Nil header words and
+    /// discriminants to the runtime, which builds Cons-Nil cells
+    /// using the supplied headers via `sigil_alloc`.
+    fn lower_string_chars(&mut self, s: Value) -> Value {
+        let (cons_h, cons_d, nil_h, nil_d) = self.list_char_layout_immediates();
+        let cons_h_v = self.builder.ins().iconst(types::I64, cons_h as i64);
+        let cons_d_v = self.builder.ins().iconst(types::I64, cons_d);
+        let nil_h_v = self.builder.ins().iconst(types::I64, nil_h as i64);
+        let nil_d_v = self.builder.ins().iconst(types::I64, nil_d);
+        let call = self.builder.ins().call(
+            self.builtins.string_chars_ref,
+            &[s, cons_h_v, cons_d_v, nil_h_v, nil_d_v],
+        );
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, call));
+        self.builder.inst_results(call)[0]
+    }
+
+    /// Plan C addendum (Char) — `string_from_chars(list)` lowering.
+    /// Threads the codegen-computed `List[Char]` Cons / Nil
+    /// discriminants to the runtime, which walks the list using
+    /// these to dispatch on each cell's discriminant byte.
+    fn lower_string_from_chars(&mut self, list: Value) -> Value {
+        let (_cons_h, cons_d, _nil_h, nil_d) = self.list_char_layout_immediates();
+        let cons_d_v = self.builder.ins().iconst(types::I64, cons_d);
+        let nil_d_v = self.builder.ins().iconst(types::I64, nil_d);
+        let call = self.builder.ins().call(
+            self.builtins.string_from_chars_ref,
+            &[list, cons_d_v, nil_d_v],
+        );
+        self.stackmap
+            .push_placeholder(function_code_offset(&self.builder, call));
+        self.builder.inst_results(call)[0]
+    }
+
+    /// Plan C addendum (Char) helper — return `(option_type_name,
+    /// some_idx, none_idx)` for the monomorphized `Option[Ty]`
+    /// instantiation. Panics if mono didn't register the
+    /// instantiation; call sites must be reachable from a
+    /// `match`-on-`Some/None` use site or a typed `let _: Option[Ty]`
+    /// binding for the mono pre-pass to pick it up.
+    fn option_layout_for(&self, inner: crate::typecheck::Ty) -> (String, usize, usize) {
+        let args = std::slice::from_ref(&inner);
+        let mangled = crate::monomorphize::mangle_type("Option", args);
+        let some_mangled = crate::monomorphize::mangle_ctor("Some", args);
+        let none_mangled = crate::monomorphize::mangle_ctor("None", args);
+        let (_some_ty_name, some_idx) =
+            self.ctor_index
+                .get(&some_mangled)
+                .cloned()
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "codegen: ctor `{some_mangled}` not registered — Option[T] must be \
+                     monomorphized at any int_to_char / string_char_at call site",
+                    )
+                });
+        let (_none_ty_name, none_idx) =
+            self.ctor_index
+                .get(&none_mangled)
+                .cloned()
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "codegen: ctor `{none_mangled}` not registered — Option[T] must be \
+                     monomorphized at any int_to_char / string_char_at call site",
+                    )
+                });
+        (mangled, some_idx, none_idx)
+    }
+
+    /// Plan C addendum (Char) helper — return the Cons / Nil header
+    /// words and discriminants for the monomorphized `List[Char]`.
+    fn list_char_layout_immediates(&self) -> (u64, i64, u64, i64) {
+        let list_name = crate::monomorphize::mangle_type("List", &[crate::typecheck::Ty::Char]);
+        let cons_mangled = crate::monomorphize::mangle_ctor("Cons", &[crate::typecheck::Ty::Char]);
+        let nil_mangled = crate::monomorphize::mangle_ctor("Nil", &[crate::typecheck::Ty::Char]);
+        let (_cons_ty, cons_idx) =
+            self.ctor_index
+                .get(&cons_mangled)
+                .cloned()
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "codegen: ctor `{cons_mangled}` not registered — List[Char] must be \
+                     monomorphized at any string_chars / string_from_chars call site",
+                    )
+                });
+        let (_nil_ty, nil_idx) = self
+            .ctor_index
+            .get(&nil_mangled)
+            .cloned()
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "codegen: ctor `{nil_mangled}` not registered — List[Char] must be \
+                 monomorphized at any string_chars / string_from_chars call site",
+                )
+            });
+        let layout = self.type_layouts.get(&list_name).unwrap_or_else(|| {
+            unreachable!(
+                "codegen: type `{list_name}` not registered — List[Char] must be \
+                 monomorphized at any string_chars / string_from_chars call site",
+            )
+        });
+        let cons_variant = &layout.variants[cons_idx];
+        let nil_variant = &layout.variants[nil_idx];
+        let cons_header = crate::layout::variant_header_word(layout.type_tag, cons_variant);
+        let nil_header = crate::layout::variant_header_word(layout.type_tag, nil_variant);
+        (
+            cons_header,
+            cons_variant.discriminant as i64,
+            nil_header,
+            nil_variant.discriminant as i64,
+        )
+    }
+
     /// Load the `index`-th env slot from the current fn's closure_ptr.
     /// The load width matches the slot kind; i64 slot words are
     /// truncated on load for sub-word types.
@@ -22963,8 +23604,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                 self.builder.ins().ireduce(types::I8, raw)
             }
-            EnvSlotKind::Char => self.builder.ins().ireduce(types::I32, raw),
-            EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
+            // Plan C addendum (Char) — boxed Char is pointer-typed; the
+            // slot already holds a pointer_ty value, so no narrow.
+            EnvSlotKind::Char | EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
                 if self.pointer_ty == types::I64 {
                     raw
                 } else {
@@ -23210,7 +23852,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Pattern::Wildcard(_) => { /* no test, no binding */ }
             Pattern::IntLit(n, _) => self.emit_scalar_eq(scrut, types::I64, *n, next),
             Pattern::BoolLit(b, _) => self.emit_scalar_eq(scrut, types::I8, i64::from(*b), next),
-            Pattern::CharLit(c, _) => self.emit_scalar_eq(scrut, types::I32, *c as i64, next),
+            // Plan C addendum (Char) — pattern-match a boxed `Char`
+            // scrutinee against a literal codepoint. Loads the u32
+            // codepoint at offset 8, zero-extends to i64, and tests
+            // against the literal value via icmp eq.
+            Pattern::CharLit(c, _) => {
+                let cp = self
+                    .builder
+                    .ins()
+                    .load(types::I32, MemFlags::trusted(), scrut, 8);
+                let widened = self.builder.ins().uextend(types::I64, cp);
+                self.emit_scalar_eq(widened, types::I64, *c as i64, next);
+            }
             Pattern::Var(name, _) => {
                 // Nullary-ctor promotion: if the scrutinee is a user
                 // type whose registry lists `name` as a Unit variant,
@@ -23291,8 +23944,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         Ty::Bool | Ty::Byte | Ty::Unit => {
                             self.builder.ins().ireduce(types::I8, raw)
                         }
-                        Ty::Char => self.builder.ins().ireduce(types::I32, raw),
-                        Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+                        Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
                         // Plan D Task 117 — Continuation in a tuple
                         // element would require storing k in a heap-
                         // allocated tuple, which the E0145 escape
@@ -23353,8 +24005,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match field_ty {
             Ty::Int => raw,
             Ty::Bool | Ty::Byte | Ty::Unit => self.builder.ins().ireduce(types::I8, raw),
-            Ty::Char => self.builder.ins().ireduce(types::I32, raw),
-            Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+            Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
             // Plan D Task 117 — Continuation in a user-type field
             // would require storing k in a heap record, which the
             // E0145 escape barrier rejects at typecheck.
@@ -23550,7 +24201,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     types::I64
                 }
             }
-            Expr::CharLit(..) => types::I32,
+            // Plan C addendum (Char) — boxed Char literal lowering
+            // returns a heap pointer.
+            Expr::CharLit(..) => self.pointer_ty,
             Expr::UnitLit(..) => types::I8,
             Expr::StringLit(..) | Expr::RecordLit { .. } => self.pointer_ty,
             Expr::Ident(name, _) => {
@@ -23781,6 +24434,44 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
                 Expr::Ident(name, _) if name == "float_to_int" => types::I64,
                 Expr::Ident(name, _) if name == "string_to_float_validate" => types::I64,
+                // Plan C addendum (Char) — return-type predictions.
+                // Boolean classifiers + comparisons → I8 (Bool).
+                // `char_to_int` → I64 (Int). Char-returning ops
+                // (`to_lower_ascii`, `to_upper_ascii`, `int_to_char`,
+                // `string_char_at`, `string_chars`, `string_from_chars`,
+                // `char_to_string`) all return boxed pointers.
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "char_eq"
+                            | "char_lt"
+                            | "char_le"
+                            | "char_gt"
+                            | "char_ge"
+                            | "is_ascii"
+                            | "is_ascii_digit"
+                            | "is_ascii_alpha"
+                            | "is_ascii_alphanumeric"
+                            | "is_ascii_whitespace"
+                    ) =>
+                {
+                    types::I8
+                }
+                Expr::Ident(name, _) if name == "char_to_int" => types::I64,
+                Expr::Ident(name, _)
+                    if matches!(
+                        name.as_str(),
+                        "char_to_string"
+                            | "to_lower_ascii"
+                            | "to_upper_ascii"
+                            | "int_to_char"
+                            | "string_char_at"
+                            | "string_chars"
+                            | "string_from_chars"
+                    ) =>
+                {
+                    self.pointer_ty
+                }
                 // Plan C Task 67 — StringBuilder return-type predictions.
                 // `sb_new` / `sb_finalize` return pointer; `sb_append`
                 // returns Unit (I8 zero).
@@ -23877,8 +24568,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 crate::ast::EnvSlotKind::Bool
                 | crate::ast::EnvSlotKind::Byte
                 | crate::ast::EnvSlotKind::Unit => types::I8,
-                crate::ast::EnvSlotKind::Char => types::I32,
-                crate::ast::EnvSlotKind::String
+                crate::ast::EnvSlotKind::Char
+                | crate::ast::EnvSlotKind::String
                 | crate::ast::EnvSlotKind::Closure
                 | crate::ast::EnvSlotKind::User => self.pointer_ty,
             },
@@ -24373,6 +25064,28 @@ struct BuiltinFuncIds {
     float_to_string: cranelift_module::FuncId,
     string_to_float_validate: cranelift_module::FuncId,
     string_to_float_parse: cranelift_module::FuncId,
+    /// Plan C addendum (Char) — boxed Char primitive FuncIds.
+    char_box: cranelift_module::FuncId,
+    char_eq: cranelift_module::FuncId,
+    char_lt: cranelift_module::FuncId,
+    char_le: cranelift_module::FuncId,
+    char_gt: cranelift_module::FuncId,
+    char_ge: cranelift_module::FuncId,
+    char_to_int: cranelift_module::FuncId,
+    int_to_char_validate: cranelift_module::FuncId,
+    int_to_char_box: cranelift_module::FuncId,
+    char_to_string: cranelift_module::FuncId,
+    char_is_ascii: cranelift_module::FuncId,
+    char_is_ascii_digit: cranelift_module::FuncId,
+    char_is_ascii_alpha: cranelift_module::FuncId,
+    char_is_ascii_alphanumeric: cranelift_module::FuncId,
+    char_is_ascii_whitespace: cranelift_module::FuncId,
+    char_to_lower_ascii: cranelift_module::FuncId,
+    char_to_upper_ascii: cranelift_module::FuncId,
+    string_chars: cranelift_module::FuncId,
+    string_char_at_validate: cranelift_module::FuncId,
+    string_char_at: cranelift_module::FuncId,
+    string_from_chars: cranelift_module::FuncId,
     /// Plan C Task 67 — runtime StringBuilder primitive FuncIds.
     /// Mem-gated.
     sb_new: cranelift_module::FuncId,
@@ -24494,6 +25207,28 @@ struct BuiltinFuncRefs {
     float_to_string_ref: FuncRef,
     string_to_float_validate_ref: FuncRef,
     string_to_float_parse_ref: FuncRef,
+    /// Plan C addendum (Char) — boxed Char primitive FuncRefs.
+    char_box_ref: FuncRef,
+    char_eq_ref: FuncRef,
+    char_lt_ref: FuncRef,
+    char_le_ref: FuncRef,
+    char_gt_ref: FuncRef,
+    char_ge_ref: FuncRef,
+    char_to_int_ref: FuncRef,
+    int_to_char_validate_ref: FuncRef,
+    int_to_char_box_ref: FuncRef,
+    char_to_string_ref: FuncRef,
+    char_is_ascii_ref: FuncRef,
+    char_is_ascii_digit_ref: FuncRef,
+    char_is_ascii_alpha_ref: FuncRef,
+    char_is_ascii_alphanumeric_ref: FuncRef,
+    char_is_ascii_whitespace_ref: FuncRef,
+    char_to_lower_ascii_ref: FuncRef,
+    char_to_upper_ascii_ref: FuncRef,
+    string_chars_ref: FuncRef,
+    string_char_at_validate_ref: FuncRef,
+    string_char_at_ref: FuncRef,
+    string_from_chars_ref: FuncRef,
     /// Plan C Task 67 — StringBuilder primitive FuncRefs (Mem-gated).
     sb_new_ref: FuncRef,
     sb_append_ref: FuncRef,
@@ -24756,6 +25491,31 @@ fn prepare_builtin_func_refs(
             .declare_func_in_func(ids.string_to_float_validate, builder.func),
         string_to_float_parse_ref: module
             .declare_func_in_func(ids.string_to_float_parse, builder.func),
+        char_box_ref: module.declare_func_in_func(ids.char_box, builder.func),
+        char_eq_ref: module.declare_func_in_func(ids.char_eq, builder.func),
+        char_lt_ref: module.declare_func_in_func(ids.char_lt, builder.func),
+        char_le_ref: module.declare_func_in_func(ids.char_le, builder.func),
+        char_gt_ref: module.declare_func_in_func(ids.char_gt, builder.func),
+        char_ge_ref: module.declare_func_in_func(ids.char_ge, builder.func),
+        char_to_int_ref: module.declare_func_in_func(ids.char_to_int, builder.func),
+        int_to_char_validate_ref: module
+            .declare_func_in_func(ids.int_to_char_validate, builder.func),
+        int_to_char_box_ref: module.declare_func_in_func(ids.int_to_char_box, builder.func),
+        char_to_string_ref: module.declare_func_in_func(ids.char_to_string, builder.func),
+        char_is_ascii_ref: module.declare_func_in_func(ids.char_is_ascii, builder.func),
+        char_is_ascii_digit_ref: module.declare_func_in_func(ids.char_is_ascii_digit, builder.func),
+        char_is_ascii_alpha_ref: module.declare_func_in_func(ids.char_is_ascii_alpha, builder.func),
+        char_is_ascii_alphanumeric_ref: module
+            .declare_func_in_func(ids.char_is_ascii_alphanumeric, builder.func),
+        char_is_ascii_whitespace_ref: module
+            .declare_func_in_func(ids.char_is_ascii_whitespace, builder.func),
+        char_to_lower_ascii_ref: module.declare_func_in_func(ids.char_to_lower_ascii, builder.func),
+        char_to_upper_ascii_ref: module.declare_func_in_func(ids.char_to_upper_ascii, builder.func),
+        string_chars_ref: module.declare_func_in_func(ids.string_chars, builder.func),
+        string_char_at_validate_ref: module
+            .declare_func_in_func(ids.string_char_at_validate, builder.func),
+        string_char_at_ref: module.declare_func_in_func(ids.string_char_at, builder.func),
+        string_from_chars_ref: module.declare_func_in_func(ids.string_from_chars, builder.func),
         sb_new_ref: module.declare_func_in_func(ids.sb_new, builder.func),
         sb_append_ref: module.declare_func_in_func(ids.sb_append, builder.func),
         sb_finalize_ref: module.declare_func_in_func(ids.sb_finalize, builder.func),

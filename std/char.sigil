@@ -1,0 +1,137 @@
+// sigil: 0.1
+//
+// std/char.sigil — Plan C addendum.
+//
+// **Documentation only.** The `Char` primitive type and its
+// operations are registered at the typechecker as builtins via
+// `register_builtin_char_schemes()`. Edits to this file have no
+// effect on compilation. `import std.char` is allowed (skip-list
+// path) but is not required.
+//
+// `Char` is Sigil's first-class Unicode codepoint type. A `Char`
+// holds exactly one Unicode scalar value in the closed range
+// `0x000000..=0x10FFFF` excluding surrogates `0xD800..=0xDFFF`.
+// Char is a *boxed* heap value (TAG_CHAR=0x0C, 16 bytes per
+// allocation) — mirroring the `Float` and `Int64` boxed-primitive
+// pattern. There is no tagged-immediate Char in v1.
+//
+// ## Literal syntax
+//
+// ```
+// 'a'        // ASCII letter
+// '9'        // ASCII digit
+// ' '        // space
+// '\n'       // newline
+// '\t'       // tab
+// '\r'       // carriage return
+// '\\'       // backslash
+// '\''       // single quote
+// '\"'       // double quote (allowed for symmetry)
+// '\0'       // null
+// '\u{41}'   // U+0041 (A)
+// '\u{1F600}'// U+1F600 (😀) — full 21-bit codepoint range
+// ```
+//
+// `'\u{...}'` accepts 1–6 hex digits. Out-of-range or surrogate
+// values are rejected at parse time (compile error, not runtime
+// `None`). Multi-codepoint grapheme clusters (e.g. `'a\u{0301}'`)
+// are rejected — Char is exactly one codepoint, not a grapheme.
+//
+// ## Operations
+//
+// Equality / ordering (codepoint-numeric, Bool result):
+// - `char_eq(Char, Char) -> Bool ![]`
+// - `char_lt(Char, Char) -> Bool ![]`
+// - `char_le(Char, Char) -> Bool ![]`
+// - `char_gt(Char, Char) -> Bool ![]`
+// - `char_ge(Char, Char) -> Bool ![]`
+//
+// Sigil v1 does NOT overload `==` / `<` on Char — use the named
+// functions above. (Pattern matching against literal Chars in
+// `match c { 'a' => ... }` IS supported; codegen loads the
+// codepoint from the boxed Char and compares against the literal.)
+//
+// Conversion:
+// - `char_to_int(Char) -> Int ![]`  — return codepoint as Int.
+//   Always succeeds; codepoint ≤ 0x10FFFF fits in Int's 63 bits.
+// - `int_to_char(Int) -> Option[Char] ![]`  — `Some(c)` if
+//   `0 ≤ n ≤ 0x10FFFF` and not in surrogate range; otherwise
+//   `None`. Lowers to a `validate-then-construct` pattern matching
+//   `string_to_int` / `string_to_float`'s shape.
+// - `char_to_string(Char) -> String ![]`  — UTF-8 encode the
+//   single codepoint into a fresh String (1–4 bytes).
+//
+// ASCII classifiers (return `false` for any non-ASCII codepoint):
+// - `is_ascii(Char) -> Bool ![]`             — codepoint < 0x80
+// - `is_ascii_digit(Char) -> Bool ![]`       — `'0'..='9'`
+// - `is_ascii_alpha(Char) -> Bool ![]`       — `'a'..='z' | 'A'..='Z'`
+// - `is_ascii_alphanumeric(Char) -> Bool ![]`— alpha or digit
+// - `is_ascii_whitespace(Char) -> Bool ![]`  — ` ` | `\t` | `\n` | `\r` | `\x0C`
+//
+// ASCII case folding (non-ASCII passes through unchanged):
+// - `to_lower_ascii(Char) -> Char ![]`
+// - `to_upper_ascii(Char) -> Char ![]`
+//
+// ## ASCII-only scope
+//
+// The classifier surface is intentionally `*_ascii` so a v2
+// `is_unicode_*` / `to_lower_unicode` set can ship additively
+// without renaming. Unicode-aware classification needs the general-
+// category table (~30 KB) and case-folding tables — not in v1
+// scope. The closure path is a future `std/unicode.sigil` plan
+// that ships the tables as embedded data + dispatchers.
+//
+// ## String codepoint operations (cross-reference)
+//
+// `String` is byte-indexed in v1. The Plan C addendum ships three
+// codepoint-aware ops (registered in `std/string.sigil`'s surface
+// table; documented here too for the `Char` cross-reference):
+//
+// - `string_chars(String) -> List[Char] ![]`  — eager UTF-8
+//   decode. Invalid sequences emit `U+FFFD` (replacement char) and
+//   resync to the next valid byte. Lossy by design — no error
+//   effect on the call site.
+//
+//   **U+FFFD merging** — invalid bytes are replaced one-for-one
+//   (one `U+FFFD` per invalid byte), matching Rust's
+//   `String::from_utf8_lossy`. The WHATWG Encoding spec defines a
+//   "maximal subpart" rule that emits one `U+FFFD` per invalid
+//   subsequence (so `\xC2\x42` produces ONE `U+FFFD + 'B'` instead
+//   of `U+FFFD + 'B'`). Sigil v1 follows the simpler per-byte
+//   convention. If the maximal-subpart shape is ever required for
+//   round-trip parity with another decoder, a strict variant
+//   `string_chars_strict: (String) -> Result[List[Char], Utf8Error]`
+//   is queued as a v2 follow-up.
+// - `string_char_at(String, Int) -> Option[Char] ![]`  —
+//   **codepoint** index (not byte). Returns `None` if index out of
+//   bounds. O(n) decode walk.
+// - `string_from_chars(List[Char]) -> String ![]`  — UTF-8
+//   encode each codepoint, concatenate.
+//
+// Existing byte-indexed ops (`string_byte_at`, `string_substring`,
+// `string_index_of`, ...) stay. Codepoint and byte ops coexist;
+// users pick based on whether they need codepoint correctness or
+// byte-level performance. Codepoint-aware variants of `string_split`
+// and `string_replace` are deferred to a follow-up plan (see
+// `PLAN_C_DEVIATIONS.md` Task 68 entry).
+//
+// ## Worked example — count digits in a string
+//
+// ```sigil
+// import std.list
+// import std.char
+//
+// fn count_digits(s: String) -> Int ![] {
+//   __count_digits_helper(string_chars(s))
+// }
+//
+// fn __count_digits_helper(cs: List[Char]) -> Int ![] {
+//   match cs {
+//     Nil => 0,
+//     Cons(c, rest) => match is_ascii_digit(c) {
+//       true => 1 + __count_digits_helper(rest),
+//       false => __count_digits_helper(rest),
+//     },
+//   }
+// }
+// ```
