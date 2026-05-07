@@ -20850,6 +20850,39 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
             }
         }
+        // Determine whether the surrounding fn is Cps or Sync by
+        // inspecting the signature against `cps_signature`'s shape:
+        // exactly 4 params [pointer_ty, pointer_ty, I32, pointer_ty]
+        // and ret_ty pointer_ty. A Cps fn returns *mut NextStep, so
+        // emitting NextStep::Discharged + return_ is the right
+        // propagation. A Sync fn returns the source-level type, so
+        // emitting NextStep::Discharged would be misinterpreted by
+        // the caller as a regular value (e.g., List ptr) — for Sync
+        // we must return `final_widened` directly while leaving the
+        // DISCHARGED tag in terminal_out for the caller chain to
+        // observe. State.get's arm body lambda `fn(s) => k(s)(s)`
+        // is Sync (its body shape doesn't match any Cps-eligible
+        // pattern in `compute_user_fn_abi`); without this
+        // discrimination, my propagation would return a NextStep
+        // ptr through state_fn(initial)'s closure-call (Sync ABI)
+        // and main would interpret that ptr as the result list,
+        // matching Nil since the NextStep struct's discriminant
+        // doesn't match Cons.
+        let surrounding_is_cps;
+        let sync_ret_ty;
+        {
+            let sig_params = &self.builder.func.signature.params;
+            let sig_returns = &self.builder.func.signature.returns;
+            surrounding_is_cps = sig_params.len() == 4
+                && sig_params[0].value_type == self.pointer_ty
+                && sig_params[1].value_type == self.pointer_ty
+                && sig_params[2].value_type == types::I32
+                && sig_params[3].value_type == self.pointer_ty
+                && sig_returns.len() == 1
+                && sig_returns[0].value_type == self.pointer_ty;
+            sync_ret_ty = sig_returns[0].value_type;
+        }
+
         if !handle_effect_ids.is_empty() {
             let term_tag = self.builder.ins().load(
                 types::I64,
@@ -20899,27 +20932,49 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 &[],
             );
 
-            // Propagate: emit NextStep::Discharged(terminal_out.value)
-            // and return. The lambda fn's caller drives a run_loop
-            // which sees DISCHARGED and bypasses outer routing,
-            // delivering the value to the surrounding handle
-            // expression's Phase 4g.
+            // Propagate: skip the surrounding expression's continuation
+            // (e.g., the outer apply in `k(s)(s)`) and return early.
+            // For Cps fns, return NextStep::Discharged(value) so the
+            // caller's run_loop sees DISCHARGED at terminal time.
+            // For Sync fns, return `final_widened` narrowed to the
+            // fn's declared return type — the DISCHARGED tag in
+            // terminal_out (preserved from the run_loop bypass that
+            // wrote it) flows up via the caller-owned channel.
             self.builder.switch_to_block(propagate_blk);
             self.builder.seal_block(propagate_blk);
-            let v_propagate = self.builder.ins().load(
-                types::I64,
-                MemFlags::trusted(),
-                self.terminal_out_param,
-                TERMINAL_RESULT_VALUE_OFF,
-            );
-            let disch_call = self
-                .builder
-                .ins()
-                .call(self.next_step_discharged_ref, &[v_propagate]);
-            self.stackmap
-                .push_placeholder(function_code_offset(&self.builder, disch_call));
-            let disch_ns = self.builder.inst_results(disch_call)[0];
-            self.builder.ins().return_(&[disch_ns]);
+            if surrounding_is_cps {
+                let v_propagate = self.builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    self.terminal_out_param,
+                    TERMINAL_RESULT_VALUE_OFF,
+                );
+                let disch_call = self
+                    .builder
+                    .ins()
+                    .call(self.next_step_discharged_ref, &[v_propagate]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, disch_call));
+                let disch_ns = self.builder.inst_results(disch_call)[0];
+                self.builder.ins().return_(&[disch_ns]);
+            } else {
+                // Sync fn — return `final_widened` narrowed to the
+                // fn's declared ret_ty. terminal_out keeps the
+                // DISCHARGED tag (run_loop bypass already wrote it
+                // before this propagation site fired).
+                let narrowed = if sync_ret_ty == types::I64 {
+                    final_widened
+                } else if sync_ret_ty.is_int() && sync_ret_ty.bits() < 64 {
+                    self.builder.ins().ireduce(sync_ret_ty, final_widened)
+                } else {
+                    debug_assert_eq!(
+                        sync_ret_ty, self.pointer_ty,
+                        "lower_k_pair_call Sync propagation: unexpected ret_ty {sync_ret_ty:?}"
+                    );
+                    final_widened
+                };
+                self.builder.ins().return_(&[narrowed]);
+            }
 
             self.builder.switch_to_block(continue_blk);
             self.builder.seal_block(continue_blk);
