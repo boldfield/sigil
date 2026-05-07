@@ -8401,7 +8401,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_done_or_dispatch_return_arm: {e}"))?;
 
-
     // Plan D Task 111d — `sigil_last_terminal_tag`,
     // `sigil_reset_last_terminal_tag`, `sigil_last_terminal_value`,
     // `sigil_reset_last_terminal_value` declarations are gone. The

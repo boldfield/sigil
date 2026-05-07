@@ -2277,18 +2277,17 @@ pub unsafe extern "C" fn sigil_run_loop(
         out
     );
     let mut current = initial_step;
-    // Plotkin fix — push this run_loop's entry depth onto the
-    // RUN_LOOP_ENTRY_DEPTH_STACK so wrap_continuation_with_outer_post_arm_k
-    // can determine which OUTER_POST_ARM_K entries this run_loop owns
-    // (entries above entry_depth) versus inherited from enclosing
-    // run_loops (entries at-or-below entry_depth). Popped at every
-    // return path below.
-    // Save the prior run_loop's entry_depth into our local frame
-    // and install ours; restore at every return path so nested
-    // run_loops nest correctly via C-stack save/restore.
+    // Plotkin fix — install this run_loop's entry depth into the
+    // single TLS `RUN_LOOP_ENTRY_DEPTH` Cell so
+    // `wrap_continuation_with_outer_post_arm_k` can determine which
+    // OUTER_POST_ARM_K entries this run_loop owns (entries above
+    // entry_depth) versus inherited from enclosing run_loops
+    // (entries at-or-below entry_depth). Save the prior value into
+    // our local frame; restore at every return path below so
+    // nested run_loops nest correctly via C-stack save/restore.
     let prior_run_loop_entry_depth = run_loop_entry_depth_get();
-    let _entry_depth_for_wrap = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
-    run_loop_entry_depth_set(_entry_depth_for_wrap);
+    let entry_depth_for_wrap = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+    run_loop_entry_depth_set(entry_depth_for_wrap);
     // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
     // run_loop entry. On the DISCHARGED bypass terminal (introduced by
     // Layer 3c to preserve algebraic-effects discharge semantics
