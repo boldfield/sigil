@@ -8,14 +8,24 @@
 // effect on compilation. `import std.string` is allowed (skip-list
 // path) but is not required.
 //
-// All operations treat strings as **byte sequences**, not codepoint
-// sequences — `string_byte_at`, `string_substring`, and
-// `string_index_of` operate on byte offsets. Codepoint-aware
-// variants (`string_char_at`, `string_chars`, `string_split`,
-// `string_join`) are deferred to Task 68 part 2 (they need either
-// the `Char` primitive widened to user surface or
-// `List`-returning helpers; both run into the flat-stdlib-namespace
-// collision per `[DEVIATION Task 66.5]`).
+// String operations are split into **byte-indexed** and **codepoint-
+// indexed** surfaces. Byte-indexed ops (`string_byte_at`,
+// `string_substring`, `string_index_of`, `string_byte_at`) take and
+// return byte offsets in the underlying UTF-8 buffer; they are O(1)
+// and sit closest to the runtime representation. Codepoint-indexed
+// ops (`string_chars`, `string_char_at`, `string_from_chars`) walk
+// the UTF-8 decode tree and operate in terms of `Char` values; they
+// are O(n) but produce codepoint-correct results.
+//
+// Pick byte-indexed when iterating over an already-validated UTF-8
+// buffer for byte-level transforms (length checks, ASCII-only
+// inspection, byte concat). Pick codepoint-indexed when the program
+// reasons in terms of "the i-th character" or builds strings
+// codepoint-by-codepoint.
+//
+// `string_split` / `string_replace` codepoint-aware variants are
+// out of scope for this addendum — see `PLAN_C_DEVIATIONS.md` Task
+// 68 entry for the closure path.
 //
 // ## Builtin operations
 //
@@ -52,6 +62,19 @@
 //   success, 1 if empty, 2 if non-decimal, 3 on overflow.
 // - `string_to_int_parse(s: String) -> Int ![]`  — caller must
 //   have validated; on validated input returns the parsed integer.
+//
+// Codepoint surface (Plan C addendum — boxed `Char`):
+// - `string_chars(s: String) -> List[Char] ![]`  — eager UTF-8
+//   decode. Invalid sequences emit `U+FFFD` (replacement char) and
+//   resync to the next valid byte. Lossy by design.
+// - `string_char_at(s: String, idx: Int) -> Option[Char] ![]`  —
+//   **codepoint** index (not byte). Returns `None` if index out of
+//   bounds. O(n) decode walk.
+// - `string_from_chars(cs: List[Char]) -> String ![]`  — UTF-8
+//   encode each codepoint, concatenate.
+//
+// See `std/char.sigil` for the full `Char` surface (literal
+// syntax, classifiers, case folding, conversion).
 //
 // ## Composition pattern for parsing
 //

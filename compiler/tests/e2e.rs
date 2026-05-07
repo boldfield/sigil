@@ -12623,3 +12623,242 @@ fn float_doc_only_import() {
     assert_eq!(code, 0, "stderr: {_stderr}");
     assert_eq!(stdout, "3.0\n");
 }
+
+// ===== Plan C addendum (Char) — boxed Char e2e ===================
+//
+// `Char` is a heap-allocated TAG_CHAR record (16 bytes) that holds a
+// Unicode codepoint. The 19 user-facing primitives + Char literals
+// + pattern matching are exercised here end-to-end through compile-
+// and-run.
+
+#[test]
+fn char_literal_round_trips_via_to_string() {
+    let src = "import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(char_to_string('A'));\n  \
+                 perform IO.println(char_to_string('\\u{1F600}'));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_literal_round_trip");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "A\n😀\n");
+}
+
+#[test]
+fn char_codepoint_round_trip() {
+    let src = "import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = char_to_int('Z');\n  \
+                 let r: Int = match int_to_char(n) {\n    \
+                   Some(c) => char_to_int(c),\n    \
+                   None => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_codepoint_round_trip");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "90\n", "Z is codepoint 90; round-trip preserves it");
+}
+
+#[test]
+fn int_to_char_rejects_out_of_range() {
+    let src = "import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_to_char(1114112) {\n    \
+                   Some(_c) => perform IO.println(\"some\"),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "int_to_char_oor");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "none\n", "0x110000 > 0x10FFFF, must be None");
+}
+
+#[test]
+fn int_to_char_rejects_surrogate() {
+    let src = "import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_to_char(55296) {\n    \
+                   Some(_c) => perform IO.println(\"some\"),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "int_to_char_surrogate");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "none\n", "0xD800 is a surrogate, must be None");
+}
+
+#[test]
+fn int_to_char_accepts_valid() {
+    let src = "import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_to_char(65) {\n    \
+                   Some(c) => perform IO.println(char_to_string(c)),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "int_to_char_valid");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "A\n");
+}
+
+#[test]
+fn is_ascii_classifiers_basic() {
+    let src = "import std.io\n\
+               fn say(b: Bool) -> Int ![IO] {\n  \
+                 match b {\n    \
+                   true => perform IO.println(\"y\"),\n    \
+                   false => perform IO.println(\"n\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 say(is_ascii_digit('5'));\n  \
+                 say(is_ascii_alpha('a'));\n  \
+                 say(is_ascii_whitespace(' '));\n  \
+                 say(is_ascii('\\u{00E9}'));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_classifiers_basic");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "y\ny\ny\nn\n");
+}
+
+#[test]
+fn to_lower_upper_ascii_passthrough() {
+    let src = "import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(char_to_string(to_upper_ascii('a')));\n  \
+                 perform IO.println(char_to_string(to_upper_ascii('\\u{00E9}')));\n  \
+                 perform IO.println(char_to_string(to_lower_ascii('Z')));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_case_passthrough");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "A\né\nz\n");
+}
+
+#[test]
+fn string_chars_ascii() {
+    let src = "import std.io\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Char] = string_chars(\"hi\");\n  \
+                 perform IO.println(int_to_string(length(xs)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "string_chars_ascii");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "2\n");
+}
+
+#[test]
+fn string_chars_multibyte() {
+    let src = "import std.io\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Char] = string_chars(\"h\\u{00E9}llo\");\n  \
+                 perform IO.println(int_to_string(length(xs)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "string_chars_multibyte");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "5\n", "héllo is 5 codepoints (h é l l o)");
+}
+
+#[test]
+fn string_char_at_codepoint_index() {
+    // codepoint-indexed: 'h' 'é' 'l' 'l' 'o' (héllo).
+    // The é is at codepoint index 1 even though it occupies bytes 1..3.
+    let src = "import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match string_char_at(\"h\\u{00E9}llo\", 1) {\n    \
+                   Some(c) => perform IO.println(char_to_string(c)),\n    \
+                   None => perform IO.println(\"oob\"),\n  \
+                 };\n  \
+                 match string_char_at(\"h\\u{00E9}llo\", 5) {\n    \
+                   Some(_c) => perform IO.println(\"some\"),\n    \
+                   None => perform IO.println(\"oob\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "string_char_at_codepoint_index");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "é\noob\n");
+}
+
+#[test]
+fn string_from_chars_round_trip() {
+    let src = "import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = \"h\\u{00E9}llo \\u{1F600}\";\n  \
+                 perform IO.println(string_from_chars(string_chars(s)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "string_from_chars_round_trip");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "héllo 😀\n");
+}
+
+#[test]
+fn char_pattern_match_against_literal() {
+    // Match patterns on Char literals should compare codepoints (load
+    // payload at offset 8, icmp), not boxed-pointer identity.
+    let src = "import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 let c: Char = 'B';\n  \
+                 match c {\n    \
+                   'A' => perform IO.println(\"a\"),\n    \
+                   'B' => perform IO.println(\"b\"),\n    \
+                   _ => perform IO.println(\"other\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_pattern_literal");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "b\n");
+}
+
+#[test]
+fn char_eq_distinguishes_different_codepoints() {
+    let src = "import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 match char_eq('a', 'a') {\n    \
+                   true => perform IO.println(\"y\"),\n    \
+                   false => perform IO.println(\"n\"),\n  \
+                 };\n  \
+                 match char_eq('a', 'b') {\n    \
+                   true => perform IO.println(\"y\"),\n    \
+                   false => perform IO.println(\"n\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_eq_distinct");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "y\nn\n");
+}
+
+#[test]
+fn char_doc_only_import() {
+    // `import std.char` is a documentation skip-list path; it
+    // compiles but pulls no Sigil items into the program. The
+    // builtin `Char` ops are registered at the typechecker level.
+    let src = "import std.char\n\
+               import std.io\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(char_to_string('A'));\n  \
+                 0\n\
+               }\n";
+    let (stdout, _stderr, code) = compile_and_run(src, "char_doc_import");
+    assert_eq!(code, 0, "stderr: {_stderr}");
+    assert_eq!(stdout, "A\n");
+}
