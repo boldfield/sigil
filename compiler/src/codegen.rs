@@ -7148,6 +7148,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     flag_builder
         .set("is_pic", "true")
         .map_err(|e| format!("cranelift flag is_pic: {e}"))?;
+    // TCO-4 — Cranelift's x86_64 backend requires frame pointers to be
+    // preserved when emitting `return_call` (the tail-call IR Sigil's
+    // Sync user fns at `CallConv::Tail` use for tail recursion). Without
+    // this, the backend panics with "frame pointers aren't fundamentally
+    // required for tail calls, but the current implementation relies on
+    // them being present" at codegen time. Setting unconditionally —
+    // the small per-fn prologue cost is acceptable for an LLM-first
+    // language whose only iteration mechanism is recursion.
+    flag_builder
+        .set("preserve_frame_pointers", "true")
+        .map_err(|e| format!("cranelift flag preserve_frame_pointers: {e}"))?;
     // Deterministic register allocation is not a flag; regalloc2 is
     // deterministic under the same input.
     let isa_builder =
@@ -9065,7 +9076,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             let shim_needed = abi == UserFnAbi::Cps
                 && (cc.top_level_fn_names_seen_as_value.contains(&f.name) || is_synth_lambda);
             if shim_needed {
-                let mut shim_sig = Signature::new(isa_call_conv(&module));
+                // TCO-4 — the shim is a Sync-ABI fn callable from
+                // closure indirect-call sites; the indirect-call sig
+                // is fixed at `CallConv::Tail`, so the shim's own sig
+                // must match. (Other Sync user fns are also Tail CC
+                // per the user-fn sig build above.)
+                let mut shim_sig = Signature::new(isa::CallConv::Tail);
                 shim_sig.params.push(AbiParam::new(pointer_ty));
                 for p in &f.params {
                     shim_sig
