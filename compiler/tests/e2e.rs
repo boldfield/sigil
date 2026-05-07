@@ -13497,3 +13497,62 @@ fn cli_combined_env_and_fs_imports() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "ok\n1\n");
 }
+
+// ===== Plan C TCO addendum — diagnostic tests ===============================
+//
+// Plan: `done/2026-05-07-01-sigil-tco-verify.md` in `boldfield/designs`.
+//
+// `count_down(1_000_000)` and `ping(1_000_000)` recurse one million levels
+// deep in tail position. With TCO they return 0 cleanly; without TCO the
+// program stack-overflows (typical exit code 139 / SIGSEGV) before reaching
+// `IO.println`. The tests pass/fail observably either way — Branch A
+// (tests pass) keeps them as regression guards; Branch B uses them as
+// the diagnostic signal for the codegen fix.
+//
+// Source shape mirrors `recursion_via_direct_call`'s `match`-arm
+// recursive Sync ABI fn (no perform inside the recursive fn, `![]` row).
+// `match arm tail` is one of the tail positions called out in TCO-2's
+// spec text.
+
+#[test]
+fn tail_recursive_count_down_one_million() {
+    let src = "fn count_down(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = count_down(1000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_count_down_one_million");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn tail_recursive_mutual_ping_pong_one_million() {
+    let src = "fn ping(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => pong(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn pong(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 1,\n    \
+                   _ => ping(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = ping(1000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "tail_recursive_mutual_ping_pong_one_million");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
