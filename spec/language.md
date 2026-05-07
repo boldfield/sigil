@@ -422,8 +422,18 @@ identifiers.
 - Integer: decimal `42`, `-7`, `0`. No hex/oct/bin literals in v1.
   Range: `[-2^62, 2^62)` (63-bit tagged Int).
 - String: `"..."` with escapes `\\`, `\"`, `\n`, `\t`, `\r`.
-- Char: `'a'`, `'\n'`. Width: 1 byte (ASCII / latin-1 codepoint).
-  v1 has no codepoint-aware string ops.
+- Char: `'a'`, `'\n'`, `'\u{1F600}'`. Heap-boxed (`TAG_CHAR=0x0C`,
+  16 bytes per allocation) Unicode scalar value in
+  `0x000000..=0x10FFFF` excluding surrogates `0xD800..=0xDFFF`.
+  Literal escapes: `\n`, `\t`, `\r`, `\\`, `\'`, `\"`, `\0`,
+  and `\u{HEX}` accepting 1–6 hex digits. Bare-codepoint UTF-8
+  literals (`'é'`, `'中'`, `'😀'`) are decoded from source. The
+  lexer rejects multi-codepoint bodies, `\u{...}` values >
+  `0x10FFFF`, and surrogate-range values at parse time.
+  Operator overloading (`==`, `<`) is **not** provided — use the
+  named functions `char_eq` / `char_lt` etc. (§3.4). Pattern-
+  matching against literal Chars in `match c { 'a' => ... }`
+  IS supported.
 - Byte: constructed via `byte_truncate(n: Int) -> Byte ![]` (truncates
   to low 8 bits) and validated with `byte_in_range(n: Int) -> Bool ![]`.
 - Bool: `true` and `false` are the literal forms of the builtin
@@ -465,7 +475,7 @@ fn main() -> Int ![IO] { 0 }                   // function
 | `Int` | 63-bit signed integer. |
 | `Bool` | `true` / `false`. |
 | `String` | Immutable UTF-8 byte sequence. |
-| `Char` | 1-byte codepoint. |
+| `Char` | Boxed Unicode codepoint (`TAG_CHAR=0x0C`, 21-bit codepoint payload). |
 | `Byte` | 1-byte unsigned integer (0..255). |
 | `Unit` | The single-value type. Literal: `()`. |
 | `Array[A]` | Immutable indexed collection. |
@@ -480,6 +490,80 @@ fn main() -> Int ![IO] { 0 }                   // function
 
 User-declared sum types and records form the rest of the type
 universe (§6).
+
+##### §3.1.1 — `Char` and codepoint string operations
+
+`Char` is Sigil's first-class Unicode codepoint type — boxed,
+single Unicode scalar value in `0x000000..=0x10FFFF` excluding
+surrogates `0xD800..=0xDFFF`. Literal syntax (§1, expanded):
+
+| Form | Example | Notes |
+|------|---------|-------|
+| Bare ASCII | `'a'`, `'5'`, `' '` | Single ASCII codepoint |
+| Bare multi-byte UTF-8 | `'é'`, `'中'`, `'😀'` | Source decoded as UTF-8 |
+| Escape | `'\n'`, `'\t'`, `'\r'`, `'\\'`, `'\''`, `'\"'`, `'\0'` | Standard C escapes |
+| Unicode escape | `'\u{41}'`, `'\u{1F600}'` | 1–6 hex digits; out-of-range / surrogate rejected at parse |
+
+The lexer rejects multi-codepoint bodies (`'ab'`, `'a\u{301}'`)
+with a "Char literal must be a single codepoint" diagnostic. Char
+is exactly one codepoint, never a grapheme cluster.
+
+**Operations on `Char`** (all `![]`-pure, registered in
+`std.char`):
+
+- Equality / ordering: `char_eq` / `char_lt` / `char_le` /
+  `char_gt` / `char_ge`. Compare codepoint-numerically. There is
+  **no `==` / `<` operator overload** for `Char` — use the
+  named functions.
+- Conversion: `char_to_int` (always succeeds), `int_to_char`
+  (returns `Option[Char]`; `None` for out-of-range or surrogate
+  inputs), `char_to_string` (UTF-8 encode into a fresh String).
+- ASCII classifiers (return `false` for any non-ASCII codepoint):
+  `is_ascii`, `is_ascii_digit`, `is_ascii_alpha`,
+  `is_ascii_alphanumeric`, `is_ascii_whitespace`.
+- ASCII case folding (non-ASCII passes through unchanged):
+  `to_lower_ascii`, `to_upper_ascii`. The `*_ascii` suffix is
+  intentional — v2 may add `is_unicode_*` /
+  `to_lower_unicode` additively without renaming.
+
+**Codepoint-aware string operations** (in `std.string`,
+documented in `std.char`):
+
+- `string_chars : (String) -> List[Char] ![]` — eager UTF-8
+  decode. Invalid byte sequences emit `U+FFFD` (replacement
+  char) and resync to the next valid leading byte; lossy by
+  design.
+- `string_char_at : (String, Int) -> Option[Char] ![]` —
+  **codepoint** index (not byte). `None` if out of bounds.
+  O(n) decode walk.
+- `string_from_chars : (List[Char]) -> String ![]` — UTF-8
+  encode each codepoint, concatenate.
+
+The byte-indexed (`string_byte_at`, `string_substring`,
+`string_index_of`) and codepoint-indexed surfaces coexist —
+choose based on whether the program reasons in terms of bytes
+or codepoints.
+
+##### Worked example — count digits
+
+```sigil
+import std.list
+import std.char
+
+fn count_digits(s: String) -> Int ![] {
+  __count_digits(string_chars(s))
+}
+
+fn __count_digits(cs: List[Char]) -> Int ![] {
+  match cs {
+    Nil => 0,
+    Cons(c, rest) => match is_ascii_digit(c) {
+      true => 1 + __count_digits(rest),
+      false => __count_digits(rest),
+    },
+  }
+}
+```
 
 #### §3.2 — Type expressions
 
@@ -885,7 +969,8 @@ files are the authoritative API reference.
 | `std.mut_array` | `MutArray[A]` (Mem-gated). |
 | `std.byte_array` | `ByteArray`, conversion to/from `String`. |
 | `std.mut_byte_array` | `MutByteArray` (Mem-gated). |
-| `std.string` | Byte-indexed string ops: `string_concat`, `string_substring`, `string_byte_at`, `string_compare`, `string_starts_with`, `string_ends_with`, `string_contains`, `string_index_of`, `string_trim`, `string_to_int_validate`, `string_to_int_parse`, `string_length`. |
+| `std.string` | Byte-indexed string ops: `string_concat`, `string_substring`, `string_byte_at`, `string_compare`, `string_starts_with`, `string_ends_with`, `string_contains`, `string_index_of`, `string_trim`, `string_to_int_validate`, `string_to_int_parse`, `string_length`. Codepoint-indexed: `string_chars`, `string_char_at`, `string_from_chars`. |
+| `std.char` | Boxed `Char` (`TAG_CHAR`): equality / ordering (`char_eq`/`lt`/`le`/`gt`/`ge`), conversion (`char_to_int`, `int_to_char` → `Option[Char]`, `char_to_string`), ASCII classifiers (`is_ascii`, `is_ascii_digit`, `is_ascii_alpha`, `is_ascii_alphanumeric`, `is_ascii_whitespace`), ASCII case (`to_lower_ascii`, `to_upper_ascii`). See §3.1.1. |
 | `std.float` | Boxed `Float` (IEEE 754 f64): arithmetic (`float_add`/`sub`/`mul`/`div`/`neg`), comparison (`float_eq`/`lt`/`le`/`gt`/`ge`; NaN≠NaN), math (`float_abs`/`floor`/`ceil`/`sqrt`), conversion (`float_from_int`/`float_to_int`/`float_to_string`/`string_to_float_validate`/`string_to_float_parse`). `float_to_string` always includes `.0` for whole numbers; `inf`/`NaN` unchanged. |
 | `std.int64` | Boxed `Int64` with arithmetic, comparison, conversion, stringify. |
 | `std.string_builder` | `StringBuilder` rope (Mem-gated). |
@@ -924,6 +1009,14 @@ The following limits are permanent v1 design choices:
   N-let-chain (§8.3) requires N to be known at compile time. For
   runtime-N iteration, use first-class continuations (§8.5) as
   `all_choices` does.
+
+#### §14.1 — Deferred to follow-up plans
+
+| Capability | Closure path |
+|------------|--------------|
+| Codepoint-aware `string_split` / `string_replace` | Future `string-codepoint-helpers` plan (depends on stdlib namespace qualification, not on `Char`). |
+| Unicode-aware `is_unicode_*` / `to_lower_unicode` / `to_upper_unicode` / case folding / normalization | Future `std/unicode.sigil` plan (ships general-category + case-folding tables as embedded data + dispatchers). The v1 `*_ascii` suffix lets the Unicode set ship additively without renaming. |
+| Strict-UTF-8 `string_chars_strict : (String) -> Result[List[Char], Utf8Error]` | v1 ships only the lossy `string_chars`; v2 may add the strict variant additively. |
 
 ### §15 — Build and run
 
