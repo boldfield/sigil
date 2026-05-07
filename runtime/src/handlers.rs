@@ -860,6 +860,17 @@ pub unsafe extern "C" fn sigil_handler_frame_new(
 /// `wrap_continuation_with_outer_post_arm_k` to decide whether to
 /// preserve the crossed-frame's chain entries (multi-shot semantics)
 /// or let them flow through as normal Done routing (single-shot).
+///
+/// # Safety
+///
+/// `arm_count` must be `<= MAX_HANDLER_ARMS` (the function aborts
+/// otherwise — checked, not a precondition). `resumes_many` is
+/// treated as a boolean (zero or non-zero); any non-zero value
+/// sets `RESUMES_MANY_BIT` on the frame's `arm_count` field.
+/// The returned pointer is GC-managed (allocated via `sigil_alloc`)
+/// and may be moved to a TLS-rooted slot before the caller
+/// allocates again. Callers are responsible for installing the
+/// frame onto the handler stack via `sigil_handle_push`.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
     effect_id: u32,
@@ -1585,7 +1596,9 @@ pub unsafe extern "C" fn sigil_continuation_identity(
     // body call), and chain step_0 is silently dropped — the multi-
     // shot enumeration produces only the first branch's value.
     if args_len == 3 {
+        // SAFETY: gc-heap-ptr arithmetic (caller-owned args buffer at args_len=3 reads slot 1 of trailing pair — identity-as-k_fn dispatch convention)
         let post_arm_k_closure = *args_ptr.add(1) as *mut u8;
+        // SAFETY: gc-heap-ptr arithmetic (same args buffer, slot 2)
         let post_arm_k_fn = *args_ptr.add(2) as *mut u8;
         let self_addr = sigil_continuation_identity as *mut u8;
         if !post_arm_k_fn.is_null() && post_arm_k_fn != self_addr {
@@ -1625,6 +1638,17 @@ pub unsafe extern "C" fn sigil_continuation_identity(
 ///   offset 24: inner_fn (code addr — bit 2 clear)
 ///   offset 32: saved_closure (GC ptr — bitmap bit 3)
 ///   offset 40: saved_fn (code addr — bit 4 clear)
+///
+/// # Safety
+///
+/// `closure_ptr` must point to a wrapper closure with the exact
+/// layout documented above (allocated by
+/// `wrap_continuation_with_outer_post_arm_k`). `args_ptr` and
+/// `args_len` follow the standard CPS-call ABI: a non-null buffer of
+/// `args_len` u64 slots that the caller (the trampoline) keeps
+/// alive across this call. The returned `NextStep` is arena-
+/// allocated and consumed by the trampoline before the next
+/// dispatch (which resets the arena).
 #[no_mangle]
 pub unsafe extern "C" fn sigil_k_continuation_wrapper(
     closure_ptr: *mut u8,
@@ -1632,9 +1656,13 @@ pub unsafe extern "C" fn sigil_k_continuation_wrapper(
     args_len: u32,
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
+    // SAFETY: gc-heap-ptr arithmetic (fixed-layout 5-slot wrapper closure: code_ptr@0, inner_closure@16, inner_fn@24, saved_closure@32, saved_fn@40)
     let inner_closure = *(closure_ptr.add(16) as *const *mut u8);
+    // SAFETY: gc-heap-ptr arithmetic (same fixed wrapper-closure layout)
     let inner_fn = *(closure_ptr.add(24) as *const *mut u8);
+    // SAFETY: gc-heap-ptr arithmetic (same fixed wrapper-closure layout)
     let saved_closure = *(closure_ptr.add(32) as *const *mut u8);
+    // SAFETY: gc-heap-ptr arithmetic (same fixed wrapper-closure layout)
     let saved_fn = *(closure_ptr.add(40) as *const *mut u8);
 
     sigil_outer_post_arm_k_push(saved_closure, saved_fn);
@@ -1642,6 +1670,7 @@ pub unsafe extern "C" fn sigil_k_continuation_wrapper(
     let ns = sigil_next_step_call(inner_closure, inner_fn, args_len);
     let ns_args = sigil_next_step_args_ptr(ns);
     for i in 0..args_len as usize {
+        // SAFETY: gc-heap-ptr arithmetic (copying caller-provided u64 args into NextStep's args buffer; bounds enforced by args_len)
         ns_args.add(i).write(*args_ptr.add(i));
     }
     ns
@@ -1733,7 +1762,7 @@ unsafe fn wrap_continuation_with_outer_post_arm_k(
     // (or original k). Execution order: outermost (= bottom-saved)
     // pushes bottom entry first, innermost (= top-saved) pushes top
     // entry last → restored stack = [bottom..top] = original.
-    for i in 0..count {
+    for entry in entries.iter().take(count) {
         // bitmap=0b01010: bits 1 and 3 set (inner_closure at slot 1,
         // saved_closure at slot 3 are GC-managed pointers). Slot 0 is
         // code_ptr (null), slot 2 is inner_fn (code addr), slot 4 is
@@ -1743,8 +1772,8 @@ unsafe fn wrap_continuation_with_outer_post_arm_k(
         *(wrapper.add(8) as *mut *mut u8) = ptr::null_mut();
         *(wrapper.add(16) as *mut *mut u8) = current_closure;
         *(wrapper.add(24) as *mut *mut u8) = current_fn;
-        *(wrapper.add(32) as *mut *mut u8) = entries[i].closure_ptr;
-        *(wrapper.add(40) as *mut *mut u8) = entries[i].fn_ptr;
+        *(wrapper.add(32) as *mut *mut u8) = entry.closure_ptr;
+        *(wrapper.add(40) as *mut *mut u8) = entry.fn_ptr;
 
         current_closure = wrapper;
         current_fn = wrapper_fn_addr;
@@ -2912,23 +2941,30 @@ mod tests {
         // `[arg, post_arm_k_closure, post_arm_k_fn]` at `args_len=3`.
         // When the arm dispatches into identity directly (perform in
         // tail position of the handle body, no helper synth-cont in
-        // scope), identity sees args_len=3 — the trailing pair is
-        // irrelevant since identity is the terminal continuation.
+        // scope), identity sees args_len=3 with trailing pair set to
+        // `(null, &sigil_continuation_identity)` — identity is the
+        // terminal continuation and recognises its own self address
+        // as a no-op trailing fn.
         //
-        // Identity must read only `args_ptr[0]` and produce
-        // `NextStep::Done(args_ptr[0])`, ignoring the trailing slots.
+        // Identity must read `args_ptr[0]`, observe the (null,
+        // identity) trailing pair, and produce
+        // `NextStep::Done(args_ptr[0])`.
         //
-        // Bisecting hint: a regression in the existing
-        // `arm_uses_k_in_tail_position_returns_continuation_value`
-        // e2e test after Slice A would surface as identity's
-        // arity-1 invariant firing here. This unit test pins the
-        // contract directly so the failure attribution is unambiguous.
+        // Plotkin fix: identity NOW dispatches through the trailing
+        // pair when `post_arm_k_fn` is non-null AND not its own
+        // self-address (required for tail-perform body shapes where
+        // the chain step_0 isn't pushed by the body's own chain).
+        // This test pins the self-address-skip contract; the
+        // sibling test
+        // `continuation_identity_dispatches_through_non_identity_trailing_fn`
+        // pins the dispatch contract.
         let _guard = crate::test_support::gc_test_lock();
         ensure_gc();
         reset_state();
         let known: u64 = 0xFEEDFACE_DEADBEEF;
-        // [arg, post_arm_k_closure (null), post_arm_k_fn (irrelevant)]
-        let args: [u64; 3] = [known, 0xCAFE, 0xBABE];
+        let identity_self_addr = sigil_continuation_identity as *const () as usize as u64;
+        // [arg, post_arm_k_closure (null), post_arm_k_fn (identity)]
+        let args: [u64; 3] = [known, 0, identity_self_addr];
         // SAFETY: gc-heap-ptr arithmetic (stack array, non-GC, outlives the call).
         let args_ptr = args.as_ptr();
         let ns = unsafe { sigil_continuation_identity(ptr::null(), args_ptr, 3, ptr::null_mut()) };
@@ -2938,6 +2974,43 @@ mod tests {
             assert_eq!((*ns).arg_count, 0);
             assert!((*ns).closure_ptr.is_null());
             assert!((*ns).fn_ptr.is_null());
+        }
+        reset_state();
+    }
+
+    #[test]
+    fn continuation_identity_dispatches_through_non_identity_trailing_fn() {
+        // Plotkin fix — when identity is dispatched as the k_fn for
+        // an arm's k(arg) call with a multi-shot chain trailing
+        // pair (a non-null, non-identity post_arm_k_fn), identity
+        // forwards to the chain step instead of returning Done.
+        // This is the load-bearing path for tail-perform body
+        // shapes (e.g. `body() => perform Effect.op()`) where the
+        // chain step_0 isn't pushed by the body's own chain machinery.
+        //
+        // Verify: identity returns NextStep::Call(post_arm_k_closure,
+        // post_arm_k_fn, [args[0]]) so the trampoline dispatches the
+        // chain step with the captured value as its single arg.
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        reset_state();
+        let known: u64 = 0xFEEDFACE_DEADBEEF;
+        // Arbitrary non-null, non-identity sentinel addresses — the
+        // dispatch only inspects them as opaque pointer values.
+        let post_arm_k_closure: u64 = 0x1000;
+        let post_arm_k_fn: u64 = 0x2000;
+        let args: [u64; 3] = [known, post_arm_k_closure, post_arm_k_fn];
+        // SAFETY: gc-heap-ptr arithmetic (stack array, non-GC, outlives the call).
+        let args_ptr = args.as_ptr();
+        let ns = unsafe { sigil_continuation_identity(ptr::null(), args_ptr, 3, ptr::null_mut()) };
+        unsafe {
+            assert_eq!((*ns).tag, NEXT_STEP_TAG_CALL);
+            assert_eq!((*ns).closure_ptr as u64, post_arm_k_closure);
+            assert_eq!((*ns).fn_ptr as u64, post_arm_k_fn);
+            assert_eq!((*ns).arg_count, 1);
+            // arg_count=1 means args_ptr[0] holds the captured value.
+            let dispatched_args = sigil_next_step_args_ptr(ns);
+            assert_eq!(*dispatched_args, known);
         }
         reset_state();
     }
